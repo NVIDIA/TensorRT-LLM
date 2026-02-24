@@ -103,7 +103,22 @@ def parse_test_list_lines(test_list, lines, test_prefix):
         if s.startswith("full:"):
             s = s.lstrip("full:")
             if test_prefix:
-                if test_prefix.split('-')[0] in s:
+                # Check for SM version pattern (e.g., sm90, sm89, sm100)
+                sm_match = re.match(r'sm(\d+)/', s)
+                if sm_match:
+                    sm_version = int(sm_match.group(1))
+                    # Get current SM version
+                    try:
+                        from ..conftest import get_sm_version
+                        current_sm = get_sm_version()
+                        # If SM versions match, replace with test_prefix
+                        if sm_version == current_sm:
+                            s = s.replace(f'sm{sm_version}',
+                                          test_prefix.split('-')[0])
+                    except Exception:
+                        # If can't get SM version, skip SM-based filtering
+                        pass
+                elif test_prefix.split('-')[0] in s:
                     s = s.replace(test_prefix.split('-')[0], test_prefix)
             return s
         elif test_prefix:

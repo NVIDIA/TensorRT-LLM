@@ -14,12 +14,15 @@
 # limitations under the License.
 
 import math
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from tensorrt_llm import LLM, SamplingParams
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, KvCacheConnectorConfig
+from tensorrt_llm import LLM, DisaggregatedParams, SamplingParams
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig, KvCacheConfig,
+                                          KvCacheConnectorConfig)
+from tensorrt_llm.llmapi.llm_utils import KvCacheRetentionConfig
 
 from ..conftest import llm_models_root
 
@@ -41,15 +44,16 @@ def model_with_connector():
         )
 
         def model_fn(*args, **kwargs):
-            return LLM(
-                *args,
-                **kwargs,
-                model=f"{llm_models_root()}/Qwen2-0.5B",
-                backend="pytorch",
-                kv_connector_config=kv_connector_config,
-                cuda_graph_config=None,
-                kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
-            )
+
+            default_kwargs = {
+                "model": f"{llm_models_root()}/Qwen2-0.5B",
+                "backend": "pytorch",
+                "kv_connector_config": kv_connector_config,
+                "cuda_graph_config": None,
+                "kv_cache_config": KvCacheConfig(free_gpu_memory_fraction=0.1)
+            }
+
+            return LLM(*args, **{**default_kwargs, **kwargs})
 
         yield model_fn, mock_scheduler, mock_worker
 
@@ -59,6 +63,16 @@ def enforce_single_worker(monkeypatch):
     monkeypatch.setenv("TLLM_WORKER_USE_SINGLE_PROCESS", "1")
 
     yield
+
+
+def generate_and_sleep(model, *args, **kwargs):
+    # Some KV connector API calls are made after a full response is returned. We want to be able to track these calls.
+    # However, we don't have any indication of when all the calls are complete.
+    # To compensate for this, we sleep between the generate call and the return of the outputs.
+    # TODO(jthomson04): Surely there's a better way to do this?
+    outputs = model.generate(*args, **kwargs)
+    time.sleep(1)
+    return outputs
 
 
 @pytest.mark.threadleak(enabled=False)
@@ -79,7 +93,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    model.generate(["Hello, world"], sampling_params)
+    generate_and_sleep(model, ["Hello, world"], sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -87,8 +101,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
     assert len(scheduler.update_state_after_alloc.call_args.args[1]) == 1
 
     # With the overlap scheduler, we generate one extra token.
-    assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
 
     # We should have a single `SchedulerOutput` per forward pass.
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
@@ -108,8 +121,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
             assert len(scheduler_output.cached_requests[0].new_tokens) == 1
 
     # We call `start_load_kv` once at the beginning of each forward pass.
-    assert worker.start_load_kv.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert worker.start_load_kv.call_count == NUM_TOKENS
 
     # Only called once when the request is received.
     assert scheduler.get_num_new_matched_tokens.call_count == 1
@@ -118,10 +130,8 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
                      for call in worker.wait_for_layer_load.call_args_list) + 1
 
     # Called num_layers * num_forward_passes times.
-    assert worker.wait_for_layer_load.call_count == num_layers * (
-        NUM_TOKENS + int(use_overlap_scheduler))
-    assert worker.save_kv_layer.call_count == num_layers * (
-        NUM_TOKENS + int(use_overlap_scheduler))
+    assert worker.wait_for_layer_load.call_count == num_layers * (NUM_TOKENS)
+    assert worker.save_kv_layer.call_count == num_layers * (NUM_TOKENS)
 
     for i, call in enumerate(worker.wait_for_layer_load.call_args_list):
         assert call.args[0] == i % num_layers
@@ -129,8 +139,7 @@ def test_connector_simple(enforce_single_worker, model_with_connector,
     for i, call in enumerate(worker.save_kv_layer.call_args_list):
         assert call.args[0] == i % num_layers
 
-    assert worker.wait_for_save.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert worker.wait_for_save.call_count == NUM_TOKENS
 
     assert scheduler.request_finished.call_count == 1
 
@@ -157,7 +166,7 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
     worker.get_finished.side_effect = lambda finished_gen, load_async: (
         finished_gen, load_async)
 
-    model.generate([
+    generate_and_sleep(model, [
         "Lorem ipsum dolor sit amet, consectetur adipiscing elit. Sed do eiusmod tempor incididunt ut labore et dolore magna aliqua."
     ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
@@ -190,7 +199,7 @@ def test_connector_async_save(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
 
-    model.generate(["Hello, world"], sampling_params)
+    generate_and_sleep(model, ["Hello, world"], sampling_params)
 
     assert scheduler.request_finished.call_count == 1
 
@@ -230,16 +239,14 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
 
     sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
 
-    model.generate([0] * NUM_INPUT_TOKENS, sampling_params)
+    generate_and_sleep(model, [0] * NUM_INPUT_TOKENS, sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
     assert len(
         scheduler.update_state_after_alloc.call_args.args[1]) == math.ceil(
             NUM_INPUT_TOKENS / BLOCK_SIZE)
 
-    # Additional token when using the overlap scheduler.
-    assert scheduler.build_connector_meta.call_count == NUM_TOKENS + int(
-        use_overlap_scheduler)
+    assert scheduler.build_connector_meta.call_count == NUM_TOKENS
 
     for i, call in enumerate(scheduler.build_connector_meta.call_args_list):
         sched_output = call.args[0]
@@ -253,11 +260,13 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
             assert len(request.new_block_ids) == math.ceil(NUM_INPUT_TOKENS /
                                                            BLOCK_SIZE)
             assert request.computed_position == 0
+            assert request.num_scheduled_tokens == NUM_INPUT_TOKENS
         elif i == 1 and use_overlap_scheduler:
             assert len(sched_output.new_requests) == 0
             assert len(sched_output.cached_requests) == 1
 
             assert len(sched_output.cached_requests[0].new_tokens) == 0
+            assert sched_output.cached_requests[0].num_scheduled_tokens == 1
         else:
             assert len(sched_output.cached_requests) == 1
             assert len(sched_output.new_requests) == 0
@@ -271,6 +280,8 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
             else:
                 assert request.new_block_ids == []
 
+            assert request.num_scheduled_tokens == 1
+
     scheduler.build_connector_meta.reset_mock()
 
     scheduler.get_num_new_matched_tokens.return_value = 8, False
@@ -278,7 +289,7 @@ def test_connector_scheduler_output(enforce_single_worker, model_with_connector,
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (NUM_INPUT_TOKENS + NUM_TOKENS) / BLOCK_SIZE)
 
-    model.generate([1] * NUM_INPUT_TOKENS, sampling_params)
+    generate_and_sleep(model, [1] * NUM_INPUT_TOKENS, sampling_params)
 
     # The initial computed position should be 0, since we haven't yet onboarded any blocks.
     assert scheduler.build_connector_meta.call_args_list[0].args[
@@ -307,7 +318,7 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
 
     sampling_params = SamplingParams(max_tokens=BLOCK_SIZE, ignore_eos=True)
 
-    model.generate([0] * (CHUNK_SIZE * 2), sampling_params)
+    generate_and_sleep(model, [0] * (CHUNK_SIZE * 2), sampling_params)
 
     assert scheduler.update_state_after_alloc.call_count == 1
 
@@ -334,15 +345,195 @@ def test_connector_scheduler_output_chunked_context(enforce_single_worker,
             assert len(req.new_tokens) == CHUNK_SIZE * 2
             assert len(req.new_block_ids) == math.ceil(CHUNK_SIZE * 2 /
                                                        BLOCK_SIZE)
+            assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 1:
             # The second prefill chunk.
             assert req.computed_position == CHUNK_SIZE
             assert len(req.new_tokens) == 0
             assert len(req.new_block_ids) == 0
+            assert req.num_scheduled_tokens == CHUNK_SIZE
         elif i == 2 and use_overlap_scheduler:
             assert len(req.new_tokens) == 0
+            assert req.num_scheduled_tokens == 1
         else:
             assert len(req.new_tokens) == 1
-
+            assert req.num_scheduled_tokens == 1
     assert len(scheduler.request_finished.call_args.args[1]) == math.ceil(
         (CHUNK_SIZE * 2 + BLOCK_SIZE) / BLOCK_SIZE)
+
+
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.parametrize("save_async", [False, True])
+def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
+                                  save_async):
+    model_fn, scheduler, worker = model_with_connector
+
+    prefill_worker = model_fn(
+        disable_overlap_scheduler=True,
+        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"))
+
+    decode_worker = model_fn(
+        cache_transceiver_config=CacheTransceiverConfig(backend="DEFAULT"),
+        kv_connector_config=None)
+
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=16)
+
+    disaggregated_params = DisaggregatedParams(request_type="context_only")
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+
+    if save_async:
+        scheduler.request_finished.return_value = True
+
+        worker.get_finished.side_effect = lambda finished_gen, load_async: (
+            finished_gen, load_async)
+    else:
+        scheduler.request_finished.return_value = False
+        worker.get_finished.return_value = [], []
+
+    result = generate_and_sleep(prefill_worker, [0] * 48,
+                                sampling_params=sampling_params,
+                                disaggregated_params=disaggregated_params)
+
+    gen_disagg_params = result.disaggregated_params
+    gen_disagg_params.request_type = "generation_only"
+
+    generate_and_sleep(decode_worker, [0] * 48,
+                       sampling_params=sampling_params,
+                       disaggregated_params=gen_disagg_params)
+
+    assert scheduler.build_connector_meta.call_count == 1
+
+    scheduler_output = scheduler.build_connector_meta.call_args.args[0]
+
+    assert len(scheduler_output.new_requests) == 1
+    assert len(scheduler_output.cached_requests) == 0
+
+    req = scheduler_output.new_requests[0]
+
+    assert req.computed_position == 0
+    assert req.num_scheduled_tokens == 48
+    assert len(req.new_tokens) == 48
+
+    assert scheduler.request_finished.call_count == 1
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_multi_request(enforce_single_worker, model_with_connector):
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True,
+                     kv_cache_config=KvCacheConfig(max_tokens=144))
+
+    sampling_params = SamplingParams(ignore_eos=True, max_tokens=4)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    scheduler.request_finished.return_value = True
+    worker.get_finished.side_effect = lambda finished_gen, load_async: (
+        finished_gen, load_async)
+
+    model.generate([[0] * 48, [1] * 48],
+                   sampling_params=[
+                       SamplingParams(ignore_eos=True, max_tokens=4),
+                       SamplingParams(ignore_eos=True, max_tokens=3)
+                   ])
+
+    # The KV cache of both prior requests should be freed, allowing the third request to run.
+    model.generate([2] * 110, sampling_params=sampling_params)
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_priorities(enforce_single_worker, model_with_connector):
+    """Test that retention priorities flow through the connector correctly.
+
+    This test verifies that when KvCacheRetentionConfig is provided,
+    the RequestData.priorities field is populated with the correct
+    per-block priorities based on the token ranges.
+    """
+    BLOCK_SIZE = 32
+    NUM_INPUT_TOKENS = 64  # 2 blocks
+    NUM_TOKENS = 4
+    HIGH_PRIORITY = 80  # For system prompt blocks
+    LOW_PRIORITY = 10  # For user input / decode blocks
+
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    # Create retention config with different priorities for different token ranges:
+    # - First 32 tokens (block 0): high priority (e.g., system prompt)
+    # - Remaining tokens (block 1+): low priority (e.g., user input)
+    retention_config = KvCacheRetentionConfig(
+        token_range_retention_priorities=[
+            KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                token_start=0,
+                token_end=32,
+                priority=HIGH_PRIORITY,
+            ),
+            KvCacheRetentionConfig.TokenRangeRetentionConfig(
+                token_start=32,
+                token_end=None,  # Extend to end of sequence
+                priority=LOW_PRIORITY,
+            ),
+        ],
+        decode_retention_priority=LOW_PRIORITY,
+    )
+
+    sampling_params = SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True)
+
+    generate_and_sleep(model, [0] * NUM_INPUT_TOKENS,
+                       sampling_params=sampling_params,
+                       kv_cache_retention_config=retention_config)
+
+    # Verify that build_connector_meta was called
+    assert scheduler.build_connector_meta.call_count >= 1
+
+    # Check the first call (new request) has priorities set
+    first_call = scheduler.build_connector_meta.call_args_list[0]
+    sched_output = first_call.args[0]
+
+    assert len(sched_output.new_requests) == 1
+    request = sched_output.new_requests[0]
+
+    # Should have 2 blocks for 64 input tokens with block size 32
+    expected_num_blocks = math.ceil(NUM_INPUT_TOKENS / BLOCK_SIZE)
+    assert len(request.new_block_ids) == expected_num_blocks
+
+    # Priorities should be set and match the retention config
+    assert request.priorities is not None
+    assert len(request.priorities) == len(request.new_block_ids)
+
+    # First block should have high priority, second block should have low priority
+    assert request.priorities[
+        0] == HIGH_PRIORITY, f"Expected priority {HIGH_PRIORITY} for block 0, got {request.priorities[0]}"
+    assert request.priorities[
+        1] == LOW_PRIORITY, f"Expected priority {LOW_PRIORITY} for block 1, got {request.priorities[1]}"
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_priorities_default(enforce_single_worker,
+                                      model_with_connector):
+    """Test that priorities are None when no retention config is provided."""
+    model_fn, scheduler, worker = model_with_connector
+
+    model = model_fn(disable_overlap_scheduler=True)
+
+    scheduler.get_num_new_matched_tokens.return_value = 0, False
+    worker.get_finished.return_value = [], []
+
+    sampling_params = SamplingParams(max_tokens=4, ignore_eos=True)
+
+    # Generate without retention config
+    generate_and_sleep(model, [0] * 48, sampling_params=sampling_params)
+
+    first_call = scheduler.build_connector_meta.call_args_list[0]
+    sched_output = first_call.args[0]
+
+    assert len(sched_output.new_requests) == 1
+    request = sched_output.new_requests[0]
+
+    # Without retention config, priorities should be None
+    assert request.priorities is None

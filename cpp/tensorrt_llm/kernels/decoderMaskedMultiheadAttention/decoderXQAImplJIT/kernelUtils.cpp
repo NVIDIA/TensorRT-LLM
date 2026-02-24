@@ -14,12 +14,13 @@
  * limitations under the License.
  */
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include <list>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 namespace jit
@@ -95,8 +96,14 @@ bool supportConfigQGMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlu
     {
         return false;
     }
-    if (xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    if (!contains({DATA_TYPE_FP16, DATA_TYPE_BF16, DATA_TYPE_E4M3}, xqaParams.kv_cache_data_type))
     {
+        return false;
+    }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (!is_skip_softmax && xqaParams.kv_cache_data_type != DATA_TYPE_E4M3)
+    {
+        // Only use hopper kernel with fp16/bf16 kv cache data type when skip softmax is enabled
         return false;
     }
     if (xqaParams.beam_width != 1)
@@ -167,6 +174,11 @@ bool supportConfigHMMA(XQAParams const& xqaParams, int SM, bool forConfigurePlug
     {
         return false;
     }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (is_skip_softmax)
+    {
+        return false;
+    }
     return true;
 }
 
@@ -200,9 +212,15 @@ bool supportConfigMLA(XQAParams const& xqaParams, int SM, bool forConfigurePlugi
     {
         return false;
     }
+    bool const is_skip_softmax = xqaParams.skip_softmax_threshold_scale_factor != 0;
+    if (is_skip_softmax)
+    {
+        return false;
+    }
     return true;
 }
 
 } // namespace jit
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

@@ -33,7 +33,7 @@ from ._utils import (QuantModeWrapper, bf16_array, bool_array,
                      fp16_array, fp32_array, get_sm_version, int32_array,
                      int64_array, np_dtype_to_trt, str_dtype_to_trt,
                      trt_dtype_to_np, trt_dtype_to_str)
-from .network import PluginInfo, set_np_weight, set_plugin_info
+from .network import PluginInfo, get_np_weight, set_np_weight, set_plugin_info
 from .plugin import TRT_LLM_PLUGIN_NAMESPACE, current_all_reduce_helper
 from .quantization import QuantMode
 
@@ -590,7 +590,7 @@ class Tensor(object):
             return id(None)
 
     def __repr__(self):
-        return f"TensorRT-LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
+        return f"TensorRT LLM Tensor: {self.name=} {self.dtype=} {self.shape=}"
 
     def __xor__(self, b):
         '''
@@ -604,7 +604,7 @@ class Tensor(object):
 
 def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
     '''
-    A helper function to create a TensorRT-LLM Tensor object that encapsulates
+    A helper function to create a TensorRT LLM Tensor object that encapsulates
     the connection between the TensorRT tensor (trt.ITensor) and the layer
     (trt.ILayer) that produces it.
 
@@ -626,7 +626,7 @@ def _create_tensor(trt_tensor: trt.ITensor, producer: trt.ILayer) -> Tensor:
             The producer.
 
     Returns:
-        The TensorRT-LLM tensor (functional.Tensor) that encapsulates the
+        The TensorRT LLM tensor (functional.Tensor) that encapsulates the
         TensorRT tensor and the layer that produces it. The former is
         accessible through the attribute 'trt_tensor' and the latter using the
         attribute 'producer'.
@@ -2051,8 +2051,8 @@ def expand_dims_like(left: Union[Tensor, int, float], right: Tensor) -> Tensor:
     return left
 
 
-# If dim is None, return a 1-D TensorRT-LLM tensor of the size
-# If dim is not None, return a 0-D TensorRT-LLM tensor of the dimension size
+# If dim is None, return a 1-D TensorRT LLM tensor of the size
+# If dim is not None, return a 0-D TensorRT LLM tensor of the dimension size
 def shape(input: Tensor,
           dim: Optional[int] = None,
           cast_to_dtype: Optional[Union[str, trt.DataType]] = None,
@@ -3279,8 +3279,6 @@ def identity(input: Tensor) -> Tensor:
     '''
     Add an identity operation.
 
-    TODO: Document why it can be done using a plugin!!!
-
     Parameters:
         input : Tensor
             The input tensor.
@@ -3471,7 +3469,7 @@ def softplus(input: Tensor, beta: float, threshold: float) -> Tensor:
 
     Parameters:
         input : Tensor
-            Input TensorRT-LLM Tensor.
+            Input TensorRT LLM Tensor.
         beta : float
             The parameter for softplus computation.
         threshold : float
@@ -3545,6 +3543,24 @@ def avg_pool2d(input: Tensor,
     return output
 
 
+def _get_trt_weight(weight: Tensor) -> Tuple[trt.Weights, bool]:
+    is_weight_constant = (weight.producer is not None
+                          and weight.producer.type == trt.LayerType.CONSTANT)
+    if is_weight_constant:
+        ndarray = get_np_weight(default_trtnet(), weight.producer.name)
+        if ndarray is not None:
+            trt_weight = trt.Weights(np_dtype_to_trt(ndarray.dtype),
+                                     ndarray.ctypes.data,
+                                     int(np.prod(ndarray.shape)))
+        else:
+            weight.producer.__class__ = trt.IConstantLayer
+            trt_weight = weight.producer.weights
+    else:
+        trt_weight = trt.Weights()
+
+    return trt_weight, is_weight_constant
+
+
 def conv1d(input: Tensor,
            weight: Tensor,
            bias: Optional[Tensor] = None,
@@ -3555,30 +3571,32 @@ def conv1d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = weight.size()[-2]
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    kernel_shape = trt.Dims([kernel_size, 1])
+
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     input_shuffled = stack([input], dim=input.ndim())
-    kernel_size = trt.Dims([kernel_size, 1])
 
     layer = default_trtnet().add_convolution_nd(input_shuffled.trt_tensor,
-                                                noutput, kernel_size, weight,
-                                                bias)
+                                                noutput, kernel_shape,
+                                                trt_weight, trt_bias)
     layer.stride_nd = (stride, 2)
     layer.padding_nd = (padding, 0)
     layer.dilation_nd = (dilation, 2)
     layer.num_groups = groups
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output_2d = _create_tensor(layer.get_output(0), layer)
     output_1d = squeeze(output_2d, dim=-1)
@@ -3604,18 +3622,21 @@ def conv2d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = (weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
-                                                kernel_size, weight, bias)
+                                                kernel_shape, trt_weight,
+                                                trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.dilation_nd = dilation
@@ -3627,9 +3648,9 @@ def conv2d(input: Tensor,
         layer.post_padding = post_padding
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
 
@@ -3668,18 +3689,21 @@ def conv3d(input: Tensor,
 
     noutput = weight.size()[0]
     kernel_size = (weight.size()[-3], weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_convolution_nd(input.trt_tensor, noutput,
-                                                kernel_size, weight, bias)
+                                                kernel_shape, trt_weight,
+                                                trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.dilation_nd = dilation
@@ -3687,9 +3711,9 @@ def conv3d(input: Tensor,
     layer.dilation_nd = dilation
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
     return output
@@ -3715,26 +3739,29 @@ def conv_transpose2d(input: Tensor,
 
     noutput = weight.size()[1]
     kernel_size = (weight.size()[-2], weight.size()[-1])
+    kernel_shape = trt.Dims(list(kernel_size))
 
-    is_weight_constant = (weight.producer is not None
-                          and weight.producer.type == trt.LayerType.CONSTANT)
-    weight = weight.producer.weights if is_weight_constant else trt.Weights()
+    trt_weight, is_weight_constant = _get_trt_weight(weight)
+    weight_tensor = weight
 
     if bias is not None:
-        is_bias_constant = (bias.producer is not None
-                            and bias.producer.type == trt.LayerType.CONSTANT)
-        bias = bias.producer.weights if is_bias_constant else trt.Weights()
+        bias_tensor = bias
+        trt_bias, is_bias_constant = _get_trt_weight(bias)
+    else:
+        bias_tensor = None
+        trt_bias = None
 
     layer = default_trtnet().add_deconvolution_nd(input.trt_tensor, noutput,
-                                                  kernel_size, weight, bias)
+                                                  kernel_shape, trt_weight,
+                                                  trt_bias)
     layer.stride_nd = stride
     layer.padding_nd = padding
     layer.num_groups = groups
 
     if not is_weight_constant:
-        layer.set_input(1, weight.trt_tensor)
-    if bias is not None and not is_bias_constant:
-        layer.set_input(2, bias.trt_tensor)
+        layer.set_input(1, weight_tensor.trt_tensor)
+    if bias_tensor is not None and not is_bias_constant:
+        layer.set_input(2, bias_tensor.trt_tensor)
 
     output = _create_tensor(layer.get_output(0), layer)
 
@@ -3883,6 +3910,7 @@ class AllReduceStrategy(IntEnum):
     LOWPRECISION = 6
     MNNVL = 7
     NCCL_SYMMETRIC = 8
+    SYMM_MEM = 9  # PyTorch symmetric memory with MULTIMEM
 
 
 class AllReduceFusionOp(IntEnum):
@@ -4022,7 +4050,10 @@ def create_allreduce_plugin(
     pfc = trt.PluginFieldCollection(pfc)
     ar_plug = allreduce_plg_creator.create_plugin("allreduce", pfc)
     plug_inputs = [tensor]
-    if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
+    if all_reduce_params.strategy not in {
+            AllReduceStrategy.NCCL, AllReduceStrategy.UB,
+            AllReduceStrategy.NCCL_SYMMETRIC
+    }:
         plug_inputs.append(workspace)
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
@@ -4094,7 +4125,7 @@ def allreduce(
     workspace = None
     if all_reduce_params.strategy != AllReduceStrategy.NCCL and all_reduce_params.strategy != AllReduceStrategy.UB:
         if current_all_reduce_helper().workspace is None:
-            all_reduce_params.strategy = AllReduceStrategy.NCCL
+            all_reduce_params.strategy = AllReduceStrategy.NCCL_SYMMETRIC
         else:
             workspace = current_all_reduce_helper().workspace.trt_tensor
     if all_reduce_params.strategy == AllReduceStrategy.UB:
@@ -5358,7 +5389,7 @@ def gpt_attention(
             An INT32 tensor of shape [1].
             by default, the max_attention_window_size is determined by the shape of cache_indir_table.
             And we support independent max_attention_window_size for each layer.
-            This controls the sliding-window-attention/cyclic-kv-cache features.
+            This controls the sliding-window-attention kv-cache features.
 
         context_lengths: Tensor (On GPU)
             The tensor that stores the context-phase sequence length of each request. Its shape

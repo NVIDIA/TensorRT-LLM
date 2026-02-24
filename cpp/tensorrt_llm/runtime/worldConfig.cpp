@@ -142,6 +142,9 @@ WorldConfig WorldConfig::mpi(SizeType32 gpusPerNode, std::optional<SizeType32> t
 
 std::vector<SizeType32> WorldConfig::getPipelineParallelGroup() const
 {
+    // Layout: pp is outermost, then tp, then cp is innermost (consecutive).
+    // rank = ppRank * (tp * cp) + tpRank * cp + cpRank
+    // PP group: all ranks with same (tpRank, cpRank) but different ppRank.
     auto const pp = getPipelineParallelism();
     auto const tp = getTensorParallelism();
     auto const cp = getContextParallelism();
@@ -157,29 +160,35 @@ std::vector<SizeType32> WorldConfig::getPipelineParallelGroup() const
 
 std::vector<SizeType32> WorldConfig::getTensorParallelGroup() const
 {
+    // Layout: pp is outermost, then tp, then cp is innermost (consecutive).
+    // rank = ppRank * (tp * cp) + tpRank * cp + cpRank
+    // TP group: all ranks with same (ppRank, cpRank) but different tpRank.
     auto const tp = getTensorParallelism();
+    auto const cp = getContextParallelism();
     auto const rank = getRank();
     auto const tpRank = getTensorParallelRank();
     std::vector<SizeType32> group;
     group.reserve(tp);
     for (SizeType32 idx = 0; idx < tp; idx++)
     {
-        group.push_back(rank - tpRank + idx);
+        group.push_back(rank - tpRank * cp + idx * cp);
     }
     return group;
 }
 
 std::vector<SizeType32> WorldConfig::getContextParallelGroup() const
 {
+    // Layout: pp is outermost, then tp, then cp is innermost (consecutive).
+    // rank = ppRank * (tp * cp) + tpRank * cp + cpRank
+    // CP group: all ranks with same (ppRank, tpRank) but different cpRank.
     auto const cp = getContextParallelism();
-    auto const tp = getTensorParallelism();
-    auto const pp = getPipelineParallelism();
     auto const rank = getRank();
+    auto const cpRank = getContextParallelRank();
     std::vector<SizeType32> group;
     group.reserve(cp);
     for (SizeType32 idx = 0; idx < cp; idx++)
     {
-        group.push_back(rank + cp % (tp * pp));
+        group.push_back(rank - cpRank + idx);
     }
     return group;
 }

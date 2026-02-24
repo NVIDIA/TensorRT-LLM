@@ -1,0 +1,20 @@
+[project]
+name = "unknown-package"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "TensorRT LLM [90828364+tensorrt-cicd@users.noreply.github.com]"}
+]
+requires-python = ">=3.10,<3.13"
+dependencies = [
+    "transformers (>=4.56.0)",
+    "datasets (==3.1.0)",
+    "evaluate (>=0.4.6,<0.5.0)",
+    "rouge-score (>=0.1.2,<0.2.0)",
+    "sentencepiece (>=0.2.1,<0.3.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"

@@ -93,36 +93,6 @@
             ],
             "trtllm_modules_to_hf_modules": {}
         },
-        "auto_parallel_config": {
-            "world_size": 1,
-            "gpus_per_node": 8,
-            "cluster_key": "A100-PCIe-80GB",
-            "cluster_info": null,
-            "sharding_cost_model": "alpha_beta",
-            "comm_cost_model": "alpha_beta",
-            "enable_pipeline_parallelism": false,
-            "enable_shard_unbalanced_shape": false,
-            "enable_shard_dynamic_shape": false,
-            "enable_reduce_scatter": true,
-            "builder_flags": null,
-            "debug_mode": false,
-            "infer_shape": true,
-            "validation_mode": false,
-            "same_buffer_io": {
-                "past_key_value_(\\d+)": "present_key_value_\\1"
-            },
-            "same_spec_io": {},
-            "sharded_io_allowlist": [
-                "past_key_value_\\d+",
-                "present_key_value_\\d*"
-            ],
-            "fast_reduce": true,
-            "fill_weights": false,
-            "parallel_config_cache": null,
-            "profile_cache": null,
-            "dump_path": null,
-            "debug_outputs": []
-        },
         "weight_sparsity": false,
         "weight_streaming": false,
         "plugin_config": {

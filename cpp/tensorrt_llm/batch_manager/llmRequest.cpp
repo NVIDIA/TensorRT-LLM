@@ -69,8 +69,9 @@ void LlmRequest::createSerializedResult(
 /// Note that there is some dependency on the order of operations in this method. Modify with care!
 std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int32_t mpiWorldRank)
 {
-    TLLM_CHECK(!isDisaggContextCompleteState());
-    if (!(isFinished() || (mIsStreaming && mState == LlmRequestState::kGENERATION_IN_PROGRESS)))
+    auto const streamingInProgress = mIsStreaming
+        && (mState == LlmRequestState::kGENERATION_IN_PROGRESS || mState == LlmRequestState::kGENERATION_TO_COMPLETE);
+    if (!(isFinished() || streamingInProgress))
     {
         return std::nullopt;
     }
@@ -98,13 +99,15 @@ std::optional<executor::Result> LlmRequest::createResult(bool useFastLogits, int
         }
         if (!hasDraftTokens())
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), std::nullopt};
+            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
+                mContextPhaseParams.value().releaseState(), std::nullopt, mContextPhaseParams.value().getCtxDpRank(),
+                mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
         else
         {
-            result.contextPhaseParams = executor::ContextPhaseParams{
-                std::move(firstGenTokens), mRequestId, mContextPhaseParams.value().releaseState(), *getDraftTokens()};
+            result.contextPhaseParams = executor::ContextPhaseParams{std::move(firstGenTokens), mRequestId,
+                mContextPhaseParams.value().releaseState(), *getDraftTokens(),
+                mContextPhaseParams.value().getCtxDpRank(), mContextPhaseParams.value().getDisaggInfoEndpoint()};
         }
     }
 

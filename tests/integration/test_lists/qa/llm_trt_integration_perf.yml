@@ -48,8 +48,6 @@ llm_trt_integration_perf:
   # Dummy lora tests
   - perf/test_perf.py::test_perf[gemma_3_1b_it-bench-pytorch-bfloat16-maxbs:2-maxnt:1024-input_output_len:128,128-loras:1-reqs:8-con:2]
 
-  # Test list validation
-  - test_list_validation.py::test_list_validation
 
 # FP8 specific tests
 - condition:

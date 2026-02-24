@@ -15,7 +15,7 @@
 
 import pytest
 from defs.common import convert_weights, venv_check_call
-from defs.conftest import get_sm_version, skip_post_blackwell
+from defs.conftest import get_sm_version, llm_models_root, skip_post_blackwell
 from defs.trt_test_alternative import check_call
 
 # skip trt flow cases on post-Blackwell-Ultra
@@ -115,6 +115,7 @@ def test_llm_whisper_general(llm_venv, engine_dir, data_type,
         print("Run inference using Python bindings of C++ runtime...")
         run_cmd = [
             f'{whisper_example_root}/../../../run.py',
+            f'--tokenizer_dir={llm_models_root()}/whisper-{tllm_model_name}',
             f'--multimodal_input_file={whisper_example_audio_file}',
             f'--engine_dir={whisper_engine_dir}',
             f'--max_output_len=96',

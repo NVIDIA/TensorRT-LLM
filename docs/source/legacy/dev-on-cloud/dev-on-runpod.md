@@ -1,7 +1,7 @@
 (dev-on-runpod)=
 
-# Develop TensorRT-LLM on Runpod
-[Runpod](https://runpod.io) is a popular cloud platform among many researchers. This doc describes how to develop TensorRT-LLM on Runpod.
+# Develop TensorRT LLM on Runpod
+[Runpod](https://runpod.io) is a popular cloud platform among many researchers. This doc describes how to develop TensorRT LLM on Runpod.
 
 ## Prepare
 
@@ -13,7 +13,7 @@ Please refer to the [Configure SSH Key](https://docs.runpod.io/pods/configuratio
 
 Note that we can skip the step of "Start your Pod. Make sure of the following things" here as we will introduce it below.
 
-## Build the TensorRT-LLM Docker Image and Upload to DockerHub
+## Build the TensorRT LLM Docker Image and Upload to DockerHub
 Please refer to the [Build Image to DockerHub](build-image-to-dockerhub.md).
 
 Note that the docker image must enable ssh access. See on [Enable ssh access to the container](build-image-to-dockerhub.md#enable-ssh-access-to-the-container).

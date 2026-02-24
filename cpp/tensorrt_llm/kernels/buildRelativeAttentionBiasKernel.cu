@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
+#include "buildRelativeAttentionBiasKernel.h"
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime_api.h>
 
-#include "buildRelativeAttentionBiasKernel.h"
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tensorrt_llm
-{
 namespace kernels
 {
 
@@ -99,4 +99,5 @@ template void invokeBuildRelativeAttentionBias<__nv_bfloat16>(__nv_bfloat16* rel
 #endif
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

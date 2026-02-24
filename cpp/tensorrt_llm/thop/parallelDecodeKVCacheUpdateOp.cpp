@@ -23,6 +23,8 @@
 namespace th = torch;
 namespace tksd = tensorrt_llm::kernels::speculative_decoding;
 
+TRTLLM_NAMESPACE_BEGIN
+
 namespace torch_ext
 {
 
@@ -113,5 +115,7 @@ void updateKVCacheDraftTokenLocation(torch::Tensor seqAcceptedDraftTokenOffsetsT
 
 } // namespace torch_ext
 
+TRTLLM_NAMESPACE_END
+
 static auto update_kv_cache_draft_token_location = torch::RegisterOperators(
-    "tensorrt_llm::update_kv_cache_draft_token_location", &torch_ext::updateKVCacheDraftTokenLocation);
+    "tensorrt_llm::update_kv_cache_draft_token_location", &tensorrt_llm::torch_ext::updateKVCacheDraftTokenLocation);

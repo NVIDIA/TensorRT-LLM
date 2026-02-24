@@ -15,6 +15,9 @@ class TestFunctional(unittest.TestCase):
     def setUp(self):
         tensorrt_llm.logger.set_level('error')
 
+    def tearDown(self):
+        torch.cuda.empty_cache()
+
     @parameterized.expand(
         list(
             product([2048], [4], ['context', 'generation'],

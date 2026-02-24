@@ -16,10 +16,11 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -32,6 +33,7 @@ void launchFusedQKNormRope(
     int const num_heads_k,   // Number of key heads
     int const num_heads_v,   // Number of value heads
     int const head_dim,      // Dimension per head
+    int const rotary_dim,    // Dimension for RoPE
     float const eps,         // Epsilon for RMS normalization
     void const* q_weight,    // RMSNorm weights for query [head_dim]
     void const* k_weight,    // RMSNorm weights for key [head_dim]
@@ -42,7 +44,9 @@ void launchFusedQKNormRope(
     float low,    // threshold for high frequency
     float high,   // threshold for low frequency
     float attention_factor, // attention_factor applied on cos and sin
-    cudaStream_t stream);   // CUDA stream
+    cudaStream_t stream,    // CUDA stream
+    bool is_qk_norm);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

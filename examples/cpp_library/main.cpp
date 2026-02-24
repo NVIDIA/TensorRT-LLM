@@ -28,11 +28,11 @@ int main(int argc, char* argv[])
         void log(nvinfer1::ILogger::Severity severity, char const* msg) noexcept override
         {
             if (severity <= nvinfer1::ILogger::Severity::kERROR)
-                std::cerr << "[TensorRT-LLM ERR]: " << msg << std::endl;
+                std::cerr << "[TensorRT LLM ERR]: " << msg << std::endl;
             else if (severity == nvinfer1::ILogger::Severity::kWARNING)
-                std::cerr << "[TensorRT-LLM WARNING]: " << msg << std::endl;
+                std::cerr << "[TensorRT LLM WARNING]: " << msg << std::endl;
             else
-                std::cout << "[TensorRT-LLM LOG]: " << msg << std::endl;
+                std::cout << "[TensorRT LLM LOG]: " << msg << std::endl;
         }
     };
 

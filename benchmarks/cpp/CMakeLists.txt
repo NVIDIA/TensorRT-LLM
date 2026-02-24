@@ -20,8 +20,8 @@ set(TOP_LEVEL_DIR "${PROJECT_SOURCE_DIR}/..")
 add_custom_target(benchmarks)
 
 if(NOT TARGET cxxopts::cxxopts)
-  set(CXXOPTS_SRC_DIR ${PROJECT_SOURCE_DIR}/../3rdparty/cxxopts)
-  add_subdirectory(${CXXOPTS_SRC_DIR} ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
+  add_subdirectory(${CMAKE_BINARY_DIR}/_deps/cxxopts-src
+                   ${CMAKE_CURRENT_BINARY_DIR}/cxxopts)
 endif()
 
 function(add_benchmark test_name test_src)

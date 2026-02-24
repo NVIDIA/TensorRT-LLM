@@ -4,12 +4,12 @@ This document describes how to build and run a custom plugin leveraging [OpenAI 
 The workflow can be summarized as follows.
   1. Implement a kernel using Triton in Python.
   2. Compile that kernel using Triton AoT (Ahead-of-Time) compilation tool to generate C files.
-  3. Implement a custom TensorRT-LLM plugin to execute the compiled kernel.
+  3. Implement a custom TensorRT LLM plugin to execute the compiled kernel.
   4. Build the TensorRT engine.
   5. It is ready to be executed by TensorRT.
 
-In this example, we show how to create a TensorRT-LLM plugin to wrap a [Fused Attention]((fmha_triton.py)) kernel implemented in OpenAI Triton.
-As a prerequisite, it is necessary to have the TensorRT-LLM C++ runtime library.
+In this example, we show how to create a TensorRT LLM plugin to wrap a [Fused Attention]((fmha_triton.py)) kernel implemented in OpenAI Triton.
+As a prerequisite, it is necessary to have the TensorRT LLM C++ runtime library.
 The instructions to build that library can be found [here](../../README.md#build-from-source).
 
 ## 1. Triton AoT Preparation
@@ -71,7 +71,7 @@ If GPU resources are limited, it is recommended to adjust the number of stages o
 
 ## 2. Implement a Custom TensorRT Plugin
 
-This section describes how to implement a custom plugin for TensorRT-LLM to execute the Triton kernel created in the previous section.
+This section describes how to implement a custom plugin for TensorRT LLM to execute the Triton kernel created in the previous section.
 We provide an example of plugin implementation.
   - TritonFlashAttentionPlugin([.cpp](TritonFlashAttentionPlugin.cpp), [.h](TritonFlashAttentionPlugin.h)): TensorRT plugin.
   - [plugin.py](plugin.py): Python wrapper.
@@ -88,15 +88,15 @@ mkdir -p build && cd build
 cmake .. && make
 cd ..
 ```
-As mentioned in the previous section, it is necessary to have the TensorRT-LLM C++ runtime library.
+As mentioned in the previous section, it is necessary to have the TensorRT LLM C++ runtime library.
 If you want to specify the library paths, run:
 ```bash
 cmake -DTRT_LIB_DIR=</path/to/trt_lib> -DTRT_INCLUDE_DIR=</path/to/trt_headers> -DTRT_LLM_LIB_DIR=</path/to/trt_llm_lib> ..
 ```
 If the build is successful, you should be able to find a shared library for the custom plugin at `build/libtrt_llm_custom_plugins.so`.
 
-A Python wrapper of the Fused Multihead Attention (FMHA) operator and the corresponding TensorRT-LLM layer are implemented in [plugin.py](plugin.py).
-It is similar to other TensorRT-LLM operators and layers implemented in [functional.py](../../tensorrt_llm/functional.py) and [layers](../../tensorrt_llm/layers), respectively.
+A Python wrapper of the Fused Multihead Attention (FMHA) operator and the corresponding TensorRT LLM layer are implemented in [plugin.py](plugin.py).
+It is similar to other TensorRT LLM operators and layers implemented in [functional.py](../../tensorrt_llm/functional.py) and [layers](../../tensorrt_llm/layers), respectively.
 That FMHA operator uses the custom plugin that wraps the functions generated from the Triton kernel.
 
 ## 3. Build and Run the TensorRT Engine

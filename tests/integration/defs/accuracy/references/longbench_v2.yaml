@@ -1,0 +1,12 @@
+DeepSeek-R1-0528:
+  - quant_algo: FP8_BLOCK_SCALES
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 52.093
+  - quant_algo: NVFP4
+    kv_cache_quant_algo: FP8
+    spec_dec_algo: MTP
+    accuracy: 52.093
+meta-llama/Llama-3.1-8B-Instruct:
+  - accuracy: 26.00
+    sigma: 25.8

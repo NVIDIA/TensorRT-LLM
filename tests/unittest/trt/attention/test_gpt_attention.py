@@ -883,7 +883,7 @@ class TestFunctional(unittest.TestCase):
                                   embd_pdrop=0,
                                   attn_pdrop=0,
                                   hidden_act='gelu',
-                                  torch_dtype=dtype,
+                                  dtype=dtype,
                                   attn_implementation='eager')
 
         if attention_type in ['gptj_attention', 'llama_attention']:

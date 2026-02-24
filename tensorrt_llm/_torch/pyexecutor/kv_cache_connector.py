@@ -49,6 +49,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 
+from .llm_request import get_draft_token_length
 from .scheduler import ScheduledRequests
 
 if TYPE_CHECKING:
@@ -66,6 +67,11 @@ class RequestData:
     new_block_ids: List[int]
     # The position of the latest token with computed (valid) kv cache values.
     computed_position: int
+    # The number of scheduled tokens for the upcoming forward pass.
+    num_scheduled_tokens: int
+    # The retention priorities for each new block (same length as new_block_ids).
+    # Used for priority-based offload filtering. None means use default priority.
+    priorities: Optional[List[int]] = None
 
 
 # A class to store some basic data regarding all inflight requests.
@@ -94,6 +100,18 @@ class KvCacheConnectorWorker(ABC):
 
     def _clear_connector_meta(self):
         self._metadata = None
+
+    def register_forward_pass_callable(self) -> Callable:
+        """
+        This callable will be called at the end of the forward pass.
+
+        Any CUDA calls which happen in the callable will execute on the
+        same stream as the forward pass.
+
+        This method is typically used by the connector to insert a
+        cuda event into the forward pass cuda stream to obtain a
+        signal of when it's appropriate to start offloading cache blocks.
+        """
 
     @abstractmethod
     def register_kv_caches(self, kv_cache_tensor: torch.Tensor):
@@ -289,12 +307,27 @@ class KvCacheConnectorSchedulerOutputRequest:
         self.block_ids.extend(new_block_ids)
         self.tokens.extend(new_tokens)
 
-        computed_position = len(
-            tokens
-        ) - 1 if req.state != LlmRequestState.CONTEXT_INIT and req.state != LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS else req.context_current_position
+        if req.state in (LlmRequestState.CONTEXT_INIT,
+                         LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS):
+            computed_position = req.context_current_position
+            num_scheduled_tokens = min(req.context_remaining_length,
+                                       req.context_chunk_size)
+        else:
+            computed_position = len(tokens) - 1
+            num_scheduled_tokens = 1 + get_draft_token_length(
+                req)  # Specdec with draft tokens is not supported yet.
+
+        # Get retention priority for each new block only if retention config is provided
+        # (for priority-based offload filtering)
+        priorities = None
+        if req.kv_cache_retention_config is not None:
+            priorities = [
+                kv_cache_manager.get_priority_by_block_id(block_id)
+                for block_id in new_block_ids
+            ]
 
         return RequestData(req.request_id, new_tokens, new_block_ids,
-                           computed_position)
+                           computed_position, num_scheduled_tokens, priorities)
 
 
 class KvCacheConnectorSchedulerOutputManager:
@@ -392,6 +425,10 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def get_num_new_matched_tokens(self, request: LlmRequest,
                                    num_computed_tokens: int) -> int:
+        if request.is_generation_only_request:
+            raise RuntimeError(
+                "Connector API is not supported for generation-only requests!")
+
         num_tokens, load_kv_async = self._run_on_leader(
             lambda: self.scheduler.get_num_new_matched_tokens(
                 request, num_computed_tokens))

@@ -56,7 +56,7 @@ public:
     }
 
     /// @brief If multiple TensorRT optimization profiles are built in the engine, this function selects the
-    /// corresponding profile that is going to be used based on the runtime shape, for now, TensorRT-LLM only split
+    /// corresponding profile that is going to be used based on the runtime shape, for now, TensorRT LLM only split
     /// multiple profiles on the num_tokens dimension, hence the profile index is selected based on which profile
     /// handles the actual num_tokens
     /// @return The index of the selected TensorRT optimization profile

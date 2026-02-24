@@ -17,12 +17,11 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_qwen import (
     Qwen2ForCausalLM, Qwen2ForProcessRewardModel)
 # yapf: enable
-from _torch.helpers import create_mock_engine
+from _torch.helpers import create_mock_cuda_graph_runner
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm._torch.pyexecutor.cuda_graph_runner import CUDAGraphRunner
 
 from utils.llm_data import llm_models_root
 from utils.util import getSMVersion
@@ -265,10 +264,8 @@ class TestQwen(unittest.TestCase):
         ]
         gen_position_ids = torch.cat(gen_position_ids).unsqueeze(0).cuda()
 
-        graph_runner = None
-        if scenario.use_cuda_graph:
-            mock_engine = create_mock_engine(1)
-            graph_runner = CUDAGraphRunner(mock_engine)
+        graph_runner = create_mock_cuda_graph_runner(
+            1) if scenario.use_cuda_graph else None
 
         def run_forward(input_ids, position_ids, attn_metadata):
             attn_metadata.prepare()
@@ -282,14 +279,15 @@ class TestQwen(unittest.TestCase):
                     "position_ids": position_ids,
                     "attn_metadata": attn_metadata,
                 }
-                graph_runner.capture(1, lambda inputs: qwen.forward(**inputs),
+                key = (1, 0, False)
+                graph_runner.capture(key, lambda inputs: qwen.forward(**inputs),
                                      inputs)
 
                 for _ in range(2):
                     # Run it twice. This helps us catch problems if buffers are accidentally reallocated
                     # in prepare().
                     attn_metadata.prepare()
-                    logits = graph_runner.replay(1, inputs)
+                    logits = graph_runner.replay(key, inputs)
                 return logits
 
         if scenario.use_cuda_graph:

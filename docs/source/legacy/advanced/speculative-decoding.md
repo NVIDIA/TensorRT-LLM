@@ -171,6 +171,8 @@ The EAGLE approach enhances the single-model Medusa method by predicting and ver
 
 Similarly to ReDrafter, TensorRT-LLM implements the EAGLE model such that logits prediction, draft tokens acceptance and draft token generation are performed inside of the TensorRT engine(EAGLE-1 and EAGLE-2 are both supported). Please, visit the [EAGLE README](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/eagle/README.md) for information about building and running the model.
 
+> **EAGLE3 note.** If the EAGLE3 draft head config omits `draft_vocab_size`, TensorRT-LLM assumes it matches `vocab_size` and emits a warning. Set `draft_vocab_size` explicitly if the draft head uses a different vocabulary.
+
 ### Disaggregated Serving
 
 [Disaggregated Serving](https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/features/disaggregated-service.md) with EAGLE3 using the two model approach is supported in the Pytorch backend. Please refer to the following [Dynamo example](https://github.com/ai-dynamo/dynamo/blob/main/examples/tensorrt_llm/llama4_plus_eagle.md) on how to run EAGLE3 with Disaggregated Serving for Llama 4 Maverick.

@@ -1,12 +1,12 @@
 # Mixtral
 
-This document shows how to build and run a Mixtral model in TensorRT-LLM on both single GPU, single node multi-GPU and
+This document shows how to build and run a Mixtral model in TensorRT LLM on both single GPU, single node multi-GPU and
 multi-node multi-GPU.  Mixtral 8x22B is also supported and can be replace Mixtral 8x7B below as long as GPU memory is
 sufficient.
 
 ## Overview
 
-The TensorRT-LLM Mixtral implementation is based on the LLaMA model, with Mixture of Experts enabled. The implementation can
+The TensorRT LLM Mixtral implementation is based on the LLaMA model, with Mixture of Experts enabled. The implementation can
 be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
 See the LLaMA example [`examples/models/core/llama`](../llama) for details.
 
@@ -30,8 +30,8 @@ git lfs install
 git clone https://huggingface.co/mistralai/Mixtral-8x22B-v0.1
 ```
 
-We use the LLaMA `convert_checkpoint.py` script to convert and build the model. TensorRT-LLM LLaMA builds TensorRT engine(s) from HF checkpoint provided by `--model_dir`.
-If no checkpoint directory is specified, TensorRT-LLM will build engine(s) with dummy weights.
+We use the LLaMA `convert_checkpoint.py` script to convert and build the model. TensorRT LLM LLaMA builds TensorRT engine(s) from HF checkpoint provided by `--model_dir`.
+If no checkpoint directory is specified, TensorRT LLM will build engine(s) with dummy weights.
 
 `trtllm-build` uses one GPU by default, but if you have already more GPUs available at build time,
 you may enable parallel builds to make the engine building process faster by adding the `--workers` argument.

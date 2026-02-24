@@ -16,6 +16,7 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheIndex.h"
 
 #include <cmath>
@@ -24,7 +25,9 @@
 #include <cuda_runtime.h>
 #include <limits>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 // Internal for K and V cache indexing
@@ -38,7 +41,7 @@ enum class KVIdxType : int32_t
 // only the fields necessary for context FMHA
 struct KVBlockArrayForContextFMHA
 {
-    using DataType = KVCacheIndex const;
+    using DataType = ::tensorrt_llm::kernels::KVCacheIndex const;
 
     // The maximum number of sequences supported by the kv-cache.
     int32_t mMaxSeqs;
@@ -322,4 +325,6 @@ struct KVLinearBuffer
     }
 };
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

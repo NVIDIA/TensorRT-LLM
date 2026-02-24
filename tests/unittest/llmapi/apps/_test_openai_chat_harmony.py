@@ -1,12 +1,18 @@
 import json
+import os
 
 import openai
 import pytest
+from utils.llm_data import llm_datasets_root
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
+os.environ['TIKTOKEN_RS_CACHE_DIR'] = os.path.join(llm_datasets_root(),
+                                                   'tiktoken_vocab')
+os.environ['TIKTOKEN_ENCODINGS_BASE'] = os.path.join(llm_datasets_root(),
+                                                     'tiktoken_vocab')
 
 
 @pytest.fixture(scope="module", ids=["GPT-OSS-20B"])
@@ -114,8 +120,10 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
         model=model,
         messages=messages,
         tools=[tool_get_current_weather],
+        extra_body={"top_k": 1},
     )
     message = response.choices[0].message
+    print(message)
     assert response.choices[0].finish_reason == "tool_calls"
     assert message.content is None
     assert message.reasoning
@@ -137,6 +145,7 @@ async def test_tool_calls(client: openai.AsyncOpenAI, model: str):
     response = await client.chat.completions.create(
         model=model,
         messages=messages,
+        extra_body={"top_k": 1},
     )
     message = response.choices[0].message
     assert message.content
@@ -151,16 +160,31 @@ async def test_streaming(client: openai.AsyncOpenAI, model: str):
             "content": "Explain the theory of relativity in brief."
         }],
         stream=True,
+        extra_body={"top_k": 1},
     )
-    collected_chunks = []
     collected_messages = []
+    first_iteration = True
     async for chunk in response:
-        # Last streaming response will only contains usage info
-        if len(chunk.choices) <= 0:
-            continue
-
-        collected_chunks.append(chunk)
-        collected_messages.append(chunk.choices[0].delta)
+        if chunk.choices:
+            delta = chunk.choices[0].delta
+            if first_iteration:
+                assert delta.role == "assistant", ValueError(
+                    "Expected role 'assistant' for first iteration")
+                collected_messages.append(delta)
+                first_iteration = False
+            else:
+                assert delta.role is None, ValueError(
+                    "Expected no role except for first iteration")
+                collected_messages.append(delta)
+        else:
+            assert hasattr(chunk, "usage"), ValueError(
+                "Expected usage info in last streaming response")
+            assert chunk.usage.prompt_tokens is not None
+            assert chunk.usage.completion_tokens is not None
+            assert chunk.usage.total_tokens is not None
+            assert chunk.usage.prompt_tokens > 0
+            assert chunk.usage.completion_tokens > 0
+            assert chunk.usage.total_tokens > 0
 
     full_response = "".join([
         m.content for m in collected_messages
@@ -205,6 +229,7 @@ async def test_streaming_tool_call(client: openai.AsyncOpenAI, model: str):
         messages=messages,
         tools=[tool_get_current_weather],
         stream=True,
+        extra_body={"top_k": 1},
     )
     tool_name: str
     reasoning_chunks: list[str] = []

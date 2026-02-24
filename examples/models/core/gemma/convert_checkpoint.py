@@ -172,8 +172,9 @@ def compute_quant_algo(args: argparse.Namespace) -> Optional[QuantAlgo]:
 def create_quant_config(args: argparse.Namespace) -> QuantConfig:
     quant_algo = compute_quant_algo(args)
     GemmaForCausalLM.assert_valid_quant_algo(quant_algo)
-    quant_config = QuantConfig(quant_algo=quant_algo,
-                               smoothquant_val=args.smoothquant)
+    quant_config = QuantConfig(quant_algo=quant_algo)
+    if args.smoothquant is not None:
+        quant_config.smoothquant_val = args.smoothquant
 
     if args.fp8_kv_cache:
         quant_config.kv_cache_quant_algo = QuantAlgo.FP8
@@ -260,7 +261,7 @@ def main() -> None:
             trt_llm_config.query_pre_attn_scalar = ckpt_config.query_pre_attn_scalar
 
     trt_llm_config_dict = trt_llm_config.to_dict()
-    print(f"Determined TensorRT-LLM configuration {trt_llm_config_dict}")
+    print(f"Determined TensorRT LLM configuration {trt_llm_config_dict}")
 
     save_config(trt_llm_config, output_dir=args.output_model_dir, log=True)
 

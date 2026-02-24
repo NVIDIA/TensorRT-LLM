@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -47,6 +47,8 @@ class BaseKVCacheManager;
 namespace tensorrt_llm::executor
 {
 
+using SizeType32 = tensorrt_llm::runtime::SizeType32;
+
 /// @brief Version of TRT-LLM
 char const* version() noexcept;
 
@@ -71,6 +73,7 @@ public:
         std::optional<FloatType> const& repetitionPenalty = std::nullopt,
         std::optional<FloatType> const& presencePenalty = std::nullopt,
         std::optional<FloatType> const& frequencyPenalty = std::nullopt,
+        std::optional<SizeType32> const& promptIgnoreLength = std::nullopt,
         std::optional<FloatType> const& lengthPenalty = std::nullopt,
         std::optional<SizeType32> const& earlyStopping = std::nullopt,
         std::optional<SizeType32> const& noRepeatNgramSize = std::nullopt,
@@ -94,6 +97,7 @@ public:
     [[nodiscard]] std::optional<FloatType> getRepetitionPenalty() const;
     [[nodiscard]] std::optional<FloatType> getPresencePenalty() const;
     [[nodiscard]] std::optional<FloatType> getFrequencyPenalty() const;
+    [[nodiscard]] std::optional<SizeType32> getPromptIgnoreLength() const;
     [[nodiscard]] std::optional<FloatType> getLengthPenalty() const;
     [[nodiscard]] std::optional<SizeType32> getEarlyStopping() const;
     [[nodiscard]] std::optional<SizeType32> getNoRepeatNgramSize() const;
@@ -114,6 +118,7 @@ public:
     void setRepetitionPenalty(std::optional<FloatType> const& repetitionPenalty);
     void setPresencePenalty(std::optional<FloatType> const& presencePenalty);
     void setFrequencyPenalty(std::optional<FloatType> const& frequencyPenalty);
+    void setPromptIgnoreLength(std::optional<SizeType32> const& promptIgnoreLength);
     void setLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     void setEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     void setNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -133,6 +138,8 @@ private:
     static std::optional<FloatType> const& checkBeamSearchDiversityRate(
         std::optional<FloatType> const& beamSearchDiversityRate);
     static std::optional<FloatType> const& checkRepetitionPenalty(std::optional<FloatType> const& repetitionpenalty);
+    static std::optional<SizeType32> const& checkPromptIgnoreLength(
+        std::optional<SizeType32> const& promptIgnoreLength);
     static std::optional<FloatType> const& checkLengthPenalty(std::optional<FloatType> const& lengthPenalty);
     static std::optional<SizeType32> const& checkEarlyStopping(std::optional<SizeType32> const& earlyStopping);
     static std::optional<SizeType32> const& checkNoRepeatNgramSize(std::optional<SizeType32> const& noRepeatNgramSize);
@@ -174,6 +181,9 @@ private:
     /// @brief Used to penalize tokens already present in the sequence (dependent on the number of appearances). It can
     /// have any values. Values < 0.f encourage repetition, values > 0.f discourage it. Default is 0.f
     std::optional<FloatType> mFrequencyPenalty;
+    /// @brief Controls how many tokens to ignore from the prompt for presence and frequency penalties. Values <= 0 have
+    /// no effect. Values > input (prompt) length will be clamped. Default is 0.
+    std::optional<SizeType32> mPromptIgnoreLength;
     /// @brief Controls how to penalize longer sequences in beam search. Default is 0.f
     std::optional<FloatType> mLengthPenalty;
     /// @brief Controls whether the generation process finishes once beamWidth sentences are generated (ends with
@@ -287,11 +297,13 @@ class MultimodalInput
 {
 public:
     explicit MultimodalInput(std::vector<std::vector<SizeType32>> multimodalHashes,
-        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths);
+        std::vector<SizeType32> multimodalPositions, std::vector<SizeType32> multimodalLengths,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt);
 
     [[nodiscard]] std::vector<std::vector<SizeType32>> getMultimodalHashes() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalPositions() const;
     [[nodiscard]] std::vector<SizeType32> getMultimodalLengths() const;
+    [[nodiscard]] std::optional<std::vector<std::optional<std::string>>> const& getMultimodalUuids() const;
 
 private:
     friend class Serialization;
@@ -301,6 +313,9 @@ private:
     std::vector<SizeType32> mMultimodalPositions;
     /// @brief The multimodal lengths
     std::vector<SizeType32> mMultimodalLengths;
+    /// @brief Optional user-provided UUIDs for multimodal items.
+    /// When provided, these are returned in KV cache events instead of content hashes.
+    std::optional<std::vector<std::optional<std::string>>> mMultimodalUuids;
 };
 
 /// @brief Configuration for mrope
@@ -428,11 +443,15 @@ class ContextPhaseParams
 public:
     using RequestIdType = std::uint64_t;
 
-    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens);
-    ContextPhaseParams(
-        VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::optional<VecTokens> draftTokens,
+        std::optional<SizeType32> ctxDpRank = std::nullopt,
+        std::optional<std::string> disaggInfoEndpoint = std::nullopt);
+    ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, void* state, std::optional<VecTokens> draftTokens,
+        std::optional<SizeType32> ctxDpRank = std::nullopt,
+        std::optional<std::string> disaggInfoEndpoint = std::nullopt);
     ContextPhaseParams(VecTokens firstGenTokens, RequestIdType reqId, std::vector<char> const& serializedState,
-        std::optional<VecTokens> draftTokens);
+        std::optional<VecTokens> draftTokens, std::optional<SizeType32> ctxDpRank = std::nullopt,
+        std::optional<std::string> disaggInfoEndpoint = std::nullopt);
 
     ContextPhaseParams(ContextPhaseParams const&);
     ContextPhaseParams(ContextPhaseParams&&) noexcept;
@@ -443,14 +462,21 @@ public:
     [[nodiscard]] bool operator==(ContextPhaseParams const&) const noexcept;
 
     [[nodiscard]] VecTokens const& getFirstGenTokens() const& noexcept;
+    void setFirstGenTokens(VecTokens const& firstGenTokens) noexcept;
     [[nodiscard]] std::optional<VecTokens> const& getDraftTokens() const& noexcept;
+    void setDraftTokens(std::optional<VecTokens> const& draftTokens) noexcept;
     [[nodiscard]] VecTokens popFirstGenTokens() && noexcept;
     [[nodiscard]] RequestIdType getReqId() const noexcept;
-
+    void setReqId(RequestIdType const& reqId) noexcept;
     [[nodiscard]] void const* getState() const noexcept;
     [[nodiscard]] void* getState() noexcept;
     [[nodiscard]] void* releaseState() noexcept;
     [[nodiscard]] std::vector<char> getSerializedState() const noexcept;
+
+    [[nodiscard]] std::optional<SizeType32> getCtxDpRank() const noexcept;
+    void setCtxDpRank(std::optional<SizeType32> const& ctxDpRank) noexcept;
+    [[nodiscard]] std::optional<std::string> const& getDisaggInfoEndpoint() const noexcept;
+    void setDisaggInfoEndpoint(std::optional<std::string> const& disaggInfoEndpoint) noexcept;
 
 private:
     friend class Serialization;
@@ -468,6 +494,12 @@ private:
 
     /// @brief The draft tokens generated by context executor
     std::optional<VecTokens> mDraftTokens;
+
+    /// @brief The context phase data parallel rank
+    std::optional<SizeType32> mCtxDpRank;
+
+    /// @brief The disaggregated info endpoint
+    std::optional<std::string> mDisaggInfoEndpoint;
 };
 
 /// @brief Configuration for speculative decoding (both draft and target models)
@@ -670,6 +702,7 @@ public:
     /// finish reason. The request may exceed this time slightly, but at most by 1 forward pass (in pipeline parallelism
     /// that may involve multiple micro-batches). A request can be timed-out before ever being scheduled.
     /// @param cacheSaltID Salt ID for KV cache blocks to limit the kv cache reuse to the requests with the same string.
+    /// @param disaggRequestId Disaggregated request ID.
     Request(VecTokens inputTokenIds, SizeType32 maxTokens, bool streaming = false,
         SamplingConfig const& samplingConfig = SamplingConfig(), OutputConfig const& outputConfig = OutputConfig(),
         std::optional<SizeType32> const& endId = std::nullopt, std::optional<SizeType32> const& padId = std::nullopt,
@@ -697,7 +730,8 @@ public:
         std::optional<GuidedDecodingParams> guidedDecodingParams = std::nullopt,
         std::optional<SizeType32> languageAdapterUid = std::nullopt,
         std::optional<MillisecondsType> allottedTimeMs = std::nullopt,
-        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt);
+        std::optional<CacheSaltIDType> cacheSaltID = std::nullopt,
+        std::optional<IdType> disaggRequestId = std::nullopt);
 
     /// @brief This logits postprocessor name will dispatch to the batched logits postprocessor
     static auto constexpr kBatchedPostProcessorName = "batched";
@@ -747,6 +781,7 @@ public:
     [[nodiscard]] std::optional<MillisecondsType> getAllottedTimeMs() const;
     [[nodiscard]] std::optional<CacheSaltIDType> getCacheSaltID() const;
     [[nodiscard]] std::optional<std::vector<std::string>> getAdditionalOutputNames() const;
+    [[nodiscard]] std::optional<IdType> getDisaggRequestId() const;
 
     void setStreaming(bool streaming);
     void setSamplingConfig(SamplingConfig const& config);
@@ -782,6 +817,7 @@ public:
     void setLanguageAdapterUid(SizeType32 languageAdapterUid);
     void setAllottedTimeMs(MillisecondsType allottedTimeMs);
     void setCacheSaltID(CacheSaltIDType cacheSaltID);
+    void setDisaggRequestId(IdType disaggRequestId);
 
 private:
     friend class Serialization;
@@ -1454,17 +1490,23 @@ public:
         DEFAULT = 0,
         MPI = 1,
         UCX = 2,
-        NIXL = 3
+        NIXL = 3,
+        MOONCAKE = 4
     };
-    explicit CacheTransceiverConfig(
-        std::optional<BackendType> backendType = std::nullopt, std::optional<size_t> maxNumTokens = std::nullopt);
+    explicit CacheTransceiverConfig(std::optional<BackendType> backendType = std::nullopt,
+        std::optional<size_t> maxNumTokens = std::nullopt, std::optional<int> kvTransferTimeoutMs = std::nullopt,
+        std::optional<int> kvTransferSenderFutureTimeoutMs = std::nullopt);
 
     bool operator==(CacheTransceiverConfig const& other) const;
     void setBackendType(std::optional<BackendType> backendType);
     void setMaxTokensInBuffer(std::optional<size_t> maxTokensInBuffer);
+    void setKvTransferTimeoutMs(std::optional<int> kvTransferTimeoutMs);
+    void setKvTransferSenderFutureTimeoutMs(std::optional<int> kvTransferSenderFutureTimeoutMs);
 
     [[nodiscard]] std::optional<size_t> getMaxTokensInBuffer() const;
     [[nodiscard]] std::optional<BackendType> getBackendType() const;
+    [[nodiscard]] std::optional<int> getKvTransferTimeoutMs() const;
+    [[nodiscard]] std::optional<int> getKvTransferSenderFutureTimeoutMs() const;
 
 private:
     std::optional<BackendType> mBackendType;
@@ -1472,13 +1514,18 @@ private:
     /// kvCache tokens to be transferred for a single request is greater than this value, the performance of the cache
     /// transfer may be degraded.
     std::optional<size_t> mMaxTokensInBuffer;
+    std::optional<int> mKvTransferTimeoutMs;
+    // @brief Timeout in milliseconds to wait for the sender future to be ready when scheduled batch size is 0. This
+    // allows the request to be eventually cancelled by the user or because of kv_transfer_timeout_ms
+    std::optional<int> mKvTransferSenderFutureTimeoutMs;
 };
 
 /// @brief Configuration class for the model executor
 class ExecutorConfig
 {
 public:
-    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds = 180000000;
+    static constexpr uint64_t kDefaultMaxSeqIdleMicroseconds
+        = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::minutes(3)).count();
 
     static constexpr SizeType32 kDefaultIterStatsMaxIterations = 1000;
 
@@ -1673,12 +1720,14 @@ struct KVCacheStoredBlockData
 {
 
     KVCacheStoredBlockData(IdType blockHash, tensorrt_llm::runtime::VecUniqueTokens tokens,
-        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority)
+        std::optional<tensorrt_llm::runtime::LoraTaskIdType> loraId, SizeType32 cacheLevel, SizeType32 priority,
+        std::vector<MmKey> mmKeys = {})
         : blockHash{blockHash}
         , tokens{std::move(tokens)}
         , loraId{loraId}
         , cacheLevel{cacheLevel}
         , priority{priority}
+        , mmKeys{std::move(mmKeys)}
     {
     }
 
@@ -1692,6 +1741,8 @@ struct KVCacheStoredBlockData
     SizeType32 cacheLevel;
     /// @brief The priority of the block
     SizeType32 priority;
+    /// @brief The multimodal keys of the block
+    std::vector<MmKey> mmKeys;
 };
 
 struct KVCacheStoredData

@@ -1,13 +1,18 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: NVIDIA TensorRT Source Code License Agreement
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
  *
- * NVIDIA CORPORATION, its affiliates and licensors retain all intellectual
- * property and proprietary rights in and to this material, related
- * documentation and any modifications thereto. Any use, reproduction,
- * disclosure or distribution of this material and related documentation
- * without an express license agreement from NVIDIA CORPORATION or
- * its affiliates is strictly prohibited.
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
  */
 
 #include "tensorrt_llm/batch_manager/kvCacheUtils.h"
@@ -52,7 +57,7 @@ TEST_F(BlockIteratorTest, BasicTest)
         auto blockTensor = tr::ITensor::slice(pool, blockIds.at(idx), 1);
         std::fill_n(tr::bufferCast<DataType>(*blockTensor), blockTensor->getSize(), idx);
     }
-    auto range = BlockRange(pool, blockIds);
+    auto range = BlockRangeForWindow(nullptr, 0, std::move(blockIds), std::move(pool));
     auto begin = range.begin();
     auto end = range.end();
     auto allEqualTo = [](tr::ITensor const& tensor, auto x) -> bool
@@ -124,7 +129,9 @@ TEST_F(BlockIteratorTest, CacheManagerTest)
 
     auto const pool = blockManager.getPrimaryPool(0);
     TLLM_CHECK(pool);
-    auto range = BlockRange(pool, blockIds);
+    auto blockIdsVec = std::vector<SizeType32>(blockIds.begin(), blockIds.end());
+    auto poolCopy = pool;
+    auto range = BlockRangeForWindow(nullptr, maxAttentionWindow, std::move(blockIdsVec), std::move(poolCopy));
     size_t cnt{0};
     for (auto iter = range.begin(); iter != range.end(); ++iter, ++cnt)
     {

@@ -1,0 +1,14 @@
+max_batch_size: 64
+max_num_tokens: 16384
+kv_cache_free_gpu_memory_fraction: 0.9
+tensor_parallel_size: 8
+moe_expert_parallel_size: 1
+trust_remote_code: true
+enable_attention_dp: false
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 64
+moe_config:
+  backend: TRTLLM
+stream_interval: 20
+num_postprocess_workers: 4

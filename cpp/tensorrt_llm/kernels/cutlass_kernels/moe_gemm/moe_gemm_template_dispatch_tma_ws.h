@@ -51,6 +51,7 @@
 #endif
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_heuristic.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_type_conversion.h"
@@ -65,7 +66,9 @@
 #include <mutex>
 #include <sstream>
 
-namespace tensorrt_llm::kernels::cutlass_kernels_oss
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::cutlass_kernels_oss
 {
 using tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput;
 using EpilogueFusion = TmaWarpSpecializedGroupedGemmInput::EpilogueFusion;
@@ -79,7 +82,9 @@ auto getDispatchFunctionForSM100(
     {
         auto select_dynamic_cga = [epilogue_schedule](auto dynamic_cga_t)
         {
-            if constexpr (!std::is_same_v<T, __nv_fp4_e2m1> && !std::is_same_v<WeightType, __nv_fp4_e2m1>
+            constexpr bool is_block_scaled
+                = std::is_same_v<T, __nv_fp4_e2m1> || std::is_same_v<WeightType, __nv_fp4_e2m1>;
+            if constexpr ((!is_block_scaled || Arch::kMinComputeCapability == 103)
                 && FUSION != EpilogueFusion::FINALIZE)
             {
                 auto func_map = std::array{
@@ -98,6 +103,8 @@ auto getDispatchFunctionForSM100(
             }
             else
             {
+                static_assert(FUSION == EpilogueFusion::FINALIZE || Arch::kMinComputeCapability != 103,
+                    "SM103 should support both epilogue schedules");
                 TLLM_CHECK_WITH_INFO(epilogue_schedule == cutlass_extensions::EpilogueScheduleType::TMA,
                     "No Smem epilogue schedule is not supported for block scaled types or finalize fusion");
                 return &kernels::cutlass_kernels_oss::tma_warp_specialized_generic_moe_gemm_kernelLauncher<Arch, T,
@@ -138,22 +145,12 @@ void dispatchMoeGemmFinalDispatchTmaWarpSpecialized(TmaWarpSpecializedGroupedGem
         TLLM_THROW("Please recompile with support for hopper by passing 90-real as an arch to build_wheel.py.");
     }
 #endif
-    // #ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
+#ifndef COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability == 103)
     {
-        static std::once_flag flag;
-        std::call_once(flag,
-            []()
-            {
-                TLLM_LOG_WARNING(
-                "Falling back to sm100f version due to a bug in cutlass." /*"For best performance please recompile with support for blackwell by "
-                "passing 103-real as an arch to build_wheel.py."*/);
-            });
-        return dispatchMoeGemmFinalDispatchTmaWarpSpecialized<cutlass::arch::Sm100, T, WeightType, OutputType,
-            EpilogueTag, FUSION, TileShape, ClusterShape>(
-            hopper_input, num_experts, gemm_config, multi_processor_count, stream, occupancy, workspace_size);
+        TLLM_THROW("Please recompile with support for blackwell by passing 103-real as an arch to build_wheel.py.");
     }
-// #endif
+#endif
 #ifndef COMPILE_BLACKWELL_TMA_GROUPED_GEMMS
     else if constexpr (Arch::kMinComputeCapability >= 100 && Arch::kMinComputeCapability < 120)
     {
@@ -388,7 +385,7 @@ void dispatchMoeGemmSelectClusterShapeTmaWarpSpecialized(TmaWarpSpecializedGroup
 #undef SHAPE_CASE
     default: TLLM_THROW("Unsupported cluster shape config %d for MoE gemm.", (int) gemm_config.cluster_shape);
     }
-} // namespace tensorrt_llm
+}
 
 template <typename T, typename WeightType, typename OutputType, typename EpilogueTag, EpilogueFusion FUSION>
 void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedGemmInput hopper_input, int num_experts,
@@ -438,7 +435,7 @@ void dispatchMoeGemmSelectTileShapeTmaWarpSpecialized(TmaWarpSpecializedGroupedG
             TLLM_THROW("Unsupported SM90 configuration requested");
         }
     }
-#ifdef ENABLE_FP4
+#if defined(ENABLE_FP4) && defined(COMPILE_BLACKWELL_SM103_TMA_GROUPED_GEMMS)
     // Check this before SM100 because we fall back to SM100 if not NVFP4
     else if (gemm_config.sm_version == 103
         && std::is_same_v<T, __nv_fp4_e2m1> && std::is_same_v<WeightType, __nv_fp4_e2m1>)
@@ -517,4 +514,6 @@ size_t calcMaxWorkspaceSizeTmaWarpSpecialized(int num_experts, cutlass_extension
     return count;
 }
 
-} // namespace tensorrt_llm::kernels::cutlass_kernels_oss
+} // namespace kernels::cutlass_kernels_oss
+
+TRTLLM_NAMESPACE_END

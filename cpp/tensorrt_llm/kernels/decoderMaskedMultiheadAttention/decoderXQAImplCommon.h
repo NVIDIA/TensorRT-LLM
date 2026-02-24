@@ -18,10 +18,12 @@
 #pragma once
 #include "decoderXQAConstants.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaDriverWrapper.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/workspace.h"
+#include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/decoderXQAImplJIT/kernelUtils.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/multiHeadAttentionCommon.h"
 #include "xqaParams.h"
@@ -29,8 +31,8 @@
 #include <cstdint>
 #include <utility>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -79,9 +81,10 @@ struct XQAKernelRuntimeHashKey
     }
 };
 
-uint32_t getKernelMTileSize(uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit);
+uint32_t getKernelMTileSize(
+    uint32_t headGrpSize, bool isSpecDec, uint32_t qSeqLen, bool isXqaJit, bool supportQGMMA, bool supportMLA);
 
-XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit);
+XQAKernelRuntimeHashKey getRuntimeHashKeyFromXQAParams(XQAParams const& xqaParams, bool isXqaJit, int SM);
 
 struct XQAKernelRuntimeHasher
 {
@@ -231,6 +234,8 @@ struct XQALaunchParam
     float* bmm2_scale_ptr = nullptr;
     int32_t* semaphores = nullptr;
     void* scratch = nullptr;
+    void* sparse_kv_block_offsets = nullptr;
+    int32_t* sparse_seq_lengths = nullptr;
 };
 
 // Setup launch params and ioScratch. ioScratch is for RoPE and output type conversion.
@@ -264,6 +269,9 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     const size_t cu_kv_seqlens_size = sizeof(int) * (batch_beam_size + 1);
     const size_t rotary_inv_freq_size = sizeof(float) * batch_beam_size * params.rotary_embedding_dim / 2;
     const size_t tokens_info_size = sizeof(int2) * params.total_num_input_tokens;
+    const size_t kv_block_offsets_size
+        = sizeof(int) * batch_beam_size * 2 * params.max_blocks_per_sequence * params.num_kv_heads;
+    const size_t seq_lengths_size = sizeof(int) * batch_beam_size * params.num_kv_heads;
     launchParams.cu_seq_lens = reinterpret_cast<int*>(workspace);
     workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, cu_seqlens_size);
     launchParams.cu_kv_seq_lens = reinterpret_cast<int*>(workspace);
@@ -279,6 +287,14 @@ void buildXQALaunchParams(XQALaunchParam<KVCacheBuffer>& launchParams, void*& in
     workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm1_scale_size);
     launchParams.bmm2_scale_ptr = reinterpret_cast<float*>(workspace);
     workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, bmm2_scale_size);
+    // Used for block sparse attention
+    if (params.use_sparse_attention)
+    {
+        launchParams.sparse_kv_block_offsets = reinterpret_cast<void*>(workspace);
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, kv_block_offsets_size);
+        launchParams.sparse_seq_lengths = reinterpret_cast<int*>(workspace);
+        workspace = tensorrt_llm::common::nextWorkspacePtrWithAlignment(workspace, seq_lengths_size);
+    }
     inputScratch = workspace;
     if (hasOutputScratch)
     {
@@ -467,4 +483,5 @@ inline int computeMultiBlockCountSpecDecGMMA(
 }
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

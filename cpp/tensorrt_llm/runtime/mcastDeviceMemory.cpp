@@ -38,7 +38,7 @@ inline size_t roundUp(size_t val, size_t gran)
 } // namespace
 
 McastDeviceMemory::McastDeviceMemory(
-    size_t bufSize, uint32_t groupSize, uint32_t groupRank, uint32_t splitColor, int deviceIdx, bool mnNvlink)
+    size_t bufSize, uint32_t groupSize, uint32_t groupRank, int deviceIdx, bool mnNvlink, int64_t mpiCommFortranHandle)
     : mIsMNNvlink(mnNvlink)
     , mDeviceIdx(deviceIdx)
     , mGroupSize(groupSize)
@@ -48,7 +48,11 @@ McastDeviceMemory::McastDeviceMemory(
     , mAllocationSize(0)
     , mMcPtr(0)
     , mMcHandle(0)
-    , mGroupComm(tensorrt_llm::mpi::MpiComm::session().split(splitColor, mGroupRank))
+#if ENABLE_MULTI_DEVICE
+    , mGroupComm(MPI_Comm_f2c(mpiCommFortranHandle), false)
+#else
+    , mGroupComm(nullptr, false)
+#endif
 {
 
     TLLM_CUDA_CHECK(cudaSetDevice(mDeviceIdx));
@@ -66,9 +70,9 @@ McastDeviceMemory::McastDeviceMemory(
     int const world_rank{tensorrt_llm::mpi::MpiComm::session().getRank()};
 
     TLLM_LOG_DEBUG(
-        "[McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, GroupSplitColor: %u, isMultiNode: %d, "
+        "[McastDeviceMemory] World Rank: %u, Group Rank: %u, Group size: %u, isMultiNode: %d, "
         "device_idx: %d, Signal pad offset: %zu",
-        world_rank, mGroupRank, mGroupSize, splitColor, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
+        world_rank, mGroupRank, mGroupSize, mIsMNNvlink, mDeviceIdx, mSignalPadOffset);
 
     if (mIsMNNvlink)
     {

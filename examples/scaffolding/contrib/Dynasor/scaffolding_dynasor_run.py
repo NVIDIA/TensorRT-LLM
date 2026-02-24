@@ -65,15 +65,14 @@ def main():
     if args.streaming:
 
         async def task(prompt: str):
-            i = 0
+            step = 0
             async for result in llm.generate_async(prompt):
-                i += 1
-                print(">>>", i, result)
-                async for output in result.cur_output:
-                    print(">>>", i, len(output.outputs[0].token_ids), "\n",
-                          output.outputs[0].text)
-            print(f">>> final output {len(result.outputs[0].token_ids)}\n",
-                  result.outputs[0].text)
+                step += 1
+                tokens_num = len(
+                    result.outputs[0].token_ids
+                ) if result.outputs[0].token_ids is not None else 0
+                print(">>>", step, tokens_num, "\n", result.outputs[0].text)
+            print(f">>> final output {tokens_num}\n", result.outputs[0].text)
 
         # Need to provide LLM's event loop to get results in the middle of the whole process.
         asyncio.run_coroutine_threadsafe(task(prompts[0]), llm.loop).result()

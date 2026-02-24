@@ -1,0 +1,124 @@
+metadata:
+  model_name: deepseek-r1-fp4
+  precision: fp4
+  model_dir_name: DeepSeek-R1-0528-FP4-v2
+  supported_gpus:
+  - GB200
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 1k1k
+  dataset_file: disagg_datasets/deepseek-r1-1024-1024-100000-ratio-1_for_serve.json
+  accuracy:
+    datasets:
+    - dataset_name: gsm8k
+      expected_value: 0.9454
+      threshold_type: hypothesis_test
+      filter_type: flexible-extract
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 03:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: gen_only
+  use_nv_sa_benchmark: false
+  multi_round: 8
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: '2048'
+  input_length: 1024
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 2
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: true
+  env_var:
+    HF_HOME: <hf_home_path>
+  tasks:
+    gsm8k:
+      model: "local-completions"
+      model_args_extra: "num_concurrent=512,max_retries=3,tokenized_requests=false,timeout=7200,max_gen_toks=16384"
+      extra_kwargs:
+        trust_remote_code: true
+worker_config:
+  gen:
+    enable_layerwise_nvtx_marker: true
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
+    pipeline_parallel_size: 1
+    max_batch_size: 128
+    max_num_tokens: 512
+    max_seq_len: 2251
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 768
+      - 1024
+      - 2048
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.9
+      dtype: fp8
+    moe_config:
+      backend: WIDEEP
+      load_balancer:
+        num_slots: 288
+        layer_updates_per_iter: 1
+    cache_transceiver_config:
+      max_tokens_in_buffer: 4608
+      backend: NIXL
+    stream_interval: 20
+    num_postprocess_workers: 4
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3
+  ctx:
+    enable_layerwise_nvtx_marker: true
+    max_batch_size: 4
+    max_num_tokens: 4608
+    max_seq_len: 2251
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.85
+      dtype: fp8
+    cache_transceiver_config:
+      max_tokens_in_buffer: 4608
+      backend: NIXL
+    speculative_config:
+      decoding_type: MTP
+      num_nextn_predict_layers: 3

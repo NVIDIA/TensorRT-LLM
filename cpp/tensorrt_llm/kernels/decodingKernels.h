@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/beamSearchKernels.h"
 #include "tensorrt_llm/runtime/common.h"
 #include "tensorrt_llm/runtime/decodingInput.h"
@@ -25,8 +26,7 @@
 #include <cuda_runtime.h>
 #include <curand_kernel.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
@@ -117,7 +117,9 @@ void invokeTransposeLogProbs(float* output_log_probs, float* output_log_probs_ti
 
 } // namespace kernels
 
-namespace runtime::kernels
+TRTLLM_NAMESPACE_END
+
+namespace tensorrt_llm::runtime::kernels
 {
 //! \brief Inserts the running beams into the finished beams stored in the CBA buffers. (beams where the most likely
 //! continuation is the end token get stored separately, and another candidate next token is stored). Then sorts the
@@ -132,6 +134,4 @@ namespace runtime::kernels
 
 void gatherTree(DecodingOutput const& decodingOutput, DecodingInput const& decodingInput,
     SamplingConfig const& samplingConfig, runtime::CudaStream const& cudaStream);
-} // namespace runtime::kernels
-
-} // namespace tensorrt_llm
+} // namespace tensorrt_llm::runtime::kernels

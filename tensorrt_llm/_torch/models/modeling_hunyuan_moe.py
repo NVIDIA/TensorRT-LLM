@@ -6,6 +6,8 @@ from tqdm import tqdm
 from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.distributed import AllReduceParams
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+    ConsumableWeightsDict
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -15,8 +17,9 @@ from ..model_config import ModelConfig
 from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
-from ..modules.fused_moe import (CutlassFusedMoE, RenormalizeMoeRoutingMethod,
-                                 VanillaMoE, create_moe)
+from ..modules.fused_moe import (CutlassFusedMoE, MoE,
+                                 RenormalizeMoeRoutingMethod, VanillaMoE,
+                                 create_moe)
 from ..modules.gated_mlp import GatedMLP
 from ..modules.linear import Linear, TensorParallelMode
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
@@ -174,7 +177,6 @@ class HunYuanAttention(Attention):
         attn_metadata: AttentionMetadata,
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
-        mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
@@ -185,7 +187,6 @@ class HunYuanAttention(Attention):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             attention_mask=attention_mask,
-            mrope_config=mrope_config,
             all_reduce_params=all_reduce_params,
             lora_params=lora_params,
             **kwargs,
@@ -342,7 +343,7 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
         self._execution_stats = None
         print("---debug model_config: ", model_config)
 
-    def load_weights(self, weights: Dict):
+    def load_weights(self, weights: ConsumableWeightsDict):
         tp_size = self.model_config.mapping.tp_size
         head_dim = self.config.hidden_size // self.config.num_attention_heads
 
@@ -358,6 +359,10 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
             'qkv_proj': ['q_proj', 'k_proj', 'v_proj'],
             'gate_up_proj': ['gate_proj', 'up_proj']
         }
+
+        # Check if weights supports mark_consumed (ConsumableWeightsDict)
+        can_mark_consumed = hasattr(weights, 'mark_consumed')
+
         for name, module in tqdm(list(self.named_modules()),
                                  desc="Loading weights"):
             if len(module._parameters) > 0:
@@ -366,6 +371,17 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                         "lm_head"):
                     continue
                 names = name.split('.')
+
+                # Special case: ConfigurableMoE.backend (TRTLLMGenFusedMoE)
+                # Currently saved MoE weights don't include 'backend' in their names.
+                # After MoE refactoring, ConfigurableMoE now has a backend submodule,
+                # and weights loading is done in the backend, so module name includes '.backend'.
+                # We need to use parent module name (without .backend) to match saved weight names.
+                # After MoE refactoring is fully complete, all paths will follow this branch.
+                if names[-1] == "backend" and isinstance(module, MoE):
+                    name = '.'.join(names[:-1])
+                    names = name.split('.')
+
                 if names[-1] in params_map:
                     # model.layers.{idx}.mlp.shared_mlp.gate_up_proj or model.layers.{idx}.self_attn.qkv_proj
                     module_weights = []
@@ -384,7 +400,13 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                             }
                         module_weights.append(fw)
                     module.load_weights(weights=module_weights)
+                    # Mark consumed source weights (e.g., q_proj, k_proj, v_proj)
+                    if can_mark_consumed:
+                        for src_name in params_map[names[-1]]:
+                            weights.mark_consumed('.'.join(names[:-1] +
+                                                           [src_name]))
                 else:
+                    original_name = name
                     name = name.replace('gate', 'gate.wg')
                     module_weights = filter_weights(name, weights)
                     if isinstance(module, CutlassFusedMoE) or isinstance(
@@ -408,6 +430,9 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                         for n, p in module._parameters.items():
                             if p is not None:
                                 p.data.copy_(module_weights[n][:])
+                    # Mark consumed weights
+                    if can_mark_consumed:
+                        weights.mark_consumed(original_name)
 
     def forward(
         self,

@@ -6,13 +6,14 @@ backend: "pytorch"
 cuda_graph_config: null
 disable_overlap_scheduler: True
 context_servers:
-  num_instances: 1
+  num_instances: 2
   tensor_parallel_size: 1
   pipeline_parallel_size: 1
   cache_transceiver_config:
     backend: DEFAULT
   urls:
       - "localhost:8001"
+      - "localhost:8002"
 generation_servers:
   num_instances: 2
   tensor_parallel_size: 1

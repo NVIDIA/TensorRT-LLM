@@ -4,7 +4,7 @@ import os
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, Generic, List, Optional, TypeVar
+from typing import Any, Dict, Generic, List, Optional, TypeVar
 
 import filelock
 import torch
@@ -12,54 +12,19 @@ import transformers
 from transformers.utils import HF_MODULES_CACHE
 
 from tensorrt_llm import logger
-from tensorrt_llm._torch.pyexecutor.config_utils import is_nemotron_hybrid
+from tensorrt_llm._torch.pyexecutor.config_utils import (is_nemotron_hybrid,
+                                                         load_pretrained_config)
 from tensorrt_llm._utils import get_sm_version, torch_dtype_to_binding
 from tensorrt_llm.bindings import LayerType as LayerTypeCpp
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.llm_args import (DeepSeekSparseAttentionConfig,
+                                          MoeLoadBalancerConfig)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
 
 TConfig = TypeVar("TConfig", bound=transformers.PretrainedConfig)
-
-
-@dataclass
-class MoeLoadBalancerConfig:
-    num_slots: Optional[int] = None
-    initial_global_assignments: Optional[Dict[int,
-                                              List[int]]] = field(default=None,
-                                                                  repr=False)
-    layer_updates_per_iter: int = 0
-
-    ep_rank: Optional[int] = field(default=None, init=False)
-    ep_size: Optional[int] = field(default=None, init=False)
-
-    def setup(self, ep_rank: int, ep_size: int) -> None:
-        self.ep_rank = ep_rank
-        self.ep_size = ep_size
-        assert self.num_slots is not None
-
-    @property
-    def num_local_slots(self) -> int:
-        return self.num_slots // self.ep_size
-
-    @property
-    def slot_start(self) -> int:
-        return self.ep_rank * self.num_local_slots
-
-    @property
-    def slot_end(self) -> int:
-        return self.slot_start + self.num_local_slots
-
-    def get_layer_initial_global_assignments(self, layer_idx: int) -> List[int]:
-        if self.initial_global_assignments is not None:
-            assert layer_idx in self.initial_global_assignments
-            assert len(
-                self.initial_global_assignments[layer_idx]) == self.num_slots
-            return self.initial_global_assignments[layer_idx]
-        else:
-            return None
 
 
 @contextlib.contextmanager
@@ -111,9 +76,9 @@ class ModelConfig(Generic[TConfig]):
     pretrained_config: Optional[TConfig] = None
     mapping: Mapping = field(default_factory=Mapping)
 
-    # quantization configs
+    # Quantization configs
     quant_config: QuantConfig = field(default_factory=QuantConfig)
-    # TODO(qijun): support per linear layer quantization
+    # Per linear layer quantization in quant_cfg.json or hf_quant_config.json
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
     # Delay weights creation to DecoderModelForCausalLM.__post_init__
     # to support mixed quantization.
@@ -121,6 +86,7 @@ class ModelConfig(Generic[TConfig]):
 
     spec_config: Optional["DecodingBaseConfig"] = None
     lora_config: Optional["LoraConfig"] = None
+    sparse_attention_config: Optional["SparseAttentionConfig"] = None
 
     is_generation: bool = True
     max_num_tokens: int = 8192
@@ -133,6 +99,13 @@ class ModelConfig(Generic[TConfig]):
     moe_backend: str = 'CUTLASS'  # options can be CUTLASS, TRTLLM
     # IF true, disables FC2+finalize fusion in CUTLASS MoE backend
     moe_disable_finalize_fusion: bool = False
+    # If true, use low precision combine in MoE operations (only for NVFP4 quantization)
+    use_low_precision_moe_combine: bool = False
+
+    # NVFP4 GEMM backend configuration - list of backends to consider for auto-selection
+    # Default excludes 'cutedsl' for faster build time. Add 'cutedsl' for extreme perf.
+    nvfp4_gemm_allowed_backends: List[str] = field(
+        default_factory=lambda: ['cutlass', 'cublaslt', 'cuda_core'])
 
     allreduce_strategy: AllReduceStrategy = AllReduceStrategy.AUTO
 
@@ -149,6 +122,10 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
+    # cute dsl op configs
+    use_cute_dsl_blockscaling_mm: bool = False
+    use_cute_dsl_blockscaling_bmm: bool = False
+
     _frozen: bool = field(default=False, init=False, repr=False)
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.
@@ -158,13 +135,15 @@ class ModelConfig(Generic[TConfig]):
         """
         Prevent modification of frozen instance attributes.
         However, we allow modification of 'extra_attrs' attributes for torch.compile
-        and 'pretrained_config' attributes for mutimodal models. All the other
-        attributes are frozen.
+        and 'pretrained_config' attributes for mutimodal models.
+        'quant_config' is allowed to be modified to set different quantization for VLM.
+        All the other attributes are frozen.
         This can be bypassed by manually setting '_frozen' to False. The design is
         to discourage modifying the attributes unintentionally.
         """
         if self._frozen:
-            if key not in ('_frozen', 'extra_attrs', 'pretrained_config'):
+            if key not in ('_frozen', 'extra_attrs', 'pretrained_config',
+                           'quant_config'):
                 raise AttributeError(
                     f"Cannot modify ModelConfig.'{key}' - instance is frozen")
         super().__setattr__(key, value)
@@ -186,7 +165,7 @@ class ModelConfig(Generic[TConfig]):
                 "TWOSHOT": AllReduceStrategy.TWOSHOT,
                 "LOWPRECISION": AllReduceStrategy.LOWPRECISION,
                 "MNNVL": AllReduceStrategy.MNNVL,
-                "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC
+                "NCCL_SYMMETRIC": AllReduceStrategy.NCCL_SYMMETRIC,
             }
             key = strategy.upper()
             return maps[key] if key in maps else AllReduceStrategy.AUTO
@@ -194,6 +173,11 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(self.allreduce_strategy, str):
             self.allreduce_strategy = get_all_reduce_strategy(
                 self.allreduce_strategy)
+
+        # Set default moe_max_num_tokens if not specified
+        # The maximum number of tokens in MoE are multiplied by DP size when attention DP is enabled
+        if self.moe_max_num_tokens is None:
+            self.moe_max_num_tokens = self.max_num_tokens * self.mapping.dp_size
 
     @property
     def torch_dtype(self) -> torch.dtype:
@@ -250,7 +234,34 @@ class ModelConfig(Generic[TConfig]):
         # once ModelType is used in pytorch flow.
 
     @staticmethod
-    def load_modelopt_quant_config(quant_config_file, model_dir, moe_backend):
+    def resolve_moe_backend(moe_backend: str, architecture: str) -> str:
+        """Resolve AUTO moe_backend to a specific backend based on model architecture.
+
+        Args:
+            moe_backend: The configured moe_backend (may be "AUTO")
+            architecture: The model architecture name (e.g., "GptOssForCausalLM")
+
+        Returns:
+            Resolved backend name (never "AUTO")
+        """
+        if moe_backend.upper() != "AUTO":
+            return moe_backend
+
+        if architecture == "GptOssForCausalLM":
+            sm_version = get_sm_version()
+            # Select the best performing backend based on SM version
+            if 100 <= sm_version < 120:  # Blackwell
+                return "TRTLLM"
+            elif 90 <= sm_version < 100:  # Hopper
+                return "TRITON"
+            else:
+                return "CUTLASS"  # Fallback to CUTLASS for other SM versions (e.g., SM120)
+
+        return "CUTLASS"
+
+    @staticmethod
+    def load_modelopt_quant_config(quant_config_file, checkpoint_dir,
+                                   moe_backend):
         quant_config = QuantConfig()
         layer_quant_config = None
 
@@ -270,27 +281,41 @@ class ModelConfig(Generic[TConfig]):
             'exclude_modules', None)
 
         if quant_config.quant_algo == QuantAlgo.MIXED_PRECISION:
-            mixed_quant_config_file = model_dir / 'quant_cfg.json'
-            with open(mixed_quant_config_file) as fm:
-                mixed_quant_configs = json.load(fm)
-                # kv_cache_quant_algo is global regardless of MIXED_PRECISION
-                kv_cache_quant_algo = mixed_quant_configs['kv_cache_quant_algo']
-                mixed_quant_configs = mixed_quant_configs['quantized_layers']
-                if kv_cache_quant_algo is not None and quant_config.kv_cache_quant_algo is not None:
-                    if kv_cache_quant_algo != quant_config.kv_cache_quant_algo:
-                        raise RuntimeError(
-                            f"The kvcache config in 'quant_cfg.json', {kv_cache_quant_algo},"
-                            f"is different from 'hf_quant_config.json', {quant_config.kv_cache_quant_algo}!"
-                        )
-                kv_cache_quant_algo = kv_cache_quant_algo or quant_config.kv_cache_quant_algo
-
-                for layer in mixed_quant_configs:
-                    config = QuantConfig()
-                    config.kv_cache_quant_algo = kv_cache_quant_algo
-                    config.quant_algo = mixed_quant_configs[layer]['quant_algo']
-                    config.group_size = mixed_quant_configs[layer].get(
-                        'group_size', None)
-                    mixed_quant_configs[layer] = config
+            json_extended_quant_configs: dict = {}
+            # See tests/unittest/llmapi/test_llm_quant.py
+            try:
+                mixed_quant_config_file = transformers.utils.hub.cached_file(
+                    checkpoint_dir, 'quant_cfg.json')
+                with open(mixed_quant_config_file) as fm:
+                    json_extended_quant_configs = json.load(fm)
+            except Exception:
+                logger.info(
+                    f"No quant_cfg.json found for layer quant info, using hf_quant_config.json."
+                )
+            json_quant_configs.update(json_extended_quant_configs)
+            # kv_cache_quant_algo is global regardless of MIXED_PRECISION
+            kv_cache_quant_algo = json_quant_configs.get(
+                'kv_cache_quant_algo', None)
+            mixed_quant_configs = json_quant_configs.get(
+                'quantized_layers', None)
+            if (kv_quant_lhs := json_extended_quant_configs.get(
+                    "kv_cache_quant_algo", None)) is not None and (
+                        kv_quant_rhs :=
+                        quant_config.kv_cache_quant_algo) is not None:
+                if kv_quant_lhs != kv_quant_rhs:
+                    raise RuntimeError(
+                        f"The kvcache config in 'quant_cfg.json', {kv_quant_lhs},"
+                        f"is different from 'hf_quant_config.json', {kv_quant_rhs}!"
+                    )
+            quant_config.kv_cache_quant_algo = json_quant_configs[
+                "kv_cache_quant_algo"]
+            for layer in mixed_quant_configs:
+                config = QuantConfig()
+                config.kv_cache_quant_algo = kv_cache_quant_algo
+                config.quant_algo = mixed_quant_configs[layer]['quant_algo']
+                config.group_size = mixed_quant_configs[layer].get(
+                    'group_size', None)
+                mixed_quant_configs[layer] = config
             layer_quant_config = mixed_quant_configs
         elif quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             if quant_config.group_size is None:
@@ -321,32 +346,94 @@ class ModelConfig(Generic[TConfig]):
         quant_config = QuantConfig()
         layer_quant_config = None
 
+        # Read exclude_modules from HF config if present (HF format module names)
+        hf_exclude_modules = hf_quant_config.get('modules_to_not_convert', None)
+
         # DeepSeek V3 FP8 ckpt
         if hf_quant_config.get("quant_method") == "fp8" and hf_quant_config.get(
                 "weight_block_size", []):
             quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
-            if moe_backend == 'TRTLLM':
-                # TODO: This is a hack. Remove after fp8 bmm is integrated.
-                quant_config.exclude_modules = [
-                    "*kv_b_proj*", "*k_b_proj*", "*eh_proj"
-                ]
-            else:
-                quant_config.exclude_modules = ["*eh_proj"]
 
             block_size = hf_quant_config.get("weight_block_size", [])
             assert tuple(block_size) == (
                 128, 128), "FP8_BLOCK_SCALES only supports block_size=(128,128)"
             quant_config.group_size = block_size[0]
+
+            # Set default exclude_modules for FP8_BLOCK_SCALES
+            if moe_backend == 'TRTLLM':
+                default_exclude = ["*kv_b_proj*", "*k_b_proj*", "*eh_proj"]
+            else:
+                default_exclude = ["*eh_proj"]
+
+            # Merge HF config's modules_to_not_convert with default exclude_modules
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = list(
+                    set(hf_exclude_modules + default_exclude))
+            else:
+                quant_config.exclude_modules = default_exclude
         # MXFP4 checkpoints.
         elif hf_quant_config.get("quant_method") == "mxfp4":
             quant_config.quant_algo = ModelConfig.get_mxfp4_quant_algo(
                 moe_backend)
             quant_config.group_size = 32
-            quant_config.exclude_modules = [
+
+            # Default exclude_modules for MXFP4 (TRTLLM internal format)
+            default_exclude = [
                 'block.*.attn.out', 'block.*.mlp.gate', 'block.*.attn.qkv',
                 'embedding', 'unembedding'
             ]
 
+            # Merge HF config's modules_to_not_convert with default exclude_modules
+            if hf_exclude_modules is not None:
+                quant_config.exclude_modules = list(
+                    set(hf_exclude_modules + default_exclude))
+            else:
+                quant_config.exclude_modules = default_exclude
+
+        # NOTE: This is for llm-compressor's quantized checkpoints.
+        elif hf_quant_config.get("quant_method") == "compressed-tensors":
+            config_groups = hf_quant_config.get("config_groups")
+            if config_groups is None:
+                raise ValueError(
+                    f"config_groups is not set in {hf_quant_config}.")
+
+            weights_quant_config = config_groups["group_0"]["weights"]
+            inputs_quant_config = config_groups["group_0"]["input_activations"]
+            weights_quant_strategy = weights_quant_config["strategy"]
+            inputs_quant_strategy = inputs_quant_config["strategy"]
+
+            if weights_quant_config["num_bits"] == 8:
+                if weights_quant_strategy == "channel":
+                    if inputs_quant_strategy != "token":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
+                        )
+                    quant_config.quant_algo = QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN
+                elif weights_quant_strategy == "block":
+                    if inputs_quant_strategy != "group":
+                        raise ValueError(
+                            f"Unsupported inputs_quant_strategy: {inputs_quant_strategy}."
+                        )
+                    quant_config.quant_algo = QuantAlgo.FP8_BLOCK_SCALES
+                    group_size = inputs_quant_config["group_size"]
+
+                    # NOTE: TRT-LLM only supports group_size=128 for FP8_BLOCK_SCALES.
+                    if group_size != 128:
+                        raise ValueError(
+                            f"Unsupported group_size: {group_size}. Supported: 128."
+                        )
+                    quant_config.group_size = group_size
+
+                else:
+                    raise ValueError(
+                        f"Unsupported weights_quant_strategy: {weights_quant_strategy}. "
+                        "Supported strategies: 'channel', 'block'.")
+            else:
+                raise ValueError(
+                    f"Unsupported quant_bits: {weights_quant_config['num_bits']}. "
+                    "Supported: 8.")
+
+            quant_config.exclude_modules = hf_quant_config.get("ignore", [])
         return quant_config, layer_quant_config
 
     @staticmethod
@@ -409,31 +496,118 @@ class ModelConfig(Generic[TConfig]):
         # Use file lock to prevent race conditions when multiple processes
         # try to import/cache the same remote model config file
         with config_file_lock():
-            pretrained_config = transformers.AutoConfig.from_pretrained(
-                checkpoint_dir,
-                trust_remote_code=trust_remote_code,
-            )
+            # When handling the case where model_format is TLLM_ENGINE
+            # send cyclic requests to the NONE URL.
+            if checkpoint_dir is not None:
+                pretrained_config = load_pretrained_config(
+                    checkpoint_dir,
+                    trust_remote_code=trust_remote_code,
+                    **kwargs,
+                )
+                if pretrained_config.architectures[
+                        0] == "DeepseekV32ForCausalLM":
+                    sparse_attention_config = kwargs.get(
+                        'sparse_attention_config')
+                    if sparse_attention_config:
+                        index_n_heads = sparse_attention_config.index_n_heads or pretrained_config.index_n_heads
+                        index_head_dim = sparse_attention_config.index_head_dim or pretrained_config.index_head_dim
+                        index_topk = sparse_attention_config.index_topk or pretrained_config.index_topk
+                        indexer_max_chunk_size = sparse_attention_config.indexer_max_chunk_size
+                        skip_indexer_for_short_seqs = sparse_attention_config.skip_indexer_for_short_seqs
+                    else:
+                        index_n_heads = pretrained_config.index_n_heads
+                        index_head_dim = pretrained_config.index_head_dim
+                        index_topk = pretrained_config.index_topk
+                        indexer_max_chunk_size = None
+                        skip_indexer_for_short_seqs = True
+                    kwargs[
+                        'sparse_attention_config'] = DeepSeekSparseAttentionConfig(
+                            index_n_heads=index_n_heads,
+                            index_head_dim=index_head_dim,
+                            index_topk=index_topk,
+                            indexer_max_chunk_size=indexer_max_chunk_size,
+                            skip_indexer_for_short_seqs=
+                            skip_indexer_for_short_seqs)
+            else:
+                raise ValueError(
+                    "checkpoint_dir is None. Cannot load model config without a valid checkpoint directory."
+                )
 
-            # Find the cache path by looking for the config.json file which should be in all
-            # huggingface models
-            model_dir = Path(
-                transformers.utils.hub.cached_file(checkpoint_dir,
-                                                   'config.json')).parent
+        # Get cached file from path or repo id, return None if not exists.
+        def cached_file(path_or_repo_id, file_name):
+            try:
+                return transformers.utils.hub.cached_file(
+                    path_or_repo_id, file_name)
+            except OSError:
+                return None
+
+        # Some checkpoints lack torch_dtype, populate with dtype
+        pretrained_config.torch_dtype = getattr(pretrained_config, 'dtype',
+                                                None)
+
+        # Apply model_kwargs to override config parameters if provided
+        model_kwargs = kwargs.pop('model_kwargs', None)
+        if model_kwargs:
+
+            def _recursive_update_config(config: transformers.PretrainedConfig,
+                                         update_dict: Dict[str, Any]):
+                """
+                Recursively update a PretrainedConfig object with values from update_dict.
+                Args:
+                    config: PretrainedConfig object to update
+                    update_dict: Dictionary with values to update in the config
+                """
+                for key, value_new in update_dict.items():
+                    target_value = getattr(config, key, None)
+
+                    # Handle nested PretrainedConfig objects when value is a dict
+                    if isinstance(value_new, dict) and isinstance(
+                            target_value, transformers.PretrainedConfig):
+                        # Recursively update the nested config
+                        logger.info(
+                            f"Recursively updating nested config: {key}")
+                        _recursive_update_config(target_value, value_new)
+                    elif (key in ["torch_dtype", "dtype"]
+                          and isinstance(value_new, str)
+                          and value_new != "auto"):
+                        # check special handling of torch_dtype (DEPRECATED!) and dtype keys to ensure we
+                        # use the correct torch.dtype object instead of a string.
+                        dtype = getattr(torch, value_new)
+                        assert isinstance(dtype,
+                                          torch.dtype), f"Invalid {dtype=}"
+                        setattr(config, key, dtype)
+                        logger.info(
+                            f"Applied model_kwargs: {key}={dtype} (previous value: {target_value})"
+                        )
+                    else:
+                        # Direct update for simple values
+                        setattr(config, key, value_new)
+                        logger.info(
+                            f"Applied model_kwargs: {key}={value_new} (previous value: {target_value})"
+                        )
+
+            _recursive_update_config(pretrained_config, model_kwargs)
 
         quant_config = QuantConfig()
         layer_quant_config = None
-        moe_backend = kwargs.get('moe_backend', 'CUTLASS')
+        moe_backend = kwargs.get('moe_backend', 'AUTO')
+        # Resolve AUTO to specific backend based on model architecture
+        architecture = pretrained_config.architectures[
+            0] if pretrained_config.architectures else ""
+        moe_backend = cls.resolve_moe_backend(moe_backend, architecture)
+        kwargs['moe_backend'] = moe_backend
 
         # quantized ckpt in modelopt format
-        if (quant_config_file := model_dir / 'hf_quant_config.json').exists():
+        if quant_config_file := cached_file(checkpoint_dir,
+                                            'hf_quant_config.json'):
             quant_config, layer_quant_config = cls.load_modelopt_quant_config(
-                quant_config_file, model_dir, moe_backend)
+                quant_config_file, checkpoint_dir, moe_backend)
         # quantized ckpt in other formats
         elif hasattr(pretrained_config, "quantization_config"):
             hf_quant_config = pretrained_config.quantization_config
             quant_config, layer_quant_config = cls.load_hf_quant_config(
                 hf_quant_config, moe_backend)
-        elif (quant_config_file := model_dir / 'dtypes.json').exists():
+        elif quant_config_file := cached_file(checkpoint_dir, 'dtypes.json'):
             quant_config, layer_quant_config = cls.load_quant_config_from_dtypes_json(
                 quant_config_file, moe_backend)
 
@@ -462,15 +636,26 @@ class ModelConfig(Generic[TConfig]):
         # TODO smor- currently assuming no rnn layers, no MOE
         from tensorrt_llm.bindings import ModelConfig as ModelConfigCpp
 
-        num_heads = self.pretrained_config.num_attention_heads // (
-            self.mapping.tp_size * self.mapping.cp_size)
+        # Attention DP should not shard attention heads; use attn_tp_size=1 in that case
+        # so downstream KV calculations see the full (non-partitioned) head count.
+        attn_tp_size = self.mapping.attn_tp_size if not self.mapping.enable_attention_dp else 1
+        attn_cp_size = self.mapping.attn_cp_size
 
-        hidden_size = self.pretrained_config.hidden_size // self.mapping.tp_size
+        num_heads = self.pretrained_config.num_attention_heads // (
+            attn_tp_size * attn_cp_size)
+
+        hidden_size = self.pretrained_config.hidden_size // attn_tp_size
+        num_layers = self.pretrained_config.num_hidden_layers
+        num_attention_layers = self.get_num_attention_layers()
+        if (self.spec_config is not None
+                and self.spec_config.spec_dec_mode.is_mtp_one_model()):
+            num_layers += self.spec_config.num_nextn_predict_layers
+            num_attention_layers += self.spec_config.num_nextn_predict_layers
 
         model_config_cpp = ModelConfigCpp(
             vocab_size=self.pretrained_config.vocab_size,
-            num_layers=self.pretrained_config.num_hidden_layers,
-            num_attention_layers=self.get_num_attention_layers(),
+            num_layers=num_layers,
+            num_attention_layers=num_attention_layers,
             num_rnn_layers=0,
             num_heads=num_heads,
             hidden_size=hidden_size,
@@ -490,13 +675,12 @@ class ModelConfig(Generic[TConfig]):
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
-                kv_heads // (self.mapping.tp_size * self.mapping.cp_size)
+                kv_heads // (attn_tp_size * attn_cp_size)
                 for kv_heads in num_key_value_heads
             ]
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
-            num_kv_heads = num_key_value_heads // (self.mapping.tp_size *
-                                                   self.mapping.cp_size)
+            num_kv_heads = num_key_value_heads // (attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
@@ -523,15 +707,23 @@ class ModelConfig(Generic[TConfig]):
 
         # For kv cache size calculation: set size_per_head
         head_dim_names = ["head_size", "head_dim"]
+        head_size = None
         for head_dim_name in head_dim_names:
-            if head_dim_name in self.pretrained_config:
-                head_size = getattr(self.pretrained_config, head_dim_name)
-                break
-        else:
-            logger.warning(
-                f"head_size/head_dim is not set, using default value {hidden_size // num_heads}"
+            if hasattr(self.pretrained_config, head_dim_name):
+                value = getattr(self.pretrained_config, head_dim_name)
+                if value is not None:
+                    head_size = value
+                    break
+
+        if head_size is None:
+            assert hidden_size % num_heads == 0, (
+                f"hidden_size ({hidden_size}) must be divisible by num_heads ({num_heads})"
             )
-            head_size = hidden_size // num_heads
+            calculated_head_size = hidden_size // num_heads
+            logger.warning(
+                f"head_size/head_dim is not set or None, using default value {calculated_head_size}"
+            )
+            head_size = calculated_head_size
 
         model_config_cpp.mlp_hidden_size = mlp_hidden_size
         model_config_cpp.size_per_head = head_size
@@ -578,5 +770,12 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
+        elif hasattr(
+                self.pretrained_config, "architectures"
+        ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
+                0] in ["Qwen3NextForCausalLM"]:
+            # Qwen3NextForCausalLM has hybrid attention pattern(1:3 full attention:linear attention),
+            # we need to calculate the number of fullattention layers
+            return self.pretrained_config.num_hidden_layers // self.pretrained_config.full_attention_interval
         else:
             return self.pretrained_config.num_hidden_layers

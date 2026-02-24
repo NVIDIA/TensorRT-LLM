@@ -14,10 +14,11 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 // merged_attn [q_total_len, H=128, D=128] (T)
@@ -38,4 +39,5 @@ void invokeMLALoadChunkedKV(T* output_kv_ptr, T* output_k_pe_ptr, KVBlockArray c
     int64_t const* cu_ctx_chunked_len, int64_t const* chunked_ld_global_offset, int lora_size, int rope_size,
     int max_seq_len, float const* kv_scale_quant_orig_ptr, cudaStream_t stream);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

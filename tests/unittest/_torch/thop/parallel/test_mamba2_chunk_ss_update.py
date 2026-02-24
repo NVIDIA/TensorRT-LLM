@@ -213,7 +213,8 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
             assert remove_padding
             chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
                 cu_seqlens, chunk_size)
-        out, ssm_state = mamba_chunk_scan_combined(
+        out = torch.empty_like(x)
+        ssm_state = mamba_chunk_scan_combined(
             x,
             dt,
             A,
@@ -231,6 +232,7 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
             dt_softplus=delta_softplus,
             return_final_states=not remove_padding,
             return_varlen_states=remove_padding,
+            out=out,
         )
 
         if (ssm_state.shape[0] > 1 and ssm_state.dtype == torch.float32
@@ -256,7 +258,8 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
         else:
             state_batch_indices = None
 
-        y = selective_state_update(
+        y = torch.empty_like(x)
+        selective_state_update(
             state,
             x,
             dt,
@@ -268,6 +271,7 @@ def test_mamba2_chunk_scan_selective_state_update(dim, headdim, ngroups, dstate,
             dt_bias=dt_bias,
             dt_softplus=delta_softplus,
             state_batch_indices=state_batch_indices,
+            out=y,
         )
         outputs = (y, state[state_batch_indices]
                    if state_batch_indices is not None else state)
@@ -430,7 +434,8 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
     z = torch.randn_like(x)
 
     ## full seqlen computation
-    out_ref, state_ref = mamba_chunk_scan_combined(
+    out_ref = torch.empty_like(x)
+    state_ref = mamba_chunk_scan_combined(
         x,
         dt,
         A,
@@ -445,6 +450,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
         dt_softplus=delta_softplus,
         return_final_states=False,
         return_varlen_states=True,
+        out=out_ref,
     )
 
     ## chunked seqlen computation
@@ -476,7 +482,8 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
         z_chunked[:, chunked_cu_seqlens[i]:chunked_cu_seqlens[i+1], ...] = chunk_f(z, i)
         # yapf: enable
 
-    partial_out, partial_state = mamba_chunk_scan_combined(
+    partial_out = torch.empty_like(x_chunked)
+    partial_state = mamba_chunk_scan_combined(
         x_chunked,
         dt_chunked,
         A,
@@ -491,6 +498,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
         dt_softplus=delta_softplus,
         return_final_states=False,
         return_varlen_states=True,
+        out=partial_out,
     )
 
     # remaining chunk
@@ -540,7 +548,8 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
     chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
         remaining_chunked_cu_seqlens, mamba_chunk_size)
 
-    out_chunked, state_chunked = mamba_chunk_scan_combined(
+    out_chunked = torch.empty_like(remaining_x_chunked)
+    state_chunked = mamba_chunk_scan_combined(
         remaining_x_chunked,
         remaining_dt_chunked,
         A,
@@ -558,6 +567,7 @@ def test_mamba2_chunk_scan_combined_prefill_chunking(mamba_chunk_size, seqlens):
         dt_softplus=delta_softplus,
         return_final_states=False,
         return_varlen_states=True,
+        out=out_chunked,
     )
     out = concat_batch_f(partial_out, out_chunked)
 

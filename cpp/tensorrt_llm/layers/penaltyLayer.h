@@ -67,18 +67,21 @@ private:
     TensorPtr mPresencePenaltyDevice;
     TensorPtr mFrequencyPenaltyDevice;
     TensorPtr mMinLengthDevice;
+    TensorPtr mPromptIgnoreLengthDevice;
 
     TensorPtr mTemperature;
     TensorPtr mRepetitionPenalty;
     TensorPtr mPresencePenalty;
     TensorPtr mFrequencyPenalty;
     TensorPtr mMinLength;
+    TensorPtr mPromptIgnoreLength;
 
     bool mUseTemperature{false};
     bool mUseRepetitionPenalty{false};
     bool mUsePresencePenalty{false};
     bool mUseFrequencyPenalty{false};
     bool mUseMinLength{false};
+    bool mUsePromptIgnoreLength{false};
 
     runtime::SizeType32 mCyclicStep{0};
     runtime::SizeType32 mRuntimeMaxSeqLen{0};

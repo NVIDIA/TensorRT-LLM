@@ -14,11 +14,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
+
 #include "tensorrt_llm/kernels/dsv3MinLatencyKernels/dsv3RouterGemm.h"
 using namespace tensorrt_llm::common;
 
-namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::dsv3MinLatencyKernels
 {
 
 // Custom FMA implementation using PTX assembly instructions
@@ -74,7 +78,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const
     }
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.wait;");
+    cudaGridDependencySynchronize();
 #endif
 
     // Process the GEMM in chunks
@@ -167,7 +171,7 @@ __global__ __launch_bounds__(128, 1) void router_gemm_kernel(float* out, T const
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    asm volatile("griddepcontrol.launch_dependents;");
+    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 }
 
@@ -238,4 +242,6 @@ template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__n
 template void tensorrt_llm::kernels::dsv3MinLatencyKernels::invokeRouterGemm<__nv_bfloat16, 16, 256, 7168>(
     float*, __nv_bfloat16 const*, __nv_bfloat16 const*, cudaStream_t);
 
-} // namespace tensorrt_llm::kernels::dsv3MinLatencyKernels
+} // namespace kernels::dsv3MinLatencyKernels
+
+TRTLLM_NAMESPACE_END

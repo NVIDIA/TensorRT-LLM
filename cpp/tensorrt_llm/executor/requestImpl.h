@@ -48,7 +48,7 @@ public:
         std::optional<Tensor> crossAttentionMask, SizeType32 numReturnSequences, std::optional<EagleConfig> eagleConfig,
         std::optional<Tensor> skipCrossAttnBlocks, std::optional<GuidedDecodingParams> guidedDecodingParams,
         std::optional<SizeType32> languageAdapterUid, std::optional<MillisecondsType> allottedTimeMs,
-        std::optional<CacheSaltIDType> cacheSaltID)
+        std::optional<CacheSaltIDType> cacheSaltID, std::optional<IdType> disaggRequestId)
         : mInputTokenIds(std::move(inputTokenIds))
         , mMaxNewTokens(maxNewTokens)
         , mStreaming(streaming)
@@ -86,6 +86,7 @@ public:
         , mLanguageAdapterUid(languageAdapterUid)
         , mAllottedTimeMs(allottedTimeMs)
         , mCacheSaltID(cacheSaltID)
+        , mDisaggRequestId(disaggRequestId)
     {
         validate();
     }
@@ -302,6 +303,11 @@ public:
         return mCacheSaltID;
     }
 
+    [[nodiscard]] std::optional<IdType> getDisaggRequestId() const
+    {
+        return mDisaggRequestId;
+    }
+
     void setStreaming(bool streaming)
     {
         mStreaming = streaming;
@@ -481,6 +487,11 @@ public:
         mCacheSaltID = cacheSaltID;
     }
 
+    void setDisaggRequestId(IdType disaggRequestId)
+    {
+        mDisaggRequestId = disaggRequestId;
+    }
+
 private:
     void validate()
     {
@@ -555,6 +566,7 @@ private:
         lambda(mLanguageAdapterUid);
         lambda(mAllottedTimeMs ? std::make_optional(mAllottedTimeMs->count()) : std::nullopt);
         lambda(mCacheSaltID);
+        lambda(mDisaggRequestId);
     }
 
     VecTokens mInputTokenIds;
@@ -594,6 +606,7 @@ private:
     std::optional<SizeType32> mLanguageAdapterUid;
     std::optional<MillisecondsType> mAllottedTimeMs;
     std::optional<CacheSaltIDType> mCacheSaltID;
+    std::optional<IdType> mDisaggRequestId;
 };
 
 } // namespace tensorrt_llm::executor

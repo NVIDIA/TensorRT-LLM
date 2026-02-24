@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from functools import partial
 from pathlib import Path
 
@@ -35,7 +34,7 @@ from tensorrt_llm.sampling_params import SamplingParams
 
 @click.command(name="latency")
 @optgroup.group("Engine run configuration",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--engine_dir",
     type=click.Path(exists=True,
@@ -46,16 +45,19 @@ from tensorrt_llm.sampling_params import SamplingParams
     help="Path to a serialized TRT-LLM engine.",
 )
 @optgroup.option(
+    "--config",
     "--extra_llm_api_options",
+    "extra_llm_api_options",
     type=str,
     default=None,
     help=
-    "Path to a YAML file that overwrites the parameters specified by trtllm-bench."
-)
-@optgroup.option("--backend",
-                 type=click.Choice(ALL_SUPPORTED_BACKENDS),
-                 default="pytorch",
-                 help="The backend to use when running benchmarking.")
+    "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified as either --config or --extra_llm_api_options.")
+@optgroup.option(
+    "--backend",
+    type=click.Choice(ALL_SUPPORTED_BACKENDS),
+    default="pytorch",
+    help="The backend to use for benchmark. Default is pytorch backend.")
 @optgroup.option(
     "--kv_cache_free_gpu_mem_fraction",
     type=float,
@@ -150,7 +152,7 @@ from tensorrt_llm.sampling_params import SamplingParams
     "Desired concurrency rate (number of requests processing at the same time), <=0 for no concurrency limit.",
 )
 @optgroup.group("Speculative Decode Options",
-                help="Runtime settings for executing a TensorRT-LLM engine.")
+                help="Runtime settings for executing a TensorRT LLM engine.")
 @optgroup.option(
     "--medusa_choices",
     type=click.Path(exists=True,
@@ -191,6 +193,7 @@ def latency_command(
 ) -> None:
     """Run a latency test on a TRT-LLM engine."""
     logger.info("Preparing to run latency benchmark...")
+
     # Parameters from CLI
     # Model, experiment, and engine params
     options = get_general_cli_options(params, bench_env)
@@ -224,7 +227,7 @@ def latency_command(
     if options.backend and options.backend.lower(
     ) in ALL_SUPPORTED_BACKENDS and options.backend.lower() != "tensorrt":
         if bench_env.checkpoint_path is None:
-            snapshot_download(options.model)
+            snapshot_download(options.model, revision=bench_env.revision)
 
         exec_settings = get_settings(params, metadata, bench_env.model,
                                      bench_env.checkpoint_path)
@@ -244,11 +247,12 @@ def latency_command(
                 f"{metadata.max_sequence_length}. Please rebuild a new engine to"
                 "support this dataset.")
     else:
-        raise RuntimeError(
-            f"Invalid backend: {options.backend}, please use one of the following: "
-            f"{ALL_SUPPORTED_BACKENDS}")
+        raise click.BadParameter(
+            f"{options.backend} is not a known backend, check help for available options.",
+            param_hint="backend")
 
     exec_settings["model"] = options.model
+    exec_settings["revision"] = bench_env.revision
     engine_tokens = exec_settings["settings_config"]["max_num_tokens"]
 
     # Update configuration with runtime options
@@ -260,14 +264,6 @@ def latency_command(
     exec_settings["settings_config"]["chunking"] = False
     exec_settings["settings_config"][
         "scheduler_policy"] = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT
-
-    # Set environment variables for setting runtime options.
-    # TODO: Once passing of variables is fixed, these should work
-    # when using MPI in C++ runtime.
-    os.environ["TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG"] = "1"
-    os.environ["TRTLLM_MMHA_KERNEL_BLOCK_SIZE"] = "256"
-    os.environ["FORCE_MULTI_BLOCK_MODE"] = "1"
-    os.environ["TRTLLM_ENABLE_PDL"] = "1"
 
     # Performance options
     exec_settings["performance_options"]["cuda_graphs"] = True
@@ -287,6 +283,17 @@ def latency_command(
     llm = None
     kwargs = kwargs | runtime_config.get_llm_args()
     kwargs['backend'] = options.backend
+
+    # Set environment variables for setting runtime options.
+    default_env_overrides = {
+        "TRTLLM_ENABLE_MMHA_MULTI_BLOCK_DEBUG": "1",
+        "TRTLLM_MMHA_KERNEL_BLOCK_SIZE": "256",
+        "FORCE_MULTI_BLOCK_MODE": "1",
+        "TRTLLM_ENABLE_PDL": "1",
+    }
+    # Update defaults with existing overrides (user preference takes priority)
+    default_env_overrides.update(kwargs.get("env_overrides", {}))
+    kwargs["env_overrides"] = default_env_overrides
 
     try:
         logger.info("Setting up latency benchmark.")

@@ -1,0 +1,126 @@
+# This is the set of transforms running in "graph" mode. In this mode, we capture the full graph
+# of the model and optimize it for inference.
+transforms:
+  ############################################################################################
+  # BUILD MODEL, EXPORT TO GRAPH MODULE, AND CLEAN UP
+  ############################################################################################
+  build_model:
+    stage: factory
+    run_per_gm: false
+    device: meta
+    requires_clean_graph: false
+  export_to_gm:
+    stage: export
+    clone_state_dict: false
+    strict: false
+    run_per_gm: false
+    requires_clean_graph: false
+  cleanup_noop_slice:
+    stage: post_export
+  cleanup_noop_add:
+    stage: post_export
+  cleanup_input_constraints:
+    stage: post_export
+  ############################################################################################
+  # RUN PATTERN MATCHER TRANSFORMATIONS TO STANDARDIZE GRAPH REPRESENTATION
+  ############################################################################################
+  match_moe_pattern:
+    stage: pattern_matcher
+  match_dense_moe_pattern:
+    stage: pattern_matcher
+  match_bmm_moe_pattern:
+    stage: pattern_matcher
+  match_repeat_kv:
+    stage: pattern_matcher
+    run_shape_prop: true
+  match_eager_attention:
+    stage: pattern_matcher
+    requires_shape_prop: true
+  match_sdpa_to_torch_attention:
+    stage: pattern_matcher
+  match_grouped_attention:
+    stage: pattern_matcher
+  match_attention_layout:
+    stage: pattern_matcher
+    attn_layout: bsnd
+  match_rope_pattern:
+    stage: pattern_matcher
+  match_rope_layout:
+    stage: pattern_matcher
+    expected_layout: bsnd
+  ############################################################################################
+  # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
+  ############################################################################################
+  eliminate_redundant_transposes:
+    stage: pattern_matcher
+  quantize_int4_linear_from_config:
+    stage: pattern_matcher
+  quantize_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_nvfp4_linear_from_config:
+    stage: pattern_matcher
+  quantize_fp8_bmm_from_config:
+    stage: pattern_matcher
+  quantize_fp8_from_graph:
+    stage: pattern_matcher
+  quantize_nvfp4_from_graph:
+    stage: pattern_matcher
+  quantize_fp8_moe:
+    stage: pattern_matcher
+  quantize_nvfp4_moe:
+    stage: pattern_matcher
+  quantize_mxfp4_moe:
+    stage: pattern_matcher
+  ############################################################################################
+  # MOVE MODEL AND LOAD WEIGHTS
+  ############################################################################################
+  load_weights:
+    stage: weight_load
+    run_per_gm: false
+    checkpoint_device: cpu
+  move_inputs_to_device:
+    stage: weight_load
+    checkpoint_device: cpu
+    run_per_gm: false
+  ############################################################################################
+  # RUN POST-LOAD FUSION AND OPTIMIZATIONS
+  ############################################################################################
+  fuse_gemms:
+    stage: post_load_fusion
+    enabled:
+      false # https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this causes OOMs on GPU
+      # But while export ONNX for EdgeLLM, we compile the model on CPU..
+      # So we can enable this transform.
+      # TODO(yoco):However, it currently make non-strict ONNX export fail.
+  fuse_moe:
+    stage: post_load_fusion
+    enabled: true
+    backend: trtllm
+  fuse_fp8_moe:
+    stage: post_load_fusion
+    enabled: true
+    backend: trtllm
+  fuse_nvfp4_moe:
+    stage: post_load_fusion
+    enabled: false
+  ############################################################################################
+  # VISUALIZE GRAPH
+  ############################################################################################
+  visualize_namespace:
+    stage: visualize
+    enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/8460
+  ############################################################################################
+  # FUSE Rope Attention & export to ONNX
+  ############################################################################################
+  fuse_rope_attention:
+    stage: export_onnx
+  short_reshape_attention_output:
+    stage: export_onnx
+  gather_last_token_ids:
+    stage: export_onnx
+  adapt_to_edgellm:
+    stage: export_onnx
+  export_to_onnx:
+    stage: export_onnx
+    output_dir: "."
+    output_name: "model.onnx"

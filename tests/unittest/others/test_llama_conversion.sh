@@ -1,7 +1,7 @@
 set -ex
 
 export PATH=~/.local/bin/:$PATH # trtllm-build is inside ~/.local/bin
-export MODEL=/home/scratch.trt_llm_data/llm-models/llama-models/llama-7b-hf/
+export MODEL=/home/scratch.trt_llm_data_ci/llm-models/llama-models/llama-7b-hf/
 
 test_fake_config() {
     python3 convert_checkpoint.py --dtype float16 --n_layer 2 --output_dir ./c-model/llama-7b/fp16
@@ -13,12 +13,12 @@ test_fake_config() {
 }
 
 test_meta() {
-    python convert_checkpoint.py --meta_ckpt_dir /home/scratch.trt_llm_data/llm-models/llama-models-v2/7B/ --output_dir ./tllm_checkpoint/llama-v2-7b-ckpt-from-meta --tp_size 2
+    python convert_checkpoint.py --meta_ckpt_dir /home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/7B/ --output_dir ./tllm_checkpoint/llama-v2-7b-ckpt-from-meta --tp_size 2
     trtllm-build --checkpoint_dir ./tllm_checkpoint/llama-v2-7b-ckpt-from-meta  --output_dir ./trt_engines/llama-v2-7b-engine-tp2-meta  --gemm_plugin float16
     mpirun -n 2 --allow-run-as-root \
     python ../summarize.py --test_trt_llm \
                            --tensorrt_llm_rouge1_threshold 18 \
-                           --hf_model_dir /home/scratch.trt_llm_data/llm-models/llama-models-v2/llama-v2-7b-hf/ \
+                           --hf_model_dir /home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/llama-v2-7b-hf/ \
                            --data_type fp16 \
                            --engine_dir ./trt_engines/llama-v2-7b-engine-tp2-meta \
                            --test_hf
@@ -80,7 +80,7 @@ test_gptq() {
     python convert_checkpoint.py --model_dir ${MODEL} \
                                  --output_dir ./tllm_checkpoint/2gpu_gptq \
                                  --dtype float16 \
-                                 --quant_ckpt_path /home/scratch.trt_llm_data/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
+                                 --quant_ckpt_path /home/scratch.trt_llm_data_ci/llm-models/int4-quantized-gptq-awq/llama-7b-4bit-gs128.safetensors \
                                  --use_weight_only \
                                  --weight_only_precision int4_gptq \
                                  --per_group \
@@ -100,8 +100,8 @@ test_gptq() {
 }
 
 test_lora() {
-    lora_dir=/home/scratch.trt_llm_data/llm-models/llama-models-v2/chinese-llama-2-lora-13b
-    python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data/llm-models/llama-models-v2/llama-v2-13b-hf \
+    lora_dir=/home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/chinese-llama-2-lora-13b
+    python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/llama-v2-13b-hf \
                          --output_dir ./tllm_checkpoint/2gpu_lora \
                          --dtype float16 \
                          --tp_size 2
@@ -126,7 +126,7 @@ test_lora() {
 }
 
 test_mixtral() {
-    python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data/llm-models/Mixtral-8x7B-v0.1/ \
+    python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data_ci/llm-models/Mixtral-8x7B-v0.1/ \
                                  --output_dir ./tllm_checkpoint/mixtral_2gpu \
                                  --dtype float16 \
                                  --pp_size 2 \
@@ -137,7 +137,7 @@ test_mixtral() {
 }
 
 test_long_alpaca_rope_scaling() {
-    python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data/llm-models/LongAlpaca-7B/ \
+    python convert_checkpoint.py --model_dir /home/scratch.trt_llm_data_ci/llm-models/LongAlpaca-7B/ \
                             --output_dir ./tllm_checkpoint/long_alpaca_tp2 \
                             --dtype float16 \
                             --tp_size 2
@@ -152,12 +152,12 @@ test_long_alpaca_rope_scaling() {
         --max_input_length 32768 \
         --input_file ../../tests/integration/test_input_files/pg64317_sanitized.txt \
         --engine_dir ./trt_engines/long_alpaca_tp2  \
-        --tokenizer_dir /home/scratch.trt_llm_data/llm-models/LongAlpaca-7B/
+        --tokenizer_dir /home/scratch.trt_llm_data_ci/llm-models/LongAlpaca-7B/
 }
 
 test_llava() {
     python ../llama/convert_checkpoint.py \
-        --model_dir /home/scratch.trt_llm_data/llm-models/llava-1.5-7b-hf/ \
+        --model_dir /home/scratch.trt_llm_data_ci/llm-models/llava-1.5-7b-hf/ \
         --output_dir ./trt_checkpoint/llava-1gpu \
         --dtype float16
 
@@ -172,7 +172,7 @@ test_llava() {
 }
 
 test_bfloat16() {
-    python convert_checkpoint.py --output_dir ./tllm_checkpoint/llama_v2-summarization/bfloat16/1-gpu --dtype=bfloat16 --tp_size=1 --pp_size=1 --model_dir /home/scratch.trt_llm_data/llm-models/llama-models-v2/llama-v2-7b-hf
+    python convert_checkpoint.py --output_dir ./tllm_checkpoint/llama_v2-summarization/bfloat16/1-gpu --dtype=bfloat16 --tp_size=1 --pp_size=1 --model_dir /home/scratch.trt_llm_data_ci/llm-models/llama-models-v2/llama-v2-7b-hf
 }
 
 test_all()

@@ -22,6 +22,8 @@
 #include <string>
 #include <vector>
 
+#include "tensorrt_llm/batch_manager/cacheTransceiver.h"
+#include "tensorrt_llm/batch_manager/cacheTransferLayer.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/envUtils.h"
@@ -42,35 +44,62 @@ class BaseCacheFormatter;
 }
 
 using BaseCacheFormatter = kv_cache_manager::BaseCacheFormatter;
+using BlockKey = kv_cache_manager::BlockKey;
 
 // TODO: unify the following class into a namespace like tensorrt_llm::transmission
 using DataContext = tensorrt_llm::executor::kv_cache::DataContext;
 using Connection = tensorrt_llm::executor::kv_cache::Connection;
 using ConnectionManager = tensorrt_llm::executor::kv_cache::ConnectionManager;
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
+using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
 
 class TransferSession
 {
 public:
+    // measures for each single transmission
     struct Measure
     {
-        double delay;     // from last token (ctx) or arrival time (gen), in ms
-        double duration;  // in ms
-        double bandwidth; // in Gbps
+        LlmRequest::TimePoint start;
+        LlmRequest::TimePoint end;
+        size_t size = 0;
+    };
+
+    enum TimeNames : uint8_t
+    {
+        kTimeRequestInfo = 0,
+        kTimeFormatter,
+        kTimePreprocess,
+        kTimeTransmissions,
+        kTimePostprocess,
+        kTimeCounts
+    };
+
+    struct KVCacheTimes
+    {
+        std::array<LlmRequest::TimePoint, kTimeCounts> times;
+        std::vector<Measure> measures;
     };
 
     TransferSession(std::vector<Connection const*> connections, DataContext dataContext,
-        executor::DataTransceiverState const& selfState, executor::DataTransceiverState otherState,
-        runtime::BufferManager const& bufferManager, LlmRequest const* llmRequest = nullptr, bool recordMeasure = false)
+        std::vector<SizeType32> counterPartRanks, executor::DataTransceiverState const& selfState,
+        executor::DataTransceiverState otherState, runtime::BufferManager const& bufferManager, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey, LlmRequest const* llmRequest = nullptr, bool recordTiming = false)
         : mConnections(std::move(connections))
-        , mDataContext(dataContext)
+        , mCounterPartRanks(std::move(counterPartRanks))
+        , mDataContext(std::move(dataContext))
         , mSelfState(&selfState)
         , mOtherState(std::move(otherState))
         , mBufferManager(&bufferManager)
         , mRequest(llmRequest)
-        , mRecordMeasure(recordMeasure)
+        , mIndexFromEnd(indexFromEnd)
+        , mLastBlockKey(lastBlockKey)
     {
         TLLM_CHECK(!mConnections.empty());
+        if (recordTiming)
+        {
+            mTimes = std::make_unique<KVCacheTimes>();
+        }
     }
 
     [[nodiscard]] std::vector<Connection const*> const& getConnections() const;
@@ -95,21 +124,48 @@ public:
     // in CacheSender, the LlmRequest is not available until the sendSync is called
     void setLlmRequest(LlmRequest const& llmRequest);
 
-    void appendMeasure(double delay, double duration, size_t size);
+    void setTime(TimeNames name);
+
+    void appendMeasure(LlmRequest::TimePoint start, LlmRequest::TimePoint end, size_t size);
 
     // TODO: 1. use global id instead of context request id; 2. export to llm metrics instead of file
     void exportMeasure(std::ofstream& outFile, bool isContext) const;
 
+    [[nodiscard]] int32_t getIndexFromEnd() const
+    {
+        return mIndexFromEnd;
+    }
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const
+    {
+        return mLastBlockKey;
+    }
+
+    [[nodiscard]] std::vector<SizeType32> const& getCounterPartRanks() const
+    {
+        return mCounterPartRanks;
+    }
+
+    void setCounterPartRanks(std::vector<SizeType32> ranks)
+    {
+        mCounterPartRanks = std::move(ranks);
+    }
+
 private:
     std::vector<Connection const*> mConnections;
+    std::vector<SizeType32> mCounterPartRanks;        // Ranks corresponding to mConnections indices
     DataContext mDataContext;
     executor::DataTransceiverState const* mSelfState; // stored in CacheReceiver/CacheSender
     executor::DataTransceiverState mOtherState;
     runtime::BufferManager const* mBufferManager;
     LlmRequest const* mRequest;
-    std::vector<Measure> mMeasures;
-    bool mRecordMeasure{false};
+    std::unique_ptr<KVCacheTimes> mTimes;
+    int32_t mIndexFromEnd{0};
+    BlockKey mLastBlockKey{};
 };
+
+using UniqueToken = tensorrt_llm::runtime::UniqueToken;
+using BlockKey = tensorrt_llm::batch_manager::kv_cache_manager::BlockKey;
 
 struct TransceiverTag
 {
@@ -122,6 +178,7 @@ struct TransceiverTag
     static constexpr int32_t kID_TAG{19};
     static constexpr int32_t kINFO_SIZE_TAG{22};
     static constexpr int32_t kINFO_TAG{32};
+    static constexpr int32_t kREADY_SIGNAL_TAG{42};
 };
 
 // Used to store the information that needs to be sent to the context executor to ensure the generation
@@ -134,8 +191,8 @@ public:
     /// @param transState The state of the data transceiver.
     RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState);
 
-    RequestInfo(LlmRequest::RequestIdType requestId, std::vector<size_t> blockHashes,
-        executor::DataTransceiverState transState);
+    RequestInfo(LlmRequest::RequestIdType requestId, executor::DataTransceiverState transState, int32_t indexFromEnd,
+        BlockKey const& lastBlockKey);
     RequestInfo() = default;
 
     /// @brief Equality comparison operator.
@@ -146,11 +203,19 @@ public:
     /// @return The request ID.
     [[nodiscard]] LlmRequest::RequestIdType getRequestId() const noexcept;
 
-    [[nodiscard]] std::vector<size_t> const& getBlockHashes() const noexcept;
+    [[nodiscard]] int32_t getIndexFromEnd() const noexcept
+    {
+        return mIndexFromEnd;
+    }
 
     /// @brief Return the state of the data transceiver.
     /// @return The state of the data transceiver.
     [[nodiscard]] executor::DataTransceiverState const& getTransState() const noexcept;
+
+    [[nodiscard]] BlockKey const& getLastBlockKey() const noexcept
+    {
+        return mLastBlockKey;
+    }
 
     /// @brief Serialization.
     /// @param requestInfo Request information to be serialized.
@@ -169,8 +234,11 @@ public:
 private:
     // The ID used in the context phase of the current request.
     LlmRequest::RequestIdType mRequestId;
+    // Index from end indicating how many trailing blocks to transfer (index+1)
+    int32_t mIndexFromEnd{0};
 
-    std::vector<size_t> mBlockHashes;
+    // Last block key, used to derive other block keys on receiver
+    BlockKey mLastBlockKey{};
 
     // The state of the data transceiver.
     executor::DataTransceiverState mTransState;
@@ -180,8 +248,10 @@ class CacheSender
 {
 public:
     /// @brief Constructor.
-    CacheSender(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheSender(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheSender() = default;
 
@@ -207,6 +277,16 @@ public:
     /// @param llmRequest The request object to which the data belongs.
     virtual RequestInfo recvRequestInfo();
 
+    /// @brief Cancel the request.
+    /// @param requestId The ID used in the context phase of the current request.
+    /// @return Whether the request is cancelled.
+    virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Send ready signal.
+    /// @param requestId The ID used in the context phase of the current request.
+    /// @param isReady Whether the request is ready to be received.
+    virtual void sendReadySignal(LlmRequest::RequestIdType requestId, bool isReady);
+
     /// @brief Destructor.
     virtual ~CacheSender();
 
@@ -225,8 +305,10 @@ class CacheReceiver
 {
 public:
     /// @brief Constructor.
-    CacheReceiver(executor::kv_cache::ConnectionManager* manager, executor::kv_cache::CacheState selfCacheState,
-        SizeType32 selfIndex, std::unique_ptr<BaseCacheFormatter> formatter);
+    /// @param manager The connection manager.
+    /// @param selfIndex The sequential index of the current executor process.
+    /// @param cacheLayer The cache layer bundling all cache states and formatters.
+    CacheReceiver(executor::kv_cache::ConnectionManager* manager, SizeType32 selfIndex, CacheTransferLayer cacheLayer);
 
     CacheReceiver() = default;
 
@@ -239,6 +321,17 @@ public:
     virtual TransferSession sendRequestInfo(LlmRequest const& llmRequest);
 
     virtual void receiveSync(TransferSession& session);
+
+    /// @brief Cancel the request.
+    /// @param llmRequest Request object.
+    /// @return Whether the request is cancelled.
+    virtual bool cancelRequest(LlmRequest const& llmRequest);
+
+    /// @brief Receive ready signal.
+    /// @param session The session object.
+    /// @return Whether the request is ready to be received.
+    virtual bool receiveReadySignal(TransferSession& session);
+
     /// @brief Destructor.
     virtual ~CacheReceiver();
 

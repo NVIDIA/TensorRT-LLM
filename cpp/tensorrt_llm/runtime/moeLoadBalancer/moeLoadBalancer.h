@@ -143,6 +143,12 @@ public:
         return mLayerId;
     }
 
+    std::vector<std::vector<int>> getOldRankExpertIds() const
+    {
+        // This API is only used in test_moe_module to check expert placement.
+        return mCpuPlacementInfo.oldRankExpertIds;
+    }
+
     tensorrt_llm::kernels::MoeLoadBalanceMetaInfo getMetaInfo() const
     {
         return mMetaInfo;
@@ -219,7 +225,7 @@ private:
 class MultiThreadWorker
 {
 public:
-    explicit MultiThreadWorker(int numThreads);
+    explicit MultiThreadWorker(int numThreads, int cudaDeviceId);
     ~MultiThreadWorker();
 
     void start();
@@ -239,6 +245,7 @@ private:
     void workerLoop(int rank);
 
     int mNumThreads;
+    int mCudaDeviceId;
     std::vector<std::thread> mThreads;
     std::mutex mMutex;
     std::condition_variable mCondition;

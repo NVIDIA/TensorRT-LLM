@@ -16,14 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/quantization.h"
 #include <assert.h>
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
@@ -34,4 +35,5 @@ void invokeGeneralRmsNorm(T* out, T const* input, T const* gamma, T const* beta,
     float* sum_per_token = nullptr, QuantT* out_quant = nullptr);
 
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

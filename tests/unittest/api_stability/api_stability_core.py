@@ -3,6 +3,7 @@ import copy
 import inspect
 import os
 import pathlib
+from collections.abc import Mapping
 from dataclasses import _HAS_DEFAULT_FACTORY_CLASS, dataclass, fields
 from pprint import pprint
 from types import MethodType, NoneType
@@ -18,7 +19,7 @@ import yaml
 from pydantic import BaseModel
 
 import tensorrt_llm
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, DisaggregatedParams
 # Import BaseCheckpointLoader for YAML processing
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
@@ -30,6 +31,7 @@ from tensorrt_llm.llmapi import (CalibConfig, CompletionOutput,
 from tensorrt_llm.llmapi.llm_args import SamplerType
 from tensorrt_llm.llmapi.llm_utils import LlmArgs
 from tensorrt_llm.logger import Singleton
+from tensorrt_llm.sampling_params import LogprobMode
 
 
 def repr_annotation(field_type: type) -> str:
@@ -78,6 +80,11 @@ class ParamSnapshot:
     annotation: type
     default: Any = None
     status: Optional[str] = None
+
+    def __post_init__(self):
+        # Unify default value of None and inspect._empty
+        if self.default is inspect._empty:
+            self.default = None
 
     @classmethod
     def from_inspect(cls, param: inspect.Parameter):
@@ -258,7 +265,8 @@ class ClassSnapshot:
                         continue
                     parameters[field_name] = ParamSnapshot(
                         annotation=field.annotation,
-                        default=field.default or inspect._empty)
+                        default=inspect._empty
+                        if field.is_required() else field.default)
                 methods[method_name] = MethodSnapshot(parameters=parameters,
                                                       return_annotation=None)
             else:
@@ -293,7 +301,8 @@ class ClassSnapshot:
                             continue
                         parameters[field_name] = ParamSnapshot(
                             annotation=field.annotation,
-                            default=field.default or inspect._empty)
+                            default=inspect._empty
+                            if field.is_required() else field.default)
                     methods["__init__"] = MethodSnapshot(parameters=parameters,
                                                          return_annotation=None)
                 else:
@@ -510,7 +519,9 @@ class ApiStabilityTestHarness:
             # step 1: check the method status
             method = getattr(self.TEST_CLASS, method_name)
             if method_name in committed_data.get('methods', {}):
-                continue
+                if method_name != "__init__":
+                    continue
+                # Both committed and non-committed methods have __init__ with different parameters
             if method_name != "__init__":
                 method_status = get_api_status(method)
                 if method_status is None:

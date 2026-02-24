@@ -15,7 +15,11 @@ methods:
         default: False
         status: beta
       cp_config:
-        annotation: Optional[dict]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
+        default: null
+        status: prototype
+      pp_partition:
+        annotation: Optional[List[int]]
         default: null
         status: prototype
       # Stats
@@ -56,28 +60,24 @@ methods:
         annotation: Optional[str]
         default: null
         status: prototype
+      custom_tokenizer:
+        annotation: Optional[str]
+        default: null
+        status: prototype
       # reasoning
       reasoning_parser:
         annotation: Optional[str]
         default: null
         status: prototype
       # Runtime behavior
-      fail_fast_on_attention_window_too_large:
-        annotation: bool
-        default: false
-        status: prototype
       garbage_collection_gen0_threshold:
         annotation: int
         default: 20000
         status: beta
       # Misc
       backend:
-        annotation: Optional[str]
-        default: null
-        status: deprecated
-      build_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
-        default: null
+        annotation: Literal["pytorch"]
+        default: pytorch
         status: deprecated
       cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
@@ -103,22 +103,30 @@ methods:
         annotation: bool
         default: False
         status: beta
+      disable_flashinfer_sampling:
+        annotation: bool
+        default: False
+        status: prototype
       moe_config:
         annotation: tensorrt_llm.llmapi.llm_args.MoeConfig
+        status: beta
+        default: null
+      nvfp4_gemm_config:
+        annotation: tensorrt_llm.llmapi.llm_args.Nvfp4GemmConfig
         status: beta
         default: null
       attn_backend:
         annotation: str
         default: TRTLLM
         status: beta
-      enable_mixed_sampler:
-        annotation: bool
-        default: False
-        status: beta
       sampler_type:
         annotation: Union[str, tensorrt_llm.llmapi.llm_args.SamplerType]
         default: auto
         status: beta
+      sampler_force_async_worker:
+        annotation: bool
+        default: False
+        status: prototype
       enable_iter_perf_stats:
         annotation: bool
         default: False
@@ -128,6 +136,14 @@ methods:
         default: False
         status: prototype
       batch_wait_timeout_ms:
+        annotation: float
+        default: 0
+        status: prototype
+      batch_wait_timeout_iters:
+        annotation: int
+        default: 0
+        status: prototype
+      batch_wait_max_tokens_ratio:
         annotation: float
         default: 0
         status: prototype
@@ -175,6 +191,54 @@ methods:
         annotation: bool
         default: False
         status: prototype
+      orchestrator_type:
+        annotation: Optional[Literal["rpc", "ray"]]
+        default: null
+        status: prototype
+      sparse_attention_config:
+        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, NoneType]
+        default: null
+        status: prototype
+      otlp_traces_endpoint:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      ray_worker_extension_cls:
+        annotation: Optional[str]
+        default: null
+        status: prototype
+      ray_placement_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
+        default: null
+        status: prototype
+      enable_sleep:
+        annotation: bool
+        default: False
+        status: prototype
+      env_overrides:
+        annotation: Optional[Dict[str, str]]
+        default: null
+        status: prototype
+      max_stats_len:
+        annotation: int
+        default: 1000
+        status: prototype
+      layer_wise_benchmarks_config:
+        annotation: tensorrt_llm.llmapi.llm_args.LayerwiseBenchmarksConfig
+        default: null
+        status: prototype
+      model_kwargs:
+        annotation: Optional[Dict[str, Any]]
+        default: null
+        status: prototype
+      use_cute_dsl_blockscaling_mm:
+        annotation: bool
+        default: False
+        status: prototype
+      use_cute_dsl_blockscaling_bmm:
+        annotation: bool
+        default: False
+        status: prototype
     return_annotation: None
   generate:
     parameters:
@@ -186,6 +250,9 @@ methods:
         default: null
       scheduling_params:
         annotation: Union[tensorrt_llm.scheduling_params.SchedulingParams, List[tensorrt_llm.scheduling_params.SchedulingParams], NoneType]
+        default: null
+      cache_salt:
+        annotation: Union[str, Sequence[str], NoneType]
         default: null
     return_annotation: Union[tensorrt_llm.llmapi.llm.RequestOutput, List[tensorrt_llm.llmapi.llm.RequestOutput]]
   generate_async:
@@ -203,7 +270,24 @@ methods:
       cache_salt:
         annotation: Optional[str]
         default: null
+      trace_headers:
+        annotation: Optional[Mapping[str, str]]
+        default: null
+        status: prototype
     return_annotation: tensorrt_llm.llmapi.llm.RequestOutput
+  preprocess:
+    parameters:
+      inputs:
+        annotation: Union[str, List[int], tensorrt_llm.inputs.data.TextPrompt, tensorrt_llm.inputs.data.TokensPrompt]
+        default: inspect._empty
+      sampling_params:
+        annotation: Optional[tensorrt_llm.sampling_params.SamplingParams]
+        default: null
+      disaggregated_params:
+        annotation: Optional[tensorrt_llm.disaggregated_params.DisaggregatedParams]
+        default: null
+    return_annotation: tensorrt_llm.llmapi.llm.PreprocessedInputs
+    status: prototype
   get_kv_cache_events:
     parameters:
       timeout:
@@ -240,3 +324,6 @@ properties:
   llm_id:
     annotation: str
     default: inspect._empty
+  disaggregated_params:
+    annotation: dict
+    default: None

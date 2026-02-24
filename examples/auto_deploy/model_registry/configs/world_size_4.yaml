@@ -1,0 +1,2 @@
+# Configuration for 4 GPU models
+world_size: 4

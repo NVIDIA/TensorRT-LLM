@@ -27,15 +27,15 @@ The Deepseek-v2 model requires least 8x80G GPU memory, model contains 236B param
 
 ## Overview
 
-The TensorRT-LLM Deepseek-v2 implementation can be found in [tensorrt_llm/models/deepseek_v2/model.py](../../tensorrt_llm/models/deepseek_v2/model.py). The TensorRT-LLM Deepseek-v2 example code is located in [`examples/models/contrib/deepseek_v2`](./). There is one main file:
+The TensorRT LLM Deepseek-v2 implementation can be found in [tensorrt_llm/models/deepseek_v2/model.py](../../tensorrt_llm/models/deepseek_v2/model.py). The TensorRT LLM Deepseek-v2 example code is located in [`examples/models/contrib/deepseek_v2`](./). There is one main file:
 
-* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Deepseek-v2 model into tensorrt-llm checkpoint format.
+* [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Deepseek-v2 model into TensorRT LLM checkpoint format.
 
 In addition, there are three shared files in the parent folder [`examples`](../../../) can be used for inference and evaluation:
 
 * [`../../../run.py`](../../../run.py) to run the model inference output by given an input text.
-* [`../../../summarize.py`](../../../summarize.py) to summarize the article from [cnn_dailmail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset, it can running the summarize from HF model and TensorRT-LLM model.
-* [`../../../mmlu.py`](../../../mmlu.py) to running score script from https://github.com/declare-lab/instruct-eval to compare HF model and TensorRT-LLM model on the MMLU dataset.
+* [`../../../summarize.py`](../../../summarize.py) to summarize the article from [cnn_dailmail](https://huggingface.co/datasets/abisee/cnn_dailymail) dataset, it can running the summarize from HF model and TensorRT LLM model.
+* [`../../../mmlu.py`](../../../mmlu.py) to running score script from https://github.com/declare-lab/instruct-eval to compare HF model and TensorRT LLM model on the MMLU dataset.
 
 ## Support Matrix
 
@@ -46,16 +46,16 @@ In addition, there are three shared files in the parent folder [`examples`](../.
 
 ## Usage
 
-The TensorRT-LLM Deepseek-v2 example code locates at [examples/models/contrib/deepseek_v2](./). It takes PyTorch weights as input, and builds corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
+The TensorRT LLM Deepseek-v2 example code locates at [examples/models/contrib/deepseek_v2](./). It takes PyTorch weights as input, and builds corresponding TensorRT engines. The number of TensorRT engines depends on the number of GPUs used to run inference.
 
 ### Build TensorRT engine(s)
 
 Below is the step-by-step to run Deepseek-v2 with TensorRT-LLM.
 
-First the checkpoint will be converted to the TensorRT-LLM checkpoint format by apply [`convert_checkpoint.py`](./convert_checkpoint.py). After that, the TensorRT engine(s) can be build with TensorRT-LLM checkpoint.
+First the checkpoint will be converted to the TensorRT LLM checkpoint format by apply [`convert_checkpoint.py`](./convert_checkpoint.py). After that, the TensorRT engine(s) can be build with TensorRT LLM checkpoint.
 
 ```bash
-# Convert Deepseek-v2 HF weights to TensorRT-LLM checkpoint format.
+# Convert Deepseek-v2 HF weights to TensorRT LLM checkpoint format.
 python convert_checkpoint.py --model_dir ./DeepSeek-V2 \
                             --output_dir ./trtllm_checkpoint_deepseek_v2_8gpu_bf16 \
                             --dtype bfloat16 \
@@ -72,7 +72,7 @@ python convert_checkpoint.py --model_dir ./DeepSeek-V2 \
 
 We observe use GPUs(8xH200) the checkpoint conversion time took ~ 34 mints, while use CPUs took ~ 21 mints and CPU memory required >= 770GB.
 
-After the checkpoint conversion, the TensorRT engine(s) can be built with the TensorRT-LLM checkpoint.
+After the checkpoint conversion, the TensorRT engine(s) can be built with the TensorRT LLM checkpoint.
 
 ```bash
 # Build engine
@@ -142,10 +142,10 @@ and the output will be like:
 [10/28/2024-16:46:22] [TRT-LLM] [I]
  Output : [[' James Best, best known for his portrayal of bumbling sheriff Rosco P. Coltrane on TV\'s "The Dukes of Hazzard," died Monday after a brief illness. He was 88.']]
 [10/28/2024-16:46:22] [TRT-LLM] [I] ---------------------------------------------------------
-[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT-LLM (total latency: 32.02327513694763 sec)
-[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT-LLM (total output tokens: 1394)
-[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT-LLM (tokens per second: 43.53083793080361)
-[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT-LLM beam 0 result
+[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT LLM (total latency: 32.02327513694763 sec)
+[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT LLM (total output tokens: 1394)
+[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT LLM (tokens per second: 43.53083793080361)
+[10/28/2024-16:49:33] [TRT-LLM] [I] TensorRT LLM beam 0 result
 [10/28/2024-16:49:33] [TRT-LLM] [I]   rouge1 : 17.85755990133811
 [10/28/2024-16:49:33] [TRT-LLM] [I]   rouge2 : 6.273032755727469
 [10/28/2024-16:49:33] [TRT-LLM] [I]   rougeL : 14.768323033457317

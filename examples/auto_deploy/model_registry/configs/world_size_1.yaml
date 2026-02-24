@@ -1,0 +1,2 @@
+# Configuration for single GPU models
+world_size: 1

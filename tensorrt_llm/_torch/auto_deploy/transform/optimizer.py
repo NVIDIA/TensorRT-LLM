@@ -1,14 +1,17 @@
 """High-level entrypoint to transform a model into an efficient inference model."""
 
+import gc
+import time
 from typing import Optional
 
+import torch
 import torch.distributed as dist
 import torch.nn as nn
-from torch.fx import Graph, GraphModule
 
 from ..distributed import common as dist_ad
 from ..models.factory import ModelFactory
 from ..shim.interface import CachedSequenceInterface
+from ..utils.logger import ad_logger
 from .interface import (
     InferenceOptimizerConfig,
     SharedConfig,
@@ -20,14 +23,16 @@ from .interface import (
 
 
 class InferenceOptimizer:
-    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig):
+    def __init__(self, factory: ModelFactory, config: InferenceOptimizerConfig, mapping=None):
         self.factory = factory
         self.config = self._clean_config(config)
         if not dist.is_initialized():
             local_rank, world_size = 0, 1
         else:
             local_rank, world_size = dist_ad.get_rank_world_size()
-        self.shared_config = SharedConfig(local_rank=local_rank, world_size=world_size)
+        self.shared_config = SharedConfig(
+            local_rank=local_rank, world_size=world_size, mapping=mapping
+        )
 
     def _clean_config(self, config: InferenceOptimizerConfig) -> StrictInferenceOptimizerConfig:
         """Get a typed checked ("strict") config with sorted keys according to stages."""
@@ -44,41 +49,37 @@ class InferenceOptimizer:
         # return strict config
         return strict_config
 
-    @staticmethod
-    def _init_gm() -> GraphModule:
-        """Initialize a fake graph module.
-
-        This is a dummy graph module that will be used to kick off the transforms.
-        """
-        return GraphModule(nn.Module(), Graph())
-
-    def __call__(
-        self, cm: CachedSequenceInterface, gm: Optional[GraphModule] = None
-    ) -> GraphModule:
+    def __call__(self, cm: CachedSequenceInterface, mod: Optional[nn.Module] = None) -> nn.Module:
         """Transform a model into an optimized inference model.
 
         Args:
             cm: The cached sequence interface defining the sequence interface.
+            mod: The model to transform.
 
         Returns:
-            A GraphModule representing the optimized inference model.
+            A nn.Module representing the optimized inference model.
         """
         ############################################################################################
         # RUN THROUGH CONFIGURED TRANSFORMATIONS
         ############################################################################################
 
-        # start with an empty fake graph module if not provided
-        if gm is None:
-            gm = self._init_gm()
+        # start with an empty model if not provided
+        if mod is None:
+            mod = nn.Module()
 
         # iterate over all transforms sorted by stage in the config
-        for t_name, t_config in self.config.items():
+        start_time = time.time()
+        for idx, (t_name, t_config) in enumerate(self.config.items()):
             # instantiate transform
             transform = TransformRegistry.get(t_name)(t_config)
             # run transform
-            gm = transform(gm, cm, self.factory, self.shared_config)
+            mod = transform(mod, cm, self.factory, self.shared_config, idx)
+        total_time = time.time() - start_time
+        ad_logger.info(f"Total time for all transforms: {total_time:.2f}s")
 
         ############################################################################################
-        # RETURN OPTIMIZED GRAPH
+        # RETURN OPTIMIZED MODEL
         ############################################################################################
-        return gm
+        torch.cuda.empty_cache()
+        gc.collect()
+        return mod

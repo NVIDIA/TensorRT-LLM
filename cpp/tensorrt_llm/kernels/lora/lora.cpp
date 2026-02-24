@@ -15,18 +15,21 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/lora/lora.h"
-
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
+
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/groupGemm.h"
+#include "tensorrt_llm/kernels/lora/lora.h"
 #include "tensorrt_llm/kernels/splitkGroupGemm.h"
 #include "tensorrt_llm/runtime/iBuffer.h"
 
 #include <algorithm>
 #include <utility>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 // TODO should reuse the function in gemmPlugin
@@ -296,7 +299,7 @@ int LoraImpl::run(int64_t numTokens, int64_t numReqs, void const* input, int32_t
                         + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));
 
                     auto const N2 = mOutHiddenSizes[loraModuleIdx];
-                    cutlass::gemm::GemmCoord problem_2(M, N2, N);
+                    cutlass::gemm::GemmCoord problem_2(M, N2, N); // token_num, module_output_size, lora_rank
                     problem_sizes_2.push_back(problem_2);
                     ptrA_2.push_back(static_cast<void*>(static_cast<char*>(lowRankWorkSpace)
                         + (loraModuleIdx * numTokens * mMaxLowRank + handled_token_num * mMaxLowRank) * typeSize));
@@ -339,4 +342,6 @@ int Lora_run(LoraImpl* impl, int64_t numTokens, int64_t numReqs, void const* inp
     return impl->run(numTokens, numReqs, input, loraRanks, loraWeightsPtr, weightIndex, outputs, workspace, stream);
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

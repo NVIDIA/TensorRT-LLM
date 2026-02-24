@@ -37,12 +37,12 @@ class VisionTower(nn.Module):
 
         if "clip" in self.name:
             self.vision_tower = AutoModel.from_pretrained(
-                model_name_or_path, torch_dtype=config.model_dtype)
+                model_name_or_path, dtype=config.model_dtype)
         elif "siglip" in self.name:
             self.vision_tower = AutoModel.from_pretrained(
                 model_name_or_path,
                 attn_implementation="flash_attention_2",
-                torch_dtype="auto")
+                dtype="auto")
         else:
             raise ValueError(f"Unsupported vision tower: {self.name}")
 

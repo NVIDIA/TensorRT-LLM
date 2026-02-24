@@ -263,11 +263,11 @@ void terminateRequest(SequenceSlotManager& seqSlotManager, LlmRequest& llmReq, S
     auto const requestId = llmReq.mRequestId;
     if (kvCacheManager)
     {
-        kvCacheManager->removeSequence(requestId, llmReq);
+        (void) kvCacheManager->removeSequence(requestId, llmReq);
     }
     if (crossKvCacheManager)
     {
-        crossKvCacheManager->removeSequence(requestId, llmReq);
+        (void) crossKvCacheManager->removeSequence(requestId, llmReq);
     }
     if (pause && !llmReq.isGenerationCompleteState())
     {

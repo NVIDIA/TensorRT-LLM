@@ -12,7 +12,8 @@ from .quantization import FusedMoEQuantScalesFP8
 from .routing import (BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod,
                       DefaultMoeRoutingMethod,
                       Llama4RenormalizeMoeRoutingMethod,
-                      LoadBalancedMoeRoutingMethod, RenormalizeMoeRoutingMethod,
+                      LoadBalancedMoeRoutingMethod, MiniMaxM2MoeRoutingMethod,
+                      RenormalizeMoeRoutingMethod,
                       RenormalizeNaiveMoeRoutingMethod, RoutingMethodType,
                       SparseMixerMoeRoutingMethod, StaticMoeRoutingMethod,
                       create_renormalize_expert_load_balanced_logits)
@@ -33,6 +34,7 @@ __all__ = [
     "MoE",
     "MoeLoadBalancer",
     "MoEWeightLoadingMode",
+    "MiniMaxM2MoeRoutingMethod",
     "RenormalizeMoeRoutingMethod",
     "RenormalizeNaiveMoeRoutingMethod",
     "RoutingMethodType",

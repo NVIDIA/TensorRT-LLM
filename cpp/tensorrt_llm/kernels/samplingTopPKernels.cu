@@ -17,10 +17,12 @@
 #error CUDART_VERSION Undefined!
 #elif (CUDART_VERSION >= 11050)
 #include <cub/cub.cuh>
+
 #else
 #include "3rdparty/cub/cub.cuh"
 #endif
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
@@ -30,7 +32,9 @@
 using namespace tensorrt_llm::common;
 using namespace tensorrt_llm::runtime;
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 __global__ void topPInitialize(TokenIdType* topPIdValBuf, SizeType32* topPOffsetBuf, SizeType32* beginTopPOffsetBuf,
     SizeType32 batchSize, SizeType32 vocabSize)
@@ -515,4 +519,6 @@ void invokeSetTopPRuntimeArgs(SizeType32 batchSize, ScatterDecodingParamEntry<Si
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

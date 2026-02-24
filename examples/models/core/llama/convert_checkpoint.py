@@ -227,7 +227,7 @@ def parse_arguments():
     parser.add_argument('--output_dir',
                         type=str,
                         default='tllm_checkpoint',
-                        help='The path to save the TensorRT-LLM checkpoint')
+                        help='The path to save the TensorRT LLM checkpoint')
     parser.add_argument(
         '--workers',
         type=int,
@@ -443,7 +443,7 @@ def from_cli_args(args):
             'moe_ep_size': args.moe_ep_size,
             'cp_size': args.cp_size,
         },
-        'quantization': args_to_quant_config(args).to_dict()
+        'quantization': args_to_quant_config(args).model_dump()
     }
     config.update(args_to_build_options(args))
     return config

@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include <assert.h>
 #include <cstdlib>
@@ -28,8 +29,8 @@
 #include <string>
 #include <type_traits>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace common
 {
 static __host__ __device__ int hash(int val)
@@ -673,4 +674,5 @@ struct MultiProducerCircularBuffer : public CircularBuffer<DEPTH, CTAS_PER_CGA>
 };
 
 } // namespace common
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

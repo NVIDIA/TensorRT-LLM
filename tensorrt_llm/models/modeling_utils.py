@@ -14,12 +14,12 @@ from typing import (TYPE_CHECKING, Callable, Dict, Generator, List, Optional,
 import numpy as np
 import safetensors
 import torch
+from pydantic import Field, PrivateAttr
 
 from .._common import default_net
 from .._utils import (QuantModeWrapper, get_init_params, numpy_to_torch,
                       release_gc, str_dtype_to_torch, str_dtype_to_trt,
                       trt_dtype_to_torch)
-from ..bindings import KVCacheType
 from ..bindings.executor import RuntimeDefaults
 from ..functional import (PositionEmbeddingType, Tensor, allgather, constant,
                           cp_split_plugin, gather_last_token_logits,
@@ -31,6 +31,8 @@ from ..layers.attention import Attention, BertAttention
 from ..layers.linear import ColumnLinear, Linear, RowLinear
 from ..layers.lora import Dora, Lora
 from ..layers.moe import MOE, MoeOOTB
+from ..llmapi.kv_cache_type import KVCacheType
+from ..llmapi.utils import StrictBaseModel
 from ..logger import logger
 from ..mapping import Mapping
 from ..module import Module, ModuleList
@@ -98,6 +100,7 @@ class SpeculativeDecodingMode(IntFlag):
     EAGLE = auto()
     NGRAM = auto()
     USER_PROVIDED = auto()
+    SAVE_HIDDEN_STATES = auto()
     AUTO = auto()
 
     @staticmethod
@@ -120,37 +123,42 @@ class SpeculativeDecodingMode(IntFlag):
             return SpeculativeDecodingMode.USER_PROVIDED
         elif args.speculative_decoding_mode == "auto":
             return SpeculativeDecodingMode.AUTO
+        elif args.speculative_decoding_mode == "save_hidden_states":
+            return SpeculativeDecodingMode.SAVE_HIDDEN_STATES
         else:
             assert False, "Unknown speculative_decoding_mode " + args.speculative_decoding_mode
 
 
-@dataclasses.dataclass
-class QuantConfig:
-    """
-    Serializable quantization configuration class, part of the PretrainedConfig.
+class QuantConfig(StrictBaseModel):
+    """Serializable quantization configuration class, part of the PretrainedConfig."""
 
-    Args:
-        quant_algo (tensorrt_llm.quantization.mode.QuantAlgo, optional): Quantization algorithm. Defaults to None.
-        kv_cache_quant_algo (tensorrt_llm.quantization.mode.QuantAlgo, optional): KV cache quantization algorithm. Defaults to None.
-        group_size (int): The group size for group-wise quantization. Defaults to 128.
-        smoothquant_val (float): The smoothing parameter alpha used in smooth quant. Defaults to 0.5.
-        clamp_val (List[float], optional): The clamp values used in FP8 rowwise quantization. Defaults to None.
-        use_meta_recipe (bool): Whether to use Meta's recipe for FP8 rowwise quantization. Defaults to False.
-        has_zero_point (bool): Whether to use zero point for quantization. Defaults to False.
-        pre_quant_scale (bool): Whether to use pre-quant scale for quantization. Defaults to False.
-        exclude_modules (List[str], optional): The module name patterns that are skipped in quantization. Defaults to None.
-        mamba_ssm_cache_dtype (str, optional): The data type for mamba SSM cache. Defaults to None.
-    """
-    quant_algo: Optional[QuantAlgo] = None
-    kv_cache_quant_algo: Optional[QuantAlgo] = None
-    group_size: int = 128
-    smoothquant_val: float = 0.5
-    clamp_val: Optional[List[float]] = None
-    use_meta_recipe: bool = False
-    has_zero_point: bool = False
-    pre_quant_scale: bool = False
-    exclude_modules: Optional[List[str]] = None
-    mamba_ssm_cache_dtype: Optional[str] = None
+    quant_algo: Optional[QuantAlgo] = Field(
+        default=None, description="Quantization algorithm.")
+    kv_cache_quant_algo: Optional[QuantAlgo] = Field(
+        default=None, description="KV cache quantization algorithm.")
+    group_size: Optional[int] = Field(
+        default=128, description="Group size for group-wise quantization.")
+    smoothquant_val: float = Field(
+        default=0.5,
+        description="Smoothing parameter alpha used in smooth quant.")
+    clamp_val: Optional[List[float]] = Field(
+        default=None,
+        description="Clamp values used in FP8 rowwise quantization.")
+    use_meta_recipe: bool = Field(
+        default=False,
+        description="Whether to use Meta's recipe for FP8 rowwise quantization."
+    )
+    has_zero_point: bool = Field(
+        default=False,
+        description="Whether to use zero point for quantization.")
+    pre_quant_scale: bool = Field(
+        default=False,
+        description="Whether to use pre-quant scale for quantization.")
+    exclude_modules: Optional[List[str]] = Field(
+        default=None,
+        description="Module name patterns that are skipped in quantization.")
+    mamba_ssm_cache_dtype: Optional[str] = Field(
+        default=None, description="Data type for mamba SSM cache.")
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
@@ -246,6 +254,8 @@ class QuantConfig:
                     return True
         return False
 
+    # NOTE: this is kept for backward compatibility with external libraries (e.g., modelopt).
+    # For new code, prefer directly using QuantConfig(**config) instead.
     @classmethod
     def from_dict(cls, config: dict) -> 'QuantConfig':
         """Create a QuantConfig instance from a dict.
@@ -259,86 +269,58 @@ class QuantConfig:
         obj = cls(**config)
         return obj
 
-    def to_dict(self) -> dict:
-        """Dump a QuantConfig instance to a dict.
 
-        Returns:
-            dict: The dict dumped from QuantConfig.
-        """
-        return dataclasses.asdict(self)
+class LayerQuantConfig(StrictBaseModel):
+    """Configuration for layer-wise/mixed-precision quantization."""
 
+    quant_algo: Optional[QuantAlgo] = Field(
+        default=None,
+        description="Quantization algorithm (typically MIXED_PRECISION).")
+    kv_cache_quant_algo: Optional[QuantAlgo] = Field(
+        default=None, description="KV cache quantization algorithm.")
+    quantized_layers: Dict[str, QuantConfig] = Field(
+        default_factory=dict,
+        description="Per-layer quantization configurations.")
 
-@dataclasses.dataclass
-class LayerQuantConfig(QuantConfig):
-    quant_algo: Optional[QuantConfig] = None
-    kv_cache_quant_algo: Optional[QuantConfig] = None
-    quantized_layers: Optional[Dict[str, QuantConfig]] = None
+    # Computed cache, not serialized
+    _auto_quant_mode: Dict[str, QuantMode] = PrivateAttr(default_factory=dict)
 
-    def __init__(self,
-                 *,
-                 quant_algo: Optional[QuantConfig] = None,
-                 kv_cache_quant_algo: Optional[QuantConfig] = None,
-                 quantized_layers: Optional[Dict[str, QuantConfig]] = None,
-                 **kwargs):
-        self.quant_algo = quant_algo
-        self.quantized_layers = quantized_layers
-        self.kv_cache_quant_algo = kv_cache_quant_algo
-        self.auto_quant_mode = {}
-        for name, layer_config in self.quantized_layers.items():
-            self.auto_quant_mode.update({
-                name:
-                QuantMode.from_quant_algo(
+    def model_post_init(self, __context) -> None:
+        """Compute auto_quant_mode after initialization."""
+        self._auto_quant_mode = {}
+        if self.quantized_layers:
+            for name, layer_config in self.quantized_layers.items():
+                self._auto_quant_mode[name] = QuantMode.from_quant_algo(
                     layer_config.quant_algo,
                     self.kv_cache_quant_algo,
                 )
-            })
-        for key in kwargs:
-            logger.warning(
-                f"Warning: Unrecognized parameter '{key}' with value '{kwargs[key]}'"
-            )
 
-    @cached_property
-    def quant_mode(self):
-        quant_mode_list = list(set(self.auto_quant_mode.values()))
+    @property
+    def auto_quant_mode(self) -> Dict[str, QuantMode]:
+        return self._auto_quant_mode
+
+    @property
+    def quant_mode(self) -> QuantModeWrapper:
+        quant_mode_list = list(set(self._auto_quant_mode.values()))
         return QuantModeWrapper(quant_mode_list)
 
-    #@lru_cache(maxsize=None)
     def layer_quant_mode(self, layer_name) -> QuantMode:
-
-        for name, quant_mode in self.auto_quant_mode.items():
+        for name, quant_mode in self._auto_quant_mode.items():
             if fnmatch.fnmatch(layer_name, name):
                 return quant_mode
-
         return QuantMode(0)
 
-    @cached_property
-    def auto_quant_list(self):
-        quant_list = []
-        for _, layer_config in self.quantized_layers.items():
-            quant_list.append(layer_config.quant_algo)
-        return list(set(quant_list))
+    @property
+    def auto_quant_list(self) -> List[QuantAlgo]:
+        if not self.quantized_layers:
+            return []
+        return list(set(lc.quant_algo for lc in self.quantized_layers.values()))
 
-    @classmethod
-    def from_dict(cls, config: dict):
-        quantized_layers = config.pop('quantized_layers', {})
-
-        quantized_layers_dict = {
-            layer_name: QuantConfig(**layer_config)
-            for layer_name, layer_config in quantized_layers.items()
-        }
-
-        obj = cls(quantized_layers=quantized_layers_dict, **config)
-        return obj
-
-    #@lru_cache(maxsize=None)
-    def _get_quant_cfg(self, module_name):
-        quant_res = QuantConfig()
-
+    def _get_quant_cfg(self, module_name) -> QuantConfig:
         for name, quant_cfg in self.quantized_layers.items():
             if fnmatch.fnmatch(module_name, name):
-                quant_res = quant_cfg
-                break
-        return quant_res
+                return quant_cfg
+        return QuantConfig()
 
     def _get_modelopt_qformat(self):
         algo_to_modelopt_map = {
@@ -348,19 +330,17 @@ class LayerQuantConfig(QuantConfig):
             QuantAlgo.W4A8_AWQ: "w4a8_awq",
             QuantAlgo.W8A8_SQ_PER_CHANNEL: "int8_sq",
         }
-        assert self.quant_algo == QuantAlgo.MIXED_PRECISION, f"We only support mixed precision quantization in LayerQuantConfig"
+        assert self.quant_algo == QuantAlgo.MIXED_PRECISION, \
+            "We only support mixed precision quantization in LayerQuantConfig"
         autoq_format = ','.join(
             [algo_to_modelopt_map[item] for item in self.auto_quant_list])
         return autoq_format
 
-    def to_dict(self):
-        output = copy.deepcopy(self.__dict__)
-        output.pop('auto_quant_mode', None)
-        output.pop('quant_mode', None)
-        for name, per_layer_config in output['quantized_layers'].items():
-            per_layer_config = per_layer_config.to_dict()
-            output['quantized_layers'][name] = per_layer_config
-        return output
+    # NOTE: this is kept for backward compatibility with external libraries (e.g., modelopt).
+    # For new code, prefer directly using LayerQuantConfig(**config) instead.
+    @classmethod
+    def from_dict(cls, config: dict) -> 'LayerQuantConfig':
+        return cls(**config)
 
 
 class PretrainedConfig:
@@ -429,8 +409,8 @@ class PretrainedConfig:
         if quantization is None:
             quantization = QuantConfig()
         elif isinstance(quantization, dict):
-            quantization = QuantConfig.from_dict(quantization)
-        assert isinstance(quantization, QuantConfig)
+            quantization = QuantConfig(**quantization)
+        assert isinstance(quantization, (QuantConfig, LayerQuantConfig))
         self.quantization = quantization
 
         self.use_parallel_embedding = use_parallel_embedding
@@ -494,7 +474,7 @@ class PretrainedConfig:
         output['position_embedding_type'] = str(self.position_embedding_type)
         output['mapping'] = self.mapping.to_dict()
         output['mapping'].pop('rank')
-        output['quantization'] = self.quantization.to_dict()
+        output['quantization'] = self.quantization.model_dump()
 
         return output
 
@@ -537,7 +517,7 @@ class PretrainedConfig:
                         assert quant_cfg == config["quantized_layers"][
                             moe_name], "MoE module needs to have the same quantization format for non-rounter sub-modules"
 
-        self.quantization = LayerQuantConfig.from_dict(config)
+        self.quantization = LayerQuantConfig.model_validate(config)
 
     @property
     def quant_mode(self):
@@ -736,13 +716,12 @@ class PretrainedModel(Module,
             config.set_rank(rank)
 
         rank = config.mapping.rank
-        if config.mapping.auto_parallel:
-            rank = 0
-        elif config.mapping.cp_size > 1:
-            # tp_cp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt
-            tp_size = config.mapping.tp_size
+        if config.mapping.cp_size > 1:
+            # cp_tp_pp rank -> tp_pp rank: because different cp ranks share the same ckpt.
             cp_size = config.mapping.cp_size
-            rank = rank % tp_size + rank // (tp_size * cp_size) * tp_size
+            # rank = pp_rank × tp_size × cp_size + tp_rank × cp_size + cp_rank.
+            # rank // cp_size is equivalent to pp_rank × tp_size + tp_rank.
+            rank = rank // cp_size
         weights_path = os.path.join(ckpt_dir, f'rank{rank}.safetensors')
 
         assert os.path.isfile(weights_path)
@@ -1304,7 +1283,7 @@ def unfuse_qkv_gemm(model: PretrainedModel) -> PretrainedModel:
 
     for name, layer in model.named_modules():
         if isinstance(layer, Attention) and not layer.cross_attention:
-            assert layer.tp_size == 1, "please disable manual tp when enable auto parallel"
+            assert layer.tp_size == 1, "unfuse_qkv_gemm requires tp_size == 1"
             if layer.qkv is None:
                 continue
             qkv_params = get_init_params(layer.qkv, ColumnLinear)
@@ -1963,7 +1942,7 @@ def save_config(config: PretrainedConfig, *, output_dir: str,
                 log: bool) -> None:
     config_path = Path(output_dir) / "config.json"
     if log:
-        logger.debug(f"Saving TensorRT-LLM configuration to {config_path}")
+        logger.debug(f"Saving TensorRT LLM configuration to {config_path}")
     config_path.parent.mkdir(exist_ok=True, parents=True)
     config_path.write_text(json.dumps(config.to_dict(), indent=4))
 

@@ -14,7 +14,8 @@ from pydantic_settings import (
     SettingsConfigDict,
 )
 
-from tensorrt_llm._torch.auto_deploy import LLM, AutoDeployConfig, DemoLLM
+from tensorrt_llm._torch.auto_deploy import LLM, DemoLLM
+from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
 from tensorrt_llm._torch.auto_deploy.utils._config import (
     DynamicYamlMixInForSettings,
     deep_merge_dicts,
@@ -62,7 +63,7 @@ class PromptConfig(BaseModel):
         "apply_chat_template.",
     )
     sp_kwargs: Dict[str, Any] = Field(
-        default_factory=lambda: {"max_tokens": 100, "top_k": 200, "temperature": 1.0},
+        default_factory=lambda: {"max_tokens": 100, "top_k": None, "temperature": 1.0},
         description="Sampling parameter kwargs passed on the SamplingParams class. "
         "Defaults are set to the values used in the original model.",
     )
@@ -139,9 +140,9 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
 
     ### CORE ARGS ##################################################################################
     # The main AutoDeploy arguments - contains model, tokenizer, backend configs, etc.
-    args: AutoDeployConfig = Field(
+    args: LlmArgs = Field(
         description="The main AutoDeploy arguments containing model, tokenizer, backend configs, etc. "
-        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.AutoDeployConfig` for more details."
+        "Please check `tensorrt_llm._torch.auto_deploy.llm_args.LlmArgs` for more details."
     )
 
     # Optional model field for convenience - if provided, will be used to initialize args.model
@@ -211,7 +212,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     def sync_model_with_args(cls, model_value, info):
         if "args" not in info.data:
             return model_value
-        args: AutoDeployConfig = info.data["args"]
+        args: LlmArgs = info.data["args"]
         return args.model
 
     @field_validator("prompt", mode="after")
@@ -219,7 +220,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     def sync_prompt_batch_size_with_args_max_batch_size(cls, prompt: PromptConfig, info):
         if "args" not in info.data:
             return prompt
-        args: AutoDeployConfig = info.data["args"]
+        args: LlmArgs = info.data["args"]
         if args.max_batch_size < prompt.batch_size:
             args.max_batch_size = prompt.batch_size
         return prompt
@@ -229,7 +230,7 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
     def adjust_args_for_benchmark(cls, benchmark: BenchmarkConfig, info):
         if "args" not in info.data:
             return benchmark
-        args: AutoDeployConfig = info.data["args"]
+        args: LlmArgs = info.data["args"]
         if benchmark.enabled:
             # propagate benchmark settings to args
             args.max_batch_size = max(benchmark.bs, args.max_batch_size)
@@ -244,7 +245,7 @@ def build_llm_from_config(config: ExperimentConfig) -> LLM:
         "demollm": DemoLLM,
         "trtllm": LLM,
     }
-    llm = llm_lookup[config.args.runtime](**config.args.to_llm_kwargs())
+    llm = llm_lookup[config.args.runtime](**config.args.model_dump(exclude_unset=True))
     return llm
 
 
@@ -275,12 +276,16 @@ def main(config: Optional[ExperimentConfig] = None):
         config.prompt.queries,
         sampling_params=SamplingParams(**config.prompt.sp_kwargs),
     )
-    results = {"prompts_and_outputs": print_outputs(outs)}
+    results = {
+        "prompts_and_outputs": print_outputs(outs),
+    }
+    # Add config values so they get logged to JET extra
+    results.update(config.model_dump(mode="json"))
 
     # run a benchmark for the model with batch_size == config.benchmark_bs
     if config.benchmark.enabled and config.args.runtime != "trtllm":
         ad_logger.info("Running benchmark...")
-        keys_from_args = ["compile_backend", "attn_backend", "mla_backend"]
+        keys_from_args = []
         fields_to_show = [f"benchmark={config.benchmark}"]
         fields_to_show.extend([f"{k}={getattr(config.args, k)}" for k in keys_from_args])
         results["benchmark_results"] = benchmark(
@@ -304,6 +309,7 @@ def main(config: Optional[ExperimentConfig] = None):
         store_benchmark_results(results, config.benchmark.results_path)
 
     llm.shutdown()
+    return results
 
 
 if __name__ == "__main__":

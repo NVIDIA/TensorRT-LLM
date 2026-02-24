@@ -17,23 +17,25 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 
 #include <limits>
 #include <string>
 #include <unordered_map>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 
 enum class DecodingPenaltyType
 {
-    Temperature, // the temperature penalty
-    Repetition,  // the repetition penalty
-    Presence,    // the presence penalty
-    Frequency,   // the frequency penalty
-    MinLength,   // the min length penalty
+    Temperature,        // the temperature penalty
+    Repetition,         // the repetition penalty
+    Presence,           // the presence penalty
+    Frequency,          // the frequency penalty
+    MinLength,          // the min length penalty
+    PromptIgnoreLength, // the prompt ignore length for presence/frequency penalty
 };
 
 inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
@@ -49,9 +51,11 @@ inline std::pair<float, float> getLimitsPenalty(DecodingPenaltyType penaltyType)
     case DecodingPenaltyType::Presence: return std::make_pair(fltMin, fltMax);
     case DecodingPenaltyType::Frequency: return std::make_pair(fltMin, fltMax);
     case DecodingPenaltyType::MinLength: return std::make_pair(-fltEpsilon, fltMax);
+    case DecodingPenaltyType::PromptIgnoreLength: return std::make_pair(-fltEpsilon, fltMax);
     }
     TLLM_CHECK_WITH_INFO(false, "Unknown penalty type %d", static_cast<int32_t>(penaltyType));
     return std::make_pair(fltMin, fltMax);
 }
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

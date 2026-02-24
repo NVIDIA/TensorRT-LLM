@@ -1,0 +1,52 @@
+version: 0.0.1
+l0_b300:
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 1
+        lte: 1
+    wildcards:
+      gpu:
+      - '*gb110*'
+      - '*b300*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+  tests:
+  # ------------- PyTorch tests ---------------
+  - unittest/_torch/attention # 200s
+  - unittest/_torch/thop/parallel TIMEOUT (90)
+  - unittest/_torch/thop/serial
+  - unittest/_torch/executor # 250s
+  # ------------- modules (non-MoE) ---------------
+  - unittest/_torch/modules/test_mla_helix.py
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/test_awq_quantization.py
+  - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/mamba
+  - unittest/_torch/modules/tests_lora_modules
+  # ------------- MoE components tests ---------------
+  - unittest/_torch/modules/test_moe_load_balancer.py
+  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/modules/test_moe_host_sharer.py
+  # ------------- legacy MoE tests ---------------
+  - unittest/_torch/modules/test_fused_moe.py
+  # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  # ------------- MoE: test_single_gpu (by backend) ---------------
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  # ---- end MoE tests ----
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
+  - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=CUTLASS-mtp_nextn=2-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]

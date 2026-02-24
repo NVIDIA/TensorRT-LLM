@@ -79,6 +79,17 @@ class Executor::Impl
     using LlmRequestPtr = std::shared_ptr<batch_manager::LlmRequest>;
     using RequestList = std::list<LlmRequestPtr>;
 
+    // When block reuse is enabled for context worker for disaggregated serving,
+    // we need to store the pinned block ids so that we can unpin them when
+    // the request is finished.
+    struct InTransmissionItem
+    {
+        LlmRequestPtr request;
+        std::vector<SizeType32> pinnedBlockIds;
+    };
+
+    using InTransList = std::list<InTransmissionItem>;
+
 public:
     Impl(std::filesystem::path const& modelPath, std::optional<std::filesystem::path> const& encoderModelPath,
         [[maybe_unused]] ModelType modelType, ExecutorConfig const& executorConfig);
@@ -167,9 +178,20 @@ private:
 
     void initializeLogitsPostProcessorBatched(LogitsPostProcessorConfig const& logitsProcConfig);
 
-    IdType generateReqId()
+    IdType generateReqId(Request const& request)
     {
-        return (mLastReqId++ % UINT64_MAX);
+        // If the request has a disaggregated request id, prefer it.
+        if (request.getDisaggRequestId().has_value() && request.getDisaggRequestId().value() > kMaxLocalReqId)
+        {
+            return request.getDisaggRequestId().value();
+        }
+        // Otherwise, generate a local request id in range [1, kMaxLocalReqId).
+        return generateLocalReqId();
+    }
+
+    IdType generateLocalReqId()
+    {
+        return (mLastReqId++ % kMaxLocalReqId);
     }
 
     std::vector<RequestWithId> getLeaderNewReqWithIds(
@@ -206,7 +228,7 @@ private:
 
     void terminateCancelledRequests(RequestList& activeRequests);
 
-    void terminateContextFinishedRequests(RequestList& inTransmissionRequests);
+    void terminateContextFinishedRequests(InTransList& inTransmissionRequests);
 
     void appendNewResponses(std::vector<Response>&& newResponses);
 
@@ -215,7 +237,7 @@ private:
     ///        and returned for bookkeeping.
     /// @return A list of requests that have completed.
     RequestList populateNewResponses(
-        RequestList& activeRequests, RequestList& inTransmissionRequests, std::vector<Response>& newResponses);
+        RequestList& activeRequests, InTransList& inTransmissionRequests, std::vector<Response>& newResponses);
 
     void executionLoop();
 
@@ -304,7 +326,10 @@ private:
 
     IdType mLastReqId = 1;
 
-    static constexpr IdType mTerminateReqId = 0;
+    static constexpr IdType kTerminateReqId = 0;
+    // Request id > kMaxLocalReqId is reserved for disaggregated requests.
+    // This max ID is also in Python side.
+    static constexpr IdType kMaxLocalReqId = 1ULL << 42U;
 
     BatchingType mBatchingType;
     bool mIsSchedulerMaxUtilization;

@@ -17,17 +17,14 @@
 #pragma once
 
 #include "cutlass_extensions/gemm_configs.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 
 #include <cuda_runtime_api.h>
 #include <vector>
 
-// namespace tk = tensorrt_llm::common;
+TRTLLM_NAMESPACE_BEGIN
 
-namespace tkc = tensorrt_llm::cutlass_extensions;
-
-namespace tensorrt_llm
-{
 namespace kernels
 {
 namespace cutlass_kernels
@@ -126,4 +123,4 @@ private:
 
 }; // namespace cutlass_kernels
 }; // namespace kernels
-}; // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END

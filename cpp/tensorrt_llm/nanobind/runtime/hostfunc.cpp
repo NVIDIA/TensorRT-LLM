@@ -78,8 +78,12 @@ std::optional<uintptr_t> launchHostFunc(
 {
     auto const stream = reinterpret_cast<cudaStream_t>(streamPtr);
 
+    nb::gil_scoped_acquire gil;
+
     auto hostFuncUserData
         = std::make_unique<HostFuncUserData>(freeUserData, pyHostFunc, nb::tuple(pyArgs), nb::dict(pyKwargs));
+
+    nb::gil_scoped_release release;
 
     cudaError_t err = cudaLaunchHostFunc(stream, cudaHostFuncTrampoline, hostFuncUserData.get());
     if (err != cudaSuccess)
@@ -110,6 +114,7 @@ void initHostFuncBindings(nb::module_& m)
 {
     m.def("launch_hostfunc", &launchHostFunc, "Launch a Python host function to a CUDA stream",
         nb::call_guard<nb::gil_scoped_release>());
-    m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function");
+    m.def("free_hostfunc_user_data", &freeHostFuncUserData, "Free the user data for the Python host function",
+        nb::call_guard<nb::gil_scoped_release>());
 }
 } // namespace tensorrt_llm::nanobind::runtime

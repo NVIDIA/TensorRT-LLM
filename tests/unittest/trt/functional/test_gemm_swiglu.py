@@ -82,11 +82,11 @@ class TestGemmSwiglu(unittest.TestCase):
             net.plugin_config.gemm_swiglu_plugin = dtype
 
         with tensorrt_llm.net_guard(net):
-            # Init TensorRT-LLM tensor for x
+            # Init TensorRT LLM tensor for x
             x_tensor = Tensor(name='x',
                               shape=x.shape,
                               dtype=str_dtype_to_trt(dtype))
-            # Init TensorRT-LLM tensor for w
+            # Init TensorRT LLM tensor for w
             w_tensor = Tensor(name='w',
                               shape=w.shape,
                               dtype=str_dtype_to_trt(dtype))

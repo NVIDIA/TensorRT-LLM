@@ -14,10 +14,11 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
                                                         LlmRequestState,
                                                         SamplingConfig)
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (KVCacheManager,
+                                                             KVCacheManagerV2)
 from tensorrt_llm._utils import str_dtype_to_binding, torch_dtype_to_str
-from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -269,7 +270,7 @@ class Scenario:
     rope_original_max_position_embeddings: int = 4096
     rope_type: str = "yarn"
     model_type: str = "deepseek_v3"
-    kv_cache_tokens_per_block: int = 64
+    kv_cache_tokens_per_block: int = 32
 
 
 @dataclass(kw_only=True, frozen=True)
@@ -329,11 +330,16 @@ context_sequence_lengths = [
 generation_seq_len_q = [1, 4]
 num_generation_steps = [10]
 
+# tokens_per_block = 32 for blackwell
+tokens_per_block = 32 if torch.cuda.get_device_capability() >= (10, 0) else 64
+
 kv_cache_dtype_list = [torch.bfloat16]
 if torch.cuda.get_device_capability() in [(8, 9), (9, 0), (10, 0), (12, 0)]:
     kv_cache_dtype_list.append(torch.float8_e4m3fn)
 scenarios = [
-    Scenario(kv_cache_dtype=kv_cache_dtype, num_layers=num_layers)
+    Scenario(kv_cache_dtype=kv_cache_dtype,
+             num_layers=num_layers,
+             kv_cache_tokens_per_block=tokens_per_block)
     for kv_cache_dtype in kv_cache_dtype_list for num_layers in [1, 2]
 ]
 
@@ -354,10 +360,13 @@ accuracy_dict = {
 @pytest.mark.parametrize("num_generation_steps",
                          num_generation_steps,
                          ids=lambda x: f"num_generation_steps: {x}")
+@pytest.mark.parametrize("v2_kv_cache", [True, False],
+                         ids=["v2_kv_cache", "v1_kv_cache"])
 def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                        generation_seq_len_q: int,
-                       num_generation_steps: List[int]):
+                       num_generation_steps: List[int], v2_kv_cache: bool):
     """Test MLA computation for both context and generation phases"""
+
     num_heads = scenario.num_heads
     num_kv_heads = scenario.num_kv_heads
     q_lora_rank = scenario.q_lora_rank
@@ -398,7 +407,8 @@ def test_attention_mla(scenario: Scenario, context_sequence_lengths: List[int],
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps)
+                          generation_seq_len_q, num_generation_steps,
+                          v2_kv_cache)
 
 
 def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
@@ -406,7 +416,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                           qk_rope_head_dim, v_head_dim, rope_config,
                           kv_cache_tokens_per_block, device, dtype,
                           kv_cache_dtype, context_sequence_lengths,
-                          generation_seq_len_q, num_generation_steps):
+                          generation_seq_len_q, num_generation_steps,
+                          v2_kv_cache):
     AttentionCls = get_attention_backend(backend_name)
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
 
@@ -592,7 +603,8 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         (num_generation_steps + 1) * generation_seq_len_q +
         kv_cache_tokens_per_block - 1
     ) // kv_cache_tokens_per_block * kv_cache_tokens_per_block * max_num_contexts
-    kv_cache_manager = KVCacheManager(
+    kv_cache_cls = KVCacheManagerV2 if v2_kv_cache else KVCacheManager
+    kv_cache_manager = kv_cache_cls(
         KvCacheConfig(
             max_tokens=max_tokens,
             enable_block_reuse=False,
@@ -620,8 +632,14 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         )
         req.paged_kv_block_ids = []
         beam_width = 1
-        kv_cache_manager.impl.add_sequence(req_id, ctx_len, beam_width, req)
         request_list.append(req)
+        if v2_kv_cache:
+            kv_cache = kv_cache_manager._create_kv_cache(req_id, None, None)
+            success = kv_cache.resume(torch.cuda.current_stream().cuda_stream)
+            assert success, f"Failed to resume KV cache for request {req_id}"
+            kv_cache.capacity = ctx_len
+        else:
+            kv_cache_manager.impl.add_sequence(req_id, ctx_len, beam_width, req)
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(context_sequence_lengths, dtype=torch.int),
         request_ids=list(range(len(context_sequence_lengths))),
@@ -644,7 +662,11 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
         if step > 0:
             for req_id in range(len(context_sequence_lengths)):
                 for _ in range(generation_seq_len_q):
-                    kv_cache_manager.impl.add_token(req_id)
+                    if v2_kv_cache:
+                        kv_cache = kv_cache_manager.kv_cache_map[req_id]
+                        kv_cache.capacity += 1
+                    else:
+                        kv_cache_manager.impl.add_token(req_id)
             attn_metadata = AttentionCls.Metadata(
                 seq_lens=torch.tensor([generation_seq_len_q] *
                                       len(context_sequence_lengths),
@@ -713,6 +735,44 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     "gen_compressed_kv_list"][step - 1]
                 k_pe = inputs_per_layer[layer_idx]["gen_k_pe_list"][step - 1]
                 latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+
+                num_tokens = fused_q.size(0)
+                num_seqs = attn_metadata.kv_lens_cuda_runtime.size(0)
+                cu_q_seqlens = torch.empty(num_seqs + 1,
+                                           dtype=torch.int32,
+                                           device=q.device)
+                cu_kv_seqlens = torch.empty(num_seqs + 1,
+                                            dtype=torch.int32,
+                                            device=q.device)
+                fmha_scheduler_counter = torch.empty(1,
+                                                     dtype=torch.uint32,
+                                                     device=q.device)
+                has_fp8_kv_cache = gen_layers[
+                    layer_idx].has_fp8_kv_cache if hasattr(
+                        gen_layers[layer_idx], 'has_fp8_kv_cache') else False
+
+                if has_fp8_kv_cache:
+                    mla_bmm1_scale = torch.empty(2,
+                                                 dtype=torch.float32,
+                                                 device=q.device)
+                    mla_bmm2_scale = torch.empty(1,
+                                                 dtype=torch.float32,
+                                                 device=q.device)
+                    quant_q_buffer = torch.empty(
+                        num_tokens,
+                        num_heads * (kv_lora_rank + qk_rope_head_dim),
+                        dtype=torch.uint8,
+                        device=q.device)
+                else:
+                    mla_bmm1_scale = None
+                    mla_bmm2_scale = None
+                    quant_q_buffer = None
+
+                gen_layers[layer_idx].mla_rope_generation(
+                    fused_q, q_pe, latent_cache, attn_metadata, cu_q_seqlens,
+                    cu_kv_seqlens, fmha_scheduler_counter, mla_bmm1_scale,
+                    mla_bmm2_scale, quant_q_buffer)
+
                 result = gen_layers[layer_idx].forward(
                     fused_q,
                     None,
@@ -721,6 +781,12 @@ def _run_test_for_backend(backend_name, num_heads, num_kv_heads, num_layers,
                     attention_input_type=AttentionInputType.generation_only,
                     latent_cache=latent_cache,
                     q_pe=q_pe,
+                    cu_q_seqlens=cu_q_seqlens,
+                    cu_kv_seqlens=cu_kv_seqlens,
+                    fmha_scheduler_counter=fmha_scheduler_counter,
+                    mla_bmm1_scale=mla_bmm1_scale,
+                    mla_bmm2_scale=mla_bmm2_scale,
+                    quant_q_buffer=quant_q_buffer,
                 )
                 ref_result, latent_cache_ref = calculate_ref_result_gen(
                     fused_q,

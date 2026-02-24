@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/stringUtils.h"
 
 #include <array>
@@ -41,7 +42,9 @@
     tensorrt_llm::common::RequestSpecificException(                                                                    \
         __FILE__, __LINE__, tensorrt_llm::common::fmtstr(__VA_ARGS__).c_str(), requestID, errorCode)
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 /// @brief Enumeration of different error codes for request-specific exceptions
@@ -77,7 +80,8 @@ private:
 
 [[noreturn]] inline void throwRuntimeError(char const* const file, int const line, char const* info)
 {
-    throw TllmException(file, line, fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info).c_str());
+    throw TllmException(
+        file, line, tensorrt_llm::common::fmtstr("[TensorRT-LLM][ERROR] Assertion failed: %s", info).c_str());
 }
 
 [[noreturn]] inline void throwRuntimeError(char const* const file, int const line, std::string const& info = "")
@@ -102,4 +106,6 @@ private:
     RequestErrorCode mErrorCode;
 };
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

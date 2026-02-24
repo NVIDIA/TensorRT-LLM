@@ -22,10 +22,6 @@ set(BENCHMARK_ENABLE_TESTING
 set(BENCHMARK_ENABLE_INSTALL
     OFF
     CACHE INTERNAL "Disable google-benchmark install")
-FetchContent_Declare(
-  googlebenchmark
-  GIT_REPOSITORY https://github.com/google/benchmark.git
-  GIT_TAG v1.8.3)
 FetchContent_MakeAvailable(googlebenchmark)
 
 add_custom_target(micro_benchmarks)

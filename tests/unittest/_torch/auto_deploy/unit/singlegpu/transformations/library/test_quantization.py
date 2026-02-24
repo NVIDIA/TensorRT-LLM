@@ -2,17 +2,24 @@
 Tests for basic graph sharding.
 """
 
+from typing import List
+
 import pytest
 import torch
+import torch.nn as nn
 from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MLP, BMMDynamicModel, BMMModel
 from _torch_test_utils import fp4_compatible, fp8_compatible
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import (
+    FullModelExportInfo,
+    ModelFactory,
+    SubModuleExportInfo,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
-from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp8_scale, pack_int4_in_uint8
 
 
 class DummyFactory(ModelFactory):
@@ -29,6 +36,9 @@ class DummyFactory(ModelFactory):
 
     def get_quant_config(self):
         return self.quant_config
+
+    def get_export_infos(self, model: nn.Module) -> List[SubModuleExportInfo]:
+        return [FullModelExportInfo()]
 
 
 @pytest.mark.parametrize(
@@ -183,4 +193,180 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
     # check there's quantization error during transformation
     assert not torch.allclose(model(x), gm_transformed(x))
     # check if we can still export the model as expected
+    torch_export_to_gm(gm_transformed, args=(x,))
+
+
+def _per_block_amax(W: torch.Tensor, block: int = 128) -> torch.Tensor:
+    N, K = W.shape
+    return W.abs().view(N, K // block, block).amax(dim=-1).to(torch.float32)
+
+
+def test_int4awq_transform_graph_and_load_hook():
+    """INT4 AWQ transform with FP model's state_dict rewritten via hook to packed+scales."""
+    device = "cuda"
+    torch.manual_seed(0)
+    quant_config = {"quant_algo": "W4A16_AWQ"}
+    BLOCK = 128
+    QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_int4_linear
+
+    # FP model (K divisible by 128, out_dims even)
+    model = MLP(256, 128, 256).to(torch.float16).to(device)
+    x = torch.randn(3, 256, dtype=torch.float16, device=device)
+
+    def int4awq_state_dict_hook(module: nn.Module, state_dict: dict, prefix: str, local_meta: dict):
+        for name, m in module.named_modules():
+            if not isinstance(m, nn.Linear):
+                continue
+            key_w = f"{prefix}{name}.weight"
+            if key_w not in state_dict:
+                continue
+            W = state_dict[key_w].detach().to(torch.float32).to(device)  # (N, K) fp
+            N, K = W.shape
+            assert N % 2 == 0 and K % BLOCK == 0
+            amax = _per_block_amax(W, BLOCK)  # (N, K//128)
+            weights_scaling_factor = (amax / 7.0).to(torch.float32)
+            W_packed = pack_int4_in_uint8(W, weights_scaling_factor)  # (N//2, K) uint8
+            state_dict[key_w] = W_packed.to(torch.uint8)
+            state_dict[f"{prefix}{name}.pre_quant_scale"] = torch.ones(
+                K, dtype=torch.float32, device=W.device
+            )
+            state_dict[f"{prefix}{name}.weight_scale"] = weights_scaling_factor
+
+    model._register_state_dict_hook(int4awq_state_dict_hook)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {"quantize_int4_linear_from_config": {"stage": "pattern_matcher"}},
+    )(None, gm).to(device)
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        lambda gm_: any(is_op(n, QUANT_OP) for n in gm_.graph.nodes),
+        lambda num_p_og: num_p_og // 2,  # stored params halved by packing
+        0.5,  # atol
+        0.5,  # rtol
+        True,  # test_load_hook
+        False,  # strict_loading
+        None,  # dynamic_shapes
+        False,  # skip_output_assert
+        quant_config,
+    )
+
+    # Still exportable
+    torch_export_to_gm(gm_transformed, args=(x,))
+
+
+def _pack_gptq_qweight(weights: torch.Tensor, scales: torch.Tensor) -> torch.Tensor:
+    """
+    Pack float weights to GPTQ qweight format [K/8, N] int32.
+    Uses GPTQ symmetric quantization: signed int4 [-8,7] stored as unsigned [0,15].
+
+    weights: [N, K] float
+    scales: [G, N] float (per-group scales)
+    Returns: [K/8, N] int32 packed qweight
+    """
+    N, K = weights.shape
+    G = scales.shape[0]
+    BLOCK = K // G
+    assert K % 8 == 0
+
+    # Expand scales from [G, N] to [N, K] for per-element division
+    scales_nk = scales.T.repeat_interleave(BLOCK, dim=1)  # [N, K]
+
+    # Quantize: w / scale gives float in approx [-8, 7] range, round to int
+    # GPTQ uses zero_point=8, so signed int4 [-8,7] maps to unsigned [0,15]
+    q_signed = (weights / scales_nk).round().clamp(-8, 7).to(torch.int8)  # [N, K] in [-8,7]
+    u4_nk = (q_signed.to(torch.int16) + 8).to(torch.uint8)  # [N, K] in [0,15]
+
+    # Pack along K: [N, K] -> [K/8, N] int32
+    # Use explicit int32 ops to avoid promotion to int64
+    u4_kn = u4_nk.T.contiguous()  # [K, N]
+    u4_blocks = u4_kn.view(K // 8, 8, N).to(torch.int32)  # [K/8, 8, N]
+    shifts = [0, 4, 8, 12, 16, 20, 24, 28]
+    qweight = torch.zeros(K // 8, N, dtype=torch.int32, device=weights.device)
+    for i in range(8):
+        qweight = qweight | (u4_blocks[:, i, :] << shifts[i])
+    return qweight
+
+
+def _pack_gptq_qzeros_v1(G: int, N: int, device: torch.device) -> torch.Tensor:
+    """
+    Build qzeros [G, N/8] int32 in GPTQ v1 format.
+    v1 stores (zero_point - 1) = 7 per nibble -> 0x77777777 per int32.
+    """
+    assert N % 8 == 0
+    val = torch.tensor(0x77777777, dtype=torch.int32, device=device)
+    return val.repeat(G, N // 8)
+
+
+def test_int4gptq_transform_graph_and_load_hook():
+    """INT4 GPTQ transform with load_hook converting v1 qzeros to v2."""
+    device = "cuda"
+    torch.manual_seed(42)
+    quant_config = {"quant_algo": "GPTQ"}
+    BLOCK = 128  # GPTQ group size
+    QUANT_OP = torch.ops.auto_deploy.torch_fake_quant_int4_gptq_linear
+
+    # Model with K divisible by 128, N divisible by 8
+    model = MLP(256, 128, 256).to(torch.float16).to(device)
+    x = torch.randn(3, 256, dtype=torch.float16, device=device)
+
+    def gptq_state_dict_hook(module: nn.Module, state_dict: dict, prefix: str, local_meta: dict):
+        """Convert FP weights to GPTQ checkpoint format (v1 qzeros)."""
+        for name, m in module.named_modules():
+            if not isinstance(m, nn.Linear):
+                continue
+            key_w = f"{prefix}{name}.weight"
+            if key_w not in state_dict:
+                continue
+
+            W = state_dict[key_w].detach().to(torch.float32).to(device)  # [N, K]
+            N, K = W.shape
+            assert N % 8 == 0 and K % BLOCK == 0
+
+            G = K // BLOCK
+
+            # Per-group scales from per-group amax
+            amax = W.abs().view(N, G, BLOCK).amax(dim=-1)  # [N, G]
+            scales = (amax / 7.0).T.to(torch.float32)  # [G, N] float32 for quantization
+
+            # Build GPTQ tensors using symmetric quantization with zero_point=8
+            qweight = _pack_gptq_qweight(W, scales)  # [K/8, N] int32
+            qzeros = _pack_gptq_qzeros_v1(G, N, W.device)  # [G, N/8] int32 (v1, zero_point=8)
+            scales = scales.to(torch.float16)  # [G, N] convert to fp16 for storage
+
+            # Replace weight with qweight, add GPTQ-specific keys
+            state_dict[f"{prefix}{name}.qweight"] = qweight
+            state_dict[f"{prefix}{name}.scales"] = scales
+            state_dict[f"{prefix}{name}.qzeros"] = qzeros
+            # Remove original weight key
+            del state_dict[key_w]
+
+    model._register_state_dict_hook(gptq_state_dict_hook)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_transformed = InferenceOptimizer(
+        DummyFactory(quant_config),
+        {"quantize_int4_gptq_linear_from_config": {"stage": "pattern_matcher"}},
+    )(None, gm).to(device)
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        lambda gm_: any(is_op(n, QUANT_OP) for n in gm_.graph.nodes),
+        lambda num_p_og: num_p_og // 8,  # qweight packs 8 int4 values per int32
+        0.5,  # atol (quantization error expected)
+        0.5,  # rtol
+        True,  # test_load_hook
+        False,  # strict_loading
+        None,  # dynamic_shapes
+        False,  # skip_output_assert
+        quant_config,
+    )
+
+    # Still exportable
     torch_export_to_gm(gm_transformed, args=(x,))

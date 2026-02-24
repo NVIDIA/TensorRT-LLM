@@ -339,11 +339,11 @@ static void* deviceptr_cast(CUdeviceptr ptr)
 void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int device) const
 {
     CUdeviceptr address{};
-    std::size_t const pageAlignedSize = mConfig->pageAligned(n);
-    TLLM_CU_CHECK(cuMemAddressReserve(&address, pageAlignedSize, 0, {}, 0));
+    std::size_t const alignedSize = mConfig->aligned(n, device);
+    TLLM_CU_CHECK(cuMemAddressReserve(&address, alignedSize, 0, {}, 0));
 
     CUDAVirtualMemoryChunk::Configurators configurators;
-    configurators.push_back(std::make_unique<UnicastConfigurator>(address, n,
+    configurators.push_back(std::make_unique<UnicastConfigurator>(address, alignedSize,
         CUmemAccessDesc{{
                             CU_MEM_LOCATION_TYPE_DEVICE,
                             device,
@@ -372,7 +372,7 @@ void CudaVirtualMemoryAllocator::allocate(Pointer* ptr, std::size_t n, int devic
                                                  CU_MEM_LOCATION_TYPE_DEVICE,
                                                  device,
                                              }},
-            n),
+            alignedSize),
         std::move(configurators));
 
     *ptr = deviceptr_cast(address);
@@ -383,8 +383,8 @@ void CudaVirtualMemoryAllocator::deallocate(Pointer ptr, std::size_t n) const
     auto const address = deviceptr_cast(ptr);
     mConfig->mManager.remove(address);
 
-    std::size_t const pageAlignedSize = mConfig->pageAligned(n);
-    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, pageAlignedSize));
+    std::size_t const alignedSize = mConfig->aligned(n);
+    TLLM_CU_CHECK_FREE_RESOURCE(cuMemAddressFree(address, alignedSize));
 }
 
 } // namespace tensorrt_llm::runtime

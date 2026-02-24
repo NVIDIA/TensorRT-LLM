@@ -32,6 +32,7 @@ class GatedMLP(nn.Module):
         layer_idx: Optional[int] = None,
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
+        use_custom_cublas_mm: bool = False,
     ):
 
         super().__init__()
@@ -57,6 +58,15 @@ class GatedMLP(nn.Module):
         else:
             mapping = config.mapping
 
+        # Calculate local intermediate size after tensor parallel sharding
+        tp_size = mapping.tp_size
+        local_intermediate_size = self.intermediate_size // tp_size
+
+        gateup_shard_indices_mapping = {
+            'gate': (0, local_intermediate_size),
+            'up': (local_intermediate_size, local_intermediate_size),
+        }
+
         self.gate_up_proj = Linear(
             self.hidden_size,
             self.intermediate_size * 2,
@@ -73,6 +83,8 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             disable_deep_gemm=disable_deep_gemm,
+            fused_weight_shard_indices_mapping=gateup_shard_indices_mapping,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
@@ -93,6 +105,7 @@ class GatedMLP(nn.Module):
             force_dynamic_quantization=config.force_dynamic_quantization,
             use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
             disable_deep_gemm=disable_deep_gemm,
+            use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,

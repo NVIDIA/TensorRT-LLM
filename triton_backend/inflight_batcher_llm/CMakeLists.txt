@@ -209,6 +209,7 @@ add_definitions("-DTRT_LLM_USE_DIM64")
 list(APPEND COMMON_HEADER_DIRS ${TORCH_INCLUDE_DIRS})
 include_directories(${COMMON_HEADER_DIRS})
 
+set(cutlass_source_dir ${CMAKE_BINARY_DIR}/_deps/cutlass-src)
 target_include_directories(
   triton-tensorrt-llm-backend
   PRIVATE ${TRTLLM_DIR}/cpp
@@ -217,7 +218,7 @@ target_include_directories(
           ${CUDA_INCLUDE_DIRS}
           ${CUDNN_ROOT_DIR}/include
           ${NCCL_INCLUDE_DIR}
-          ${3RDPARTY_DIR}/cutlass/include
+          ${cutlass_source_dir}/include
           ${MPI_INCLUDE_PATH}
           ${COMMON_HEADER_DIR})
 

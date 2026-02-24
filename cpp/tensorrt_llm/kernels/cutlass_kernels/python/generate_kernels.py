@@ -3,19 +3,6 @@ import enum
 import os
 from itertools import chain, product
 
-file_to_patch = os.path.abspath(
-    os.path.join(
-        os.path.dirname(__file__),
-        "../../../../../3rdparty/cutlass/python/cutlass_library/heuristics_provider.py"
-    ))
-# replace "from library import" to "from cutlass_library.library import"
-with open(file_to_patch, "r") as f:
-    file_contents = f.read()
-with open(file_to_patch, "w") as f:
-    f.write(
-        file_contents.replace("from library import",
-                              "from cutlass_library.library import"))
-
 from cutlass_library import *
 
 
@@ -54,9 +41,9 @@ EpiTag = {
 
 EpiFusion = {
     TrtLlm_EpilogueFusion.epilogue_fusion_none:
-    "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE",
+    "tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::NONE",
     TrtLlm_EpilogueFusion.epilogue_fusion_finalize:
-    "tensorrt_llm::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE",
+    "tensorrt_llm::kernels::cutlass_kernels::TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE",
 }
 
 EpiFusionSuffixes = {
@@ -226,8 +213,10 @@ def instantiate_operation_tma_warp_specialized(operation):
 
     if operation.gemm_kind == GemmKind.Gemm:
         weight_tag = DataTypeTag[operation.weight_type]
+        # Use sm100_generic_mixed_gemm_kernelLauncher for SM100 and above
+        launcher_name = "sm100_generic_mixed_gemm_kernelLauncher" if operation.arch >= 100 else "sm90_generic_mixed_gemm_kernelLauncher"
         instantiation = f"""
-template void sm90_generic_mixed_gemm_kernelLauncher<{act_tag}, {weight_tag}, {scale_zero_tag}, {bias_tag}, {out_tag},
+template void {launcher_name}<{act_tag}, {weight_tag}, {scale_zero_tag}, {bias_tag}, {out_tag},
 {quant_op}, {epi_tag},
 {cute_cta_shape}, {cute_cga_shape},
 {kernel_sched}, {epi_sched}> (
@@ -240,9 +229,11 @@ const {act_tag}*, const {weight_tag}*, const {scale_zero_tag}*, const {scale_zer
                 or operation.weight_type != e2m1):
             # Mixed MoE GEMM
             weight_tag = CudaTypeName[operation.weight_type]
+            assert operation.epi_fusion is not None
+            epi_fusion = EpiFusion[operation.epi_fusion]
             instantiation = f"""
 template void sm90_generic_mixed_moe_gemm_kernelLauncher<{act_tag}, {weight_tag}, {out_tag},
-{epi_tag}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
+{epi_tag}, {epi_fusion}, {cute_cta_shape}, {cute_cga_shape}, {kernel_sched}, {epi_sched}, {quant_op}> (
 GroupedGemmInput<{act_tag}, {weight_tag}, {out_tag}, {out_tag}>inputs, TmaWarpSpecializedGroupedGemmInput hopper_inputs, int sm_count_, size_t* workspace_size);
 """
         else:
@@ -321,8 +312,8 @@ def get_file_content(launcher_inl_files, operations):
     instantiations = "\n".join(insts_list)
 
     file_content = f"""{includes}
-namespace tensorrt_llm
-{{
+#include "tensorrt_llm/common/config.h"
+TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {{
 namespace cutlass_kernels_oss
@@ -332,7 +323,7 @@ namespace cutlass_kernels_oss
 
 }} // namespace cutlass_kernels_oss
 }} // namespace kernels
-}} // namespace tensorrt_llm
+TRTLLM_NAMESPACE_END
 """
     return file_content
 
@@ -601,6 +592,11 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
 
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
 
+    epi_fusions = [
+        TrtLlm_EpilogueFusion.epilogue_fusion_none,
+        TrtLlm_EpilogueFusion.epilogue_fusion_finalize
+    ]
+
     M_TILES = [64, 128]  # Currently M tile must be 128 for Grouped GEMM
     N_TILES = [16, 32, 64, 128]
     K_TILES = [128, 256, 512]
@@ -618,13 +614,13 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
     cga_shapes = list(product([1, 2], [1, 2], [1]))
 
     partial_args_int4 = product(supported_dtypes_int4, quant_ops, epi_tags,
-                                cta_shapes_mnk_int4, cga_shapes)
+                                epi_fusions, cta_shapes_mnk_int4, cga_shapes)
     partial_args_fp4 = product(supported_dtypes_fp4, quant_ops, epi_tags,
-                               cta_shapes_mnk_fp4, cga_shapes)
+                               epi_fusions, cta_shapes_mnk_fp4, cga_shapes)
     partial_args = chain(partial_args_int4, partial_args_fp4)
 
     operations = list()
-    for dtype_combo, quant_op, epi_tag, cta_shape_mnk, cga_shape in partial_args:
+    for dtype_combo, quant_op, epi_tag, epi_fusion, cta_shape_mnk, cga_shape in partial_args:
         use_coop = cta_shape_mnk[0] >= 128
         mainloop_schedules = [
             KernelScheduleType.TmaWarpSpecializedCooperative,
@@ -637,7 +633,7 @@ def generate_sm90_mixed_type_grouped_gemm_operations(is_arch_enabled):
                     == KernelScheduleType.TmaWarpSpecializedCooperative):
                 continue
             moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped, arch, *dtype_combo, quant_op, epi_tag, cta_shape_mnk, \
-                                                    warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule)
+                                                    warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule, epi_fusion)
             operations.append(moe_gemm_operation)
     return operations
 
@@ -663,7 +659,7 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
     if not is_arch_enabled:
         return []
     arch = 120
-    supported_dtypes = [e2m1]
+    supported_dtypes = [e2m1, (DataType.e4m3, e2m1)]
     quant_ops = [TrtLlm_QuantOp.none]
     epi_tags = [TrtLlm_EpilogueTag.epilogue_op_default]
     cta_shapes_mnk = [[128, 128, 128], [128, 128, 256], [256, 128, 128],
@@ -691,28 +687,40 @@ def generate_sm120_grouped_gemm_operations(is_arch_enabled):
         mainloop_schedule = KernelScheduleType.TmaWarpSpecializedCooperative
         epi_schedule = None
 
-        otypes = [dtype]
-        if dtype in [DataType.e4m3, e2m1]:
+        if isinstance(dtype, tuple):
+            act_type, weight_type = dtype
+        else:
+            act_type, weight_type = dtype, dtype
+
+        # Minimal filter: for mixed FP8xFP4 on SM120, only emit 128x128x128
+        if act_type == DataType.e4m3 and weight_type == e2m1:
+            if cta_shape_mnk != [128, 128, 128]:
+                continue
+
+        otypes = [act_type]
+        if act_type in [DataType.e4m3, e2m1]:
             otypes = [DataType.f16, DataType.bf16]
 
         for otype in otypes:
-            moe_gemm_operation = TrtLlm_GemmLauncher(GemmKind.Grouped,
-                                                     arch,
-                                                     dtype,
-                                                     dtype,
-                                                     dtype,
-                                                     dtype,
-                                                     otype,
-                                                     quant_op,
-                                                     epi_tag,
-                                                     cta_shape_mnk,
-                                                     warp_shape,
-                                                     stages,
-                                                     cga_shape,
-                                                     mainloop_schedule,
-                                                     epi_schedule,
-                                                     epi_fusion,
-                                                     swap_ab=swap_ab)
+            moe_gemm_operation = TrtLlm_GemmLauncher(
+                GemmKind.Grouped,
+                arch,
+                act_type,
+                weight_type,
+                act_type,
+                act_type,
+                otype,
+                quant_op,
+                epi_tag,
+                cta_shape_mnk,
+                warp_shape,
+                stages,
+                cga_shape,
+                mainloop_schedule,
+                epi_schedule,
+                epi_fusion,
+                is_mx_fpx=(act_type == DataType.e4m3 and weight_type == e2m1),
+                swap_ab=swap_ab)
 
             operations.append(moe_gemm_operation)
     return operations
@@ -809,8 +817,69 @@ def generate_sm103_operations(is_arch_enabled):
     return operations
 
 
+def generate_sm100_mixed_gemm_operations(is_arch_enabled):
+    if not is_arch_enabled:
+        return []
+    arch = 100
+
+    # For SM100 (Blackwell), we support similar dtypes as SM90
+    # Takes the form (activation_type, weight_type, scalezero_type, bias_type, output_type)
+    supported_dtypes = [
+        (DataType.e4m3, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.e4m3, DataType.u4, DataType.f16, DataType.bf16,
+         DataType.bf16),
+        (DataType.f16, DataType.u4, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.bf16, DataType.u4, DataType.bf16, DataType.bf16,
+         DataType.bf16),
+        (DataType.f16, DataType.u8, DataType.f16, DataType.f16, DataType.f16),
+        (DataType.bf16, DataType.u8, DataType.bf16, DataType.bf16,
+         DataType.bf16)
+    ]
+
+    quant_ops = [
+        TrtLlm_QuantOp.per_column_scale_only,
+        TrtLlm_QuantOp.finegrained_scale_only,
+        TrtLlm_QuantOp.finegrained_scale_and_zeros
+    ]
+
+    epi_tags = [TrtLlm_EpilogueTag.epilogue_op_bias]
+
+    # SM100 uses different tile shapes
+    M_TILES = [64, 128]
+    N_TILES = [128]
+    cta_shapes_mn = product(M_TILES, N_TILES)
+
+    warp_shape = [4, 1, 1]
+    stages = 0  # auto
+
+    # SM100 currently only supports 1x1x1 cluster shape
+    cga_shapes = [(1, 1, 1)]
+
+    partial_args = product(supported_dtypes, quant_ops, epi_tags, cta_shapes_mn,
+                           cga_shapes)
+
+    operations = list()
+    for dtype_combo, quant_op, epi_tag, cta_shape_mn, cga_shape in partial_args:
+        max_k_bits = 128 * 8
+        cta_shape_k = max_k_bits // GetDataTypeBits(dtype_combo[0])
+        cta_shape_mnk = cta_shape_mn + (cta_shape_k, )
+
+        # SM100 uses 1SM schedule for mixed type GEMM
+        mainloop_schedule = KernelScheduleType.TmaWarpSpecialized1SmSm100
+        epi_schedule = EpilogueScheduleType.TmaWarpSpecialized1Sm
+
+        fpA_intB_operation = TrtLlm_GemmLauncher(GemmKind.Gemm, arch, *dtype_combo, quant_op, epi_tag, cta_shape_mnk, \
+                                                 warp_shape, stages, cga_shape, mainloop_schedule, epi_schedule)
+
+        if is_gemm_op_valid_sm100(fpA_intB_operation):
+            operations.append(fpA_intB_operation)
+
+    return operations
+
+
 def generate_sm100_operations(is_arch_enabled):
     operations = generate_sm100_grouped_gemm_operations(is_arch_enabled, 100)
+    operations.extend(generate_sm100_mixed_gemm_operations(is_arch_enabled))
     return operations
 
 
@@ -879,6 +948,7 @@ if __name__ == "__main__":
     output_dir = os.path.abspath(args.output_dir)
 
     fpA_intB_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm90.inl"
+    fpA_intB_sm100_inl = "tensorrt_llm/kernels/cutlass_kernels/fpA_intB_gemm/launchers/fpA_intB_launcher_sm100.inl"
     moe_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
     # moe_gemm_inl = "tensorrt_llm/kernels/internal_cutlass_kernels/src/moe_gemm/launchers/moe_gemm_tma_ws_launcher.inl"
     moe_mixed_gemm_inl = "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/launchers/moe_gemm_tma_ws_mixed_input_launcher.inl"
@@ -888,6 +958,8 @@ if __name__ == "__main__":
 
     inl_map = {
         (GemmKind.Gemm, 90): [fpA_intB_inl],
+        (GemmKind.Gemm, 100): [fpA_intB_sm100_inl],
+        (GemmKind.Gemm, 103): [fpA_intB_sm100_inl],
         (GemmKind.Grouped, 90): [moe_gemm_inl],
         (GemmKind.Grouped, 100): [moe_gemm_inl],
         (GemmKind.Grouped, 103): [moe_gemm_inl],

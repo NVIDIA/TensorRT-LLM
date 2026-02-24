@@ -24,7 +24,7 @@ Prepare a dataset following the [benchmarking documentation](https://github.com/
 Run 32-way expert parallelism inference on the prepared dataset. Please refer to the [LLM API MGMN example](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/llm-api/llm_mgmn_trtllm_bench.sh) for details on running `trtllm-bench` on Slurm.
 
 ```bash
-cat > ./extra_llm_api_options.yaml <<EOF
+cat > ./config.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_backend: WideEP
@@ -39,7 +39,7 @@ trtllm-bench --model ${MODEL_NAME} \
     throughput \
     --tp 32 \
     --ep 32 \
-    --extra_llm_api_options ./extra_llm_api_options.yaml \
+    --config ./config.yaml \
     --kv_cache_free_gpu_mem_fraction 0.75 \
     --dataset ./dataset.json \
     --warmup 0 \
@@ -115,7 +115,7 @@ export EXPERT_STATISTIC_ITER_RANGE=100-200
 Run 36-way expert parallelism inference with the EPLB configuration incorporated:
 
 ```bash
-cat > ./extra_llm_api_options_eplb.yaml <<EOF
+cat > ./config_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_config:
@@ -130,7 +130,7 @@ trtllm-bench --model ${MODEL_NAME} \
     throughput \
     --tp 36 \
     --ep 36 \
-    --extra_llm_api_options ./extra_llm_api_options_eplb.yaml \
+    --config ./config_eplb.yaml \
     --kv_cache_free_gpu_mem_fraction 0.75 \
     --dataset ./dataset.json \
     --warmup 0 \
@@ -181,7 +181,7 @@ EOF
 Run 36-way expert parallelism inference with the EPLB configuration incorporated:
 
 ```bash
-cat > ./extra_llm_api_options_eplb.yaml <<EOF
+cat > ./config_eplb.yaml <<EOF
 enable_attention_dp: true
 cuda_graph_config: {}
 moe_config:
@@ -196,7 +196,7 @@ trtllm-bench --model ${MODEL_NAME} \
     throughput \
     --tp 36 \
     --ep 36 \
-    --extra_llm_api_options ./extra_llm_api_options_eplb.yaml \
+    --config ./config_eplb.yaml \
     --kv_cache_free_gpu_mem_fraction 0.75 \
     --dataset ./dataset.json \
     --warmup 0 \

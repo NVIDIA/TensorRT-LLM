@@ -12,9 +12,12 @@ class Qwen2MoeHfWeightMapper(HfWeightMapper):
     def is_special_instance_module(self, module: nn.Module) -> bool:
         return isinstance(module, MoE)
 
-    def handle_special_instance_module(self, module: nn.Module,
-                                       module_name: str,
-                                       module_weights: dict) -> None:
+    def handle_special_instance_module(
+            self,
+            module: nn.Module,
+            module_name: str,
+            module_weights: dict,
+            allow_partial_loading: bool = False) -> None:
         if isinstance(module, MoE):
             updated_module_weights = {}
             for weight_name, weight_value in module_weights.items():
@@ -23,4 +26,5 @@ class Qwen2MoeHfWeightMapper(HfWeightMapper):
                                                "w3").replace("down_proj", "w2")
                 updated_module_weights[new_weight_name] = weight_value
             del module_weights
-            module.load_weights(weights=[updated_module_weights])
+            module.load_weights(weights=[updated_module_weights],
+                                allow_partial_loading=allow_partial_loading)

@@ -25,7 +25,7 @@ from vit_onnx_trt import Preprocss
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
-from tensorrt_llm.bindings import KVCacheType
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ModelConfig, SamplingConfig, Session,
                                   TensorInfo)
@@ -118,8 +118,7 @@ class QWenInfer(object):
         num_kv_heads = config["pretrained_config"].get("num_key_value_heads",
                                                        num_heads)
         if "kv_cache_type" in config["build_config"]:
-            kv_cache_type = KVCacheType.from_string(
-                config["build_config"]["kv_cache_type"])
+            kv_cache_type = KVCacheType(config["build_config"]["kv_cache_type"])
         else:
             kv_cache_type = KVCacheType.CONTINUOUS
 
@@ -418,7 +417,7 @@ class QWenInfer(object):
                             print(f'Output(beam: {beam}): "{output_text}"')
         logger.info(f"Input length={input_lengths[b]}")
         logger.info(f"Output length={output_ids.shape}")
-        logger.info(f"TensorRT-LLM QWen time: {Qwen_time:3f} sec ")
+        logger.info(f"TensorRT LLM QWen time: {Qwen_time:3f} sec ")
         history.append((query, output_text))
         return output_text
 
@@ -516,7 +515,7 @@ def vit_process(image_path, vit_engine_path, stream):
         ok = session_vit.run(visual_inputs, visual_outputs, stream)
     profiler.stop("ViT")
     Vit_time = profiler.elapsed_time_in_sec("ViT") / run_time
-    logger.info(f"TensorRT-LLM ViT latency: {Vit_time:3f} sec ")
+    logger.info(f"TensorRT LLM ViT latency: {Vit_time:3f} sec ")
 
     assert ok, "Runtime execution failed for vit session"
 

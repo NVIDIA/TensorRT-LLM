@@ -533,8 +533,8 @@ struct GemmFpAIntB
         run_kernel<arch::Sm80>(params, shared_storage);
 #elif (__CUDA_ARCH__ == 890)
         run_kernel<arch::Sm89>(params, shared_storage);
-#elif (__CUDA_ARCH__ >= 1000)
-        // Use SM80 implementation for GB10x, GB20x.
+#elif (__CUDA_ARCH__ >= 1200)
+        // Use SM80 implementation for GB20x.
         run_kernel<arch::Sm80>(params, shared_storage);
 #else
         CUTLASS_NOT_IMPLEMENTED(); // Don't compile these for Hopper or later. Use CUTLASS 3.x kernels.

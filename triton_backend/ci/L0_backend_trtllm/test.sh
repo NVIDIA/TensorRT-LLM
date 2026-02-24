@@ -1,5 +1,5 @@
 #!/bin/bash
-# Copyright 2024, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# Copyright 2024-2025, NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 #
 # Redistribution and use in source and binary forms, with or without
 # modification, are permitted provided that the following conditions
@@ -481,9 +481,9 @@ for NUM_GPU in "${NUM_GPUS_TO_TEST[@]}"; do
 
             python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/ensemble/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},logits_datatype:TYPE_FP32
             python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/preprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},preprocessing_instance_count:${INSTANCE_COUNT}
-            python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/tensorrt_llm/config.pbtxt triton_backend:${TRITON_BACKEND},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},engine_dir:${ENGINE_DIR},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MS},batching_strategy:inflight_batching,max_queue_size:${MAX_QUEUE_SIZE},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,request_stats_max_iterations:10,exclude_input_in_output:True,enable_kv_cache_reuse:True,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32
+            python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/tensorrt_llm/config.pbtxt triton_backend:${TRITON_BACKEND},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},engine_dir:${ENGINE_DIR},max_queue_delay_microseconds:${MAX_QUEUE_DELAY_MS},batching_strategy:inflight_batching,max_queue_size:${MAX_QUEUE_SIZE},max_tokens_in_paged_kv_cache:2560,max_attention_window_size:2560,kv_cache_free_gpu_mem_fraction:0.5,request_stats_max_iterations:10,exclude_input_in_output:True,enable_kv_cache_reuse:True,encoder_input_features_data_type:TYPE_FP16,logits_datatype:TYPE_FP32,prompt_embedding_table_data_type:TYPE_FP16
             python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/postprocessing/config.pbtxt tokenizer_dir:${TOKENIZER_DIR},triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},postprocessing_instance_count:${INSTANCE_COUNT}
-            python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/tensorrt_llm_bls/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},bls_instance_count:${INSTANCE_COUNT},logits_datatype:TYPE_FP32
+            python3 ${FILL_TEMPLATE_SCRIPT} -i ${MODEL_DIR}/tensorrt_llm_bls/config.pbtxt triton_max_batch_size:${TRITON_MAX_BATCH_SIZE},decoupled_mode:${DECOUPLED_MODE},bls_instance_count:${INSTANCE_COUNT},logits_datatype:TYPE_FP32,prompt_embedding_table_data_type:TYPE_FP16
 
             for ENDPOINT in generate grpc inflight_batcher_llm; do
                 SERVER_LOG="./${NUM_GPU}gpu_perf_metrics_${TRITON_BACKEND}_${ENDPOINT}_${DECOUPLED_TRIAL}_server.log"

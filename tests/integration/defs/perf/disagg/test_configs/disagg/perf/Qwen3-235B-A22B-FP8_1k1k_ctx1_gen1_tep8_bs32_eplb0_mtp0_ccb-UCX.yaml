@@ -1,0 +1,91 @@
+# nvbugs: 5561153
+metadata:
+  model_name: Qwen3-235B-A22B-FP8
+  precision: fp8
+  model_dir_name: Qwen3-235B-A22B-FP8
+  supported_gpus:
+  - GB200
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 1k1k
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 02:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: e2e
+  use_nv_sa_benchmark: true
+  multi_round: 8
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: 1 2 4 8 16 36
+  input_length: 1024
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 1
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: false
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 2048
+    max_seq_len: 2051
+    cuda_graph_config:
+      enable_padding: true
+      max_batch_size: 128
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.7
+      dtype: fp8
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      max_tokens_in_buffer: 2048
+      backend: UCX
+    stream_interval: 20
+    num_postprocess_workers: 4
+    allreduce_strategy: MNNVL
+    disable_overlap_scheduler: false
+  ctx:
+    max_batch_size: 32
+    max_num_tokens: 2048
+    max_seq_len: 2051
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: false
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    kv_cache_config:
+      enable_block_reuse: true
+      free_gpu_memory_fraction: 0.7
+      dtype: fp8
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      max_tokens_in_buffer: 2048
+      backend: UCX

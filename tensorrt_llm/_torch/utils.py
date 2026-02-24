@@ -2,23 +2,27 @@ import contextlib
 import os
 import threading
 from dataclasses import dataclass
-from enum import Enum
+from enum import Enum, IntEnum
 from typing import Dict, List
 
 import torch
+from torch.nn import functional as F
 
-from tensorrt_llm._utils import TensorWrapper, convert_to_torch_tensor
+from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
+                                 torch_dtype_to_str)
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.math_utils import ceil_div, pad_up
 from tensorrt_llm.quantization.utils import fp4_utils
 
 is_torch_compiling_flag = False
+is_piecewise_running_flag = False
 
 aux_stream_name_list = [
     'Attention',
     'MoeShared',
     'MoeChunkingOverlap',
     'MoeBalancer',
+    'MoeOutputMemset',
 ]
 AuxStreamType = Enum(
     'AuxStreamType',
@@ -31,6 +35,35 @@ EventType = Enum(
 )
 
 
+# IMPORTANT: Keep the same order of activation functions in this enum and the enum in
+# cpp/tensorrt_llm/kernels/cutlass_kernels/include/common.h
+class ActivationType(IntEnum):
+    InvalidType = 0
+    Identity = 1
+    Gelu = 2
+    Relu = 3
+    Silu = 4
+    Swiglu = 5
+    Geglu = 6
+    SwigluBias = 7
+    Relu2 = 8
+
+
+# Keep this in sync with the ActType enum in
+# cpp/tensorrt_llm/kernels/trtllmGenKernels/batchedGemm/KernelRunner.h
+class ActType_TrtllmGen(IntEnum):
+    SwiGlu = 0
+    Relu2 = 1
+
+
+# IMPORTANT: when adding a new activation type, please update this function.
+# And make sure it aligned with cpp/tensorrt_llm/kernels/cutlass_kernels/include/moe_gemm_kernels.h::isGatedActivation function.
+def is_gated_activation(activation_type: ActivationType) -> bool:
+    return activation_type in [
+        ActivationType.Swiglu, ActivationType.SwigluBias, ActivationType.Geglu
+    ]
+
+
 def set_torch_compiling(enable: bool):
     global is_torch_compiling_flag
     is_torch_compiling_flag = enable
@@ -39,6 +72,16 @@ def set_torch_compiling(enable: bool):
 def is_torch_compiling() -> bool:
     global is_torch_compiling_flag
     return is_torch_compiling_flag
+
+
+def set_piecewise_running(enable: bool):
+    global is_piecewise_running_flag
+    is_piecewise_running_flag = enable
+
+
+def is_piecewise_running() -> bool:
+    global is_piecewise_running_flag
+    return is_piecewise_running_flag
 
 
 _global_attrs = threading.local()
@@ -257,6 +300,25 @@ def fp4_scale_infer_shape(input_shapes: List[List[int]]):
     return scale_shape * 2
 
 
+def fp4_unswizzled_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp4 scale tensor.
+    """
+    out_shape, scale_shape = fp4_utils.get_fp4_shape(input_shapes[0],
+                                                     sf_vec_size=16,
+                                                     is_swizzled_layout=False)
+    return scale_shape * 2
+
+
+def fp8_scale_infer_shape(input_shapes: List[List[int]]):
+    """Calculate the dimensions of the fp8 scale tensor.
+    """
+    input_shape = input_shapes[0]
+    assert len(input_shape) == 2 or len(input_shape) == 3
+    has_batch = len(input_shape) == 3
+    m = input_shape[-2]
+    return pad_up(m, 4) if has_batch else m
+
+
 _enable_piecewise_cuda_graph = True
 
 
@@ -288,9 +350,20 @@ def get_per_request_piecewise_cuda_graph_flag() -> bool:
     return getattr(_global_attrs, 'per_request_piecewise_cuda_graph_flag', True)
 
 
-def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
-    lm_head_tp_size = int(os.getenv('LM_HEAD_TP_SIZE', 2))
-    assert mapping.tp_size % lm_head_tp_size == 0
+def create_lm_head_tp_mapping(mapping: Mapping, token_count: int) -> Mapping:
+    # We use heuristic to determine the lm_head_tp_size
+    # Since token_count=256 will hit the boundary of math-bound problem
+    # We use 256 // token_count to determine the lm_head_tp_size
+    # For more details, refer to the blog: https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md#mtp-lm-head-tensor-parallelism
+    lm_head_tp_size_raw = 256 // token_count
+    # TODO: On platforms like GB200, setting lm_head_tp_size_upper_bound to world_size could be more efficient when world_size > gpus_per_node, we need to do further investigation.
+    lm_head_tp_size_upper_bound = min(mapping.world_size, mapping.gpus_per_node)
+    lm_head_tp_size = int(
+        os.getenv(
+            'LM_HEAD_TP_SIZE',
+            nearest_in_buckets(lm_head_tp_size_raw,
+                               [1, lm_head_tp_size_upper_bound])))
+    assert mapping.tp_size % lm_head_tp_size == 0, f"mapping.tp_size: {mapping.tp_size}, lm_head_tp_size: {lm_head_tp_size}"
     lm_head_pp_size = mapping.pp_size * mapping.tp_size // lm_head_tp_size
 
     return Mapping(
@@ -302,3 +375,119 @@ def create_lm_head_tp_mapping(mapping: Mapping) -> Mapping:
         enable_attention_dp=mapping.enable_attention_dp,
         enable_lm_head_tp_in_adp=mapping.enable_lm_head_tp_in_adp,
     )
+
+
+def get_device_uuid(device_idx: int) -> str:
+    """Get the UUID of a CUDA device using torch cuda api"""
+
+    property = torch.cuda.get_device_properties(device_idx)
+    uuid = "GPU-" + str(property.uuid)
+    return uuid
+
+
+def maybe_compile(func=None, **compile_kwargs):
+    """
+    Conditionally compile a function with torch.compile.
+    If is_piecewise_running() is True, the function will not be compiled to avoid host overhead in attention op.
+    Args:
+        func: The function to decorate (optional, for direct decoration).
+        **compile_kwargs: Keyword arguments for torch.compile.
+    Returns:
+        The conditionally compiled function..
+    """
+
+    def decorator(f):
+        compiled_func = torch.compile(f, **compile_kwargs)
+
+        def wrapper(*args, **kwargs):
+            if is_piecewise_running():
+                return f(*args, **kwargs)
+            return compiled_func(*args, **kwargs)
+
+        return wrapper
+
+    return decorator(func) if func else decorator
+
+
+def split(x: torch.Tensor,
+          tp_size: int,
+          idx: int,
+          dim: int = 0) -> torch.Tensor:
+    assert x.shape[dim] % tp_size == 0
+    split_size = x.shape[dim] // tp_size
+    if tp_size == 1:
+        return x
+    return torch.split(x, split_size, dim=dim)[idx]
+
+
+def relu2(x: torch.Tensor) -> torch.Tensor:
+    return torch.square(F.relu(x))
+
+
+def tensor_to_str(x: torch.Tensor, num_elements: int = 10) -> str:
+    # Pass num_elements=-1 will print the whole tensor
+    if num_elements < 0:
+        num_elements = torch.numel(x)
+    if x.dtype in (torch.int32, torch.int64):
+        float_x = x.to(dtype=float)
+    else:
+        float_x = x
+    return ("Tensor("
+            f"shape={tuple(x.shape)}, "
+            f"dtype={torch_dtype_to_str(x.dtype)}, "
+            f"device={x.device}, "
+            f"stats=("
+            f"abs_mean={float_x.abs().mean().item():.3f}, "
+            f"mean={float_x.mean().item():.3f}, "
+            f"std={float_x.std().item():.3f}, "
+            f"max={x.max().item():.3f}, "
+            f"min={x.min().item():.3f}"
+            "), "
+            f"values={x.flatten()[:num_elements].tolist()}"
+            ")")
+
+
+@maybe_compile
+def maybe_compiled_copy_(dst, src):
+    dst.copy_(src)
+
+
+@maybe_compile
+def maybe_compiled_cat(tensors, dim):
+    return torch.cat(tensors, dim)
+
+
+def replace_parameter_and_save_metadata(
+        module: torch.nn.Module, param_name: str,
+        new_param: torch.nn.Parameter | torch.Tensor, metadata_dict: Dict):
+    """
+    Replace a parameter in a module and save the metadata of the original parameter.
+    On first call: saves original param's meta tensor and new param's tensor, then replaces.
+    On subsequent calls: copies new_param data into the saved tensor, then registers it.
+    """
+    saved_param = None
+    if param_name not in metadata_dict:
+        # First time: save original meta tensor and the new param tensor reference
+        original_meta = getattr(module, param_name).to("meta")
+        # Convert new_param to Parameter if it's a Tensor, otherwise use directly
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param = new_param
+        elif isinstance(new_param, torch.Tensor):
+            saved_param = torch.nn.Parameter(new_param, requires_grad=False)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+        metadata_dict[param_name] = {
+            'meta': original_meta,
+            'param': saved_param
+        }
+    else:
+        # Subsequent calls: copy new_param into the saved tensor
+        saved_param = metadata_dict[param_name]['param']
+        if isinstance(new_param, torch.nn.Parameter):
+            saved_param.data.copy_(new_param.data)
+        elif isinstance(new_param, torch.Tensor):
+            saved_param.data.copy_(new_param)
+        else:
+            raise ValueError(f"Invalid type {type(new_param)} for new_param")
+
+    module.register_parameter(param_name, saved_param)

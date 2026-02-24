@@ -1,0 +1,9 @@
+# Configuration for Llama 3.3 70B
+# AutoDeploy-specific settings for large Llama models
+
+max_batch_size: 1024
+max_num_tokens: 2048
+trust_remote_code: true
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
+kv_cache_config:
+  dtype: fp8

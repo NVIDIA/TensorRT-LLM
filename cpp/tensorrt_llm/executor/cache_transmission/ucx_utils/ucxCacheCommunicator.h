@@ -55,11 +55,14 @@ private:
     std::mutex mAddressToConnectionIdMutex;
     CommState mCommState;
     int mDevice;
+    int mRank;
+    int mWorldSize;
     std::atomic<UcxConnection::ConnectionIdType> mConnectionIdCounter{1};
     zmq::context_t mZmqContext;
     zmq::socket_t mZmqRepSocket;
     std::string mZmqRepEndpoint;
     std::thread mZmqRepThread;
+    std::atomic<bool> mIsRunning{true};
 
     UcxConnection::ConnectionIdType getNewConnectionId(std::shared_ptr<ucxx::Endpoint> const& newEp);
     UcxConnection::ConnectionIdType addConnection(std::string const& ip, uint16_t port);
@@ -78,6 +81,13 @@ public:
     Connection const* recvConnect(DataContext const& ctx, void* data, size_t size) override;
     std::vector<Connection const*> getConnections(CommState const& state) override;
     [[nodiscard]] CommState const& getCommState() const override;
+
+    [[nodiscard]] int getRank() const
+    {
+        return mRank;
+    }
+
+    [[nodiscard]] bool isRunning() const override;
 };
 
 #if defined(__clang__)

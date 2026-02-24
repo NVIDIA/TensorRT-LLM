@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2025, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -29,6 +29,8 @@
 #include <cassert>
 #include <chrono>
 #include <cstdint>
+#include <cstring>
+#include <list>
 #include <memory>
 #include <optional>
 #include <utility>
@@ -47,6 +49,8 @@ enum class LlmRequestState : int32_t
     kUNKNOWN = 0,                             ///< Unknown state
     kENCODER_INIT = 1,                        ///< Encoder phase starts (for encoder-decoder models)
 
+    kDISAGG_CONTEXT_WAIT_SCHEDULER = 7,       ///< Waiting for scheduler to schedule the context-only request
+                                              /// e.g. in gen-first mode when generation request is not scheduled yet
     kDISAGG_GENERATION_INIT = 8,              ///< New Generation request arrived at generation model
     kDISAGG_GENERATION_TRANS_IN_PROGRESS = 9, ///< Transmitting the kv cache
 
@@ -56,13 +60,14 @@ enum class LlmRequestState : int32_t
                                             /// used in layer-wise transmission
     kDISAGG_GENERATION_TRANS_COMPLETE = 12, ///< Kv cache transmission are finished
     kGENERATION_IN_PROGRESS = 13,           ///< Generation phase is in progress
-    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
 
     // schedulable states ends
+    kGENERATION_TO_COMPLETE = 14,           ///< Generation phase is to be completed
     kGENERATION_COMPLETE = 20,              ///< Generation phase completed
     kDISAGG_CONTEXT_TRANS_IN_PROGRESS = 21, ///< Waiting context-only request transmitting the kv cache,
                                             /// after computation finished
     kDISAGG_CONTEXT_COMPLETE = 22,          ///< Context-only request finished kv cache transmission.
+    kDISAGG_GENERATION_WAIT_TOKENS = 23,    ///< Generation-only request waiting for ctx/draft tokens to be received
 
     // error states
     kDISAGG_TRANS_ERROR = -1, ///< Error occurred during kv cache transmission
@@ -101,6 +106,7 @@ public:
     using RequestPtr = std::shared_ptr<GenericLlmRequest>;
     using MillisecondsType = std::chrono::milliseconds;
     using TimePoint = std::chrono::time_point<std::chrono::steady_clock>;
+    using Duration = std::chrono::time_point<std::chrono::steady_clock>::duration;
     using CacheSaltIDType = runtime::CacheSaltIDType;
 
     GenericLlmRequest(RequestIdType requestId, SizeType32 maxNewTokens, std::shared_ptr<VecTokens> const& inputTokens,
@@ -113,6 +119,7 @@ public:
         std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> multimodalHashes = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalPositions = std::nullopt,
         std::optional<std::shared_ptr<std::vector<SizeType32>>> multimodalLengths = std::nullopt,
+        std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> multimodalUuids = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -162,6 +169,7 @@ public:
         , mMultimodalHashes(std::move(multimodalHashes))
         , mMultimodalPositions(std::move(multimodalPositions))
         , mMultimodalLengths(std::move(multimodalLengths))
+        , mMultimodalUuids(std::move(multimodalUuids))
         , mMultimodalEmbedding(std::move(multimodalEmbedding))
         , mMropeRotaryCosSin(std::move(mropeRotaryCosSin))
         , mMropePositionDeltas(mropePositionDeltas)
@@ -835,6 +843,20 @@ public:
         // for enc-dec models, pause means saving generated tokens to prompt but need to re-do encoder phase
         mState = mEncoderTokens.has_value() || mEncoderInputFeatures ? LlmRequestState::kENCODER_INIT
                                                                      : LlmRequestState::kCONTEXT_INIT;
+
+        if (mLlmRequestType == LlmRequestType::LLMREQUEST_TYPE_GENERATION_ONLY)
+        {
+
+            // If gen only server is configured with MAX_UTILIZATION scheduler, the running gen only request may be
+            // paused and rescheduled as context_init state, which will run context phase, degrading performance.
+            // Have no idea how to avoid this. If we modify the max utilization scheduler to avoid pausing
+            // generation-only requests, it could result in no KV cache being available, causing requests to remain
+            // unscheduled indefinitely. We just issue a warning here.
+            TLLM_LOG_WARNING(
+                "Pausing generation-only request, request_id: %lu, changes it to context init state, which may degrade "
+                "performance.",
+                mRequestId);
+        }
         mContextCurrentPositionTarget = 0;
         mContextCurrentPositionDraft = 0;
         mPrepopulatedPromptLenTarget = 0;
@@ -887,6 +909,11 @@ public:
     [[nodiscard]] std::optional<std::shared_ptr<std::vector<SizeType32>>> getMultimodalLengths() const
     {
         return mMultimodalLengths;
+    }
+
+    [[nodiscard]] std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> getMultimodalUuids() const
+    {
+        return mMultimodalUuids;
     }
 
     [[nodiscard]] std::optional<TensorPtr> getMultimodalEmbedding() const
@@ -1074,7 +1101,6 @@ public:
         TLLM_CHECK_WITH_INFO(prepopulatedPromptLen < promptLen,
             "Invalid state: prepopulatedPromptLen (%d) >= promptLen (%d) for request %lu", prepopulatedPromptLen,
             promptLen, mRequestId);
-        TLLM_CHECK(prepopulatedPromptLen < promptLen);
 
         auto& prePromptLen = mUseDraftModel ? mPrepopulatedPromptLenDraft : mPrepopulatedPromptLenTarget;
         auto& contextCurrentPosition = mUseDraftModel ? mContextCurrentPositionDraft : mContextCurrentPositionTarget;
@@ -1115,9 +1141,9 @@ public:
         mDraftLogits = draftLogits;
     }
 
-    [[nodiscard]] SizeType32 getNumDraftTokens() const
+    [[nodiscard]] SizeType32 getNumDraftTokens() const noexcept
     {
-        return hasDraftTokens() ? mDraftTokens->size() : 0;
+        return hasDraftTokens() ? static_cast<SizeType32>(mDraftTokens->size()) : 0;
     }
 
     void discardDraftTokens(SizeType32 numTokensToDiscard)
@@ -1255,7 +1281,7 @@ public:
     {
         if (mPerfMetrics.timingMetrics.firstScheduledTime == executor::RequestPerfMetrics::TimePoint{})
         {
-            mPerfMetrics.timingMetrics.firstScheduledTime = std::chrono::steady_clock::now();
+            mPerfMetrics.timingMetrics.firstScheduledTime = getSteadyClockNow();
         }
     }
 
@@ -1378,17 +1404,17 @@ public:
         mGenerationLogitsFragments.push_back(genLogits);
     }
 
-    SizeType32 getGenerationLogitsFragmentsSize()
+    [[nodiscard]] SizeType32 getGenerationLogitsFragmentsSize() const noexcept
     {
-        return mGenerationLogitsFragments.size();
+        return static_cast<SizeType32>(mGenerationLogitsFragments.size());
     }
 
-    void clearGenerationLogitsFragments()
+    void clearGenerationLogitsFragments() noexcept
     {
         mGenerationLogitsFragments.clear();
     }
 
-    bool hasAdditionalOutputs()
+    [[nodiscard]] bool hasAdditionalOutputs() const noexcept
     {
         return !mAdditionalContextOutputTensors.empty() || !mAdditionalGenerationOutputTensors.empty();
     }
@@ -1509,15 +1535,17 @@ public:
     {
         switch (mState)
         {
-        case batch_manager::LlmRequestState::kENCODER_INIT: return executor::RequestStage::kENCODER_IN_PROGRESS; break;
-        case batch_manager::LlmRequestState::kCONTEXT_INIT: return executor::RequestStage::kCONTEXT_IN_PROGRESS; break;
+        case batch_manager::LlmRequestState::kENCODER_INIT: return executor::RequestStage::kENCODER_IN_PROGRESS;
+        case batch_manager::LlmRequestState::kCONTEXT_INIT:
+        case batch_manager::LlmRequestState::kDISAGG_CONTEXT_WAIT_SCHEDULER:
+            return executor::RequestStage::kCONTEXT_IN_PROGRESS;
         case batch_manager::LlmRequestState::kGENERATION_IN_PROGRESS:
         case batch_manager::LlmRequestState::kGENERATION_TO_COMPLETE:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_COMPLETE:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_INIT:
         case batch_manager::LlmRequestState::kDISAGG_GENERATION_TRANS_IN_PROGRESS:
+        case batch_manager::LlmRequestState::kDISAGG_GENERATION_WAIT_TOKENS:
             return executor::RequestStage::kGENERATION_IN_PROGRESS;
-            break;
         default: TLLM_LOG_ERROR("Unexpected request state."); return executor::RequestStage::kGENERATION_COMPLETE;
         }
     }
@@ -1534,8 +1562,14 @@ public:
 
     void setContextCurrentPosition(SizeType32 contextCurrentPosition)
     {
-        mContextCurrentPositionDraft = contextCurrentPosition;
-        mContextCurrentPositionTarget = contextCurrentPosition;
+        if (mUseDraftModel)
+        {
+            mContextCurrentPositionDraft = contextCurrentPosition;
+        }
+        else
+        {
+            mContextCurrentPositionTarget = contextCurrentPosition;
+        }
     }
 
     /// When chunked, the position of the current chunk is returned. Otherwise, only the beginning
@@ -1665,6 +1699,12 @@ public:
             [](auto reason) { return reason == executor::FinishReason::kLENGTH; });
     }
 
+    [[nodiscard]] bool isFinishedDueToCancellation() const noexcept
+    {
+        return std::all_of(mFinishReasons.begin(), mFinishReasons.end(),
+            [](auto reason) { return reason == executor::FinishReason::kCANCELLED; });
+    }
+
     [[nodiscard]] bool isTimedOut() const
     {
         if (!mAllottedTimeMs.has_value())
@@ -1689,22 +1729,22 @@ public:
         mDecodingIter = iter;
     }
 
-    void setKvCacheTransferStart(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferStart(TimePoint time) const
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferStart = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferStart = maybeToGlobalSteadyClock(time);
     }
 
-    void setKvCacheTransferEnd(std::chrono::time_point<std::chrono::steady_clock> const& time)
+    void setKvCacheTransferEnd(TimePoint time) const
     {
-        mPerfMetrics.timingMetrics.kvCacheTransferEnd = time;
+        mPerfMetrics.timingMetrics.kvCacheTransferEnd = maybeToGlobalSteadyClock(time);
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferStart()
+    TimePoint getKvCacheTransferStart() const
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferStart;
     }
 
-    std::chrono::time_point<std::chrono::steady_clock> getKvCacheTransferEnd()
+    TimePoint getKvCacheTransferEnd() const
     {
         return mPerfMetrics.timingMetrics.kvCacheTransferEnd;
     }
@@ -1788,7 +1828,7 @@ public:
         if (finishReason == executor::FinishReason::kTIMED_OUT)
         {
             TLLM_LOG_DEBUG("Request %ld finished by timeout after %f sec", mRequestId,
-                std::chrono::duration<float>(std::chrono::steady_clock::now() - mStartTime).count());
+                std::chrono::duration<float>(getSteadyClockNow() - mStartTime).count());
         }
         if (finishReason == executor::FinishReason::kCANCELLED)
         {
@@ -1826,7 +1866,7 @@ public:
 
     void updatePerfMetrics(executor::IterationType iter)
     {
-        auto const currentTokenTime = std::chrono::steady_clock::now();
+        auto const currentTokenTime = getSteadyClockNow();
 
         if (!mPerfMetrics.firstIter)
         {
@@ -1841,16 +1881,6 @@ public:
             mPerfMetrics.lastIter = iter;
             mPerfMetrics.timingMetrics.lastTokenTime = currentTokenTime;
         }
-    }
-
-    void setRequestedBlockHashes(std::vector<size_t> hashes)
-    {
-        mRequestedBlockHashes = std::move(hashes);
-    }
-
-    [[nodiscard]] std::vector<size_t> const& getRequestedBlockHashes() const
-    {
-        return mRequestedBlockHashes;
     }
 
     void setIsDummyRequest(bool isDummyRequest)
@@ -1873,6 +1903,13 @@ public:
         return mUseDraftModel;
     }
 
+    // If sGlobalSteadyClockOffset is set, return a global steady clock time point, otherwise return local steady clock
+    // time point
+    [[nodiscard]] static TimePoint getSteadyClockNow()
+    {
+        return maybeToGlobalSteadyClock(std::chrono::steady_clock::now());
+    }
+
     RequestIdType mRequestId;
     SizeType32 mPromptLen;
     SizeType32 mMaxNewTokens;
@@ -1891,6 +1928,9 @@ public:
 
     // current position of the prompt tuning table (only used in chunked prefill mode)
     SizeType32 mPtableCurrentPosition{0};
+
+    // The offset between local steady clock and global steady clock (at rank 0)
+    inline static std::optional<Duration> sGlobalSteadyClockOffset{std::nullopt};
 
 protected:
     bool mIsStreaming;
@@ -1931,6 +1971,7 @@ protected:
     std::optional<std::shared_ptr<std::vector<std::vector<SizeType32>>>> mMultimodalHashes{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalPositions{std::nullopt};
     std::optional<std::shared_ptr<std::vector<SizeType32>>> mMultimodalLengths{std::nullopt};
+    std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>> mMultimodalUuids{std::nullopt};
     std::optional<TensorPtr> mMultimodalEmbedding{std::nullopt};
     std::optional<TensorPtr> mMropeRotaryCosSin{std::nullopt};
     std::optional<SizeType32> mMropePositionDeltas{std::nullopt};
@@ -2024,9 +2065,9 @@ protected:
 
     std::optional<TensorPtr> mSkipCrossAttnBlocks{std::nullopt};
 
-    // Performance metrics.
+    // Performance metrics. Should be updatable even from a const LlmRequest reference.
     bool mReturnPerfMetrics{false};
-    executor::RequestPerfMetrics mPerfMetrics;
+    mutable executor::RequestPerfMetrics mPerfMetrics;
 
     // Guided decoding params.
     std::optional<executor::GuidedDecodingParams> mGuidedDecodingParams{std::nullopt};
@@ -2043,9 +2084,6 @@ protected:
 
     // Tensors containing the additional generation output.
     TensorMap mAdditionalGenerationOutputTensors;
-
-    // Context request only. The hashes of the blocks that are requested by the corresponding generation request.
-    std::vector<size_t> mRequestedBlockHashes;
 
     bool mIsDummyRequest{false};
 
@@ -2150,7 +2188,8 @@ private:
 
         if (mReturnPerfMetrics)
         {
-            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(std::chrono::steady_clock::now());
+            // arrivalTime is assumed to be recorded at the rank 0, so no need to convert it to global clock
+            mPerfMetrics.timingMetrics.arrivalTime = arrivalTime.value_or(getSteadyClockNow());
         }
         mStartTime = std::chrono::steady_clock::now();
     }
@@ -2179,6 +2218,15 @@ private:
         tensor->unsqueeze(0);
 
         return tensor;
+    }
+
+    static TimePoint maybeToGlobalSteadyClock(TimePoint const& time_point)
+    {
+        if (sGlobalSteadyClockOffset.has_value())
+        {
+            return time_point + *sGlobalSteadyClockOffset;
+        }
+        return time_point;
     }
 };
 
@@ -2212,6 +2260,7 @@ public:
         std::optional<std::vector<std::vector<SizeType32>>> multimodalHashes = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalPositions = std::nullopt,
         std::optional<std::vector<SizeType32>> multimodalLengths = std::nullopt,
+        std::optional<std::vector<std::optional<std::string>>> multimodalUuids = std::nullopt,
         std::optional<TensorPtr> multimodalEmbedding = std::nullopt,
         std::optional<TensorPtr> mropeRotaryCosSin = std::nullopt,
         std::optional<SizeType32> mropePositionDeltas = std::nullopt,
@@ -2252,6 +2301,9 @@ public:
             multimodalLengths.has_value()
                 ? std::make_shared<std::vector<SizeType32>>(std::move(multimodalLengths.value()))
                 : std::optional<std::shared_ptr<std::vector<SizeType32>>>(std::nullopt),
+            multimodalUuids.has_value()
+                ? std::make_shared<std::vector<std::optional<std::string>>>(std::move(multimodalUuids.value()))
+                : std::optional<std::shared_ptr<std::vector<std::optional<std::string>>>>(std::nullopt),
             std::move(multimodalEmbedding), std::move(mropeRotaryCosSin), mropePositionDeltas, loraTaskId,
             std::move(loraWeights), std::move(loraConfig), lookaheadConfig, std::move(kvCacheRetentionConfig),
             returnLogProbs, returnContextLogits, returnGenerationLogits,

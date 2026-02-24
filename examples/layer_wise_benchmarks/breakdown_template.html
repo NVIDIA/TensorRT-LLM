@@ -1,0 +1,768 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CUDA Kernel Latency Dashboard</title>
+    <script
+        src="https://cdn.jsdelivr.net/npm/echarts@6.0.0/dist/echarts.min.js"
+        integrity="sha384-F07Cpw5v8spSU0H113F33m2NQQ/o6GqPTnTjf45ssG4Q6q58ZwhxBiQtIaqvnSpR"
+        crossorigin="anonymous">
+    </script>
+    <style>
+        :root {
+            --bg-color: #1e1e1e;
+            --text-color: #d4d4d4;
+            --border-color: #3e3e42;
+            --header-bg: #252526;
+            --parent-row-bg: #2d2d30;
+            --leaf-row-bg: #1e1e1e;
+            --total-row-bg: #1a3c4d;
+            --accent-color: #007acc;
+
+            /* Selection Colors */
+            --row-hover-bg: #2a2d2e;
+            --row-select-bg: rgba(55, 55, 61, 0.8); /* Base row select */
+            --col-select-bg: rgba(0, 122, 204, 0.15); /* Column highlight */
+            --cell-select-bg: rgba(0, 122, 204, 0.4); /* Intersection */
+
+            --progress-bar-bg: rgba(0, 255, 200, 0.12);
+        }
+
+        body {
+            font-family: "Segoe UI", -apple-system, Roboto, Helvetica, Arial, sans-serif;
+            background-color: var(--bg-color);
+            color: var(--text-color);
+            margin: 0;
+            padding: 15px;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            box-sizing: border-box;
+        }
+
+        /* Layout */
+        .toolbar {
+            margin-bottom: 10px;
+            display: flex;
+            gap: 10px;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .dashboard-grid {
+            display: grid;
+            grid-template-columns: 1fr 450px;
+            gap: 15px;
+            flex: 1;
+            overflow: hidden;
+        }
+
+        .table-panel {
+            border: 1px solid var(--border-color);
+            overflow: auto;
+            position: relative;
+            background: var(--bg-color);
+        }
+
+        .charts-panel {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+            overflow: hidden;
+        }
+
+        .chart-container {
+            flex: 1;
+            background: var(--header-bg);
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 10px;
+            display: flex;
+            flex-direction: column;
+        }
+
+        .chart-header {
+            font-size: 12px;
+            font-weight: bold;
+            color: #aaa;
+            margin-bottom: 5px;
+            border-bottom: 1px solid #444;
+            padding-bottom: 5px;
+        }
+
+        .chart-body {
+            flex: 1;
+            width: 100%;
+            min-height: 0;
+        }
+
+        button {
+            background-color: #333;
+            color: white;
+            border: 1px solid #555;
+            padding: 6px 12px;
+            cursor: pointer;
+            border-radius: 3px;
+            font-size: 12px;
+        }
+        button:hover { background-color: #444; border-color: var(--accent-color); }
+
+        /* --- Table Styles (Fixed Layout) --- */
+        table {
+            width: 100%;
+            border-collapse: separate;
+            border-spacing: 0;
+            font-size: 13px;
+            min-width: 1000px;
+            table-layout: fixed; /* Crucial for equal widths */
+        }
+
+        th, td {
+            border-right: 1px solid var(--border-color);
+            border-bottom: 1px solid var(--border-color);
+            white-space: nowrap;
+            cursor: pointer;
+            position: relative;
+            height: 28px;
+            padding: 0;
+            overflow: hidden;
+        }
+
+        /* --- Column Width Control --- */
+        /* 1. First Column (Name) fixed width */
+        th:first-child, td:first-child {
+            width: 220px;
+            min-width: 220px;
+            max-width: 220px;
+            position: sticky;
+            left: 0;
+            z-index: 30;
+            border-left: 1px solid var(--border-color);
+        }
+
+        /* 2. All other columns share remaining space equally */
+        th:not(:first-child), td:not(:first-child) {
+            min-width: 80px;
+        }
+
+        /* Cell Internal Layout */
+        .cell-content {
+            position: relative;
+            z-index: 2;
+            padding: 6px 8px;
+            display: block;
+            width: 100%;
+            height: 100%;
+            box-sizing: border-box;
+            overflow: hidden;
+            text-overflow: ellipsis;
+        }
+
+        .progress-bar {
+            position: absolute;
+            top: 2px; bottom: 2px; right: 2px;
+            background-color: var(--progress-bar-bg);
+            z-index: 1;
+            pointer-events: none;
+        }
+
+        /* Sticky Header */
+        thead { position: sticky; top: 0; z-index: 20; }
+        th {
+            background-color: var(--header-bg);
+            font-weight: 600;
+            text-align: center;
+            border-top: 1px solid var(--border-color);
+            padding: 6px;
+        }
+        thead tr:first-child th:first-child { z-index: 40; }
+
+        /* Row Colors */
+        tr.row-parent td { background-color: var(--parent-row-bg); color: #eee; font-weight: 600; }
+        tr.row-leaf td { background-color: var(--leaf-row-bg); color: #ccc; }
+        tr.row-total td { background-color: var(--total-row-bg); color: #fff; font-weight: bold; border-top: 2px solid #666; }
+
+        /* Sticky col bg fix */
+        tr.row-parent td:first-child { background-color: var(--parent-row-bg); }
+        tr.row-leaf td:first-child { background-color: var(--leaf-row-bg); }
+        tr.row-total td:first-child { background-color: var(--total-row-bg); }
+
+        /* --- Highlighting Logic --- */
+
+        /* 1. Row Selected (Applied to TR) */
+        tr.row-selected td {
+            background-color: var(--row-select-bg) !important; /* Overrides default row color */
+            border-top: 1px solid var(--accent-color);
+            border-bottom: 1px solid var(--accent-color);
+        }
+
+        /* 2. Column Selected (Applied to TD via class) */
+        td.col-selected {
+            background-color: var(--col-select-bg);
+        }
+
+        /* IMPORTANT: Force sticky column to NOT take column color unless it's the intersection (handled below) */
+        td:first-child.col-selected {
+             background-color: inherit;
+        }
+
+        /* 3. Intersection (The specific cell) */
+        tr.row-selected td.col-selected {
+            background-color: var(--cell-select-bg) !important;
+            color: #fff;
+        }
+
+        /* Data Alignment */
+        td.data-cell .cell-content, tr.row-total td .cell-content {
+            text-align: right;
+            font-family: 'Consolas', monospace;
+        }
+
+        .toggle-icon {
+            display: inline-block; width: 16px; text-align: center; margin-right: 5px;
+            transition: transform 0.2s;
+        }
+        .collapsed .toggle-icon { transform: rotate(-90deg); }
+        .hidden { display: none; }
+
+        /* Config Panel Styles */
+        .config-panel {
+            margin-bottom: 10px;
+            font-size: 12px;
+            color: #888;
+        }
+        .config-panel details {
+            background-color: #252526;
+            border: 1px solid var(--border-color);
+            border-radius: 4px;
+            padding: 4px 8px;
+        }
+        .config-panel summary {
+            cursor: pointer;
+            font-weight: bold;
+            user-select: none;
+            outline: none;
+        }
+        .config-panel summary:hover {
+            color: var(--text-color);
+        }
+        .config-panel pre {
+            margin: 5px 0 0 0;
+            white-space: pre-wrap;
+            word-break: break-all;
+            font-family: "Consolas", "Monaco", monospace;
+            color: #aaa;
+            padding: 5px;
+            background-color: #1e1e1e;
+            border-radius: 3px;
+        }
+    </style>
+</head>
+<body>
+
+<div class="toolbar">
+    <strong>Controls:</strong>
+    <button onclick="collapseAll()">Collapse All</button>
+    <span id="level-buttons"></span>
+    <button onclick="expandAll()">Expand All</button>
+    <span style="font-size: 12px; color: #666; margin-left: 10px;">(Tip: Arrows to move, +/- to toggle, Click charts to select)</span>
+</div>
+
+<div class="config-panel">
+    <details>
+        <summary>🔧 Configuration (Click to expand)</summary>
+        <pre>{{ configText }}</pre>
+    </details>
+</div>
+
+<div class="dashboard-grid">
+    <div class="table-panel">
+        <table id="kernelTable">
+            <thead id="tableHead"></thead>
+            <tbody id="tableBody"></tbody>
+            <tfoot id="tableFoot"></tfoot>
+        </table>
+    </div>
+
+    <div class="charts-panel">
+        <div class="chart-container">
+            <div class="chart-header" id="barTitle">Row Analysis</div>
+            <div id="barChart" class="chart-body"></div>
+        </div>
+        <div class="chart-container">
+            <div class="chart-header" id="sunburstTitle">Column Hierarchy</div>
+            <div id="sunburstChart" class="chart-body"></div>
+        </div>
+    </div>
+</div>
+
+<script>
+    // --- 1. Data & Config ---
+    const headerConfig = {{ headerConfig }};
+
+    const rawData = {{ rawData }};
+
+    // --- 2. State & Utils ---
+    let activeRowId = 'row_0';
+    let activeRowNode = rawData[0];
+    let activeColIndex = 0;
+    let barChartInst = null;
+    let sunburstChartInst = null;
+    let headerHeight = null;
+    const columnLabels = [];
+    let columnTotals = [];
+    let totalNode = null; // Special node for the "Total" row
+    let numCols = null;
+
+    const fmt = (num) => num.toFixed(1);
+
+    function processData(nodes) {
+        function aggregate(node) {
+            if (node.time) return node.time;
+            if (node.children) {
+                const childrenTimes = node.children.map(child => aggregate(child));
+                const summedTime = childrenTimes[0].map((_, colIndex) =>
+                    childrenTimes.reduce((acc, currArr) => acc + currArr[colIndex], 0)
+                );
+                node.calculatedTime = summedTime;
+                return summedTime;
+            }
+            throw new Error("Invalid node format!");
+        }
+        const topLevelTimes = rawData.map(aggregate);
+
+        // Calculate Totals
+        numCols = topLevelTimes[0].length;
+        columnTotals = new Array(numCols).fill(0);
+        for (let c = 0; c < numCols; c++) {
+            columnTotals[c] = topLevelTimes.reduce((sum, row) => sum + row[c], 0);
+        }
+
+        // Create Total Node for Chart
+        totalNode = {
+            name: "Total",
+            calculatedTime: columnTotals,
+            children: [] // Total doesn't have children for breakdown in this context
+        };
+    }
+    processData(rawData);
+
+    function generateColumnLabels(node, depth = 0, prefix = "") {
+        node.forEach(item => {
+            const newPrefix = prefix ? `${prefix} ${item.name}` : item.name;
+            if (item.children) {
+                generateColumnLabels(item.children, depth + 1, newPrefix);
+            } else {
+                columnLabels.push(prefix ? `${prefix}\n${item.name}` : item.name);
+                headerHeight = Math.max(headerHeight, depth);
+            }
+        });
+    }
+    generateColumnLabels(headerConfig);
+
+    // --- 3. Rendering ---
+    function renderHeader() {
+        const thead = document.getElementById('tableHead');
+        const totalRows = headerHeight + 1;
+        const rows = Array.from({ length: headerHeight + 1 }, () => []);
+        rows[0].push({ name: "Kernel Name", colspan: 1, rowspan: headerHeight + 1 });
+
+        function getColSpan(node) {
+            if (!node.children || node.children.length === 0) return 1;
+            return node.children.reduce((sum, child) => sum + getColSpan(child), 0);
+        }
+        function traverse(node, level) {
+            if (level >= totalRows) return;
+            node.forEach(child => {
+                const isLeaf = !child.children || child.children.length === 0;
+                const colspan = getColSpan(child);
+                const rowspan = isLeaf ? (totalRows - level) : 1;
+                rows[level].push({ name: child.name, colspan, rowspan });
+                if (!isLeaf) traverse(child.children, level + 1);
+            });
+        }
+        traverse(headerConfig, 0);
+
+        let html = '';
+        rows.forEach(row => {
+            html += '<tr>';
+            row.forEach(cell => {
+                html += `<th colspan="${cell.colspan}" rowspan="${cell.rowspan}" title="${cell.name}">${cell.name}</th>`;
+            });
+            html += '</tr>';
+        });
+        thead.innerHTML = html;
+    }
+
+    let rowIdMap = new Map();
+
+    function renderTableBody(nodes, level, parentId = null) {
+        let html = '';
+        nodes.forEach((node, index) => {
+            const uniqueId = parentId ? `${parentId}_${index}` : `row_${index}`;
+            rowIdMap.set(uniqueId, node);
+
+            const isLeaf = !node.children || node.children.length === 0;
+            const timeData = node.time || node.calculatedTime;
+            const parentClass = parentId ? `child-of-${parentId}` : '';
+            const rowType = isLeaf ? 'row-leaf' : 'row-parent';
+            const toggleIcon = isLeaf ? `<span class="toggle-icon" style="opacity:0">🔹</span>` : `<span class="toggle-icon">▼</span>`;
+
+            html += `<tr id="${uniqueId}" class="${parentClass} ${rowType}" data-level="${level}">`;
+
+            // Name Col
+            html += `<td onclick="toggleFold('${uniqueId}', event)" style="padding-left: ${10 + level * 20}px">
+                        <div class="cell-content" title="${node.name}">${toggleIcon} ${node.name}</div>
+                     </td>`;
+
+            // Data Cols
+            timeData.forEach((val, colIdx) => {
+                const total = columnTotals[colIdx] || 1;
+                const pct = (val / total) * 100;
+
+                html += `<td class="data-cell col-${colIdx}" ${val ? "title=\"" + fmt(val) + "\"" : ""}
+                             onclick="handleCellClick('${uniqueId}', ${colIdx})">
+                            <div class="progress-bar" style="width: ${pct}%;"></div>
+                            <div class="cell-content">${val ? fmt(val) : ""}</div>
+                         </td>`;
+            });
+            html += `</tr>`;
+
+            if (!isLeaf) html += renderTableBody(node.children, level + 1, uniqueId);
+        });
+        return html;
+    }
+
+    function renderTotalRow() {
+        const tfoot = document.getElementById('tableFoot');
+        const uniqueId = 'row_total';
+        rowIdMap.set(uniqueId, totalNode);
+
+        let html = `<tr id="${uniqueId}" class="row-total">`;
+        html += `<td><div class="cell-content" style="padding-left: 10px;">Total</div></td>`;
+
+        columnTotals.forEach((val, colIdx) => {
+            html += `<td class="col-${colIdx}" onclick="handleCellClick('${uniqueId}', ${colIdx})">
+                        <div class="progress-bar" style="width: 100%;"></div>
+                        <div class="cell-content">${fmt(val)}</div>
+                     </td>`;
+        });
+        html += `</tr>`;
+        tfoot.innerHTML = html;
+    }
+
+    // --- 4. Interaction ---
+    function toggleFold(rowId, event) {
+        event.stopPropagation();
+        const row = document.getElementById(rowId);
+        // Check if toggle icon exists and is visible (opacity check matches leaf logic)
+        if (!row.querySelector('.toggle-icon') || row.querySelector('.toggle-icon').style.opacity === '0') return;
+
+        const isCollapsed = row.classList.contains('collapsed');
+        if (isCollapsed) {
+            row.classList.remove('collapsed');
+            document.querySelectorAll(`.child-of-${rowId}`).forEach(c => c.classList.remove('hidden'));
+        } else {
+            row.classList.add('collapsed');
+            hideDescendants(rowId);
+        }
+        updateSunburst();
+    }
+
+    function hideDescendants(parentId) {
+        document.querySelectorAll(`.child-of-${parentId}`).forEach(child => {
+            child.classList.add('hidden');
+            if (child.querySelector('.toggle-icon')) hideDescendants(child.id);
+        });
+    }
+
+    function handleCellClick(rowId, colIdx) {
+        const node = rowIdMap.get(rowId);
+        activeRowId = rowId;
+        activeRowNode = node;
+        activeColIndex = colIdx;
+        updateUI();
+    }
+
+    function updateUI() {
+        // 1. Clear all
+        document.querySelectorAll('.row-selected').forEach(el => el.classList.remove('row-selected'));
+        document.querySelectorAll('.col-selected').forEach(el => el.classList.remove('col-selected'));
+
+        // 2. Highlight Row (TR)
+        const tr = document.getElementById(activeRowId);
+        if(tr) tr.classList.add('row-selected');
+
+        // 3. Highlight Column (TDs)
+        document.querySelectorAll(`.col-${activeColIndex}`).forEach(td => td.classList.add('col-selected'));
+
+        // 4. Update Titles
+        document.getElementById('barTitle').innerHTML = `Row: <span style="color:#fff">${activeRowNode.name}</span> Analysis`;
+        const colName = columnLabels[activeColIndex].replace(/\n/g, ' ');
+        document.getElementById('sunburstTitle').innerHTML = `Column: <span style="color:#fff">${colName}</span> Breakdown`;
+
+        // 5. Refresh Charts
+        updateBarChart();
+        updateSunburst();
+    }
+
+    // --- 5. Charts ---
+    function updateBarChart() {
+        if (!barChartInst) barChartInst = echarts.init(document.getElementById('barChart'));
+
+        const data = activeRowNode.time || activeRowNode.calculatedTime;
+        const barColor = (activeRowNode.name === 'Total') ? '#00b894' : '#007acc';
+
+        const option = {
+            backgroundColor: 'transparent',
+            tooltip: {
+                trigger: 'axis',
+                axisPointer: { type: 'shadow' },
+                formatter: function(params) {
+                    const param = params[0];
+                    return `${param.name}<br/>${param.marker} <b>${param.value.toFixed(1)}</b>`;
+                }
+            },
+            grid: { top: 30, bottom: 60, left: 50, right: 20 },
+            xAxis: {
+                type: 'category',
+                data: columnLabels,
+                axisLabel: { color: '#aaa', fontSize: 10, rotate: 45, interval: 0 },
+                axisLine: { lineStyle: { color: '#444' } }
+            },
+            yAxis: { type: 'value', splitLine: { lineStyle: { color: '#333' } }, axisLabel: { color: '#aaa' } },
+            series: [{
+                data: data,
+                type: 'bar',
+                itemStyle: { color: barColor, borderRadius: [3,3,0,0] },
+                markPoint: {
+                    data: [{ coord: [activeColIndex, data[activeColIndex]], value: 'Selected', itemStyle: { color: '#ff6b6b' }, label: { color: '#fff' } }],
+                    animationDuration: 300,
+                    animationDurationUpdate: 300
+                }
+            }]
+        };
+        barChartInst.setOption(option);
+
+        barChartInst.off('click');
+        barChartInst.on('click', function(params) {
+            if (params.dataIndex !== undefined) {
+                handleCellClick(activeRowId, params.dataIndex);
+            }
+        });
+    }
+
+    function updateSunburst() {
+        if (!sunburstChartInst) sunburstChartInst = echarts.init(document.getElementById('sunburstChart'));
+
+        function build(nodes, parentIdPrefix="row") {
+            const res = [];
+            nodes.forEach((node, idx) => {
+                const currentId = parentIdPrefix === "row" ? `row_${idx}` : `${parentIdPrefix}_${idx}`;
+                const domRow = document.getElementById(currentId);
+                if (!domRow) return;
+
+                const isCollapsed = domRow.classList.contains('collapsed');
+                const isLeaf = !node.children || node.children.length === 0;
+                const val = (node.time || node.calculatedTime)[activeColIndex];
+                const isSelected = (currentId === activeRowId);
+
+                const item = {
+                    name: node.name,
+                    value: val,
+                    rowId: currentId,
+                    itemStyle: {
+                        borderColor: isSelected ? '#ff4d4f' : '#1e1e1e',
+                        borderWidth: isSelected ? 3 : 1,
+                        color: isSelected ? '#ff7875' : undefined
+                    },
+                    label: { color: isSelected ? '#000' : '#eee' }
+                };
+
+                if (!isLeaf && !isCollapsed) {
+                    item.children = build(node.children, currentId);
+                } else {
+                    item.value = val;
+                }
+                res.push(item);
+            });
+            return res;
+        }
+
+        const data = build(rawData);
+
+        const option = {
+            backgroundColor: 'transparent',
+            tooltip: {
+                trigger: 'item',
+                formatter: function(param) {
+                    return `${param.name}<br/>${param.marker} <b>${param.value.toFixed(1)}</b>`;
+                }
+            },
+            series: {
+                type: 'sunburst',
+                data: data,
+                radius: ['15%', '90%'],
+                sort: null,
+                label: { rotate: 'radial', minAngle: 5 },
+                itemStyle: { borderRadius: 2 },
+                emphasis: { focus: 'ancestor' },
+                animationDuration: 300,
+                color: ['#a63a3a', '#2f4554', '#266b4b', '#a88432', '#603675', '#3b5090']
+            }
+        };
+        sunburstChartInst.setOption(option);
+
+        sunburstChartInst.off('click');
+        sunburstChartInst.on('click', function(params) {
+            if (params.data && params.data.rowId) {
+                handleCellClick(params.data.rowId, activeColIndex);
+                const tr = document.getElementById(params.data.rowId);
+                if(tr) tr.scrollIntoView({block: 'center', behavior: 'smooth'});
+            }
+        });
+    }
+
+    // --- 6. Init & Controls ---
+    function expandAll() {
+        document.querySelectorAll('tr').forEach(tr => tr.classList.remove('collapsed', 'hidden'));
+        updateSunburst();
+    }
+    function collapseAll() {
+        document.querySelectorAll('.row-parent').forEach(tr => tr.classList.add('collapsed'));
+        document.querySelectorAll('tr[data-level]').forEach(tr => { if (tr.dataset.level > 0) tr.classList.add('hidden'); });
+        updateSunburst();
+    }
+    function expandToLevel(lvl) {
+        collapseAll();
+        document.querySelectorAll('tr').forEach(tr => {
+            const rLvl = parseInt(tr.dataset.level);
+            if (rLvl < lvl) tr.classList.remove('collapsed');
+            if (rLvl <= lvl) tr.classList.remove('hidden');
+        });
+        updateSunburst();
+    }
+
+    // Keyboard Navigation
+    document.addEventListener('keydown', (e) => {
+        if (e.ctrlKey || e.altKey || e.metaKey) return;
+
+        // 1. Handle Expand (+) and Collapse (-)
+        if (e.key === '+' || e.key === '=') { // + or = for expand
+            const row = document.getElementById(activeRowId);
+            // Only expand if collapsed
+            if (row && row.classList.contains('collapsed')) {
+                toggleFold(activeRowId, { stopPropagation: () => {} });
+                return; // Done
+            }
+        }
+        if (e.key === '-' || e.key === '_') { // - or _ for collapse
+            const row = document.getElementById(activeRowId);
+            // Only collapse if NOT collapsed
+            if (row && !row.classList.contains('collapsed')) {
+                toggleFold(activeRowId, { stopPropagation: () => {} });
+                return; // Done
+            }
+        }
+
+        // 2. Handle Navigation (Arrows)
+        const visibleRows = Array.from(document.querySelectorAll('#tableBody tr:not(.hidden)'));
+        if (visibleRows.length === 0) return;
+
+        let currentRowIdx = visibleRows.findIndex(tr => tr.id === activeRowId);
+        if (activeRowId === 'row_total') {
+             if (e.key === 'ArrowUp') currentRowIdx = visibleRows.length;
+        }
+
+        if (currentRowIdx === -1 && activeRowId !== 'row_total') currentRowIdx = 0;
+
+        const totalCols = columnLabels.length;
+        let handled = false;
+        let newRowId = activeRowId;
+        let newColIdx = activeColIndex;
+
+        if (e.key === 'ArrowUp') {
+            if (activeRowId === 'row_total') {
+                newRowId = visibleRows[visibleRows.length - 1].id;
+                handled = true;
+            } else if (currentRowIdx > 0) {
+                newRowId = visibleRows[currentRowIdx - 1].id;
+                handled = true;
+            }
+        } else if (e.key === 'ArrowDown') {
+            if (currentRowIdx < visibleRows.length - 1) {
+                newRowId = visibleRows[currentRowIdx + 1].id;
+                handled = true;
+            } else if (currentRowIdx === visibleRows.length - 1) {
+                newRowId = 'row_total';
+                handled = true;
+            }
+        } else if (e.key === 'ArrowLeft') {
+            if (activeColIndex > 0) {
+                newColIdx = activeColIndex - 1;
+                handled = true;
+            }
+        } else if (e.key === 'ArrowRight') {
+            if (activeColIndex < totalCols - 1) {
+                newColIdx = activeColIndex + 1;
+                handled = true;
+            }
+        }
+
+        if (handled) {
+            e.preventDefault();
+            handleCellClick(newRowId, newColIdx);
+            const tr = document.getElementById(newRowId);
+            if (tr) tr.scrollIntoView({block: 'nearest'});
+        }
+    });
+
+    window.onload = () => {
+        document.getElementById('kernelTable').style["min-width"] = Math.max(1000, (220 + 60 * numCols)) + "px";
+        renderHeader();
+        document.getElementById('tableBody').innerHTML = renderTableBody(rawData, 0);
+        renderTotalRow();
+        handleCellClick('row_0', 0);
+
+        window.addEventListener('resize', () => {
+            barChartInst && barChartInst.resize();
+            sunburstChartInst && sunburstChartInst.resize();
+        });
+    };
+
+    function initLevelButtons() {
+        function getDepth(node) {
+            if (!node.children || node.children.length === 0) return 0;
+            let max = 0;
+            for (let child of node.children) {
+                max = Math.max(max, getDepth(child));
+            }
+            return max + 1;
+        }
+        let maxDepth = 0;
+        for (let node of rawData) {
+            maxDepth = Math.max(maxDepth, getDepth(node));
+        }
+
+        const container = document.getElementById('level-buttons');
+        if (container) {
+            container.innerHTML = '';
+            for (let i = 1; i < maxDepth; i++) {
+                const btn = document.createElement('button');
+                btn.innerText = 'Level ' + i;
+                btn.onclick = function() { expandToLevel(i); };
+                // Copy styles from other buttons if possible, or rely on CSS
+                // The existing buttons don't have inline styles, just CSS class likely.
+                // But wait, <button> elements in this file might be styled by tag selector.
+                container.appendChild(btn);
+                // Add a space
+                container.appendChild(document.createTextNode(' '));
+            }
+        }
+    }
+    // Execute initialization
+    initLevelButtons();
+</script>
+</body>
+</html>

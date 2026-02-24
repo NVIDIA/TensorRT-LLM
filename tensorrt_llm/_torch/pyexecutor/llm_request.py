@@ -1,5 +1,5 @@
-from copy import deepcopy
-from dataclasses import dataclass
+from copy import copy, deepcopy
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Union
 
 import torch
@@ -8,6 +8,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
+from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
 '''
@@ -39,25 +40,60 @@ REQUEST_TYPE_MAPPING = {
 }
 
 
+@dataclass(slots=True)
+class PerfTimingInfo:
+    """Stores performance timing information for a request."""
+    # Per-step metrics list (generation phase)
+    step_metrics: List[Dict] = field(default_factory=list)
+    # Per-chunk metrics list (context/prefill phase, similar to step_metrics)
+    # Non-chunked prefill = single-element list. Each entry stores CPU times and GPU events.
+    ctx_chunk_metrics: List[Dict] = field(default_factory=list)
+    # Temporary step timing (current iteration)
+    forward_start_time: Optional[float] = None
+    forward_end_time: Optional[float] = None
+    sample_start_time: Optional[float] = None
+    sample_end_time: Optional[float] = None
+    # GPU events for current step/chunk timing
+    gpu_forward_start_event: Optional[torch.cuda.Event] = None
+    gpu_forward_end_event: Optional[torch.cuda.Event] = None
+    gpu_sample_end_event: Optional[torch.cuda.Event] = None
+    # Context phase GPU timing totals (ms) - sum of all chunks
+    ctx_gpu_forward_time: Optional[float] = None
+    ctx_gpu_sample_time: Optional[float] = None
+    # Flag: set after the last ctx chunk is saved (py_decoding_iter == 1)
+    ctx_chunks_complete: bool = False
+
+
 class LogitsStorage:
 
-    def __init__(self,
-                 seq_length: int,
-                 use_device_memory=True,
-                 should_exclude_last=False):
-        if should_exclude_last:
+    def __init__(
+        self,
+        *,
+        seq_length: int,
+        use_device_memory=True,
+        extra_token_for_overlap_scheduler=False,
+        use_chunked_generation_logits=False,
+        chunk_size=8
+    ):  # logic adpted from HandleGenerationLogits.cpp to use chunked transfer
+        if extra_token_for_overlap_scheduler:
             # Exclude last logits is used when overlap scheduler is used, that generates one extra token,
             # so we should make sure there's memory for that extra +1.
             seq_length += 1
         self.seq_length = seq_length
         self.use_device_memory = use_device_memory
-        self._should_exclude_last = should_exclude_last
+        self.use_chunked_generation_logits = use_chunked_generation_logits
+        self.chunk_size = chunk_size
         self._logits_indices = []
 
         # Lazily initialized by _init() upon first append()
         self._storage: torch.Tensor | None = None
         self.beam_width = -1
         self.vocab_size = -1
+
+        # Chunked mode: device-side fragments
+        if use_chunked_generation_logits:
+            self._device_fragments: List[torch.Tensor] = []
+            self._current_position = 0
 
     def _init(self, logits: torch.Tensor):
         _, self.beam_width, self.vocab_size = logits.shape
@@ -76,40 +112,99 @@ class LogitsStorage:
                 pin_memory=True,
                 requires_grad=False)
 
+    def _init_chunked_storage(self, logits: torch.Tensor):
+        # with chunked mode, we only use cpu memory
+        _, self.beam_width, self.vocab_size = logits.shape
+
+        self._storage = torch.empty(
+            (self.seq_length, self.beam_width, self.vocab_size),
+            dtype=logits.dtype,
+            device='cpu',
+            pin_memory=True,
+            requires_grad=False)
+
     def append(self, logits: torch.Tensor):
         if logits.ndim == 2:
             logits = logits.unsqueeze(1)
         assert logits.ndim == 3, f"Bad logits shape, expect [num_tokens, beam_width, vocab_size], got {logits.shape}"
 
-        if self.beam_width == -1:
-            self._init(logits)
+        if self.use_chunked_generation_logits:
+            if self.beam_width == -1:
+                self._init_chunked_storage(logits)
+            self._add_fragment(logits)
+        else:
+            if self.beam_width == -1:
+                self._init(logits)
 
-        assert logits.size(1) == self.beam_width, "Beam width mismatch"
+            assert logits.size(1) == self.beam_width, "Beam width mismatch"
 
-        position = 0 if not self._logits_indices else self._logits_indices[-1][1]
-        new_position = logits.size(0) + position
-        if new_position > self.seq_length:
-            raise ValueError(
-                f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
-                f"({position} already filled) but trying to append {logits.size(0)} more logits"
-            )
+            position = 0 if not self._logits_indices else self._logits_indices[
+                -1][1]
+            new_position = logits.size(0) + position
+            if new_position > self.seq_length:
+                raise ValueError(
+                    f"LogitsStorage overflow. This storage can only hold {self.seq_length} logits "
+                    f"({position} already filled) but trying to append {logits.size(0)} more logits"
+                )
 
-        self._storage[position:new_position].copy_(logits, non_blocking=True)
-        self._logits_indices.append((position, new_position))
+            self._storage[position:new_position].copy_(logits,
+                                                       non_blocking=True)
+            self._logits_indices.append((position, new_position))
 
-    def get(self, all_logits: bool) -> torch.Tensor | None:
+    def get(self, all_logits: bool, exclude_last: bool) -> torch.Tensor | None:
         """Returns the used logits storage if there are any, otherwise, returns None.
-        When all_logits is True then all set logits are returned, otherwise, only the last logits are returned."""
+
+        Args:
+            all_logits: If True, return all logits; if False, return only the last chunk of logits.
+            exclude_last: If True, drop the entire last chunk. Requires at least 2 chunks to have been appended.
+                This is used when overlap scheduler is enabled to discard the extra iteration's logits.
+        """
+        if self._storage is None:
+            return None
+
         try:
-            last = -2 if self._should_exclude_last else -1
+            # When exclude_last=True, we expect at least 2 chunks and drop the whole last chunk
+            last = -2 if exclude_last else -1
             start = 0 if all_logits else self._logits_indices[last][0]
             end = self._logits_indices[last][1]
             return self._storage[start:end]
         except IndexError:
             return None
 
-    def set_exclude_last(self, should_exclude_last: bool) -> None:
-        self._should_exclude_last = should_exclude_last
+    def _add_fragment(self, logits: torch.Tensor):
+        """Add a logits fragment to device storage"""
+        self._device_fragments.append(logits.clone())
+
+        # Streaming mode: transfer immediately after each fragment (self.chunk_size=1).
+        # Non-streaming mode: batch transfer every chunk_size steps.
+        if len(self._device_fragments) == self.chunk_size:
+            self._transfer_chunk_to_host()
+
+    def _transfer_chunk_to_host(self):
+        """Transfer accumulated fragments to host"""
+        if not self._device_fragments:
+            return
+
+        # Allocate host storage if needed
+        assert self._storage is not None, "Storage should be initialized"
+
+        # Merge fragments on device first
+        merged_logits = torch.cat(self._device_fragments, dim=0)
+
+        # Copy to host (device-to-host transfer)
+        end_pos = self._current_position + len(self._device_fragments)
+        self._storage[self._current_position:end_pos].copy_(merged_logits,
+                                                            non_blocking=True)
+
+        # Update position and clear fragments
+        self._logits_indices.append((self._current_position, end_pos))
+        self._current_position = end_pos
+        self._device_fragments.clear()
+
+    def finalize_chunked_transfer(self):
+        """Force transfer of any remaining fragments to host (for chunked mode)"""
+        if self.use_chunked_generation_logits and self._device_fragments:
+            self._transfer_chunk_to_host()
 
 
 class LogProbStorage:
@@ -157,7 +252,31 @@ class LogProbStorage:
 class PyResult:
     """PyResult reimplements some features of `bindings.executor.Result` in Python"""
 
+    @dataclass
+    class Diff:
+        """
+        Diff is used to track the changes of the PyResult.
+        It is designed to incrementally sync the PyResult to other ranks
+        by `get_diff` on one rank and `apply_diff` on other ranks.
+        """
+        exclude_last_generation_logits: bool | None = None
+        context_logits_list: list[torch.Tensor] = field(default_factory=list)
+        generation_logits_list: list[torch.Tensor] = field(default_factory=list)
+        reset_log_probs: tuple[list[TokenLogprobs],
+                               list[float] | None] | None = None
+        log_probs_list: list[tuple[list[TokenLogprobs], list[float]
+                                   | None]] = field(default_factory=list)
+        mm_embeddings: list[dict[str, Any] | None] = None
+        mrope_position_ids: dict[str, Any] | None = None
+        mrope_position_deltas: dict[str, Any] | None = None
+        additional_context_outputs_list: list[tuple[str, torch.Tensor]] = field(
+            default_factory=list)
+        additional_generation_outputs_list: list[tuple[str,
+                                                       torch.Tensor]] = field(
+                                                           default_factory=list)
+
     def __init__(self,
+                 *,
                  prompt_len: int,
                  max_new_tokens: int,
                  use_device_memory=True,
@@ -165,33 +284,152 @@ class PyResult:
                  return_log_probs: bool = False,
                  return_context_logits: bool = False,
                  return_generation_logits: bool = False,
-                 exclude_last_generation_logits: bool = False):
+                 exclude_last_generation_logits: bool = False,
+                 use_chunked_generation_logits: bool = True,
+                 chunk_size: int = 8,
+                 additional_outputs: Optional[List[str]] = None):
+        if streaming and use_chunked_generation_logits:
+            assert chunk_size == 1, "chunk_size must be 1 in streaming mode"
         self._streaming = streaming
+        self._chunk_size = chunk_size
+        self._exclude_last_generation_logits = exclude_last_generation_logits
+
+        # Note that in C++ implemnetation both context logits and generation logits are stored on host memory.
+        # Here we only use host memory for generation logits if in chunked model.
         self._context_logits = LogitsStorage(
-            prompt_len, use_device_memory) if return_context_logits else None
+            seq_length=prompt_len,
+            use_device_memory=use_device_memory,
+            extra_token_for_overlap_scheduler=False,
+            use_chunked_generation_logits=False
+        ) if return_context_logits else None
         self._generation_logits = LogitsStorage(
-            max_new_tokens, use_device_memory, exclude_last_generation_logits
-        ) if return_generation_logits else None
+            seq_length=max_new_tokens,
+            use_device_memory=use_device_memory,
+            extra_token_for_overlap_scheduler=exclude_last_generation_logits,
+            use_chunked_generation_logits=use_chunked_generation_logits,
+            chunk_size=self._chunk_size) if return_generation_logits else None
         self._log_probs = LogProbStorage() if return_log_probs else None
-        self._mm_embeddings = None
+        self._mm_embeddings: Optional[List[Dict[str, Any]]] = None
+        self._mrope_position_ids = None
+        self._mrope_position_deltas = None
+        self._additional_context_outputs = {
+            name: []
+            for name in additional_outputs
+        } if additional_outputs else None
+        self._additional_generation_outputs = {
+            name: []
+            for name in additional_outputs
+        } if additional_outputs else None
+        self.diff = PyResult.Diff()
+
+    def reset_diff(self):
+        self.diff = PyResult.Diff()
+
+    def get_diff(self) -> Diff:
+        for i, context_logits in enumerate(self.diff.context_logits_list):
+            self.diff.context_logits_list[i] = context_logits.to("cpu")
+        for i, generation_logits in enumerate(self.diff.generation_logits_list):
+            self.diff.generation_logits_list[i] = generation_logits.to("cpu")
+        return self.diff
+
+    def apply_diff(self, diff: Diff):
+        if diff.exclude_last_generation_logits is not None:
+            self._exclude_last_generation_logits = diff.exclude_last_generation_logits
+        if len(diff.context_logits_list) > 0:
+            for context_logits in diff.context_logits_list:
+                self._context_logits.append(context_logits)
+        if len(diff.generation_logits_list) > 0:
+            for generation_logits in diff.generation_logits_list:
+                self._generation_logits.append(generation_logits)
+        if diff.reset_log_probs is not None:
+            self._log_probs.set_log_probs(*diff.reset_log_probs)
+        if len(diff.log_probs_list) > 0:
+            for log_probs, cum_log_probs in diff.log_probs_list:
+                self._log_probs.append(log_probs, cum_log_probs)
+        if diff.mm_embeddings is not None:
+            self._mm_embeddings = diff.mm_embeddings
+        if diff.mrope_position_ids is not None:
+            self._mrope_position_ids = diff.mrope_position_ids
+            self._mrope_position_deltas = diff.mrope_position_deltas
+        if len(diff.additional_context_outputs_list) > 0:
+            for name, additional_context_outputs in diff.additional_context_outputs_list:
+                self._additional_context_outputs[name].append(
+                    additional_context_outputs)
+        if len(diff.additional_generation_outputs_list) > 0:
+            for name, additional_generation_outputs in diff.additional_generation_outputs_list:
+                self._additional_generation_outputs[name].append(
+                    additional_generation_outputs)
+
+    def set_exclude_last_generation_logits(
+            self, exclude_last_generation_logits: bool):
+        self._exclude_last_generation_logits = exclude_last_generation_logits
+        self.diff.exclude_last_generation_logits = exclude_last_generation_logits
 
     def append_context_logits(self, context_logits: torch.Tensor):
         if self._context_logits:
             self._context_logits.append(context_logits)
+            self.diff.context_logits_list.append(context_logits)
 
     def append_generation_logits(self, generation_logits: torch.Tensor):
         if self._generation_logits:
             self._generation_logits.append(generation_logits)
+            self.diff.generation_logits_list.append(generation_logits)
 
     def append_log_probs(self,
                          log_probs: list[TokenLogprobs],
                          cum_log_probs: Optional[list[float]] = None):
         if self._log_probs:
             self._log_probs.append(log_probs, cum_log_probs)
+            self.diff.log_probs_list.append((log_probs, cum_log_probs))
 
-    def append_mm_embeddings(self, mm_embeddings: torch.Tensor):
-        self._mm_embeddings = SharedTensorContainer.from_tensor(
-            mm_embeddings).dump_to_dict()
+    def append_mm_embeddings(self, mm_embeddings: torch.Tensor,
+                             multimodal_lengths: List[int]):
+        """Split concatenated embeddings by multimodal_lengths and create handles for each.
+
+        Args:
+            mm_embeddings: Concatenated multimodal embeddings tensor of shape [total_tokens, hidden_dim]
+            multimodal_lengths: List of token lengths for each multimodal item
+        """
+        # Split the concatenated tensor by lengths to get per-item embeddings
+        split_embeddings = torch.split(mm_embeddings, multimodal_lengths, dim=0)
+
+        # Create a SharedTensorContainer handle for each split
+        self._mm_embeddings = [
+            SharedTensorContainer.from_tensor(emb).dump_to_dict()
+            for emb in split_embeddings
+        ]
+        self.diff.mm_embeddings = self._mm_embeddings
+
+    def set_mrope_position(
+        self,
+        mrope_position_ids: torch.Tensor,
+        mrope_position_deltas: torch.Tensor,
+    ):
+        self._mrope_position_ids = (SharedTensorContainer.from_tensor(
+            mrope_position_ids).dump_to_dict())
+        self._mrope_position_deltas = (SharedTensorContainer.from_tensor(
+            mrope_position_deltas).dump_to_dict())
+        self.diff.mrope_position_ids = self._mrope_position_ids
+        self.diff.mrope_position_deltas = self._mrope_position_deltas
+
+    def transfer_remaining_device_logits(self):
+        """Finalize any remaining generation logits transfers (for chunked mode)"""
+        if self._generation_logits:
+            self._generation_logits.finalize_chunked_transfer()
+
+    def append_additional_context_outputs(
+            self, name: str, additional_context_outputs: torch.Tensor):
+        self._additional_context_outputs[name].append(
+            additional_context_outputs.to("cpu", non_blocking=True))
+        self.diff.additional_context_outputs_list.append(
+            (name, self._additional_context_outputs[name][-1]))
+
+    def append_additional_generation_outputs(
+            self, name: str, additional_generation_outputs: torch.Tensor):
+        self._additional_generation_outputs[name].append(
+            additional_generation_outputs.to("cpu", non_blocking=True))
+        self.diff.additional_generation_outputs_list.append(
+            (name, self._additional_generation_outputs[name][-1]))
 
     def set_log_probs(self, log_probs: list[TokenLogprobs],
                       cum_log_probs: list[float]):
@@ -202,11 +440,13 @@ class PyResult:
         """
         if self._log_probs:
             self._log_probs.set_log_probs(log_probs, cum_log_probs)
+            self.diff.reset_log_probs = (log_probs, cum_log_probs)
+            self.diff.log_probs_list.clear()
 
     @property
     def context_logits(self) -> torch.Tensor | None:
         if self._context_logits is None or (storage := self._context_logits.get(
-                all_logits=True)) is None:
+                all_logits=True, exclude_last=False)) is None:
             return None
         return storage[:, 0]  # remove beam_width axis for context
 
@@ -217,37 +457,84 @@ class PyResult:
         if not self._generation_logits:
             return None
 
-        storage = self._generation_logits.get(all_logits=not self._streaming)
+        storage = self._generation_logits.get(
+            all_logits=not self._streaming,
+            exclude_last=self._exclude_last_generation_logits)
         if storage is None:
             return None
         return storage.transpose(0, 1)
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
-        return self._log_probs and self._log_probs.log_probs
+        return self._log_probs and hasattr(
+            self._log_probs, 'log_probs') and self._log_probs.log_probs
 
     @property
     def cum_log_probs(self) -> list[float] | None:
         return self._log_probs and self._log_probs.cum_log_probs
 
     @property
-    def mm_embedding_handle(self) -> Dict[str, Any] | None:
+    def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:
+        """Returns a list of SharedTensorContainer handles, one per multimodal item."""
         return self._mm_embeddings
+
+    @property
+    def mrope_position_ids_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_ids
+
+    @property
+    def mrope_position_deltas_handle(self) -> Dict[str, Any] | None:
+        # NOTE: when populated, the returned `dict` contains the information necessary to rebuild
+        # the `SharedTensorContainer` using the `from_dict` class method.
+        return self._mrope_position_deltas
+
+    @property
+    def additional_context_outputs(self) -> Dict[str, torch.Tensor] | None:
+        if self._additional_context_outputs is None:
+            return None
+        outputs = {}
+        for name, output_list in self._additional_context_outputs.items():
+            if len(output_list) == 0:
+                continue
+            outputs[name] = torch.cat(
+                output_list, dim=0) if len(output_list) > 1 else output_list[0]
+        return outputs
+
+    @property
+    def additional_generation_outputs(self) -> Dict[str, torch.Tensor] | None:
+        if self._additional_generation_outputs is None:
+            return None
+        outputs = {}
+        for name, output_list in self._additional_generation_outputs.items():
+            if len(output_list) == 0:
+                continue
+            outputs[name] = torch.cat(
+                output_list, dim=0) if len(output_list) > 1 else output_list[0]
+        return outputs
 
 
 class LlmResult:
     """LlmResult wraps `bindings.executor.Result` but detour some features to Python implementation"""
     py_result_properties = frozenset(
         ('context_logits', 'generation_logits', 'log_probs', 'cum_log_probs',
-         'mm_embedding_handle'))
+         'mm_embedding_handles', 'additional_context_outputs',
+         'additional_generation_outputs', 'mrope_position_ids_handle',
+         'mrope_position_deltas_handle'))
 
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
                  py_result: PyResult,
-                 is_final: bool = False):
+                 is_final: bool = False,
+                 time_breakdown_metrics: Optional[Dict] = None):
         self._result = result
         self._py_result = py_result
         self.is_final = is_final
+        self.cached_tokens = 0
+        # Time breakdown metrics for performance analysis
+        # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
+        self.time_breakdown_metrics = time_breakdown_metrics
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
@@ -278,6 +565,17 @@ class LlmResponse:
     def has_error(self):
         return self.error_msg is not None
 
+    def clear_context_logits(self):
+        """Clear context logits from the response result.
+
+        This is used to drop context logits after prompt_logprobs have been computed
+        when the user didn't explicitly request them.
+        """
+        if self.result and hasattr(self.result, '_py_result'):
+            py_result = self.result._py_result
+            if hasattr(py_result, '_context_logits'):
+                py_result._context_logits = None
+
 
 class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
     """LlmRequest wraps `bindings.internal.batch_manager.LlmRequest`
@@ -293,6 +591,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             return_generation_logits: bool = False,
             return_logits_device_memory: bool = True,
             exclude_last_generation_logits: bool = False,
+            additional_outputs: Optional[List[str]] = None,
             return_perf_metrics: bool = False,
             stop_words_list: list[list[int]] | None = None,
             llm_request: Optional[
@@ -300,6 +599,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             is_draft: bool = False,
             seq_slot: Optional[int] = None,
             target_seq_slot: Optional[int] = None,
+            num_logprobs: int = 0,
+            is_first_draft: bool = False,
+            use_chunked_generation_logits: bool = True,
+            logits_chunk_size: int = 8,
+            logprobs_mode: LogprobMode = LogprobMode.RAW,
             **kwargs):
 
         self.py_logits_post_processors = kwargs.pop("py_logits_post_processors",
@@ -327,6 +631,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_prompt_len = self.prompt_len
         self.py_orig_prompt_len = self.orig_prompt_len
         self.py_max_new_tokens = self.max_new_tokens
+        self.py_min_length = self.sampling_config.min_length
+        # `seqlen_this_rank_cp`, `total_input_len_cp`, and `py_helix_is_inactive_rank` are relevant to helix parallelism.
+        self.seqlen_this_rank_cp = self.prompt_len
+        self.total_input_len_cp = self.prompt_len
+        self.py_helix_is_inactive_rank = False
         self.py_batch_idx = None
         self.py_draft_pages_allocated = 0
         self.py_rewind_len = 0
@@ -336,36 +645,67 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_target_probs = None
         self.py_last_draft_tokens = None
         self.py_num_accepted_draft_tokens = 0
+        self.py_num_accepted_draft_tokens_indices = []
+        self.py_rewind_draft_token_separate_adjustment = 0
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
-        self.py_lora_task_layer_module_configs: list[
-            tensorrt_llm.bindings.internal.runtime.
-            TaskLayerModuleConfig] | None = None
+        self.py_kv_transfer_start_time = None
+        self.py_kv_transfer_timed_out = False
 
+        # Performance timing info (step metrics, GPU events, context GPU timing)
+        # Lazily created only when return_perf_metrics is enabled to avoid
+        # overhead for every request.
+        self.py_perf_timing: Optional[PerfTimingInfo] = None
+
+        self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
         self.py_return_generation_logits = return_generation_logits
         self.py_return_logits_device_memory = return_logits_device_memory
+        self.py_additional_outputs = additional_outputs
+
         self.py_is_draft = is_draft
         # The request's sequence slot ID, an index between 0 (inclusive) and max_batch_size (exclusive).
         self.py_seq_slot = seq_slot
         # If the request is a draft request, target_seq_slot is the sequence slot ID of its target request.
         self.py_target_seq_slot = target_seq_slot
         self.use_draft_model = is_draft
+        self._cached_tokens = 0
+        self._cached_tokens_set = False
+        # Whether the request is for the first forward of the draft model.
+        self.py_is_first_draft = is_first_draft
+        self.d2t = None
+        self.py_draft_use_greedy_sampling = False
+        self.py_disable_speculative_decoding = False
+
+        # Chunked logits parameters
+        self.py_use_chunked_generation_logits = use_chunked_generation_logits
+        self.py_logits_chunk_size = logits_chunk_size if not self.streaming else 1
 
         # TODO: remove this when use DynamicDecodeOp in pytorch flow.
         # currently, keep py_stop_words_list as python list, rather than tensor.
         self.py_stop_words_list = stop_words_list
 
-        self.py_result = PyResult(self.py_prompt_len, self.py_max_new_tokens,
-                                  return_logits_device_memory, self.streaming,
-                                  return_log_probs, return_context_logits,
-                                  return_generation_logits,
-                                  exclude_last_generation_logits)
+        self.py_logprobs_mode = LogprobMode(
+            logprobs_mode)  # handle passed a raw string
+        self.py_disaggregated_params = None
+
+        self.py_result = PyResult(
+            prompt_len=self.py_prompt_len,
+            max_new_tokens=self.py_max_new_tokens,
+            use_device_memory=return_logits_device_memory,
+            streaming=self.streaming,
+            return_log_probs=return_log_probs,
+            return_context_logits=return_context_logits,
+            return_generation_logits=return_generation_logits,
+            exclude_last_generation_logits=exclude_last_generation_logits,
+            use_chunked_generation_logits=self.py_use_chunked_generation_logits,
+            chunk_size=self.py_logits_chunk_size,
+            additional_outputs=additional_outputs)
         self.child_requests = []
 
-        self._py_embedding_bias_1d = None
+        self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
             # Pre-squeeze to 1D if needed (remove batch dimension)
             if self.embedding_bias.dim() > 1:
@@ -373,19 +713,96 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             else:
                 self._py_embedding_bias_1d = self.embedding_bias
 
+    def set_exclude_last_generation_logits(
+            self, exclude_last_generation_logits: bool):
+        self.py_result.set_exclude_last_generation_logits(
+            exclude_last_generation_logits)
+
+    @property
+    def cached_tokens(self) -> int:
+        return self._cached_tokens
+
+    @cached_tokens.setter
+    def cached_tokens(self, value: int):
+        if not self._cached_tokens_set:
+            self._cached_tokens = value
+            self._cached_tokens_set = True
+
     def is_generation_only_request(self):
         return self.py_llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY
 
-    def create_response(
-            self,
-            use_fast_logits=False,
-            mpi_world_rank=0) -> tensorrt_llm.bindings.executor.Response | None:
+    def create_response(self,
+                        use_fast_logits=False,
+                        mpi_world_rank=0) -> LlmResponse | None:
+        """Create an LlmResponse from the current request state.
+
+        This method generates a response containing the request's execution results,
+        including generated tokens, logits, and completion status. It wraps the
+        parent class's serialized result in a PyTorch-specific LlmResponse object.
+
+        Args:
+            use_fast_logits (bool, optional, default=False): Only applicable for TRT-backend with speculative decoding enabled. When returning generation logits under speculative decoding,
+            `use_fast_logits=True` replaces tensor payloads with tiny metadata so the target pulls logits
+            directly (zero-copy/IPC), reducing overhead; ignored on PyTorch.
+            mpi_world_rank (int, optional, default=0): Only applicable for TRT-backend, with speculative decoding
+            enabled, and `use_fast_logits=True`. Contains the MPI world rank of the process containing the draft
+            model, that produces the generation logits. This helps transfer logits from the draft model to the
+            target model without going through the serialization/transport path.
+
+        Returns:
+            LlmResponse | None: An LlmResponse object containing the request results
+            if there is valid output, otherwise None.
+            The response includes:
+            - request_id: The request identifier (parent ID for child requests)
+            - result: LlmResult wrapping both serialized and PyTorch-specific results
+            - client_id: The client identifier for request routing
+
+        Note:
+            Returns None if the serialized result is empty (len(result) == 0),
+            indicating no output was generated for this request iteration.
+        """
         result, is_final = super().create_serialized_result(
             use_fast_logits, mpi_world_rank)
+
+        # Performs a deep copy of py_result._log_probs to eliminate race conditions that may occur between IPC communication and the overriding of newly generated log_probs in streaming mode.
+        if self.streaming and self.py_result.log_probs and self.sampling_config.beam_width <= 1:
+            py_result = copy(self.py_result)
+            py_result._log_probs = deepcopy(self.py_result._log_probs)
+
+            for log_prob in self.py_result.log_probs:
+                log_prob.clear()
+        else:
+            py_result = self.py_result
+
+        # Only include time_breakdown_metrics in the final response to avoid O(N²) overhead
+        # during streaming (copying all step_metrics for every token is very expensive)
+        time_breakdown_metrics = None
+        if is_final and self.py_perf_timing is not None:
+            time_breakdown_metrics = {}
+            if self.py_perf_timing.step_metrics:
+                time_breakdown_metrics[
+                    'step_metrics'] = self.py_perf_timing.step_metrics.copy()
+            if self.py_perf_timing.ctx_chunk_metrics:
+                time_breakdown_metrics[
+                    'ctx_chunk_metrics'] = self.py_perf_timing.ctx_chunk_metrics.copy(
+                    )
+            if self.py_perf_timing.ctx_gpu_forward_time is not None:
+                time_breakdown_metrics[
+                    'ctx_gpu_forward_time'] = self.py_perf_timing.ctx_gpu_forward_time
+            if self.py_perf_timing.ctx_gpu_sample_time is not None:
+                time_breakdown_metrics[
+                    'ctx_gpu_sample_time'] = self.py_perf_timing.ctx_gpu_sample_time
+            # Only set if there's actual data
+            if not time_breakdown_metrics:
+                time_breakdown_metrics = None
+
         return LlmResponse(
             request_id=self.py_request_id
-            if self.is_child else self.parent_request_id,
-            result=LlmResult(result, self.py_result, is_final),
+            if not self.is_child else self.parent_request_id,
+            result=LlmResult(result,
+                             py_result,
+                             is_final,
+                             time_breakdown_metrics=time_breakdown_metrics),
             client_id=self.py_client_id) if len(result) > 0 else None
 
     @property
@@ -466,7 +883,8 @@ def executor_request_to_llm_request(
         executor_request: ExecutorRequest,
         child_req_ids: List[int],
         exclude_last_generation_logits: bool,
-        input_token_ids: Optional[List] = None) -> LlmRequest:
+        input_token_ids: Optional[List] = None,
+        position_ids: Optional[List] = None) -> LlmRequest:
     executor_sampling_config = executor_request.sampling_config
     sampling_config = SamplingConfig(executor_sampling_config)
 
@@ -480,10 +898,12 @@ def executor_request_to_llm_request(
     multimodal_hashes = None
     multimodal_positions = None
     multimodal_lengths = None
+    multimodal_uuids = None
     if executor_request.multimodal_input is not None:
         multimodal_hashes = executor_request.multimodal_input.multimodal_hashes
         multimodal_positions = executor_request.multimodal_input.multimodal_positions
         multimodal_lengths = executor_request.multimodal_input.multimodal_lengths
+        multimodal_uuids = executor_request.multimodal_input.multimodal_uuids
 
     # Extract mrope fields
     mrope_rotary_cos_sin = None
@@ -505,6 +925,7 @@ def executor_request_to_llm_request(
             convert_wordlist(executor_request.bad_words), dtype=torch.int32)
         if executor_request.bad_words else None,
         stop_words_list=stop_words_list,
+        position_ids=position_ids,
         prompt_embedding_table=None if executor_request.prompt_tuning_config
         is None else executor_request.prompt_tuning_config.embedding_table,
         prompt_vocab_size=None if executor_request.prompt_tuning_config is None
@@ -512,6 +933,7 @@ def executor_request_to_llm_request(
         multimodal_hashes=multimodal_hashes,
         multimodal_positions=multimodal_positions,
         multimodal_lengths=multimodal_lengths,
+        multimodal_uuids=multimodal_uuids,
         multimodal_embedding=executor_request.multimodal_embedding,
         lora_task_id=executor_request.lora_config.task_id
         if executor_request.lora_config is not None else None,
@@ -524,12 +946,18 @@ def executor_request_to_llm_request(
         mrope_position_deltas=mrope_position_deltas,
         lookahead_config=None,
         return_log_probs=executor_request.output_config.return_log_probs,
+        num_logprobs=getattr(executor_request, "py_num_logprobs", 0),
         return_context_logits=executor_request.output_config.
         return_context_logits,
         return_perf_metrics=executor_request.output_config.return_perf_metrics,
         return_generation_logits=executor_request.output_config.
         return_generation_logits,
         exclude_last_generation_logits=exclude_last_generation_logits,
+        additional_outputs=[
+            output.name for output in
+            executor_request.output_config.additional_model_outputs
+        ] if executor_request.output_config.additional_model_outputs is not None
+        else None,
         draft_tokens=getattr(executor_request, "draft_tokens", None),
         draft_logits=None,
         exclude_input_from_output=executor_request.output_config.
@@ -549,7 +977,15 @@ def executor_request_to_llm_request(
         cache_salt_id=executor_request.cache_salt_id,
         arrival_time=getattr(executor_request, "py_arrival_time", None),
         py_multimodal_data=getattr(executor_request, "py_multimodal_data",
-                                   None))
+                                   None),
+        kv_cache_retention_config=executor_request.kv_cache_retention_config,
+        logprobs_mode=getattr(executor_request, "py_logprobs_mode",
+                              LogprobMode.RAW),
+    )
+
+    llm_request.py_disaggregated_params = getattr(executor_request,
+                                                  "py_disaggregated_params",
+                                                  None)
     if child_req_ids:
         for child_id in child_req_ids:
             llm_request.create_child_request(child_id)

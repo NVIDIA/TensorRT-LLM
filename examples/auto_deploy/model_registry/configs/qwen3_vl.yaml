@@ -1,0 +1,5 @@
+# Configuration for Qwen3-VL models
+# Forces consistent dtype to avoid BFloat16/Float32 mismatch
+
+model_kwargs:
+  torch_dtype: bfloat16

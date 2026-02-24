@@ -31,7 +31,6 @@ from tqdm import tqdm
 import tensorrt_llm
 from tensorrt_llm._common import default_net
 from tensorrt_llm._utils import str_dtype_to_trt, trt_dtype_to_str
-from tensorrt_llm.bindings import KVCacheType
 from tensorrt_llm.functional import (ACT2FN, AttentionMaskType, LayerNormType,
                                      PositionEmbeddingType, Tensor,
                                      constant_to_tensor_)
@@ -41,6 +40,7 @@ from tensorrt_llm.layers.attention import (Attention, AttentionParams,
                                            BertAttention, KeyValueCacheParams,
                                            bert_attention, layernorm_map)
 from tensorrt_llm.layers.normalization import RmsNorm
+from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.generation_mixin import GenerationMixin
 from tensorrt_llm.models.model_weights_loader import (ModelWeightsFormat,
@@ -1482,7 +1482,7 @@ class STDiT3ModelWeightsLoader(ModelWeightsLoader):
 
     def translate_to_external_key(self, tllm_key: str,
                                   tllm_to_externel_key_dict: dict):
-        """Convert and load external checkpoint into a TensorRT-LLM model.
+        """Convert and load external checkpoint into a TensorRT LLM model.
         """
         trtllm_to_hf_name = {
             r"spatial_blocks.(\d+).attn.q_layernorm.weight":

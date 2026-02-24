@@ -1636,7 +1636,7 @@ def get_allowed_models(benchmark_type=None):
                    if i.benchmark_type == benchmark_type)
 
 
-def get_build_config(model_name, return_dict=True) -> Union[BuildConfig]:
+def get_build_config(model_name, return_dict=True) -> Union[Dict, BuildConfig]:
     if model_name in _allowed_configs:
         cfg = _allowed_configs[model_name].build_config
         return asdict(cfg) if return_dict else cfg

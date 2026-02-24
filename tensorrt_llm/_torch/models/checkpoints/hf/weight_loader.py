@@ -9,22 +9,25 @@ import safetensors
 import torch
 import tqdm
 
-from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
-    BaseWeightLoader
+from tensorrt_llm._torch.models.checkpoints.base_weight_loader import (
+    BaseWeightLoader, ConsumableWeightsDict)
 from tensorrt_llm._torch.models.modeling_utils import (
     register_checkpoint_weight_loader, run_concurrently)
 from tensorrt_llm._utils import (local_mpi_barrier, local_mpi_rank,
                                  local_mpi_size)
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import Mapping
 
 
+@register_checkpoint_weight_loader("mistral")
 @register_checkpoint_weight_loader("HF")
 class HfWeightLoader(BaseWeightLoader):
     """
     Loads weights from SafeTensors/bin/pth files.
     """
 
-    def load_weights(self, checkpoint_dir: str) -> dict[str, Any]:
+    def load_weights(self, checkpoint_dir: str,
+                     mapping: Mapping) -> dict[str, Any]:
         weight_files = glob.glob(f"{checkpoint_dir}/*.safetensors")
         # Some model checkpoint directories contain not only the sharded safetensors, but one
         # consolidated tensor. In the presence of both, we favor the former, as there really is no need
@@ -67,7 +70,7 @@ class HfWeightLoader(BaseWeightLoader):
         raise RuntimeError(f"No weight files found in {checkpoint_dir}.")
 
     def _load_weights_in_parallel(self, weight_files: List[str], load_func,
-                                  description: str) -> dict[str, Any]:
+                                  description: str) -> ConsumableWeightsDict:
         """
         Load weight files in parallel using the specified loading function.
 
@@ -77,7 +80,7 @@ class HfWeightLoader(BaseWeightLoader):
             description: Description for the progress bar
 
         Returns:
-            Dictionary containing all loaded weights
+            ConsumableWeightsDict containing all loaded weights
         """
         weights = {}
         pbar = tqdm.tqdm(total=len(weight_files), desc=description)
@@ -88,10 +91,11 @@ class HfWeightLoader(BaseWeightLoader):
                          reduce_func=weights.update,
                          pbar=pbar)
 
-        return weights
+        return ConsumableWeightsDict(weights)
 
     @staticmethod
     def _load_safetensors_file(file):
+        logger.info(f"Start to load safetensor file {file}")
         return safetensors.torch.load_file(file)
 
     @staticmethod

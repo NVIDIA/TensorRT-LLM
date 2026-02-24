@@ -1,0 +1,9 @@
+{
+    "version": "0.5",
+    "requires": [
+        "libnuma/system#65d9e0e45ccc1e477b97d678fa7d56bb%1769137587.8781652"
+    ],
+    "build_requires": [],
+    "python_requires": [],
+    "config_requires": []
+}

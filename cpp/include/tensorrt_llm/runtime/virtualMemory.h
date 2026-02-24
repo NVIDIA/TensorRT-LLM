@@ -22,9 +22,11 @@
 #include "tensorrt_llm/runtime/iBuffer.h"
 #include "tensorrt_llm/runtime/memoryCounters.h"
 
+#include <atomic>
 #include <cuda.h>
 #include <map>
 #include <mutex>
+#include <numeric>
 #include <unistd.h>
 #include <utility>
 
@@ -466,7 +468,7 @@ public:
         CudaVirtualMemoryManager& mManager;
         std::string mTag;
         CudaStreamPtr mBackStream;
-        std::size_t mPageSize;
+        std::atomic<std::size_t> mAlignment;
         RestoreMode mMode;
         bool mBackground{};
 
@@ -487,14 +489,45 @@ public:
             : mManager(manager)
             , mTag(std::move(tag))
             , mBackStream(std::move(backStream))
-            , mPageSize(getpagesize())
+            , mAlignment(0)
             , mMode(mode)
         {
         }
 
-        [[nodiscard]] std::size_t pageAligned(std::size_t n) const noexcept
+        [[nodiscard]] std::size_t aligned(std::size_t n, int device = 0)
         {
-            return (n + mPageSize - 1) & ~(mPageSize - 1);
+            // Lazy loading the alignment, since CUDA driver may yet to be initialized when Configuration is
+            // constructed.
+            // We have one process for each GPU so caching the value is fine.
+            constexpr std::size_t loading = std::numeric_limits<std::size_t>::max();
+            std::size_t alignment = 0;
+            if (mAlignment.compare_exchange_strong(alignment, loading, std::memory_order_relaxed))
+            {
+                std::size_t gpuAlignment = 1;
+                CUmemAllocationProp const prop{CU_MEM_ALLOCATION_TYPE_PINNED, CU_MEM_HANDLE_TYPE_NONE,
+                    {
+                        CU_MEM_LOCATION_TYPE_DEVICE,
+                        device,
+                    }};
+                TLLM_CU_CHECK(
+                    cuMemGetAllocationGranularity(&gpuAlignment, &prop, CU_MEM_ALLOC_GRANULARITY_RECOMMENDED));
+                alignment = std::lcm(getpagesize(), gpuAlignment);
+                mAlignment.store(alignment, std::memory_order_relaxed);
+            }
+            else
+            {
+                // spin wait
+                while (alignment == loading)
+                {
+#if defined(__x86_64__)
+                    asm volatile("pause");
+#elif defined(__aarch64__)
+                    asm volatile("yield");
+#endif
+                    alignment = mAlignment.load(std::memory_order_relaxed);
+                }
+            }
+            return (n + alignment - 1) / alignment * alignment;
         }
 
         // Background configuration, used to indicate no virtual memory allocator is explicitly configured by the user.

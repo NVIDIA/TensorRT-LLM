@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -77,7 +78,7 @@ AllreducePlugin::AllreducePlugin(void const* data, size_t length)
     }
     TLLM_CHECK_WITH_INFO(d == a + length,
         "Expected length (%d) != real length (%d). This is often "
-        "caused by using different TensorRT-LLM version to build "
+        "caused by using different TensorRT LLM version to build "
         "engine and run engine.",
         (int) length, (int) (d - a));
     check();
@@ -137,13 +138,12 @@ bool AllreducePlugin::supportsFormatCombination(
     int pos, nvinfer1::PluginTensorDesc const* inOut, int nbInputs, int nbOutputs) noexcept
 {
     int base_inputs = 0;
-    if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::UB)
+    switch (mStrategy)
     {
-        base_inputs = 1;
-    }
-    else
-    {
-        base_inputs = 2;
+    case AllReduceStrategyType::NCCL:
+    case AllReduceStrategyType::UB:
+    case AllReduceStrategyType::NCCL_SYMMETRIC: base_inputs = 1; break;
+    default: base_inputs = 2; break;
     }
     int fusion_op_extra_inputs = 0;
     int scale_idx = 0;
@@ -169,9 +169,15 @@ bool AllreducePlugin::supportsFormatCombination(
 
     TLLM_CHECK(nbInputs == (base_inputs + fusion_op_extra_inputs));
 
-    if (mStrategy != AllReduceStrategyType::NCCL && mStrategy != AllReduceStrategyType::UB && pos == 1)
+    if (pos == 1)
     {
-        return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        switch (mStrategy)
+        {
+        case AllReduceStrategyType::NCCL:
+        case AllReduceStrategyType::UB:
+        case AllReduceStrategyType::NCCL_SYMMETRIC: break;
+        default: return (inOut[pos].type == nvinfer1::DataType::kINT64) && (inOut[pos].format == TensorFormat::kLINEAR);
+        }
     }
     if (mStrategy == AllReduceStrategyType::UB)
     {
@@ -222,25 +228,26 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
     {
         if (!isAuto)
         {
-            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_INFO("Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
         }
         else if (forceDeterministic)
         {
             TLLM_LOG_WARNING(
-                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "Since Peer to Peer not supported, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might "
+                "produce "
                 "non-deterministic results.");
         }
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     if (isAuto && !mIsNVLINKSupported && !forceDeterministic)
     {
-        return AllReduceStrategyType::NCCL;
+        return AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     auto const maxWorkspaceSize = utils::customAllReduceUtils::getMaxRequiredWorkspaceSize(worldSize);
 
-    AllReduceStrategyType strat = AllReduceStrategyType::NCCL;
+    AllReduceStrategyType strat = AllReduceStrategyType::NCCL_SYMMETRIC;
     auto const messageSizeBytes = messageSize * common::getDTypeSize(type);
 
     if (messageSizeBytes <= maxWorkspaceSize)
@@ -268,7 +275,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::NCCL;
+                strat = AllReduceStrategyType::NCCL_SYMMETRIC;
             }
         }
         else
@@ -279,7 +286,7 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
             }
             else
             {
-                strat = AllReduceStrategyType::NCCL;
+                strat = AllReduceStrategyType::NCCL_SYMMETRIC;
             }
         }
 
@@ -287,30 +294,31 @@ AllReduceStrategyType AllreducePlugin::selectImplementation(
         {
             if (!isAuto)
             {
-                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL");
+                TLLM_LOG_WARNING("Since not aligned, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
             }
             else if (forceDeterministic)
             {
                 TLLM_LOG_WARNING(
-                    "Since not aligned, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                    "Since not aligned, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might produce "
                     "non-deterministic results.");
             }
-            strat = AllReduceStrategyType::NCCL;
+            strat = AllReduceStrategyType::NCCL_SYMMETRIC;
         }
     }
     else
     {
         if (!isAuto)
         {
-            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL");
+            TLLM_LOG_WARNING("Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL_SYMMETRIC");
         }
         else if (forceDeterministic)
         {
             TLLM_LOG_WARNING(
-                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL. NCCL might produce "
+                "Since messageSize > maxWorkspace, fallback to AllReduceStrategy: NCCL_SYMMETRIC. NCCL_SYMMETRIC might "
+                "produce "
                 "non-deterministic results.");
         }
-        strat = AllReduceStrategyType::NCCL;
+        strat = AllReduceStrategyType::NCCL_SYMMETRIC;
     }
 
     return strat;
@@ -337,6 +345,10 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     {
         runtimeStrategy = AllReduceStrategyType::NCCL;
     }
+    else if (mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
+    {
+        runtimeStrategy = AllReduceStrategyType::NCCL_SYMMETRIC;
+    }
     else if (mStrategy == AllReduceStrategyType::UB)
     {
         runtimeStrategy = AllReduceStrategyType::UB;
@@ -353,6 +365,11 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     case AllReduceStrategyType::NCCL:
     {
         TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL", rank);
+        break;
+    }
+    case AllReduceStrategyType::NCCL_SYMMETRIC:
+    {
+        TLLM_LOG_DEBUG("AllReducePlugin strategy for rank %d: NCCL_SYMMETRIC", rank);
         break;
     }
     case AllReduceStrategyType::ONESHOT:
@@ -373,14 +390,14 @@ int AllreducePlugin::enqueue(nvinfer1::PluginTensorDesc const* inputDesc, nvinfe
     default: break;
     }
 
-    if (runtimeStrategy == AllReduceStrategyType::NCCL)
+    if (runtimeStrategy == AllReduceStrategyType::NCCL || runtimeStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
     {
         if (mOp == AllReduceFusionOp::RESIDUAL_RMS_NORM || mOp == AllReduceFusionOp::RESIDUAL_RMS_PREPOST_NORM)
         {
             NCCLCHECK(ncclAllReduce(inputs[0], outputs[1], size, (*getDtypeMap())[mType], ncclSum, *mNcclComm, stream));
             tensorrt_llm::kernels::AllReduceParams params;
             int fusion_ptr_idx = 0;
-            if (mStrategy == AllReduceStrategyType::NCCL)
+            if (mStrategy == AllReduceStrategyType::NCCL || mStrategy == AllReduceStrategyType::NCCL_SYMMETRIC)
             {
                 fusion_ptr_idx = 1;
             }
@@ -585,19 +602,8 @@ bool AllreducePlugin::isCustomAllReduceSupported(int ranks_per_node) const noexc
         && (static_cast<size_t>(ranks_per_node) <= kernels::MAX_RANKS_PER_NODE) && (ranks_per_node > 0);
 }
 
-class NvmlManager
-{
-public:
-    NvmlManager()
-    {
-        NVML_CHECK(nvmlInit());
-    }
-
-    ~NvmlManager()
-    {
-        NVML_CHECK(nvmlShutdown());
-    }
-};
+using tensorrt_llm::common::NvmlManager;
+using tensorrt_llm::common::NVMLWrapper;
 
 std::set<int> getLocalGroup(std::set<int> const& group)
 {
@@ -695,6 +701,7 @@ void AllreducePlugin::setGroupTopology() noexcept
     TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
     NvmlManager nvmlManager;
+    auto const& nvml = nvmlManager.sharedWrapper();
     std::unordered_set<int> visitedDevice;
     mIsP2PSupported = true;
     mIsNVLINKSupported = true;
@@ -722,26 +729,26 @@ void AllreducePlugin::setGroupTopology() noexcept
             }
 
             nvmlDevice_t firstDevice;
-            NVML_CHECK(nvmlDeviceGetHandleByIndex(firstDeviceId, &firstDevice));
+            NVML_CHECK(nvml->nvmlDeviceGetHandleByIndex(firstDeviceId, &firstDevice));
 
             bool isNVLINK = false;
 
             for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
             {
                 nvmlPciInfo_t remotePciInfo;
-                if (nvmlDeviceGetNvLinkRemotePciInfo_v2(firstDevice, link, &remotePciInfo) != NVML_SUCCESS)
+                if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(firstDevice, link, &remotePciInfo) != NVML_SUCCESS)
                 {
                     continue;
                 }
 
                 nvmlDevice_t remoteDevice;
-                auto const result = nvmlDeviceGetHandleByPciBusId_v2(remotePciInfo.busId, &remoteDevice);
+                auto const result = nvml->nvmlDeviceGetHandleByPciBusId(remotePciInfo.busId, &remoteDevice);
 
                 if (result == NVML_SUCCESS)
                 {
                     // Two GPUs are connected directly through nvlink
                     unsigned int remoteDeviceId;
-                    NVML_CHECK(nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
+                    NVML_CHECK(nvml->nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
 
                     if (remoteDeviceId == static_cast<unsigned int>(secondDeviceId))
                     {
@@ -754,12 +761,12 @@ void AllreducePlugin::setGroupTopology() noexcept
                     // now remotePciInfo represents the pci information of nvswitch,
                     // determine whether nvlink is supported by whether two GPUs are connected to the same nvswitch.
                     nvmlDevice_t secondDevice;
-                    NVML_CHECK(nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
+                    NVML_CHECK(nvml->nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
 
                     for (unsigned int secondLink = 0; secondLink < NVML_NVLINK_MAX_LINKS; secondLink++)
                     {
                         nvmlPciInfo_t secondRemotePciInfo;
-                        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(secondDevice, secondLink, &secondRemotePciInfo)
+                        if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(secondDevice, secondLink, &secondRemotePciInfo)
                             != NVML_SUCCESS)
                         {
                             continue;

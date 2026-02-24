@@ -18,7 +18,7 @@ Note that, the `model_dir` could accept the following formats:
 ## FastAPI server
 
 NOTE: This FastAPI-based server is only an example for demonstrating the usage
-of TensorRT-LLM LLM API. It is not intended for production use.
+of TensorRT LLM LLM API. It is not intended for production use.
 For production, use the `trtllm-serve` command. The server exposes OpenAI compatible API endpoints.
 
 ### Install the additional requirements

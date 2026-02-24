@@ -15,13 +15,18 @@
  */
 
 #pragma once
+
+#include "tensorrt_llm/common/config.h"
+
 #include <cstdint>
 #include <cuda_fp8.h>
 #include <cuda_runtime_api.h>
 #include <vector>
 
 // non-persistent-cooperative GEMM
-namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::fp8_blockscale_gemm
 {
 
 class CutlassFp8BlockScaleGemmRunnerInterface
@@ -41,6 +46,11 @@ public:
         = 0;
 
     virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
+        size_t num_problems, size_t expected_m, size_t shape_n, size_t shape_k, cudaStream_t stream,
+        float const* scales_a = nullptr, float const* scales_b = nullptr)
+        = 0;
+
+    virtual void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
         float const* scales_b = nullptr)
         = 0;
@@ -50,8 +60,12 @@ public:
         int shape_k, cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b)
         = 0;
 
+    // Backward compatibility to support old signature
     virtual void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
         cudaStream_t stream)
+        = 0;
+    virtual void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+        cudaStream_t stream, bool use_ue8m0)
         = 0;
     virtual void fp8CS1x128Reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x,
         int shape_h, int shape_y, int stride_x, cudaStream_t stream)
@@ -96,6 +110,10 @@ public:
         cudaStream_t stream) override;
 
     void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
+        size_t num_problems, size_t expected_m, size_t shape_n, size_t shape_k, cudaStream_t stream,
+        float const* scales_a = nullptr, float const* scales_b = nullptr) override;
+
+    void moeGemm(void* mat_d, void const* mat_a, void const* mat_b, int64_t const* problem_m_offsets,
         size_t num_problems, size_t shape_n, size_t shape_k, cudaStream_t stream, float const* scales_a = nullptr,
         float const* scales_b = nullptr) override;
 
@@ -104,7 +122,13 @@ public:
         cudaStream_t stream, float* scales_a, int stride_scales_a, float* scales_b) override;
 
     void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
-        cudaStream_t stream) override;
+        cudaStream_t stream) override
+    {
+        fp8CS1x128(mat_quant, scales, mat, shape_x, shape_y, stream, false);
+    }
+
+    void fp8CS1x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
+        cudaStream_t stream, bool use_ue8m0) override;
     void fp8CS1x128Reshape(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_h,
         int shape_y, int stride_x, cudaStream_t stream) override;
     void fp8CS128x128(__nv_fp8_e4m3* mat_quant, float* scales, __nv_bfloat16 const* mat, int shape_x, int shape_y,
@@ -127,4 +151,6 @@ private:
     int64_t expected_m_ = 0;
 };
 
-} // namespace tensorrt_llm::kernels::fp8_blockscale_gemm
+} // namespace kernels::fp8_blockscale_gemm
+
+TRTLLM_NAMESPACE_END

@@ -13,13 +13,16 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAllReduceFusionKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
 #include <cooperative_groups.h>
 
-namespace tensorrt_llm::kernels::ar_fusion::moe
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels::ar_fusion::moe
 {
 template <int NRanks>
 struct LamportComm
@@ -28,9 +31,9 @@ struct LamportComm
     {
         counter_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[0];
         flag_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[2];
-        clear_ptr = &reinterpret_cast<int*>(workspace[NRanks * 3])[4];
+        clear_ptr = &reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[0];
         flag_value = *flag_ptr;
-        int comm_size = reinterpret_cast<int*>(workspace[NRanks * 3])[3];
+        auto comm_size = reinterpret_cast<int64_t*>(workspace[NRanks * 3 + 1])[1];
         clear_size = *clear_ptr;
         int data_offset = flag_value % 3;
         int clear_offset = (flag_value + 2) % 3;
@@ -46,7 +49,7 @@ struct LamportComm
         }
     }
 
-    __device__ __forceinline__ void update(int new_clear_size)
+    __device__ __forceinline__ void update(int64_t new_clear_size)
     {
         if (blockIdx.x == 0 && threadIdx.x == 0)
         {
@@ -61,10 +64,10 @@ struct LamportComm
 
     int* counter_ptr;
     int* flag_ptr;
-    int* clear_ptr;
+    int64_t* clear_ptr;
     uint8_t* data_bufs[NRanks];
     uint8_t* clear_buf;
-    int clear_size;
+    int64_t clear_size;
     int flag_value;
 };
 
@@ -770,4 +773,6 @@ void moefinalize_allreduce_fusion_op(MoeFinalizeAllReduceFusionParams const& par
 #undef MOE_FINALIZE_DISPATCH1
 }
 
-}; // namespace tensorrt_llm::kernels::ar_fusion::moe
+}; // namespace kernels::ar_fusion::moe
+
+TRTLLM_NAMESPACE_END

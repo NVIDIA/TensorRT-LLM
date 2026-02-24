@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/executor/dataTransceiverState.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/tensor.h"
@@ -36,6 +37,10 @@ struct SocketState;
 class Serialization
 {
 public:
+    // BlockKey (KV cache)
+    static size_t serializedSize(tensorrt_llm::batch_manager::kv_cache_manager::BlockKey const& key);
+    static void serialize(tensorrt_llm::batch_manager::kv_cache_manager::BlockKey const& key, std::ostream& os);
+    static tensorrt_llm::batch_manager::kv_cache_manager::BlockKey deserializeBlockKey(std::istream& is);
     // TimePoint
     [[nodiscard]] static RequestPerfMetrics::TimePoint deserializeTimePoint(std::istream& is);
     static void serialize(RequestPerfMetrics::TimePoint const& tp, std::ostream& os);
@@ -343,6 +348,11 @@ public:
     [[nodiscard]] static size_t serializedSize(KVCacheUpdatedData const& data);
     static void serialize(KVCacheUpdatedData const& data, std::ostream& os);
     [[nodiscard]] static KVCacheUpdatedData deserializeKVCacheUpdatedData(std::istream& is);
+
+    // MmKey
+    [[nodiscard]] static size_t serializedSize(MmKey const& key);
+    static void serialize(MmKey const& key, std::ostream& os);
+    [[nodiscard]] static MmKey deserializeMmKey(std::istream& is);
 
     // UniqueToken
     [[nodiscard]] static size_t serializedSize(tensorrt_llm::runtime::UniqueToken const& token);

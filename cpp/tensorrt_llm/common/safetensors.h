@@ -16,6 +16,7 @@
 
 #pragma once
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/logger.h"
 #include <NvInferRuntime.h>
 #include <cstdint>
@@ -23,7 +24,9 @@
 #include <memory>
 #include <utility>
 
-namespace tensorrt_llm::common::safetensors
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common::safetensors
 {
 class INdArray
 {
@@ -58,4 +61,6 @@ public:
     virtual ~ISafeTensor() = default;
 };
 
-} // namespace tensorrt_llm::common::safetensors
+} // namespace common::safetensors
+
+TRTLLM_NAMESPACE_END

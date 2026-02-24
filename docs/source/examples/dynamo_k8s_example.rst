@@ -1,18 +1,8 @@
 Dynamo K8s Example
 =================================
 
-
-1. Install Dynamo Cloud
-
-Please follow `this guide <https://docs.nvidia.com/dynamo/latest/guides/dynamo_deploy/dynamo_cloud.html>`_
-to install Dynamo cloud for your Kubernetes cluster.
-
-2. Deploy the TRT-LLM Deployment
-
-Dynamo uses custom resource definitions (CRDs) to manage the lifecycle of the
-deployments.  You can use the `DynamoDeploymentGraph yaml <https://github.com/ai-dynamo/dynamo/tree/main/components/backends/trtllm/deploy>`_
-files to create aggregated, and disaggregated TRT-LLM deployments.
-
-Please see `Deploying Dynamo Inference Graphs to Kubernetes using the Dynamo
-Cloud Platform <https://docs.nvidia.com/dynamo/latest/guides/dynamo_deploy/operator_deployment.html>`_
+This example demonstrates how to deploy TensorRT-LLM on a Kubernetes cluster
+using Dynamo Cloud.  Dynamo provides an operator-based approach to manage the
+lifecycle of model deployments through Custom Resource Definitions (CRDs).
+Please see `Dynamo Kubernetes Quick Start Guide <https://docs.nvidia.com/dynamo/latest/kubernetes/README.html>`_
 for more details.

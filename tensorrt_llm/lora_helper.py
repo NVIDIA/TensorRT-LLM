@@ -13,10 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Literal, Optional
 
-from ._utils import DictConversion
+from pydantic import Field
+
+from tensorrt_llm.llmapi.utils import StrictBaseModel
 
 
 def get_missing_qkv_modules_from_lora_modules(
@@ -46,6 +47,7 @@ def get_default_trtllm_modules_to_hf_modules():
         "attn_q": "q_proj",
         "attn_k": "k_proj",
         "attn_v": "v_proj",
+        "attn_qkv": "qkv_proj",
         "attn_dense": "o_proj",
         "mlp_h_to_4h": "gate_proj",
         "mlp_4h_to_h": "down_proj",
@@ -79,22 +81,50 @@ def use_lora(
             f"Unsupported lora_ckpt_source: {lora_config.lora_ckpt_source}")
 
 
-@dataclass
-class LoraConfig(DictConversion):
-    lora_dir: List[str] = field(default_factory=list)
-    lora_ckpt_source: str = "hf"
-    max_lora_rank: int = 64
-    lora_target_modules: List[str] = field(default_factory=list)
-    trtllm_modules_to_hf_modules: Dict[str, str] = field(default_factory=dict)
-    max_loras: Optional[int] = None
-    max_cpu_loras: Optional[int] = None
-    swap_gate_up_proj_lora_b_weight: bool = True
-
-    def __post_init__(self):
-        assert self.lora_ckpt_source in [
-            "hf", "nemo"
-        ], (f"lora_ckpt_source must be one of 'hf' or 'nemo', got {self.lora_ckpt_source}"
-            )
+class LoraConfig(StrictBaseModel):
+    lora_dir: List[str] = Field(
+        default_factory=list,
+        description="List of directories containing LoRA adapter checkpoints. "
+        "For HuggingFace format, expects adapter_model.bin/.safetensors and adapter_config.json. "
+        "For NeMo format, expects .nemo files. If empty, lora_target_modules must be provided."
+    )
+    lora_ckpt_source: Literal["hf", "nemo"] = Field(
+        default="hf",
+        description=
+        "Checkpoint format: 'hf' for HuggingFace PEFT format, 'nemo' for NeMo format. "
+        "NeMo only supports attn_qkv module.")
+    max_lora_rank: int = Field(
+        default=64,
+        description=
+        "Maximum LoRA rank across all adapters, used to pre-allocate workspace memory. "
+        "Set to the actual max rank of your adapters to reduce memory usage.")
+    lora_target_modules: List[str] = Field(
+        default_factory=list,
+        description="TensorRT-LLM module names where LoRA is applied "
+        "(e.g., ['attn_q', 'attn_k', 'attn_v'], ['attn_qkv'], ['mlp_gate', 'mlp_up']). "
+        "If empty and lora_dir is provided, inferred from checkpoint.")
+    trtllm_modules_to_hf_modules: Dict[str, str] = Field(
+        default_factory=dict,
+        description=
+        "Mapping from TensorRT-LLM module names to HuggingFace module names "
+        "(e.g., {'attn_q': 'q_proj'}). If empty, uses default mappings.")
+    max_loras: Optional[int] = Field(
+        default=None,
+        description=
+        "Maximum number of LoRA adapters that can be loaded simultaneously in GPU memory. "
+        "Controls device-side LoRA cache size.")
+    max_cpu_loras: Optional[int] = Field(
+        default=None,
+        description=
+        "Maximum number of LoRA adapters that can be stored in CPU memory. "
+        "Controls host-side cache for prefetching adapters before moving to GPU."
+    )
+    swap_gate_up_proj_lora_b_weight: bool = Field(
+        default=True,
+        description=
+        "Whether to swap gate/up projection order in fused gate_up_proj LoRA B weights. "
+        "Set to False for models like Phi-4-MM that use a different weight order."
+    )
 
     @property
     def missing_qkv_modules(self) -> List[str]:

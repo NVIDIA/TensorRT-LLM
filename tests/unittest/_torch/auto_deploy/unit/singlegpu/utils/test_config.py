@@ -389,7 +389,7 @@ def test_env_overrides_yaml(basic_yaml_files):
     """Test that environment variables override yaml configs."""
     with patch.dict(
         os.environ,
-        {"SIMPLE": '{"value": 888, "name": "env_value"}', "OPTION": '{"name": "env_option"}'},
+        {"AD_SIMPLE": '{"value": 888, "name": "env_value"}', "AD_OPTION": '{"name": "env_option"}'},
     ):
         settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
@@ -403,7 +403,7 @@ def test_env_overrides_yaml(basic_yaml_files):
 
 def test_partial_env_override(basic_yaml_files):
     """Test partial environment variable override."""
-    with patch.dict(os.environ, {"SIMPLE": '{"flag": true}', "OPTION": '{"option": "on"}'}):
+    with patch.dict(os.environ, {"AD_SIMPLE": '{"flag": true}', "AD_OPTION": '{"option": "on"}'}):
         settings = BasicSettings(yaml_extra=[basic_yaml_files["config1"]])
 
         # Mix of env and yaml values
@@ -412,23 +412,6 @@ def test_partial_env_override(basic_yaml_files):
         assert settings.simple.flag is True  # from env
         assert settings.option.name == "config1_option"  # from yaml
         assert settings.option.option == "on"  # from env
-
-
-# Error handling tests
-def test_deprecated_yaml_configs_field_error(basic_yaml_files):
-    """Test that using deprecated yaml_configs field raises ValueError."""
-    with pytest.raises(
-        ValueError, match=r"The 'yaml_configs' field is deprecated.*Please use 'yaml_extra' instead"
-    ):
-        BasicSettings(yaml_configs=[basic_yaml_files["config1"]])
-
-
-def test_empty_yaml_configs_allowed():
-    """Test that empty yaml_configs list doesn't raise error."""
-    # Empty yaml_configs should not raise error (but validation will still fail for missing fields)
-    with pytest.raises(ValidationError):
-        # Should fail validation for missing required fields, not for yaml_configs deprecation
-        BasicSettings(yaml_configs=[])
 
 
 def test_missing_yaml_file(temp_dir):

@@ -16,11 +16,15 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
+
 #include <functional>
 #include <memory>
 #include <optional>
 
-namespace tensorrt_llm::common
+TRTLLM_NAMESPACE_BEGIN
+
+namespace common
 {
 
 /**
@@ -100,4 +104,6 @@ public:
     }
 };
 
-} // namespace tensorrt_llm::common
+} // namespace common
+
+TRTLLM_NAMESPACE_END

@@ -9,6 +9,7 @@ import torch
 from blake3 import blake3
 from torchvision.transforms import ToPILImage
 
+import tensorrt_llm
 from tensorrt_llm.logger import logger
 
 # Default hasher
@@ -35,6 +36,22 @@ class MultimodalInput:
 
     Each span is unique to its multimodal item and may include special tokens for some models,
     (e.g., image_end_token, image_break_token for mistral3) mixed with the actual multimodal tokens.
+    """
+
+    multimodal_uuids: Optional[List[Optional[str]]] = None
+    """Optional user-provided UUIDs for multimodal data items.
+
+    When provided, these UUIDs will be returned in KV cache events instead of the
+    computed hash hex string. This enables deterministic cache identification across
+    sessions using user-defined stable identifiers.
+
+    Each element can be:
+    - A string UUID: Used as the cache identifier (returned in events)
+    - None: Falls back to content-based hashing for that item
+
+    If the UUID string is longer than 32 bytes, it will be hashed internally
+    for cache key computation, but the original UUID string is preserved and
+    returned in KV cache events.
     """
 
     def __post_init__(self):
@@ -68,13 +85,32 @@ class MultimodalInput:
                 f"positions={len(self.multimodal_positions)}, lengths={len(self.multimodal_lengths)}"
             )
 
+        # Validate multimodal_uuids if provided
+        if self.multimodal_uuids is not None:
+            if not isinstance(self.multimodal_uuids, list):
+                raise TypeError("multimodal_uuids must be a list")
+            if len(self.multimodal_uuids) != len(self.multimodal_hashes):
+                raise ValueError(
+                    f"multimodal_uuids length ({len(self.multimodal_uuids)}) must match "
+                    f"multimodal_hashes length ({len(self.multimodal_hashes)})")
+            for i, uuid in enumerate(self.multimodal_uuids):
+                if uuid is not None and not isinstance(uuid, str):
+                    raise TypeError(
+                        f"multimodal_uuids[{i}] must be a string or None, got {type(uuid)}"
+                    )
+
     @classmethod
-    def from_components(cls, mm_hashes: List[List[int]],
-                        mm_positions: List[int],
-                        mm_lengths: List[int]) -> 'MultimodalInput':
+    def from_components(
+            cls,
+            mm_hashes: List[List[int]],
+            mm_positions: List[int],
+            mm_lengths: List[int],
+            mm_uuids: Optional[List[Optional[str]]] = None
+    ) -> 'MultimodalInput':
         return cls(multimodal_hashes=mm_hashes,
                    multimodal_positions=mm_positions,
-                   multimodal_lengths=mm_lengths)
+                   multimodal_lengths=mm_lengths,
+                   multimodal_uuids=mm_uuids)
 
     def to_tensor(self) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Convert data to tensors"""
@@ -404,13 +440,18 @@ class MultimodalParams:
     def to_device(self,
                   element: str,
                   device: str,
-                  pin_memory: bool = False) -> None:
+                  pin_memory: bool = False,
+                  target_keywords: Optional[List[str]] = None) -> None:
         """Move specified multimodal data element to target device.
 
         Args:
             element: Element to move (only "multimodal_data" is supported)
             device: Target device (e.g., "cuda", "cpu")
-            pin_memory: Whether to pin memory for faster transfers
+            pin_memory: Whether to pin memory for asynchronous transfers
+            target_keywords: Optional list of keyword paths to filter which data to move.
+                    Each string can be a simple key or dot-separated path
+                    (e.g., ["image.pixel_values", "mrope_config"])
+                    If provided, only data matching these paths will be moved to device.
 
         Raises:
             ValueError: If element is not "multimodal_data" or device is invalid
@@ -425,34 +466,99 @@ class MultimodalParams:
         if data is None:
             return  # Nothing to move
 
-        transformed_data = self._apply_tensor_operation(data,
-                                                        "to_device",
-                                                        device=device,
-                                                        pin_memory=pin_memory)
+        # If keyword is specified, only move data for those keyword paths
+        if target_keywords is not None:
+            if not isinstance(data, dict):
+                raise ValueError(
+                    f"multimodal_data must be a dictionary when keyword is specified, "
+                    f"got {type(data)}")
+
+            # Process multiple keyword paths
+            transformed_data = self._move_multiple_paths_to_device(
+                data, target_keywords, device, pin_memory)
+        else:
+            # Move all data as before
+            transformed_data = self._apply_tensor_operation(
+                data, "to_device", device=device, pin_memory=pin_memory)
+
         setattr(self, element, transformed_data)
+
+    def _move_multiple_paths_to_device(self, data: Dict[str, Any],
+                                       target_keywords: List[str], device: str,
+                                       pin_memory: bool) -> Dict[str, Any]:
+        """Move multiple nested data paths to device.
+
+        Args:
+            data: The multimodal data dictionary
+            target_keywords: List of keyword paths (can be dot-separated)
+            device: Target device
+            pin_memory: Whether to pin memory
+
+        Returns:
+            Updated data dictionary with specified paths moved to device
+        """
+        result = data
+        for keyword_path in target_keywords:
+            # Parse each keyword path
+            if '.' in keyword_path:
+                key_path = keyword_path.split('.')
+            else:
+                key_path = [keyword_path]
+
+            # Navigate to the target location and move data
+            current = result
+            parent_path = key_path[:-1]
+            target_key = key_path[-1]
+
+            # Navigate to the parent dictionary
+            for key in parent_path:
+                if not isinstance(current, dict) or key not in current:
+                    # Path doesn't exist, skip this keyword path
+                    break
+                current = current[key]
+            else:
+                # Check if the target key exists and move it to device
+                if isinstance(current, dict) and target_key in current:
+                    current[target_key] = self._apply_tensor_operation(
+                        current[target_key],
+                        "to_device",
+                        device=device,
+                        pin_memory=pin_memory)
+
+        return result
 
     def strip_for_generation(self) -> None:
         """Strip multimodal data for generation processing.
 
-        Keeps only mrope_config and removes all other multimodal data
+        Keeps only mrope_position_deltas and removes all other multimodal data
         (embeddings, images, etc.) as they're not needed during generation.
         """
         if not self.multimodal_data:
             return
 
-        # Extract mrope_config before clearing
-        mrope_config = None
+        # Extract mrope_position_deltas before clearing
+        mrope_position_deltas = None
         if 'mrope_config' in self.multimodal_data:
             mrope_config = self.multimodal_data['mrope_config']
+            if isinstance(mrope_config,
+                          dict) and 'mrope_position_deltas' in mrope_config:
+                mrope_position_deltas = mrope_config['mrope_position_deltas']
 
-        # Clear all data and restore only mrope_config if it exists
+        # Clear all data and restore only position deltas if they exist
         self.multimodal_data = {}
-        if mrope_config is not None:
-            self.multimodal_data['mrope_config'] = mrope_config
+        if mrope_position_deltas is not None:
+            self.multimodal_data['mrope_config'] = {
+                'mrope_position_deltas': mrope_position_deltas
+            }
 
     def has_content(self) -> bool:
         """Check if this object contains any multimodal data."""
         return bool(self.multimodal_input or self.multimodal_data)
+
+
+@dataclass
+class MultimodalServerConfig():
+    media_io_kwargs: Optional[dict] = None
 
 
 # adopt from vllm : https://github.com/vllm-project/vllm/blob/main/vllm/vllm/multimodal/hash.py
@@ -475,39 +581,116 @@ def serialize_item(obj: object) -> bytes:
     raise ValueError(f"Unsupported object type: {type(obj)}")
 
 
-def apply_mm_hashes(mm_data: Dict[str, Any],
-                    hash_lib=default_hasher) -> Dict[str, List[str]]:
-    """Apply hashing to multimodal data items."""
+def apply_mm_hashes(
+    mm_data: Dict[str, Any],
+    mm_uuids: Optional[Dict[str, List[Optional[str]]]] = None,
+    hash_lib=default_hasher
+) -> Tuple[Dict[str, List[str]], Optional[List[Optional[str]]]]:
+    """Apply hashing to multimodal data items, combining UUID with content when provided.
 
-    def _hash_image(image):
-        # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
-        hasher = hash_lib()
-        if isinstance(image, torch.Tensor):
+    When a UUID is provided for an item, the hash is computed from both the UUID
+    and the content together: BLAKE3(UUID || Content). This ensures:
+    - Cache correctness: Different content always produces different hashes
+    - User isolation: Same content with different UUIDs produces different hashes
+    - The original UUID string is preserved and returned in KV cache events
+
+    Args:
+        mm_data: Dictionary of modality -> data items
+        mm_uuids: Optional dictionary of modality -> list of UUID strings.
+                  Use None for items that should use content-based hashing only.
+        hash_lib: Hash function to use (default: blake3)
+
+    Returns:
+        Tuple of:
+        - Dictionary of modality -> list of hash hex strings (64 chars each)
+        - Flattened list of original UUID strings (or None for content-hashed items)
+    """
+
+    def _hash_content(hasher, item):
+        """Hash the content of a multimodal item into the provided hasher."""
+        if isinstance(item, torch.Tensor):
             # Ensure tensor is on CPU and contiguous for consistent hashing
-            image = image.detach().cpu().contiguous()
-            hasher.update(serialize_item(image))
-        elif isinstance(image, list):
+            item = item.detach().cpu().contiguous()
+            hasher.update(serialize_item(item))
+        elif isinstance(item, list):
             # Hash each frame with a separator to avoid collisions between [A,B] and [AB]
-            for frame in image:
+            for frame in item:
+                hasher.update(b"<frame>")
+                if isinstance(frame, torch.Tensor):
+                    frame = frame.detach().cpu().contiguous()
+                hasher.update(serialize_item(frame))
+        elif isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+            frames = item.frames
+            for frame in frames:
                 hasher.update(b"<frame>")
                 if isinstance(frame, torch.Tensor):
                     frame = frame.detach().cpu().contiguous()
                 hasher.update(serialize_item(frame))
         else:
-            hasher.update(serialize_item(image))
+            hasher.update(serialize_item(item))
 
+    def _hash_item(item):
+        """Hash only the content of a multimodal item (no UUID)."""
+        # TODO: possible hash collision w/ this simplified version (vllm/PR/17378)
+        hasher = hash_lib()
+        _hash_content(hasher, item)
+        return hasher.hexdigest()
+
+    def _hash_item_with_uuid(item, uuid: str):
+        """Hash UUID and content together: BLAKE3(UUID || Content).
+
+        This creates a unique hash that incorporates both the user-provided
+        identifier and the actual content, ensuring cache correctness while
+        supporting user-defined cache isolation.
+        """
+        hasher = hash_lib()
+        # Hash UUID first with delimiters to prevent length-extension ambiguity
+        hasher.update(b"<uuid>")
+        hasher.update(uuid.encode('utf-8'))
+        hasher.update(b"</uuid>")
+        # Then hash the content
+        hasher.update(b"<content>")
+        _hash_content(hasher, item)
+        hasher.update(b"</content>")
         return hasher.hexdigest()
 
     mm_items = {
         modality: items if isinstance(items, list) else [items]
         for modality, items in mm_data.items()
     }
-    # TODO: need to hash both modality and item to distinguish modality (vllm/PR)
-    mm_hashes = {
-        modality: [_hash_image(item) for item in items]
-        for modality, items in mm_items.items()
-    }
-    return mm_hashes
+
+    # Collect UUIDs in the same order as items
+    all_uuids: List[Optional[str]] = []
+    mm_hashes: Dict[str, List[str]] = {}
+
+    for modality, items in mm_items.items():
+        modality_uuids = None
+        if mm_uuids is not None and modality in mm_uuids:
+            modality_uuids = mm_uuids[modality]
+            if not isinstance(modality_uuids, list):
+                modality_uuids = [modality_uuids]
+            if len(modality_uuids) != len(items):
+                raise ValueError(
+                    f"UUID list length ({len(modality_uuids)}) doesn't match "
+                    f"data items length ({len(items)}) for modality '{modality}'"
+                )
+
+        hashes = []
+        for i, item in enumerate(items):
+            uuid = modality_uuids[i] if modality_uuids else None
+            if uuid is not None:
+                # Hash UUID + content together for cache correctness
+                hashes.append(_hash_item_with_uuid(item, uuid))
+                all_uuids.append(uuid)  # Store original UUID
+            else:
+                # Fall back to content-only hashing
+                hashes.append(_hash_item(item))
+                all_uuids.append(None)
+
+        mm_hashes[modality] = hashes
+
+    # Return None for uuids if no UUIDs were provided at all
+    return mm_hashes, all_uuids if mm_uuids is not None else None
 
 
 def hexdigest_to_int32(hex_digest: str) -> List[int]:
@@ -524,6 +707,30 @@ def hexdigest_to_int32(hex_digest: str) -> List[int]:
             value = value - 0x100000000  # Convert to signed by subtracting 2^32
         result.append(value)
     return result
+
+
+def int32_to_hexdigest(int32_values: List[int]) -> str:
+    """Convert 8 int32 values back to a 64-character hexadecimal digest.
+
+    This is the inverse of hexdigest_to_int32.
+
+    Args:
+        int32_values: List of 8 signed int32 values
+
+    Returns:
+        64-character hexadecimal string representing the 32-byte hash
+    """
+    if len(int32_values) != 8:
+        raise ValueError(f"Expected 8 int32 values, got {len(int32_values)}")
+
+    result = []
+    for value in int32_values:
+        # Convert signed int32 back to unsigned
+        if value < 0:
+            value = value + 0x100000000
+        # Format as 8 hex characters (zero-padded)
+        result.append(f'{value:08x}')
+    return ''.join(result)
 
 
 def find_mm_token_lengths(mm_data: Dict[str, Any],
@@ -557,6 +764,8 @@ def find_mm_token_lengths(mm_data: Dict[str, Any],
                     image=item, )
                 modality_token_lengths.append(num_tokens)
             elif modality == "video":
+                if isinstance(item, tensorrt_llm.inputs.utils.VideoData):
+                    item = item.frames
                 assert isinstance(item, list), "Video must be a list of frames"
                 if isinstance(item[0], torch.Tensor):
                     item = [ToPILImage()(frame) for frame in item]
@@ -593,6 +802,7 @@ def find_mm_token_positions(
         num_mm_tokens: List of contiguous chunk lengths for each multimodal item
         vocab_size: Size of the model's vocabulary (used to identify tokens > vocab_size)
         mm_token_ids: Specific token IDs that represent multimodal tokens
+        mm_special_token_ids: Specific token IDs that represent special multimodal tokens
 
     Returns:
         List of starting positions for each contiguous multimodal token
@@ -603,7 +813,7 @@ def find_mm_token_positions(
             "Provide either mm_token_ids or vocab_size to find multimodal token positions"
         )
     if mm_token_ids is not None and vocab_size is not None:
-        logger.warning(
+        logger.debug(
             "Both mm_token_ids and vocab_size are provided, using mm_token_ids and ignoring vocab_size"
         )
 
@@ -614,13 +824,25 @@ def find_mm_token_positions(
         elif isinstance(input_ids, np.ndarray):
             input_ids = torch.from_numpy(input_ids)
 
-    # Create mask for multimodal tokens
+    # Create mask for multimodal tokens including special tokens if provided
     if mm_token_ids is None:
         mm_mask = input_ids >= vocab_size
+        if mm_special_token_ids is not None:
+            mm_special_token_ids = mm_special_token_ids.to(
+                device=input_ids.device, dtype=input_ids.dtype)
+            mm_mask = mm_mask | torch.isin(input_ids, mm_special_token_ids)
     else:
+        mm_token_ids = mm_token_ids.to(device=input_ids.device,
+                                       dtype=input_ids.dtype)
         if mm_token_ids.ndim != 1:
             raise ValueError("mm_token_ids must be a 1D tensor")
-        mm_token_ids = torch.unique(mm_token_ids)
+        if mm_special_token_ids is not None:
+            mm_special_token_ids = mm_special_token_ids.to(
+                device=input_ids.device, dtype=input_ids.dtype)
+            mm_token_ids = torch.unique(
+                torch.cat([mm_token_ids, mm_special_token_ids]))
+        else:
+            mm_token_ids = torch.unique(mm_token_ids)
         mm_mask = torch.isin(input_ids, mm_token_ids)
 
     # If no multimodal tokens found, return empty list

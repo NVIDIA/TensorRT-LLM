@@ -1,47 +1,17 @@
 import os
 import tempfile
-from typing import List
+from typing import Any
 
 import openai
 import pytest
 import requests
 import yaml
+from utils.llm_data import llm_models_root
 
 from ..test_llm import get_model_path
-from .openai_server import RemoteOpenAIServer
+from .openai_server import RemoteMMEncoderServer
 
 pytestmark = pytest.mark.threadleak(enabled=False)
-
-
-class RemoteMMEncoderServer(RemoteOpenAIServer):
-    """Remote server for testing multimodal encoder endpoints."""
-
-    def __init__(self,
-                 model: str,
-                 cli_args: List[str] = None,
-                 port: int = None) -> None:
-        # Reuse parent initialization but change the command
-        import subprocess
-        import sys
-
-        from tensorrt_llm.llmapi.mpi_session import find_free_port
-
-        self.host = "localhost"
-        self.port = port if port is not None else find_free_port()
-        self.rank = os.environ.get("SLURM_PROCID", 0)
-
-        args = ["--host", f"{self.host}", "--port", f"{self.port}"]
-        if cli_args:
-            args += cli_args
-
-        # Use mm_embedding_serve command instead of regular serve
-        launch_cmd = ["trtllm-serve", "mm_embedding_serve"] + [model] + args
-
-        self.proc = subprocess.Popen(launch_cmd,
-                                     stdout=sys.stdout,
-                                     stderr=sys.stderr)
-        self._wait_for_server(url=self.url_for("health"),
-                              timeout=self.MAX_SERVER_START_WAIT_S)
 
 
 @pytest.fixture(scope="module", ids=["Qwen2.5-VL-3B-Instruct"])
@@ -98,10 +68,13 @@ def async_client(server: RemoteMMEncoderServer):
     return server.get_async_client()
 
 
-def test_multimodal_content_mm_encoder(client: openai.OpenAI, model_name: str):
+def test_multimodal_content_mm_encoder(
+        client: openai.OpenAI,
+        model_name: str) -> tuple[list[dict[str, Any]], dict[str, Any]]:
 
     content_text = "Describe the natural environment in the image."
-    image_url = "https://huggingface.co/datasets/YiYiXu/testing-images/resolve/main/seashore.png"
+    image_url = str(llm_models_root() / "multimodals" / "test_data" /
+                    "seashore.png")
     messages = [{
         "role":
         "user",
@@ -134,6 +107,8 @@ def test_multimodal_content_mm_encoder(client: openai.OpenAI, model_name: str):
         0] == 324  # qwen2.5-vl: 324 tokens for the same image
     assert mm_handle["tensor_size"][
         1] == 2048  # qwen2.5-vl: hidden_size of the vision encoder
+
+    return messages, mm_handle  # used by tests/unittest/llmapi/apps/_test_openai_chat_multimodal.py
 
 
 def test_health(server: RemoteMMEncoderServer):

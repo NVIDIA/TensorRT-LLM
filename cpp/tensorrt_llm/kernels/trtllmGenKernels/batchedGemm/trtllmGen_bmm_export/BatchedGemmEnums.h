@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 1993-2025 NVIDIA CORPORATION &
+ * SPDX-FileCopyrightText: Copyright (c) 1993-2026 NVIDIA CORPORATION &
  * AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -34,7 +34,9 @@ enum class RouteImpl
     // Use LDGSTS to do the routing
     Ldgsts = 1,
     // Use UTMALDG.GATHER4 to do the routing
-    Tma = 2
+    Tma = 2,
+    // Use LDG+STS to do the routing
+    LdgPlusSts = 3
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -56,6 +58,13 @@ inline bool doesRouteImplUseLdgsts(RouteImpl mode)
 inline bool doesRouteImplUseTma(RouteImpl mode)
 {
     return (mode == RouteImpl::Tma);
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool doesRouteImplUseLdgPlusSts(RouteImpl mode)
+{
+    return (mode == RouteImpl::LdgPlusSts);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

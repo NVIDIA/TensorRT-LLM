@@ -2,6 +2,7 @@ import io
 # pickle is not secure, but but this whole file is a wrapper to make it
 # possible to mitigate the primary risk of code injection via pickle.
 import pickle  # nosec B403
+import re
 from functools import partial
 
 # This is an example class (white list) to showcase how to guard serialization with approved classes.
@@ -50,17 +51,12 @@ BASE_EXAMPLE_CLASSES = {
     "tensorrt_llm._torch.models.modeling_siglip": ["SiglipVisionModel"],
     "tensorrt_llm._torch.models.modeling_vila": ["VilaModel"],
     "tensorrt_llm._torch.models.modeling_gpt_oss": ["GptOssForCausalLM"],
-    ### ending import of torch models classes
     "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
     "tensorrt_llm._torch.pyexecutor.llm_request":
     ["LogitsStorage", "PyResult", "LlmResult", "LlmResponse", "LogProbStorage"],
     "tensorrt_llm._torch.speculative.mtp": ["MTPConfig"],
     "tensorrt_llm._torch.speculative.interface": ["SpeculativeDecodingMode"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
-    "tensorrt_llm.auto_parallel.config": ["AutoParallelConfig", "CostModel"],
-    "tensorrt_llm.auto_parallel.cluster_info":
-    ["ClusterInfo", "MathThroughput"],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig", "LoadFormat"],
+    ### ending import of torch models classes
     "tensorrt_llm.bindings.executor": [
         "BatchingType", "CacheTransceiverConfig", "CapacitySchedulerPolicy",
         "ContextPhaseParams", "ContextChunkingPolicy", "DynamicBatchConfig",
@@ -70,8 +66,6 @@ BASE_EXAMPLE_CLASSES = {
         "KvCacheRetentionConfig.TokenRangeRetentionConfig", "PeftCacheConfig",
         "SchedulerConfig"
     ],
-    "tensorrt_llm._torch.pyexecutor.config": ["PyTorchConfig"],
-    "tensorrt_llm._torch.model_config": ["MoeLoadBalancerConfig"],
     "tensorrt_llm.builder": ["BuildConfig"],
     "tensorrt_llm.disaggregated_params": ["DisaggregatedParams"],
     "tensorrt_llm.inputs.multimodal": ["MultimodalInput"],
@@ -133,19 +127,31 @@ def register_approved_class(obj):
 
 class Unpickler(pickle.Unpickler):
 
-    def __init__(self, *args, approved_imports={}, **kwargs):
+    def __init__(self,
+                 *args,
+                 approved_imports={},
+                 approved_module_patterns=None,
+                 **kwargs):
         super().__init__(*args, **kwargs)
         self.approved_imports = approved_imports
+        self.approved_module_patterns = approved_module_patterns or []
 
     # only import approved classes, this is the security boundary.
     def find_class(self, module, name):
-        if name not in self.approved_imports.get(module, []):
-            # If this is triggered when it shouldn't be, then the module
-            # and class should be added to the approved_imports. If the class
-            # is being used as part of a routine scenario, then it should be added
-            # to the appropriate base classes above.
-            raise ValueError(f"Import {module} | {name} is not allowed")
-        return super().find_class(module, name)
+        # Check exact match in approved_imports
+        if name in self.approved_imports.get(module, []):
+            return super().find_class(module, name)
+
+        # Check regex pattern match in approved_module_patterns
+        for pattern in self.approved_module_patterns:
+            if re.match(pattern, module):
+                return super().find_class(module, name)
+
+        # If this is triggered when it shouldn't be, then the module
+        # and class should be added to the approved_imports. If the class
+        # is being used as part of a routine scenario, then it should be added
+        # to the appropriate base classes above.
+        raise ValueError(f"Import {module} | {name} is not allowed")
 
 
 # these are taken from the pickle module to allow for this to be a drop in replacement
@@ -163,13 +169,15 @@ def load(file,
          encoding="ASCII",
          errors="strict",
          buffers=None,
-         approved_imports={}):
+         approved_imports={},
+         approved_module_patterns=None):
     return Unpickler(file,
                      fix_imports=fix_imports,
                      buffers=buffers,
                      encoding=encoding,
                      errors=errors,
-                     approved_imports=approved_imports).load()
+                     approved_imports=approved_imports,
+                     approved_module_patterns=approved_module_patterns).load()
 
 
 def loads(s,
@@ -179,7 +187,8 @@ def loads(s,
           encoding="ASCII",
           errors="strict",
           buffers=None,
-          approved_imports={}):
+          approved_imports={},
+          approved_module_patterns=None):
     if isinstance(s, str):
         raise TypeError("Can't load pickle from unicode string")
     file = io.BytesIO(s)
@@ -188,4 +197,5 @@ def loads(s,
                      buffers=buffers,
                      encoding=encoding,
                      errors=errors,
-                     approved_imports=approved_imports).load()
+                     approved_imports=approved_imports,
+                     approved_module_patterns=approved_module_patterns).load()

@@ -79,6 +79,10 @@ Alternatively, the ``--model`` argument also accepts a local path to pre-built T
 
 For more details, see ``trtllm-eval --help`` and ``trtllm-eval <task> --help``.
 
+.. include:: ../_includes/note_sections.rst
+   :start-after: .. start-note-config-flag-alias
+   :end-before: .. end-note-config-flag-alias
+
 
 
 Syntax

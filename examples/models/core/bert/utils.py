@@ -18,7 +18,7 @@ from transformers import RobertaConfig, RobertaPreTrainedModel, RobertaForQuesti
 
 # NOTE: This routine is copied from from tests/unittests/utils/llm_data.py
 def llm_models_root(check=False) -> Optional[Path]:
-    root = Path("/home/scratch.trt_llm_data/llm-models/")
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
 
     if "LLM_MODELS_ROOT" in os.environ:
         root = Path(os.environ.get("LLM_MODELS_ROOT"))
@@ -28,7 +28,7 @@ def llm_models_root(check=False) -> Optional[Path]:
 
     if check:
         assert root.exists(), \
-        "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data to run this test"
+        "You shall set LLM_MODELS_ROOT env or be able to access /home/scratch.trt_llm_data_ci to run this test"
 
     return root if root.exists() else None
 

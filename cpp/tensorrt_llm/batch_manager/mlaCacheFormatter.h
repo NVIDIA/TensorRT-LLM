@@ -27,12 +27,11 @@ namespace tensorrt_llm::batch_manager::kv_cache_manager
 class MLACacheFormatter final : public BaseCacheFormatter
 {
 public:
-    MLACacheFormatter(BaseKVCacheManager* cacheManager, CacheTransBufferManager* cacheTransBufferManager)
+    MLACacheFormatter(BaseKVCacheManager* cacheManager, std::vector<CacheTransBufferManager*> cacheTransBufferManagers)
         : mCacheManager{cacheManager}
-        , mCacheTransBufferManager{cacheTransBufferManager}
+        , mCacheTransBufferManagers{cacheTransBufferManagers}
     {
         TLLM_CHECK(mCacheManager);
-        TLLM_CHECK(mCacheTransBufferManager);
     }
 
     void format(tensorrt_llm::batch_manager::TransferSession& session) override;
@@ -53,12 +52,16 @@ public:
     }
 
     static bool needSendCache(CacheState const& selfConfig, CacheState const& destConfig, runtime::SizeType32 selfIdx);
-    std::vector<size_t> pickRecvConnections(size_t numConnections, CacheState const& selfConfig, SizeType32 selfIdx,
-        CacheState const& destConfig) const override;
+    std::pair<std::vector<size_t>, std::vector<size_t>> pickRecvConnections(size_t numConnections,
+        CacheState const& selfConfig, SizeType32 selfIdx, CacheState const& destConfig,
+        std::vector<SizeType32> const& counterPartRanks) const override;
+
+    [[nodiscard]] std::vector<size_t> pickSendConnections(size_t numConnections, CacheState const& selfConfig,
+        SizeType32 selfIdx, CacheState const& destConfig, std::vector<SizeType32> const& counterPartRanks) const;
 
 private:
     BaseKVCacheManager* mCacheManager;
-    CacheTransBufferManager* mCacheTransBufferManager;
+    std::vector<CacheTransBufferManager*> mCacheTransBufferManagers;
 };
 
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

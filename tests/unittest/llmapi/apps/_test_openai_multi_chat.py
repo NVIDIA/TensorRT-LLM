@@ -48,7 +48,6 @@ def engine_from_fp8_quantization(model_name):
 
     llm = LLM(model_path,
               tensor_parallel_size=tp_size,
-              auto_parallel_world_size=tp_size,
               quant_config=quant_config,
               calib_config=calib_config,
               build_config=build_config)

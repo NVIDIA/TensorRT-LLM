@@ -1,138 +1,207 @@
-# TensorRT-LLM Benchmark Test System
+# TensorRT-LLM Perf Sanity Test System
 
-Benchmarking scripts for TensorRT-LLM serving performance tests with configuration-driven test cases and CSV report generation.
+Performance sanity testing scripts for TensorRT-LLM with configuration-driven test cases supporting single-node, multi-node aggregated, and multi-node disaggregated architectures.
+
+This document serves as a reference for both developers and AI agents working with the perf sanity system.
 
 ## Overview
 
-- Run performance benchmarks across multiple model configurations
-- Manage test cases through YAML configuration files
-- Generate comprehensive CSV reports with complete test case coverage
-- Support selective execution of specific test cases
+- Run performance sanity benchmarks across multiple model configs
+- Support three deployment architectures: single-node, multi-node aggregated, and multi-node disaggregated
+- Manage test cases through YAML config files
+- Automated resource calculation and job submission via SLURM
 
-## Scripts Overview
+## System Architecture
 
-### 1. `benchmark_config.yaml` - Test Case Configuration
-**Purpose**: Defines all benchmark test cases in a structured YAML format.
+### Key Scripts
 
-**Structure**:
-```yaml
-test_cases:
-  - id: 1
-    model: "70B-FP8"
-    gpus: 1
-    tp: 1
-    ep: 1
-    attn_backend: "TRTLLM"
-    moe_backend: ""
-    enable_attention_dp: false
-    free_gpu_mem_fraction: 0.9
-    max_batch_size: 512
-    isl: 1024
-    osl: 1024
-    max_num_tokens: 16384
-    moe_max_num_tokens: ""
-    concurrency_iterations:
-      - [1, 10]
-      - [8, 10]
-      - [64, 5]
-      - [512, 2]
-```
+| Script | Purpose | SLURM Launch Draft |
+|--------|---------|-------------------|
+| `tests/integration/defs/perf/test_perf_sanity.py` | Main pytest entry point for all perf sanity tests | N/A |
+| `jenkins/scripts/perf/disaggregated/submit.py` | CI submission script (disaggregated tests only) | Uses `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+| `jenkins/scripts/perf/local/submit.py` | Local submission script (both aggregated and disaggregated tests) | Uses `jenkins/scripts/perf/aggregated/slurm_launch_draft.sh` or `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+| `jenkins/L0_Test.groovy` | Jenkins CI pipeline for test orchestration | N/A |
 
-**Configuration Fields**:
-- `id`: Unique identifier for the test case
-- `model`: Model name (e.g., "70B-FP8", "Scout-FP4")
-- `gpus`: Number of GPUs to use
-- `tp`: Tensor parallelism size
-- `ep`: Expert parallelism size
-- `attn_backend`: Attention backend ("TRTLLM", "FLASHINFER")
-- `moe_backend`: MoE backend ("DEEPGEMM", "TRTLLM", "CUTLASS", "")
-- `enable_attention_dp`: Enable attention data parallelism
-- `free_gpu_mem_fraction`: GPU memory fraction to reserve
-- `max_batch_size`: Maximum batch size
-- `isl`: Input sequence length
-- `osl`: Output sequence length
-- `max_num_tokens`: Maximum number of tokens
-- `moe_max_num_tokens`: Maximum number of tokens for MoE
-- `concurrency_iterations`: List of [concurrency, iteration] pairs
+### SLURM Launch Script Generation
 
+The submit scripts generate `slurm_launch.sh` from draft templates:
 
-### 2. `run_benchmark_serve.py` - Main Benchmark Runner
-**Purpose**: Executes performance benchmarks based on YAML configuration files.
+| Submit Script | Mode | Draft Template Used |
+|---------------|------|---------------------|
+| `jenkins/scripts/perf/disaggregated/submit.py` | Disaggregated (CI only) | `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
+| `jenkins/scripts/perf/local/submit.py` | Aggregated (local) | `jenkins/scripts/perf/aggregated/slurm_launch_draft.sh` |
+| `jenkins/scripts/perf/local/submit.py` | Disaggregated (local) | `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
 
-**Usage**:
-```bash
-python run_benchmark_serve.py --output_folder <output_folder> --config_file <config_file> [--skip <skip_pattern>] [--select <select_pattern>]
-```
+## Configuration Files
 
-**Arguments**:
-- `--output_folder`: Directory to store benchmark results (required)
-- `--config_file`: Path to YAML configuration file (required)
-- `--skip`: Skip pattern for specific test cases/concurrencies (optional, default: no skipping)
-- `--select`: Select pattern for specific test cases/concurrencies (optional, default: all test cases)
+There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
+
+### Aggregated Mode Config Files
+
+**Location**: `tests/scripts/perf-sanity`
+
+**File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen).
 
 **Examples**:
-```bash
-# Run all test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --skip default --select default
+- `deepseek_r1_fp4_v2_grace_blackwell.yaml` - Single-node aggregated test
+- `deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml` - Multi-node aggregated test
 
-# Skip specific test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --skip "2-1,4"
+**Use Cases**:
+- Single-node: Performance tests on a single server with multiple GPUs
+- Multi-node: Model runs across multiple nodes with unified execution
 
-# Run specific concurrencies from specific test cases
-python run_benchmark_serve.py --output_folder results --config_file benchmark_config.yaml --select "1,2-3"
+### Disaggregated Mode Config Files
 
+**Location**: `tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity`
+
+**File Naming**: `xxx.yaml` (can contain `-` hyphen).
+
+**Example**: `deepseek-r1-fp4_1k1k_ctx1_gen1_dep8_bs768_eplb0_mtp0_ccb-UCX.yaml`
+
+**Use Case**: Disaggregated architecture where model runs across multiple nodes with separate context (prefill) and generation (decode) servers.
+
+## Test Case Formats
+
+In each test db yml file (with keyword `perf_sanity`), there are four test types:
+
+### 1. Normal Aggregated Test
+
+Uses aggregated config files from `tests/scripts/perf-sanity`.
+
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-{agg config file base name}-{test name}]
 ```
 
-**Skip Pattern**:
-Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_case2-concurrency3"`
-- `"2,4"`: Skip test cases 2 and 4 entirely
-- `"2-1,4-2"`: Skip test case 2's 1st concurrency and test case 4's 2nd concurrency
-- `"default"` or empty: No skipping (default)
-
-**Select Pattern**:
-Format: `"test_case1,test_case2,test_case3"` or `"test_case1-concurrency1,test_case2-concurrency3"`
-- `"1,3,5"`: Run only test cases 1, 3, and 5 (all concurrencies)
-- `"1-1,2-3"`: Run test case 1's 1st concurrency and test case 2's 3rd concurrency
-- `"default"` or empty: Run all test cases (default)
-
-
-### 3. `parse_benchmark_results.py` - Results Parser
-**Purpose**: Parses benchmark log files and generates comprehensive CSV reports with all test cases from the configuration file.
-
-**Usage**:
-```bash
-python parse_benchmark_results.py --input_folder <input_folder> --output_csv <output_csv> --config_file <config_file>
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
 ```
 
-**Arguments**:
-- `input_folder`: Folder containing benchmark log files (serve.*.log) (required)
-- `output_csv`: Output CSV filename for the results table (required)
-- `config_file`: Path to benchmark_config.yaml file (required)
+### 2. Aggregated ctx_only Test
 
-**Examples**:
-```bash
-python parse_benchmark_results.py --config_file ./benchmark_logs --output_csv results.csv --input_folder ./benchmark_config.yaml
+Uses disaggregated config files but runs context (prefill) phase only in aggregated mode.
 
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{disagg config file base name}]
 ```
 
-### 4. `benchmark-serve.sh` - SLURM Job Script
-**Usage**:
-```bash
-sbatch benchmark-serve.sh [IMAGE] [bench_dir] [output_dir] [select_pattern] [skip_pattern]
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
 ```
 
-**Parameters**:
-- `IMAGE`: Docker image (default: tensorrt-llm-staging/release:main-x86_64)
-- `bench_dir`: Directory containing config file and benchmark scripts (default: current directory)
-- `output_dir`: Directory containing output logs and csv. (default: current directory)
-- `select_pattern`: Select pattern (default: default - all test cases)
-- `skip_pattern`: Skip pattern (default: default - no skipping)
+### 3. Disaggregated gen_only Test
 
-**Examples**:
-```bash
+Uses disaggregated config files and runs generation (decode) phase only.
 
-bench_dir="/path/to/benchmark/scripts"
-output_dir="/path/to/store/output/files"
-sbatch --reservation=RES--COM-3970 --qos=reservation -D ${output_dir} ${bench_dir}/benchmark-serve.sh urm.nvidia.com/sw-tensorrt-docker/tensorrt-llm-staging/release:main-x86_64 ${bench_dir} ${output_dir} "1-1" ""
-
+**Format**:
 ```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{disagg config file base name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+### 4. Disaggregated e2e Test
+
+Uses disaggregated config files and runs full end-to-end disaggregated flow.
+
+**Format**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{disagg config file base name}]
+```
+
+**Example**:
+```
+perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+## CI Test Database
+
+Test lists are defined in `tests/integration/test_lists/test-db/`.
+
+### YAML File Naming Convention
+
+| Test Type | File Pattern | Example |
+|-----------|--------------|---------|
+| Single-node aggregated | `l0_{gpu_type}_multi_gpus_perf_sanity.yml` | `l0_b200_multi_gpus_perf_sanity.yml` |
+| Multi-node aggregated | `l0_{gpu_type}_multi_nodes_perf_sanity_node{node count}_gpu{gpu count per test}.yml` | `l0_b200_multi_nodes_perf_sanity_node2_gpu16.yml` |
+| Multi-node disaggregated | `l0_{gpu_type}_multi_gpus_perf_sanity_ctx{ctx worker count}node{node count per ctx worker}_gpu{gpu count per ctx worker}_gen{gen worker count}node{node count per gen worker}_gpu{gen gpus per gen worker}.yml` | `l0_b200_multi_gpus_perf_sanity_ctx1node1_gpu8_gen1node1_gpu8.yml` |
+
+### Jenkins Pipeline Configuration
+
+Tests are defined in `jenkins/L0_Test.groovy` under the `launchTestJobs` function:
+
+| Config Variable | Test Type |
+|-----------------|-----------|
+| `x86SlurmTestConfigs` | Single-node aggregated tests |
+| `SBSASlurmTestConfigs` | Multi-node aggregated tests |
+| `multiNodesSBSAConfigs` | Multi-node disaggregated tests |
+
+## CI Stage Rules
+
+### Test Batching Rules
+
+| Test Type | Nodes per Test | Max Tests per Stage | Notes |
+|-----------|----------------|---------------------|-------|
+| Normal aggregated test | 1 | 6 | Multiple tests can share a stage |
+| Aggregated ctx_only test | 1 | 6 | Multiple tests can share a stage |
+| Normal aggregated test | > 1 | 1 | One test per stage |
+| Aggregated ctx_only test | > 1 | 1 | One test per stage |
+| Disaggregated gen_only test | Any | 1 | Always one test per stage |
+| Disaggregated e2e test | Any | 1 | Always one test per stage |
+
+**Important**: Pre-merge and post-merge tests must be in separate stages.
+
+### GPU Hours Calculation
+
+- Each CI stage runtime is approximately **1 hour**
+- GPU hours = (number of stages) x (GPUs per stage) x 1 hour
+
+**Example**: A test configuration with 12 single-node tests (6 tests x 2 stages) using 8 GPUs each = 2 stages x 8 GPUs x 1 hour = 16 GPU hours
+
+## Running Tests
+
+**Important**: Do NOT add `--perf` flag when running pytest. Perf sanity tests are static test cases and do not use perf mode.
+
+### Local Run Examples
+
+```bash
+# Run a normal aggregated test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_dep4_mtp1_1k1k]
+
+# Run an aggregated ctx_only test
+pytest perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+
+# Run a disaggregated gen_only test
+pytest perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+
+# Run a disaggregated e2e test
+pytest perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-deepseek-r1-fp4_1k1k_ctx1_gen1_dep8]
+```
+
+### Using Local Submit Script
+
+For local SLURM job submission (supports both aggregated and disaggregated tests):
+
+```bash
+python jenkins/scripts/perf/local/submit.py --help
+```
+
+## Quick Reference for AI Agents
+
+When working with perf sanity tests, use these paths:
+
+| Resource | Path |
+|----------|------|
+| Pytest script | `tests/integration/defs/perf/test_perf_sanity.py` |
+| Aggregated configs | `tests/scripts/perf-sanity/*.yaml` |
+| Disaggregated configs | `tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity/*.yaml` |
+| CI submit (disagg only) | `jenkins/scripts/perf/disaggregated/submit.py` |
+| Local submit (all) | `jenkins/scripts/perf/local/submit.py` |
+| Jenkins pipeline | `jenkins/L0_Test.groovy` |
+| Test database | `tests/integration/test_lists/test-db/` |

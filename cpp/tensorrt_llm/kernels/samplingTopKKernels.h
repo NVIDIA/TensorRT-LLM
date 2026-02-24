@@ -17,12 +17,15 @@
 #pragma once
 
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/memoryUtils.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <curand_kernel.h>
 
-namespace tensorrt_llm::kernels
+TRTLLM_NAMESPACE_BEGIN
+
+namespace kernels
 {
 
 static constexpr runtime::SizeType32 TOP_K_MAX = 1024;
@@ -302,4 +305,6 @@ __device__ __host__ inline void setupTopKTopPRuntimeArgOne(runtime::SizeType32 b
     }
 }
 
-} // namespace tensorrt_llm::kernels
+} // namespace kernels
+
+TRTLLM_NAMESPACE_END

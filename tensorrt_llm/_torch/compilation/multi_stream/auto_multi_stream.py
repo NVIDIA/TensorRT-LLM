@@ -39,6 +39,7 @@ def estimate_time(node: Node) -> int:
     moe_ops = {
         torch.ops.trtllm.fp4_block_scale_moe_runner.default,
         torch.ops.trtllm.fused_moe.default,
+        torch.ops.trtllm.moe_custom_op.default,
     }
 
     gemm_ops = {
@@ -209,7 +210,9 @@ class MultiStreamDAG:
                     for inplace_arg in inplace_map[func].values():
                         # At this stage, all inplace op must be using kwargs for all params
                         assert inplace_arg in node.kwargs
-                        latest_inplace_stat[node.kwargs[inplace_arg]] = vertex
+                        args = flatten_args([node.kwargs[inplace_arg]])
+                        for arg in args:
+                            latest_inplace_stat[arg] = vertex
 
             for edge in in_edges.values():
                 edge.out_edges.append(vertex)

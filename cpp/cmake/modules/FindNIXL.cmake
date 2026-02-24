@@ -23,6 +23,16 @@ endif()
 
 find_package(ucx REQUIRED)
 
+# Set default NIXL_ROOT if not provided
+if(NOT NIXL_ROOT)
+  set(NIXL_ROOT
+      "/opt/nvidia/nvda_nixl"
+      CACHE PATH "NIXL installation directory" FORCE)
+  message(STATUS "NIXL_ROOT not set, using default: ${NIXL_ROOT}")
+else()
+  message(STATUS "Using provided NIXL_ROOT: ${NIXL_ROOT}")
+endif()
+
 find_path(NIXL_INCLUDE_DIR nixl.h HINTS ${NIXL_ROOT}/include)
 
 if(CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64")
@@ -69,5 +79,5 @@ else()
   message(STATUS "NIXL_LIBRARY: ${NIXL_LIBRARY}")
   message(STATUS "NIXL_BUILD_LIBRARY: ${NIXL_BUILD_LIBRARY}")
   message(STATUS "SERDES_LIBRARY: ${SERDES_LIBRARY}")
-  message(FATAL_ERROR "NIXL not found after installation attempt.")
+  unset(NIXL_ROOT CACHE)
 endif()

@@ -35,7 +35,7 @@ The following examples demonstrate how to use TensorRT LLM's multimodal support 
 Quickly try out TensorRT LLM's multimodal support using our `LLM-API` and a ready-to-run [example](source:examples/llm-api/quickstart_multimodal.py):
 
 ```bash
-python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image
+python3 quickstart_multimodal.py --model_dir Efficient-Large-Model/NVILA-8B --modality image --disable_kv_cache_reuse
 ```
 
 ### OpenAI-Compatible Server via [`trtllm-serve`](../../source/commands/trtllm-serve/trtllm-serve.rst)

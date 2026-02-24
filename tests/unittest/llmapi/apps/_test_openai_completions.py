@@ -3,8 +3,10 @@
 
 from typing import List
 
+import numpy as np
 import openai
 import pytest
+import yaml
 
 from ..test_llm import get_model_path
 from .openai_server import RemoteOpenAIServer
@@ -22,6 +24,23 @@ def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module")
+def temp_extra_llm_api_options_file(tmp_path_factory):
+    extra_llm_api_options_dict = {
+        "enable_chunked_prefill": False,
+        "gather_generation_logits": True,
+        "kv_cache_config": {
+            "enable_block_reuse": False,
+        }
+    }
+
+    temp_file_path = tmp_path_factory.mktemp(
+        "config") / "extra_llm_api_options.yaml"
+    with open(temp_file_path, 'w') as f:
+        yaml.dump(extra_llm_api_options_dict, f)
+    return temp_file_path
+
+
 @pytest.fixture(scope="module",
                 params=[0, 2],
                 ids=["disable_processpool", "enable_processpool"])
@@ -30,11 +49,28 @@ def num_postprocess_workers(request):
 
 
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str, num_postprocess_workers: int):
+def server(model_name: str, backend: str, num_postprocess_workers: int,
+           temp_extra_llm_api_options_file: str):
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
+    args.extend(["--kv_cache_free_gpu_memory_fraction",
+                 "0.2"])  # for co-existence with other servers
+    args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     if backend == "trt":
-        args.extend(["--max_beam_width", "4"])
+        args.extend(
+            ["--extra_llm_api_options", temp_extra_llm_api_options_file])
+    with RemoteOpenAIServer(model_path, args) as remote_server:
+        yield remote_server
+
+
+@pytest.fixture(scope="module")
+def server_with_beam_search(model_name: str, backend: str,
+                            num_postprocess_workers: int):
+    model_path = get_model_path(model_name)
+    args = ["--backend", f"{backend}"]
+    args.extend(["--kv_cache_free_gpu_memory_fraction",
+                 "0.2"])  # for co-existence with other servers
+    args.extend(["--max_beam_width", "2"])
     args.extend(["--num_postprocess_workers", f"{num_postprocess_workers}"])
     with RemoteOpenAIServer(model_path, args) as remote_server:
         yield remote_server
@@ -48,6 +84,11 @@ def client(server: RemoteOpenAIServer):
 @pytest.fixture(scope="module")
 def async_client(server: RemoteOpenAIServer):
     return server.get_async_client()
+
+
+@pytest.fixture(scope="module")
+def async_client_with_beam_search(server_with_beam_search: RemoteOpenAIServer):
+    return server_with_beam_search.get_async_client()
 
 
 def test_single_completion(client: openai.OpenAI, model_name):
@@ -65,10 +106,9 @@ def test_single_completion(client: openai.OpenAI, model_name):
     assert completion.choices is not None and len(completion.choices) == 1
     completion_tokens = 5
     prompt_tokens = 6
-    assert completion.usage == openai.types.CompletionUsage(
-        completion_tokens=completion_tokens,
-        prompt_tokens=prompt_tokens,
-        total_tokens=prompt_tokens + completion_tokens)
+    assert completion.usage.completion_tokens == completion_tokens
+    assert completion.usage.prompt_tokens == prompt_tokens
+    assert completion.usage.total_tokens == prompt_tokens + completion_tokens
 
     # test using token IDs
     completion = client.completions.create(
@@ -146,12 +186,10 @@ async def test_batch_completions(async_client: openai.AsyncOpenAI, model_name,
 @pytest.mark.asyncio(loop_scope="module")
 @pytest.mark.parametrize("prompts",
                          [["Hello, my name is"] * 2, [[0, 0, 0, 0, 0]] * 2])
-async def test_batch_completions_beam_search(async_client: openai.AsyncOpenAI,
-                                             model_name, prompts, backend):
+async def test_batch_completions_beam_search(
+        async_client_with_beam_search: openai.AsyncOpenAI, model_name, prompts):
     # test beam search
-    if backend == 'pytorch':
-        pytest.skip("Beam search is not supported in PyTorch backend yet")
-    batch = await async_client.completions.create(
+    batch = await async_client_with_beam_search.completions.create(
         model=model_name,
         prompt=prompts,
         n=2,
@@ -416,3 +454,212 @@ async def test_completion_with_invalid_logit_bias(
         async_client: openai.AsyncOpenAI, model_name: str):
     """Test with invalid token IDs (non-integer keys)"""
     await invalid_logit_bias_helper(async_client, model_name, 'completions')
+
+
+def test_completion_logprobs(client: openai.OpenAI, model_name: str,
+                             backend: str, num_postprocess_workers: int):
+    """Test completion with logprobs enabled (non-streaming)."""
+    if backend == "trt" and num_postprocess_workers > 0:
+        pytest.skip("Logprobs is not supported in TRT processpool mode")
+
+    prompt = "Hello, my name is"
+
+    completion = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        logprobs=1,
+    )
+
+    choice = completion.choices[0]
+    assert choice.logprobs is not None
+
+    # Verify logprobs structure
+    logprobs = choice.logprobs
+    assert logprobs.tokens is not None
+    assert logprobs.token_logprobs is not None
+    assert logprobs.text_offset is not None
+
+    # Verify lengths match
+    assert len(logprobs.tokens) == len(logprobs.token_logprobs)
+    assert len(logprobs.tokens) == len(logprobs.text_offset)
+    assert len(logprobs.tokens) > 0
+
+    # Verify logprobs values are valid (negative or zero for log probabilities)
+    for token_logprob in logprobs.token_logprobs:
+        assert token_logprob is not None
+        assert token_logprob <= 0
+
+    # Verify text_offset is monotonically increasing
+    for i in range(1, len(logprobs.text_offset)):
+        assert logprobs.text_offset[i] >= logprobs.text_offset[i - 1]
+
+    # Verify tokens are non-empty strings
+    for token in logprobs.tokens:
+        assert isinstance(token, str)
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_logprobs_streaming(async_client: openai.AsyncOpenAI,
+                                             backend: str, model_name: str,
+                                             num_postprocess_workers: int):
+    """Test completion with logprobs enabled (streaming)."""
+    if backend == "trt" and num_postprocess_workers > 0:
+        pytest.skip("Logprobs is not supported in TRT processpool mode")
+
+    prompt = "Hello, my name is"
+
+    # First get non-streaming result for comparison
+    single_completion = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        logprobs=1,
+    )
+    single_logprobs = single_completion.choices[0].logprobs
+    assert single_logprobs is not None
+
+    # Now test streaming
+    stream = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+        logprobs=2,
+        stream=True,
+    )
+
+    all_tokens: List[str] = []
+    all_token_logprobs: List[float] = []
+
+    async for chunk in stream:
+        choice = chunk.choices[0]
+        if choice.logprobs is not None:
+            if choice.logprobs.tokens:
+                all_tokens.extend(choice.logprobs.tokens)
+            if choice.logprobs.token_logprobs:
+                all_token_logprobs.extend(choice.logprobs.token_logprobs)
+
+    # Verify streaming logprobs match non-streaming
+    assert all_tokens == single_logprobs.tokens
+    assert len(all_token_logprobs) == len(single_logprobs.token_logprobs)
+
+    # Compare logprobs values (should be close)
+    all_token_logprobs_arr = np.array(all_token_logprobs)
+    single_token_logprobs_arr = np.array(single_logprobs.token_logprobs)
+    assert np.allclose(all_token_logprobs_arr, single_token_logprobs_arr)
+
+    # Verify all logprobs are valid
+    for logprob in all_token_logprobs:
+        assert logprob is not None
+        assert logprob <= 0
+
+
+def test_completion_cached_tokens(client: openai.OpenAI, model_name: str,
+                                  backend: str):
+    if backend == "trt":
+        pytest.skip("Cached tokens is not supported in trt backend yet")
+
+    prompt = "This is a test prompt"
+
+    # Run the completion for the first time
+    single_completion = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    expected_cached_tokens = single_completion.usage.prompt_tokens - 1
+
+    # Run the completion for the second time
+    single_completion = client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    assert single_completion.usage is not None
+    assert single_completion.usage.prompt_tokens_details is not None
+    assert single_completion.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+
+
+@pytest.mark.asyncio(loop_scope="module")
+async def test_completion_cached_tokens_stream(async_client: openai.AsyncOpenAI,
+                                               model_name: str, backend: str):
+    if backend == "trt":
+        pytest.skip("Cached tokens is not supported in trt backend yet")
+
+    prompt = "This is a test prompt"
+
+    # Run the completion for the first time so that cached tokens are created
+    single_completion = await async_client.completions.create(
+        model=model_name,
+        prompt=prompt,
+        max_tokens=5,
+        temperature=0.0,
+    )
+    expected_cached_tokens = single_completion.usage.prompt_tokens - 1
+
+    # Test stream=True, stream_options=
+    #     {"include_usage": True, "continuous_usage_stats": False}
+    stream = await async_client.completions.create(model=model_name,
+                                                   prompt=prompt,
+                                                   max_tokens=5,
+                                                   temperature=0.0,
+                                                   stream=True,
+                                                   stream_options={
+                                                       "include_usage":
+                                                       True,
+                                                       "continuous_usage_stats":
+                                                       False,
+                                                   })
+    async for chunk in stream:
+        if chunk.choices[0].finish_reason is None:
+            assert chunk.usage is None
+        else:
+            assert chunk.usage is None
+            final_chunk = await stream.__anext__()
+            assert final_chunk.usage is not None
+            assert final_chunk.usage.prompt_tokens > 0
+            assert final_chunk.usage.completion_tokens > 0
+            assert final_chunk.usage.total_tokens == (
+                final_chunk.usage.prompt_tokens +
+                final_chunk.usage.completion_tokens)
+            assert final_chunk.usage.prompt_tokens_details is not None
+            assert final_chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+            assert final_chunk.choices == []
+
+    # Test stream=True, stream_options=
+    #     {"include_usage": True, "continuous_usage_stats": True}
+    stream = await async_client.completions.create(model=model_name,
+                                                   prompt=prompt,
+                                                   max_tokens=5,
+                                                   temperature=0.0,
+                                                   stream=True,
+                                                   stream_options={
+                                                       "include_usage":
+                                                       True,
+                                                       "continuous_usage_stats":
+                                                       True,
+                                                   })
+    async for chunk in stream:
+        assert chunk.usage is not None
+        assert chunk.usage.prompt_tokens > 0
+        assert chunk.usage.completion_tokens > 0
+        assert chunk.usage.prompt_tokens_details is not None
+        assert chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+        assert chunk.usage.total_tokens == (chunk.usage.prompt_tokens +
+                                            chunk.usage.completion_tokens)
+        if chunk.choices[0].finish_reason is not None:
+            final_chunk = await stream.__anext__()
+            assert final_chunk.usage is not None
+            assert final_chunk.usage.prompt_tokens > 0
+            assert final_chunk.usage.completion_tokens > 0
+            assert final_chunk.usage.total_tokens == (
+                final_chunk.usage.prompt_tokens +
+                final_chunk.usage.completion_tokens)
+            assert final_chunk.usage.prompt_tokens_details is not None
+            assert final_chunk.usage.prompt_tokens_details.cached_tokens == expected_cached_tokens
+            assert final_chunk.choices == []

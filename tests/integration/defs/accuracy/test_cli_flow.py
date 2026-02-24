@@ -18,12 +18,18 @@ from tensorrt_llm.llmapi import (EagleDecodingConfig, LookaheadDecodingConfig,
                                  MedusaDecodingConfig)
 from tensorrt_llm.quantization import QuantAlgo
 
-from ..conftest import (llm_models_root, parametrize_with_ids, skip_no_nvls,
-                        skip_post_blackwell, skip_pre_ada, skip_pre_blackwell,
-                        skip_pre_hopper)
+from ..conftest import (get_sm_version, llm_models_root, parametrize_with_ids,
+                        skip_no_nvls, skip_post_blackwell, skip_pre_ada,
+                        skip_pre_blackwell, skip_pre_hopper)
 from .accuracy_core import (MMLU, CliFlowAccuracyTestHarness, CnnDailymail,
                             Humaneval, PassKeyRetrieval64k,
                             PassKeyRetrieval128k, SlimPajama6B, ZeroScrolls)
+
+# skip trt flow cases on post-Blackwell-Ultra
+if get_sm_version() >= 103:
+    pytest.skip(
+        "TRT workflow tests are not supported on post Blackwell-Ultra architecture",
+        allow_module_level=True)
 
 
 class TestGpt2(CliFlowAccuracyTestHarness):
@@ -210,6 +216,7 @@ class TestLlama3_3NemotronSuper49Bv1(CliFlowAccuracyTestHarness):
     EXAMPLE_FOLDER = "models/core/nemotron_nas"
 
     @pytest.mark.skip_less_device(2)
+    @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype_tp2(self):
         self.run(tasks=[MMLU(self.MODEL_NAME)], tp_size=2, dtype='auto')
 
@@ -421,7 +428,8 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
     def test_lookahead(self, mocker):
         mocker.patch.object(CnnDailymail, "MAX_BATCH_SIZE", 8)
 
-        self.run(spec_dec_algo=LookaheadDecodingConfig.decoding_type,
+        self.run(spec_dec_algo=LookaheadDecodingConfig.
+                 model_fields["decoding_type"].default,
                  extra_build_args=[
                      "--max_draft_len=83",
                      "--speculative_decoding_mode=lookahead_decoding"
@@ -441,7 +449,8 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
             extra_summarize_args.append("--cuda_graph_mode")
 
         self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.decoding_type,
+                 spec_dec_algo=MedusaDecodingConfig.
+                 model_fields["decoding_type"].default,
                  extra_convert_args=[
                      f"--medusa_model_dir={self.MEDUSA_MODEL_PATH}",
                      "--num_medusa_heads=4"
@@ -469,7 +478,8 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
             extra_summarize_args.extend(
                 ["--eagle_posterior_threshold=0.09", "--temperature=0.7"])
 
-        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+        self.run(spec_dec_algo=EagleDecodingConfig.
+                 model_fields["decoding_type"].default,
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",
@@ -496,7 +506,8 @@ class TestVicuna7B(CliFlowAccuracyTestHarness):
         if chunked_context:
             extra_summarize_args.append("--enable_chunked_context")
 
-        self.run(spec_dec_algo=EagleDecodingConfig.decoding_type,
+        self.run(spec_dec_algo=EagleDecodingConfig.
+                 model_fields["decoding_type"].default,
                  extra_convert_args=[
                      f"--eagle_model_dir={self.EAGLE_MODEL_PATH}",
                      "--max_draft_len=63", "--num_eagle_layers=4",
@@ -841,7 +852,8 @@ class TestLlama3_1_8BInstruct(CliFlowAccuracyTestHarness):
             "--medusa_choices=[[0], [0, 0], [1], [0, 1], [2], [0, 0, 0], [1, 0], [0, 2], [3], [0, 3], [4], [0, 4], [2, 0], [0, 5], [0, 0, 1], [5], [0, 6], [6], [0, 7], [0, 1, 0], [1, 1], [7], [0, 8], [0, 0, 2], [3, 0], [0, 9], [8], [9], [1, 0, 0], [0, 2, 0], [1, 2], [0, 0, 3], [4, 0], [2, 1], [0, 0, 4], [0, 0, 5], [0, 1, 1], [0, 0, 6], [0, 3, 0], [5, 0], [1, 3], [0, 0, 7], [0, 0, 8], [0, 0, 9], [6, 0], [0, 4, 0], [1, 4], [7, 0], [0, 1, 2], [2, 0, 0], [3, 1], [2, 2], [8, 0], [0, 5, 0], [1, 5], [1, 0, 1], [0, 2, 1], [9, 0], [0, 6, 0], [1, 6], [0, 7, 0]]"
         ]
         self.run(dtype="float16",
-                 spec_dec_algo=MedusaDecodingConfig.decoding_type,
+                 spec_dec_algo=MedusaDecodingConfig.
+                 model_fields["decoding_type"].default,
                  extra_build_args=["--speculative_decoding_mode=medusa"],
                  extra_summarize_args=extra_summarize_args)
 

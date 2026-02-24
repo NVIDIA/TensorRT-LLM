@@ -92,13 +92,8 @@ public:
     bool verifyQueueIntegrity() override;
 
 private:
-    // Check if the block should be added to mFreeQueues.
-    bool isReleasedLeafBlock(BlockPtr const& block);
-
     // Queues of available leaf blocks, split by cache level and priority level
     std::vector<std::vector<FreeBlocksQueue>> mFreeQueues;
-    // All blocks that have been released, along with the amount of released children
-    std::vector<std::unordered_set<SizeType32>> mReleasedBlocks;
     // Iterators to block entries in mFreeQueues
     std::vector<std::optional<FreeBlocksQueue::iterator>> mFreeBlockIterators;
     // Amount of free blocks at each cache level

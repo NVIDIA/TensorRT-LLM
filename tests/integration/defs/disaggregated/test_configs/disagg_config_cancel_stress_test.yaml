@@ -1,0 +1,44 @@
+hostname: localhost
+port: 8000
+model: DeepSeek-V3-Lite/bf16
+backend: "pytorch"
+enable_autotuner: False
+context_servers:
+  disable_overlap_scheduler: True
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_num_tokens: 16384
+  max_seq_len: 32768
+  enable_chunked_prefill: True
+  kv_cache_config:
+    enable_block_reuse: True
+    enable_partial_reuse: True
+    free_gpu_memory_fraction: 0.3
+  cache_transceiver_config:
+    backend: "DEFAULT"
+    max_tokens_in_buffer: 32768
+  cuda_graph_config:
+    enable_padding: True
+    max_batch_size: 1
+  urls:
+      - "localhost:8001"
+generation_servers:
+  num_instances: 1
+  tensor_parallel_size: 1
+  pipeline_parallel_size: 1
+  max_num_tokens: 2048
+  max_seq_len: 32768
+  enable_chunked_prefill: True
+  kv_cache_config:
+    enable_block_reuse: True
+    enable_partial_reuse: True
+    free_gpu_memory_fraction: 0.85
+  cache_transceiver_config:
+    backend: "DEFAULT"
+    max_tokens_in_buffer: 32768
+  cuda_graph_config:
+    enable_padding: True
+    max_batch_size: 64
+  urls:
+      - "localhost:8002"

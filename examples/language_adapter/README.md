@@ -1,6 +1,6 @@
 # Language-Adapter
 
-This document shows how to build and run a model with Language-Adapter plugin in TensorRT-LLM on NVIDIA GPUs.
+This document shows how to build and run a model with Language-Adapter plugin in TensorRT LLM on NVIDIA GPUs.
 
 ## Overview
 The concept of Language Adapter during inference time was introduced in [MAD-X: An Adapter-Based Framework for Multi-Task Cross-Lingual Transfer

@@ -14,12 +14,15 @@
  * limitations under the License.
  */
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/layers/dynamicDecodeLayer.h"
 #include "tensorrt_llm/runtime/iTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 namespace th = torch;
+
+TRTLLM_NAMESPACE_BEGIN
 
 namespace torch_ext
 {
@@ -32,12 +35,13 @@ public:
     virtual void setup(size_t const batch_size, size_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
-        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs)
+        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> prompt_ignore_length_opt,
+        th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
+        th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> min_p_opt, bool output_log_probs,
+        bool cum_log_probs)
         = 0;
 
     virtual void forward(th::Tensor const& logits, int const step, int const max_input_length,
@@ -72,12 +76,13 @@ public:
     void setup(size_t const batch_size, size_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
-        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs) override;
+        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> prompt_ignore_length_opt,
+        th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
+        th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> min_p_opt, bool output_log_probs,
+        bool cum_log_probs) override;
 
     void forward(th::Tensor const& logits, int const step, int const max_input_length, int const max_attention_window,
         int const sink_token_length, uint64_t const ite, int const local_batch_size, th::Tensor end_id,
@@ -115,12 +120,13 @@ public:
     void setup(int64_t const batch_size, int64_t const beam_width, th::optional<th::Tensor> runtime_top_k_opt,
         th::optional<th::Tensor> runtime_top_p_opt, th::optional<th::Tensor> temperature_opt,
         th::optional<th::Tensor> repetition_penalty_opt, th::optional<th::Tensor> presence_penalty_opt,
-        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> min_length_opt,
-        th::optional<th::Tensor> length_penalty_opt, th::optional<th::Tensor> early_stopping_opt,
-        th::optional<th::Tensor> beam_search_diversity_rate_opt, th::optional<th::Tensor> random_seed_opt,
-        th::optional<th::Tensor> top_p_decay_opt, th::optional<th::Tensor> top_p_min_opt,
-        th::optional<th::Tensor> top_p_reset_ids_opt, th::optional<th::Tensor> no_repeat_ngram_size_opt,
-        th::optional<th::Tensor> min_p_opt, bool output_log_probs, bool cum_log_probs);
+        th::optional<th::Tensor> frequency_penalty_opt, th::optional<th::Tensor> prompt_ignore_length_opt,
+        th::optional<th::Tensor> min_length_opt, th::optional<th::Tensor> length_penalty_opt,
+        th::optional<th::Tensor> early_stopping_opt, th::optional<th::Tensor> beam_search_diversity_rate_opt,
+        th::optional<th::Tensor> random_seed_opt, th::optional<th::Tensor> top_p_decay_opt,
+        th::optional<th::Tensor> top_p_min_opt, th::optional<th::Tensor> top_p_reset_ids_opt,
+        th::optional<th::Tensor> no_repeat_ngram_size_opt, th::optional<th::Tensor> min_p_opt, bool output_log_probs,
+        bool cum_log_probs);
 
     th::Tensor forward(th::Tensor const& logits, int64_t const step, int64_t const max_input_length,
         int64_t const max_attention_window, int64_t const sink_token_length, int64_t const ite,
@@ -155,3 +161,5 @@ private:
 };
 
 } // namespace torch_ext
+
+TRTLLM_NAMESPACE_END

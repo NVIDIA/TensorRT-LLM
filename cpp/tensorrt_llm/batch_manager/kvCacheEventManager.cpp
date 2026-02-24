@@ -102,7 +102,7 @@ void KVCacheEventManager::enqueueStoredEvent(std::vector<BlockPtr> const& blocks
     for (auto const& block : blocks)
     {
         data.blocks.emplace_back(block->getHash(), block->getUniqueTokens(), block->getBlockKey().loraTaskId,
-            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority());
+            block->isPrimary() ? kPrimaryLevel : kSecondaryLevel, block->getPriority(), block->getExtraKeys());
     }
 
     enqueueEvent({mEventId++, data, windowSize, mAttentionDpRank});
@@ -152,6 +152,12 @@ std::deque<tle::KVCacheEvent> KVCacheEventManager::getEvents(std::optional<std::
 void KVCacheEventManager::flush()
 {
     auto eventQueue = std::exchange(mEventQueue, {});
+
+    if (eventQueue.empty())
+    {
+        return;
+    }
+
     std::unique_lock<std::mutex> lck(mPendingEventsMutex);
     mPendingEvents.push_back(std::move(eventQueue));
     mPendingEmptyCV.notify_one();

@@ -202,7 +202,7 @@ class Module(object):
         tm = {k: v for k, v in torch_module.named_parameters()}
 
         assert sorted(m.keys()) == sorted(tm.keys()), (
-            "The parameter names of the tensorrt-llm module must be the same with the torch module"
+            "The parameter names of the TensorRT LLM module must be the same with the torch module"
         )
 
         for k, v in self.named_parameters():

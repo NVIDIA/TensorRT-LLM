@@ -1,10 +1,14 @@
 import logging
+import threading
+import time
+import uuid
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Any, List, Literal, Optional, Tuple
+from enum import IntEnum
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import yaml
 from mpi4py.MPI import COMM_WORLD, Comm
+from mpi4py.util import pkl5
 
 from .._utils import global_mpi_rank, global_mpi_size
 
@@ -16,10 +20,11 @@ __all__ = [
 ]
 
 
-class ServerRole(Enum):
+class ServerRole(IntEnum):
     CONTEXT = 0
     GENERATION = 1
     MM_ENCODER = 2
+    VISUAL_GEN = 3
 
 
 @dataclass
@@ -44,6 +49,27 @@ class ConditionalDisaggConfig():
 
 
 @dataclass
+class OtlpConfig():
+    otlp_traces_endpoint: Optional[
+        str] = None  # Target URL to which OpenTelemetry traces will be sent
+
+
+@dataclass
+class MinimalInstances:
+    context_servers: int = 1  # the minimal number of context servers
+    generation_servers: int = 1  # the minimal number of generation servers
+
+
+@dataclass
+class DisaggClusterConfig:
+    cluster_uri: str  # the uri of the cluster storage
+    cluster_name: str = ""  # the name of the cluster, used like a namespace
+    minimal_instances: Optional[MinimalInstances] = None
+    heartbeat_interval_sec: int = 5  # the worker will send heartbeat to the cluster storage every heartbeat_interval_sec seconds
+    inactive_timeout_sec: int = 10  # the worker will be considered inactive if it doesn't send heartbeat for inactive_timeout_sec seconds
+
+
+@dataclass
 class DisaggServerConfig():
     server_configs: List[CtxGenServerConfig]
     hostname: str = "localhost"
@@ -51,8 +77,15 @@ class DisaggServerConfig():
     ctx_router_config: Optional[RouterConfig] = None
     gen_router_config: Optional[RouterConfig] = None
     conditional_disagg_config: Optional[ConditionalDisaggConfig] = None
+    otlp_config: Optional[OtlpConfig] = None
     max_retries: int = 1
     perf_metrics_max_requests: int = 0
+    disagg_cluster_config: Optional[DisaggClusterConfig] = None
+    node_id: int = uuid.getnode(
+    ) % 1021  # Assuming only one disagg-server is running on a machine, moding mac by the largest 10-bit prime
+    # If this causes collisions, users can set node_id manually within range [0, 1023] in config
+    schedule_style: Literal['context_first',
+                            'generation_first'] = 'context_first'
 
 
 @dataclass
@@ -64,16 +97,16 @@ class MetadataServerConfig():
     refresh_interval: float = 10.0
 
 
-def get_ctx_gen_server_urls(
+def get_ctx_gen_server_addrs(
         server_configs: list[CtxGenServerConfig]
 ) -> tuple[list[str], list[str]]:
     ctx_server_urls = []
     gen_server_urls = []
     for cfg in server_configs:
         if cfg.type == "ctx":
-            ctx_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+            ctx_server_urls.append(f"{cfg.hostname}:{cfg.port}")
         else:
-            gen_server_urls.append(f"http://{cfg.hostname}:{cfg.port}")
+            gen_server_urls.append(f"{cfg.hostname}:{cfg.port}")
 
     return ctx_server_urls, gen_server_urls
 
@@ -96,6 +129,8 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                        context_servers: Optional[dict] = None,
                        generation_servers: Optional[dict] = None,
                        conditional_disagg_config: Optional[dict] = None,
+                       otlp_config: Optional[dict] = None,
+                       disagg_cluster: Optional[dict] = None,
                        **kwargs: Any) -> DisaggServerConfig:
     context_servers = context_servers or {}
     generation_servers = generation_servers or {}
@@ -116,23 +151,29 @@ def extract_disagg_cfg(hostname: str = 'localhost',
                 # Inherit the value from the top-level
                 servers[key] = value
 
+    server_configs = []
+    disagg_cluster_config = None
     ctx_router_config = extract_router_config(context_servers)
     gen_router_config = extract_router_config(generation_servers)
-
-    server_configs = extract_ctx_gen_cfgs(
-        type="ctx", **context_servers) + extract_ctx_gen_cfgs(
-            type="gen", **generation_servers)
-
     ctx_router_config.server_role = ServerRole.CONTEXT
     gen_router_config.server_role = ServerRole.GENERATION
+    if disagg_cluster:
+        disagg_cluster_config = extract_disagg_cluster_config(disagg_cluster)
+    else:
+        server_configs = extract_ctx_gen_cfgs(
+            type="ctx", **context_servers) + extract_ctx_gen_cfgs(
+                type="gen", **generation_servers)
 
     conditional_disagg_config = ConditionalDisaggConfig(
         **conditional_disagg_config) if conditional_disagg_config else None
 
+    otlp_config = OtlpConfig(**otlp_config) if otlp_config else None
+
     config = DisaggServerConfig(server_configs, hostname, port,
                                 ctx_router_config, gen_router_config,
-                                conditional_disagg_config, max_retries,
-                                perf_metrics_max_requests)
+                                conditional_disagg_config, otlp_config,
+                                max_retries, perf_metrics_max_requests,
+                                disagg_cluster_config)
 
     return config
 
@@ -167,7 +208,7 @@ def extract_ctx_gen_cfgs(type: Literal['ctx', 'gen'],
 
     # Compute the number of ranks per instance
     instance_num_ranks = kwargs.get('tensor_parallel_size', 1) * kwargs.get(
-        'pipeline_parallel_size', 1)
+        'pipeline_parallel_size', 1) * kwargs.get('context_parallel_size', 1)
 
     cfgs = []
     for hostname, port in zip(hostnames, ports):
@@ -220,6 +261,33 @@ def get_server_configs_dict(
     return num_workers, server_dict
 
 
+def extract_disagg_cluster_config(
+        cluster_config_dict: Dict[str, Any],
+        cluster_uri: Optional[str] = None) -> DisaggClusterConfig:
+    """
+    Build the DisaggClusterConfig from the cluster_config_dict.
+    Use the default value of DisaggClusterConfig and MinimalInstances if the corresponding fields are not provided.
+    If cluster_uri is provided, it will override the cluster_uri in the cluster_config_dict.
+    """
+
+    def update_dataclass(obj, data_dict: Dict[str, Any]):
+        for key, value in data_dict.items():
+            if key not in obj.__dataclass_fields__:
+                raise KeyError(
+                    f"Key {key} not found in {obj.__class__.__name__}")
+            if value is not None:
+                setattr(obj, key, value)
+        return obj
+
+    cluster_config_dict["minimal_instances"] = update_dataclass(
+        MinimalInstances(), cluster_config_dict.get("minimal_instances", {}))
+    cluster_config = update_dataclass(
+        DisaggClusterConfig(cluster_uri or cluster_config_dict["cluster_uri"]),
+        cluster_config_dict,
+    )
+    return cluster_config
+
+
 def split_world_comm(
         server_configs: List[CtxGenServerConfig]) -> Tuple[bool, int, Comm]:
 
@@ -261,7 +329,7 @@ def split_world_comm(
         f"global_rank: {global_rank}, instance_idx: {instance_idx}, sub_rank: {sub_rank}, is_leader: {is_leader}"
     )
 
-    return is_leader, instance_idx, sub_comm
+    return is_leader, instance_idx, pkl5.Intracomm(sub_comm)
 
 
 def parse_metadata_server_config_file(
@@ -273,3 +341,48 @@ def parse_metadata_server_config_file(
     with open(metadata_server_config_file, 'r') as file:
         config = yaml.safe_load(file)
         return MetadataServerConfig(**config)
+
+
+MIN_GLOBAL_ID = 1 << 42
+
+# Consider GIL being removed in the future, use a lock to protect the counter
+_global_disagg_request_id_lock = threading.Lock()
+_global_disagg_request_id_counter = 0
+
+
+def get_global_disagg_request_id(machine_id: int) -> int:
+    """
+    a snowflake global disagg request id that doesn't guarantee monotonicity
+    0: positive integer
+    1-41  41 bits: timestamp_ms
+    42-51 10 bits: machine_id
+    52-63 12 bits: counter
+    """
+    global _global_disagg_request_id_lock
+    global _global_disagg_request_id_counter
+
+    COUNTER_BITS = 12
+    MACHINE_ID_BITS = 10
+    COUNTER_MASK = (1 << COUNTER_BITS) - 1
+    MAX_INT64 = (1 << 63) - 1
+
+    if machine_id not in range(0, (1 << MACHINE_ID_BITS) - 1):
+        raise ValueError(
+            f"machine_id must be in range [0, {(1 << MACHINE_ID_BITS) - 1})")
+
+    timestamp_ms = int(time.monotonic() * 1000)
+    with _global_disagg_request_id_lock:
+        counter = _global_disagg_request_id_counter & COUNTER_MASK
+        _global_disagg_request_id_counter += 1
+
+    # Rotate in [MIN_GLOBAL_ID, MAX_INT64)
+    # [0, MIN_GLOBAL_ID) is reserved for local ids
+    global_id = (timestamp_ms << (MACHINE_ID_BITS + COUNTER_BITS)) | (
+        machine_id << COUNTER_BITS) | counter
+    global_id_int64 = global_id % (MAX_INT64 - MIN_GLOBAL_ID) + MIN_GLOBAL_ID
+    return global_id_int64
+
+
+def get_local_request_id(last_id: int) -> int:
+    """ increment the last_id by 1 and mod by MIN_GLOBAL_ID """
+    return (last_id + 1) & (MIN_GLOBAL_ID - 1)

@@ -15,12 +15,13 @@
  */
 #pragma once
 
+#include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/kernels/decodingCommon.h"
 #include "tensorrt_llm/runtime/common.h"
 #include <cuda_runtime.h>
 
-namespace tensorrt_llm
-{
+TRTLLM_NAMESPACE_BEGIN
+
 namespace kernels
 {
 //! \brief Sets finished state to FinishedState::FINISHED_STOP_WORDS if any of the stopWords is met.
@@ -95,4 +96,5 @@ void invokeExplicitEOSCriterion(runtime::TokenIdType const** outputIds, runtime:
     runtime::SizeType32 const* batchSlots, runtime::SizeType32 batchSize, runtime::SizeType32 beamWidth,
     runtime::SizeType32 maxTokensPerStep, cudaStream_t stream);
 } // namespace kernels
-} // namespace tensorrt_llm
+
+TRTLLM_NAMESPACE_END

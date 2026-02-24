@@ -1,0 +1,3 @@
+v3.5.1
+# This file tracks the version of triton-kernels that was vendored.
+# To update, run: python scripts/vendor_triton_kernels.py --tag <new-tag>
