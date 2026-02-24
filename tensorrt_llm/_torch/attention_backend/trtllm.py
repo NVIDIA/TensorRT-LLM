@@ -95,6 +95,7 @@ class TrtllmAttentionWrapper:
     attention_input_type: Optional[torch.Tensor]
     quant_config: Optional[QuantConfig]
     kv_cache_manager: Optional[KVCacheManager]
+    request_ids: Optional[List[int]]
     kwargs: dict
 
     def __init__(
@@ -230,6 +231,7 @@ class TrtllmAttentionWrapper:
         helix_is_inactive_rank: Optional[torch.Tensor] = None,
         quant_config: Optional[QuantConfig] = None,
         kv_cache_manager: Optional[KVCacheManager] = None,
+        request_ids: Optional[List[int]] = None,
         **kwargs,
     ):
         """
@@ -279,6 +281,7 @@ class TrtllmAttentionWrapper:
             helix_is_inactive_rank (torch.Tensor): For Helix: whether the current rank is inactive, with shape (batch_size) on GPU.
             quant_config (Optional[QuantConfig]): The quantization configuration.
             kv_cache_manager (Optional[KVCacheManager]): The KV cache manager.
+            request_ids (Optional[List[int]]): The request IDs for the attention layer, with shape (batch_size) on GPU.
         """
         self.layer_idx = layer_idx
         self.tokens_per_block = tokens_per_block
@@ -341,6 +344,7 @@ class TrtllmAttentionWrapper:
         self.skip_softmax_threshold_scale_factor_decode = skip_softmax_threshold_scale_factor_decode
         self.quant_config = quant_config
         self.kv_cache_manager = kv_cache_manager
+        self.request_ids = request_ids
         self.kwargs.update(kwargs)
 
     def create_output(
@@ -615,6 +619,7 @@ class TrtllmAttentionWrapper:
                 quant_q_buffer,
                 self.quant_config,
                 self.kv_cache_manager,
+                self.request_ids,
             )
         else:
             thop.attention(
@@ -937,7 +942,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     pin_memory=True,
                 )
 
-            if self.enable_flash_mla:
+            if self.enable_flash_mla or _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
                 self.block_ids_per_seq = self.get_empty(
                     buffers,
                     [
@@ -948,6 +953,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     dtype=torch.int32,
                     capture_graph=capture_graph,
                 )
+            if self.enable_flash_mla:
                 self.kv_block_ids_per_seq = self.get_empty(
                     buffers,
                     [
@@ -1095,6 +1101,8 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
         if self.enable_flash_mla:
             self.prepare_flash_mla()
+        elif _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION:
+            self.prepare_trtllm_gen_attention()
 
         # number of tokens needed in the kv cache for each sequence after the next pass.
         if self.enable_helix:
@@ -1167,6 +1175,17 @@ class TrtllmAttentionMetadata(AttentionMetadata):
         self.prompt_lens_cpu_runtime = self.prompt_lens_cpu[:self.num_seqs]
         self.host_request_types_runtime = self.host_request_types[:self.
                                                                   num_seqs]
+
+    def prepare_trtllm_gen_attention(self) -> None:
+        if (self.kv_cache_manager is None or self.block_ids_per_seq is None
+                or self.request_ids is None):
+            return
+        block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
+            self.request_ids).pin_memory()
+        num_blocks = block_ids_per_seq.shape[1]
+        self.block_ids_per_seq.fill_(0)
+        self.block_ids_per_seq[:self.num_seqs, :num_blocks].copy_(
+            block_ids_per_seq, non_blocking=True)
 
     def prepare_flash_mla(self) -> None:
         block_ids_per_seq = self.kv_cache_manager.get_block_ids_per_seq(
@@ -1935,6 +1954,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
             quant_config=self.quant_config,
             kv_cache_manager=metadata.kv_cache_manager,
+            request_ids=metadata.request_ids,
         )
 
         self.wrapper.run(q,
