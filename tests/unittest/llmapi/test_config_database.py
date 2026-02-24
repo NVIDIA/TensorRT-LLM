@@ -19,27 +19,88 @@ from pathlib import Path
 from unittest import mock
 
 import pytest
+import yaml
 
+from tensorrt_llm._torch.models.modeling_utils import MODEL_CLASS_MAPPING
 from tensorrt_llm.commands.serve import main as serve_main
 from tensorrt_llm.llmapi import llm_args as llm_args_module
 
-from . import yaml_validation_harness as yaml_harness
+from .yaml_validation_harness import (
+    assert_no_default_valued_leaves,
+    collect_yaml_files,
+    load_yaml_dict,
+    mock_cuda_for_schema_validation,
+    validate_torch_llm_args_config,
+)
 
 CONFIG_ROOT = Path(__file__).parents[3] / "examples" / "configs"
+REPO_ROOT = CONFIG_ROOT.parent.parent
 CURATED_DIR = CONFIG_ROOT / "curated"
 DATABASE_DIR = CONFIG_ROOT / "database"
 
-CURATED_CONFIGS = yaml_harness.collect_yaml_files(CURATED_DIR, "**/*.yaml")
-DATABASE_CONFIGS = yaml_harness.collect_yaml_files(
-    DATABASE_DIR, "**/*.yaml", exclude_names={"lookup.yaml"}
-)
+CURATED_CONFIGS = collect_yaml_files(CURATED_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
+DATABASE_CONFIGS = collect_yaml_files(DATABASE_DIR, "**/*.yaml", exclude_names={"lookup.yaml"})
 ALL_CONFIGS = sorted(CURATED_CONFIGS + DATABASE_CONFIGS)
+ALL_LOOKUP_PATHS = sorted((DATABASE_DIR / "lookup.yaml", CURATED_DIR / "lookup.yaml"))
+
+
+def _load_config_path_to_lookup_entry() -> dict[str, dict]:
+    """Build config_path -> {model, arch?} from database and curated lookup.yaml files."""
+    result = {}
+    for lookup_path in ALL_LOOKUP_PATHS:
+        if not lookup_path.exists():
+            continue
+        with open(lookup_path, encoding="utf-8") as f:
+            entries = yaml.safe_load(f)
+        if not entries:
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or "config_path" not in entry:
+                continue
+            key = entry["config_path"]
+            result[key] = {"model": entry.get("model"), "arch": entry.get("arch")}
+    return result
+
+
+_CONFIG_PATH_TO_ENTRY = _load_config_path_to_lookup_entry()
+
+
+def _get_default_values_for_config(config_path: Path) -> dict:
+    """Get the default values for a config path.
+
+    Some models may have custom default values that are different from the global defaults.
+    Based on the model architecture, get the default values that are actually applied.
+    """
+    try:
+        config_key = config_path.relative_to(REPO_ROOT).as_posix()
+    except ValueError:
+        config_key = None
+    entry = _CONFIG_PATH_TO_ENTRY.get(config_key) if config_key else None
+    global_default = llm_args_module.TorchLlmArgs(
+        model="dummy/model", skip_tokenizer_init=True
+    ).model_dump(mode="json")
+    if not entry or not entry.get("arch") or not entry.get("model"):
+        return global_default
+
+    model = entry["model"]
+    arch = entry["arch"]
+    model_cls = MODEL_CLASS_MAPPING.get(arch)
+    if not model_cls or not hasattr(model_cls, "get_model_defaults"):
+        return global_default
+
+    base_args = llm_args_module.TorchLlmArgs(model=model, skip_tokenizer_init=True).model_dump(
+        mode="json"
+    )
+
+    model_defaults = model_cls.get_model_defaults(base_args)
+    base_args.update(model_defaults)
+    return base_args
 
 
 @pytest.fixture(autouse=True)
 def mock_gpu_environment():
     """Mock GPU functions for CPU-only schema test execution."""
-    with yaml_harness.mock_cuda_for_schema_validation():
+    with mock_cuda_for_schema_validation():
         yield
 
 
@@ -56,25 +117,23 @@ def _assert_kv_cache_block_reuse_policy(config_dict: dict) -> None:
 @pytest.mark.part0
 @pytest.mark.parametrize("config_path", ALL_CONFIGS, ids=get_config_id)
 def test_database_yaml_config_validates_against_llm_args(config_path: Path):
-    config_dict = yaml_harness.load_yaml_dict(config_path)
-    yaml_harness.validate_torch_llm_args_config(config_dict)
+    config_dict = load_yaml_dict(config_path)
+    validate_torch_llm_args_config(config_dict)
 
 
 @pytest.mark.part0
 @pytest.mark.parametrize("config_path", ALL_CONFIGS, ids=get_config_id)
 def test_database_yaml_config_does_not_disable_kv_cache_block_reuse(config_path: Path):
-    config_dict = yaml_harness.load_yaml_dict(config_path)
+    config_dict = load_yaml_dict(config_path)
     _assert_kv_cache_block_reuse_policy(config_dict)
 
 
 @pytest.mark.part0
 @pytest.mark.parametrize("config_path", ALL_CONFIGS, ids=get_config_id)
 def test_database_yaml_config_does_not_set_default_leaves(config_path: Path):
-    config_dict = yaml_harness.load_yaml_dict(config_path)
-    default_cfg = llm_args_module.TorchLlmArgs(
-        model="dummy/model", skip_tokenizer_init=True
-    ).model_dump(mode="json")
-    yaml_harness.assert_no_default_valued_leaves(config_dict, default_cfg)
+    config_dict = load_yaml_dict(config_path)
+    default_cfg = _get_default_values_for_config(config_path)
+    assert_no_default_valued_leaves(config_dict, default_cfg)
 
 
 @pytest.mark.part0
