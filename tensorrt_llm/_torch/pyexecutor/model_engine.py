@@ -676,7 +676,7 @@ class PyTorchModelEngine(ModelEngine):
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-        if not self.is_draft_model:
+        if not self.is_draft_model and not self.mapping.has_cp_helix():
             # Run extra general warmup to warmup memory pool before running real requests.
             self._general_warmup(resource_manager, reverse=True)
 
@@ -705,6 +705,9 @@ class PyTorchModelEngine(ModelEngine):
                                          reverse=reverse)
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
+            # Helix CP does not support warmup with context requests.
+            if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
+                continue
             with self._release_batch_context(
                     self._create_warmup_request(resource_manager, num_tokens,
                                                 num_gen_tokens),
