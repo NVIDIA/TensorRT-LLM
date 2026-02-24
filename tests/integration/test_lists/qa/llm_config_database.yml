@@ -110,6 +110,44 @@ llm_config_database:
 - condition:
     wildcards:
       gpu:
+      - '*gb200*'
+      cpu: aarch64
+      linux_distribution_name: ubuntu*
+    ranges:
+      system_gpu_count:
+        gte: 4
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_1024_conc4_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_1024_conc32_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_1024_conc512_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_8192_conc4_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_8192_conc32_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_8192_conc256_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_8192_1024_conc4_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_8192_1024_conc32_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_8192_1024_conc256_gpu4]
+- condition:
+    wildcards:
+      gpu:
+      - '*gb200*'
+      cpu: aarch64
+      linux_distribution_name: ubuntu*
+    ranges:
+      system_gpu_count:
+        gte: 8
+  tests:
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_1024_conc8_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_1024_conc64_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_1024_conc1024_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_8192_conc4_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_8192_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_1024_8192_conc512_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_8192_1024_conc4_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_8192_1024_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_gb200-warnold_nv_glm_4_7_modelopt_fp8_8192_1024_conc512_gpu8]
+- condition:
+    wildcards:
+      gpu:
       - '*h100*'
       cpu: x86_64
       linux_distribution_name: ubuntu*
