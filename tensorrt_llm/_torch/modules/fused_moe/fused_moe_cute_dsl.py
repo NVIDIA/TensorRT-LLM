@@ -675,48 +675,30 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=True,
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        if is_sm_100f():
-            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
-                input=x,
-                weight=self.w3_w1_weight.view(weight_dtype),
-                input_scale=x_sf,
-                weight_scale=self.quant_scales[0],
-                group_offset=expert_first_token_offset,
-                num_experts=self.num_slots,
-                top_k=self.routing_method.experts_per_token,
-                num_local_experts=self.expert_size_per_partition,
-                local_expert_offset=self.slot_start,
-            )
-        else:
-            x = cute_dsl_fp8_group_blockwise_gemm_ref(
-                a=x,
-                b=self.w3_w1_weight.view(weight_dtype),
-                a_sf=x_sf,
-                b_sf=self.quant_scales[0],
-                offset_array=expert_first_token_offset,
-            )
+        x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+            input=x,
+            weight=self.w3_w1_weight.view(weight_dtype),
+            input_scale=x_sf,
+            weight_scale=self.quant_scales[0],
+            group_offset=expert_first_token_offset,
+            num_experts=self.num_slots,
+            top_k=self.routing_method.experts_per_token,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+        )
         x = swiglu_fused_moe(x)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        if is_sm_100f():
-            x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
-                input=x,
-                weight=self.w2_weight.view(weight_dtype),
-                input_scale=x_sf,
-                weight_scale=self.quant_scales[1],
-                group_offset=expert_first_token_offset,
-                num_experts=self.num_slots,
-                top_k=self.routing_method.experts_per_token,
-                num_local_experts=self.expert_size_per_partition,
-                local_expert_offset=self.slot_start,
-            )
-        else:
-            x = cute_dsl_fp8_group_blockwise_gemm_ref(
-                a=x,
-                b=self.w2_weight.view(weight_dtype),
-                a_sf=x_sf,
-                b_sf=self.quant_scales[1],
-                offset_array=expert_first_token_offset,
-            )
+        x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+            input=x,
+            weight=self.w2_weight.view(weight_dtype),
+            input_scale=x_sf,
+            weight_scale=self.quant_scales[1],
+            group_offset=expert_first_token_offset,
+            num_experts=self.num_slots,
+            top_k=self.routing_method.experts_per_token,
+            num_local_experts=self.expert_size_per_partition,
+            local_expert_offset=self.slot_start,
+        )
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
