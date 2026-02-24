@@ -309,7 +309,8 @@ class OpenSearchDB:
             return None
         if not isinstance(must_not_clauses, list):
             OpenSearchDB.logger.info(
-                f"Invalid must_not_clauses type: {type(must_not_clauses).__name__}")
+                f"Invalid must_not_clauses type: {type(must_not_clauses).__name__}"
+            )
             return None
 
         bool_query = {"must": must_clauses}
