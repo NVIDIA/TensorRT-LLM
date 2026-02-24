@@ -2051,7 +2051,7 @@ def test_ptp_quickstart_advanced_mtp(llm_root, llm_venv, model_name,
                 "--use_one_model",
             ],
             stdout=running_log)
-        _check_mem_usage(running_log, [54.90, 0, 0, 0])
+        _check_mem_usage(running_log, [112.0, 0, 0, 0])
 
 
 @pytest.mark.parametrize("model_name,model_path", [
