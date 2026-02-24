@@ -1471,17 +1471,21 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            MediaStorage.save_video(
+            actual_output_path = MediaStorage.save_video(
                 video=output.video,
                 output_path=self.media_storage_path / f"{video_id}.mp4",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
             )
 
+            # Determine media type based on actual output file extension
+            actual_path = Path(actual_output_path)
+            media_type = "video/mp4" if actual_path.suffix == ".mp4" else "video/x-msvideo"
+
             return FileResponse(
-                self.media_storage_path / f"{video_id}.mp4",
-                media_type="video/mp4",
-                filename=f"{video_id}.mp4",
+                actual_output_path,
+                media_type=media_type,
+                filename=actual_path.name,
             )
 
         except ValueError as e:
@@ -1628,7 +1632,7 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
-            MediaStorage.save_video(
+            actual_output_path = MediaStorage.save_video(
                 video=output.video,
                 output_path=self.media_storage_path / f"{video_id}.mp4",
                 audio=output.audio,
@@ -1638,6 +1642,8 @@ class OpenAIServer:
             if job:
                 job.status = "completed"
                 job.completed_at = int(time.time())
+                # Store actual file extension in case it differs from requested (.mp4 vs .avi)
+                job.output_path = str(actual_output_path)
                 await VIDEO_STORE.upsert(video_id, job)
 
         except Exception as e:
@@ -1742,12 +1748,24 @@ class OpenAIServer:
                     status_code=HTTPStatus.BAD_REQUEST
                 )
 
-            video_file_name = f"{video_id}.mp4"
-            if os.path.exists(self.media_storage_path / video_file_name):
+            # Try to use stored output path, otherwise check for both .mp4 and .avi
+            video_path = None
+            if hasattr(job, 'output_path') and job.output_path and os.path.exists(job.output_path):
+                video_path = Path(job.output_path)
+            else:
+                # Fall back to checking common extensions
+                for ext in [".mp4", ".avi"]:
+                    candidate = self.media_storage_path / f"{video_id}{ext}"
+                    if os.path.exists(candidate):
+                        video_path = candidate
+                        break
+
+            if video_path and os.path.exists(video_path):
+                media_type = "video/mp4" if video_path.suffix == ".mp4" else "video/x-msvideo"
                 return FileResponse(
-                    self.media_storage_path / video_file_name,
-                    media_type="video/mp4",
-                    filename=video_file_name,
+                    video_path,
+                    media_type=media_type,
+                    filename=video_path.name,
                 )
             else:
                 return self.create_error_response(
@@ -1788,12 +1806,23 @@ class OpenAIServer:
                     status_code=HTTPStatus.BAD_REQUEST
                 )
 
-            # Delete the video
-            success = await VIDEO_STORE.pop(video_id)
-            video_file_name = f"{video_id}.mp4"
+            # Delete the video file(s) - check for both .mp4 and .avi
+            video_path = None
+            if hasattr(job, 'output_path') and job.output_path and os.path.exists(job.output_path):
+                video_path = job.output_path
+            else:
+                # Fall back to checking common extensions
+                for ext in [".mp4", ".avi"]:
+                    candidate = self.media_storage_path / f"{video_id}{ext}"
+                    if os.path.exists(candidate):
+                        video_path = candidate
+                        break
 
-            if os.path.exists(self.media_storage_path / video_file_name):
-                os.remove(self.media_storage_path / video_file_name)
+            if video_path and os.path.exists(video_path):
+                os.remove(video_path)
+
+            # Delete from store
+            success = await VIDEO_STORE.pop(video_id)
 
             return JSONResponse(content={"deleted": success is not None})
 

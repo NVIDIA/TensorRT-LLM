@@ -22,8 +22,14 @@ Before running these examples, ensure you have:
 
    ```bash
    pip install git+https://github.com/huggingface/diffusers.git
-   pip install av
    ```
+
+   **Optional**: For better video compression (H.264/MP4), install ffmpeg:
+   ```bash
+   # Ubuntu/Debian
+   apt-get install ffmpeg
+   ```
+   If ffmpeg is not available, the server will use a pure Python encoder that outputs MJPEG/AVI format.
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash
@@ -275,7 +281,12 @@ curl -X GET "http://localhost:8000/v1/videos/{video_id}"
 
 ### Download Video
 ```bash
+# The server returns either MP4 (with ffmpeg) or AVI (without ffmpeg)
+# Check the Content-Type header to determine the format
 curl -X GET "http://localhost:8000/v1/videos/{video_id}/content" -o output.mp4
+
+# Or use -J -O to let curl use the server-provided filename
+curl -X GET "http://localhost:8000/v1/videos/{video_id}/content" -J -O
 ```
 
 ### Delete Video
@@ -315,8 +326,18 @@ Errors are displayed with full stack traces for debugging.
 Generated files are saved to the current working directory:
 
 - `output_generation.png` - Synchronous image generation (`sync_image_gen.py`)
-- `output_sync.mp4` - Synchronous video generation (`sync_video_gen.py`)
-- `output_async.mp4` - Asynchronous video generation (`async_video_gen.py`)
-- `output_multipart.mp4` - Multipart example output (`multipart_example.py`)
+- `output_sync.mp4` or `output_sync.avi` - Synchronous video generation (`sync_video_gen.py`)
+- `output_async.mp4` or `output_async.avi` - Asynchronous video generation (`async_video_gen.py`)
 
 **Note:** You can customize output filenames using the `--output` parameter in all scripts.
+
+## Video Encoding
+
+The server supports two video encoding modes:
+
+| Encoder | Format | Requirements | Features |
+|---------|--------|--------------|----------|
+| **FFmpeg (H.264)** | MP4 | ffmpeg installed | Better compression, audio support |
+| **Pure Python (MJPEG)** | AVI | None (built-in) | No external dependencies |
+
+The server automatically selects the best available encoder. The example scripts detect the actual format from the server response and adjust the output filename extension accordingly.
