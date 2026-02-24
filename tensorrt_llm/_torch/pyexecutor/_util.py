@@ -1,13 +1,11 @@
 import os
-from typing import Dict, List, Optional
+from typing import Dict, Optional
 
 import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import \
-    MODEL_CLASS_VISION_ENCODER_MAPPING
 from tensorrt_llm._utils import (confidential_compute_enabled,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
@@ -26,13 +24,16 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
+<<<<<<< HEAD
 from ..speculative import (get_num_extra_kv_tokens, get_num_spec_layers,
                            get_spec_decoder, should_use_separate_draft_kv_cache)
+=======
+from ..speculative import get_spec_decoder
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
-from .llm_request import ExecutorResponse
 from .mamba_cache_manager import MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
@@ -60,6 +61,12 @@ def get_kv_cache_manager_cls(model_config: ModelConfig):
         return KVCacheManager
 
 
+def is_vswa_enabled(kv_cache_config):
+    max_attention_window = kv_cache_config.max_attention_window
+    return max_attention_window is not None and len(
+        set(max_attention_window)) > 1
+
+
 class KvCacheCreator:
     """Groups together logic related to KV cache construction."""
 
@@ -69,7 +76,6 @@ class KvCacheCreator:
         model_engine: PyTorchModelEngine,
         draft_model_engine: Optional[PyTorchModelEngine],
         mapping: Mapping,
-        net_max_seq_len: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
         max_num_tokens: int,
         max_beam_width: int,
@@ -98,9 +104,6 @@ class KvCacheCreator:
         self._tokens_per_block = tokens_per_block
         self._max_seq_len = max_seq_len
         self._max_batch_size = max_batch_size
-        self._net_max_seq_len = net_max_seq_len
-        self._dummy_reqs = None
-        self._profiling_stage_data = profiling_stage_data
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
             model_engine.model.model_config)
         self._execution_stream = execution_stream
@@ -128,24 +131,21 @@ class KvCacheCreator:
                 tokens_per_block=self._tokens_per_block)
         return kv_size_per_token
 
-    def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction,
-                        allocated_bytes: int) -> int:
+    def _cal_max_memory(self, peak_memory, total_gpu_memory, fraction) -> int:
         """
         Calculate the max KV cache capacity.
-
-        NOTE: `allocated_bytes` is the total KV-cache memory that must be pre-allocated during the estimation phase (for both the main and draft models) so the estimation run can complete successfully. When computing `available_kv_mem`, add this amount back in.
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        available_kv_mem = (total_gpu_memory - peak_memory +
-                            allocated_bytes) * fraction
+        available_kv_mem = (total_gpu_memory - peak_memory) * fraction
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
-            f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
+            f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB"
+        )
         return int(available_kv_mem)
 
+<<<<<<< HEAD
     def _create_dummy_mm_context_request(
             self, input_seq_len: int) -> List[trtllm.Request]:
         requests = []
@@ -337,6 +337,9 @@ class KvCacheCreator:
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self, py_executor: PyExecutor) -> None:
+=======
+    def configure_kv_cache_capacity(self) -> None:
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
         """Perform KV cache capacity estimation.
         NOTE: for VSWA case, we calculate and set kv cache memory instead of using max_tokens in kv_cache_config.
 
@@ -361,6 +364,7 @@ class KvCacheCreator:
             f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
         )
 
+<<<<<<< HEAD
         py_executor.set_gather_responses(True)
         origin_iter_stats = py_executor.enable_iter_perf_stats
         py_executor.enable_iter_perf_stats = False
@@ -418,13 +422,11 @@ class KvCacheCreator:
         allocated_bytes = kv_stats.allocated_bytes + (
             kv_stats_draft.allocated_bytes if kv_stats_draft is not None else 0)
 
+=======
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
         # calculate max memory from peak memory and free gpu memory fraction
-        kv_cache_max_memory = self._cal_max_memory(peak_memory,
-                                                   total_gpu_memory, fraction,
-                                                   allocated_bytes)
-
-        max_attention_window = self._kv_cache_config.max_attention_window
-        is_vswa = max_attention_window and len(set(max_attention_window)) > 1
+        kv_cache_max_memory = self._cal_max_memory(total_used_bytes,
+                                                   total_gpu_memory, fraction)
 
         # NOTE:
         # KvCacheCreator currently controls KV-cache capacity using two parameters in KVCacheConfig:
@@ -436,6 +438,8 @@ class KvCacheCreator:
         # ---------------------------handle max_tokens---------------------------------
         # if user provided max_tokens, calculate max memory from max_tokens
         if self._max_kv_tokens_in is not None:
+            is_vswa = is_vswa_enabled(self._kv_cache_config)
+
             # raise error if it is VSWA case
             if is_vswa:
                 logger.warning(
@@ -468,14 +472,10 @@ class KvCacheCreator:
         )
         # set max_gpu_total_bytes
         self._kv_cache_config.max_gpu_total_bytes = kv_cache_max_memory
-        if isinstance(self._profiling_stage_data, dict):
-            self._profiling_stage_data["activation_bytes"] = activation_bytes
         # ---------------------------handle max_gpu_total_bytes---------------------------------
 
     def _create_kv_cache_manager(
-            self,
-            model_engine: PyTorchModelEngine,
-            estimating_kv_cache: bool = False) -> KVCacheManager:
+            self, model_engine: PyTorchModelEngine) -> KVCacheManager:
         mapping = self._mapping
         assert model_engine.model.model_config.is_generation, "Only construct KV cache for generation models."
 
@@ -501,31 +501,17 @@ class KvCacheCreator:
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
-            estimating_kv_cache=estimating_kv_cache,
             execution_stream=self._execution_stream,
             layer_mask=spec_dec_layer_mask,
         )
 
-        # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
-        if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
-            # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
-            if kv_cache_manager is not None:
-                if kv_cache_manager.max_seq_len < self._max_seq_len:
-                    self._dummy_reqs = self._create_dummy_context_requests(
-                        max(
-                            1, self._net_max_seq_len - 1 -
-                            (self._max_seq_len - kv_cache_manager.max_seq_len)))
-                self._max_seq_len = kv_cache_manager.max_seq_len
-
         # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
         if kv_cache_manager is not None:
-            if kv_cache_manager.max_seq_len < self._max_seq_len:
-                self._dummy_reqs = self._create_dummy_context_requests(
-                    max(1, kv_cache_manager.max_seq_len - 1))
             self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
 
+<<<<<<< HEAD
     def _should_create_separate_draft_kv_cache(self) -> bool:
         """
         Check if we need a separate draft KV cache manager for one-model mode.
@@ -614,14 +600,18 @@ class KvCacheCreator:
     def build_managers(self,
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
+=======
+    def build_managers(self, resources: Dict) -> None:
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
         """Construct KV caches for model and draft model (if applicable)."""
-        kv_cache_manager = self._create_kv_cache_manager(
-            self._model_engine, estimating_kv_cache)
+        self.configure_kv_cache_capacity()
+        kv_cache_manager = self._create_kv_cache_manager(self._model_engine, )
 
-        if not estimating_kv_cache and self._kv_connector_manager is not None and self._draft_model_engine is not None:
+        if self._kv_connector_manager is not None and self._draft_model_engine is not None:
             raise NotImplementedError(
                 "Connector manager is not supported for draft model.")
 
+<<<<<<< HEAD
         draft_kv_cache_manager = None
 
         # Two-model speculative decoding: draft model has separate engine
@@ -632,20 +622,15 @@ class KvCacheCreator:
         elif self._should_create_separate_draft_kv_cache():
             draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
                 estimating_kv_cache)
+=======
+        draft_kv_cache_manager = self._create_kv_cache_manager(
+            self._draft_model_engine
+        ) if self._draft_model_engine is not None else None
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
             ResourceManagerType.DRAFT_KV_CACHE_MANAGER] = draft_kv_cache_manager
-
-    def teardown_managers(self, resources: Dict) -> None:
-        """Clean up KV caches for model and draft model (if applicable)."""
-        resources[ResourceManagerType.KV_CACHE_MANAGER].shutdown()
-        del resources[ResourceManagerType.KV_CACHE_MANAGER]
-        draft_kv_cache_manager = resources[
-            ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
-        if draft_kv_cache_manager:
-            draft_kv_cache_manager.shutdown()
-        del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
 
 def _create_kv_cache_manager(
@@ -661,6 +646,7 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
+<<<<<<< HEAD
         estimating_kv_cache: bool,
         execution_stream: Optional[torch.cuda.Stream] = None,
         # Optional overrides for one-model draft case (when model_engine is None)
@@ -669,6 +655,9 @@ def _create_kv_cache_manager(
         is_draft: Optional[bool] = None,
         layer_mask: Optional[List[bool]] = None,
         num_layers: Optional[int] = None) -> KVCacheManager:
+=======
+        execution_stream: Optional[torch.cuda.Stream] = None) -> KVCacheManager:
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -723,11 +712,15 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             vocab_size=config.vocab_size,
             max_beam_width=max_beam_width,
+<<<<<<< HEAD
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
+=======
+            is_draft=model_engine.is_draft_model,
+            kv_connector_manager=kv_connector_manager,
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
             sparse_attn_config=sparse_attn_config,
-            is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
         )
@@ -736,7 +729,7 @@ def _create_kv_cache_manager(
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
 
-        if not estimating_kv_cache and kv_connector_manager is not None:
+        if kv_connector_manager is not None:
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
@@ -802,7 +795,6 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
-            is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
     elif is_qwen3_next(config):
@@ -810,7 +802,7 @@ def _create_kv_cache_manager(
             raise ValueError(
                 "MambaHybridCacheManager + beam search is not supported yet.")
 
-        if not estimating_kv_cache and kv_connector_manager is not None:
+        if kv_connector_manager is not None:
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
@@ -852,14 +844,19 @@ def _create_kv_cache_manager(
             mapping=mapping,
             dtype=kv_cache_dtype,
             spec_config=spec_config,
-            is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
         )
     else:
+<<<<<<< HEAD
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
         is_vswa = kv_cache_config.max_attention_window is not None and len(
             set(kv_cache_config.max_attention_window)) > 1
         binding_model_config = _model_config.get_bindings_model_config(
+=======
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+        is_vswa = is_vswa_enabled(kv_cache_config)
+        binding_model_config = model_engine.model.model_config.get_bindings_model_config(
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
             tokens_per_block=tokens_per_block) if is_vswa else None
 
         kv_cache_manager = kv_cache_manager_cls(
@@ -878,11 +875,15 @@ def _create_kv_cache_manager(
             max_num_tokens=max_num_tokens,
             model_config=binding_model_config,
             max_beam_width=max_beam_width,
+<<<<<<< HEAD
             is_draft=is_draft,
             kv_connector_manager=kv_connector_manager
             if not estimating_kv_cache else None,
+=======
+            is_draft=model_engine.is_draft_model,
+            kv_connector_manager=kv_connector_manager,
+>>>>>>> 4eb9c9b47 (Remove memory estimation process)
             sparse_attn_config=sparse_attn_config,
-            is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
         )
@@ -897,7 +898,6 @@ def create_py_executor_instance(
     llm_args,
     ctx_chunk_config,
     model_engine,
-    start_worker,
     sampler,
     drafter,
     guided_decoder: Optional[GuidedDecoder] = None,
@@ -1091,7 +1091,6 @@ def create_py_executor_instance(
         if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
-        start_worker=start_worker,
         garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
         kv_connector_manager=kv_connector_manager,
         max_seq_len=max_seq_len,
@@ -1237,53 +1236,6 @@ def _try_infer_num_experts(model_config: ModelConfig) -> int:
         return 1
 
     return num_experts
-
-
-def _adjust_torch_mem_fraction():
-    # If true, adjust PyTorch CUDA memory fraction to correspond to the
-    # total GPU memory minus the statically allocated engine memory.
-    # If false, set the PyTorch CUDA memory fraction to 1.0.
-    _limit_torch_cuda_mem_fraction: bool = True
-
-    # FIXME: PyTorch only uses the garbage_collection_threshold setting
-    #        if a memory fraction is set, cf.
-    #   https://github.com/pytorch/pytorch/blob/cd995bfb2aac8891465809be3ce29543bd524287/c10/cuda/CUDACachingAllocator.cpp#L1357
-    logger.debug("Setting PyTorch memory fraction to 1.0")
-    torch.cuda.set_per_process_memory_fraction(1.0)
-
-    # FIXME: As soon as
-    #     torch.cuda._set_allocator_settings (added in PyTorch 2.8.0-rc1)
-    #   or a similar API is available, the warning below should be removed
-    #   and the allocator GC threshold be set via the new API instead.
-    torch_allocator_config = os.environ.get("PYTORCH_ALLOC_CONF", "")
-    torch_mem_threshold_advised = (
-        torch.cuda.get_allocator_backend() == "native"
-        and "expandable_segments:True" not in torch_allocator_config)
-    torch_mem_threshold_set = "garbage_collection_threshold:" in torch_allocator_config
-    if torch_mem_threshold_advised and not torch_mem_threshold_set:
-        logger.warning(
-            "It is recommended to incl. 'garbage_collection_threshold:0.???' or 'backend:cudaMallocAsync'"
-            " or 'expandable_segments:True' in PYTORCH_ALLOC_CONF.")
-
-    # NOTE: Even if a memory threshold was not set (cf. warning above), setting a memory
-    #       fraction < 1.0 is beneficial, because
-    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L2719
-    #       and
-    #         https://github.com/pytorch/pytorch/blob/5228986c395dc79f90d2a2b991deea1eef188260/c10/cuda/CUDACachingAllocator.cpp#L1240
-    #       lead PyTorch to release all unused memory before hitting the set fraction. This
-    #       still mitigates OOM, although at a higher performance impact, because it
-    #       effectively resets the allocator cache.
-    if not _limit_torch_cuda_mem_fraction:
-        return
-    mem_reserved = torch.cuda.memory_reserved()
-    mem_free, mem_total = torch.cuda.mem_get_info()
-    safety_margin = 32 * 1024**2
-    mem_torch_max = mem_free + mem_reserved - safety_margin
-    mem_torch_fraction = mem_torch_max / mem_total
-    logger.info(
-        f"Setting PyTorch memory fraction to {mem_torch_fraction} ({mem_torch_max / 1024**3} GiB)"
-    )
-    torch.cuda.set_per_process_memory_fraction(mem_torch_fraction)
 
 
 def validate_feature_combination(llm_args, model_engine, sampler_type):
