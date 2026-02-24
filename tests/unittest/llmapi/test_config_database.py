@@ -48,7 +48,9 @@ def get_config_id(config_path: Path) -> str:
 
 
 def _assert_kv_cache_block_reuse_policy(config_dict: dict) -> None:
-    assert config_dict.get("kv_cache_config", {}).get("enable_block_reuse") is not False
+    assert config_dict.get("kv_cache_config", {}).get("enable_block_reuse") is not False, (
+        "KV cache block reuse should not be disabled"
+    )
 
 
 @pytest.mark.part0
@@ -62,7 +64,7 @@ def test_database_yaml_config_validates_against_llm_args(config_path: Path):
 @pytest.mark.parametrize("config_path", ALL_CONFIGS, ids=get_config_id)
 def test_database_yaml_config_does_not_disable_kv_cache_block_reuse(config_path: Path):
     config_dict = yaml_harness.load_yaml_dict(config_path)
-    yaml_harness.assert_custom_policy(config_dict, _assert_kv_cache_block_reuse_policy)
+    _assert_kv_cache_block_reuse_policy(config_dict)
 
 
 @pytest.mark.part0

@@ -17,7 +17,7 @@
 from __future__ import annotations
 
 import copy
-from collections.abc import Callable, Iterable, Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -100,10 +100,6 @@ def assert_no_default_valued_leaves(
         raise AssertionError(
             "Found default-valued config leaves:\n" + "\n".join(sorted(violations))
         )
-
-
-def assert_custom_policy(cfg: dict[str, Any], policy_fn: Callable[[dict[str, Any]], None]) -> None:
-    policy_fn(cfg)
 
 
 @contextmanager
