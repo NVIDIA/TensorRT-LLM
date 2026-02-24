@@ -865,7 +865,6 @@ class TestWanPipeline:
                 "quant_algo": "NVFP4",
                 "dynamic": True,
             },
-            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
 
@@ -1869,7 +1868,6 @@ class TestWanPipeline:
                 "quant_algo": "NVFP4",
                 "dynamic": True,
             },
-            pipeline={"warmup_steps": 0},
         )
         pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load(skip_warmup=True)
 
@@ -2083,7 +2081,6 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
         pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
@@ -2098,7 +2095,6 @@ class TestWanPipeline:
                 device="cuda",
                 dtype="bfloat16",
                 skip_components=SKIP_COMPONENTS,
-                pipeline={"warmup_steps": 0},
             )
             pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load(skip_warmup=True)
 
@@ -2138,7 +2134,6 @@ class TestWanPipeline:
                 "dynamic": True,
                 "ignore": mixed_ignore_patterns,
             },
-            pipeline={"warmup_steps": 0},
         )
         pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load(skip_warmup=True)
 
