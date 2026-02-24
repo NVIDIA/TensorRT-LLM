@@ -16,7 +16,10 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 }
 @Field String LLM_ROOT = "llm"
 
-@Field String BOT_REPO = "https://gitlab-master.nvidia.com/ftp/llm-bloom-bot.git"
+@Field String BOT_REPO = ""
+withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
+    BOT_REPO = "${DEFAULT_GIT_URL}/ftp/llm-bloom-bot.git"
+}
 @Field String BOT_REVISION = "master"
 @Field String BOT_ROOT = "bot"
 
@@ -881,8 +884,11 @@ def collectTestResults(pipeline, testFilter, globalVars)
         // TODO: CI TEST MODE - Force tag update stage to run in non-PostMerge jobs
         if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
             stage("Update GitHub Tag") {
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
-                updateGithubTagCommit(pipeline, globalVars)
+                // Wrap in catchError to ensure tag update failures don't fail the pipeline
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
+                    updateGithubTagCommit(pipeline, globalVars)
+                }
             }
         }
         stage("Collect Perf Regression Result") {
@@ -1339,17 +1345,18 @@ def updateGithubTagCommit(pipeline, globalVars) {
         return false
     }
 
-    def buildResult = currentBuild.result ?: 'SUCCESS'
+    // In post block, currentBuild.result is already determined (SUCCESS, FAILURE, UNSTABLE, or ABORTED)
+    // It will never be null at this point since post blocks run after all stages complete
+    def buildResult = currentBuild.result ?: 'UNKNOWN'
 
     // Checkout bot repo (needed by the Python script for failure analysis)
+    // Only needed if build has failed (not SUCCESS)
     if (buildResult != 'SUCCESS') {
         trtllm_utils.checkoutSource(BOT_REPO, BOT_REVISION, BOT_ROOT)
     }
 
     def downstreamDurationsJson = writeJSON(returnText: true, json: globalVars.get(DOWNSTREAM_JOB_DURATION, [:]))
     def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
-
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
 
     withCredentials([
         usernamePassword(
