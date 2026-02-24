@@ -132,7 +132,7 @@ python visual_gen_wan_t2v.py \
     --output_path output_fp8.mp4
 ```
 
-Supported `--linear_type` values: `default` (BF16/FP16), `trtllm-fp8-per-tensor`, `trtllm-fp8-blockwise`, `svd-nvfp4`.
+Supported `--linear_type` values: `default` (BF16/FP16), `trtllm-fp8-per-tensor`, `trtllm-fp8-blockwise`, `trtllm-nvfp4`.
 
 **ModelOpt `quantization_config` format:**
 

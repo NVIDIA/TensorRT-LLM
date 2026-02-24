@@ -126,7 +126,7 @@ def parse_args():
         "--linear_type",
         type=str,
         default="default",
-        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "svd-nvfp4"],
+        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
         help="Linear layer quantization type",
     )
 
@@ -205,7 +205,7 @@ def build_diffusion_config(args):
         quant_config = {"quant_algo": "FP8", "dynamic": True}
     elif args.linear_type == "trtllm-fp8-blockwise":
         quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "svd-nvfp4":
+    elif args.linear_type == "trtllm-nvfp4":
         quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
     # Note: pipeline type (FLUX.1 vs FLUX.2) is auto-detected from model_index.json
