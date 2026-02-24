@@ -203,7 +203,7 @@ def pulseScan(llmRepo, branchName) {
                     ]) {
                         sh 'pulse scan --no-fail --sbom .'
                         if (params.repoUrlKey != "github_fork") {
-                            sh 'pulse upload-sbom --skip-validation --sbom-file sbom.cdx.json --vulnerability-report nspect_scan_report.json'
+                            sh 'pulse upload-sbom --override --skip-validation --sbom-file sbom.cdx.json --vulnerability-report nspect_scan_report.json'
                         }
                     }
                   }
