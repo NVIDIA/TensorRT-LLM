@@ -4,3 +4,11 @@
 urllib3>=2.6.3
 # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
 wheel>=0.46.2
+# WAR against https://github.com/advisories/GHSA-cfh3-3jmp-rvhc
+pillow>=12.1.1
+# WAR against https://github.com/advisories/GHSA-6mq8-rvhq-8wgg
+aiohttp>=3.13.3
+# WAR against https://github.com/advisories/GHSA-7gcm-g887-7qv7
+protobuf>=6.33.5
+# WAR against https://huntr.com/bounties/7b5932bb-58d1-4e71-b85c-43dc40522ff2
+gradio>=6.6
