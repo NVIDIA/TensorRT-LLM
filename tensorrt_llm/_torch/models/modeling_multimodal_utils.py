@@ -378,8 +378,8 @@ def fuse_input_embeds(
     input_embeds[mm_token_indices, :] = mm_embed.to(dtype=input_embeds.dtype,
                                                     device=input_embeds.device)
     if extra_embeds is not None and len(extra_embeds) > 0:
-        return None, cast(torch.FloatTensor, input_embeds), extra_embeds
-    return None, cast(torch.FloatTensor, input_embeds)
+        return input_ids, cast(torch.FloatTensor, input_embeds), extra_embeds
+    return input_ids, cast(torch.FloatTensor, input_embeds)
 
 
 #region VILA utils
