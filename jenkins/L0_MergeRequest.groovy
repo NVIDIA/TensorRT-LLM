@@ -1340,7 +1340,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
  */
 def updateGithubTagCommit(pipeline, globalVars) {
     // Only update tag for post-merge builds
-    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+    if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || true)) { // TODO: CI TEST MODE - Force tag update for pre-merge builds
         echo "Not a PostMerge build - skipping tag update"
         return false
     }

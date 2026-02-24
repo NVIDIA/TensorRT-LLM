@@ -531,7 +531,8 @@ def main() -> int:
         return 1
 
     # Only support post-merge builds (triggered by GitLab mirror)
-    if "PostMerge" not in args.job_name:
+    # TODO: CI TEST MODE - Allow pre-merge builds for testing
+    if "PostMerge" not in args.job_name and False:  # Set to True to enable test mode
         log("ERROR: This script only supports post-merge builds")
         return 1
 
