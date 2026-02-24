@@ -770,7 +770,7 @@ def serve(
             pipeline_parallel_size=pipeline_parallel_size,
             context_parallel_size=context_parallel_size,
             cp_config={"cp_type": context_parallel_type}
-            if context_parallel_size > 1 else {},
+            if context_parallel_size > 1 else None,
             moe_expert_parallel_size=moe_expert_parallel_size,
             moe_cluster_parallel_size=moe_cluster_parallel_size,
             gpus_per_node=gpus_per_node,
