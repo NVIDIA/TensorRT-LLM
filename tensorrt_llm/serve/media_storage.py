@@ -6,8 +6,9 @@ This module provides storage handlers for persisting generated media assets
 """
 
 import os
+import shutil
 import struct
-import subprocess
+import subprocess  # nosec B404
 import tempfile
 from abc import ABC, abstractmethod
 from io import BytesIO
@@ -20,23 +21,37 @@ from PIL import Image
 from tensorrt_llm.logger import logger
 
 # Video encoder availability flags (cached after first check)
-_FFMPEG_AVAILABLE: Optional[bool] = None
+_FFMPEG_PATH: Optional[str] = None
 
 
 def _check_ffmpeg_available() -> bool:
-    """Check if ffmpeg CLI is available."""
-    global _FFMPEG_AVAILABLE
-    if _FFMPEG_AVAILABLE is None:
-        try:
-            result = subprocess.run(
-                ["ffmpeg", "-version"],
-                capture_output=True,
-                text=True,
-            )
-            _FFMPEG_AVAILABLE = result.returncode == 0
-        except FileNotFoundError:
-            _FFMPEG_AVAILABLE = False
-    return _FFMPEG_AVAILABLE
+    """Check if ffmpeg CLI is available and cache its path."""
+    global _FFMPEG_PATH
+    if _FFMPEG_PATH is None:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is not None:
+            try:
+                result = subprocess.run(
+                    [ffmpeg_path, "-version"],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    _FFMPEG_PATH = ffmpeg_path
+                else:
+                    _FFMPEG_PATH = ""
+            except (FileNotFoundError, OSError):
+                _FFMPEG_PATH = ""
+        else:
+            _FFMPEG_PATH = ""
+    return bool(_FFMPEG_PATH)
+
+
+def _get_ffmpeg_path() -> str:
+    """Get the cached ffmpeg path. Must call _check_ffmpeg_available() first."""
+    if _FFMPEG_PATH is None:
+        _check_ffmpeg_available()
+    return _FFMPEG_PATH or ""
 
 
 class VideoEncoder(ABC):
@@ -170,8 +185,9 @@ class FfmpegCliEncoder(VideoEncoder):
             # Build ffmpeg command
             # Input: raw RGB frames piped via stdin
             # Output: H.264 encoded MP4
+            ffmpeg_path = _get_ffmpeg_path()
             cmd = [
-                "ffmpeg",
+                ffmpeg_path,
                 "-y",  # Overwrite output
                 "-f",
                 "rawvideo",  # Input format
