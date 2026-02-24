@@ -1138,35 +1138,36 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         return True
 
     class FinishReasonsHandler:
-        _EMPTY_STOP_WORD_TOKEN_ID = -2
-        _PAD_STOP_WORD_TOKEN_ID = -1
+        _EMPTY_STOP_WORD_TOKEN_ID: int = -2
+        _PAD_STOP_WORD_TOKEN_ID: int = -1
 
         @dataclass(kw_only=True)
         class _FinishReasonsStore:
             """Auxiliary data structures used for finish reasons handling."""
 
-            # Buffer to contain the finish reasons per iteration
+            # Per-request dynamic metadata
             finish_reasons_cuda: torch.Tensor
-            """Shape: max_tokens, batch_size, beam_width
+            """Shape: [max_tokens, batch_size, beam_width]
             Usage: Stores the currently estimated finish_reasons for each request"""
+
             # Per-request static metadata
             max_lengths_cuda: torch.Tensor
-            """Shape: batch_size
+            """Shape: [batch_size]
             Usage: Stores the maximum lengths for each request"""
             end_ids_cuda: torch.Tensor
             """Shape: batch_size
             Usage: Stores the end ids for each request"""
             stop_words_cuda: torch.Tensor
-            """ Shape: max_num_stop_words, max_stop_word_length, batch_size,
+            """ Shape: [max_num_stop_words, max_stop_word_length, batch_size]
             Usage: Stores the stop words for each request as a padded tensor."""
             past_tokens_cuda: torch.Tensor
-            """ Shape: max_stop_word_length,batch_size, beam_width
+            """ Shape: [max_stop_word_length,batch_size, beam_width]
             Usage: Stores the last max_stop_word_length tokens for each beam."""
             max_stop_word_lengths_host: torch.Tensor
-            """ Shape: batch_size,
+            """ Shape: [batch_size]
             Usage: Stores the size of the longest stop word for each request."""
             num_accepted_draft_tokens_host: torch.Tensor
-            """ Shape: batch_size,
+            """ Shape: [batch_size]
             Usage: Stores the number of accepted tokens for each request."""
 
         def __init__(
@@ -1178,7 +1179,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_tokens: int,
             max_seq_len: int,
         ):
-            self.update_sizes(
+            self._update_sizes(
                 max_stop_word_length,
                 max_num_stop_words,
                 max_num_sequences,
@@ -1186,14 +1187,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 max_tokens,
                 max_seq_len,
             )
-            self.setup_store()
-            self.setup_helper_tensors()
+            self._setup_store()
+            self._setup_helper_tensors()
 
         @property
-        def use_speculative_decoding(self) -> bool:
+        def _use_speculative_decoding(self) -> bool:
             return self.max_tokens > 1
 
-        def update_sizes(
+        def _update_sizes(
             self,
             max_stop_word_length: int,
             max_num_stop_words: int,
@@ -1202,24 +1203,30 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_tokens: int,
             max_seq_len: int,
         ):
-            self.max_stop_word_length = max_stop_word_length
-            self.max_num_stop_words = max_num_stop_words
-            self.max_num_sequences = max_num_sequences
-            self.max_beam_width = max_beam_width
-            self.max_tokens = max_tokens
-            self.max_seq_len = max_seq_len
-            self.stop_words_shape = (
+            """Updates the sizes of the finish reasons handler
+
+            Sets member variables to store the current sizes.
+            These sizes are used to initialize the buffer tensors.
+            """
+            self.max_stop_word_length: int = max_stop_word_length
+            self.max_num_stop_words: int = max_num_stop_words
+            self.max_num_sequences: int = max_num_sequences
+            self.max_beam_width: int = max_beam_width
+            self.max_tokens: int = max_tokens
+            self.max_seq_len: int = max_seq_len
+            self.stop_words_shape: tuple[int, int, int] = (
                 self.max_num_stop_words,
                 self.max_stop_word_length,
                 self.max_num_sequences,
             )
-            self.past_tokens_shape = (
+            self.past_tokens_shape: tuple[int, int, int] = (
                 self.max_stop_word_length - 1 + self.max_tokens,
                 self.max_num_sequences,
                 self.max_beam_width,
             )
 
-        def setup_store(self):
+        def _setup_store(self):
+            """Sets up the store for the finish reasons handler by initializing all buffer tensors."""
             finish_reasons_cuda = int_tensor(
                 (self.max_tokens, self.max_num_sequences, self.max_beam_width)
             )
@@ -1233,21 +1240,23 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             num_accepted_draft_tokens_host = torch.empty(
                 self.max_num_sequences, device="cpu", dtype=torch.int32
             )
-            self.store = self._FinishReasonsStore(
-                finish_reasons_cuda=finish_reasons_cuda,
-                max_lengths_cuda=max_lengths_cuda,
-                end_ids_cuda=end_ids_cuda,
-                stop_words_cuda=stop_words_cuda,
-                past_tokens_cuda=past_tokens_cuda,
-                max_stop_word_lengths_host=max_stop_word_lengths_host,
-                num_accepted_draft_tokens_host=num_accepted_draft_tokens_host,
+            self.store: TorchSampler.FinishReasonsHandler._FinishReasonsStore = (
+                self._FinishReasonsStore(
+                    finish_reasons_cuda=finish_reasons_cuda,
+                    max_lengths_cuda=max_lengths_cuda,
+                    end_ids_cuda=end_ids_cuda,
+                    stop_words_cuda=stop_words_cuda,
+                    past_tokens_cuda=past_tokens_cuda,
+                    max_stop_word_lengths_host=max_stop_word_lengths_host,
+                    num_accepted_draft_tokens_host=num_accepted_draft_tokens_host,
+                )
             )
 
-        def setup_helper_tensors(self):
+        def _setup_helper_tensors(self):
             # Helper tensors for finish_reasons:
             """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer).
             See `def _write_reason`."""
-            self._reason_tensors_cuda = {
+            self._reason_tensors_cuda: dict[FinishReason, torch.Tensor] = {
                 reason: torch.tensor(
                     reason.value, dtype=self.store.finish_reasons_cuda.dtype, device="cuda"
                 )
@@ -1261,7 +1270,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
             }
             # setup local buffer for max tokens checking
-            self._max_tokens_offset_cuda = torch.arange(
+            self._max_tokens_offset_cuda: torch.Tensor = torch.arange(
                 1, self.max_tokens + 1, device="cuda", dtype=torch.int32
             ).view(-1, 1, 1)
 
@@ -1271,7 +1280,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._resize_stop_word_buffers()
 
         def _resize_stop_word_buffers(self):
-            self._stop_words_index_offset_cuda = torch.arange(
+            self._stop_words_index_offset_cuda: torch.Tensor = torch.arange(
                 max(0, self.max_stop_word_length - 1), device="cuda"
             ).unsqueeze(1)
 
@@ -1285,14 +1294,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.max_stop_word_length,
                 self.max_num_sequences,
             )
-            self._past_token_buffer_cuda = torch.empty(
+            self._past_token_buffer_cuda: torch.Tensor = torch.empty(
                 self.past_tokens_shape, device="cuda", dtype=torch.int32
             )
             # resize the stop words buffer if necessary
             # if the sizes are constant, this does nothing
             store = self.store
-            store.stop_words_cuda.resize_(self.stop_words_shape)
-            store.past_tokens_cuda.resize_(self.past_tokens_shape)
+            _ = store.stop_words_cuda.resize_(self.stop_words_shape)
+            _ = store.past_tokens_cuda.resize_(self.past_tokens_shape)
 
         class TemporaryData:
             """Data structure to store the temporary data during setup_sampler_step for new requests"""
@@ -1311,7 +1320,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self.total_max_num_stop_words: int = 0
 
         def prepare_for_new_request(self, request: LlmRequest, temp_data: TemporaryData):
-            """Fill temp_data with the corresponding data from new requests to be used during setup_sampler_step"""
+            """Fill temp_data with the corresponding data from new requests to be used during setup_sampler_step
+
+            Args:
+                request: The request to prepare for.
+                temp_data: The temporary data to fill with the request data.
+            """
 
             temp_data.max_lens.append(
                 min(self.max_seq_len, request.orig_prompt_len + request.py_max_new_tokens)
@@ -1319,6 +1333,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             temp_data.end_ids.append(request.py_end_id if request.py_end_id is not None else -1)
 
             if request.py_stop_words_list is not None:
+                assert request.py_seq_slot is not None
                 temp_data.stop_word_seq_slots.append(request.py_seq_slot)
                 extracted_stop_words_cuda, max_length, num_stop_words = self._extract_stop_words(
                     request.py_stop_words_list
@@ -1347,19 +1362,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         ):
             """Update tensors of this store with the new request data.
 
-            If stop words are present, also update the stop words buffers,
-            potentially triggering a resize of the stop words buffers
+            If stop words are present, also update the stop words buffers.
+            If the new stop words exceed either the current max_num_stop_words or max_stop_word_length values,
+            a resize of the stop words buffers is triggered. If a resize is necessary, all requests in the batch
+            need to be re-processed.
 
             Args:
                 seq_slots_cuda: The sequence slots of the processed requests. Used to determine where to
-                read and write from the finish_reasons and new_tokens buffers on the device. Shape: (len(requests),)
-                max_lengths_cuda: The maximum lengths for each request. Shape: (len(requests),)
-                end_ids_cuda: The end ids for each request. Shape: (len(requests),)
+                  read and write from the finish_reasons and new_tokens buffers on the device.
+                  Shape: [len(requests)]
+                max_lengths_cuda: The maximum lengths for each request.
+                  Shape: [len(requests)]
+                end_ids_cuda: The end ids for each request.
+                  Shape: [len(requests)]
                 seq_slots_host: The sequence slots of the processed requests. Used to determine where to
-                read and write from the finish_reasons and new_tokens buffers on the host. Shape: (len(requests),)
+                  read and write from the finish_reasons and new_tokens buffers on the host.
+                  Shape: [len(requests)]
                 temp_data: The temporary data of all the new requests.
                 scheduled_requests: The scheduled requests. Only used if a resize of the stop words
-                related buffers is necessary
+                  related buffers is necessary
             """
 
             store = self.store
@@ -1383,6 +1404,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def _maybe_resize_stop_words_buffer(
             self, total_max_length: int, total_max_num_stop_words: int
         ) -> bool:
+            """Checks if the stop words buffer needs to be resized and resizes it if necessary
+
+            If the total maximum length or number of stop words exceeds the current maximum values,
+            the stop words buffer is resized to the new maximum values.
+
+            Args:
+                total_max_length: The maximum length of the stop words in this batch.
+                total_max_num_stop_words: The maximum number of stop words of a request in this batch.
+            Returns:
+                True if the stop words buffer needs to be resized, False otherwise.
+            """
             if (
                 total_max_length > self.max_stop_word_length
                 or total_max_num_stop_words > self.max_num_stop_words
@@ -1396,6 +1428,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def _reprocess_stop_words_buffer(
             self, scheduled_requests: ScheduledRequests
         ) -> tuple[list[torch.Tensor], list[torch.Tensor], list[int]]:
+            """Reprocesses the stop words buffer with the new maximum values
+
+            If a resize of the stop words buffer is necessary, all requests in the batch need to be re-processed.
+
+            Args:
+                scheduled_requests: The scheduled requests.
+            Returns:
+                stop_words_cuda_list: A list of device tensors containing the top words per request with stop words.
+                past_tokens_cuda_list: A list of device tensors containing the past tokens per request with stop words.
+                stop_word_seq_slots: A list of host tensors containing the sequence slots per request with stop words.
+            """
             stop_words_cuda_list: list[torch.Tensor] = []
             past_tokens_cuda_list: list[torch.Tensor] = []
             stop_word_seq_slots: list[int] = []
@@ -1405,6 +1448,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     extracted_stop_words_cuda, _, _ = self._extract_stop_words(
                         request.py_stop_words_list
                     )
+                    assert request.py_seq_slot is not None
                     stop_word_seq_slots.append(request.py_seq_slot)
                     stop_words_cuda_list.append(extracted_stop_words_cuda)
                     past_tokens_cuda_list.append(self._get_past_tokens(request))
@@ -1419,6 +1463,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             past_tokens_cuda_list: list[torch.Tensor],
             stop_word_seq_slots: list[int],
         ):
+            """Updates the stop words buffer with the new maximum values
+
+            Args:
+                scheduled_requests: The scheduled requests.
+                total_max_length: The maximum length of the stop words in this batch.
+                total_max_num_stop_words: The maximum number of stop words of a request in this batch.
+                stop_words_cuda_list: A list of device tensors containing the top words per request with stop words.
+                past_tokens_cuda_list: A list of device tensors containing the past tokens per request with stop words.
+            """
             # Potentially resize the buffers and update
             # stop_words, past_tokens and stop_word_seq_slots
             # In case of a resize all requests in the batch need to be re-processed
@@ -1460,23 +1513,31 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def _extract_stop_words(
             self, stop_words_list: list[list[int]]
         ) -> tuple[torch.Tensor, int, int]:
-            """Extract the stop words from the stop words list and return
-            the stop words tensor, the maximum stop word length and the number of stop words
+            """Extract the stop words and size information from the stop words list
+
+            Processes the stop words list and stores the stop words in a padded device tensor.
+            Stop words shorter than FinishReasonsHandler.max_stop_word_length
+            are padded with _PAD_STOP_WORD_TOKEN_ID to max_stop_word_length.
+            Unused stop word slots are padded with _EMPTY_STOP_WORD_TOKEN_ID.
+            This function additionally returns the maximum stop word length and the number of stop words
+            in the processed stop words list.
+
 
             Args:
-                stop_words_list: list[list[int]]. List of lists. The first list contains the
-                tokens of the stop_sequences the second list contains the prefix sum of the
-                stop word lengths.
+                stop_words_list: A List of two lists containing stop words information. The first list contains the
+                  tokens of the stop_sequences the second list contains the prefix sum of the
+                  stop word lengths.
 
             Returns:
-                stop_words: torch.Tensor. The stop words device tensor
-                max_stop_word_length: int. The maximum stop word length
-                num_stop_words: int. The number of stop words
+                stop_words: A padded device tensor containing the stop words
+                  Shape: [max_num_stop_words, max_stop_word_length]
+                max_stop_word_length: The maximum stop word length in the stop words list
+                num_stop_words: The number of stop words in the stop words list
             """
             stop_words_host = torch.empty(
                 self.max_num_stop_words, self.max_stop_word_length, device="cpu", dtype=torch.int32
             )
-            stop_words_host.fill_(self._EMPTY_STOP_WORD_TOKEN_ID)
+            _ = stop_words_host.fill_(self._EMPTY_STOP_WORD_TOKEN_ID)
             words, cumulative_stop_word_lengths = stop_words_list
             words_host = torch.tensor(words, device="cpu", dtype=torch.int32)
             beg = 0
@@ -1491,6 +1552,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # skip processing if either the length or the index is greater than the current max values.
                 # These will be updated outside this function.
                 if length > self.max_stop_word_length or idx >= self.max_num_stop_words:
+                    beg = end
                     continue
                 stop_words_host[idx, -length:] = words_host[beg:end]
                 stop_words_host[idx, :-length] = self._PAD_STOP_WORD_TOKEN_ID
@@ -1505,10 +1567,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """Get the past tokens from the request and return the past tokens device tensor
 
             Args:
-                request: LlmRequest. The request to get the past tokens for
+                request: The request to get the past tokens for
 
             Returns:
-                past_tokens: torch.Tensor. The past tokens device tensor
+                past_tokens: The past tokens device tensor
+                  Shape: [max_stop_word_length - 1, max_beam_width]
             """
             past_tokens_host = torch.zeros(
                 max(0, self.max_stop_word_length - 1),
@@ -1562,10 +1625,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             Args:
                 seq_slots_host: The sequence slots of the processed requests. Used to determine where to
-                read and write from the finish_reasons and new_tokens buffers. Shape: (len(requests),)
-                is_draft_mask: A mask of requests that are drafts. Shape: (len(requests),)
+                  read and write from the finish_reasons and new_tokens buffers.
+                  Shape: [len(requests)]
+                is_draft_mask: A mask of requests that are drafts.
+                  Shape: [len(requests)]
                 is_last_context_chunk: A mask of context requests that are the last context chunk.
-                Shape: (len(context_requests),)
+                  Shape: [len(context_requests)]
+            Returns:
+                num_accepted_tokens_cuda: The number of accepted draft tokens +1 for each request.
+                  Shape: [len(requests)] if torch.Tensor
+                stop_word_indices_cuda: The indices of the requests that have stop words in the current batch.
+                  Shape: [len(requests_with_stop_words)]
+                single_token_stop_words_only: Whether all stop words in this batch are of length 1.
             """
             # Filter all requests, that have stop words
             store = self.store
@@ -1579,7 +1650,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             if batch_has_stop_words:
                 num_accepted_tokens_cuda = 1
                 # Only calculate num_accepted_tokens from the accepted draft tokens if speculative decoding is enabled
-                if self.use_speculative_decoding:
+                if self._use_speculative_decoding:
                     num_accepted_tokens_cuda = (
                         store.num_accepted_draft_tokens_host[seq_slots_host].to(
                             device="cuda", non_blocking=True
@@ -1606,19 +1677,29 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             single_token_stop_words_only: bool = False,
             first_finish_reasons: torch.Tensor | None = None,
         ) -> None:
-            """later end reason overwrites earlier, in reverse precedence order
+            """Writes the finish reasons to the finish_reasons tensor.
 
-            writes the finish reasons to the finish_reasons tensor.
+            The finish reasons are written to the finish_reasons tensor in the following order:
+            - Stop words
+            - Max length
+            - End ID
+            Later finish reasons overwrite earlier ones, in reverse precedence order.
+
             Args:
-                seq_slots: the sequence slots of the processed requests. Used to determine where to
-                read and write from the finish_reasons and new_tokens buffers. Shape: (len(requests),)
-                seq_lens: the sequence lengths of the processed requests. Shape: (len(requests),)
-                new_tokens: a buffer containing the newly generated tokens.
-                num_accepted_tokens: a buffer containing the number of accepted draft tokens +1 for each request.
-                stop_word_indices: the indices of the requests that have stop words in the current batch.
-                single_token_stop_words_only: whether the stop words are single tokens only.
-                first_finish_reasons: the first finish reason of each beam. Shape: (max_batch_size, max_beam_width)
-                Shape: (max_tokens, max_batch_size, max_beam_width)
+                seq_slots: The sequence slots of the processed requests. Used to determine where to
+                  read and write from the finish_reasons and new_tokens buffers.
+                  Shape: [len(requests)]
+                seq_lens: The sequence lengths of the processed requests.
+                  Shape: [len(requests)]
+                new_tokens: A buffer containing the newly generated tokens.
+                  Shape: [max_tokens, max_batch_size, max_beam_width]
+                num_accepted_tokens: A buffer containing the number of accepted draft tokens +1 for each request.
+                  Shape: [max_batch_size] if torch.Tensor
+                stop_word_indices: The indices of the requests that have stop words in the current batch.
+                  Shape: [len(requests_with_stop_words)]
+                single_token_stop_words_only: Whether all stop words in this batch are of length 1
+                first_finish_reasons: The first finish reason of each beam.
+                  Shape: [max_batch_size, max_beam_width]
             """
 
             # Seq Slots should be on the same device as new_tokens
@@ -1631,7 +1712,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             # we need to fill with NOT_FINISHED so we can differentiate between
             # previous requests that had the same seq slot
-            finish_reasons.index_fill_(1, seq_slots, FinishReason.NOT_FINISHED.value)
+            _ = finish_reasons.index_fill_(1, seq_slots, FinishReason.NOT_FINISHED.value)
             batched_finish_reasons = finish_reasons[:, seq_slots]
 
             if stop_word_indices is not None:
@@ -1647,7 +1728,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     stop_words_func(
                         stop_seq_slots,
                         stop_tokens,
-                        num_accepted_tokens=num_accepted_tokens[stop_word_indices]
+                        num_accepted_tokens[stop_word_indices]
                         if isinstance(num_accepted_tokens, torch.Tensor)
                         else num_accepted_tokens,
                     ),
@@ -1679,6 +1760,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def _are_end_id(
             self, end_ids_cuda: torch.Tensor, tokens_cuda: torch.Tensor
         ) -> torch.Tensor:
+            """Checks if the tokens are the end id
+
+            Args:
+                end_ids_cuda: The end ids of the requests to check the end id of.
+                  Shape: [len(requests)]
+                tokens_cuda: A buffer containing the newly generated tokens.
+                  Shape: [max_tokens, len(requests), max_beam_width]
+            Returns:
+                A tensor where each element is True if the corresponding token is the end id, False otherwise
+                Shape: [max_tokens, len(requests), max_beam_width]
+            """
             return tokens_cuda == end_ids_cuda.view(1, -1, 1).expand(
                 self.max_tokens, -1, self.max_beam_width
             )
@@ -1689,11 +1781,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """Checks which sequences are at or beyond the max length
 
             Args:
-                seq_lens_cuda: the sequence lengths of the requests to check the max length of
-                max_seq_lens_cuda: the maximum sequence lengths of the requests to check the max length of
+                seq_lens_cuda: The sequence lengths of the requests to check the max length of.
+                  Shape: [len(requests)]
+                max_seq_lens_cuda: The maximum sequence lengths of the requests to check the max length of.
+                  Shape: [len(requests)]
             Returns:
-                A tensor of shape (max_tokens, len(requests), max_beam_width)
-                where each element is True if the sequence is at or beyond the max length, False otherwise
+                A tensor where each element is True if the sequence at the corresponding token
+                is at or beyond the max length, False otherwise
+                Shape: [max_tokens, len(requests), max_beam_width]
             """
             lengths_tensor_cuda = (
                 seq_lens_cuda.view(1, -1, 1) + self._max_tokens_offset_cuda
@@ -1710,6 +1805,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             tokens: torch.Tensor,
             num_accepted_tokens: torch.Tensor | int,
         ) -> torch.Tensor:
+            """Checks if the tokens are stop words
+
+            Args:
+                seq_slots: The sequence slots of the processed requests. Used to determine where to
+                  read and write from the finish_reasons and new_tokens buffers.
+                  Shape: [len(requests)]
+                tokens: A buffer containing the newly generated tokens.
+                  Shape: [max_tokens, len(requests), max_beam_width]
+                num_accepted_tokens: The number of accepted draft tokens +1 for each request.
+                  Shape: [len(requests)] if torch.Tensor
+            Returns:
+                A tensor where each element is True if the sequence at the corresponding token
+                ends with a stop word, False otherwise
+                Shape: [max_tokens, len(requests), max_beam_width]
+            """
             store = self.store
             # num_words, len_words, batch_size
             # unsqueeze the beam_width dimension to match the past tokens tensor
@@ -1739,7 +1849,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Fill in the new tokens at the end of the past tokens buffer
             full_tokens[-self.max_tokens :] = tokens
             # unsqueeze the num_stop_words dimension to match the stop_words tensor
-            full_tokens = full_tokens.unsqueeze(0)
+            full_tokens_for_match = full_tokens.unsqueeze(0)
             # short words are padded with _PAD_STOP_WORD_TOKEN_ID, so we need to mask them
             mask = stop_words != self._PAD_STOP_WORD_TOKEN_ID
             matches = torch.empty(
@@ -1757,7 +1867,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Check the stop words at each step
             for step_idx in range(self.max_tokens):
                 _ = torch.eq(
-                    full_tokens[:, step_idx : step_idx + self.max_stop_word_length],
+                    full_tokens_for_match[:, step_idx : step_idx + self.max_stop_word_length],
                     stop_words,
                     out=matches[step_idx],
                 )
@@ -1777,8 +1887,22 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self,
             seq_slots: torch.Tensor,
             tokens: torch.Tensor,
-            num_accepted_tokens: torch.Tensor,
+            _num_accepted_tokens: torch.Tensor | int,
         ) -> torch.Tensor:
+            """Checks if the tokens are stop words (single token per stop word only)
+
+            Args:
+                seq_slots: The sequence slots of the processed requests. Used to determine where to
+                  read and write from the finish_reasons and new_tokens buffers.
+                  Shape: [len(requests)]
+                tokens: A buffer containing the newly generated tokens.
+                  Shape: [max_tokens, len(requests), max_beam_width]
+                _num_accepted_tokens: Unused
+            Returns:
+                A tensor where each element is True if the sequence at the corresponding token
+                ends with a stop word, False otherwise
+                Shape: [max_tokens, len(requests), max_beam_width]
+            """
             per_step = torch.zeros(
                 (self.max_tokens, seq_slots.shape[0], self.max_beam_width),
                 dtype=torch.bool,
