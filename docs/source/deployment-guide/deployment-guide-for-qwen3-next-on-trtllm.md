@@ -227,7 +227,3 @@ Run `bench.sh` to begin a serving benchmark. This will take a long time if you r
 ```shell
 ./bench.sh
 ```
-
-## Known Issues
-
-Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.
