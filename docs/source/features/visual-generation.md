@@ -132,7 +132,9 @@ python visual_gen_wan_t2v.py \
     --output_path output_fp8.mp4
 ```
 
-Supported `--linear_type` values: `default` (BF16/FP16), `trtllm-fp8-per-tensor`, `trtllm-fp8-blockwise`, `trtllm-nvfp4`.
+The `--linear_type` flag enables **dynamic quantization**, which quantizes linear layer weights on-the-fly during loading from an unquantized (BF16/FP16) checkpoint. No pre-quantized checkpoint is needed — the weights are converted to the target precision at load time.
+
+Supported `--linear_type` values: `default` (BF16/FP16, no quantization), `trtllm-fp8-per-tensor`, `trtllm-fp8-blockwise`, `trtllm-nvfp4`.
 
 **ModelOpt `quantization_config` format:**
 

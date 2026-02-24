@@ -98,7 +98,10 @@ def parse_args():
         type=str,
         default="default",
         choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
-        help="Linear layer quantization type",
+        help=(
+            "Dynamic quantization mode for linear layers. "
+            "Quantizes weights on-the-fly during loading from an unquantized checkpoint."
+        ),
     )
 
     # Attention Backend
