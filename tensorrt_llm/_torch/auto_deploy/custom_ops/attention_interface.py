@@ -36,30 +36,17 @@ from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-from ...._utils import nvtx_range, str_dtype_to_torch
+from ...._utils import get_torch_dtype_to_np, nvtx_range, str_dtype_to_torch
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
 
+
 # Torch dtype → numpy dtype for fast list-to-tensor conversion.
 # numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
-_TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {
-    torch.int: np.int32,
-    torch.int32: np.int32,
-    torch.int64: np.int64,
-    torch.long: np.int64,
-    torch.float: np.float32,
-    torch.float32: np.float32,
-    torch.float64: np.float64,
-    torch.double: np.float64,
-    torch.float16: np.float16,
-    torch.bool: np.bool_,
-}
-
-
 def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
     """Convert a Python list to a tensor, using numpy for speed."""
-    np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
+    np_dtype = get_torch_dtype_to_np(dtype)
     if np_dtype is not None:
         return torch.from_numpy(np.array(data, dtype=np_dtype))
     return torch.tensor(data, dtype=dtype)
