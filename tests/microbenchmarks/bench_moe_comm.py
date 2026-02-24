@@ -883,7 +883,9 @@ def _run_benchmark_worker_under_current_mpi(
 
     # Write JSON report if requested
     if rank == 0 and args.output_file and all_results:
-        os.makedirs(os.path.dirname(args.output_file), exist_ok=True)
+        output_dir = os.path.dirname(args.output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
         with open(args.output_file, "w") as f:
             json.dump(all_results, f, indent=2)
         print(f"Report written to {args.output_file}", flush=True)
