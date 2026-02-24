@@ -511,8 +511,7 @@ def main():
                 must_not_clauses.append(clause)
 
         data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
-            args.project_name, must_clauses, size=MAX_QUERY_SIZE,
-            must_not_clauses=must_not_clauses
+            args.project_name, must_clauses, size=MAX_QUERY_SIZE, must_not_clauses=must_not_clauses
         )
         if data_list is None:
             print("Failed to query data for update")
