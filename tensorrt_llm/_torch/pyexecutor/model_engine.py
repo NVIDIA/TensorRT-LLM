@@ -676,12 +676,9 @@ class PyTorchModelEngine(ModelEngine):
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-        if not kv_cache_manager.is_estimating_kv_cache and not self.is_draft_model:
+        if not self.is_draft_model:
             # Run extra general warmup to warmup memory pool before running real requests.
             self._general_warmup(resource_manager, reverse=True)
-
-        # Set the value back to the original value after all warmups are complete
-        self.enable_spec_decode = self.is_spec_decode
 
     def _general_warmup(self,
                         resource_manager: ResourceManager,
@@ -870,6 +867,8 @@ class PyTorchModelEngine(ModelEngine):
                                      new_tensors_device=None,
                                      resource_manager=resource_manager)
                         torch.cuda.synchronize()
+        # Set the value back to the original value after cuda graph warmups are complete
+        self.enable_spec_decode = self.is_spec_decode
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
