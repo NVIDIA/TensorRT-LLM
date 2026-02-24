@@ -39,6 +39,7 @@ l0_dgx_b200:
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM"
   # ------------- MoE: test_multi_gpu_eplb ---------------
   - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
+  # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-False-True-True]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-True-True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_trtllm-torch_compile=True]
