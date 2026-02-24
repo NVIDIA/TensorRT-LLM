@@ -27,6 +27,7 @@
 #include "cutlass/epilogue/collective/collective_builder.hpp"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
 #include "cutlass/gemm/kernel/gemm_universal.hpp"
+#include "cutlass/gemm/kernel/tile_scheduler_params.h"
 
 #include "cutlass/util/packed_stride.hpp"
 
@@ -144,6 +145,7 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
     using OperatorClass = cutlass::arch::OpClassTensorOp;             // Operator class tag
     using TileShape = CTAShape;                                       // Threadblock-level tile size
     using StageCountType = cutlass::gemm::collective::StageCountAuto; // Stage count maximized based on the tile size
+    using RasterOrderOptions = typename cutlass::gemm::kernel::detail::PersistentTileSchedulerSm90GroupParams<Shape<int,int,int>>::RasterOrderOptions;
 
     using EpilogueFusionOp = cutlass::epilogue::fusion::ScaledAccPerRowBiasPerColScaleScatter<
         typename cutlass::layout::LayoutTranspose<LayoutD>::type, ElementFinalOutput, ElementAccumulator, ElementBias,
@@ -257,6 +259,9 @@ void sm90_generic_mixed_moe_gemm_kernelLauncher(GroupedGemmInput<T, WeightType, 
             reinterpret_cast<StrideS*>(hopper_inputs.int4_groupwise_params.stride_s_a), group_size},
         epilogue_args, hw_info};
 
+    arguments.scheduler.max_swizzle_size = 2;
+    arguments.scheduler.raster_order = RasterOrderOptions::Heuristic;
+    
     assert(group_size == int(inputs.groupwise_quant_group_size));
     if (workspace_size != nullptr)
     {

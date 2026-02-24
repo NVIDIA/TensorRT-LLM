@@ -1324,18 +1324,24 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                                             torch.float8_e4m3fn,
                                             89).view(dst_w3_w1_weight.shape)
         # SM90 ModelOpt quantized weights
-        elif module.sm_version == 90 and module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-            # Original:  [(N//2)*I4x2, K] which is two int4 elts in output dim packed into one
-            # Transpose: [K, (N//2)*I4x2]
-            transposed = w31_weight_shard.cpu().T.contiguous()
-            # Unpack:    [K, N*I8]
-            unpacked = unpacker(transposed.view(torch.int8))
-            # Transpose: [N, K*I8]
-            transposed = unpacked.T.contiguous()
-            # Pack:      [N, (K//2)*I4x2]
-            w31_weight_shard = packer(transposed)
-        elif module.sm_version == 90 and module.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
-            pass
+        elif module.sm_version == 90:
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                # Original:  [(N//2)*I4x2, K] which is two int4 elts in output dim packed into one
+                # Transpose: [K, (N//2)*I4x2]
+                transposed = w31_weight_shard.cpu().T.contiguous()
+                # Unpack:    [K, N*I8]
+                unpacked = unpacker(transposed.view(torch.int8))
+                # Transpose: [N, K*I8]
+                transposed = unpacked.T.contiguous()
+                # Pack:      [N, (K//2)*I4x2]
+                w31_weight_shard = packer(transposed)
+            elif module.sm_version == 90 and module.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
+                pass
+
+            if w31_weight_shard.ndim == 2:
+                w31_weight_shard = w31_weight_shard.cuda()
+                w31_weight_shard = torch.ops.trtllm.interleave_4bit_weights_for_Hopper_mixed_gemm(
+                    w31_weight_shard, 0)
         else:
             raise NotImplementedError(
                 f"Unsupported configuration: SM{module.sm_version} and {module.weight_loading_mode}."
@@ -1370,18 +1376,24 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
                                            torch.float8_e4m3fn,
                                            89).view(dst_w2_weight.shape)
         # SM90 ModelOpt quantized weights
-        elif module.sm_version == 90 and module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
-            # Original:  [(N//2)*I4x2, K] which is two int4 elts in output dim packed into one
-            # Transpose: [K, (N//2)*I4x2]
-            transposed = w2_weight_shard.cpu().T.contiguous()
-            # Unpack:    [K, N*I8]
-            unpacked = unpacker(transposed.view(torch.int8))
-            # Transpose: [N, K*I8]
-            transposed = unpacked.T.contiguous()
-            # Pack:      [N, (K//2)*I4x2]
-            w2_weight_shard = packer(transposed)
-        elif module.sm_version == 90 and module.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
-            pass
+        elif module.sm_version == 90:
+            if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
+                # Original:  [(N//2)*I4x2, K] which is two int4 elts in output dim packed into one
+                # Transpose: [K, (N//2)*I4x2]
+                transposed = w2_weight_shard.cpu().T.contiguous()
+                # Unpack:    [K, N*I8]
+                unpacked = unpacker(transposed.view(torch.int8))
+                # Transpose: [N, K*I8]
+                transposed = unpacked.T.contiguous()
+                # Pack:      [N, (K//2)*I4x2]
+                w2_weight_shard = packer(transposed)
+            elif module.sm_version == 90 and module.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
+                pass
+
+            if w2_weight_shard.ndim == 2:
+                w2_weight_shard = w2_weight_shard.cuda()
+                w2_weight_shard = torch.ops.trtllm.interleave_4bit_weights_for_Hopper_mixed_gemm(
+                    w2_weight_shard, 0)
         else:
             raise NotImplementedError(
                 f"Unsupported configuration: SM{module.sm_version} and {module.weight_loading_mode}."
@@ -1704,9 +1716,11 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         pad_size_inter = module.intermediate_size_per_partition - w3_weight_shard.shape[
             0]
         if w3_weight_shard.ndim == 2:
+            # [intermediate_size, hidden_size]
             pad_size_hidden = module.hidden_size // 2 - w3_weight_shard.shape[1]
             pad_shape = (0, pad_size_hidden, 0, pad_size_inter)
         elif w3_weight_shard.ndim == 1:
+            # [intermediate_size]
             pad_shape = (0, pad_size_inter)
         else:
             raise NotImplementedError(
@@ -1717,6 +1731,10 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
         w3_weight_shard = torch.nn.functional.pad(w3_weight_shard, pad_shape)
 
         w31_weight_shard = torch.cat([w3_weight_shard, w1_weight_shard], dim=0)
+
+        if w31_weight_shard.ndim == 2:
+            w31_weight_shard = torch.ops.trtllm.interleave_4bit_weights_for_Hopper_mixed_gemm(
+                w31_weight_shard, 1)
 
         dst_w3_w1_weight.copy_(w31_weight_shard.view(dst_w3_w1_weight.dtype),
                                non_blocking=True)
@@ -1747,6 +1765,11 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 f"Invalid shape of w2_weight_shard {w2_weight_shard.shape}")
 
         w2_weight_shard = torch.nn.functional.pad(w2_weight_shard, pad_shape)
+
+        if w2_weight_shard.ndim == 2:
+            w2_weight_shard = torch.ops.trtllm.interleave_4bit_weights_for_Hopper_mixed_gemm(
+                w2_weight_shard, 1)
+
         dst_w2_weight.copy_(w2_weight_shard.view(dst_w2_weight.dtype),
                             non_blocking=True)
 

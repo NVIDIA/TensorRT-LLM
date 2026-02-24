@@ -305,10 +305,19 @@ std::vector<CutlassGemmConfig> get_candidate_configs_sm90(CutlassGemmConfig::Can
         if (has_w4afp8)
         {
             bool const has_coop_supported = sm90_supports_coop(tile_config);
-            std::set<MainloopScheduleType> mainloop_schedules{MainloopScheduleType::PINGPONG};
+            std::set<MainloopScheduleType> mainloop_schedules;
             if (has_coop_supported)
             {
+                // Due to the limitation on the number of registers on SM,
+                // cooperative scheduler does not support CtaShape128x128x128B.
+                if (tile_config == CutlassTileConfigSM90::CtaShape128x128x128B)
+                    continue;
+
                 mainloop_schedules.insert(MainloopScheduleType::COOPERATIVE);
+            }
+            else
+            {
+                mainloop_schedules.insert(MainloopScheduleType::PINGPONG);
             }
             auto const epilogue_schedule = EpilogueScheduleType::AUTO;
             for (auto const& mainloop_schedule : mainloop_schedules)

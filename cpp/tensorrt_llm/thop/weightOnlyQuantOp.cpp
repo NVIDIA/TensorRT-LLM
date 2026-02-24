@@ -17,6 +17,7 @@
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaBf16Wrapper.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/cutlass_preprocessors.h"
+#include "tensorrt_llm/kernels/cutlass_kernels/moe_gemm/moe_gemm_mixed_utils.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #if defined(TORCH_VERSION_MAJOR)                                                                                       \
@@ -401,6 +402,42 @@ Tensor mxfp4_dequantize_unswizzled(Tensor weight, Tensor scale, int64_t group_si
     return dequant_weight;
 }
 
+Tensor interleave_4bit_weights_for_Hopper_mixed_gemm(Tensor weight, int64_t weight_quant_type)
+{
+    // weight_quant_type:
+    // 0 for int4
+    // 1 for fp4
+    TORCH_CHECK(weight_quant_type == 0 || weight_quant_type == 1, "Invalid weight quant type");
+
+    // weight (n, k / 2)
+    int const n = weight.size(0);
+    int const k = weight.size(1) * 2;
+
+    CHECK_TH_CUDA(weight);
+    CHECK_CONTIGUOUS(weight);
+
+    TORCH_CHECK(weight.numel() != 0, "weight should not be empty tensor");
+    TORCH_CHECK(
+        weight.dtype() == torch::kInt8 || weight.dtype() == torch::kUInt8, "Weight must be a packed int8/uint8 tensor");
+
+    Tensor weight_interleaved
+        = torch::empty({n, k / 2}, torch::dtype(torch::kUInt8).device(torch::kCUDA).requires_grad(false));
+
+    uint8_t* weight_ptr = get_ptr<uint8_t>(weight);
+    uint8_t* weight_interleaved_ptr = get_ptr<uint8_t>(weight_interleaved);
+
+    if (weight_quant_type == 0)
+    {
+        interleave_int4_weights_for_Hopper_mixed_gemm(weight_ptr, weight_interleaved_ptr, n, k);
+    }
+    else if (weight_quant_type == 1)
+    {
+        interleave_fp4_weights_for_Hopper_mixed_gemm(weight_ptr, weight_interleaved_ptr, n, k);
+    }
+
+    return weight_interleaved;
+}
+
 } // namespace torch_ext
 
 TRTLLM_NAMESPACE_END
@@ -438,3 +475,7 @@ static auto subbyte_transpose
 
 static auto mxfp4_dequantize_unswizzled = torch::RegisterOperators(
     "trtllm::mxfp4_dequantize_unswizzled", &tensorrt_llm::torch_ext::mxfp4_dequantize_unswizzled);
+
+static auto interleave_4bit_weights_for_Hopper_mixed_gemm
+    = torch::RegisterOperators("trtllm::interleave_4bit_weights_for_Hopper_mixed_gemm",
+        &tensorrt_llm::torch_ext::interleave_4bit_weights_for_Hopper_mixed_gemm);
