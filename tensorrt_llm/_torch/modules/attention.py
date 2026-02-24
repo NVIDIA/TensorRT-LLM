@@ -1,8 +1,10 @@
 import math
+import os
 import weakref
 from typing import List, Optional, Union, cast
 
 import torch
+import torch.nn.functional as F
 from torch import nn
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
@@ -1047,6 +1049,30 @@ class MLA(nn.Module):
                 is_neox=pos_embd_params.is_neox,
             )
 
+        # Short-sequence MHA optimization for DSA models:
+        # For short prefill sequences, use MHA (kv_b_proj expansion + standard
+        # attention) instead of the absorption path, which has overhead from
+        # extra BMMs and larger head_dim (kv_lora_rank + qk_rope_head_dim).
+        # Only active when rope_fusion is True (DSA with TrtllmAttention).
+        _threshold_str = os.environ.get(
+            'TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD', '0')
+        try:
+            self.short_seq_mha_threshold = int(_threshold_str)
+        except ValueError:
+            raise ValueError(
+                f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
+                f"got '{_threshold_str}'")
+        # Create a RotaryEmbedding for the short-seq MHA path only when the
+        # optimization is enabled. This is needed to apply RoPE to k_pe
+        # manually since the attention backend's fused RoPE is bypassed.
+        self._rotary_emb_mha = None
+        if self.short_seq_mha_threshold > 0:
+            self._rotary_emb_mha = RotaryEmbedding(
+                pos_embd_params.rope,
+                head_dim=self.qk_rope_head_dim,
+                is_neox=pos_embd_params.is_neox,
+            )
+
         self.llama_4_scaling = False
         if hasattr(config.pretrained_config, 'llama_4_scaling'):
             self.llama_4_scaling = True
@@ -1463,6 +1489,7 @@ class MLA(nn.Module):
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
                 topk_indices=topk_indices[:num_ctx_tokens, :],
+                position_ids=position_ids,
             )
 
         if num_generations > 0:
@@ -1540,7 +1567,26 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
         topk_indices: Optional[torch.Tensor] = None,
+        position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        # Short-sequence MHA optimization: for short prefill sequences, use
+        # direct MHA (kv_b_proj expansion + SDPA) instead of the absorption
+        # path. MHA avoids the Q-absorption and V-projection BMMs and uses a
+        # smaller head_dim (qk_head_dim=192 vs kv_lora_rank+rope=576),
+        # yielding faster attention for small sequence lengths.
+        # Guard: only when rope_fusion is True (apply_rotary_emb is False) to
+        # avoid double-RoPE application. When apply_rotary_emb is True, the
+        # caller already applied RoPE to q and k_pe, and our path would apply
+        # it again via mla_rope_append_paged_kv_assign_q / _rotary_emb_mha.
+        if (self.short_seq_mha_threshold > 0
+                and not self.apply_rotary_emb
+                and position_ids is not None
+                and attn_metadata.max_ctx_seq_len
+                <= self.short_seq_mha_threshold):
+            return self.forward_context_short_mha(q, compressed_kv, k_pe,
+                                                  position_ids, attn_metadata,
+                                                  output, latent_cache)
+
         if get_sm_version() >= 100:
             return self.forward_absorption_context(q,
                                                    compressed_kv,
@@ -1556,6 +1602,118 @@ class MLA(nn.Module):
                                                         output,
                                                         topk_indices,
                                                         is_generation=False)
+
+    @nvtx_range("forward_context_short_mha")
+    def forward_context_short_mha(
+        self,
+        q: torch.Tensor,
+        compressed_kv: torch.Tensor,
+        k_pe: torch.Tensor,
+        position_ids: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        output: torch.Tensor,
+        latent_cache: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """MHA (dense or masked) for short sequences during prefill.
+
+        For short sequences, using standard multi-head attention with expanded
+        KV (via kv_b_proj) is more efficient than the absorption path used by
+        DSA. The absorption path requires two extra BMMs (Q-absorption and
+        V-projection) and uses a larger head_dim (kv_lora_rank + rope_dim = 576)
+        for the attention kernel, compared to the standard qk_head_dim = 192.
+
+        This method:
+        1. Stores latent_cache in paged KV cache and applies RoPE to q via the
+           MQA backend's mla_rope_append_paged_kv_assign_q.
+        2. Applies RoPE to k_pe manually using the RotaryEmbedding.
+        3. Expands compressed KV via kv_b_proj to get full k_nope and v.
+        4. Constructs full K = [k_nope, RoPE(k_pe)] per head.
+        5. Computes attention via torch scaled_dot_product_attention (SDPA).
+        """
+        num_ctx_tokens = q.shape[0]
+
+        # Step 1: Store latent_cache in paged cache + apply RoPE to q.
+        # mla_rope_append_paged_kv_assign_q modifies q in-place: applies RoPE
+        # to the rope portion of each head, and appends latent_cache (with
+        # RoPE'd k_pe) to the paged KV cache for future generation.
+        # NOTE: This path is only safe when apply_rotary_emb is False (i.e.,
+        # rope_fusion is True), so q and k_pe arrive WITHOUT RoPE applied.
+        trtllm_mqa = cast(TrtllmAttention, self.mqa)
+        trtllm_mqa.mla_rope_append_paged_kv_assign_q(q, latent_cache,
+                                                      attn_metadata)
+
+        # Step 2: Apply RoPE to k_pe using the RotaryEmbedding.
+        # position_ids covers all tokens; slice to context tokens only.
+        ctx_position_ids = position_ids[..., :num_ctx_tokens]
+        [k_pe_roped] = self._rotary_emb_mha(ctx_position_ids, [k_pe])
+
+        # Step 3: Expand KV via kv_b_proj.
+        kv = self.kv_b_proj(compressed_kv)
+        k_nope, v = kv.split(
+            [
+                self.num_heads_tp * self.qk_nope_head_dim,
+                self.num_heads_tp * self.v_head_dim
+            ],
+            -1,
+        )
+
+        # Step 4: Construct full K = [k_nope, k_pe_roped] per head.
+        k_nope_r = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
+        k_pe_expanded = k_pe_roped.view(-1, 1,
+                                        self.qk_rope_head_dim).expand(
+                                            -1, self.num_heads_tp, -1)
+        k = torch.cat([k_nope_r, k_pe_expanded], dim=-1)
+        # k: [num_ctx_tokens, num_heads_tp, qk_head_dim]
+
+        # Step 5: Reshape Q, V for attention.
+        q_r = q.view(-1, self.num_heads_tp,
+                     self.qk_head_dim)  # [tokens, H, D]
+        v_r = v.view(-1, self.num_heads_tp,
+                     self.v_head_dim)  # [tokens, H, Dv]
+
+        # Step 6: Compute attention using SDPA.
+        # Handle packed variable-length sequences by processing per-sequence.
+        num_contexts = attn_metadata.num_contexts
+        seq_lens = attn_metadata.prompt_lens_cpu_runtime[:num_contexts]
+
+        if num_contexts == 1:
+            # Single sequence: straightforward SDPA.
+            seq_len = num_ctx_tokens
+            # [1, H, S, D]
+            q_b = q_r.unsqueeze(0).transpose(1, 2)
+            k_b = k.unsqueeze(0).transpose(1, 2)
+            v_b = v_r.unsqueeze(0).transpose(1, 2)
+
+            attn_out = F.scaled_dot_product_attention(
+                q_b, k_b, v_b, is_causal=True, scale=self.softmax_scale)
+
+            attn_out = attn_out.transpose(1, 2).squeeze(
+                0)  # [S, H, Dv]
+            output[:seq_len].copy_(
+                attn_out.reshape(seq_len,
+                                 self.num_heads_tp * self.v_head_dim))
+        else:
+            # Multiple sequences: process per-sequence to handle variable
+            # lengths correctly with causal masking.
+            offset = 0
+            for i in range(num_contexts):
+                slen = seq_lens[i].item()
+                # [1, H, slen, D]
+                q_seq = q_r[offset:offset + slen].unsqueeze(0).transpose(1, 2)
+                k_seq = k[offset:offset + slen].unsqueeze(0).transpose(1, 2)
+                v_seq = v_r[offset:offset + slen].unsqueeze(0).transpose(1, 2)
+
+                attn_out_seq = F.scaled_dot_product_attention(
+                    q_seq, k_seq, v_seq, is_causal=True,
+                    scale=self.softmax_scale)
+
+                attn_out_seq = attn_out_seq.transpose(1, 2).squeeze(0)
+                output[offset:offset + slen].copy_(
+                    attn_out_seq.reshape(
+                        slen, self.num_heads_tp * self.v_head_dim))
+                offset += slen
+
+        return output
 
     def forward_generation_dsa(
         self,
