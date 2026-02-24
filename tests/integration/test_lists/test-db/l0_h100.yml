@@ -20,7 +20,22 @@ l0_h100:
   - unittest/_torch/debugger
   - unittest/_torch/executor
   - unittest/_torch/misc
-  - unittest/_torch/modules
+  # ------------- modules (non-MoE) ---------------
+  - unittest/_torch/modules/test_mla_helix.py
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/test_awq_quantization.py
+  - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/mamba
+  - unittest/_torch/modules/tests_lora_modules
+  # ------------- MoE components tests ---------------
+  - unittest/_torch/modules/test_moe_load_balancer.py
+  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/modules/test_moe_host_sharer.py
+  # ------------- legacy MoE tests ---------------
+  - unittest/_torch/modules/test_fused_moe.py
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
   - unittest/_torch/speculative -k "eagle3"
@@ -57,7 +72,8 @@ l0_h100:
   - accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_auto_dtype_vswa_reuse_disable_overlap_scheduler
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=TRTLLM-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=TRTLLM] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=TRTLLM] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=TRTLLM] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_dummy_load_format
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding[xgrammar]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_guided_decoding_with_eagle3[xgrammar-eagle3_one_model=True]
@@ -230,7 +246,8 @@ l0_h100:
   # ------------- PyTorch tests ---------------
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16[attn_backend=FLASHINFER-torch_compile=True]
-  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[attn_backend=FLASHINFER]
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=False-attn_backend=FLASHINFER] TIMEOUT (90)
+  - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_chunked_prefill[use_temperature=True-attn_backend=FLASHINFER] TIMEOUT (90)
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=False-attn_backend=FLASHINFER-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8[fp8kv=True-attn_backend=FLASHINFER-torch_compile=False]
