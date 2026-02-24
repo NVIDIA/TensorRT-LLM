@@ -1,4 +1,3 @@
-import logging
 from dataclasses import dataclass, field
 from typing import List
 
@@ -12,24 +11,20 @@ from tensorrt_llm.scaffolding import (
 )
 from tensorrt_llm.scaffolding.task_collection import drop_kv_cache_scope, sub_request_node
 
-from .prompts import research_system_prompt, research_system_prompt_prefix
+from .prompts import RESEARCHER_SYSTEM_PROMPT
 from .tools import reflection_tool, web_search_tool
 from .utils import get_today_str
-
-LOGGER = logging.getLogger()
 
 
 @dataclass
 class ResearchTask(Task):
     research_topic: str = field(default=None)
     research_result: str = field(default=None)
+    tool_call_id: str = field(default=None)
 
     @staticmethod
-    def from_topic(topic: str) -> "ResearchTask":
-        task = ResearchTask()
-        task.research_topic = topic
-        task.research_result = ""
-        return task
+    def from_topic(topic: str, tool_call_id: str) -> "ResearchTask":
+        return ResearchTask(research_topic=topic, research_result="", tool_call_id=tool_call_id)
 
 
 class Compressor(Controller):
@@ -88,12 +83,17 @@ class Researcher(Controller):
         )
 
     def process(self, research_tasks: List[ResearchTask], **kwargs):
+        assert len(research_tasks) == 1, "Researcher only supports one ResearchTask"
+        assert research_tasks[0].research_topic is not None, (
+            "ResearchTask must have a research topic"
+        )
+        assert research_tasks[0].tool_call_id is not None, "ResearchTask must have a tool call id"
+
         chat_task = ChatTask.create_from_prompt(
             research_tasks[0].research_topic,
             [
                 SystemMessage(
-                    research_system_prompt.format(date=get_today_str()),
-                    prefix=research_system_prompt_prefix,
+                    RESEARCHER_SYSTEM_PROMPT.format(date=get_today_str()),
                 )
             ],
             tools=self.tools,
@@ -103,5 +103,5 @@ class Researcher(Controller):
 
         yield from self.compress_controller.process([chat_task])
 
-        research_tasks[0].research_result = chat_task.output_str
+        research_tasks[0].research_findings = chat_task.output_str
         return

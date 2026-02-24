@@ -11,7 +11,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.scaffolding.math_utils import get_digit_majority_vote_result
 from tensorrt_llm.scaffolding.task import (AssistantMessage, ChatTask,
                                            GenerationTask, MCPCallTask, Task,
-                                           UserMessage)
+                                           ToolMessage)
 
 
 class Controller(ABC):
@@ -244,13 +244,15 @@ class ChatWithMCPController(Controller):
         for _ in range(self.max_iterations):
             yield from self.generation_controller.process([chat_task])
             response_message = chat_task.messages[-1]
+            print(f"\nresponse_message: {response_message}\n")
             assert isinstance(
                 response_message, AssistantMessage
             ), f"response is not AssistantMessage, {type(response_message)=}"
             if response_message.tool_calls is not None:
                 tool_calls = response_message.tool_calls
                 mcp_tasks = [
-                    MCPCallTask.create_mcptask(tool_call.function.name,
+                    MCPCallTask.create_mcptask(tool_call.id,
+                                               tool_call.function.name,
                                                tool_call.function.arguments,
                                                self.WorkerTag.TOOLCALL)
                     for tool_call in tool_calls
@@ -258,7 +260,9 @@ class ChatWithMCPController(Controller):
                 yield mcp_tasks
                 for mcp_task in mcp_tasks:
                     if mcp_task.result_str is not None:
-                        chat_task.add_message(UserMessage(mcp_task.result_str))
+                        chat_task.add_message(
+                            ToolMessage(mcp_task.result_str,
+                                        mcp_task.tool_call_id))
             else:
                 break
 

@@ -3,6 +3,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Any, Dict, List, Mapping, Optional, Union
 
+import openai
 import torch
 
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -49,7 +50,7 @@ class GenerationTask(Task):
     input_str: Optional[str] = None
     skip_tokenizer: bool = False
     skip_detokenizer: bool = False
-    #streaming: bool = False
+    # streaming: bool = False
 
     # sampling params for openai
     # Ordered by official OpenAI API documentation
@@ -112,7 +113,7 @@ class StreamGenerationTask(GenerationTask):
     # new tokens that have already been generated.
     streaming_step: Optional[int] = field(default=1)
 
-    #result field
+    # result field
     # worker set this field and identify the same task by this field
     request_handle: Any = field(default=None)
     # worker set this field to True when the generation is finished
@@ -139,7 +140,6 @@ class RewardTask(Task):
 class RoleMessage:
     role: Optional[str] = field(default=None)
     content: Optional[str] = field(default=None)
-    prefix: Optional[str] = field(default=None)
 
     def __str__(self) -> str:
         return json.dumps({
@@ -153,29 +153,30 @@ class RoleMessage:
     def to_dict(self) -> Dict[str, Any]:
         return {"role": self.role, "content": self.content}
 
-    @classmethod
-    def from_dict(cls, data: Dict[str, Any]):
-        return cls(role=data["role"], content=data["content"])
-
 
 @dataclass
 class UserMessage(RoleMessage):
 
-    def __init__(self, content: str, prefix: Optional[str] = None):
-        super().__init__(role="user", content=content, prefix=prefix)
+    def __init__(self, content: str):
+        super().__init__(role="user", content=content)
 
 
 @dataclass
 class AssistantMessage(RoleMessage):
     reasoning: Optional[str] = field(default=None)
     reasoning_content: Optional[str] = field(default=None)
-    tool_calls: Optional[List[Any]] = field(default=None)
+    tool_calls: Optional[List[
+        openai.types.chat.ChatCompletionMessageFunctionToolCall]] = field(
+            default=None)
 
-    def __init__(self,
-                 content: str,
-                 reasoning: Optional[str] = None,
-                 reasoning_content: Optional[str] = None,
-                 tool_calls: Optional[List[Any]] = None):
+    def __init__(
+        self,
+        content: str,
+        reasoning: Optional[str] = None,
+        reasoning_content: Optional[str] = None,
+        tool_calls: Optional[List[
+            openai.types.chat.ChatCompletionMessageFunctionToolCall]] = None,
+    ):
         super().__init__(role="assistant", content=content)
         self.reasoning = reasoning
         self.reasoning_content = reasoning_content
@@ -191,16 +192,62 @@ class AssistantMessage(RoleMessage):
             self.reasoning,
             "reasoning_content":
             self.reasoning_content,
-            "tool_calls": [str(tool) for tool in self.tool_calls]
+            "tool_calls": [{
+                "id": tool.id,
+                "type": "function",
+                "function": {
+                    "name": tool.function.name,
+                    "arguments": tool.function.arguments,
+                },
+            } for tool in self.tool_calls]
             if self.tool_calls is not None else None,
         })
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role":
+            "assistant",
+            "content":
+            self.content,
+            "tool_calls": [{
+                "id": tool.id,
+                "type": "function",
+                "function": {
+                    "name": tool.function.name,
+                    "arguments": tool.function.arguments,
+                },
+            } for tool in self.tool_calls]
+            if self.tool_calls is not None else None,
+        }
 
 
 @dataclass
 class SystemMessage(RoleMessage):
 
-    def __init__(self, content: str, prefix: Optional[str] = None):
-        super().__init__(role="system", content=content, prefix=prefix)
+    def __init__(self, content: str):
+        super().__init__(role="system", content=content)
+
+
+@dataclass
+class ToolMessage(RoleMessage):
+
+    def __init__(self, content: str, tool_call_id: str):
+        super().__init__(role="tool", content=content)
+        self.tool_call_id = tool_call_id
+
+    def __str__(self) -> str:
+        return json.dumps({
+            "role": "tool",
+            "content": self.content,
+            "tool_call_id": self.tool_call_id,
+        })
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "role": "tool",
+            "content": self.content,
+            "tool_call_id": self.tool_call_id,
+        }
 
 
 class ToolDescription:
@@ -260,9 +307,11 @@ class ChatTask(StreamGenerationTask):
         self.messages.extend(messages)
 
     @staticmethod
-    def create_from_prompt(user_prompt: Optional[str],
-                           system_prompts: Optional[list[SystemMessage]] = None,
-                           tools: Optional[Any] = None) -> "ChatTask":
+    def create_from_prompt(
+        user_prompt: Optional[str],
+        system_prompts: Optional[list[SystemMessage]] = None,
+        tools: Optional[Any] = None,
+    ) -> "ChatTask":
         task = ChatTask()
         if system_prompts is not None:
             task.messages.extend(system_prompts)
@@ -283,16 +332,18 @@ class ChatTask(StreamGenerationTask):
 @dataclass
 class MCPCallTask(Task):
     # mcp inputs
+    tool_call_id: Optional[str] = field(default=None)
     tool_name: Optional[str] = field(default=None)
     args: Optional[dict] = field(default=None)
 
-    #result field
+    # result field
     result_str: Optional[str] = None
 
     @staticmethod
-    def create_mcptask(tool_name: str, args: dict,
+    def create_mcptask(tool_call_id: str, tool_name: str, args: dict,
                        worker_tag: str) -> "MCPCallTask":
         task = MCPCallTask()
+        task.tool_call_id = tool_call_id
         task.tool_name = tool_name
         task.args = args
         task.worker_tag = worker_tag
@@ -302,23 +353,15 @@ class MCPCallTask(Task):
 @dataclass
 class DropKVCacheTask(Task):
     messages_to_retain: list[RoleMessage] = field(default_factory=list)
-    partial_prefix: Optional[str] = field(
-        default=None)  # Currently unused since it's hard to tackle
     chat_task: ChatTask = field(default=None)
 
     def __init__(self, chat_task: ChatTask, worker_tag: str):
         self.worker_tag = worker_tag
 
         self.messages_to_retain = []
-        self.partial_prefix = None
         self.chat_task = chat_task
 
-        retain = True
-        for message in chat_task.messages:
-            if (message.role == "system" or message.role == "user") and retain:
-                if message.prefix is not None:
-                    self.messages_to_retain.append(message)
-                if message.prefix is None or len(message.prefix) < len(
-                        message.content):
-                    self.partial_prefix = message.prefix
-                    retain = False
+        self.messages_to_retain = [
+            message for message in chat_task.messages
+            if message.role in ("system", "user")
+        ]

@@ -168,8 +168,9 @@ class OpenaiWorker(Worker):
             response = await self.async_client.chat.completions.create(**params)
             task.finish_reason = response.choices[0].finish_reason
             content = response.choices[0].message.content
-            reasoning = response.choices[0].message.reasoning
-            reasoning_content = response.choices[0].message.reasoning_content
+            reasoning = getattr(response.choices[0].message, 'reasoning', None)
+            reasoning_content = getattr(response.choices[0].message,
+                                        'reasoning_content', None)
             tool_calls = response.choices[0].message.tool_calls
             task.messages.append(
                 AssistantMessage(content, reasoning, reasoning_content,

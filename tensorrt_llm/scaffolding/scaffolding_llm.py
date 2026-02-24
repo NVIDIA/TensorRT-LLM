@@ -1,14 +1,24 @@
 import asyncio
+import contextvars
 import threading
 import traceback
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Generator, List, Mapping, Union
+from typing import Any, Generator, List, Mapping, Optional, Union
 
 from .controller import Controller, ParallelProcess
 from .result import ScaffoldingResult
 from .task import Task
 from .worker import Worker
+
+# Public ContextVar holding the :class:`ScaffoldingResult` for the request
+# currently being processed.  Set automatically by
+# :meth:`ScaffoldingLlm._handle_single_request` and propagated to every
+# ``asyncio.create_task`` in the processing chain.  Workers can read this
+# to obtain per-request routing information (e.g. ``result.id``).
+current_scaffolding_result: contextvars.ContextVar[
+    Optional[ScaffoldingResult]] = contextvars.ContextVar(
+        'current_scaffolding_result', default=None)
 
 
 @dataclass(frozen=True)
@@ -99,7 +109,13 @@ class ScaffoldingLlm:
         await asyncio.gather(*async_tasks)
 
     async def _handle_single_request(self, request: ScaffoldingRequest):
-        """Process a single scaffolding request."""
+        """Process a single scaffolding request.
+
+        Sets :data:`current_scaffolding_result` so that every downstream
+        ``asyncio.create_task`` (workers, parallel sub-generators, etc.)
+        inherits the per-request :class:`ScaffoldingResult`.
+        """
+        token = current_scaffolding_result.set(request.result)
         try:
             gen = self._create_controller_generator(request)
             await self._handle_controller_generator(gen, request)
@@ -109,6 +125,7 @@ class ScaffoldingLlm:
             request.result.set_output(None)
             raise
         finally:
+            current_scaffolding_result.reset(token)
             self.running_req_count -= 1
             self._maybe_schedule()
 
@@ -172,6 +189,18 @@ class ScaffoldingLlm:
         self.main_loop_thread.start()
 
     def generate_async(self, prompt: str) -> ScaffoldingResult:
+        """Submit a prompt for asynchronous scaffolding execution.
+
+        Args:
+            prompt: The user prompt to process.
+
+        Returns:
+            A :class:`ScaffoldingResult` whose ``aresult()`` /
+            ``result()`` methods block until execution completes.
+            The result carries a unique :pyattr:`ScaffoldingResult.id`
+            and a :pyattr:`ScaffoldingResult.metadata` dict that
+            workers can read via :data:`current_scaffolding_result`.
+        """
         result = ScaffoldingResult()
 
         async def put_request():
@@ -180,7 +209,8 @@ class ScaffoldingLlm:
                     prompt=prompt,
                     kwargs={},
                     result=result,
-                    controller=self.prototype_controller.clone())
+                    controller=self.prototype_controller.clone(),
+                )
             except Exception as e:
                 self.task_queue.put(None)
                 print(
