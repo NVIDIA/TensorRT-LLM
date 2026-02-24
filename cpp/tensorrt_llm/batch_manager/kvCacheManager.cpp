@@ -2062,7 +2062,7 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
         {
             // Send block to front of free queue if it has no reusable state
             // This means it will be evicted first
-            auto toFront = block->isDetached();
+            auto const toFront = block->isDetached();
             mEvictionPolicy->releaseBlock(block, toFront);
         }
     }
