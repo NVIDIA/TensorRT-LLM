@@ -1269,19 +1269,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Helper tensors for finish_reasons:
             """Preallocate buffer needed for torch.nonzero_static(..., out=finish_reasons_nonzero_static_buffer).
             See `def _write_reason`."""
-            self._reason_tensors_cuda: dict[FinishReason, torch.Tensor] = {
-                reason: torch.tensor(
-                    reason.value, dtype=self.store.finish_reasons_cuda.dtype, device="cuda"
-                )
-                for reason in [
-                    FinishReason.NOT_FINISHED,
-                    FinishReason.END_ID,
-                    FinishReason.STOP_WORDS,
-                    FinishReason.LENGTH,
-                    FinishReason.TIMED_OUT,
-                    FinishReason.CANCELLED,
-                ]  # `in FinishReason` clashes with PyBind11: `TypeError: 'pybind11_type' object is not iterable`
-            }
             # setup local buffer for max tokens checking
             self._max_tokens_offset_cuda: torch.Tensor = torch.arange(
                 1, self._max_tokens + 1, device="cuda", dtype=torch.int32
@@ -1293,6 +1280,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             self._past_token_buffer_cuda: torch.Tensor = torch.empty(
                 self._past_tokens_shape, device="cuda", dtype=torch.int32
+            )
+            starts = torch.arange(self._max_tokens, device="cuda")
+            ends = starts + self._max_stop_word_length
+            self._multi_arange_indexing: torch.Tensor = torch_multi_arange(
+                ends=ends,
+                starts=starts,
+                output_length=self._max_tokens * self._max_stop_word_length,
             )
 
         def _resize_stop_word_buffers(self) -> None:
@@ -1312,6 +1306,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             self._past_token_buffer_cuda = torch.empty(
                 self._past_tokens_shape, device="cuda", dtype=torch.int32
+            )
+            starts = torch.arange(self._max_tokens, device="cuda")
+            ends = starts + self._max_stop_word_length
+            self._multi_arange_indexing = torch_multi_arange(
+                ends=ends,
+                starts=starts,
+                output_length=self._max_tokens * self._max_stop_word_length,
             )
             # resize the stop words buffer if necessary
             # if the sizes are constant, this does nothing
@@ -1616,7 +1617,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def write_finish_reasons(
             self,
             seq_slots_host: torch.Tensor,
-            is_draft_mask: torch.Tensor,
             is_last_context_chunk: torch.Tensor,
             seq_slots_cuda: torch.Tensor,
             seq_lens_cuda: torch.Tensor,
@@ -1625,7 +1625,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         ) -> torch.Tensor:
             num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only = (
                 self._prepare_stop_word_handling_for_finish_reasons(
-                    seq_slots_host, is_draft_mask, is_last_context_chunk
+                    seq_slots_host, is_last_context_chunk
                 )
             )
             self._write_finish_reasons(
@@ -1642,7 +1642,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def _prepare_stop_word_handling_for_finish_reasons(
             self,
             seq_slots_host: torch.Tensor,
-            is_draft_mask_host: torch.Tensor,
             is_last_context_chunk_host: torch.Tensor,
         ) -> tuple[torch.Tensor | int | None, torch.Tensor | None, bool]:
             """Prepare stop word handling for finish reasons.
@@ -1650,8 +1649,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             Args:
                 seq_slots_host: The sequence slots of the processed requests. Used to determine where to
                   read and write from the finish_reasons and new_tokens buffers.
-                  Shape: [len(requests)]
-                is_draft_mask_host: A mask of requests that are drafts.
                   Shape: [len(requests)]
                 is_last_context_chunk_host: A mask of context requests that are the last context chunk.
                   Shape: [len(context_requests)]
@@ -1669,7 +1666,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # as draft requests and chunked context requests can be in the sampler
             # without having setup a slot in the FinishReasonsHandler.
             # These can be removed once this can be avoided.
-            stop_word_mask &= ~is_draft_mask_host
             stop_word_mask[: is_last_context_chunk_host.shape[0]] &= is_last_context_chunk_host
             batch_has_stop_words = stop_word_mask.any()
             num_accepted_tokens_cuda: torch.Tensor | int | None = None
@@ -1760,18 +1756,18 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         if isinstance(num_accepted_tokens, torch.Tensor)
                         else num_accepted_tokens,
                     ),
-                    self._reason_tensors_cuda[FinishReason.STOP_WORDS],
+                    FinishReason.STOP_WORDS.value,
                     batched_finish_reasons[:, stop_word_indices],
                 )
 
             batched_finish_reasons = torch.where(
                 self._are_max_length(seq_lens, store.max_lengths_cuda[seq_slots]),
-                self._reason_tensors_cuda[FinishReason.LENGTH],
+                FinishReason.LENGTH.value,
                 batched_finish_reasons,
             )
             batched_finish_reasons = torch.where(
                 self._are_end_id(store.end_ids_cuda[seq_slots], tokens),
-                self._reason_tensors_cuda[FinishReason.END_ID],
+                FinishReason.END_ID.value,
                 batched_finish_reasons,
             )
 
@@ -1876,8 +1872,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             # Fill in the new tokens at the end of the past tokens buffer
             full_tokens[-self._max_tokens :] = tokens
-            # unsqueeze the num_stop_words dimension to match the stop_words tensor
-            full_tokens_for_match = full_tokens.unsqueeze(0)
             # short words are padded with _PAD_STOP_WORD_TOKEN_ID, so we need to mask them
             mask = stop_words != self._PAD_STOP_WORD_TOKEN_ID
             matches = torch.empty(
@@ -1892,13 +1886,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 dtype=torch.bool,
             )
 
-            # Check the stop words at each step
-            for step_idx in range(self._max_tokens):
-                _ = torch.eq(
-                    full_tokens_for_match[:, step_idx : step_idx + self._max_stop_word_length],
-                    stop_words,
-                    out=matches[step_idx],
-                )
+            # Get the comparison sequence for each step
+            full_tokens_for_match = full_tokens[self._multi_arange_indexing].view(
+                self._max_tokens,
+                1,  # Unsqueeze on dimension 1 to match the num_stop_words dimension of stop words
+                self._max_stop_word_length,
+                seq_slots.shape[0],
+                self._max_beam_width,
+            )
+            # Unsqueeze on dimension 0 to match the max_tokens dimension of full tokens
+            stop_words_for_match = stop_words.unsqueeze(0)
+            _ = torch.eq(full_tokens_for_match, stop_words_for_match, out=matches)
             # Mask the padding tokens
             matches_after_mask = torch.where(
                 mask.unsqueeze(0).expand(self._max_tokens, -1, -1, -1, -1), matches, True
@@ -3304,23 +3302,30 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Prepare stop word handling
         # Draft requests need to be ignored for stop word handling as they never setup
         # their buffers in the store.
-        # Only context requests at their last junk are setup and should be considered for stop word handling
-        is_draft_mask = torch.tensor([r.py_is_draft for r in requests], dtype=torch.bool)
-        is_last_context_chunk = torch.tensor(
-            [r.is_last_context_chunk for r in scheduled_requests.context_requests], dtype=torch.bool
-        )
-        finish_reasons = self._finish_reasons_handler.write_finish_reasons(
-            seq_slots_host=seq_slots_host,
-            is_draft_mask=is_draft_mask,
-            is_last_context_chunk=is_last_context_chunk,
-            seq_slots_cuda=seq_slots_cuda,
-            seq_lens_cuda=seq_lens_cuda,
-            new_tokens_cuda=new_tokens,
-            first_finish_reasons_cuda=(
-                beam_search_store.first_finish_reasons if beam_search_store is not None else None
-            ),
-        )
-        finish_reasons_host = self._copy_to_host(finish_reasons)
+        # Assume that either all requests are drafts or None are drafts
+        if len(requests) > 0 and not requests[0].py_is_draft:
+            # Only context requests at their last chunk are setup and should be considered for stop word handling
+            is_last_context_chunk = torch.tensor(
+                [r.is_last_context_chunk for r in scheduled_requests.context_requests],
+                dtype=torch.bool,
+            )
+            finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
+                seq_slots_host=seq_slots_host,
+                is_last_context_chunk=is_last_context_chunk,
+                seq_slots_cuda=seq_slots_cuda,
+                seq_lens_cuda=seq_lens_cuda,
+                new_tokens_cuda=new_tokens,
+                first_finish_reasons_cuda=(
+                    beam_search_store.first_finish_reasons
+                    if beam_search_store is not None
+                    else None
+                ),
+            )
+            finish_reasons_host = self._copy_to_host(finish_reasons_device)
+        else:
+            finish_reasons_host = self._copy_to_host(
+                self._finish_reasons_handler.store.finish_reasons_cuda
+            )
 
         beam_history_builders = None
         if self._use_beam_search:

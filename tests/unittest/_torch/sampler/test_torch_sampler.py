@@ -672,7 +672,6 @@ class TestFinishReasons:
                 num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
                     sampler._finish_reasons_handler._prepare_stop_word_handling_for_finish_reasons(
                         seq_slots_host,
-                        torch.zeros(len(requests), dtype=torch.bool),
                         torch.zeros((0,), dtype=torch.bool),
                     )
                 )
