@@ -467,6 +467,8 @@ disaggregated/test_auto_scaling.py::test_worker_restart[http-load_balancing]
 disaggregated/test_auto_scaling.py::test_worker_restart[http-kv_cache_aware]
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[etcd-round_robin]
 disaggregated/test_auto_scaling.py::test_disagg_server_restart[http-round_robin]
+disaggregated/test_disaggregated.py::test_disaggregated_overlap_transceiver_runtime_python[TinyLlama-1.1B-Chat-v1.0]
+disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python[DeepSeek-V3-Lite-fp8]
 
 # llm-api promote pytorch to default
 llmapi/test_llm_api_qa.py::TestLlmDefaultBackend::test_llm_args_logging
