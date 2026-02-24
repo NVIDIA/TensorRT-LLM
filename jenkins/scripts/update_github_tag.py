@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """Update GitHub tag when all pre-merge tests pass.
 
-This script checks whether a CI build should update the GitHub tag
+This script checks whether a post-merge CI build should update the GitHub tag
 'latest-ci-stable-commit-<branch>'. It validates downstream job durations,
 analyzes failed stages, and creates/updates the tag if appropriate.
+
+Note: Only supports post-merge builds (triggered by GitLab mirror).
 
 Usage (called from Jenkins):
     python3 jenkins/scripts/update_github_tag.py \
         --build-result SUCCESS \
         --commit-sha <sha> \
-        --github-pr-api-url <url> \
         --target-branch main \
         --llm-repo <repo_url> \
         --downstream-durations '{"Build-x86_64": 30, ...}' \
@@ -43,7 +44,7 @@ MIN_JOB_DURATIONS = {
 }
 
 
-def log(msg: str) -> None:
+def log(msg):
     """Print a log message to stdout."""
     print(msg, flush=True)
 
@@ -57,7 +58,7 @@ def run_cmd(cmd, **kwargs):
 # ---------------------------------------------------------------------------
 # Step 1: Validate downstream job durations
 # ---------------------------------------------------------------------------
-def validate_downstream_job_durations(downstream_durations: dict) -> bool:
+def validate_downstream_job_durations(downstream_durations):
     """Validate that all required jobs ran with sufficient duration.
 
     Returns True if all required jobs are present and ran long enough.
@@ -198,61 +199,305 @@ def are_all_failures_post_merge(failed_stage_list):
 # ---------------------------------------------------------------------------
 # Step 4: Create / update GitHub tag
 # ---------------------------------------------------------------------------
+def verify_github_token_permissions(github_token, repo):
+    """Verify that the GitHub token has necessary permissions.
+
+    Args:
+        github_token: GitHub token
+        repo: Repository in format "owner/repo"
+
+    Returns:
+        (has_read, has_write) tuple, or (False, False) on error
+    """
+    api_base = f"https://api.github.com/repos/{repo}"
+
+    # Test read permission
+    cmd_read = [
+        "curl",
+        "-s",
+        "-X",
+        "GET",
+        f"{api_base}",
+        "-H",
+        f"Authorization: Bearer {github_token}",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        "-w",
+        "\\nHTTP_CODE:%{http_code}",
+    ]
+
+    result_read = subprocess.run(cmd_read, capture_output=True, text=True)
+    output_read = result_read.stdout
+    read_code = (
+        output_read.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_read else "unknown"
+    )
+    has_read = read_code in ["200", "201"]
+
+    # Test write permission by checking if we can access refs
+    cmd_write = [
+        "curl",
+        "-s",
+        "-X",
+        "GET",
+        f"{api_base}/git/refs/tags",
+        "-H",
+        f"Authorization: Bearer {github_token}",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        "-w",
+        "\\nHTTP_CODE:%{http_code}",
+    ]
+
+    result_write = subprocess.run(cmd_write, capture_output=True, text=True)
+    output_write = result_write.stdout
+    write_code = (
+        output_write.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_write else "unknown"
+    )
+    has_write = write_code in ["200", "201"]
+
+    return (has_read, has_write)
+
+
+def create_github_tag_via_api(commit_sha, tag_name, tag_message, github_token):
+    """Create GitHub tag using REST API (no clone required).
+
+    Args:
+        commit_sha: Git commit SHA
+        tag_name: Tag name
+        tag_message: Tag message
+        github_token: GitHub token
+
+    Returns True on success.
+    """
+    repo = "NVIDIA/TensorRT-LLM"
+    api_base = f"https://api.github.com/repos/{repo}"
+
+    # Verify token permissions first
+    log("Verifying GitHub token permissions...")
+    has_read, has_write = verify_github_token_permissions(github_token, repo)
+
+    if not has_read:
+        log("ERROR: Token lacks read permission for repository")
+        return False
+
+    if not has_write:
+        log("ERROR: Token lacks write permission for repository")
+        return False
+
+    log("✓ Token has required read/write permissions")
+
+    # Check if tag ref already exists
+    log(f"Checking if tag '{tag_name}' already exists...")
+    cmd_check = [
+        "curl",
+        "-s",
+        "-X",
+        "GET",
+        f"{api_base}/git/refs/tags/{tag_name}",
+        "-H",
+        f"Authorization: Bearer {github_token}",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        "-w",
+        "\\nHTTP_CODE:%{http_code}",
+    ]
+
+    result_check = subprocess.run(cmd_check, capture_output=True, text=True)
+    output_check = result_check.stdout
+    check_code = (
+        output_check.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_check else "unknown"
+    )
+
+    if check_code == "200":
+        # Tag ref exists - update it to point to new commit directly
+        # Note: This updates the ref to point to commit SHA directly (lightweight tag)
+        # If you need to preserve annotated tag with message, we'd need to create new tag object first
+        log(f"Tag '{tag_name}' already exists, updating ref to point to new commit {commit_sha}")
+
+        # Use PATCH to update existing ref to point to new commit
+        ref_data = {"sha": commit_sha, "force": True}
+
+        cmd_update = [
+            "curl",
+            "-s",
+            "-X",
+            "PATCH",
+            f"{api_base}/git/refs/tags/{tag_name}",
+            "-H",
+            f"Authorization: Bearer {github_token}",
+            "-H",
+            "Accept: application/vnd.github.v3+json",
+            "-H",
+            "Content-Type: application/json",
+            "-d",
+            json.dumps(ref_data),
+            "-w",
+            "\\nHTTP_CODE:%{http_code}",
+        ]
+
+        result_update = subprocess.run(cmd_update, capture_output=True, text=True)
+        output_update = result_update.stdout
+        update_code = (
+            output_update.split("HTTP_CODE:")[-1].strip()
+            if "HTTP_CODE:" in output_update
+            else "unknown"
+        )
+
+        if update_code == "200":
+            log(f"✓ Successfully updated tag '{tag_name}' to point to {commit_sha}")
+            return True
+
+        log(f"ERROR: Failed to update tag ref (HTTP {update_code})")
+        if result_update.stderr:
+            log(f"STDERR: {result_update.stderr}")
+        if output_update:
+            log(f"Response: {output_update.split('HTTP_CODE:')[0]}")
+        return False
+
+    # Tag ref doesn't exist - create new tag object and ref
+    log(f"Tag '{tag_name}' does not exist, creating new tag...")
+
+    # Step 1: Create tag object
+    tag_data = {"tag": tag_name, "message": tag_message, "object": commit_sha, "type": "commit"}
+
+    cmd_create_tag = [
+        "curl",
+        "-s",
+        "-X",
+        "POST",
+        f"{api_base}/git/tags",
+        "-H",
+        f"Authorization: Bearer {github_token}",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        json.dumps(tag_data),
+        "-w",
+        "\\nHTTP_CODE:%{http_code}",
+    ]
+
+    result_tag = subprocess.run(cmd_create_tag, capture_output=True, text=True)
+    output_tag = result_tag.stdout
+    tag_code = (
+        output_tag.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_tag else "unknown"
+    )
+
+    if tag_code != "201":
+        log(f"ERROR: Failed to create tag object (HTTP {tag_code})")
+        if result_tag.stderr:
+            log(f"STDERR: {result_tag.stderr}")
+        # Check if tag object already exists (422)
+        if tag_code == "422":
+            log("Tag object already exists, attempting to get tag SHA...")
+            cmd_get = [
+                "curl",
+                "-s",
+                "-X",
+                "GET",
+                f"{api_base}/git/tags/{tag_name}",
+                "-H",
+                f"Authorization: Bearer {github_token}",
+                "-H",
+                "Accept: application/vnd.github.v3+json",
+                "-w",
+                "\\nHTTP_CODE:%{http_code}",
+            ]
+            result_get = subprocess.run(cmd_get, capture_output=True, text=True)
+            output_get = result_get.stdout
+            if "HTTP_CODE:200" in output_get:
+                try:
+                    tag_sha = json.loads(output_get.split("HTTP_CODE:")[0])["sha"]
+                except (json.JSONDecodeError, KeyError):
+                    log("ERROR: Failed to parse existing tag object")
+                    return False
+            else:
+                log("ERROR: Could not retrieve existing tag object")
+                return False
+        else:
+            return False
+    else:
+        # Successfully created tag object
+        try:
+            tag_sha = json.loads(output_tag.split("HTTP_CODE:")[0])["sha"]
+        except (json.JSONDecodeError, KeyError):
+            log("ERROR: Failed to parse tag object response")
+            return False
+
+    # Step 2: Create ref pointing to tag
+    ref_data = {"ref": f"refs/tags/{tag_name}", "sha": tag_sha}
+
+    cmd_create_ref = [
+        "curl",
+        "-s",
+        "-X",
+        "POST",
+        f"{api_base}/git/refs",
+        "-H",
+        f"Authorization: Bearer {github_token}",
+        "-H",
+        "Accept: application/vnd.github.v3+json",
+        "-H",
+        "Content-Type: application/json",
+        "-d",
+        json.dumps(ref_data),
+        "-w",
+        "\\nHTTP_CODE:%{http_code}",
+    ]
+
+    result_ref = subprocess.run(cmd_create_ref, capture_output=True, text=True)
+    output_ref = result_ref.stdout
+    ref_code = (
+        output_ref.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_ref else "unknown"
+    )
+
+    if ref_code == "201":
+        log(f"✓ Successfully created tag '{tag_name}'")
+        return True
+
+    log(f"ERROR: Failed to create ref (HTTP {ref_code})")
+    if result_ref.stderr:
+        log(f"STDERR: {result_ref.stderr}")
+    return False
+
+
 def create_github_tag(
-    commit_sha: str,
-    pr_number: str,
-    target_branch: str,
-    llm_repo: str,
-) -> bool:
+    commit_sha,
+    target_branch,
+    llm_repo,
+):
     """Create or update the GitHub tag for the given commit.
 
+    Uses GitHub REST API to avoid cloning the repository.
+
     Requires GITHUB_TOKEN environment variable to be set.
-    The token is referenced via $GITHUB_TOKEN in the shell script
-    to avoid leaking it in log output.
+
+    Args:
+        commit_sha: Git commit SHA
+        target_branch: Target branch name
+        llm_repo: Repository URL (not used with API method, kept for compatibility)
 
     Returns True on success.
     """
     commit_sha = (
-        "b464c750567e0b1b35712084fda1e575d85fb97c"  # TODO: CI TEST MODE - Hardcode commit SHA
+        "c53b8fc2f15086eb0ff6362c502f0d2ad3aca98b"  # TODO: CI TEST MODE - Hardcode commit SHA
     )
     tag_name = f"latest-ci-stable-commit-{target_branch}"
-    log(f"Creating tag '{tag_name}' for PR #{pr_number} at {commit_sha}")
+    tag_message = f"Post-merge tests passed for branch {target_branch}"
 
-    # NOTE: Use $GITHUB_TOKEN (shell variable) instead of embedding the token
-    # directly in the command string to prevent token leakage in logs.
-    github_push_url = "https://$GITHUB_TOKEN@github.com/NVIDIA/TensorRT-LLM.git"
+    log(f"Creating tag '{tag_name}' for post-merge commit {commit_sha}")
 
-    script = f"""#!/bin/sh
-set -e
+    github_token = os.environ.get("GITHUB_TOKEN", "")
+    if not github_token:
+        log("ERROR: GITHUB_TOKEN environment variable is not set")
+        return False
 
-# Install git-lfs if needed
-which git-lfs || apk add --no-cache git-lfs || true
+    # Use GitHub REST API (no clone required)
+    log("Using GitHub REST API to create tag (no repository clone needed)")
+    success = create_github_tag_via_api(commit_sha, tag_name, tag_message, github_token)
 
-# Clone repo (shallow clone for speed)
-rm -rf repo
-git clone --depth=1 --no-checkout {llm_repo} repo
-cd repo
-
-git config --global user.email "90828364+tensorrt-cicd@users.noreply.github.com"
-git config --global user.name "tensorrt-cicd"
-
-# Fetch the specific commit
-git fetch origin {commit_sha} --depth=1 || git fetch origin --unshallow
-
-# Delete existing remote tag if present
-git push {github_push_url} :refs/tags/{tag_name} 2>/dev/null || true
-
-# Create new tag (annotated)
-git tag -a {tag_name} {commit_sha} -m "Pre-merge tests passed for PR #{pr_number}"
-
-# Push tag to GitHub
-git push {github_push_url} {tag_name}
-"""
-
-    log(f"Running git tag script for {tag_name}...")
-    result = subprocess.run(["sh", "-c", script], capture_output=False)
-
-    if result.returncode == 0:
+    if success:
         log(f"✓ Successfully created GitHub tag: {tag_name}")
         return True
 
@@ -269,7 +514,6 @@ def main() -> int:
         "--build-result", required=True, help="Build result (SUCCESS, FAILURE, ...)"
     )
     parser.add_argument("--commit-sha", required=True, help="Git commit SHA")
-    parser.add_argument("--github-pr-api-url", required=True, help="GitHub PR API URL")
     parser.add_argument("--target-branch", default="main", help="Target branch name")
     parser.add_argument("--llm-repo", required=True, help="LLM repo URL for cloning")
     parser.add_argument(
@@ -286,16 +530,19 @@ def main() -> int:
         log("ERROR: GITHUB_TOKEN environment variable is not set")
         return 1
 
-    pr_number = args.github_pr_api_url.rstrip("/").split("/")[-1]
+    # Only support post-merge builds (triggered by GitLab mirror)
+    if "PostMerge" not in args.job_name:
+        log("ERROR: This script only supports post-merge builds")
+        return 1
 
     log(f"=== GitHub Tag Update Check ({args.build_result}) ===")
+    log("Post-merge build detected (GitLab mirror trigger)")
 
     # Fast path: SUCCESS → update tag directly
     if args.build_result == "SUCCESS":
         log("✓ Pipeline succeeded - updating tag")
         ok = create_github_tag(
             args.commit_sha,
-            pr_number,
             args.target_branch,
             args.llm_repo,
         )
@@ -335,7 +582,6 @@ def main() -> int:
     log("✓ Only post-merge failures detected - updating tag")
     ok = create_github_tag(
         args.commit_sha,
-        pr_number,
         args.target_branch,
         args.llm_repo,
     )

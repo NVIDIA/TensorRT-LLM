@@ -1326,12 +1326,16 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
 }
 
 /**
- * Check if pre-merge tests passed and update GitHub tag accordingly.
+ * Update GitHub tag for post-merge builds (triggered by GitLab mirror).
  * Delegates all logic to the Python script jenkins/scripts/update_github_tag.py
+ *
+ * Note: Only supports post-merge builds. Pre-merge PR/MR are temporary tests
+ * and should not trigger tag updates.
  */
 def updateGithubTagCommit(pipeline, globalVars) {
-    if (!globalVars[GITHUB_PR_API_URL]) {
-        echo "Not a GitHub PR - skipping tag update"
+    // Only update tag for post-merge builds
+    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+        echo "Not a PostMerge build - skipping tag update"
         return false
     }
 
@@ -1358,7 +1362,6 @@ def updateGithubTagCommit(pipeline, globalVars) {
             script: """python3 ${LLM_ROOT}/jenkins/scripts/update_github_tag.py \
                 --build-result '${buildResult}' \
                 --commit-sha '${env.gitlabCommit}' \
-                --github-pr-api-url '${globalVars[GITHUB_PR_API_URL]}' \
                 --target-branch '${targetBranch}' \
                 --llm-repo '${LLM_REPO}' \
                 --downstream-durations '${downstreamDurationsJson}' \
