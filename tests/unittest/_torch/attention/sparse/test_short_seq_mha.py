@@ -262,20 +262,57 @@ def _build_mla(rope_config, device, threshold):
         else:
             os.environ['TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD'] = old_val
 
+    # mla.mqa (DSATrtllmAttention) does not inherit from nn.Module, so
+    # mla.to(device) does NOT recursively move its children. Explicitly
+    # move the indexer (which IS an nn.Module) so its weights are on CUDA.
+    if hasattr(mla, 'mqa') and hasattr(mla.mqa, 'indexer'):
+        mla.mqa.indexer.to(device)
+
     return mla, mapping, sparse_config, model_config
 
 
 def _init_mla_weights(mla):
-    """Initialize MLA weights deterministically."""
+    """Initialize MLA weights deterministically.
+
+    The kv_b_proj weight must use the LOADED layout (as produced by
+    modeling_deepseekv3.py's load_kv_b_proj_and_k_b_proj_trans), NOT the raw
+    HuggingFace layout. The loaded layout is:
+        [all_heads_k_nope, all_heads_v] along the output dimension,
+    i.e. rows 0..num_heads*qk_nope-1 are k_nope weights for all heads, and
+    rows num_heads*qk_nope..end are v weights for all heads.
+
+    This layout is what forward_context_short_mha expects when it does:
+        kv.split([num_heads * qk_nope, num_heads * v], dim=-1)
+    """
     with torch.no_grad():
-        mla.kv_b_proj.weight.normal_(mean=0.0, std=NN_INIT_STD)
-        kv_b_weight = mla.kv_b_proj.weight.data
-        kv_b_weight_reshaped = kv_b_weight.view(
-            NUM_HEADS, QK_NOPE_HEAD_DIM + V_HEAD_DIM, KV_LORA_RANK)
-        mla.v_b_proj.data = kv_b_weight_reshaped[:,
-                                                  QK_NOPE_HEAD_DIM:, :].contiguous()
-        mla.k_b_proj_trans.data = kv_b_weight_reshaped[:, :QK_NOPE_HEAD_DIM, :].transpose(
-            1, 2).contiguous()
+        # Generate k_nope and v weights separately, then concatenate in the
+        # loaded layout: [all_k_nope || all_v].
+        k_nope_weight = torch.empty(
+            NUM_HEADS, QK_NOPE_HEAD_DIM, KV_LORA_RANK,
+            dtype=mla.kv_b_proj.weight.dtype,
+            device=mla.kv_b_proj.weight.device)
+        k_nope_weight.normal_(mean=0.0, std=NN_INIT_STD)
+
+        v_weight = torch.empty(
+            NUM_HEADS, V_HEAD_DIM, KV_LORA_RANK,
+            dtype=mla.kv_b_proj.weight.dtype,
+            device=mla.kv_b_proj.weight.device)
+        v_weight.normal_(mean=0.0, std=NN_INIT_STD)
+
+        # kv_b_proj.weight: [num_heads*(qk_nope+v_head), kv_lora_rank]
+        # Loaded layout: first num_heads*qk_nope rows are k_nope, rest are v.
+        mla.kv_b_proj.weight.data = torch.cat([
+            k_nope_weight.reshape(NUM_HEADS * QK_NOPE_HEAD_DIM, KV_LORA_RANK),
+            v_weight.reshape(NUM_HEADS * V_HEAD_DIM, KV_LORA_RANK),
+        ], dim=0)
+
+        # k_b_proj_trans: [num_heads, kv_lora_rank, qk_nope_head_dim]
+        mla.k_b_proj_trans.data = k_nope_weight.transpose(1,
+                                                          2).contiguous()
+
+        # v_b_proj: [num_heads, v_head_dim, kv_lora_rank]
+        mla.v_b_proj.data = v_weight.contiguous()
+
         mla.mqa.indexer.wq_b.weight.normal_(mean=0.0, std=NN_INIT_STD)
         mla.mqa.indexer.wk.weight.normal_(mean=0.0, std=NN_INIT_STD)
         mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=NN_INIT_STD)
@@ -673,10 +710,18 @@ def test_short_mha_agrees_with_absorption_path():
     # Copy weights from short to absorption so they are identical.
     with torch.no_grad():
         _init_mla_weights(mla_short)
-        # Copy all parameters.
+        # Copy all nn.Module parameters (registered on MLA directly).
         for (name_s, param_s), (name_a, param_a) in zip(
                 mla_short.named_parameters(), mla_absorption.named_parameters()):
             assert name_s == name_a, f"Parameter name mismatch: {name_s} vs {name_a}"
+            param_a.data.copy_(param_s.data)
+        # mla.mqa is NOT an nn.Module, so named_parameters() above misses the
+        # indexer weights. Copy them explicitly so both paths use the same
+        # sparse routing (topk_indices).
+        for (name_s, param_s), (name_a, param_a) in zip(
+                mla_short.mqa.indexer.named_parameters(),
+                mla_absorption.mqa.indexer.named_parameters()):
+            assert name_s == name_a, f"Indexer param mismatch: {name_s} vs {name_a}"
             param_a.data.copy_(param_s.data)
 
     # Shared KV cache managers (need separate ones since they have state).
