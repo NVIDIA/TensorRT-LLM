@@ -1066,18 +1066,23 @@ def create_py_executor_instance(
     attention_type = AttentionTypeCpp.MLA if is_mla(
         config) else AttentionTypeCpp.DEFAULT
 
+    # Treat Ulysses CP as TP for kv cache transceiver
+    mapping_for_kv_cache_transceiver = mapping
+    if mapping.has_cp_ulysses():
+        mapping_for_kv_cache_transceiver = mapping.repurpose_ulysses_cp_to_tp()
+
     # For hybrid models, this has both impl and mamba_impl
     mamba_cache_manager = None
     if isinstance(kv_cache_manager, MambaHybridCacheManager):
         mamba_cache_manager = kv_cache_manager
 
     kv_cache_transceiver = create_kv_cache_transceiver(
-        mapping, dist, kv_cache_manager, attention_type,
-        cache_transceiver_config, mamba_cache_manager)
-
+        mapping_for_kv_cache_transceiver, dist, kv_cache_manager,
+        attention_type, cache_transceiver_config, mamba_cache_manager)
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,

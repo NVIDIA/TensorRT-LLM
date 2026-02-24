@@ -15,6 +15,9 @@ python3 quickstart_advanced.py --model_dir nvidia/Llama-3.1-8B-Instruct-FP8 --kv
 # BF16 + TP=8
 python3 quickstart_advanced.py --model_dir nvidia/Llama-3_1-Nemotron-Ultra-253B-v1 --tp_size 8
 
+# Ulysses CP=2
+python3 quickstart_advanced.py --model_dir nvidia/Llama-3.1-8B-Instruct-FP8 --cp_size 2
+
 # Nemotron-H requires disabling cache reuse in kv cache
 python3 quickstart_advanced.py --model_dir nvidia/Nemotron-H-8B-Base-8K --disable_kv_cache_reuse --max_batch_size 8
 ```

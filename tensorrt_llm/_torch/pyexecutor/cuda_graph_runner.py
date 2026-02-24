@@ -326,6 +326,14 @@ class CUDAGraphRunner:
                 "multimodal_params"] = self.shared_static_tensors[
                     "multimodal_params"][:batch_size * self.max_beam_width]
 
+        if initial_inputs["attn_metadata"].mapping and initial_inputs[
+                "attn_metadata"].mapping.has_cp_ulysses():
+            cp_size = initial_inputs["attn_metadata"].mapping.cp_size
+            num_tokens_for_capture_cp = (num_tokens_for_capture + cp_size -
+                                         1) // cp_size
+            sliced_static_tensors["input_ids"] = sliced_static_tensors[
+                "input_ids"][:num_tokens_for_capture_cp]
+
         capture_inputs = initial_inputs.copy()
         capture_inputs.update(sliced_static_tensors)
 
@@ -381,6 +389,9 @@ class CUDAGraphRunner:
         static_tensors["input_ids"][:seqlen].copy_(input_ids)
 
         position_ids = current_inputs["position_ids"]
+        # the length of position_ids may be different from input_ids in Ulysses context parallel
+        seqlen = position_ids.shape[-1]
+
         if self.config.use_mrope and current_inputs.get(
                 'multimodal_params') is not None:
             static_tensors["position_ids"][:, :, :seqlen].copy_(position_ids)
