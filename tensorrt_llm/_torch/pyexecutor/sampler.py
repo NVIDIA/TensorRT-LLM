@@ -404,14 +404,21 @@ def _request_get_sampling_params(request: LlmRequest) -> UtilsSamplingParams:
     )
 
 
-def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
-    """Resolve the sampling strategy for a request.
+def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
+    return not params.use_beam_search
 
-    Note: Callers inside _group_requests_by_strategy_key benefit from store.strategies
-    caching, which ensures this function is called at most once per request per slot.
-    """
+
+def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
+    # We try to cache the resolved strategy on the request object, as it's not cheap enough to
+    # resolve it on every iteration.
+    if hasattr(request, "py_sampling_strategy"):
+        return request.py_sampling_strategy
+
     params = _request_get_sampling_params(request)
-    return resolve_sampling_strategy(params, vocab_size=vocab_size)
+    sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
+    if _request_sampling_params_cachable(params):
+        request.py_sampling_strategy = sampling_strategy
+    return sampling_strategy
 
 
 class _CachingRequestGrouper(Generic[GenericStrategyKeyType]):
@@ -1742,8 +1749,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             not request.is_finished
             and not request.py_is_draft
             and (
-                (request.is_context_init_state and request.is_last_context_chunk)
-                or request.is_disagg_generation_transmission_complete
+                # NB: sample_async currently receives logits corresponding to other prefill chunks,
+                #     not only the last chunk. Therefore, this cannot be conditioned on
+                #     request.is_last_context_chunk. Instead, each context chunk is treated as a
+                #     "new" request.
+                request.is_context_init_state or request.is_disagg_generation_transmission_complete
             )
         )
 
