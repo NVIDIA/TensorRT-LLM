@@ -73,19 +73,6 @@ def moe_trtllm_debug_msg(enable=False):
             "TLLM_BATCHED_GEMM_PRINT_CONFIGS"] = TLLM_BATCHED_GEMM_PRINT_CONFIGS
 
 
-@contextmanager
-def cute_dsl_fp8_block_scales():
-    TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM = os.environ.get(
-        "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM", "0")
-    # enable
-    os.environ["TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM"] = "1"
-    try:
-        yield
-    finally:
-        os.environ[
-            "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM"] = TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM
-
-
 def round_up(x, alignment):
     return (x + alignment - 1) // alignment * alignment
 
@@ -1153,6 +1140,19 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
 
     quant_config = QuantConfig(quant_algo=QuantAlgo.FP8_BLOCK_SCALES)
 
+    fused_moe = CuteDslFusedMoE(
+        num_experts=NUM_EXPERTS,
+        routing_method=routing_method,
+        hidden_size=HIDDEN_SIZE,
+        intermediate_size=INTERMEDIATE_SIZE,
+        dtype=dtype,
+        reduce_results=True,
+        model_config=ModelConfig(quant_config=quant_config, mapping=mapping),
+        weight_loading_mode=WeightLoadingMode,
+    )
+    fused_moe.cuda()
+    fused_moe.load_weights([weights])
+
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
         routing_method=routing_method,
@@ -1166,24 +1166,9 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
 
-    with cute_dsl_fp8_block_scales():
-        fused_moe = CuteDslFusedMoE(
-            num_experts=NUM_EXPERTS,
-            routing_method=routing_method,
-            hidden_size=HIDDEN_SIZE,
-            intermediate_size=INTERMEDIATE_SIZE,
-            dtype=dtype,
-            reduce_results=True,
-            model_config=ModelConfig(quant_config=quant_config,
-                                     mapping=mapping),
-            weight_loading_mode=WeightLoadingMode,
-        )
-        fused_moe.cuda()
-        fused_moe.load_weights([weights])
-
-        with torch.inference_mode():
-            output = fused_moe.forward(x, router_logits)
-            ref_output = ref_fused_moe.forward(x, router_logits)
+    with torch.inference_mode():
+        output = fused_moe.forward(x, router_logits)
+        ref_output = ref_fused_moe.forward(x, router_logits)
 
     # compare
     torch.cuda.synchronize()
@@ -1356,7 +1341,10 @@ def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
-@skip_pre_blackwell
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
