@@ -106,29 +106,20 @@ __global__ void scaleMatrix(T_OUT* output, T_S const* input_scale, T_IN const* i
     cudaGridDependencySynchronize();
 #endif
 
-    if constexpr (QUANTIZE_MODE == QuantizeMode::PER_TENSOR)
+    for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
     {
-        float const s = static_cast<float>(input_scale[0]);
-        float const factor = QUANTIZE ? (1.0f / s) : s;
-        for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
+
+        if (QUANTIZE_MODE == QuantizeMode::PER_CHANNEL)
         {
-            output[i] = T_OUT(static_cast<float>(input[i]) * factor);
+            output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i % lda])));
         }
-    }
-    else
-    {
-        for (int64_t i = threadIdx.x + blockIdx.x * blockDim.x; i < numel; i += blockDim.x * gridDim.x)
+        else if (QUANTIZE_MODE == QuantizeMode::PER_TOKEN)
         {
-            if constexpr (QUANTIZE_MODE == QuantizeMode::PER_CHANNEL)
-            {
-                output[i]
-                    = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i % lda])));
-            }
-            else if constexpr (QUANTIZE_MODE == QuantizeMode::PER_TOKEN)
-            {
-                output[i]
-                    = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i / lda])));
-            }
+            output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[i / lda])));
+        }
+        else if (QUANTIZE_MODE == QuantizeMode::PER_TENSOR)
+        {
+            output[i] = T_OUT(scale<QUANTIZE>(static_cast<float>(input[i]), static_cast<float>(input_scale[0])));
         }
     }
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
