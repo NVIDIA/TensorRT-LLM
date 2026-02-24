@@ -12,11 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Any
+from typing import Any, cast
 
 import torch
 from transformers.configuration_utils import PretrainedConfig
 
+from tensorrt_llm._torch.attention_backend import TrtllmAttentionMetadata
 from tensorrt_llm._torch.attention_backend.interface import AttentionMetadata
 from tensorrt_llm._torch.models.checkpoints.base_config_loader import BaseConfigLoader
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import BaseWeightLoader
@@ -49,6 +50,7 @@ class DummyConfig(PretrainedConfig):
 class DummyModel(torch.nn.Module):
     def __init__(self, model_config: ModelConfig):
         super().__init__()
+        assert model_config.pretrained_config is not None
         self.dtype = model_config.pretrained_config.torch_dtype
         self.model_config = model_config
 
@@ -67,9 +69,11 @@ class DummyModel(torch.nn.Module):
         attn_metadata: AttentionMetadata,
         return_context_logits: bool = False,
         **kwargs,
-    ) -> torch.Tensor:
+    ) -> dict[str, torch.Tensor]:
         num_batch_tokens = input_ids.size(0)
 
+        assert self.config is not None
+        assert attn_metadata.seq_lens_cuda is not None
         vocab_size = self.config.vocab_size
         last_tokens = (
             torch.cumsum(
@@ -98,18 +102,18 @@ class DummyModel(torch.nn.Module):
 
         num_context_requests = attn_metadata.num_contexts
         # each beam has its own attn_metadata.seq_lens_cuda entry
-        num_generation_requests = (
-            last_tokens.shape[0] - num_context_requests
-        ) // attn_metadata.beam_width
+        beam_width = cast(TrtllmAttentionMetadata, attn_metadata).beam_width
+        num_generation_requests = (last_tokens.shape[0] - num_context_requests) // beam_width
         num_requests = num_generation_requests + num_context_requests
 
         # return cache indirection, as additional model output.
         # each sequence should only return a 1D cache indirection tensor
+        assert attn_metadata.cache_indirection is not None
         context_cache_indirection = attn_metadata.cache_indirection[:num_context_requests, 0]
         generation_cache_indirection = attn_metadata.cache_indirection[
             num_context_requests:num_requests
         ].view(
-            num_generation_requests * attn_metadata.beam_width,
+            num_generation_requests * beam_width,
             attn_metadata.cache_indirection.shape[-1],
         )
         return {
@@ -130,7 +134,7 @@ class DummyModel(torch.nn.Module):
 
 @register_checkpoint_weight_loader("DUMMY_FORMAT")
 class DummyWeightLoader(BaseWeightLoader):
-    def load_weights(self, checkpoint_dir: str, **kwargs) -> dict[str, Any]:
+    def load_weights(self, checkpoint_dir: str, **kwargs) -> dict[str, Any]:  # type: ignore
         """Load weights from your dummy format.
         Args:
             checkpoint_dir: Directory containing checkpoint files

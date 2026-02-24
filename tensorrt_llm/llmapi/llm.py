@@ -7,8 +7,9 @@ import tempfile
 import time
 import weakref
 from collections.abc import Mapping
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, List, Literal, Optional, Sequence, Union, cast
+from typing import Any, List, Literal, Optional, Sequence, Tuple, Union, cast
 
 import transformers
 from tqdm import tqdm
@@ -116,6 +117,18 @@ TORCH_LLM_DOCSTRING = TORCH_LLMARGS_EXPLICIT_DOCSTRING + """
 """
 
 
+@dataclass
+class PreprocessedInputs:
+    """Light structure for holding preprocessed inputs.
+
+    Can be passed to `generate_async` to skip preprocessing.
+    """
+
+    prompt_token_ids: List[int]
+    query_token_ids: Optional[List[int]] = None
+    multimodal_params: Optional[MultimodalParams] = None
+
+
 class BaseLLM:
     """
     The base class for all LLM classes.
@@ -175,17 +188,16 @@ class BaseLLM:
                         f"{self.__class__.__name__} got invalid argument: {key}"
                     )
 
-            self.args = llm_args_cls.from_kwargs(
-                model=model,
-                tokenizer=tokenizer,
-                tokenizer_mode=tokenizer_mode,
-                skip_tokenizer_init=skip_tokenizer_init,
-                trust_remote_code=trust_remote_code,
-                tensor_parallel_size=tensor_parallel_size,
-                dtype=dtype,
-                revision=revision,
-                tokenizer_revision=tokenizer_revision,
-                **kwargs)
+            self.args = llm_args_cls(model=model,
+                                     tokenizer=tokenizer,
+                                     tokenizer_mode=tokenizer_mode,
+                                     skip_tokenizer_init=skip_tokenizer_init,
+                                     trust_remote_code=trust_remote_code,
+                                     tensor_parallel_size=tensor_parallel_size,
+                                     dtype=dtype,
+                                     revision=revision,
+                                     tokenizer_revision=tokenizer_revision,
+                                     **kwargs)
 
         except Exception as e:
             logger.error(
@@ -361,7 +373,7 @@ class BaseLLM:
     @nvtx_range_debug("LLM.generate_async", color="green", category="LLM")
     def generate_async(
         self,
-        inputs: PromptInputs,
+        inputs: Union[PromptInputs, PreprocessedInputs],
         sampling_params: Optional[SamplingParams] = None,
         lora_request: Optional[LoRARequest] = None,
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
@@ -377,7 +389,7 @@ class BaseLLM:
         Asynchronous generation accepts single prompt only.
 
         Args:
-            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
+            inputs (Union[tensorrt_llm.inputs.data.PromptInputs, tensorrt_llm.llmapi.llm.PreprocessedInputs]): The prompt text or token ids, or a `PreprocessedInputs` returned by `preprocess`. If the latter, preprocessing will be skipped by this method.
             sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
                 A default one will be used if not provided.
             lora_request (tensorrt_llm.executor.request.LoRARequest, optional): LoRA request to use for generation, if any. Defaults to None.
@@ -396,10 +408,8 @@ class BaseLLM:
         if self._executor is None or self._executor.is_shutdown():
             raise RuntimeError("LLM is shutting down")
 
-        arrival_time = steady_clock_now(
-        ) if self.args.return_perf_metrics else None
-
         sampling_params = self._prepare_sampling_params(sampling_params)
+
         cache_salt_id = get_cache_salt_id(
             cache_salt) if cache_salt is not None else None
         # With pytorch backend, py_executor has logic to handle max_tokens of 1,
@@ -407,11 +417,69 @@ class BaseLLM:
         # TODO: Also support for trt backend
         is_ctx_only = disaggregated_params is not None and disaggregated_params.request_type == "context_only"
         is_gen_only = disaggregated_params is not None and disaggregated_params.request_type == "generation_only"
-        is_mm_disagg = disaggregated_params is not None and disaggregated_params.multimodal_embedding_handles is not None
 
         if is_ctx_only and not self._on_trt_backend:
             sampling_params.max_tokens = 1
 
+        if isinstance(inputs, PreprocessedInputs):
+            prompt_token_ids = inputs.prompt_token_ids
+            prompt = None
+            query_token_ids = inputs.query_token_ids
+            multimodal_params = inputs.multimodal_params
+        else:
+            prompt_token_ids, prompt, query_token_ids, multimodal_params = (
+                self._preprocess(inputs, sampling_params, disaggregated_params))
+
+        arrival_time = steady_clock_now(
+        ) if self.args.return_perf_metrics else None
+
+        self._check_arguments(
+            len(prompt_token_ids),
+            len(query_token_ids) if query_token_ids is not None else 0,
+            sampling_params,
+            is_gen_only=is_gen_only)
+        if _postproc_params:
+            _postproc_params.postproc_args.num_prompt_tokens = len(
+                prompt_token_ids)
+        result = self._executor.generate_async(
+            prompt_token_ids,
+            query_token_ids=query_token_ids,
+            sampling_params=sampling_params,
+            lora_request=lora_request,
+            prompt_adapter_request=prompt_adapter_request,
+            streaming=streaming,
+            kv_cache_retention_config=kv_cache_retention_config,
+            disaggregated_params=disaggregated_params,
+            trace_headers=trace_headers,
+            postproc_params=_postproc_params,
+            multimodal_params=multimodal_params,
+            scheduling_params=scheduling_params,
+            cache_salt_id=cache_salt_id,
+            arrival_time=arrival_time,
+        )
+
+        if sampling_params.return_perf_metrics:
+            result.metrics_dict.update(
+                {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
+
+        return RequestOutput._from_generation_result(result, prompt,
+                                                     self.tokenizer)
+
+    def _preprocess(
+        self,
+        inputs: PromptInputs,
+        sampling_params: SamplingParams,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+    ) -> Tuple[List[int], Optional[str], Optional[List[int]],
+               Optional[MultimodalParams]]:
+        """Preprocess raw prompts into token IDs and multimodal params.
+
+        This is the CPU-heavy portion of generate_async (tokenization,
+        multimodal processing, hash computation).
+
+        Returns:
+            `(prompt_token_ids, prompt, query_token_ids, multimodal_params)`
+        """
         inputs = prompt_inputs(inputs)
 
         if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
@@ -430,8 +498,15 @@ class BaseLLM:
                 )
                 sampling_params.add_special_tokens = False
 
+        is_mm_disagg = (disaggregated_params is not None
+                        and disaggregated_params.multimodal_embedding_handles
+                        is not None)
+        is_gen_only = (disaggregated_params is not None and
+                       disaggregated_params.request_type == "generation_only")
+
         query_token_ids = None
         multimodal_params = None
+        prompt = None
 
         if is_mm_disagg:
             if not getattr(self.input_processor, "support_mm_disagg", False):
@@ -465,15 +540,13 @@ class BaseLLM:
                     multimodal_input=multimodal_input,
                     multimodal_data=multimodal_data,
                 )
-
         elif "prompt_token_ids" in inputs:
             prompt_token_ids = inputs['prompt_token_ids']
-            prompt = None
             query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
             # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
             if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
-                # It looks like `PyTorchModelEngine` assumes both are present when using mrope?
+                # PyTorchModelEngine assumes both are present when using mrope.
                 if disaggregated_params.mrope_position_deltas_handle is None:
                     raise RuntimeError(
                         "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
@@ -546,37 +619,36 @@ class BaseLLM:
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
             )
 
-        self._check_arguments(
-            len(prompt_token_ids),
-            len(query_token_ids) if query_token_ids is not None else 0,
-            sampling_params,
-            is_gen_only=is_gen_only)
-        if _postproc_params:
-            _postproc_params.postproc_args.num_prompt_tokens = len(
-                prompt_token_ids)
-        result = self._executor.generate_async(
-            prompt_token_ids,
+        return prompt_token_ids, prompt, query_token_ids, multimodal_params
+
+    @set_api_status("prototype")
+    def preprocess(
+        self,
+        inputs: PromptInputs,
+        sampling_params: Optional[SamplingParams] = None,
+        disaggregated_params: Optional[DisaggregatedParams] = None,
+    ) -> PreprocessedInputs:
+        """Preprocess raw prompts into token IDs and multimodal params.
+
+        Args:
+            inputs (tensorrt_llm.inputs.data.PromptInputs): The prompt text or token ids; it must be single prompt.
+            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): The sampling params for the generation. Defaults to None.
+                A default one will be used if not provided.
+            disaggregated_params (tensorrt_llm.disaggregated_params.DisaggregatedParams, optional): Disaggregated parameters. Defaults to None.
+
+        Returns:
+            tensorrt_llm.llmapi.llm.PreprocessedInputs: A preprocessed-inputs object that can be
+                passed directly to :meth:`generate_async` as ``inputs``.
+        """
+        sampling_params = self._prepare_sampling_params(sampling_params)
+        prompt_token_ids, _prompt, query_token_ids, multimodal_params = (
+            self._preprocess(inputs, sampling_params, disaggregated_params))
+
+        return PreprocessedInputs(
+            prompt_token_ids=prompt_token_ids,
             query_token_ids=query_token_ids,
-            sampling_params=sampling_params,
-            lora_request=lora_request,
-            prompt_adapter_request=prompt_adapter_request,
-            streaming=streaming,
-            kv_cache_retention_config=kv_cache_retention_config,
-            disaggregated_params=disaggregated_params,
-            trace_headers=trace_headers,
-            postproc_params=_postproc_params,
             multimodal_params=multimodal_params,
-            scheduling_params=scheduling_params,
-            cache_salt_id=cache_salt_id,
-            arrival_time=arrival_time,
         )
-
-        if sampling_params.return_perf_metrics:
-            result.metrics_dict.update(
-                {MetricNames.ARRIVAL_TIMESTAMP: time.time()})
-
-        return RequestOutput._from_generation_result(result, prompt,
-                                                     self.tokenizer)
 
     @set_api_status("beta")
     def get_stats(self, timeout: Optional[float] = 2) -> List[dict]:

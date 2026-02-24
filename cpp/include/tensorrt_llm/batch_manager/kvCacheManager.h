@@ -698,6 +698,7 @@ public:
         return mLogPrefix;
     }
 
+    // Get num free blocks in the primary memory pool
     [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
@@ -841,6 +842,15 @@ public:
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vectors.
     //! \details Only full blocks are considered.
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
+    //!          of the request's context are already cached.
+    //! \param uniqueTokens The unique tokens representing the request's context.
+    //! \param llmRequest The request to check for reusable blocks.
+    //! \return The number of full blocks that can be reused.
+    [[nodiscard]] SizeType32 countReusableBlocks(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
@@ -1016,7 +1026,7 @@ private:
     // Only be 1 or 2. If 2: general KV stored. If 1: K == V for any token, so only K is stored to optimize the
     // max_num_tokens(For DeepSeek). Controlled by mCacheType
     SizeType32 mKVFactor;
-    std::set<KVCacheBlock::IdType> reusedBlockIds;
+    std::set<KVCacheBlock::IdType> mReusedBlockIds;
     std::string const mLogPrefix;
     // Number of reused tokens
     double mReusedTokens;
@@ -1139,6 +1149,11 @@ public:
 
     // WILL NOT WORK FOR VARIABLE WINDOW ATTENTION
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
+    [[nodiscard]] SizeType32 countReusableBlocks(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
 
     //! \brief Bring block from primary to secondary memory for window size.
@@ -1595,6 +1610,16 @@ public:
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
         = 0;
 
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    //! \details Traverses the radix tree to count how many consecutive blocks from the beginning
+    //!          of the request's context are already cached.
+    //! \param uniqueTokens The unique tokens representing the request's context.
+    //! \param llmRequest The request to check for reusable blocks.
+    //! \return The number of full blocks that can be reused.
+    [[nodiscard]] virtual SizeType32 countReusableBlocks(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+        = 0;
+
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
     virtual void storeContextBlocks(LlmRequest const& llmRequest) = 0;
@@ -1963,6 +1988,10 @@ public:
     //! \brief Find first new block that must be allocated for context phase and return it's concatenated token vector.
     //! \details Only full blocks are considered.
     [[nodiscard]] std::optional<BlockKey> findNewContextBlock(
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
+
+    //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
+    [[nodiscard]] SizeType32 countReusableBlocks(
         VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
 
     //! \brief Store full context blocks contributed by llmRequest.

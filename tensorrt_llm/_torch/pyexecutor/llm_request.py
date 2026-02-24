@@ -1,14 +1,10 @@
 from copy import copy, deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Optional, Union
 
 import torch
 
 import tensorrt_llm.bindings
-
-if TYPE_CHECKING:
-    from tensorrt_llm._torch.pyexecutor.sampler import Strategy
-
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
@@ -42,6 +38,30 @@ REQUEST_TYPE_MAPPING = {
     tllm_executor.RequestType.REQUEST_TYPE_GENERATION_ONLY:
     LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY,
 }
+
+
+@dataclass(slots=True)
+class PerfTimingInfo:
+    """Stores performance timing information for a request."""
+    # Per-step metrics list (generation phase)
+    step_metrics: List[Dict] = field(default_factory=list)
+    # Per-chunk metrics list (context/prefill phase, similar to step_metrics)
+    # Non-chunked prefill = single-element list. Each entry stores CPU times and GPU events.
+    ctx_chunk_metrics: List[Dict] = field(default_factory=list)
+    # Temporary step timing (current iteration)
+    forward_start_time: Optional[float] = None
+    forward_end_time: Optional[float] = None
+    sample_start_time: Optional[float] = None
+    sample_end_time: Optional[float] = None
+    # GPU events for current step/chunk timing
+    gpu_forward_start_event: Optional[torch.cuda.Event] = None
+    gpu_forward_end_event: Optional[torch.cuda.Event] = None
+    gpu_sample_end_event: Optional[torch.cuda.Event] = None
+    # Context phase GPU timing totals (ms) - sum of all chunks
+    ctx_gpu_forward_time: Optional[float] = None
+    ctx_gpu_sample_time: Optional[float] = None
+    # Flag: set after the last ctx chunk is saved (py_decoding_iter == 1)
+    ctx_chunks_complete: bool = False
 
 
 class LogitsStorage:
@@ -506,11 +526,15 @@ class LlmResult:
     def __init__(self,
                  result: Union[bytes, tensorrt_llm.bindings.executor.Result],
                  py_result: PyResult,
-                 is_final: bool = False):
+                 is_final: bool = False,
+                 time_breakdown_metrics: Optional[Dict] = None):
         self._result = result
         self._py_result = py_result
         self.is_final = is_final
         self.cached_tokens = 0
+        # Time breakdown metrics for performance analysis
+        # Contains: step_metrics (list), ctx_gpu_forward_time (float), ctx_gpu_sample_time (float)
+        self.time_breakdown_metrics = time_breakdown_metrics
 
     def __getattr__(self, item):
         if item in self.py_result_properties:
@@ -629,6 +653,11 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
 
+        # Performance timing info (step metrics, GPU events, context GPU timing)
+        # Lazily created only when return_perf_metrics is enabled to avoid
+        # overhead for every request.
+        self.py_perf_timing: Optional[PerfTimingInfo] = None
+
         self.py_num_logprobs = num_logprobs
         self.py_return_log_probs = return_log_probs
         self.py_return_context_logits = return_context_logits
@@ -675,8 +704,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             chunk_size=self.py_logits_chunk_size,
             additional_outputs=additional_outputs)
         self.child_requests = []
-
-        self._py_sampling_strategy: "Strategy | None" = None
 
         self._py_embedding_bias_1d: Optional[torch.Tensor] = None
         if hasattr(self, 'embedding_bias') and self.embedding_bias is not None:
@@ -747,10 +774,35 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         else:
             py_result = self.py_result
 
+        # Only include time_breakdown_metrics in the final response to avoid O(N²) overhead
+        # during streaming (copying all step_metrics for every token is very expensive)
+        time_breakdown_metrics = None
+        if is_final and self.py_perf_timing is not None:
+            time_breakdown_metrics = {}
+            if self.py_perf_timing.step_metrics:
+                time_breakdown_metrics[
+                    'step_metrics'] = self.py_perf_timing.step_metrics.copy()
+            if self.py_perf_timing.ctx_chunk_metrics:
+                time_breakdown_metrics[
+                    'ctx_chunk_metrics'] = self.py_perf_timing.ctx_chunk_metrics.copy(
+                    )
+            if self.py_perf_timing.ctx_gpu_forward_time is not None:
+                time_breakdown_metrics[
+                    'ctx_gpu_forward_time'] = self.py_perf_timing.ctx_gpu_forward_time
+            if self.py_perf_timing.ctx_gpu_sample_time is not None:
+                time_breakdown_metrics[
+                    'ctx_gpu_sample_time'] = self.py_perf_timing.ctx_gpu_sample_time
+            # Only set if there's actual data
+            if not time_breakdown_metrics:
+                time_breakdown_metrics = None
+
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,
-            result=LlmResult(result, py_result, is_final),
+            result=LlmResult(result,
+                             py_result,
+                             is_final,
+                             time_breakdown_metrics=time_breakdown_metrics),
             client_id=self.py_client_id) if len(result) > 0 else None
 
     @property

@@ -107,6 +107,7 @@ class CppMambaCacheManager(BaseResourceManager):
             dtype=dtype_binding,
             ssm_cache_dtype=ssm_cache_dtype_binding,
             pp_layers=pp_layers,
+            num_layers=num_layers,
         )
         self._max_num_sequences = max_num_sequences
 
@@ -117,6 +118,10 @@ class CppMambaCacheManager(BaseResourceManager):
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # For Mamba cache manager, we always need one slot per request.
         return 1
+
+    def is_speculative(self) -> bool:
+        # C++ MambaCacheManager does not support speculative decoding
+        return False
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
@@ -593,7 +598,6 @@ class MambaCacheManager(BaseResourceManager):
         return self._impl.get_intermediate_conv_states(layer_idx)
 
     def is_speculative(self) -> bool:
-        assert not self._use_cpp, "is_speculative is not supported in CppMambaCacheManager"
         return self._impl.is_speculative()
 
     def mamba_layer_cache(
@@ -608,7 +612,7 @@ class MambaCacheManager(BaseResourceManager):
 
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
-        assert self._use_cpp, "update_mamba_states is not supported in PythonMambaCacheManager"
+        assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 

@@ -29,7 +29,7 @@ In this way, we can indirectly control the sparsity via the threshold. The thres
 The method is fully dynamic, and can be applied to both the prefilling and decoding. The algorithm of Skip Softmax Attention is described in the paper [BLASST: Dynamic Blocked Attention Sparsity via Softmax Thresholding](https://arxiv.org/pdf/2512.12087). We have also published a [Developer Blog](https://developer.nvidia.com/blog/accelerating-long-context-inference-with-skip-softmax-in-nvidia-tensorrt-llm/) for explanation. Please refer to these resources for in-depth dive into the algorithm details. We will focus on the application of Skip Softmax Attention in TensorRT-LLM to accelerate long-context inference.
 
 <p align="center">
-  <img src="../media/tech_blog16_blasst.jpg" alt="BLASST Illustration" style="width: 50%; min-width: 300px; display: block; margin: auto;" />
+  <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog16_blasst.jpg" alt="BLASST Illustration" style="width: 50%; min-width: 300px; display: block; margin: auto;" />
 </p>
 
 ## Example Usage
@@ -152,16 +152,16 @@ The following figures plot **speedup vs. achieved sparsity**, on top of the base
     <td style="width: 50%; padding: 0 8px; vertical-align: top;">
       <p align="center"><b>Hopper (H200)</b></p>
       <p align="center"><b>Prefill</b></p>
-      <img src="../media/tech_blog16_hopper_prefill.png" alt="Hopper prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog16_hopper_prefill.png" alt="Hopper prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
       <p align="center"><b>Decode</b></p>
-      <img src="../media/tech_blog16_hopper_decode.png" alt="Hopper decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog16_hopper_decode.png" alt="Hopper decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
     </td>
     <td style="width: 50%; padding: 0 8px; vertical-align: top;">
       <p align="center"><b>Blackwell (B200)</b></p>
       <p align="center"><b>Prefill</b></p>
-      <img src="../media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog16_blackwell_prefill.png" alt="Blackwell prefill kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
       <p align="center"><b>Decode</b></p>
-      <img src="../media/tech_blog16_blackwell_decode.png" alt="Blackwell decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
+      <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog16_blackwell_decode.png" alt="Blackwell decode kernel" style="width: 100%; min-width: 280px; display: block; margin: auto;" />
     </td>
   </tr>
 </table>
