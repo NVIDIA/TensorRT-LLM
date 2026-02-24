@@ -46,6 +46,7 @@ _CACHED_CONV_OPS = [
 # Cached delta rule ops (branching on prefill vs decode)
 _CACHED_DELTA_OPS = [
     "auto_deploy::fla_cached_delta_rule",
+    "auto_deploy::fla_cached_gated_delta_rule",
 ]
 
 # Metadata preparation ops (branch on batch_info_host, do CPU math on CUDA tensors)
