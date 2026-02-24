@@ -33,7 +33,6 @@ l0_dgx_b300:
   - unittest/_torch/modules/test_moe_host_sharer.py
   # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py
-  # ---- end MoE tests ----
   - unittest/_torch/modeling -k "modeling_llama"
   - unittest/_torch/modeling -k "modeling_mixtral"
   - unittest/_torch/modeling -k "modeling_gpt_oss"
