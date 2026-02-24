@@ -1385,43 +1385,19 @@ class PyTorchModelEngine(ModelEngine):
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
-        Make some changes to the device inputs and avoid block the async data transfer
+        Make some changes to the device inputs and avoid block the async data transfer.
+        Note: kv_lens correction is now done outside the CUDA graph in
+        _prepare_tp_inputs (after attn_metadata.prepare()). Only position_ids
+        correction remains here since it's a simple in-place GPU op that is
+        CUDA-graph-safe.
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
-            # When enabling overlap scheduler, the kv cache for draft tokens will
-            # be prepared in advance by using the max_total_draft_tokens. But we need to use
-            # new_tokens_lens_device to get the real past kv lengths and the
-            # correct position ids. And to avoid blocking the async data transfer,
-            # we need to preprocess the inputs in forward to update the position_ids and
-            # kv cache length.
             if inputs['attn_metadata'].kv_cache_manager is not None:
-                num_seqs = inputs['attn_metadata'].num_seqs
-                num_ctx_requests = inputs['attn_metadata'].num_contexts
-                num_gen_requests = inputs['attn_metadata'].num_generations
                 num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
-                num_chunked_ctx_requests = inputs[
-                    'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] += (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                if hasattr(inputs['attn_metadata'], 'kv_lens_cuda'):
-                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
-                        # The generation requests with draft_tokens are treated as chunked context requests when extend_ctx returns True.
-                        inputs['attn_metadata'].kv_lens_cuda[
-                            num_ctx_requests -
-                            num_chunked_ctx_requests:num_ctx_requests] += (
-                                self.
-                                previous_kv_lens_offsets_cuda[:
-                                                              num_chunked_ctx_requests]
-                            )
-                    else:
-                        inputs['attn_metadata'].kv_lens_cuda[
-                            num_ctx_requests:num_seqs] += (
-                                self.
-                                previous_kv_lens_offsets_cuda[:num_gen_requests]
-                            )
-                    inputs['attn_metadata'].on_update_kv_lens()
 
         if self.guided_decoder is not None:
             self.guided_decoder.token_event.record()
@@ -1433,35 +1409,16 @@ class PyTorchModelEngine(ModelEngine):
         Postprocess to make sure model forward doesn't change the inputs.
         It is only used in cuda graph capture, because other cases will prepare
         new inputs before the model forward.
+        Note: kv_lens reversal is no longer needed here since the correction
+        was moved outside the CUDA graph into _prepare_tp_inputs.
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             if inputs['attn_metadata'].kv_cache_manager is not None:
-                num_seqs = inputs['attn_metadata'].num_seqs
-                num_ctx_requests = inputs['attn_metadata'].num_contexts
-                num_gen_requests = inputs['attn_metadata'].num_generations
                 num_ctx_tokens = inputs['attn_metadata'].num_ctx_tokens
-                num_chunked_ctx_requests = inputs[
-                    'attn_metadata'].num_chunked_ctx_requests
                 previous_batch_tokens = inputs['input_ids'].shape[
                     0] - num_ctx_tokens
                 inputs['position_ids'][0, num_ctx_tokens:] -= (
                     self.previous_pos_id_offsets_cuda[:previous_batch_tokens])
-                # Only TrtllmAttentionMetadata has kv_lens_cuda.
-                if isinstance(inputs['attn_metadata'], TrtllmAttentionMetadata):
-                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
-                        inputs['attn_metadata'].kv_lens_cuda[
-                            num_ctx_requests -
-                            num_chunked_ctx_requests:num_ctx_requests] -= (
-                                self.
-                                previous_kv_lens_offsets_cuda[:
-                                                              num_chunked_ctx_requests]
-                            )
-                    else:
-                        inputs['attn_metadata'].kv_lens_cuda[
-                            num_ctx_requests:num_seqs] -= (
-                                self.
-                                previous_kv_lens_offsets_cuda[:num_gen_requests]
-                            )
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
@@ -2793,6 +2750,35 @@ class PyTorchModelEngine(ModelEngine):
         if hasattr(self.model.model_config.pretrained_config, 'chunk_size'):
             attn_metadata.mamba_chunk_size = self.model.model_config.pretrained_config.chunk_size
         attn_metadata.prepare()
+
+        # Apply kv_lens correction for overlap scheduler + spec decode OUTSIDE
+        # the CUDA graph. Previously this was done inside _preprocess_inputs
+        # (which runs inside the CUDA graph), but DSA's on_update_kv_lens()
+        # calls get_paged_mqa_logits_metadata() which allocates memory via
+        # torch::empty() -- memory allocation inside CUDA graphs causes hangs
+        # in persistent kernels like fp8_paged_mqa_logits.
+        if self.enable_spec_decode and not self._disable_overlap_scheduler:
+            if attn_metadata.kv_cache_manager is not None:
+                num_seqs = attn_metadata.num_seqs
+                num_ctx_requests = attn_metadata.num_contexts
+                num_gen_requests = attn_metadata.num_generations
+                num_chunked_ctx_requests = attn_metadata.num_chunked_ctx_requests
+                if hasattr(attn_metadata, 'kv_lens_cuda'):
+                    if num_ctx_requests >= num_chunked_ctx_requests and num_chunked_ctx_requests > 0:
+                        attn_metadata.kv_lens_cuda[
+                            num_ctx_requests -
+                            num_chunked_ctx_requests:num_ctx_requests] += (
+                                self.
+                                previous_kv_lens_offsets_cuda[:
+                                                              num_chunked_ctx_requests]
+                            )
+                    else:
+                        attn_metadata.kv_lens_cuda[
+                            num_ctx_requests:num_seqs] += (
+                                self.
+                                previous_kv_lens_offsets_cuda[:num_gen_requests]
+                            )
+                    attn_metadata.on_update_kv_lens()
 
         peft_cache_manager = resource_manager and resource_manager.get_resource_manager(
             ResourceManagerType.PEFT_CACHE_MANAGER)
