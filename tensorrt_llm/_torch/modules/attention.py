@@ -6,6 +6,7 @@ from typing import List, Optional, Union, cast
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.nn.utils.rnn import pad_sequence
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
@@ -1704,26 +1705,43 @@ class MLA(nn.Module):
                 attn_out.reshape(num_ctx_tokens,
                                  self.num_heads_tp * self.v_head_dim))
         else:
-            # Multiple packed sequences: process per-sequence to apply causal
-            # masking correctly per sequence boundary.
-            # TODO: Consider using NestedTensor or padding+mask to avoid the
-            # Python loop when batch sizes are large.
-            offset = 0
-            for i in range(num_contexts):
-                slen = seq_lens[i].item()
-                q_seq = q_r[offset:offset + slen].unsqueeze(0).transpose(1, 2)
-                k_seq = k[offset:offset + slen].unsqueeze(0).transpose(1, 2)
-                v_seq = v_r[offset:offset + slen].unsqueeze(0).transpose(1, 2)
+            # Multiple packed sequences: pad to max length and batch SDPA.
+            # For short sequences, padding overhead is minimal and batching
+            # reduces kernel launch overhead vs. a per-sequence Python loop.
+            seq_lens_list = seq_lens.tolist()
+            max_seq_len = max(seq_lens_list)
 
-                attn_out_seq = F.scaled_dot_product_attention(
-                    q_seq, k_seq, v_seq, is_causal=True,
-                    scale=self.softmax_scale)
+            # Split packed tensors into per-sequence views
+            q_seqs = torch.split(q_r, seq_lens_list, dim=0)
+            k_seqs = torch.split(k, seq_lens_list, dim=0)
+            v_seqs = torch.split(v_r, seq_lens_list, dim=0)
 
-                attn_out_seq = attn_out_seq.transpose(1, 2).squeeze(0)
-                output[offset:offset + slen].copy_(
-                    attn_out_seq.reshape(
-                        slen, self.num_heads_tp * self.v_head_dim))
-                offset += slen
+            # Pad and stack into [B, max_seq_len, H, D],
+            # then transpose to [B, H, S, D] for SDPA
+            q_padded = pad_sequence(q_seqs,
+                                    batch_first=True).transpose(1, 2)
+            k_padded = pad_sequence(k_seqs,
+                                    batch_first=True).transpose(1, 2)
+            v_padded = pad_sequence(v_seqs,
+                                    batch_first=True).transpose(1, 2)
+
+            # Single batched SDPA call. is_causal=True is correct because
+            # real token at position j only attends to positions 0..j, all
+            # of which are real tokens (padding is right-aligned at end).
+            attn_out = F.scaled_dot_product_attention(
+                q_padded, k_padded, v_padded, is_causal=True,
+                scale=self.softmax_scale)
+
+            # [B, H, S, Dv] -> [B, S, H*Dv]
+            hd = self.num_heads_tp * self.v_head_dim
+            attn_out = attn_out.transpose(1, 2).reshape(
+                num_contexts, max_seq_len, hd)
+
+            # Extract valid (non-padded) tokens via boolean mask
+            seq_lens_t = torch.tensor(seq_lens_list, device=q.device)
+            positions = torch.arange(max_seq_len, device=q.device)
+            valid_mask = positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)
+            output[:num_ctx_tokens].copy_(attn_out[valid_mask])
 
         return output
 
