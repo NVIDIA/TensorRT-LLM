@@ -453,7 +453,9 @@ class ADEngine(ModelEngine):
         # ADEngine.__init__, and ADEngine.build_from_config. Seems a bit unnatural atm.
 
         # construct inference optimizer
-        build_and_optimize = InferenceOptimizer(factory=factory, config=ad_config.transforms)
+        build_and_optimize = InferenceOptimizer(
+            factory=factory, config=ad_config.transforms, mapping=mapping
+        )
 
         # construct engine
         return cls(
@@ -746,7 +748,7 @@ class ADEngine(ModelEngine):
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-            # get cache indices
+            # get cache indices and truncate the number of blocks according to total tokens
             cache_indices = kv_cache_manager.get_cache_indices(request)
             cache_loc.extend(cache_indices)
             pages_per_seq.append(len(cache_indices))
@@ -764,12 +766,24 @@ class ADEngine(ModelEngine):
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
-        # update the sequence info object now
+        # Compute batch_info explicitly based on actual request ordering rather than
+        # relying on the seq_len > 1 heuristic in nest_sequences. With chunked prefill,
+        # a context request may have context_chunk_size=1, giving seq_len=1. The heuristic
+        # would misclassify it as decode, causing host_request_types to be inconsistent
+        # with the actual request ordering (context + extend first, then generation).
+        # This mismatch leads to incorrect token splitting in thop.attention.
+        num_prefill_seqs = num_ctx_requests + len(extend_requests)
+        num_prefill_tokens = sum(seq_len[:num_prefill_seqs])
+        num_decode_seqs = len(generation_requests)
+        batch_info = [num_prefill_seqs, num_prefill_tokens, num_decode_seqs]
+
+        # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             position_ids=position_ids,
             seq_len=seq_len,
             input_pos=input_pos,
+            batch_info=batch_info,
             cu_seqlen=cu_seqlen,
             cache_loc=cache_loc,
             pages_per_seq=pages_per_seq,
@@ -782,13 +796,9 @@ class ADEngine(ModelEngine):
             logits_gather_info=logits_gather_info,
             _gather_idx=None if new_tokens is None else flat_gather_indices,
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
+            _ungathered_input_ids=new_tokens.flatten() if new_tokens is not None else None,
             **extra_args,
         )
-        # scatter the new tokens into the input_ids tensor if provided
-        if new_tokens is not None:
-            self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
-
-        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
@@ -1027,15 +1037,10 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     # initialize process groups
     world_size = mpi_world_size()
     rank = mpi_rank()
-    enable_attention_dp = ad_config.transforms.get("detect_sharding", {}).get(
-        "enable_attention_dp", False
-    )
-    dist_mapping = Mapping(
-        rank=rank,
-        world_size=world_size,
-        tp_size=world_size,
-        enable_attention_dp=enable_attention_dp,
-    )
+
+    # Initialize Mapping from config
+    dist_mapping = ad_config.init_mapping_from_config(rank, world_size)
+
     dist = Distributed.get(dist_mapping)
     ad_logger.set_rank(rank)
     torch.cuda.set_device(rank)
@@ -1158,6 +1163,18 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             raise RuntimeError(
                 "Could not determine the vocabulary size. Required for guided decoding."
             )
+
+        # The tokenizer may be None if stripped from MPI kwargs to avoid pickle
+        # failures with trust_remote_code models. Reload it from the model path
+        # when guided decoding needs it.
+        if tokenizer is None and ad_config.model is not None:
+            ad_logger.info("Tokenizer not provided; loading from model path for guided decoding")
+            from tensorrt_llm.tokenizer import TransformersTokenizer
+
+            tokenizer = TransformersTokenizer.from_pretrained(
+                ad_config.model, trust_remote_code=ad_config.trust_remote_code
+            )
+
         guided_decoding_config = get_guided_decoding_config(
             guided_decoding_backend=guided_decoding_backend, tokenizer=tokenizer
         )

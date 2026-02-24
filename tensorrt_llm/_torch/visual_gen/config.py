@@ -29,7 +29,9 @@ class PipelineComponent(str, Enum):
     TRANSFORMER = "transformer"
     VAE = "vae"
     TEXT_ENCODER = "text_encoder"
+    TEXT_ENCODER_2 = "text_encoder_2"
     TOKENIZER = "tokenizer"
+    TOKENIZER_2 = "tokenizer_2"
     SCHEDULER = "scheduler"
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
@@ -196,14 +198,19 @@ class PipelineConfig(BaseModel):
     """General pipeline configuration."""
 
     enable_torch_compile: bool = True
-    torch_compile_models: str = PipelineComponent.TRANSFORMER
-    torch_compile_mode: str = "default"
+    torch_compile_models: List[str] = []  # empty = auto detect transformer components
+    torch_compile_mode: Literal["default", "max-autotune", "reduce-overhead"] = "default"
+    enable_fullgraph: bool = False
     fuse_qkv: bool = True
+    enable_cuda_graph: bool = False
+    enable_layerwise_nvtx_marker: bool = False
 
     # Offloading Config
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
+
+    warmup_steps: int = 1  # Number of denoising steps to run during warmup (0 to disable)
 
 
 # =============================================================================
@@ -455,6 +462,10 @@ class DiffusionModelConfig(BaseModel):
         # This allows simple configs like {"quant_algo": "FP8"} to work.
         if quant_algo is not None and not quant_config_dict.get("config_groups"):
             dynamic_weight_quant = quant_config_dict.get("dynamic", True)
+            # NVFP4 requires dynamic activation quantization when using dynamic mode
+            # since input_scale is not calibrated
+            if quant_algo == QuantAlgo.NVFP4 and dynamic_weight_quant:
+                dynamic_activation_quant = True
 
         quant_config = QuantConfig(
             quant_algo=quant_algo,

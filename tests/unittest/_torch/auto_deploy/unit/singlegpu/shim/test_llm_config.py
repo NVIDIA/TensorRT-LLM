@@ -163,7 +163,7 @@ def test_non_registered_model_factory(model_factory: str):
         ("moe_tensor_parallel_size", 2),
         ("moe_expert_parallel_size", 2),
         ("enable_attention_dp", True),
-        ("cp_config", {"some_key": "some_value"}),
+        ("cp_config", {"cp_type": "HELIX"}),
     ],
 )
 def test_parallel_config_validation(parallel_field, invalid_value):
