@@ -3011,6 +3011,15 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
         sh "bash -c 'pip3 show tensorrt || true'"
     }
 
+    // Upload attribution files when they exist
+    def attrDir = "tensorrt_llm/cpp/build/attribution"
+    def wheelBase = wheelName.replace('.whl', '')
+    for (f in ["missing_files.json", "import_payload.json", "file_mappings.json"]) {
+        if (fileExists("${attrDir}/${f}")) {
+            trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
+        }
+    }
+
     return wheelName
 }
 
