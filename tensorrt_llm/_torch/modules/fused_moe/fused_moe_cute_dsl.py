@@ -1,5 +1,4 @@
 import math
-import os
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
@@ -676,9 +675,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             use_fp8_block_scaling=True,
         )
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        use_cute_dsl = os.environ.get(
-            "TLLM_USE_CUTE_DSL_BLOCKWISE_GROUPED_GEMM", "0") == "1"
-        if use_cute_dsl:
+        if is_sm_100f():
             x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
                 input=x,
                 weight=self.w3_w1_weight.view(weight_dtype),
@@ -700,7 +697,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             )
         x = swiglu_fused_moe(x)
         x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-        if use_cute_dsl:
+        if is_sm_100f():
             x = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
                 input=x,
                 weight=self.w2_weight.view(weight_dtype),

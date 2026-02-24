@@ -317,7 +317,7 @@ class FP8BlockScalingGroupedGemmInputsHelper(GroupedGemmInputsHelper):
             - group_offset
         """
         a, b, a_sf, b_sf, group_offset = inputs
-        num_tokens = a.size(0)
+        num_tokens = self.infer_num_tokens(a.size(0))
         num_tokens_per_expert = self.generate_num_tokens_per_expert(
             num_tokens, approx_max_load=True)
 
@@ -2930,7 +2930,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     dynamic_tensor_specs=(DynamicTensorSpec(
                         0, 0, helper.gen_tuning_buckets,
                         helper.map_to_tuning_buckets), ),
-                    constraint_specs=(ConstraintSpec(2, 0,
+                    constraint_specs=(ConstraintSpec(2, 1,
                                                      fp8_scale_infer_shape), ),
                     inputs_pre_hook=helper.inputs_pre_hook,
                     use_cold_l2_cache=True,
