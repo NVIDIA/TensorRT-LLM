@@ -229,9 +229,9 @@ class TRTLLMGenFusedMoE(MoE):
                 if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                     MnnvlMemory.initialize()
                     self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                        model_config.mapping)
+                        self.mapping)
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                        model_config.mapping)
+                        self.mapping)
                 elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                     # Calculate required workspace size
                     ep_size = self.mapping.moe_ep_size

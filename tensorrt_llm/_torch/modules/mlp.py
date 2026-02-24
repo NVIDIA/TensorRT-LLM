@@ -34,25 +34,28 @@ class MLP(nn.Module):
         self.activation = activation
 
         config = config or ModelConfig()
-        self.mapping = config.mapping
+        # For HELIX CP, attention TP+CP ranks become MLP TP ranks.
+        effective_mapping = config.mapping
+        if effective_mapping.has_cp_helix():
+            effective_mapping = effective_mapping.repurpose_helix_cp_to_tp()
+        self.mapping = effective_mapping
         if overridden_tp_size is not None:
-            assert config.mapping.tp_size % overridden_tp_size == 0
+            assert effective_mapping.tp_size % overridden_tp_size == 0
             tp_size = overridden_tp_size
-            # "Misuse" pp_size here to perform all-reduce within smaller groups
-            pp_size = config.mapping.pp_size * config.mapping.tp_size // overridden_tp_size
+            pp_size = effective_mapping.pp_size * effective_mapping.tp_size // overridden_tp_size
             mapping = Mapping(
                 world_size=tp_size * pp_size,
-                rank=self.mapping.rank,
-                gpus_per_node=self.mapping.gpus_per_node,
+                rank=effective_mapping.rank,
+                gpus_per_node=effective_mapping.gpus_per_node,
                 tp_size=tp_size,
                 pp_size=pp_size,
             )
         else:
-            mapping = config.mapping
+            mapping = effective_mapping
 
         self.up_lora = LoraLayer(
             [LoraModuleType.MLP_H_TO_4H],
-            [self.intermediate_size // config.mapping.tp_size])
+            [self.intermediate_size // effective_mapping.tp_size])
 
         self.up_proj = Linear(
             self.hidden_size,

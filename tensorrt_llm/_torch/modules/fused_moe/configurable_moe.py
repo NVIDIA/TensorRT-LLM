@@ -234,7 +234,7 @@ class ConfigurableMoE(MoE):
         # moe_max_num_tokens is set in ModelConfig.__post_init__ if not specified
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens
-        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        default_moe_max_num_tokens = model_config.max_num_tokens * self.mapping.dp_size
 
         # Auxiliary stream for chunking overlap
         if self.moe_max_num_tokens < default_moe_max_num_tokens:

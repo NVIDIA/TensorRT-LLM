@@ -264,7 +264,7 @@ class CutlassFusedMoE(MoE):
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        default_moe_max_num_tokens = model_config.max_num_tokens * self.mapping.dp_size
         if self.moe_max_num_tokens < default_moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
@@ -303,9 +303,9 @@ class CutlassFusedMoE(MoE):
                 if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                     MnnvlMemory.initialize()
                     self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                        model_config.mapping)
+                        self.mapping)
                     self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                        model_config.mapping)
+                        self.mapping)
                 elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
                     # Calculate required workspace size
                     ep_size = self.mapping.moe_ep_size
