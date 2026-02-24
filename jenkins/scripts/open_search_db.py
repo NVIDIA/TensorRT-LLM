@@ -286,29 +286,39 @@ class OpenSearchDB:
     @staticmethod
     def queryPerfDataFromOpenSearchDB(project_name,
                                       must_clauses,
-                                      size=DEFAULT_QUERY_SIZE):
+                                      size=DEFAULT_QUERY_SIZE,
+                                      must_not_clauses=None):
         """
-        Query perf data from OpenSearchDB using must clauses.
+        Query perf data from OpenSearchDB using must and must_not clauses.
 
         :param project_name: Name of the project.
         :param must_clauses: List of must clauses for query.
         :param size: Query size.
+        :param must_not_clauses: List of must_not clauses for query.
         :return: list of data dicts, empty list if no data, None on error.
         """
         if DISABLE_OPEN_SEARCH_DB_FOR_LOCAL_TEST:
             return []
         if must_clauses is None:
             must_clauses = []
+        if must_not_clauses is None:
+            must_not_clauses = []
         if not isinstance(must_clauses, list):
             OpenSearchDB.logger.info(
                 f"Invalid must_clauses type: {type(must_clauses).__name__}")
             return None
+        if not isinstance(must_not_clauses, list):
+            OpenSearchDB.logger.info(
+                f"Invalid must_not_clauses type: {type(must_not_clauses).__name__}")
+            return None
+
+        bool_query = {"must": must_clauses}
+        if must_not_clauses:
+            bool_query["must_not"] = must_not_clauses
 
         json_data = {
             "query": {
-                "bool": {
-                    "must": must_clauses
-                }
+                "bool": bool_query
             },
             "size": size,
         }
