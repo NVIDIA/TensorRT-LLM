@@ -47,6 +47,9 @@ class RewriteEmbeddingToInputsEmbedsConfig(TransformConfig):
 class RewriteEmbeddingToInputsEmbeds(BaseTransform):
     """Transform that rewrites the graph to accept inputs_embeds instead of input_ids.
 
+    NOTE(yoco) This is a temporary solution. We will change this after EdgeLLM
+    and TensorRT-LLM align on how to handle multimodal models.
+
     This transform performs the following operations:
     1. Detects the pattern: input_ids (placeholder) → embedding(weight, input_ids)
     2. Extracts the embedding weight tensor

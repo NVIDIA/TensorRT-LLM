@@ -187,11 +187,15 @@ class AdaptToEdgeLLM(BaseTransform):
         # If we run shape inference with has_valid_shapes=True,
         # it will fail because it will lift some placeholder to meta
         # and cause a device mismatch error.
+        # TODO(yoco) See https://github.com/NVIDIA/TensorRT-LLM/pull/11180#discussion_r2789187355
+        # We actually has a function placeholders_on_meta(mod) to check if we need to lift.
+        # With that check, we should be able to run shape inference without lifting.
+        # However, it somehow does not work. We need to figure out why and fix it.
         run_shape_prop(gm)
 
         ad_logger.info(f"Changed {num_bfloat16_casts} bfloat16 casts to float16")
         ad_logger.info(f"Adapted EdgeLLM model (inserted {num_attn_casts} attention casts)")
 
         return gm, TransformInfo(
-            skipped=False, num_matches=num_attn_casts, is_clean=False, has_valid_shapes=False
+            skipped=False, num_matches=num_attn_casts, is_clean=False, has_valid_shapes=True
         )
