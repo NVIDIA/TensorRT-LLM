@@ -14,10 +14,21 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+
+# ============================================================================
+# Flash Attention 4 availability
+# ============================================================================
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
 from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 
 # Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
+
+_flash_attn4_available = _fa4_fwd is not None
+requires_flash_attn4 = pytest.mark.skipif(
+    not _flash_attn4_available,
+    reason="FlashAttention 4 not installed",
+)
 
 # ============================================================================
 # Original naive implementations for comparison
@@ -195,7 +206,7 @@ def generate_rope_embeddings(
 # ============================================================================
 # Test functions
 # ============================================================================
-@pytest.mark.parametrize("attn_backend", ["VANILLA", "TRTLLM"])
+@pytest.mark.parametrize("attn_backend", ["VANILLA", "TRTLLM", "FA4"])
 def test_self_attention_equivalence(attn_backend: str):
     """Test that integrated self-attention produces same output as naive."""
     print("\n" + "=" * 60)
@@ -508,7 +519,7 @@ def run_all_tests():
     results = {}
 
     # Run self-attention tests with different backends
-    for backend in ["VANILLA", "TRTLLM"]:
+    for backend in ["VANILLA", "TRTLLM"] + (["FA4"] if _flash_attn4_available else []):
         results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend)
 
     # Run cross-attention test (VANILLA only)
