@@ -1,13 +1,13 @@
 """
 Attention Data Parallelism (ADP) abstractions.
 
-Provides RankState and ADPRequestAssigner interface for distributing
+Provides RankState and ADPRouter interface for distributing
 new requests across ADP ranks.
 
 Protocol:
     1. Each rank builds its local RankState
     2. All ranks exchange RankState via allgather
-    3. ADPRequestAssigner.assign_requests() distributes new requests
+    3. ADPRouter.route_requests() distributes new requests
 """
 
 from __future__ import annotations
@@ -15,13 +15,16 @@ from __future__ import annotations
 import heapq
 from abc import ABC, abstractmethod
 from collections import namedtuple
-from dataclasses import dataclass
+from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 if TYPE_CHECKING:
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
     from ..executor_request_queue import RequestQueueItem
+
+HeapVal = namedtuple("HeapVal",
+                     ["num_tokens", "num_requests", "rank", "request_list"])
 
 
 @dataclass
@@ -30,34 +33,24 @@ class RankState:
 
     Each rank populates its local RankState, then all ranks exchange states
     via allgather. The collected list[RankState] is the input to
-    ADPRequestAssigner.
+    ADPRouter.
     """
 
     rank: int
     num_active_requests: int = 0
     num_active_tokens: int = 0
 
-    def to_list(self) -> list[int]:
-        """Serialize to a flat list for allgather transport.
-
-        Keep in sync with ``from_list()`` when adding fields.
-        """
-        return [self.num_active_requests, self.num_active_tokens]
+    def serialize(self) -> list[int]:
+        """Serialize to a flat list for allgather transport."""
+        return list(astuple(self))
 
     @classmethod
-    def from_list(cls, rank: int, data: list[int]) -> RankState:
-        """Deserialize from a flat list received via allgather.
-
-        Keep in sync with ``to_list()`` when adding fields.
-        """
-        return cls(
-            rank=rank,
-            num_active_requests=data[0],
-            num_active_tokens=data[1],
-        )
+    def deserialize(cls, data: list[int]) -> RankState:
+        """Deserialize from a flat list received via allgather."""
+        return cls(*data)
 
 
-class ADPRequestAssigner(ABC):
+class ADPRouter(ABC):
     """Abstract interface for distributing new requests across ADP ranks.
 
     Interface:
@@ -69,17 +62,17 @@ class ADPRequestAssigner(ABC):
     def create_rank_state(
         self,
         rank: int,
-        activate_requests: list[LlmRequest],
+        active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem],
     ) -> RankState:
         """Create local RankState from current rank's active and new requests.
 
         Args:
             rank: The current rank index.
-            activate_requests: Currently active LlmRequests on this rank.
+            active_requests: Currently active LlmRequests on this rank.
             new_requests: New requests popped from the waiting queue.
-                Currently unused; reserved for future assigners that need
-                new-request info (e.g. KV-cache-aware scheduling).
+                Currently unused; reserved for future routers that need
+                new-request info (e.g. KV-cache-aware routing).
 
         Returns:
             RankState for this rank, to be serialized and allgathered.
@@ -87,7 +80,7 @@ class ADPRequestAssigner(ABC):
         raise NotImplementedError
 
     @abstractmethod
-    def assign_requests(
+    def route_requests(
         self,
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
@@ -108,8 +101,8 @@ class ADPRequestAssigner(ABC):
         raise NotImplementedError
 
 
-class DefaultADPRequestAssigner(ADPRequestAssigner):
-    """Default heap-based request assigner.
+class DefaultADPRouter(ADPRouter):
+    """Default heap-based request router.
 
     Distributes requests across tensor parallel ranks for attention DP.
     It first tries to assign requests to their target dp_rank (if specified
@@ -131,20 +124,20 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
     def create_rank_state(
         self,
         rank: int,
-        activate_requests: list[LlmRequest],
+        active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem],
     ) -> RankState:
         if self.has_cp_helix:
-            num_active_tokens = sum(req.total_input_len_cp for req in activate_requests)
+            num_active_tokens = sum(req.total_input_len_cp for req in active_requests)
         else:
-            num_active_tokens = sum(req.py_orig_prompt_len for req in activate_requests)
+            num_active_tokens = sum(req.py_orig_prompt_len for req in active_requests)
         return RankState(
             rank=rank,
-            num_active_requests=len(activate_requests),
+            num_active_requests=len(active_requests),
             num_active_tokens=num_active_tokens,
         )
 
-    def assign_requests(
+    def route_requests(
         self,
         all_rank_states: list[RankState],
         new_requests: list[RequestQueueItem],
@@ -225,8 +218,6 @@ class DefaultADPRequestAssigner(ADPRequestAssigner):
         """
         if not new_requests:
             return all_ranks_new_requests
-
-        HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
         all_ranks_new_requests_heap = [
             HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])

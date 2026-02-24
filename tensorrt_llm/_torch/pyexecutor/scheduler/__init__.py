@@ -21,7 +21,7 @@ This module contains:
 """
 
 # Re-export from scheduler.py
-from .adp_request_assigner import ADPRequestAssigner, DefaultADPRequestAssigner, RankState
+from .adp_router import ADPRouter, DefaultADPRouter, RankState
 from .scheduler import (
     BindCapacityScheduler,
     BindMicroBatchScheduler,
@@ -59,8 +59,8 @@ __all__ = [
     "SimpleScheduler",
     "SimpleUnifiedScheduler",
     # ADP
-    "ADPRequestAssigner",
-    "DefaultADPRequestAssigner",
+    "ADPRouter",
+    "DefaultADPRouter",
     "RankState",
     # Waiting queues
     "FCFSWaitingQueue",

@@ -2,7 +2,7 @@
 
 Tests for:
 - RankState serialization/deserialization
-- ADPRequestAssigner interface and DefaultADPRequestAssigner
+- ADPRouter interface and DefaultADPRouter
 """
 
 from unittest.mock import MagicMock, Mock
@@ -12,9 +12,9 @@ import pytest
 from tensorrt_llm._torch.pyexecutor.executor_request_queue import RequestQueueItem
 from tensorrt_llm._torch.pyexecutor.request_utils import get_from_waiting_queue
 from tensorrt_llm._torch.pyexecutor.scheduler import FCFSWaitingQueue
-from tensorrt_llm._torch.pyexecutor.scheduler.adp_request_assigner import (
-    ADPRequestAssigner,
-    DefaultADPRequestAssigner,
+from tensorrt_llm._torch.pyexecutor.scheduler.adp_router import (
+    ADPRouter,
+    DefaultADPRouter,
     RankState,
 )
 
@@ -69,7 +69,7 @@ def _assign(
     new_requests,
     max_num_active_requests,
 ):
-    """Helper: call DefaultADPRequestAssigner with flat-list args."""
+    """Helper: call DefaultADPRouter.route_requests with flat-list args."""
     tp_size = len(all_ranks_num_active_requests)
     states = [
         RankState(
@@ -79,7 +79,7 @@ def _assign(
         )
         for i in range(tp_size)
     ]
-    return DefaultADPRequestAssigner().assign_requests(
+    return DefaultADPRouter().route_requests(
         states, new_requests, max_num_active_requests
     )
 
@@ -106,19 +106,19 @@ class TestRankState:
         assert state.num_active_requests == 5
         assert state.num_active_tokens == 100
 
-    def test_to_list(self):
+    def test_serialize(self):
         state = RankState(rank=0, num_active_requests=5, num_active_tokens=100)
-        assert state.to_list() == [5, 100]
+        assert state.serialize() == [0, 5, 100]
 
-    def test_from_list(self):
-        state = RankState.from_list(rank=2, data=[3, 50])
+    def test_deserialize(self):
+        state = RankState.deserialize(data=[2, 3, 50])
         assert state.rank == 2
         assert state.num_active_requests == 3
         assert state.num_active_tokens == 50
 
     def test_roundtrip(self):
         original = RankState(rank=1, num_active_requests=10, num_active_tokens=200)
-        restored = RankState.from_list(rank=1, data=original.to_list())
+        restored = RankState.deserialize(data=original.serialize())
         assert original == restored
 
     def test_defaults(self):
@@ -127,98 +127,98 @@ class TestRankState:
         assert state.num_active_tokens == 0
 
 
-class TestDefaultADPRequestAssigner:
+class TestDefaultADPRouter:
     def test_interface_compliance(self):
-        assigner = DefaultADPRequestAssigner()
-        assert isinstance(assigner, ADPRequestAssigner)
+        assigner = DefaultADPRouter()
+        assert isinstance(assigner, ADPRouter)
 
     def test_empty_requests(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
         ]
-        result, expected = assigner.assign_requests(states, [], max_num_active_requests=10)
+        result, expected = assigner.route_requests(states, [], max_num_active_requests=10)
         assert result == {0: [], 1: []}
         assert expected >= 0
 
     def test_balanced_distribution(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
         ]
         reqs = [_make_request_item(i, num_tokens=10) for i in range(4)]
-        result, _ = assigner.assign_requests(states, reqs, max_num_active_requests=10)
+        result, _ = assigner.route_requests(states, reqs, max_num_active_requests=10)
         total_assigned = sum(len(v) for v in result.values())
         assert total_assigned == 4
         assert abs(len(result[0]) - len(result[1])) <= 1
 
     def test_target_dp_rank_respected(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=0, num_active_tokens=0),
         ]
         req = _make_request_item(1, target_dp_rank=1, attention_dp_relax=False)
-        result, _ = assigner.assign_requests(states, [req], max_num_active_requests=10)
+        result, _ = assigner.route_requests(states, [req], max_num_active_requests=10)
         assert len(result[1]) == 1
         assert result[1][0].id == 1
 
     def test_target_dp_rank_at_capacity_falls_through(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [
             RankState(rank=0, num_active_requests=0, num_active_tokens=0),
             RankState(rank=1, num_active_requests=2, num_active_tokens=20),
         ]
         req = _make_request_item(1, target_dp_rank=1, attention_dp_relax=False)
-        result, _ = assigner.assign_requests(states, [req], max_num_active_requests=2)
+        result, _ = assigner.route_requests(states, [req], max_num_active_requests=2)
         assert len(result[0]) == 1
         assert len(result[1]) == 0
 
     def test_favors_less_loaded_rank(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [
             RankState(rank=0, num_active_requests=3, num_active_tokens=300),
             RankState(rank=1, num_active_requests=1, num_active_tokens=100),
         ]
         reqs = [_make_request_item(i, num_tokens=50) for i in range(4)]
-        result, _ = assigner.assign_requests(states, reqs, max_num_active_requests=10)
+        result, _ = assigner.route_requests(states, reqs, max_num_active_requests=10)
         assert len(result[1]) >= len(result[0])
         assert sum(len(v) for v in result.values()) == 4
 
     def test_single_rank(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [RankState(rank=0, num_active_requests=0, num_active_tokens=0)]
         reqs = [_make_request_item(i) for i in range(5)]
-        result, expected = assigner.assign_requests(states, reqs, max_num_active_requests=10)
+        result, expected = assigner.route_requests(states, reqs, max_num_active_requests=10)
         assert len(result[0]) == 5
         assert expected == 5
 
     def test_four_ranks(self):
-        assigner = DefaultADPRequestAssigner()
+        assigner = DefaultADPRouter()
         states = [RankState(rank=i, num_active_requests=0, num_active_tokens=0) for i in range(4)]
         reqs = [_make_request_item(i, num_tokens=10) for i in range(8)]
-        result, _ = assigner.assign_requests(states, reqs, max_num_active_requests=10)
+        result, _ = assigner.route_requests(states, reqs, max_num_active_requests=10)
         total = sum(len(v) for v in result.values())
         assert total == 8
         for rank_reqs in result.values():
             assert len(rank_reqs) == 2
 
     def test_create_rank_state_default(self):
-        assigner = DefaultADPRequestAssigner(has_cp_helix=False)
+        assigner = DefaultADPRouter(has_cp_helix=False)
         req1 = Mock(py_orig_prompt_len=100)
         req2 = Mock(py_orig_prompt_len=200)
-        state = assigner.create_rank_state(rank=0, activate_requests=[req1, req2], new_requests=[])
+        state = assigner.create_rank_state(rank=0, active_requests=[req1, req2], new_requests=[])
         assert state.rank == 0
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 300
 
     def test_create_rank_state_cp_helix(self):
-        assigner = DefaultADPRequestAssigner(has_cp_helix=True)
+        assigner = DefaultADPRouter(has_cp_helix=True)
         req1 = Mock(total_input_len_cp=150)
         req2 = Mock(total_input_len_cp=250)
-        state = assigner.create_rank_state(rank=1, activate_requests=[req1, req2], new_requests=[])
+        state = assigner.create_rank_state(rank=1, active_requests=[req1, req2], new_requests=[])
         assert state.rank == 1
         assert state.num_active_requests == 2
         assert state.num_active_tokens == 400
@@ -592,7 +592,7 @@ def test_attention_dp_scheduling_cases(
 
 def test_balance_requests_across_ranks_empty_requests():
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
-    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
+    result = DefaultADPRouter()._balance_requests_across_ranks(
         [],
         all_ranks_new_requests,
         [2, 1, 3, 0],
@@ -615,7 +615,7 @@ def test_balance_requests_across_ranks_single_request():
     all_ranks_num_active_tokens = [10, 20, 5, 15]
     expected_num_active_requests = 2
 
-    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
+    result = DefaultADPRouter()._balance_requests_across_ranks(
         [req],
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -656,7 +656,7 @@ def test_balance_requests_across_ranks_multiple_requests():
     all_ranks_num_active_tokens = [5, 15, 25, 10]
     expected_num_active_requests = 2
 
-    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
+    result = DefaultADPRouter()._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -694,7 +694,7 @@ def test_balance_requests_across_ranks_capacity_limits():
     all_ranks_num_active_tokens = [10, 10, 10, 10]
     expected_num_active_requests = 2
 
-    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
+    result = DefaultADPRouter()._balance_requests_across_ranks(
         requests,
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -736,7 +736,7 @@ def test_balance_requests_across_ranks_heap_ordering():
     all_ranks_num_active_tokens = [30, 10, 5, 20]
     expected_num_active_requests = 4
 
-    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
+    result = DefaultADPRouter()._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
         all_ranks_num_active_requests,
@@ -780,7 +780,7 @@ def test_balance_requests_across_ranks_token_count_sorting():
 
     all_ranks_new_requests = {0: [], 1: [], 2: [], 3: []}
 
-    result = DefaultADPRequestAssigner()._balance_requests_across_ranks(
+    result = DefaultADPRouter()._balance_requests_across_ranks(
         [req1, req2, req3],
         all_ranks_new_requests,
         [0, 0, 0, 0],
