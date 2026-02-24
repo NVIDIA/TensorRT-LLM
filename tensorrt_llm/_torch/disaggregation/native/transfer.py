@@ -519,14 +519,13 @@ class Sender:
         return
 
     def _get_tx_session(self, unique_rid: int) -> TxSessionBase:
-        if unique_rid not in self._tx_sessions:
-            return None
-        session_ref = self._tx_sessions[unique_rid]
+        session_ref = self._tx_sessions.get(unique_rid)
         if session_ref is None:
-            raise RuntimeError(f"TxSession {unique_rid} reference is None")
+            return None
         session = session_ref()
         if session is None:
-            raise RuntimeError(f"TxSession {unique_rid} has been garbage collected")
+            logger.warning(f"TxSession {unique_rid} has been garbage collected")
+            return None
         return session
 
     def submit_task(self, agent_args: WriteMeta):
@@ -913,13 +912,14 @@ class TxSession(TxSessionBase):
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        # Clear session resources from Sender
+        # Clear session from Sender's lookup dict.
+        # Do NOT null out _kv_tasks/_aux_task/_sender here:
+        # worker threads may still hold a strong reference to this session
+        # and need access to these fields to finish in-flight transfers.
+        # Resources are freed when the session object is garbage collected.
         if self._sender is not None:
             unique_rid = self._base_args.params.disagg_request_id
             self._sender.clear_session(unique_rid)
-        self._kv_tasks = None
-        self._aux_task = None
-        self._sender = None
 
     def __enter__(self):
         return self
@@ -1049,21 +1049,19 @@ class Receiver:
         Args:
             unique_rid: The unique request ID of the session to clear
         """
-        if unique_rid in self._rx_sessions:
-            del self._rx_sessions[unique_rid]
+        self._rx_sessions.pop(unique_rid, None)
 
     def setup_session(self, rx_session: RxSessionBase):
         self._rx_sessions[rx_session._base_args.params.disagg_request_id] = weakref.ref(rx_session)
 
     def _get_rx_session(self, unique_rid: int) -> RxSessionBase:
-        if unique_rid not in self._rx_sessions:
-            raise RuntimeError(f"RxSession {unique_rid} not found")
-        session_ref = self._rx_sessions[unique_rid]
+        session_ref = self._rx_sessions.get(unique_rid)
         if session_ref is None:
-            raise RuntimeError(f"RxSession {unique_rid} reference is None")
+            return None
         session = session_ref()
         if session is None:
-            raise RuntimeError(f"RxSession {unique_rid} has been garbage collected")
+            logger.warning(f"RxSession {unique_rid} has been garbage collected")
+            return None
         return session
 
     def dispatch_task(self, task: KVRecvTask):
@@ -1261,14 +1259,14 @@ class RxSession(RxSessionBase):
         if getattr(self, "_closed", False):
             return
         self._closed = True
-        # Clear session resources from Receiver
+        # Clear session from Receiver's lookup dict.
+        # Do NOT null out _kv_tasks/_receiver or reset counters here:
+        # the listener thread may still hold a strong reference to this session
+        # and need access to these fields to finish processing in-flight status messages.
+        # Resources are freed when the session object is garbage collected.
         if self._receiver is not None:
             unique_rid = self._base_args.params.disagg_request_id
             self._receiver.clear_session(unique_rid)
-        self._receiver = None
-        self._kv_tasks = None
-        self._last_slice_counts = 0
-        self._aux_counts = 0
 
     def __enter__(self):
         return self
