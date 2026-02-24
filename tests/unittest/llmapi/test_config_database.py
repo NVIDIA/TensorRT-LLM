@@ -141,6 +141,18 @@ def test_database_yaml_config_count():
     assert len(ALL_CONFIGS) > 0, "No curated or database config files found"
 
 
+@pytest.mark.part0
+def test_all_configs_have_lookup_entry():
+    """Every config in ALL_CONFIGS must have an entry in the lookup files (ALL_LOOKUP_PATHS)."""
+    config_keys = {p.relative_to(REPO_ROOT).as_posix() for p in ALL_CONFIGS}
+    lookup_keys = set(_CONFIG_PATH_TO_ENTRY)
+    missing = config_keys - lookup_keys
+    assert not missing, (
+        "The following configs have no entry in the lookup files. "
+        "Add each to the appropriate lookup.yaml file:\n" + "\n".join(sorted(missing))
+    )
+
+
 def _serve_cli_args(config_path: Path, port: int = 17999):
     """CLI argv for serve, like: trtllm-serve <model> --config <config.yaml> --port <port>."""
     return [
