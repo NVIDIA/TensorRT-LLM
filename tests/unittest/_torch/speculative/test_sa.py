@@ -205,6 +205,11 @@ def test_llama_sa(disable_overlap_scheduler: bool, use_cuda_graph: bool,
         print(f"{'Speedup (E2E)':<30} {speedup:.2f}x")
     print("=" * 70 + "\n")
 
+    # Synchronize CUDA to catch any async memory errors before test completes.
+    # This ensures errors are attributed to this test rather than propagating
+    # to subsequent tests.
+    torch.cuda.synchronize()
+
 
 @pytest.mark.parametrize("max_matching_ngram_size", [2, 4, -1])
 def test_sa_config_validation(max_matching_ngram_size: int):

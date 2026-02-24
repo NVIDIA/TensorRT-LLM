@@ -143,7 +143,6 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_tokens = model_engine.max_num_tokens
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
-        # Create SA manager if MTP+SA mode is enabled
         sa_manager = None
         if getattr(spec_config, 'use_sa_spec', False):
             sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
@@ -159,7 +158,6 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         else:
             return None
     if spec_dec_mode.is_mtp_one_model():
-        # Create SA manager if MTP+SA mode is enabled
         sa_manager = None
         if getattr(spec_config, 'use_sa_spec', False):
             sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,

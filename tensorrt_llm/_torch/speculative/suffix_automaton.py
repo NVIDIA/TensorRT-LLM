@@ -252,6 +252,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         num_requests = len(request_ids)
         self._gpu_batch_indices[:num_requests].copy_(batch_indices, non_blocking=True)
+        torch.cuda.synchronize()
 
     def extend(
         self,
@@ -402,12 +403,13 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._initialized_requests.clear()
         self._gpu_slots = None
 
-        # Free GPU memory
         self._gpu_match_len = None
         self._gpu_draft_tokens = None
         self._gpu_batch_indices = None
         self._workspace_allocated = False
         self._allocated_max_draft_len = 0
+
+        torch.cuda.empty_cache()
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
