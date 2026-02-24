@@ -468,6 +468,11 @@ bool KVCacheBlock::isLeaf() const
     return mNextBlocks.empty();
 }
 
+bool KVCacheBlock::isDetached() const
+{
+    return mPrevBlock == nullptr && mNextBlocks.empty();
+}
+
 std::map<SizeType32, float> BlockManager::calculateWindowSizeToShare(
     std::map<SizeType32, std::vector<SizeType32>> const& windowSizeToLayers,
     std::map<SizeType32, SizeType32> const& windowSizeToCacheSizePerToken)
@@ -1638,7 +1643,10 @@ void WindowBlockManager::releaseBlocks(GenerationRequest& sequence)
         // If ref count is zero, move block to free blocks
         if (!block->hasRefs())
         {
-            mEvictionPolicy->releaseBlock(block);
+            // Send block to front of free queue if it has no reusable state
+            // This means it will be evicted first
+            auto toFront = block->isDetached();
+            mEvictionPolicy->releaseBlock(block, toFront);
         }
     }
     // Remove stored block ids in sequence

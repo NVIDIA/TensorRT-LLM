@@ -136,6 +136,7 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 
     mReleasedBlocks[cacheLevel].insert(id);
 
+    // TODO: Is this still correct? We add all the blocks to free queue, not just the leaf ones.
     // It's possible that this block is the child of a matched block that's in mFreeQueues. If this happens, we need to
     // remove the parent from mFreeQueues, since it's no longer a released leaf block.
     auto parent = block->getPrevBlock();
