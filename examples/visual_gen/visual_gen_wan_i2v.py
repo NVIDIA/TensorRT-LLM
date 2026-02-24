@@ -146,22 +146,12 @@ def parse_args():
         help="Torch compile models",
     )
     parser.add_argument(
-        "--torch_compile_mode",
-        type=str,
-        default="default",
-        help="Torch compile mode",
-        choices=["default", "max-autotune", "reduce-overhead"],
-    )
-    parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
     )
 
-    # Warmup
+    # Autotune
     parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=1,
-        help="Warmup steps. Useful for performance benchmarking.",
+        "--disable_autotune", action="store_true", help="Disable autotuning during warmup"
     )
 
     # Layerwise nvtx marker
@@ -204,13 +194,14 @@ def main():
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "pipeline": {
+        "compilation": {
             "enable_cuda_graph": args.enable_cudagraph,
             "enable_torch_compile": not args.disable_torch_compile,
             "torch_compile_models": args.torch_compile_models,
-            "torch_compile_mode": args.torch_compile_mode,
             "enable_fullgraph": args.enable_fullgraph,
-            "warmup_steps": args.warmup_steps,
+            "enable_autotune": not args.disable_autotune,
+        },
+        "pipeline": {
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     }
