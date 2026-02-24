@@ -695,31 +695,26 @@ def _run_benchmark_worker_under_current_mpi(
     experts_per_rank = num_experts_total // ep_size
     num_slots = num_experts_total
 
+    benchmark_metadata = {
+        "bench": "bench_moe_comm",
+        "launcher": launcher,
+        "profile": args.profile,
+        "backend": args.backend,
+        "ep_size": ep_size,
+        "hidden_size": hidden_size,
+        "local_batch_size": local_batch_sizes,
+        "top_k": top_k,
+        "dtype": str(act_dtype),
+        "quant_algo": quant_algo.name,
+        "perfect_router": bool(args.perfect_router),
+        "experts_per_rank": experts_per_rank,
+        "num_experts_total": num_experts_total,
+        "max_num_tokens_per_rank": max_num_tokens_per_rank,
+        "random_seed": int(args.random_seed),
+        "device_count": torch.cuda.device_count(),
+    }
     if rank == 0:
-        print(
-            json.dumps(
-                {
-                    "bench": "bench_moe_comm",
-                    "launcher": launcher,
-                    "profile": args.profile,
-                    "backend": args.backend,
-                    "ep_size": ep_size,
-                    "hidden_size": hidden_size,
-                    "local_batch_size": local_batch_sizes,
-                    "top_k": top_k,
-                    "dtype": str(act_dtype),
-                    "quant_algo": quant_algo.name,
-                    "perfect_router": bool(args.perfect_router),
-                    "experts_per_rank": experts_per_rank,
-                    "num_experts_total": num_experts_total,
-                    "max_num_tokens_per_rank": max_num_tokens_per_rank,
-                    "random_seed": int(args.random_seed),
-                    "device_count": torch.cuda.device_count(),
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
+        print(json.dumps(benchmark_metadata, indent=2), flush=True)
 
     backends = (
         ["ALLGATHER", "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED", "DEEPEP", "DEEPEPLOWLATENCY"]
@@ -882,7 +877,9 @@ def _run_benchmark_worker_under_current_mpi(
 
             if rank == 0:
                 print(json.dumps(output, indent=2), flush=True)
-                all_results.append(output)
+                output_with_metadata = dict(output)
+                output_with_metadata["benchmark_metadata"] = benchmark_metadata
+                all_results.append(output_with_metadata)
 
     # Write JSON report if requested
     if rank == 0 and args.output_file and all_results:
