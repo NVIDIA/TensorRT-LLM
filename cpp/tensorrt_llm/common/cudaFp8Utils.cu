@@ -20,6 +20,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/reduceKernelUtils.cuh"
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <cuda_fp16.h>
 #include <limits>
@@ -32,14 +33,15 @@ namespace common
 #ifdef ENABLE_FP8
 
 constexpr int CTA_SIZE = 256;
-constexpr int VEC_SIZE = 8; // elements per vectorized iteration (128-bit load = 8 × bf16)
-constexpr int64_t MAX_GRID_DIM = 65536;
+constexpr int kVecSize = 8;
+constexpr int kPairsPerVec = kVecSize / 2;
+constexpr int64_t kMaxGridDim = 65536;
 
 inline int64_t scaleMatrixVecGridSize(int64_t numel)
 {
-    int64_t vecElements = numel / VEC_SIZE;
+    int64_t vecElements = numel / kVecSize;
     int64_t blocks = (vecElements + CTA_SIZE - 1) / CTA_SIZE;
-    return std::max(int64_t(1), std::min(blocks, MAX_GRID_DIM));
+    return std::max(int64_t(1), std::min(blocks, kMaxGridDim));
 }
 
 template <bool QUANTIZE>
@@ -61,21 +63,21 @@ __global__ void scaleMatrixPerTensorVec(
 
     float const s = static_cast<float>(input_scale[0]);
     float const factor = QUANTIZE ? (1.0f / s) : s;
-    int64_t const vecElements = numel / VEC_SIZE;
+    int64_t const vecElements = numel / kVecSize;
     int64_t const stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
 
     for (int64_t vi = threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x; vi < vecElements; vi += stride)
     {
-        int64_t const base = vi * VEC_SIZE;
+        int64_t const base = vi * kVecSize;
 
         // 128-bit load: 8 × bf16
         float4 raw = *reinterpret_cast<float4 const*>(input + base);
         __nv_bfloat162 const* pairs = reinterpret_cast<__nv_bfloat162 const*>(&raw);
 
         // Convert 4 × bf16-pair → 4 × float2 → 4 × fp8-pair → pack into 2 × uint32
-        __nv_fp8x2_storage_t fp8_pairs[4];
+        __nv_fp8x2_storage_t fp8_pairs[kPairsPerVec];
 #pragma unroll
-        for (int p = 0; p < 4; ++p)
+        for (int p = 0; p < kPairsPerVec; ++p)
         {
             float2 f2 = __bfloat1622float2(pairs[p]);
             f2.x *= factor;
@@ -88,7 +90,7 @@ __global__ void scaleMatrixPerTensorVec(
     }
 
     // Scalar tail for remaining elements (numel not divisible by 8)
-    int64_t const tailStart = vecElements * VEC_SIZE;
+    int64_t const tailStart = vecElements * kVecSize;
     for (int64_t i = tailStart + threadIdx.x + static_cast<int64_t>(blockIdx.x) * blockDim.x; i < numel; i += stride)
     {
         output[i] = __nv_fp8_e4m3(static_cast<float>(input[i]) * factor);
@@ -150,7 +152,13 @@ void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* inp
     // PER_TENSOR + bf16→fp8: use vectorized kernel (128-bit loads, supports float or bf16 scale)
     if constexpr (CanUseVecPerTensor<T_OUT, T_S, T_IN>::value)
     {
-        if (quantize_mode == QuantizeMode::PER_TENSOR)
+        // Alignment check
+        constexpr std::uintptr_t kInputAlign = alignof(float4);
+        constexpr std::uintptr_t kOutputAlign = alignof(uint2);
+        bool const aligned = (reinterpret_cast<std::uintptr_t>(input) % kInputAlign == 0)
+            && (reinterpret_cast<std::uintptr_t>(output) % kOutputAlign == 0);
+
+        if (quantize_mode == QuantizeMode::PER_TENSOR && aligned)
         {
             dim3 grid(static_cast<unsigned int>(scaleMatrixVecGridSize(numel)));
             dim3 block(CTA_SIZE);
