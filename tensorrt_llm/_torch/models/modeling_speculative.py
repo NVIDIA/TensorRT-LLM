@@ -10,6 +10,7 @@ from tensorrt_llm.logger import logger
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from ..distributed import cp_allgather
 from ..model_config import ModelConfig, TConfig
 from ..modules.attention import MLA, Attention
 from ..modules.decoder_layer import DecoderLayer
@@ -1098,6 +1099,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                                                       hidden_states)
         if attn_metadata.padded_num_tokens is not None:
             hidden_states = hidden_states[:attn_metadata.num_tokens]
+
+        if attn_metadata.mapping and attn_metadata.mapping.has_cp_ulysses():
+            hidden_states = cp_allgather(hidden_states,
+                                         attn_metadata.mapping,
+                                         dim=0)
 
         if self.draft_model is not None:
             # get logits

@@ -454,6 +454,8 @@ def merge_requests(
                 tokens_per_block=cp_config["tokens_per_block"],
                 exclude_last_generation_logits=exclude_last_generation_logits,
             )
+        elif cp_type == CpType.ULYSSES:
+            pass
         else:
             raise NotImplementedError(f"Unsupported cp type {cp_type.name}.")
 

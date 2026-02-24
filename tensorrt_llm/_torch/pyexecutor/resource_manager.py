@@ -302,6 +302,8 @@ class KVCacheManager(BaseResourceManager):
         tp_size = mapping.tp_size
         if mapping.enable_attention_dp:
             tp_size = 1
+        elif mapping.has_cp_ulysses():
+            tp_size *= mapping.cp_size
 
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
