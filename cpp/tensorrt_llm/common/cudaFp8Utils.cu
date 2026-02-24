@@ -50,15 +50,16 @@ __inline__ __device__ float scale(float a, float b)
 
 // Vectorized PER_TENSOR kernel for bf16 input → fp8 output.
 // Each thread processes 8 bf16 values per iteration via 128-bit loads / 64-bit stores.
-template <bool QUANTIZE>
+// T_S may be float or __nv_bfloat16; the single scale element is converted to float once.
+template <bool QUANTIZE, typename T_S>
 __global__ void scaleMatrixPerTensorVec(
-    __nv_fp8_e4m3* output, float const* input_scale, __nv_bfloat16 const* input, int64_t numel)
+    __nv_fp8_e4m3* output, T_S const* input_scale, __nv_bfloat16 const* input, int64_t numel)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
 #endif
 
-    float const s = input_scale[0];
+    float const s = static_cast<float>(input_scale[0]);
     float const factor = QUANTIZE ? (1.0f / s) : s;
     int64_t const vecElements = numel / VEC_SIZE;
     int64_t const stride = static_cast<int64_t>(blockDim.x) * gridDim.x;
@@ -146,11 +147,16 @@ struct CanUseVecPerTensor<__nv_fp8_e4m3, float, __nv_bfloat16> : std::true_type
 {
 };
 
+template <>
+struct CanUseVecPerTensor<__nv_fp8_e4m3, __nv_bfloat16, __nv_bfloat16> : std::true_type
+{
+};
+
 template <typename T_OUT, typename T_S, typename T_IN>
 void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* input, int64_t numel, int64_t lda,
     QuantizeMode quantize_mode, cudaStream_t stream)
 {
-    // PER_TENSOR + bf16→fp8 with float scale: use vectorized kernel (128-bit loads)
+    // PER_TENSOR + bf16→fp8: use vectorized kernel (128-bit loads, supports float or bf16 scale)
     if constexpr (CanUseVecPerTensor<T_OUT, T_S, T_IN>::value)
     {
         if (quantize_mode == QuantizeMode::PER_TENSOR)
@@ -167,7 +173,7 @@ void invokeQuantizeMatrix(T_OUT* output, T_S const* input_scale, T_IN const* inp
             attrs[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL();
             config.numAttrs = 1;
             config.attrs = attrs;
-            cudaLaunchKernelEx(&config, scaleMatrixPerTensorVec<true>, output, input_scale, input, numel);
+            cudaLaunchKernelEx(&config, scaleMatrixPerTensorVec<true, T_S>, output, input_scale, input, numel);
             sync_check_cuda_error(stream);
             return;
         }
