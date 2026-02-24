@@ -1058,10 +1058,10 @@ class MLA(nn.Module):
             'TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD', '0')
         try:
             self.short_seq_mha_threshold = int(_threshold_str)
-        except ValueError:
+        except ValueError as err:
             raise ValueError(
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
-                f"got '{_threshold_str}'")
+                f"got '{_threshold_str}'") from err
         # Create a RotaryEmbedding for the short-seq MHA path only when the
         # optimization is enabled. This is needed to apply RoPE to k_pe
         # manually since the attention backend's fused RoPE is bypassed.
@@ -1570,10 +1570,17 @@ class MLA(nn.Module):
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         # Short-sequence MHA optimization: for short prefill sequences, use
-        # direct MHA (kv_b_proj expansion + SDPA) instead of the absorption
+        # dense MHA (kv_b_proj expansion + SDPA) instead of the absorption
         # path. MHA avoids the Q-absorption and V-projection BMMs and uses a
         # smaller head_dim (qk_head_dim=192 vs kv_lora_rank+rope=576),
         # yielding faster attention for small sequence lengths.
+        #
+        # topk_indices (sparse routing) is intentionally not used here: for
+        # short sequences, dense attention over all tokens is both faster and
+        # produces higher-quality output than sparse selection. The DSA sparse
+        # routing is an optimization for long sequences where the quadratic
+        # attention cost dominates.
+        #
         # Guard: only when rope_fusion is True (apply_rotary_emb is False) to
         # avoid double-RoPE application. When apply_rotary_emb is True, the
         # caller already applied RoPE to q and k_pe, and our path would apply
@@ -1614,7 +1621,7 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        """MHA (dense or masked) for short sequences during prefill.
+        """Dense MHA for short sequences during prefill.
 
         For short sequences, using standard multi-head attention with expanded
         KV (via kv_b_proj) is more efficient than the absorption path used by
@@ -1622,13 +1629,18 @@ class MLA(nn.Module):
         V-projection) and uses a larger head_dim (kv_lora_rank + rope_dim = 576)
         for the attention kernel, compared to the standard qk_head_dim = 192.
 
+        Uses SDPA instead of self.mha.forward() because DSA models set
+        self.mha = None (only self.mqa is available for MQA/generation).
+
         This method:
         1. Stores latent_cache in paged KV cache and applies RoPE to q via the
            MQA backend's mla_rope_append_paged_kv_assign_q.
         2. Applies RoPE to k_pe manually using the RotaryEmbedding.
         3. Expands compressed KV via kv_b_proj to get full k_nope and v.
         4. Constructs full K = [k_nope, RoPE(k_pe)] per head.
-        5. Computes attention via torch scaled_dot_product_attention (SDPA).
+        5. Computes dense attention via torch SDPA (no sparse routing — for
+           short sequences, dense attention is both faster and higher quality
+           than sparse selection via topk_indices).
         """
         num_ctx_tokens = q.shape[0]
 
@@ -1677,9 +1689,7 @@ class MLA(nn.Module):
         seq_lens = attn_metadata.prompt_lens_cpu_runtime[:num_contexts]
 
         if num_contexts == 1:
-            # Single sequence: straightforward SDPA.
-            seq_len = num_ctx_tokens
-            # [1, H, S, D]
+            # Single sequence: straightforward SDPA with [1, H, S, D] layout.
             q_b = q_r.unsqueeze(0).transpose(1, 2)
             k_b = k.unsqueeze(0).transpose(1, 2)
             v_b = v_r.unsqueeze(0).transpose(1, 2)
@@ -1687,18 +1697,18 @@ class MLA(nn.Module):
             attn_out = F.scaled_dot_product_attention(
                 q_b, k_b, v_b, is_causal=True, scale=self.softmax_scale)
 
-            attn_out = attn_out.transpose(1, 2).squeeze(
-                0)  # [S, H, Dv]
-            output[:seq_len].copy_(
-                attn_out.reshape(seq_len,
+            attn_out = attn_out.transpose(1, 2).squeeze(0)  # [S, H, Dv]
+            output[:num_ctx_tokens].copy_(
+                attn_out.reshape(num_ctx_tokens,
                                  self.num_heads_tp * self.v_head_dim))
         else:
-            # Multiple sequences: process per-sequence to handle variable
-            # lengths correctly with causal masking.
+            # Multiple packed sequences: process per-sequence to apply causal
+            # masking correctly per sequence boundary.
+            # TODO: Consider using NestedTensor or padding+mask to avoid the
+            # Python loop when batch sizes are large.
             offset = 0
             for i in range(num_contexts):
                 slen = seq_lens[i].item()
-                # [1, H, slen, D]
                 q_seq = q_r[offset:offset + slen].unsqueeze(0).transpose(1, 2)
                 k_seq = k[offset:offset + slen].unsqueeze(0).transpose(1, 2)
                 v_seq = v_r[offset:offset + slen].unsqueeze(0).transpose(1, 2)
