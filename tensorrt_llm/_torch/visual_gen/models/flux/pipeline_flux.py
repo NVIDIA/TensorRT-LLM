@@ -41,6 +41,13 @@ class FluxPipeline(BasePipeline):
     Supports FLUX.1-dev (50 steps, guidance) and FLUX.1-schnell (4 steps, no guidance).
     """
 
+    def __init__(self, model_config):
+        assert model_config.parallel.dit_cfg_size == 1, (
+            "FluxPipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+        )
+
+        super().__init__(model_config)
+
     @staticmethod
     def _compute_flux_timestep_embedding(module, timestep, guidance=None):
         """Compute timestep embedding for FLUX transformer.
