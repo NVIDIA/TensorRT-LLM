@@ -529,7 +529,6 @@ def stress_test(config,
                 36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
             )
 
-    # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
         test_server_config = ServerConfig(
             port=test_server_config.port,
