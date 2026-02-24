@@ -1019,7 +1019,7 @@ class SequenceInfo:
             # that dominates host time for large page counts (e.g., 50k ISL models).
             # page_seq_indices[j] = which sequence page j belongs to
             # page_in_seq[j] = which page within that sequence (0-indexed)
-            pages_per_seq_t = torch.tensor(pages_per_seq, dtype=torch.int)
+            pages_per_seq_t = self._args_list["pages_per_seq"]
             seq_indices = torch.arange(len(pages_per_seq), dtype=torch.int)
             page_seq_indices_t = torch.repeat_interleave(seq_indices, pages_per_seq_t)
             cu_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
@@ -1030,6 +1030,9 @@ class SequenceInfo:
             )
             self._store_arg("page_seq_indices", page_seq_indices_t)
             self._store_arg("page_in_seq", page_in_seq_t)
+
+            if cu_num_pages is None:
+                cu_num_pages = cu_pages.tolist()
 
         # update cumulative number of pages
         if cu_num_pages is None:
