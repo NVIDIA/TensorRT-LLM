@@ -82,6 +82,11 @@ This table is designed to provide a straightforward starting point; for detailed
      - Max Throughput
      - `llama-4-scout.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/llama-4-scout.yaml>`_
      - ``trtllm-serve nvidia/Llama-4-Scout-17B-16E-Instruct-FP8 --config ${TRTLLM_DIR}/examples/configs/curated/llama-4-scout.yaml``
+   * - `Kimi-K2-Thinking (NVFP4) <https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4>`_
+     - B200, GB200
+     - Max Throughput
+     - `kimi-k2-thinking.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/curated/kimi-k2-thinking.yaml>`_
+     - ``trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 --config ${TRTLLM_DIR}/examples/configs/curated/kimi-k2-thinking.yaml``
 
 Model-Specific Deployment Guides
 ---------------------------------

@@ -1,0 +1,15 @@
+max_batch_size: 128
+max_num_tokens: 8448
+max_seq_len: 8212
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+enable_attention_dp: true
+pipeline_parallel_size: 1
+print_iter_log: true
+kv_cache_config:
+  free_gpu_memory_fraction: 0.75
+  dtype: fp8
+cache_transceiver_config:
+  backend: UCX
+  max_tokens_in_buffer: 8448
+trust_remote_code: true
