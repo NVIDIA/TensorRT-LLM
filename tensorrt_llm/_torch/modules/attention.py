@@ -1063,10 +1063,11 @@ class MLA(nn.Module):
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
         # Create a RotaryEmbedding for the short-seq MHA path only when the
-        # optimization is enabled. This is needed to apply RoPE to k_pe
-        # manually since the attention backend's fused RoPE is bypassed.
+        # optimization is enabled AND rope_fusion is True (apply_rotary_emb is
+        # False). When apply_rotary_emb is True the dispatch guard skips this
+        # path, so the embedding would never be used.
         self._rotary_emb_mha = None
-        if self.short_seq_mha_threshold > 0:
+        if self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb:
             self._rotary_emb_mha = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.qk_rope_head_dim,
@@ -1587,6 +1588,7 @@ class MLA(nn.Module):
         # it again via mla_rope_append_paged_kv_assign_q / _rotary_emb_mha.
         if (self.short_seq_mha_threshold > 0
                 and not self.apply_rotary_emb
+                and self.mapping.cp_size == 1
                 and position_ids is not None
                 and attn_metadata.max_ctx_seq_len
                 <= self.short_seq_mha_threshold):
