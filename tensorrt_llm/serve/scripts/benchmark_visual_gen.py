@@ -30,6 +30,7 @@ On the client side, run:
         --max-concurrency 1 \
         --save-result
 """
+
 import argparse
 import asyncio
 import gc
@@ -52,7 +53,7 @@ from tqdm.asyncio import tqdm
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
-MILLISECONDS_TO_SECONDS_CONVERSION = 1000
+SECONDS_TO_MILLISECONDS = 1000
 
 
 @dataclass
@@ -118,8 +119,7 @@ def _build_payload_common(request_input: VisualGenRequestInput) -> dict:
 def _get_headers() -> dict[str, str]:
     return {
         "Content-Type": "application/json",
-        "Authorization":
-        f"Bearer {os.environ.get('OPENAI_API_KEY', 'unused')}",
+        "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY', 'unused')}",
     }
 
 
@@ -139,9 +139,9 @@ async def _do_post(
     output = VisualGenRequestOutput()
     st = time.perf_counter()
     try:
-        async with request_session.post(url=request_input.api_url,
-                                        json=payload,
-                                        headers=_get_headers()) as response:
+        async with request_session.post(
+            url=request_input.api_url, json=payload, headers=_get_headers()
+        ) as response:
             if response.status == 200:
                 await response.read()
                 output.success = True
@@ -204,10 +204,8 @@ async def get_request(
     request_rate: float,
     burstiness: float = 1.0,
 ) -> AsyncGenerator[VisualGenSampleRequest, None]:
-    """Asynchronously generates requests at a specified rate
-    with optional burstiness."""
-    assert burstiness > 0, (
-        f"A positive burstiness factor is expected, but given {burstiness}.")
+    """Asynchronously generates requests at a specified rate with optional burstiness."""
+    assert burstiness > 0, f"A positive burstiness factor is expected, but given {burstiness}."
     theta = 1.0 / (request_rate * burstiness)
     for request in input_requests:
         yield request
@@ -228,8 +226,7 @@ def calculate_metrics(
 
     for out in outputs:
         if out.exception_type:
-            error_counts[out.exception_type] = error_counts.get(
-                out.exception_type, 0) + 1
+            error_counts[out.exception_type] = error_counts.get(out.exception_type, 0) + 1
         if out.success:
             e2e_latencies.append(out.e2e_latency)
             completed += 1
@@ -244,9 +241,10 @@ def calculate_metrics(
         warnings.warn(
             "All requests failed. This is likely due to a misconfiguration "
             "on the benchmark arguments.",
-            stacklevel=2)
+            stacklevel=2,
+        )
 
-    e2e_ms = [v * MILLISECONDS_TO_SECONDS_CONVERSION for v in e2e_latencies]
+    e2e_ms = [v * SECONDS_TO_MILLISECONDS for v in e2e_latencies]
 
     return VisualGenBenchmarkMetrics(
         completed=completed,
@@ -257,9 +255,11 @@ def calculate_metrics(
         std_e2e_latency_ms=float(np.std(e2e_ms)) if e2e_ms else 0,
         min_e2e_latency_ms=float(np.min(e2e_ms)) if e2e_ms else 0,
         max_e2e_latency_ms=float(np.max(e2e_ms)) if e2e_ms else 0,
-        percentiles_e2e_latency_ms=[(p, float(np.percentile(e2e_ms, p)))
-                                    for p in selected_percentiles]
-        if e2e_ms else [(p, 0.0) for p in selected_percentiles],
+        percentiles_e2e_latency_ms=[
+            (p, float(np.percentile(e2e_ms, p))) for p in selected_percentiles
+        ]
+        if e2e_ms
+        else [(p, 0.0) for p in selected_percentiles],
     )
 
 
@@ -280,8 +280,8 @@ async def benchmark(
 ) -> dict[str, Any]:
     if backend not in VISUAL_GEN_REQUEST_FUNCS:
         raise ValueError(
-            f"Unknown backend: {backend}. "
-            f"Available: {list(VISUAL_GEN_REQUEST_FUNCS.keys())}")
+            f"Unknown backend: {backend}. Available: {list(VISUAL_GEN_REQUEST_FUNCS.keys())}"
+        )
 
     request_func = VISUAL_GEN_REQUEST_FUNCS[backend]
 
@@ -308,7 +308,8 @@ async def benchmark(
             raise ValueError(
                 "Initial test run failed - Please make sure benchmark "
                 "arguments are correctly specified. "
-                f"Error: {test_output.error}")
+                f"Error: {test_output.error}"
+            )
         else:
             print("Initial test run completed. Starting main benchmark run...")
     else:
@@ -323,46 +324,34 @@ async def benchmark(
     print(f"Burstiness factor: {burstiness} ({distribution})")
     print(f"Maximum request concurrency: {max_concurrency}")
 
-    pbar = None if disable_tqdm else tqdm(total=len(input_requests),
-                                          desc="Benchmarking")
+    pbar = None if disable_tqdm else tqdm(total=len(input_requests), desc="Benchmarking")
 
-    semaphore = (asyncio.Semaphore(max_concurrency)
-                 if max_concurrency else None)
+    semaphore = asyncio.Semaphore(max_concurrency) if max_concurrency else None
 
     async def limited_request_func(req_input, pbar_ref, sess):
         if semaphore is None:
-            return await request_func(request_input=req_input,
-                                      pbar=pbar_ref,
-                                      session=sess)
+            return await request_func(request_input=req_input, pbar=pbar_ref, session=sess)
         async with semaphore:
-            return await request_func(request_input=req_input,
-                                      pbar=pbar_ref,
-                                      session=sess)
+            return await request_func(request_input=req_input, pbar=pbar_ref, session=sess)
 
     timeout = aiohttp.ClientTimeout(total=request_timeout)
     benchmark_start_time = time.perf_counter()
     tasks: list[asyncio.Task] = []
-    session = aiohttp.ClientSession(
+    async with aiohttp.ClientSession(
         trust_env=True,
         timeout=timeout,
-        connector=aiohttp.TCPConnector(limit=0,
-                                       limit_per_host=0,
-                                       force_close=True),
-    )
+        connector=aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True),
+    ) as session:
+        async for request in get_request(input_requests, request_rate, burstiness):
+            request_input = _make_request_input(request.prompt)
+            tasks.append(asyncio.create_task(limited_request_func(request_input, pbar, session)))
 
-    async for request in get_request(input_requests, request_rate, burstiness):
-        request_input = _make_request_input(request.prompt)
-        tasks.append(
-            asyncio.create_task(
-                limited_request_func(request_input, pbar, session)))
-
-    outputs: list[VisualGenRequestOutput] = await asyncio.gather(*tasks)
+        outputs: list[VisualGenRequestOutput] = await asyncio.gather(*tasks)
 
     if pbar is not None:
         pbar.close()
 
     benchmark_duration = time.perf_counter() - benchmark_start_time
-    await session.close()
 
     metrics = calculate_metrics(
         outputs=outputs,
@@ -385,8 +374,7 @@ async def benchmark(
         "min_e2e_latency_ms": metrics.min_e2e_latency_ms,
         "max_e2e_latency_ms": metrics.max_e2e_latency_ms,
         "percentiles_e2e_latency_ms": {
-            f"p{int(p) if int(p) == p else p}": v
-            for p, v in metrics.percentiles_e2e_latency_ms
+            f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_e2e_latency_ms
         },
         "e2e_latencies": [out.e2e_latency for out in outputs],
         "errors": [out.error for out in outputs],
@@ -396,45 +384,38 @@ async def benchmark(
     return result
 
 
-def _print_results(backend: str, model_id: str, benchmark_duration: float,
-                   metrics: VisualGenBenchmarkMetrics):
+def _print_results(
+    backend: str, model_id: str, benchmark_duration: float, metrics: VisualGenBenchmarkMetrics
+):
     """Print benchmark results to stdout."""
-    print("{s:{c}^{n}}".format(s=' Serving Benchmark Result (VisualGen) ',
-                               n=60,
-                               c='='))
+    print("{s:{c}^{n}}".format(s=" Serving Benchmark Result (VisualGen) ", n=60, c="="))
     print("{:<40} {:<10}".format("Backend:", backend))
     print("{:<40} {:<10}".format("Model:", model_id))
     print("{:<40} {:<10}".format("Total requests:", metrics.total_requests))
     print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10}".format("Failed requests:",
-                                 metrics.total_requests - metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):",
-                                    benchmark_duration))
-    print("{:<40} {:<10.4f}".format("Request throughput (req/s):",
-                                    metrics.request_throughput))
+    print("{:<40} {:<10}".format("Failed requests:", metrics.total_requests - metrics.completed))
+    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
+    print("{:<40} {:<10.4f}".format("Request throughput (req/s):", metrics.request_throughput))
 
     if metrics.total_requests - metrics.completed > 0:
         print("=" * 60)
-        print(f"  !!! {metrics.total_requests - metrics.completed} "
-              "FAILED REQUESTS - CHECK LOG FOR ERRORS !!!")
+        print(
+            f"  !!! {metrics.total_requests - metrics.completed} "
+            "FAILED REQUESTS - CHECK LOG FOR ERRORS !!!"
+        )
         print("=" * 60)
 
-    print("{s:{c}^{n}}".format(s=' E2E Latency ', n=60, c='-'))
-    print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):",
-                                    metrics.mean_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):",
-                                    metrics.median_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Std Dev E2E Latency (ms):",
-                                    metrics.std_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Min E2E Latency (ms):",
-                                    metrics.min_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Max E2E Latency (ms):",
-                                    metrics.max_e2e_latency_ms))
+    print("{s:{c}^{n}}".format(s=" E2E Latency ", n=60, c="-"))
+    print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
+    print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
+    print("{:<40} {:<10.2f}".format("Std Dev E2E Latency (ms):", metrics.std_e2e_latency_ms))
+    print("{:<40} {:<10.2f}".format("Min E2E Latency (ms):", metrics.min_e2e_latency_ms))
+    print("{:<40} {:<10.2f}".format("Max E2E Latency (ms):", metrics.max_e2e_latency_ms))
     for p, v in metrics.percentiles_e2e_latency_ms:
         p_word = str(int(p)) if int(p) == p else str(p)
         print("{:<40} {:<10.2f}".format(f"P{p_word} E2E Latency (ms):", v))
 
-    print("{s:{c}^{n}}".format(s=' Placeholder Metrics ', n=60, c='-'))
+    print("{s:{c}^{n}}".format(s=" Placeholder Metrics ", n=60, c="-"))
     print("{:<40} {:<10}".format("TTFF (ms):", "N/A (placeholder)"))
     print("{:<40} {:<10}".format("GenFPS:", "N/A (placeholder)"))
     print("=" * 60)
@@ -445,7 +426,7 @@ def load_prompts(args: argparse.Namespace) -> list[VisualGenSampleRequest]:
     prompts: list[str] = []
 
     if args.prompt_file:
-        with open(args.prompt_file) as f:
+        with open(args.prompt_file, encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -486,7 +467,8 @@ def main(args: argparse.Namespace):
     if endpoint is None:
         raise ValueError(
             f"Cannot resolve endpoint for backend '{backend}'. "
-            "Please specify --endpoint explicitly.")
+            "Please specify --endpoint explicitly."
+        )
 
     if args.base_url is not None:
         api_url = f"{args.base_url}{endpoint}"
@@ -498,8 +480,7 @@ def main(args: argparse.Namespace):
     seconds = args.seconds
     if args.num_frames is not None:
         seconds = args.num_frames / args.fps
-        print(f"Computed seconds={seconds:.3f} from "
-              f"num_frames={args.num_frames} / fps={args.fps}")
+        print(f"Computed seconds={seconds:.3f} from num_frames={args.num_frames} / fps={args.fps}")
 
     gen_params: dict[str, Any] = {
         "size": args.size,
@@ -517,7 +498,10 @@ def main(args: argparse.Namespace):
 
     extra_body = None
     if args.extra_body:
-        extra_body = json.loads(args.extra_body)
+        try:
+            extra_body = json.loads(args.extra_body)
+        except json.JSONDecodeError as e:
+            raise ValueError(f"Invalid JSON in --extra-body: {e}") from e
 
     gc.disable()
 
@@ -530,15 +514,14 @@ def main(args: argparse.Namespace):
             request_rate=args.request_rate,
             burstiness=args.burstiness,
             disable_tqdm=args.disable_tqdm,
-            selected_percentiles=[
-                float(p) for p in args.metric_percentiles.split(",")
-            ],
+            selected_percentiles=[float(p) for p in args.metric_percentiles.split(",")],
             max_concurrency=args.max_concurrency,
             gen_params=gen_params,
             extra_body=extra_body,
             no_test_input=args.no_test_input,
             request_timeout=args.request_timeout,
-        ))
+        )
+    )
 
     if args.save_result:
         result_json: dict[str, Any] = {}
@@ -552,12 +535,10 @@ def main(args: argparse.Namespace):
         if args.metadata:
             for item in args.metadata:
                 if "=" in item:
-                    kvstring = item.split("=")
-                    result_json[kvstring[0].strip()] = kvstring[1].strip()
+                    key, value = item.split("=", 1)
+                    result_json[key.strip()] = value.strip()
                 else:
-                    raise ValueError(
-                        "Invalid metadata format. "
-                        "Please use KEY=VALUE format.")
+                    raise ValueError("Invalid metadata format. Please use KEY=VALUE format.")
 
         result_json = {**result_json, **benchmark_result}
 
@@ -565,18 +546,21 @@ def main(args: argparse.Namespace):
             for field_name in ["e2e_latencies", "errors"]:
                 result_json.pop(field_name, None)
 
-        result_json["request_rate"] = (args.request_rate
-                                       if args.request_rate < float("inf")
-                                       else "inf")
+        result_json["request_rate"] = (
+            args.request_rate if args.request_rate < float("inf") else "inf"
+        )
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
 
         base_model_id = model_id.split("/")[-1]
-        max_concurrency_str = (f"-concurrency{args.max_concurrency}"
-                               if args.max_concurrency is not None else "")
-        file_name = (f"{backend}-{args.request_rate}qps"
-                     f"{max_concurrency_str}-{base_model_id}"
-                     f"-{current_dt}.json")
+        max_concurrency_str = (
+            f"-concurrency{args.max_concurrency}" if args.max_concurrency is not None else ""
+        )
+        file_name = (
+            f"{backend}-{args.request_rate}qps"
+            f"{max_concurrency_str}-{base_model_id}"
+            f"-{current_dt}.json"
+        )
         if args.result_filename:
             file_name = args.result_filename
         if args.result_dir:
@@ -591,158 +575,144 @@ def main(args: argparse.Namespace):
 
 if __name__ == "__main__":
     parser = FlexibleArgumentParser(
-        description="Benchmark VisualGen (image/video generation) serving.")
+        description="Benchmark VisualGen (image/video generation) serving."
+    )
 
-    parser.add_argument("--backend",
-                        type=str,
-                        default="openai-videos",
-                        choices=list(VISUAL_GEN_REQUEST_FUNCS.keys()),
-                        help="Backend API type.")
-    parser.add_argument("--model",
-                        type=str,
-                        required=True,
-                        help="HuggingFace model ID "
-                        "(e.g. Wan-AI/Wan2.1-T2V-14B).")
-    parser.add_argument("--host",
-                        type=str,
-                        default="127.0.0.1",
-                        help="Server host.")
-    parser.add_argument("--port",
-                        type=int,
-                        default=8000,
-                        help="Server port.")
-    parser.add_argument("--base-url",
-                        type=str,
-                        default=None,
-                        help="Full base URL (overrides --host/--port).")
-    parser.add_argument("--endpoint",
-                        type=str,
-                        default=None,
-                        help="API endpoint path (auto-resolved from "
-                        "backend if not specified).")
+    parser.add_argument(
+        "--backend",
+        type=str,
+        default="openai-videos",
+        choices=list(VISUAL_GEN_REQUEST_FUNCS.keys()),
+        help="Backend API type.",
+    )
+    parser.add_argument(
+        "--model",
+        type=str,
+        required=True,
+        help="HuggingFace model ID (e.g. Wan-AI/Wan2.1-T2V-14B).",
+    )
+    parser.add_argument("--host", type=str, default="127.0.0.1", help="Server host.")
+    parser.add_argument("--port", type=int, default=8000, help="Server port.")
+    parser.add_argument(
+        "--base-url", type=str, default=None, help="Full base URL (overrides --host/--port)."
+    )
+    parser.add_argument(
+        "--endpoint",
+        type=str,
+        default=None,
+        help="API endpoint path (auto-resolved from backend if not specified).",
+    )
 
     prompt_group = parser.add_mutually_exclusive_group()
     prompt_group.add_argument(
         "--prompt",
         type=str,
         default=None,
-        help="Single text prompt (repeated --num-prompts times).")
+        help="Single text prompt (repeated --num-prompts times).",
+    )
     prompt_group.add_argument(
         "--prompt-file",
         type=str,
         default=None,
         help="Path to prompt file. Supports plain text (one prompt "
-        "per line) or JSONL with 'text'/'prompt' field.")
-    parser.add_argument("--num-prompts",
-                        type=int,
-                        default=5,
-                        help="Number of prompts to benchmark.")
+        "per line) or JSONL with 'text'/'prompt' field.",
+    )
+    parser.add_argument(
+        "--num-prompts", type=int, default=5, help="Number of prompts to benchmark."
+    )
 
     gen_group = parser.add_argument_group("Generation Parameters")
     gen_group.add_argument(
         "--size",
         type=str,
         default="auto",
-        help="Output resolution in WxH format (e.g. 480x832) or 'auto'.")
-    gen_group.add_argument("--seconds",
-                           type=float,
-                           default=4.0,
-                           help="Video duration in seconds.")
-    gen_group.add_argument("--fps",
-                           type=int,
-                           default=16,
-                           help="Frames per second.")
+        help="Output resolution in WxH format (e.g. 480x832) or 'auto'.",
+    )
+    gen_group.add_argument("--seconds", type=float, default=4.0, help="Video duration in seconds.")
+    gen_group.add_argument("--fps", type=int, default=16, help="Frames per second.")
     gen_group.add_argument(
         "--num-frames",
         type=int,
         default=None,
-        help="Total frames to generate. Overrides --seconds "
-        "(computed as num_frames / fps).")
-    gen_group.add_argument("--num-inference-steps",
-                           type=int,
-                           default=None,
-                           help="Number of diffusion denoising steps.")
-    gen_group.add_argument("--guidance-scale",
-                           type=float,
-                           default=None,
-                           help="Classifier-free guidance scale.")
-    gen_group.add_argument("--seed",
-                           type=int,
-                           default=None,
-                           help="Random seed for reproducibility.")
-    gen_group.add_argument("--negative-prompt",
-                           type=str,
-                           default=None,
-                           help="Negative prompt (concepts to avoid).")
+        help="Total frames to generate. Overrides --seconds (computed as num_frames / fps).",
+    )
+    gen_group.add_argument(
+        "--num-inference-steps", type=int, default=None, help="Number of diffusion denoising steps."
+    )
+    gen_group.add_argument(
+        "--guidance-scale", type=float, default=None, help="Classifier-free guidance scale."
+    )
+    gen_group.add_argument(
+        "--seed", type=int, default=None, help="Random seed for reproducibility."
+    )
+    gen_group.add_argument(
+        "--negative-prompt", type=str, default=None, help="Negative prompt (concepts to avoid)."
+    )
     gen_group.add_argument(
         "--extra-body",
         type=str,
         default=None,
-        help='JSON string of extra request body parameters '
-        '(e.g. \'{"guidance_rescale": 0.7}\').')
+        help="JSON string of extra request body parameters (e.g. '{\"guidance_rescale\": 0.7}').",
+    )
 
     traffic_group = parser.add_argument_group("Traffic Control")
     traffic_group.add_argument(
         "--request-rate",
         type=float,
         default=float("inf"),
-        help="Request rate (req/s). Default inf sends all at once.")
+        help="Request rate (req/s). Default inf sends all at once.",
+    )
     traffic_group.add_argument(
         "--burstiness",
         type=float,
         default=1.0,
-        help="Burstiness factor for request generation. "
-        "1.0 = Poisson process.")
-    traffic_group.add_argument("--max-concurrency",
-                               type=int,
-                               default=None,
-                               help="Maximum concurrent requests.")
+        help="Burstiness factor for request generation. 1.0 = Poisson process.",
+    )
+    traffic_group.add_argument(
+        "--max-concurrency", type=int, default=None, help="Maximum concurrent requests."
+    )
     traffic_group.add_argument(
         "--request-timeout",
         type=float,
         default=6 * 60 * 60,
-        help="Request timeout in seconds (default: 6 hours).")
+        help="Request timeout in seconds (default: 6 hours).",
+    )
 
     output_group = parser.add_argument_group("Output")
-    output_group.add_argument("--save-result",
-                              action="store_true",
-                              help="Save results to JSON file.")
     output_group.add_argument(
-        "--save-detailed",
-        action="store_true",
-        help="Include per-request details in saved results.")
-    output_group.add_argument("--result-dir",
-                              type=str,
-                              default=None,
-                              help="Directory for result files.")
-    output_group.add_argument("--result-filename",
-                              type=str,
-                              default=None,
-                              help="Custom result filename.")
+        "--save-result", action="store_true", help="Save results to JSON file."
+    )
+    output_group.add_argument(
+        "--save-detailed", action="store_true", help="Include per-request details in saved results."
+    )
+    output_group.add_argument(
+        "--result-dir", type=str, default=None, help="Directory for result files."
+    )
+    output_group.add_argument(
+        "--result-filename", type=str, default=None, help="Custom result filename."
+    )
     output_group.add_argument(
         "--metric-percentiles",
         type=str,
         default="50,90,99",
-        help="Comma-separated percentile values "
-        "(default: '50,90,99').")
+        help="Comma-separated percentile values (default: '50,90,99').",
+    )
     output_group.add_argument(
         "--metadata",
         type=str,
         nargs="*",
         default=None,
-        help="Key=value pairs to add to result metadata.")
+        help="Key=value pairs to add to result metadata.",
+    )
 
-    parser.add_argument("--disable-tqdm",
-                        action="store_true",
-                        help="Disable progress bar.")
-    parser.add_argument("--no-test-input",
-                        action="store_true",
-                        help="Skip the initial single-prompt test run.")
+    parser.add_argument("--disable-tqdm", action="store_true", help="Disable progress bar.")
+    parser.add_argument(
+        "--no-test-input", action="store_true", help="Skip the initial single-prompt test run."
+    )
 
     args = parser.parse_args()
 
     if args.prompt is None and args.prompt_file is None:
-        parser.error(
-            "Either --prompt or --prompt-file must be specified.")
+        parser.error("Either --prompt or --prompt-file must be specified.")
 
     main(args)

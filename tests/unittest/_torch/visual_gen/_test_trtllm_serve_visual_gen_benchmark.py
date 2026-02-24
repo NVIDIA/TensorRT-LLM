@@ -114,9 +114,9 @@ class RemoteVisualGenServer:
         start = time.time()
         while True:
             try:
-                if requests.get(url).status_code == 200:
+                if requests.get(url, timeout=5).status_code == 200:
                     return
-            except Exception as err:
+            except requests.RequestException as err:
                 result = self.proc.poll()
                 if result is not None and result != 0:
                     raise RuntimeError("Visual-gen server exited unexpectedly.") from err
@@ -169,7 +169,7 @@ def test_visual_gen_benchmark_video(
 ):
     """Run benchmark_visual_gen.py for video generation and validate output."""
     benchmark_cmd = [
-        "python3",
+        sys.executable,
         benchmark_script,
         "--backend",
         backend,
@@ -214,7 +214,7 @@ def test_visual_gen_benchmark_save_result(
     """Verify --save-result produces a valid JSON output file."""
     result_dir = str(tmp_path / "results")
     benchmark_cmd = [
-        "python3",
+        sys.executable,
         benchmark_script,
         "--backend",
         backend,

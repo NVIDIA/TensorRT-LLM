@@ -321,7 +321,11 @@ class DiffusionRemoteClient:
         logger.info("DiffusionClient: Waiting for workers")
 
         future = asyncio.run_coroutine_threadsafe(self._wait_ready_async(), self._event_loop)
-        future.result()
+        try:
+            future.result()
+        except Exception:
+            self.shutdown()
+            raise
 
     async def _wait_ready_async(self):
         """Wait for workers to be ready (async version).
