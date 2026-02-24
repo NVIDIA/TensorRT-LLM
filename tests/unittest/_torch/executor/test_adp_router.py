@@ -79,9 +79,7 @@ def _assign(
         )
         for i in range(tp_size)
     ]
-    return DefaultADPRouter().route_requests(
-        states, new_requests, max_num_active_requests
-    )
+    return DefaultADPRouter().route_requests(states, new_requests, max_num_active_requests)
 
 
 @pytest.fixture

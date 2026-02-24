@@ -311,8 +311,7 @@ class PyExecutor:
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
         self.adp_router: ADPRouter = (
-            adp_router
-            or DefaultADPRouter(has_cp_helix=dist.has_cp_helix))
+            adp_router or DefaultADPRouter(has_cp_helix=dist.has_cp_helix))
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
@@ -2354,10 +2353,7 @@ class PyExecutor:
             new_requests=[],
         )
         responses_list = self.dist.tp_allgather(local_state.serialize())
-        return [
-            RankState.deserialize(data=resp)
-            for resp in responses_list
-        ]
+        return [RankState.deserialize(data=resp) for resp in responses_list]
 
     def _pop_from_waiting_queue(
         self,

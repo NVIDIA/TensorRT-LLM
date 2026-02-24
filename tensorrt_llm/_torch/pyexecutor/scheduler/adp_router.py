@@ -23,8 +23,7 @@ if TYPE_CHECKING:
 
     from ..executor_request_queue import RequestQueueItem
 
-HeapVal = namedtuple("HeapVal",
-                     ["num_tokens", "num_requests", "rank", "request_list"])
+HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
 
 
 @dataclass
