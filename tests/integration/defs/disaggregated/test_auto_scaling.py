@@ -147,7 +147,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=0)
+                                     device=1)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1, port=disagg_port)
@@ -169,7 +169,7 @@ async def test_worker_restart(model_name, disagg_server_config, worker_config,
                                      worker_config,
                                      work_dir,
                                      port=0,
-                                     device=1)
+                                     device=0)
         await wait_for_disagg_server_status(disagg_port, 1, 1)
         await asyncio.sleep(CHECK_STATUS_INTERVAL)
         verify_cluster_info(True, 1, 1, port=disagg_port)
