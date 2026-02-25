@@ -24,6 +24,8 @@ from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
 from tensorrt_llm.layers import LanguageAdapterConfig
 from tensorrt_llm.models import PretrainedConfig
 
+from examples._deprecation import emit_engine_arch_deprecation
+
 dir_path = os.path.dirname(os.path.realpath(__file__))
 LOGGER = logging.getLogger(__name__)
 
@@ -1840,6 +1842,7 @@ def convert(worker_rank, world_size, args, model_config, convert_args,
 
 
 if __name__ == "__main__":
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     parser = argparse.ArgumentParser(
         formatter_class=argparse.RawTextHelpFormatter)
     parser.add_argument(
