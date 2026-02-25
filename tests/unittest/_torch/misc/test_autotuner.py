@@ -868,3 +868,44 @@ def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
     )
     for r in results:
         assert r is True
+
+
+@pytest.mark.parametrize("use_cuda_graph", [False, True])
+def test_global_timer_vs_cuda_event(use_cuda_graph):
+    """Verify globaltimer and cuda-event backends report times within 5%."""
+    runner = GemmRunner()
+    x = torch.randn(M // 2, 64, device='cuda')
+    w = torch.randn(64, 128, device='cuda')
+    tuning_config = TuningConfig(use_cuda_graph=use_cuda_graph)
+
+    tuner = AutoTuner()
+
+    for tactic in runner.get_valid_tactics([x, w], OptimizationProfile()):
+        # Profile with cuda events
+        tuner._use_global_timer = False
+        event_time = tuner._profile_single_kernel(
+            runner=runner,
+            inputs=[x, w],
+            tactic=tactic,
+            tuning_config=tuning_config,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+        # Profile with globaltimer
+        tuner._use_global_timer = True
+        gt_time = tuner._profile_single_kernel(
+            runner=runner,
+            inputs=[x, w],
+            tactic=tactic,
+            tuning_config=tuning_config,
+            use_cuda_graph=use_cuda_graph,
+        )
+
+        assert event_time > 0, f"cuda event time should be positive, got {event_time}"
+        assert gt_time > 0, f"globaltimer time should be positive, got {gt_time}"
+
+        rel_diff = abs(gt_time - event_time) / event_time
+        assert rel_diff < 0.05, (
+            f"tactic={tactic}: globaltimer ({gt_time:.4f}ms) and cuda event "
+            f"({event_time:.4f}ms) differ by {rel_diff * 100:.1f}%, expected < 5%"
+        )
