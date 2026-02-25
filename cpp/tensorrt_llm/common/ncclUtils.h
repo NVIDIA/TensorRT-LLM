@@ -311,9 +311,9 @@ private:
 class ScopedNCCLWindowBuffer
 {
 public:
-    ScopedNCCLWindowBuffer(ncclComm_t comm, size_t size)
-        : mComm(comm)
-        , mBuffer(NCCLWindowAllocator::getInstance().requestBuffer(comm, size))
+    ScopedNCCLWindowBuffer(std::shared_ptr<ncclComm_t> comm, size_t size)
+        : mComm(std::move(comm))
+        , mBuffer(NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size))
     {
     }
 
@@ -321,7 +321,7 @@ public:
     {
         if (mBuffer.isValid())
         {
-            NCCLWindowAllocator::getInstance().releaseBuffer(mComm, mBuffer.ptr);
+            NCCLWindowAllocator::getInstance().releaseBuffer(*mComm, mBuffer.ptr);
         }
     }
 
@@ -351,7 +351,7 @@ public:
     ScopedNCCLWindowBuffer& operator=(ScopedNCCLWindowBuffer&&) = delete;
 
 private:
-    ncclComm_t mComm;
+    std::shared_ptr<ncclComm_t> mComm;
     NCCLWindowBuffer mBuffer;
 };
 
@@ -359,7 +359,7 @@ private:
 // The tensor will automatically release the buffer back to the pool when destroyed.
 // This is analogous to torch_ext::create_userbuffers_tensor() but for NCCLWindowAllocator.
 inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
-    ncclComm_t comm, at::IntArrayRef shape, torch::ScalarType dtype)
+    std::shared_ptr<ncclComm_t> comm, at::IntArrayRef shape, torch::ScalarType dtype)
 {
     // Calculate buffer size
     int64_t buffer_size
@@ -382,7 +382,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     try
     {
-        buffer = allocator.requestBuffer(comm, buffer_size);
+        buffer = allocator.requestBuffer(*comm, buffer_size);
     }
     catch (std::exception const& e)
     {
@@ -398,7 +398,7 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     }
 
     // Create custom deleter that releases the buffer
-    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(comm, ptr); };
+    auto deleter = [comm, ptr = buffer.ptr](void*) { NCCLWindowAllocator::getInstance().releaseBuffer(*comm, ptr); };
 
     // Create tensor from the buffer
     auto tensor = torch::from_blob(buffer.ptr, shape, strides_vec, deleter, torch::dtype(dtype).device(torch::kCUDA));
