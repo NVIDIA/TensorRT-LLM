@@ -8,6 +8,7 @@ l0_b200:
     wildcards:
       gpu:
       - '*b100*'
+      - '*b200*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
@@ -140,6 +141,7 @@ l0_b200:
     wildcards:
       gpu:
       - '*b100*'
+      - '*b200*'
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
@@ -165,6 +167,7 @@ l0_b200:
     wildcards:
       gpu:
       - '*b100*'
+      - '*b200*'
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
@@ -181,6 +184,7 @@ l0_b200:
     wildcards:
       gpu:
       - '*b100*'
+      - '*b200*'
       linux_distribution_name: ubuntu*
     terms:
       stage: post_merge
@@ -212,6 +216,7 @@ l0_b200:
     wildcards:
       gpu:
       - '*b100*'
+      - '*b200*'
       linux_distribution_name: ubuntu*
     terms:
       stage: pre_merge
