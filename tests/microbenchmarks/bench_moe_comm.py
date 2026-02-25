@@ -117,7 +117,18 @@ def _sync():
 def _set_device_from_local_rank():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
-    dev = local_mpi_rank() % torch.cuda.device_count()
+    local_rank = local_mpi_rank()
+    device_count = torch.cuda.device_count()
+    if local_rank >= device_count:
+        raise RuntimeError(
+            "Detected GPU oversubscription: "
+            f"local_mpi_rank={local_rank} >= cuda_device_count={device_count}. "
+            "Reduce local MPI ranks to match visible GPU count "
+            "(e.g. srun --ntasks-per-node=<gpus>, "
+            "mpirun --map-by ppr:<gpus>:node, "
+            "or adjust CUDA_VISIBLE_DEVICES)."
+        )
+    dev = local_rank % device_count
     torch.cuda.set_device(dev)
     return dev
 
