@@ -2139,7 +2139,7 @@ def parseTaskConfigFromStageName(String stageName) {
     if (matcher.find()) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
-            system_gpu_count: "${matcher.group(2)}",
+            system_gpu_count: matcher.group(2) ?: "1", // Default to 1 if _GPUs not present
             node_count: matcher.group(3) ?: "1" // Default to 1 if _Nodes not present
         ]
     }
