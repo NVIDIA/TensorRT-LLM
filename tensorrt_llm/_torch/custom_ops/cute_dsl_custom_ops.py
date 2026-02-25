@@ -6,7 +6,7 @@ import torch
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version, is_sm_100f
+from ..._utils import get_sm_version
 from ...math_utils import ceil_div, pad_up
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
@@ -2235,10 +2235,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[int]:
-            if not is_sm_100f():
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
-                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
-                    f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL FP8 GEMM only supports SM100 and SM103. Skipping all tactics."
                 )
                 return []
 
@@ -2482,10 +2482,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
             )
-        if not is_sm_100f():
+        if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
-                f"CuteDSL: SM version {get_sm_version()} is not supported. "
-                f"CuteDSL FP8 GEMM only supports SM 100 family. Skipping all tactics."
+                f"CuteDSL: SM version {sm_version} is not supported. "
+                f"CuteDSL FP8 GEMM only supports SM100 and SM103. Skipping all tactics."
             )
         tuner = AutoTuner.get()
 
@@ -2548,10 +2548,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             **kwargs,
         ) -> List[int]:
 
-            if not is_sm_100f():
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
-                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
-                    f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
                 )
                 return []
             # [b, m, k]
@@ -2797,10 +2797,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(
                 f"CuteDSL FP8 BMM only supports bfloat16 output, got {output_dtype}"
             )
-        if not is_sm_100f():
+        if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
-                f"CuteDSL: SM version {get_sm_version()} is not supported. "
-                f"CuteDSL FP8 BMM only supports SM 100 family. Skipping all tactics."
+                f"CuteDSL: SM version {sm_version} is not supported. "
+                f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
             )
 
         tuner = AutoTuner.get()
@@ -2870,10 +2870,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             profile: OptimizationProfile,
             **kwargs,
         ) -> List[int]:
-            if not is_sm_100f():
+            if (sm_version := get_sm_version()) not in (100, 103):
                 logger.debug(
-                    f"CuteDSL: SM version {get_sm_version()} is not supported. "
-                    f"CuteDSL FP8 Group Gemm only supports SM 100 family. Skipping all tactics."
+                    f"CuteDSL: SM version {sm_version} is not supported. "
+                    f"CuteDSL FP8 Group Gemm only supports SM100 and SM103. Skipping all tactics."
                 )
                 return []
             m, k, n = inputs[0].shape[0], inputs[0].shape[1], inputs[1].shape[1]

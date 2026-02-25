@@ -110,8 +110,8 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    not isSM100Family(),
-    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "k, n",
@@ -220,8 +220,8 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
 
 @pytest.mark.skipif(
-    not isSM100Family(),
-    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "k, n",

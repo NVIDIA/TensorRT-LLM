@@ -1004,27 +1004,27 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
             input = input.to(torch.bfloat16) * module.input_scale
         assert input.dtype == torch.bfloat16
 
-        if is_sm_100f():
-            if module.use_cute_dsl_blockscaling_mm or module.disable_deep_gemm:
-                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
-                    input)
-                output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-                    act_input_fp8, module.weight, act_input_sf,
-                    module.weight_scale)
-            else:
-                output = torch.ops.trtllm.fp8_swap_ab_gemm(
-                    input,
-                    module.weight,
-                    module.weight_scale,
-                    disable_ue8m0_cast=True,
-                )
-        elif get_sm_version() == 120:
-            act_input_fp8, act_input_sf = per_token_quant_and_transform(input)
-            output = torch.ops.trtllm.fp8_block_scaling_gemm(
-                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
-        else:
+        sm_version = get_sm_version()
+        if (module.use_cute_dsl_blockscaling_mm
+                or module.disable_deep_gemm) and sm_version in (100, 103):
             act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
                 input)
+            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                act_input_fp8, module.weight, act_input_sf, module.weight_scale)
+        elif is_sm_100f() and not module.disable_deep_gemm:
+            output = torch.ops.trtllm.fp8_swap_ab_gemm(
+                input,
+                module.weight,
+                module.weight_scale,
+                disable_ue8m0_cast=True,
+            )
+        else:
+            if sm_version == 120:
+                act_input_fp8, act_input_sf = per_token_quant_and_transform(
+                    input)
+            else:
+                act_input_fp8, act_input_sf = torch.ops.trtllm.fp8_quantize_1x128(
+                    input)
             output = torch.ops.trtllm.fp8_block_scaling_gemm(
                 act_input_fp8, module.weight, act_input_sf, module.weight_scale)
 
