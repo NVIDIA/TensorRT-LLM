@@ -126,6 +126,16 @@ RUN GITHUB_MIRROR=${GITHUB_MIRROR} bash ./install_triton.sh && \
     rm install_triton.sh && \
     rm install_mooncake.sh
 
+# Install CI tooling packages (ssh, rsync, libffi-dev) needed during Jenkins test runs
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    autossh \
+    libffi-dev \
+    openssh-client \
+    openssh-server \
+    rsync \
+    sshpass \
+    && rm -rf /var/lib/apt/lists/*
+
 FROM ${DEVEL_IMAGE} AS wheel
 WORKDIR /src/tensorrt_llm
 COPY benchmarks benchmarks
