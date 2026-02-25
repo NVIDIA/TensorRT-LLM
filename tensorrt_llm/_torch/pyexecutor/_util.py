@@ -588,6 +588,10 @@ class KvCacheCreator:
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
             effective_draft_config)
 
+        # Use V2 if enabled and the base class is KVCacheManager
+        if draft_kv_cache_manager_cls == KVCacheManager and self._kv_cache_config.use_kv_cache_manager_v2:
+            draft_kv_cache_manager_cls = KVCacheManagerV2
+
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,

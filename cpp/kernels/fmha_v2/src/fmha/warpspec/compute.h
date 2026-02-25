@@ -665,6 +665,15 @@ struct Compute
             {
                 cbr_v.wait();
             }
+
+#pragma unroll
+            // Advance V descriptor by the same amount as the BMM2 loop would,
+            // so that the descriptor stays in sync for subsequent KV steps.
+            for (int kbi = 0; kbi < BMM2_MMAS_K_GROUPS - 1; kbi++)
+            {
+                ctile_o.increment_gmma_desc_group();
+            }
+
             return;
         }
 
