@@ -1015,29 +1015,27 @@ class SequenceInfo:
             self._store_arg("cache_loc", cache_loc)
             self._store_arg("pages_per_seq", pages_per_seq)
 
-            # Auto-compute page_seq_indices and page_in_seq from pages_per_seq using
-            # vectorized torch ops. This avoids the slow Python-list-to-tensor conversion
-            # that dominates host time for large page counts (e.g., 50k ISL models).
+            # Resolve cu_num_pages: use caller-provided value or derive from pages_per_seq
+            if cu_num_pages is None:
+                pps_t = self._args_list["pages_per_seq"]
+                cu_num_pages = torch.zeros(len(pps_t) + 1, dtype=torch.int)
+                cu_num_pages[1:] = pps_t.cumsum(0)
+            self._store_arg("cu_num_pages", cu_num_pages)
+
+            # Compute page_seq_indices and page_in_seq using vectorized torch ops,
+            # reusing the stored cu_num_pages tensor instead of recomputing the cumsum.
             # page_seq_indices[j] = which sequence page j belongs to
             # page_in_seq[j] = which page within that sequence (0-indexed)
             pages_per_seq_t = self._args_list["pages_per_seq"]
+            cu_pages_t = self._args_list["cu_num_pages"]
             seq_indices = torch.arange(len(pages_per_seq), dtype=torch.int)
             page_seq_indices_t = torch.repeat_interleave(seq_indices, pages_per_seq_t)
-            cu_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
-            cu_pages[1:] = pages_per_seq_t.cumsum(0)
-            total_pages = cu_pages[-1].item()
+            total_pages = cu_pages_t[-1].item()
             page_in_seq_t = torch.arange(total_pages, dtype=torch.int) - torch.repeat_interleave(
-                cu_pages[:-1], pages_per_seq_t
+                cu_pages_t[:-1], pages_per_seq_t
             )
             self._store_arg("page_seq_indices", page_seq_indices_t)
             self._store_arg("page_in_seq", page_in_seq_t)
-
-        if cu_num_pages is None:
-            pps_t = self._args_list["pages_per_seq"]
-            cu_num_pages = torch.zeros(len(pps_t) + 1, dtype=torch.int)
-            cu_num_pages[1:] = pps_t.cumsum(0)
-            cu_num_pages = cu_num_pages.tolist()
-        self._store_arg("cu_num_pages", cu_num_pages)
 
         # update sequence length with cache
         if seq_len_with_cache is None:
