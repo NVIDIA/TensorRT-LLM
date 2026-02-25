@@ -2961,7 +2961,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     sh "env | sort"
     sh "ccache -sv"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", false, true)
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }

@@ -316,10 +316,10 @@ def setupPipelineEnvironment(pipeline, testFilter, globalVars)
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
     if (env.gitlabMergeRequestLastCommit) {
         env.gitlabCommit = env.gitlabMergeRequestLastCommit
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     } else {
         branch = env.gitlabBranch ? env.gitlabBranch : "main"
-        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, branch, LLM_ROOT, false, true)
         checkoutCommit = sh (script: "cd ${LLM_ROOT} && git rev-parse HEAD",returnStdout: true).trim()
         env.gitlabCommit = checkoutCommit
     }
@@ -400,13 +400,13 @@ def launchReleaseCheck(pipeline)
         sh "pip3 config set global.break-system-packages true"
         sh "git config --global --add safe.directory \"*\""
         // Step 1: Clone TRT-LLM source codes
-        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
         sh "cd ${LLM_ROOT} && git config --unset-all core.hooksPath"
 
         // Step 2: Run guardwords scan
         def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
         if (env.alternativeTRT || isOfficialPostMergeJob) {
-            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, true, true)
+            trtllm_utils.checkoutSource(SCAN_REPO, SCAN_COMMIT, SCAN_ROOT, false, true)
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${SCAN_ROOT} && pip3 install -e .")
             try {
                 ignoreList = [
