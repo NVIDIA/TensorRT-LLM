@@ -374,6 +374,12 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        fields = ["_seq_lens", "_seq_lens_cuda"]
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            fields.append("kv_lens_cuda")
+        attn_metadata.prepare_for_spec_dec(*fields)
+
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
     def forward(self,
