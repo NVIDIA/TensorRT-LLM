@@ -13,9 +13,12 @@ attention_dp_config:
   batching_wait_iters: 0
   enable_balance: true
   timeout_iters: 60
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true
 backend: pytorch
-max_num_tokens: 1600
+max_num_tokens: 2112
 max_seq_len: 2068

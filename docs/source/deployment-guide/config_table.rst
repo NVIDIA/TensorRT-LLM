@@ -14,7 +14,7 @@
 .. list-table::
    :width: 100%
    :header-rows: 1
-   :widths: 12 15 15 13 20 25
+   :widths: 10 15 15 13 18 29
 
    * - GPU
      - Performance Profile
@@ -449,7 +449,7 @@
 .. list-table::
    :width: 100%
    :header-rows: 1
-   :widths: 12 15 15 13 20 25
+   :widths: 10 15 15 13 18 29
 
    * - GPU
      - Performance Profile
@@ -536,7 +536,7 @@
      - `8k1k_tp4_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml>`_
      - ``trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml``
    * - 4xB200_NVL
-     - Balanced
+     - Low Latency
      - 8192 / 1024
      - 32
      - `8k1k_tp4_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc32.yaml>`_
@@ -559,6 +559,12 @@
      - 256
      - `8k1k_tp4_conc256.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml>`_
      - ``trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml``
+   * - 4xB200_NVL
+     - High Throughput
+     - 8192 / 1024
+     - 1024
+     - `8k1k_tp4_conc1024.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc1024.yaml>`_
+     - ``trtllm-serve nvidia/DeepSeek-R1-0528-FP4-v2 --config ${TRTLLM_DIR}/examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc1024.yaml``
    * - 4xB200_NVL
      - Max Throughput
      - 8192 / 1024
@@ -782,7 +788,7 @@
 .. list-table::
    :width: 100%
    :header-rows: 1
-   :widths: 12 15 15 13 20 25
+   :widths: 10 15 15 13 18 29
 
    * - GPU
      - Performance Profile
