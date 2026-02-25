@@ -1696,8 +1696,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
 
-        # Plus 1 for cuda graph dummy request
-        self.index_mapper = IndexMapper(max_batch_size + 1, max_beam_width)
+        # With pipeline parallelism, multiple microbatches can be in-flight
+        # simultaneously, so we need slots for all concurrent sequences.
+        # Plus 1 for cuda graph dummy request.
+        max_num_sequences = max_batch_size * mapping.pp_size
+        self.index_mapper = IndexMapper(max_num_sequences + 1, max_beam_width)
         self.index_scales = torch.empty(self.num_pools,
                                         dtype=torch.int32,
                                         pin_memory=prefer_pinned(),
@@ -1720,7 +1723,7 @@ class KVCacheManagerV2(BaseResourceManager):
 
         self.host_kv_cache_block_offsets = torch.empty(
             self.num_pools,
-            (max_batch_size + 1) * max_beam_width,
+            (max_num_sequences + 1) * max_beam_width,
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
@@ -2122,6 +2125,8 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
+        if request.py_request_id not in self.kv_cache_map:
+            return
         kv_cache = self.kv_cache_map.pop(request.py_request_id)
         if (self.enable_block_reuse and not request.is_dummy_request
                 and request.context_current_position
@@ -2249,8 +2254,8 @@ class KVCacheManagerV2(BaseResourceManager):
         pool_handled = set()
 
         # Handle each layer from start to end to traverse the whole KV cache.
-        for layer_id in typed_range(LayerId(self.num_local_layers)):
-            pool_id = self.layer_to_pool_mapping_dict[layer_id]
+        for layer_id, layer_offset in self.layer_offsets.items():
+            pool_id = self.layer_to_pool_mapping_dict[layer_offset]
             if pool_id in pool_handled:
                 continue
             buffer = self.get_buffers(layer_id)
