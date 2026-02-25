@@ -467,12 +467,15 @@ class PyResult:
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
-        return self._log_probs and hasattr(
-            self._log_probs, 'log_probs') and self._log_probs.log_probs
+        if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
+            return None
+        return self._log_probs.log_probs
 
     @property
     def cum_log_probs(self) -> list[float] | None:
-        return self._log_probs and self._log_probs.cum_log_probs
+        if not self._log_probs or not hasattr(self._log_probs, 'cum_log_probs'):
+            return None
+        return self._log_probs.cum_log_probs
 
     @property
     def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:

@@ -24,6 +24,7 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
+from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
@@ -289,16 +290,33 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
-            if finish_reasons[
-                    src_idx] != tllm.FinishReason.CANCELLED and self.use_trtllm_sampler:
-                # Check if logprobs is a list (not a dict or other structure)
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 if len(output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-            assert len(
-                output.logprobs
-            ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
+
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs) >= output.length - 1, (
+                        f"logprobs length: {len(output.logprobs)} < "
+                        f"output.length - 1: {output.length - 1}")
+                    if len(output.logprobs) < output.length:
+                        logger.warning(
+                            "Disaggregated serving: logprobs for the first "
+                            "generated token were not transferred from the "
+                            "context server. The response will contain %d "
+                            "logprob entries instead of %d. Ensure "
+                            "logprobs are requested on both context and "
+                            "generation servers.", len(output.logprobs),
+                            output.length)
+                else:
+                    assert len(output.logprobs) == output.length, (
+                        f"logprobs length: {len(output.logprobs)} != "
+                        f"output.length: {output.length}")
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -449,6 +467,22 @@ class GenerationResultBase:
                 self._handle_sequence(finish_reasons, response_result,
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
+
+            # Logprobs are computed at the Python level and have no
+            # corresponding field in the C++ ContextPhaseParams. Embed them
+            # into opaque_state so the generation_only side can extract them
+            # without adding a new public API field to DisaggregatedParams.
+            if (context_phase_params is not None
+                    and self._disaggregated_params is not None):
+                first_gen_lp = [
+                    out.logprobs[0] for out in self._outputs if out.logprobs
+                ]
+                if first_gen_lp and self._disaggregated_params.opaque_state:
+                    from ..disaggregated_params import wrap_opaque_extras
+                    self._disaggregated_params.opaque_state = \
+                        wrap_opaque_extras(
+                            self._disaggregated_params.opaque_state,
+                            first_gen_log_probs=first_gen_lp)
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
