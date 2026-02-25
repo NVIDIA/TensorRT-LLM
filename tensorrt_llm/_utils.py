@@ -333,6 +333,11 @@ _torch_to_np_dtype_dict = {
 }
 
 
+def get_torch_dtype_to_np(dtype):
+    """Return the numpy dtype for a torch dtype, or None if not supported."""
+    return _torch_to_np_dtype_dict.get(dtype)
+
+
 def torch_dtype_to_np(dtype):
     ret = _torch_to_np_dtype_dict.get(dtype)
     assert ret is not None, f'Unsupported dtype: {dtype}'
