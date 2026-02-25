@@ -16,6 +16,7 @@ from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
+from tensorrt_llm.bindings.internal.batch_manager import KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -1981,13 +1982,10 @@ class KVCacheManagerV2(BaseResourceManager):
             request)
 
     def get_kv_cache_stats(self):
+        kv_cache_stats = KvCacheStats()
+        kv_cache_stats.allocated_bytes = self.impl.get_quota(GPU_LEVEL)
 
-        class KVCacheStatus:
-
-            def __init__(self, allocated_bytes: int):
-                self.allocated_bytes = allocated_bytes
-
-        return KVCacheStatus(allocated_bytes=self.impl.get_quota(GPU_LEVEL))
+        return kv_cache_stats
 
     def get_block_ids_per_seq(self, request_ids: List[int]) -> torch.Tensor:
         block_ids_per_seq = self.get_batch_cache_indices(request_ids)
@@ -2022,6 +2020,18 @@ class KVCacheManagerV2(BaseResourceManager):
 
         beam_width = max_beam_width
         requests = []
+
+        def release_resources(current_request: LlmRequest,
+                              free_draft_resources: bool = False) -> None:
+            for req in requests:
+                self.free_resources(req)
+            self.free_resources(current_request)
+            if draft_kv_cache_manager is not None:
+                for req in requests:
+                    draft_kv_cache_manager.free_resources(req)
+                if free_draft_resources:
+                    draft_kv_cache_manager.free_resources(current_request)
+
         for i, req_id in enumerate(request_ids):
             # exact choice of n can be ignored for dummy requests
             sampling_params = SamplingParams(n=beam_width,
@@ -2051,17 +2061,14 @@ class KVCacheManagerV2(BaseResourceManager):
                 assert kv_cache.num_committed_tokens == 0
                 success = kv_cache.resume(self._stream.cuda_stream)
                 if not success:
-                    for r in requests:
-                        self.free_resources(r)
-                    self.free_resources(req)
+                    release_resources(req)
                     return None
                 kv_cache.stop_committing()
                 dummy_capacity = token_num + self.num_extra_kv_tokens + num_extra_decoding_steps
                 success = kv_cache.resize(dummy_capacity)
                 if not success:
-                    raise ValueError(
-                        f"Failed to resize capacity of KV cache for request {req.py_request_id} to {dummy_capacity} tokens for dummy request"
-                    )
+                    release_resources(req)
+                    return None
                 draft_kv_cache = None
                 if draft_kv_cache_manager is not None:
                     draft_kv_cache = draft_kv_cache_manager._create_kv_cache(
@@ -2069,18 +2076,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     success = draft_kv_cache.resume(
                         torch.cuda.current_stream().cuda_stream)
                     if not success:
-                        for r in requests:
-                            self.free_resources(r)
-                            draft_kv_cache.free_resources(r)
-                        self.free_resources(req)
-                        draft_kv_cache.free_resources(req)
+                        release_resources(req, free_draft_resources=True)
                         return None
                     draft_kv_cache.stop_committing()
                     success = draft_kv_cache.resize(dummy_capacity)
                     if not success:
-                        raise ValueError(
-                            f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {dummy_capacity} tokens for dummy request"
-                        )
+                        release_resources(req, free_draft_resources=True)
+                        return None
 
             if is_gen:
                 req.state = LlmRequestState.GENERATION_IN_PROGRESS
@@ -2277,7 +2279,7 @@ class KVCacheManagerV2(BaseResourceManager):
         for kv_cache in self.kv_cache_map.values():
             kv_cache.close()
         self.kv_cache_map.clear()
-        self.impl.clear_reusable_blocks()
+        self.impl.shutdown()
 
     def get_max_resource_count(self) -> int:
         # TODO: implement this
@@ -2352,7 +2354,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         req.get_tokens(DEFAULT_BEAM_INDEX)
                         [kv_cache.num_committed_tokens:req.
                          context_current_position])
-                kv_cache.stop_committing()
+                if req.context_remaining_length == 0:
+                    kv_cache.stop_committing()
             else:
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:
