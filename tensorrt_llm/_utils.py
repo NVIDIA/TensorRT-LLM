@@ -1190,6 +1190,8 @@ class KVCacheEventSerializer:
 
     @staticmethod
     def _event_diff_to_json(data):
+        if data is None:
+            return None
         return {
             "type": "event_diff",
             "new_value": data.new_value,

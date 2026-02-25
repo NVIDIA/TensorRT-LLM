@@ -457,6 +457,12 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
 
+    // Step 6: packaging attribution files into tarfile when they exist
+    sh "mkdir -p TensorRT-LLM/attribution"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/missing_files.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/file_mappings.json TensorRT-LLM/attribution/ || true"
+
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
         sh "pigz --version || true"

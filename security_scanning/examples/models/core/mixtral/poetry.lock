@@ -33,14 +33,14 @@ testing = ["bitsandbytes", "datasets", "deepspeed", "evaluate", "parameterized",
 
 [[package]]
 name = "certifi"
-version = "2026.1.4"
+version = "2026.2.25"
 description = "Python package for providing Mozilla's CA Bundle."
 optional = false
 python-versions = ">=3.7"
 groups = ["main"]
 files = [
-    {file = "certifi-2026.1.4-py3-none-any.whl", hash = "sha256:9943707519e4add1115f44c2bc244f782c0249876bf51b6599fee1ffbedd685c"},
-    {file = "certifi-2026.1.4.tar.gz", hash = "sha256:ac726dd470482006e014ad384921ed6438c457018f4b3d204aea4281258b2120"},
+    {file = "certifi-2026.2.25-py3-none-any.whl", hash = "sha256:027692e4402ad994f1c42e52a4997a9763c646b73e4096e4d5d6db8af1d6f0fa"},
+    {file = "certifi-2026.2.25.tar.gz", hash = "sha256:e887ab5cee78ea814d3472169153c2d12cd43b14bd03329a39a9c6e2e80bfba7"},
 ]
 
 [[package]]
@@ -287,35 +287,38 @@ tqdm = ["tqdm"]
 
 [[package]]
 name = "hf-xet"
-version = "1.2.0"
+version = "1.3.1"
 description = "Fast transfer of large files with the Hugging Face Hub."
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 markers = "platform_machine == \"x86_64\" or platform_machine == \"amd64\" or platform_machine == \"arm64\" or platform_machine == \"aarch64\""
 files = [
-    {file = "hf_xet-1.2.0-cp313-cp313t-macosx_10_12_x86_64.whl", hash = "sha256:ceeefcd1b7aed4956ae8499e2199607765fbd1c60510752003b6cc0b8413b649"},
-    {file = "hf_xet-1.2.0-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:b70218dd548e9840224df5638fdc94bd033552963cfa97f9170829381179c813"},
-    {file = "hf_xet-1.2.0-cp313-cp313t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:7d40b18769bb9a8bc82a9ede575ce1a44c75eb80e7375a01d76259089529b5dc"},
-    {file = "hf_xet-1.2.0-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:cd3a6027d59cfb60177c12d6424e31f4b5ff13d8e3a1247b3a584bf8977e6df5"},
-    {file = "hf_xet-1.2.0-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:6de1fc44f58f6dd937956c8d304d8c2dea264c80680bcfa61ca4a15e7b76780f"},
-    {file = "hf_xet-1.2.0-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:f182f264ed2acd566c514e45da9f2119110e48a87a327ca271027904c70c5832"},
-    {file = "hf_xet-1.2.0-cp313-cp313t-win_amd64.whl", hash = "sha256:293a7a3787e5c95d7be1857358a9130694a9c6021de3f27fa233f37267174382"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:10bfab528b968c70e062607f663e21e34e2bba349e8038db546646875495179e"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:2a212e842647b02eb6a911187dc878e79c4aa0aa397e88dd3b26761676e8c1f8"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:30e06daccb3a7d4c065f34fc26c14c74f4653069bb2b194e7f18f17cbe9939c0"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:29c8fc913a529ec0a91867ce3d119ac1aac966e098cf49501800c870328cc090"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:66e159cbfcfbb29f920db2c09ed8b660eb894640d284f102ada929b6e3dc410a"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:9c91d5ae931510107f148874e9e2de8a16052b6f1b3ca3c1b12f15ccb491390f"},
-    {file = "hf_xet-1.2.0-cp314-cp314t-win_amd64.whl", hash = "sha256:210d577732b519ac6ede149d2f2f34049d44e8622bf14eb3d63bbcd2d4b332dc"},
-    {file = "hf_xet-1.2.0-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:46740d4ac024a7ca9b22bebf77460ff43332868b661186a8e46c227fdae01848"},
-    {file = "hf_xet-1.2.0-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:27df617a076420d8845bea087f59303da8be17ed7ec0cd7ee3b9b9f579dff0e4"},
-    {file = "hf_xet-1.2.0-cp37-abi3-manylinux_2_17_x86_64.manylinux2014_x86_64.whl", hash = "sha256:3651fd5bfe0281951b988c0facbe726aa5e347b103a675f49a3fa8144c7968fd"},
-    {file = "hf_xet-1.2.0-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:d06fa97c8562fb3ee7a378dd9b51e343bc5bc8190254202c9771029152f5e08c"},
-    {file = "hf_xet-1.2.0-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:4c1428c9ae73ec0939410ec73023c4f842927f39db09b063b9482dac5a3bb737"},
-    {file = "hf_xet-1.2.0-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:a55558084c16b09b5ed32ab9ed38421e2d87cf3f1f89815764d1177081b99865"},
-    {file = "hf_xet-1.2.0-cp37-abi3-win_amd64.whl", hash = "sha256:e6584a52253f72c9f52f9e549d5895ca7a471608495c4ecaa6cc73dba2b24d69"},
-    {file = "hf_xet-1.2.0.tar.gz", hash = "sha256:a8c27070ca547293b6890c4bf389f713f80e8c478631432962bb7f4bc0bd7d7f"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-macosx_10_12_x86_64.whl", hash = "sha256:08b231260c68172c866f7aa7257c165d0c87887491aafc5efeee782731725366"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:0810b69c64e96dee849036193848007f665dca2311879c9ea8693f4fc37f1795"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:ecd38f98e7f0f41108e30fd4a9a5553ec30cf726df7473dd3e75a1b6d56728c2"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:65411867d46700765018b1990eb1604c3bf0bf576d9e65fc57fdcc10797a2eb9"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-musllinux_1_2_aarch64.whl", hash = "sha256:1684c840c60da12d76c2a031ba40e4b154fdbf9593836fcf5ff090d95a033c61"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-musllinux_1_2_x86_64.whl", hash = "sha256:b3012c0f2ce1f0863338491a2bc0fd3f84aded0e147ab25f230da1f5249547fd"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-win_amd64.whl", hash = "sha256:4eb432e1aa707a65a7e1f8455e40c5b47431d44fe0fb1b0c5d53848c27469398"},
+    {file = "hf_xet-1.3.1-cp313-cp313t-win_arm64.whl", hash = "sha256:e56104c84b2a88b9c7b23ba11a2d7ed0ccbe96886b3f985a50cedd2f0e99853f"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-macosx_10_12_x86_64.whl", hash = "sha256:6517a245e41df3eae5adc5f9e8c86fa52abd548de798cbcd989f0082152860aa"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:4a322d506c513f98fdc1aa2aaa825daefd535b686e80ca789e6d33fcb146f524"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:8f16ec9d26badec46334a798e01b5d86af536924789c95b1a1ec6a05f26523e0"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:e1f5d72bd5b73e61530fff573bcff34bdb64af2bf4862cdd516e6c1dab4dc75b"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-musllinux_1_2_aarch64.whl", hash = "sha256:4bc71afd853508b2ddf123b8fc9de71b0afa4c956ec730b69fb76103781e94cd"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-musllinux_1_2_x86_64.whl", hash = "sha256:541b4b00ed294ae6cfd9416de9506e58971013714d7316189c9638ed54e362d4"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-win_amd64.whl", hash = "sha256:f85480b4fe3e8e4cdbc59ef1d235152b732fd57ca439cc983c291892945ae818"},
+    {file = "hf_xet-1.3.1-cp314-cp314t-win_arm64.whl", hash = "sha256:83a8830160392ef4bea78d443ea2cf1febe65783b3843a8f12c64b368981e7e2"},
+    {file = "hf_xet-1.3.1-cp37-abi3-macosx_10_12_x86_64.whl", hash = "sha256:581d1809a016f7881069d86a072168a8199a46c839cf394ff53970a47e4f1ca1"},
+    {file = "hf_xet-1.3.1-cp37-abi3-macosx_11_0_arm64.whl", hash = "sha256:329c80c86f2dda776bafd2e4813a46a3ee648dce3ac0c84625902c70d7a6ddba"},
+    {file = "hf_xet-1.3.1-cp37-abi3-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:2973c3ff594c3a8da890836308cae1444c8af113c6f10fe6824575ddbc37eca7"},
+    {file = "hf_xet-1.3.1-cp37-abi3-manylinux_2_28_aarch64.whl", hash = "sha256:ed4bfd2e6d10cb86c9b0f3483df1d7dd2d0220f75f27166925253bacbc1c2dbe"},
+    {file = "hf_xet-1.3.1-cp37-abi3-musllinux_1_2_aarch64.whl", hash = "sha256:713913387cc76e300116030705d843a9f15aee86158337eeffb9eb8d26f47fcd"},
+    {file = "hf_xet-1.3.1-cp37-abi3-musllinux_1_2_x86_64.whl", hash = "sha256:e5063789c9d21f51e9ed4edbee8539655d3486e9cad37e96b7af967da20e8b16"},
+    {file = "hf_xet-1.3.1-cp37-abi3-win_amd64.whl", hash = "sha256:607d5bbc2730274516714e2e442a26e40e3330673ac0d0173004461409147dee"},
+    {file = "hf_xet-1.3.1-cp37-abi3-win_arm64.whl", hash = "sha256:851b1be6597a87036fe7258ce7578d5df3c08176283b989c3b165f94125c5097"},
+    {file = "hf_xet-1.3.1.tar.gz", hash = "sha256:513aa75f8dc39a63cc44dbc8d635ccf6b449e07cdbd8b2e2d006320d2e4be9bb"},
 ]
 
 [package.extras]

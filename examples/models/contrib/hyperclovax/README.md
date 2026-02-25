@@ -224,7 +224,7 @@ trtllm-build \
 ```
 
 ### Run Engine
-Test your engine with the [run.py](../run.py) script:
+Test your engine with the [run.py](../../../run.py) script:
 
 ```bash
 python3 ../../../run.py \

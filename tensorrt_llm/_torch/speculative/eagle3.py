@@ -272,7 +272,8 @@ class Eagle3SpecMetadata(SpecMetadata):
                 to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
                 eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
                                      self.hidden_size].index_copy_(
-                                         0, token_idx, to_save)
+                                         0, token_idx,
+                                         to_save[:self.num_tokens])
                 break
 
     def get_hidden_states(self):

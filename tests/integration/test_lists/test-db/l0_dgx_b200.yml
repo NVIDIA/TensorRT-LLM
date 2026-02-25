@@ -16,9 +16,30 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
+  # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEPLowLatency]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[NVLinkTwoSided]
+  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
+  # --- CUTLASS ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and None"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not MXFP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  # --- TRTLLM ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
+  # --- CUTEDSL (NVFP4 only) ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
+  # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM"
+  # ------------- MoE: test_multi_gpu_eplb ---------------
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
+  # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-False-True-True]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-True-True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[tep4_latency_moe_trtllm-torch_compile=True]
@@ -204,12 +225,18 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-one_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-one_model-no_overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-two_model-no_overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-one_model-no_overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-two_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-no_overlap_scheduler]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]

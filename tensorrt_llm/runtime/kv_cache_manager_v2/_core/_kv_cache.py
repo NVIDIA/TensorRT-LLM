@@ -71,6 +71,7 @@ from .._utils import (
     unwrap_rawref,
     value_or,
 )
+from ._moving_average import Average
 
 if TYPE_CHECKING:
     from ._kv_cache_manager import KVCacheManager
@@ -174,6 +175,8 @@ class _KVCache:
         "_num_committed_blocks",
         "_finish_event",
         "_tokens_per_block",
+        "_avg_history_length",
+        "_avg_capacity",
         "__rawref__",
     )
 
@@ -208,6 +211,8 @@ class _KVCache:
     _finish_event: CachedCudaEvent | None
 
     _tokens_per_block: int
+    _avg_history_length: Average
+    _avg_capacity: Average
 
     def __init__(
         self,
@@ -229,11 +234,11 @@ class _KVCache:
         self._commit_state = self.CommitState.ALLOWED
         self._blocks = cast(TypedIndexList, [])
         self._base_page_indices = make_typed(
-            lambda: make_typed(lambda: array.array("i"), self.manager._storage.num_life_cycles),
+            lambda _: make_typed(lambda _: array.array("i"), self.manager._storage.num_life_cycles),
             self.beam_width,
         )
         self._page_indices = make_typed(
-            lambda: make_typed(lambda: array.array("i"), self.manager._storage.num_life_cycles),
+            lambda _: make_typed(lambda _: array.array("i"), self.manager._storage.num_life_cycles),
             self.beam_width,
         )
         self._committed_tokens = []
@@ -243,6 +248,13 @@ class _KVCache:
         self.__rawref__ = rawref.NULL
         if input_tokens is not None:
             self._setup_for_reuse(input_tokens)
+        self._avg_history_length = Average()
+        self._avg_capacity = Average()
+        self._avg_history_length.update(self.history_length)
+        self._avg_capacity.update(self.capacity)
+        manager._living_kv_caches.add(rawref.ref(self))
+        manager._avg_reused_length.update(self.history_length)
+        manager._num_created_kv_caches += 1
         assert NDEBUG or self._check_sanity()
 
     def set_page_index_buf(
@@ -321,9 +333,15 @@ class _KVCache:
             return
         self.stop_committing()
         assert NDEBUG or self._check_sanity()
+        manager = self.manager
+        manager._avg_sqr_capacity.update(self._avg_capacity.value**2)
+        manager._avg_sqr_history_length.update(self._avg_history_length.value**2)
+        manager._try_update_target_ratios()
         with self._record_event():
             self._clear_blocks()
         self._status = self.Status.CLOSED
+        manager._living_kv_caches.remove(self.__rawref__)
+        manager._num_closed_kv_caches += 1
 
     def __del__(self) -> None:
         self.close()
@@ -406,8 +424,14 @@ class _KVCache:
         assert self.status == self.Status.ACTIVE
         tokens_per_block = self.tokens_per_block
         assert div_up(self._capacity, tokens_per_block) == len(self._blocks)
-        capacity = value_or(capacity, self._capacity)
-        history_length = value_or(history_length, self._history_length)
+        if capacity is None:
+            capacity = self._capacity
+        else:
+            self._avg_capacity.update(capacity)
+        if history_length is None:
+            history_length = self._history_length
+        else:
+            self._avg_history_length.update(history_length)
         if history_length < self._history_length:
             raise ValueError("History length cannot be decreased")
         if capacity < history_length:
@@ -466,7 +490,7 @@ class _KVCache:
             )
             for ordinal in typed_range(old_num_blocks, new_num_blocks):
                 block = make_typed(
-                    lambda: filled_list(cast(BlockPage, None), num_life_cycles), beam_width
+                    lambda _: filled_list(cast(BlockPage, None), num_life_cycles), beam_width
                 )
                 for beam_index in typed_range(beam_width):
                     for lc in typed_range(num_life_cycles):
@@ -917,7 +941,7 @@ class _KVCache:
         tokens_per_block = manager.tokens_per_block
         assert all(b[1] == tokens_per_block for b in matched[:-1])
 
-        def get_num_matched_tokens(_):
+        def get_num_matched_tokens(_):  # @fixme: remove the _ parameter
             return tokens_per_block * (len(matched) - 1) + matched[-1][1] if matched else 0
 
         life_cycles = manager._life_cycles
@@ -984,7 +1008,7 @@ class _KVCache:
             [
                 SeqBlock(
                     make_typed(
-                        lambda: filled_list(cast(BlockPage, None), life_cycles.size),
+                        lambda _: filled_list(cast(BlockPage, None), life_cycles.size),
                         self.beam_width,
                     ),
                     b[0] if b[1] == tokens_per_block else None,
@@ -993,7 +1017,10 @@ class _KVCache:
             ],
         )
 
+        storage = manager._storage
+        lc2pg = storage._life_cycle_grouping
         beam_idx = DEFAULT_BEAM_INDEX
+
         for lc_idx, lc in life_cycles.items():
             stale_start, stale_end = _KVCache._get_stale_range(
                 tokens_per_block, get_num_matched_tokens(matched), lc
@@ -1009,16 +1036,13 @@ class _KVCache:
                 # make copy for partial blocks.
                 assert ordinal == len(matched) - 1 and self._blocks[ordinal].tree_block is None
                 page = holder.page
-                assert page.manager is manager._storage
-                storage = manager._storage
-                num_slots = filled_list(0, life_cycles.size)
-                num_slots[lc_idx] = 1
-                pg_idx = storage.get_pool_group_index(lc_idx)
-                # try to fine one slot in any cache level
-                for i in range(manager._storage.num_cache_levels):
+                assert page.manager is storage
+                pg_idx = lc2pg[lc_idx]
+                # try to find one slot in any cache level
+                for i in range(storage.num_cache_levels):
                     lvl = CacheLevel(i + page.cache_level)
                     try:
-                        slot = storage.new_slots(lvl, num_slots)[lc_idx][0]
+                        slot = storage.new_slots_for_pool_group(lvl, pg_idx, 1)[0]
                     except OutOfPagesError:
                         continue
                     except Exception:
