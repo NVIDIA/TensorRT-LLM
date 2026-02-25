@@ -322,7 +322,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("missed_blocks", &tbk::KvCacheStats::missedBlocks)
         .def_rw("cache_hit_rate", &tbk::KvCacheStats::cacheHitRate)
         .def_rw("num_free_blocks_per_window_size", &tbk::KvCacheStats::numFreeBlocksPerWindowSize)
-        .def_ro("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
+        .def_rw("allocated_bytes", &tbk::KvCacheStats::allocatedBytes);
 
     nb::class_<tbk::TempAttentionWindowInputs>(m, "TempAttentionWindowInputs")
         .def(nb::init<>())
