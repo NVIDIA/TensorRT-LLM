@@ -1486,14 +1486,31 @@ class MLA(nn.Module):
 
         # TODO: fuse wq_b + (indexer) wlq here
         q = self.q_b_proj(q)
-        # Indexer
-        topk_indices = self.indexer(
-            qr,
-            hidden_states,
-            attn_metadata,
-            position_ids,
-            indexer_k=indexer_k,  # indexer K proj
-        )
+
+        # Check if the short-seq MHA path will handle context, in which case
+        # the indexer (topk_indices) is not needed for context tokens.
+        use_short_mha_for_ctx = (
+            num_contexts > 0
+            and self.short_seq_mha_threshold > 0
+            and not self.apply_rotary_emb
+            and self.mapping.cp_size == 1
+            and position_ids is not None
+            and attn_metadata.max_ctx_seq_len
+            <= self.short_seq_mha_threshold)
+
+        # Skip the indexer entirely when the short MHA path handles all
+        # context tokens and there are no generation tokens.
+        if use_short_mha_for_ctx and num_generations == 0:
+            topk_indices = None
+        else:
+            # Indexer
+            topk_indices = self.indexer(
+                qr,
+                hidden_states,
+                attn_metadata,
+                position_ids,
+                indexer_k=indexer_k,  # indexer K proj
+            )
 
         assert q.shape[
             0] == num_tokens, f"Expect q.shape[0] to be {num_tokens}, but got {q.shape[0]}"
@@ -1516,7 +1533,7 @@ class MLA(nn.Module):
                 attn_metadata,
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
-                topk_indices=topk_indices[:num_ctx_tokens, :],
+                topk_indices=topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None,
                 position_ids=position_ids,
             )
 

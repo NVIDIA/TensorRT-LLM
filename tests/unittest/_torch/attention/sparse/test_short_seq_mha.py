@@ -398,9 +398,6 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
                                 device=device)
     k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype,
                         device=device)
-    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype,
-                                device=device)
-    qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
     position_ids = torch.cat([
         torch.arange(slen, device=device, dtype=torch.int32)
@@ -429,21 +426,14 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     # Verify the threshold guard will trigger.
     assert attn_metadata.max_ctx_seq_len <= threshold
 
-    # Compute indexer topk_indices (required by forward_context_dsa API).
-    topk_indices = mla.mqa.indexer(
-        qr,
-        hidden_states,
-        attn_metadata,
-        position_ids,
-        indexer_k=mla.mqa.indexer.wk(hidden_states),
-    )
-
     # Clone inputs since forward_context_dsa may modify them in-place.
     q_for_ref = q.clone()
     compressed_kv_for_ref = compressed_kv.clone()
     k_pe_for_ref = k_pe.clone()
 
     # Run the actual forward (should dispatch to forward_context_short_mha).
+    # topk_indices=None: the short MHA path does not use sparse routing,
+    # so the indexer computation can be skipped entirely for short sequences.
     mla.forward_context_dsa(
         q=q,
         compressed_kv=compressed_kv,
@@ -451,7 +441,7 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
         attn_metadata=attn_metadata,
         output=output,
         latent_cache=latent_cache,
-        topk_indices=topk_indices,
+        topk_indices=None,
         position_ids=position_ids,
     )
 
@@ -523,9 +513,6 @@ def test_short_mha_boundary_threshold_equals_max_seq():
                                 device=device)
     k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype,
                         device=device)
-    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype,
-                                device=device)
-    qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
     position_ids = torch.cat([
         torch.arange(slen, device=device, dtype=torch.int32)
@@ -554,18 +541,11 @@ def test_short_mha_boundary_threshold_equals_max_seq():
     # Verify boundary: max_ctx_seq_len == threshold.
     assert attn_metadata.max_ctx_seq_len == threshold
 
-    topk_indices = mla.mqa.indexer(
-        qr,
-        hidden_states,
-        attn_metadata,
-        position_ids,
-        indexer_k=mla.mqa.indexer.wk(hidden_states),
-    )
-
     q_for_ref = q.clone()
     compressed_kv_for_ref = compressed_kv.clone()
     k_pe_for_ref = k_pe.clone()
 
+    # topk_indices=None: the short MHA path does not use sparse routing.
     mla.forward_context_dsa(
         q=q,
         compressed_kv=compressed_kv,
@@ -573,7 +553,7 @@ def test_short_mha_boundary_threshold_equals_max_seq():
         attn_metadata=attn_metadata,
         output=output,
         latent_cache=latent_cache,
-        topk_indices=topk_indices,
+        topk_indices=None,
         position_ids=position_ids,
     )
 
@@ -767,13 +747,22 @@ def test_short_mha_agrees_with_absorption_path():
         )
         attn_metadata.prepare()
 
-        topk_indices = mla_module.mqa.indexer(
-            qr.clone(),
-            hidden_states.clone(),
-            attn_metadata,
-            position_ids.clone(),
-            indexer_k=mla_module.mqa.indexer.wk(hidden_states.clone()),
-        )
+        # Only compute topk_indices when needed: the short MHA path
+        # does not use sparse routing, so the indexer can be skipped.
+        use_short_mha = (
+            mla_module.short_seq_mha_threshold > 0
+            and attn_metadata.max_ctx_seq_len
+            <= mla_module.short_seq_mha_threshold)
+        if use_short_mha:
+            topk_indices = None
+        else:
+            topk_indices = mla_module.mqa.indexer(
+                qr.clone(),
+                hidden_states.clone(),
+                attn_metadata,
+                position_ids.clone(),
+                indexer_k=mla_module.mqa.indexer.wk(hidden_states.clone()),
+            )
 
         mla_module.forward_context_dsa(
             q=q.clone(),
