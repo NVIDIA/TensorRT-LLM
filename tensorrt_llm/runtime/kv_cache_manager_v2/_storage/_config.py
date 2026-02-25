@@ -21,7 +21,14 @@ from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex
-from .._utils import HomoTuple, TypedIndexList, filled_list, get_uniform_attribute, is_sorted
+from .._utils import (
+    HomoTuple,
+    TypedIndexList,
+    filled_list,
+    get_uniform_attribute,
+    is_sorted,
+    typed_map,
+)
 
 
 class BufferId(NamedTuple):
@@ -53,7 +60,7 @@ class SlotDescVariant:
     """
 
     life_cycle_id: LifeCycleId
-    coalesced_buffers: HomoTuple[CoalescedBuffer]
+    coalesced_buffers: TypedIndexList[PoolIndex, CoalescedBuffer]
 
     def __post_init__(self) -> None:
         assert is_sorted(self.coalesced_buffers, key=lambda s: s.size, reverse=True)
@@ -63,8 +70,8 @@ class SlotDescVariant:
         return self.life_cycle_id
 
     @property
-    def slot_size_list(self) -> HomoTuple[int]:
-        return tuple(s.size for s in self.coalesced_buffers)
+    def slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
+        return typed_map(self.coalesced_buffers, lambda cb: cb.size)
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,7 +83,7 @@ class SlotDesc:
     variants: HomoTuple[SlotDescVariant]
 
     @property
-    def slot_size_list(self) -> HomoTuple[int]:
+    def slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
         return get_uniform_attribute(self.variants, lambda s: s.slot_size_list)
 
 
@@ -163,13 +170,15 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
             CoalescedBuffer(size, tuple(buffer_ids)) for size, buffer_ids in size_to_buffers.items()
         ]
         slots.sort(key=lambda p: p.size, reverse=True)
-        slot_groups.append(SlotDescVariant(life_cycle_id, tuple(slots)))
+        slot_groups.append(
+            SlotDescVariant(life_cycle_id, cast(TypedIndexList[PoolIndex, CoalescedBuffer], slots))
+        )
     # Merge slot groups with the same slot_size_list
     pool_groups_by_slot_size_list = defaultdict[HomoTuple[int], list[SlotDescVariant]](
         list[SlotDescVariant]
     )
     for slot_group in slot_groups:
-        pool_groups_by_slot_size_list[slot_group.slot_size_list].append(slot_group)
+        pool_groups_by_slot_size_list[tuple(slot_group.slot_size_list)].append(slot_group)
     slot_desc_list = cast(
         TypedIndexList[PoolGroupIndex, SlotDesc],
         [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],
