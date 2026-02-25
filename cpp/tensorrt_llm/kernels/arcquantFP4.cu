@@ -32,7 +32,6 @@ namespace
 
 #define FP4_MAX 6
 #define SCALE_EPS 0.001953125f
-#define MAX_HIDDEN_DIM 16384
 #define GROUP_NUM(x) ((x) / 16)
 
 // Fast reciprocal.
@@ -106,12 +105,6 @@ __forceinline__ __device__ int64_t get_sf_offset(int row_id, int pos, int K)
     return sf_offset;
 }
 
-struct PackFp4
-{
-    int8_t low : 4;
-    int8_t high : 4;
-};
-
 } // namespace
 
 namespace kernels
@@ -130,7 +123,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
     T* input = reinterpret_cast<T*>(hidden_states);
     __nv_fp8_e4m3* q_scale_tensor = reinterpret_cast<__nv_fp8_e4m3*>(q_scale);
     // One block solves one row of hidden states.
-    __shared__ uint8_t smem[MAX_HIDDEN_DIM * sizeof(T)];
+    extern __shared__ uint8_t smem[];
     T* input_smem = reinterpret_cast<T*>(smem);
     // Local memory stores the reordered hidden states.
     __nv_bfloat16 input_frag[elements_per_thread];
@@ -153,13 +146,13 @@ __global__ void quantize_reorder_nvfp4_kernel(
     }
     // Coalesced access global memory
     int tid = threadIdx.x;
-    int const bytes_per_iter = bdx * 16;
+    int const bytes_per_iter = bdx * sizeof(float4);
     int const iters = hidden_dim * sizeof(T) / bytes_per_iter;
 #pragma unroll
     for (int i = 0; i < iters; ++i)
     {
         // Each thread loads 16 bytes
-        int offset = i * bytes_per_iter + tid * 16;
+        int offset = i * bytes_per_iter + tid * sizeof(float4);
         *(float4*) (reinterpret_cast<uint8_t*>(input_smem) + offset)
             = *(float4*) (reinterpret_cast<uint8_t*>(input) + offset);
     }
@@ -195,10 +188,10 @@ __global__ void quantize_reorder_nvfp4_kernel(
     {
         // Prepare scaled inputs for quantization
         float scaled_inputs[4];
-        scaled_inputs[0] = (float) input_frag[i + 0] * r_scale;
-        scaled_inputs[1] = (float) input_frag[i + 1] * r_scale;
-        scaled_inputs[2] = (float) input_frag[i + 2] * r_scale;
-        scaled_inputs[3] = (float) input_frag[i + 3] * r_scale;
+        scaled_inputs[0] = __bfloat162float(input_frag[i + 0]) * r_scale;
+        scaled_inputs[1] = __bfloat162float(input_frag[i + 1]) * r_scale;
+        scaled_inputs[2] = __bfloat162float(input_frag[i + 2]) * r_scale;
+        scaled_inputs[3] = __bfloat162float(input_frag[i + 3]) * r_scale;
 
         // PTX-based quantization: converts 4 floats -> 4 e2m1 using hardware instruction
         // Uses cvt.rn.satfinite.e2m1x2.f32 which bypasses ALU pipeline
@@ -206,12 +199,11 @@ __global__ void quantize_reorder_nvfp4_kernel(
 
         // Dequantize e2m1 to float and compute residuals using PTX instructions
         float4 e2m1_float = e2m1_to_float(packed_e2m1);
-        input_frag[i + 0] = __float2bfloat16_rn((float) input_frag[i + 0] - e2m1_float.x * qdq_scale);
-        input_frag[i + 1] = __float2bfloat16_rn((float) input_frag[i + 1] - e2m1_float.y * qdq_scale);
-        input_frag[i + 2] = __float2bfloat16_rn((float) input_frag[i + 2] - e2m1_float.z * qdq_scale);
-        input_frag[i + 3] = __float2bfloat16_rn((float) input_frag[i + 3] - e2m1_float.w * qdq_scale);
+        input_frag[i + 0] = __float2bfloat16_rn(__bfloat162float(input_frag[i + 0]) - e2m1_float.x * qdq_scale);
+        input_frag[i + 1] = __float2bfloat16_rn(__bfloat162float(input_frag[i + 1]) - e2m1_float.y * qdq_scale);
+        input_frag[i + 2] = __float2bfloat16_rn(__bfloat162float(input_frag[i + 2]) - e2m1_float.z * qdq_scale);
+        input_frag[i + 3] = __float2bfloat16_rn(__bfloat162float(input_frag[i + 3]) - e2m1_float.w * qdq_scale);
 
-        // Store packed e2m1 values to PackFp4 struct
         reinterpret_cast<uint16_t*>(output_frag)[i / 4] = packed_e2m1;
     }
     int const ke_thread_count = GROUP_NUM(KE);
@@ -227,8 +219,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
                 maxv = cuda_max(maxv, __bfloat162float(cuda_abs(input_frag[i])));
             }
             scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
-            // logical_coord1 = make_coord(make_coord(0, (pos + 1) % 4), (pos + 1) / 4);
-            // q_scale_tensor(make_coord(logical_coord0, logical_coord1, logical_coord2)) = Float2Ue4m3(scale);
             sf_offset = get_sf_offset(row_id, pos + 1, K);
             __nv_fp8_e4m3 scale_ue4m3_res = (__nv_fp8_e4m3) scale;
             q_scale_tensor[sf_offset] = scale_ue4m3_res;
@@ -238,10 +228,10 @@ __global__ void quantize_reorder_nvfp4_kernel(
             {
                 // Prepare scaled residuals for quantization
                 float scaled_inputs[4];
-                scaled_inputs[0] = (float) input_frag[i + 0] * r_scale;
-                scaled_inputs[1] = (float) input_frag[i + 1] * r_scale;
-                scaled_inputs[2] = (float) input_frag[i + 2] * r_scale;
-                scaled_inputs[3] = (float) input_frag[i + 3] * r_scale;
+                scaled_inputs[0] = __bfloat162float(input_frag[i + 0]) * r_scale;
+                scaled_inputs[1] = __bfloat162float(input_frag[i + 1]) * r_scale;
+                scaled_inputs[2] = __bfloat162float(input_frag[i + 2]) * r_scale;
+                scaled_inputs[3] = __bfloat162float(input_frag[i + 3]) * r_scale;
 
                 // PTX-based quantization of residuals
                 uint16_t packed_e2m1 = fp32_vec4_to_e2m1(scaled_inputs);
@@ -281,8 +271,9 @@ void run_quantize_reorder_nvfp4(int16_t* hidden_states, float* input_scale, int1
     int hidden_dim = KQ;
     dim3 grids(seq_len);
     dim3 blocks(hidden_dim / GROUP_SIZE);
+    size_t smem_size = hidden_dim * sizeof(T);
     quantize_reorder_nvfp4_kernel<T, GROUP_SIZE, arcquant_type>
-        <<<grids, blocks, 0, stream>>>((T*) hidden_states, input_scale, reorder_index, q_out, q_scale, KQ, KE);
+        <<<grids, blocks, smem_size, stream>>>((T*) hidden_states, input_scale, reorder_index, q_out, q_scale, KQ, KE);
 }
 
 // Explicit template instantiation for the specific types used
