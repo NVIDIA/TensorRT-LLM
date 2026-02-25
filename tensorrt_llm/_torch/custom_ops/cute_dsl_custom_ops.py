@@ -2253,9 +2253,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # m, n
             c_major = "n"
 
-            use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
-            cluster_shape_mn_candi = [
+            use_2cta_instrs_candidates = [False, True]
+            mma_tiler_mn_candidates = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candidates = [
                 (1, 1),
                 (1, 2),
                 (1, 4),
@@ -2266,27 +2266,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
-                for use_2cta_instrs in use_2cta_instrs_candi
-                for mma_tiler_mn in mma_tiler_mn_candi
-                for cluster_shape_mn in cluster_shape_mn_candi
+            valid_tactics = []
+            for use_2cta_instrs, mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    use_2cta_instrs_candidates, mma_tiler_mn_candidates,
+                    cluster_shape_mn_candidates):
                 if self.__class__.kernel_class.can_implement(
-                    cutlass.Float8E4M3FN,  # ab_dtype,
-                    cutlass.Float32,  # acc_dtype,
-                    cutlass.BFloat16,  # c_dtype,
-                    use_2cta_instrs,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    m,
-                    n,
-                    k,
-                    batch_size,
-                    a_major,
-                    b_major,
-                    c_major,
-                )
-            ]
+                        cutlass.Float8E4M3FN,  # ab_dtype,
+                        cutlass.Float32,  # acc_dtype,
+                        cutlass.BFloat16,  # c_dtype,
+                        use_2cta_instrs,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                ):
+                    valid_tactics.append(
+                        (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn))
+            return valid_tactics
 
         def forward(
             self,
@@ -2485,8 +2486,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"CuteDSL: SM version {sm_version} is not supported. "
-                f"CuteDSL FP8 GEMM only supports SM100 and SM103. Skipping all tactics."
-            )
+                f"CuteDSL FP8 GEMM only supports SM100 and SM103.")
         tuner = AutoTuner.get()
 
         runner = CuteDSLFp8BlackwellRunner(output_dtype=output_dtype,
@@ -2566,9 +2566,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # m, n
             c_major = "n"
 
-            use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
-            cluster_shape_mn_candi = [
+            use_2cta_instrs_candidates = [False, True]
+            mma_tiler_mn_candidates = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candidates = [
                 (1, 1),
                 (1, 2),
                 (1, 4),
@@ -2579,27 +2579,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
-                for use_2cta_instrs in use_2cta_instrs_candi
-                for mma_tiler_mn in mma_tiler_mn_candi
-                for cluster_shape_mn in cluster_shape_mn_candi
+            valid_tactics = []
+            for use_2cta_instrs, mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    use_2cta_instrs_candidates, mma_tiler_mn_candidates,
+                    cluster_shape_mn_candidates):
                 if self.__class__.kernel_class.can_implement(
-                    cutlass.Float8E4M3FN,  # ab_dtype,
-                    cutlass.Float32,  # acc_dtype,
-                    cutlass.BFloat16,  # c_dtype,
-                    use_2cta_instrs,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    m,
-                    n,
-                    k,
-                    batch_size,
-                    a_major,
-                    b_major,
-                    c_major,
-                )
-            ]
+                        cutlass.Float8E4M3FN,  # ab_dtype,
+                        cutlass.Float32,  # acc_dtype,
+                        cutlass.BFloat16,  # c_dtype,
+                        use_2cta_instrs,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                ):
+                    valid_tactics.append(
+                        (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn))
+            return valid_tactics
 
         def forward(
             self,
@@ -2800,8 +2801,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if (sm_version := get_sm_version()) not in (100, 103):
             raise ValueError(
                 f"CuteDSL: SM version {sm_version} is not supported. "
-                f"CuteDSL FP8 BMM only supports SM100 and SM103. Skipping all tactics."
-            )
+                f"CuteDSL FP8 BMM only supports SM100 and SM103.")
 
         tuner = AutoTuner.get()
 
@@ -2885,9 +2885,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # m, n
             c_major = "n"
 
-            use_2cta_instrs_candi = [False, True]
-            mma_tiler_mn_candi = [(64, 128), (128, 128), (256, 128)]
-            cluster_shape_mn_candi = [
+            use_2cta_instrs_candidates = [False, True]
+            mma_tiler_mn_candidates = [(64, 128), (128, 128), (256, 128)]
+            cluster_shape_mn_candidates = [
                 (1, 1),
                 (1, 2),
                 (1, 4),
@@ -2898,27 +2898,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 (4, 2),
                 (4, 4),
             ]
-            return [
-                (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn)
-                for use_2cta_instrs in use_2cta_instrs_candi
-                for mma_tiler_mn in mma_tiler_mn_candi
-                for cluster_shape_mn in cluster_shape_mn_candi
+            valid_tactics = []
+            for use_2cta_instrs, mma_tiler_mn, cluster_shape_mn in itertools.product(
+                    use_2cta_instrs_candidates, mma_tiler_mn_candidates,
+                    cluster_shape_mn_candidates):
                 if self.__class__.kernel_class.can_implement(
-                    cutlass.Float8E4M3FN,  # ab_dtype,
-                    cutlass.Float32,  # acc_dtype,
-                    cutlass.BFloat16,  # c_dtype,
-                    use_2cta_instrs,
-                    mma_tiler_mn,
-                    cluster_shape_mn,
-                    m,
-                    n,
-                    k,
-                    batch_size,
-                    a_major,
-                    b_major,
-                    c_major,
-                )
-            ]
+                        cutlass.Float8E4M3FN,  # ab_dtype,
+                        cutlass.Float32,  # acc_dtype,
+                        cutlass.BFloat16,  # c_dtype,
+                        use_2cta_instrs,
+                        mma_tiler_mn,
+                        cluster_shape_mn,
+                        m,
+                        n,
+                        k,
+                        batch_size,
+                        a_major,
+                        b_major,
+                        c_major,
+                ):
+                    valid_tactics.append(
+                        (use_2cta_instrs, mma_tiler_mn, cluster_shape_mn))
+            return valid_tactics
 
         def get_tuning_config(self):
             key = self.unique_id()
