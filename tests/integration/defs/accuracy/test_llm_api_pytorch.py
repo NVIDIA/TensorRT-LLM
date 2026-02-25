@@ -4539,11 +4539,13 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
             (4, 1, 4, True, True, True),
         ],
         ids=["tp4", "ep4", "dp4"])
-    @pytest.mark.parametrize("v2_kv_cache", [True, False],
-                             ids=["v2_kv_cache", "v1_kv_cache"])
+    @pytest.mark.parametrize(
+        "v2_kv_cache,kv_cache_reuse", [(True, True), (False, True),
+                                       (True, False)],
+        ids=["v2_kv_cache", "v1_kv_cache", "v2_kv_cache_no_reuse"])
     def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
                       ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      mocker, v2_kv_cache):
+                      mocker, v2_kv_cache, kv_cache_reuse):
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -4562,6 +4564,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.7,
                                         dtype=kv_cache_dtype,
+                                        enable_block_reuse=kv_cache_reuse,
                                         use_kv_cache_manager_v2=v2_kv_cache)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
