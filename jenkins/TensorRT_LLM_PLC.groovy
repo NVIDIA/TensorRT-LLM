@@ -190,7 +190,6 @@ def pulseScan(llmRepo, branchName) {
                   .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
                     def versionMatcher = branchName =~ /^release\/(\d+\.\d+)$/
                     def version = versionMatcher ? "${versionMatcher[0][1]}.0" : branchName
-                    def SBOMName = "sbom_" + branchName.replaceAll('/', '_')
                     withEnv([
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
@@ -198,13 +197,10 @@ def pulseScan(llmRepo, branchName) {
                         "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
                         "PULSE_SCAN_PROJECT_VERSION=${version}",
-                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
+                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
+                        "PULSE_SCAN_OVERRIDE=false"
                     ]) {
                         sh 'pulse scan --no-fail --sbom .'
-                        sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
-                        if (params.repoUrlKey != "github_fork") {
-                            sh "pulse upload-sbom --sbom-name ${SBOMName} --sbom-version ${version} --override --skip-validation --sbom-file sbom_toupload.json"
-                        }
                     }
                   }
             }
@@ -212,6 +208,7 @@ def pulseScan(llmRepo, branchName) {
     }
     container("cpu") {
         sh "cat nspect_scan_report.json"
+        sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
         sh "cat sbom_toupload.json"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
