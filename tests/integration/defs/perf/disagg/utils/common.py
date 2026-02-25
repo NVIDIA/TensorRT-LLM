@@ -265,7 +265,7 @@ class InfoPrinter:
         logger.info(f"SLURM_PARTITION:   {EnvManager.get_slurm_partition()}")
         logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
         logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")
-        logger.info(f"CI_PIPELINE_ID:       {EnvManager.get_pipeline_id()}")
+        logger.info(f"PIPELINE_ID:       {EnvManager.get_pipeline_id()}")
         
         if test_config:
             config_path = test_config.config_path
