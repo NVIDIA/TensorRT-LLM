@@ -59,43 +59,39 @@ def quantize_fp8_blockwise(
         - This uses 128x128 block scaling compatible with Linear module's FP8_BLOCK_SCALES
     """
     out_features, in_features = weight.shape
-    weight_fp32 = weight.float()
-
-    # Calculate number of blocks
     num_blocks_out = (out_features + block_size - 1) // block_size
     num_blocks_in = (in_features + block_size - 1) // block_size
 
-    # Initialize outputs
-    qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
-    block_scales = torch.empty(
-        (num_blocks_out, num_blocks_in), dtype=torch.float32, device=weight.device
+    # Pad to multiple of block_size
+    pad_out = num_blocks_out * block_size - out_features
+    pad_in = num_blocks_in * block_size - in_features
+    if pad_out > 0 or pad_in > 0:
+        weight_padded = torch.nn.functional.pad(weight, (0, pad_in, 0, pad_out))
+    else:
+        weight_padded = weight
+
+    # Reshape so each block becomes a row:
+    # (out, in) -> (nb_out, bs, nb_in, bs) -> (nb_out, nb_in, bs, bs) -> (nb_out*nb_in, bs*bs)
+    rows_per_block = (
+        weight_padded.reshape(num_blocks_out, block_size, num_blocks_in, block_size)
+        .permute(0, 2, 1, 3)
+        .reshape(num_blocks_out * num_blocks_in, block_size * block_size)
     )
 
-    # Quantize each block
-    for i in range(num_blocks_out):
-        row_start = i * block_size
-        row_end = min((i + 1) * block_size, out_features)
+    # Single CUDA kernel: per-row FP8 quantization
+    # quantize_e4m3_activation uses PER_TOKEN mode: one scale per row
+    qrows, scales = torch.ops.tensorrt_llm.quantize_e4m3_activation(rows_per_block.contiguous())
 
-        for j in range(num_blocks_in):
-            col_start = j * block_size
-            col_end = min((j + 1) * block_size, in_features)
+    # Reshape back: (nb_out*nb_in, bs*bs) -> (nb_out, nb_in, bs, bs) -> (out_padded, in_padded)
+    qweight_padded = (
+        qrows.reshape(num_blocks_out, num_blocks_in, block_size, block_size)
+        .permute(0, 2, 1, 3)
+        .reshape(num_blocks_out * block_size, num_blocks_in * block_size)
+    )
 
-            # Extract block
-            block = weight_fp32[row_start:row_end, col_start:col_end]
-
-            # Compute block scale
-            max_val = block.abs().max()
-            scale = (
-                max_val / FP8_E4M3_MAX if max_val > 0 else torch.tensor(1.0, device=weight.device)
-            )
-
-            # Quantize block
-            inv_scale = scale.reciprocal() if scale > 0 else torch.tensor(1.0, device=weight.device)
-            qblock = (block * inv_scale).clamp(-FP8_E4M3_MAX, FP8_E4M3_MAX).to(torch.float8_e4m3fn)
-
-            # Store results
-            qweight[row_start:row_end, col_start:col_end] = qblock
-            block_scales[i, j] = scale.to(torch.float32)
+    # Remove padding and extract scales
+    qweight = qweight_padded[:out_features, :in_features].contiguous()
+    block_scales = scales.reshape(num_blocks_out, num_blocks_in).to(torch.float32)
 
     return qweight, block_scales
 
