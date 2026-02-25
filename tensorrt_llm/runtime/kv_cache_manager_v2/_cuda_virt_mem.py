@@ -142,6 +142,7 @@ class VirtMem:
     def destroy(self) -> None:
         if self._vm_size == 0:
             return
+        _unwrap(drv.cuCtxSynchronize())
         while self._pm_stack:
             self._pop().close()
         _unwrap(drv.cuMemAddressFree(self._address, self._vm_size))
@@ -164,6 +165,7 @@ class VirtMem:
             raise
 
     def shrink(self, num_phys_mem: int) -> None:
+        _unwrap(drv.cuCtxSynchronize())
         for _ in range(num_phys_mem):
             self._pop().close()
 

@@ -30,37 +30,42 @@ make -C docker release_build IMAGE_TAG=kimi-k2-thinking-local
 make -C docker release_run IMAGE_NAME=tensorrt_llm IMAGE_TAG=kimi-k2-thinking-local LOCAL_USER=1
 ```
 
-### Launch the TensorRT LLM Server
+### Recommended Performance Settings
 
-Prepare an `EXTRA_OPTIONS_YAML_FILE` that specifies LLM API arguments when deploying the model. An example YAML file is as follows:
+We maintain YAML configuration files with recommended performance settings in the [`examples/configs`](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs) directory. These config files are present in the TensorRT LLM container at the path `/app/tensorrt_llm/examples/configs`. You can use these out-of-the-box, or adjust them to your specific use case.
 
-```yaml
-max_batch_size: 128
-max_num_tokens: 8448
-max_seq_len: 8212
-tensor_parallel_size: 8
-moe_expert_parallel_size: 8
-enable_attention_dp: true
-pipeline_parallel_size: 1
-print_iter_log: true
-kv_cache_config:
-  free_gpu_memory_fraction: 0.75
-  dtype: fp8
-cache_transceiver_config:
-  backend: UCX
-  max_tokens_in_buffer: 8448
-trust_remote_code: true
+```shell
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+EXTRA_LLM_API_FILE=${TRTLLM_DIR}/examples/configs/curated/kimi-k2-thinking.yaml
 ```
 
-This YAML file specifies configurations that deploy the model with 8-way expert parallelism for the MoE part and 8-way attention data parallelism. It also enables `trust_remote_code`, so that it works with the Kimi K2 Thinking customized [tokenizer](https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4/blob/main/tokenization_kimi.py).
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
 
+````{admonition} Show code
+:class: dropdown
 
-With the `EXTRA_OPTIONS_YAML_FILE`, use the following example command to launch the TensorRT LLM server with the Kimi-K2-Thinking-NVFP4 model from within the container.
+```{literalinclude} ../../../examples/configs/curated/kimi-k2-thinking.yaml
+---
+language: shell
+prepend: |
+  EXTRA_LLM_API_FILE=/tmp/config.yml
+
+  cat << EOF > ${EXTRA_LLM_API_FILE}
+append: EOF
+---
+```
+````
+
+### Launch the TensorRT LLM Server
+
+This YAML config deploys the model with 8-way expert parallelism for the MoE part and 8-way attention data parallelism. It also enables `trust_remote_code`, so that it works with the Kimi K2 Thinking customized [tokenizer](https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4/blob/main/tokenization_kimi.py).
+
+With the `EXTRA_LLM_API_FILE`, use the following example command to launch the TensorRT LLM server with the Kimi-K2-Thinking-NVFP4 model from within the container.
 
 ```bash
 trtllm-serve nvidia/Kimi-K2-Thinking-NVFP4 \
     --host 0.0.0.0 --port 8000 \
-    --config ${EXTRA_OPTIONS_YAML_FILE}
+    --config ${EXTRA_LLM_API_FILE}
 ```
 
 TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:
@@ -84,120 +89,36 @@ When the `Status: 200` code is returned, the server is ready for queries.
 
 TensorRT LLM provides a set of SLURM scripts that can be easily configured through YAML files and automatically launch SLURM jobs on GB200 NVL72 clusters for deployment, benchmarking, and accuracy testing purposes. The scripts are located at `examples/disaggregated/slurm/benchmark`. Refer to [this page](https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts) for more details and example wide EP config files.
 
-For Kimi K2 Thinking, an example configuration for SLURM arguments and the scripts is as follows:
+For Kimi K2 Thinking, an example configuration for SLURM arguments and the scripts is provided at [`examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml`](https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml).
 
-```yaml
-# SLURM Configuration
-slurm:
-  script_file: "disaggr_torch.slurm"
-  partition: "<partition>"
-  account: "<account>"
-  job_time: "02:00:00"
-  job_name: "<job_name>"
-  extra_args: "" # Cluster specific arguments, e.g. "--gres=gpu:4 --exclude=node1,node2"
-  numa_bind: true # Only enable for GB200 NVL72
-
-# Benchmark Mode
-benchmark:
-  mode: "e2e"  # Options: e2e, gen_only
-  use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script
-  multi_round: 8  # Number of benchmark rounds
-  benchmark_ratio: 0.8  # Benchmark ratio
-  streaming: true  # Enable streaming mode
-  concurrency_list: "16"
-  input_length: 1024  # Input sequence length
-  output_length: 1024  # Output sequence length
-  dataset_file: "<dataset_file>"
-
-# Hardware Configuration
-hardware:
-  gpus_per_node: 4  # Modify this with your hardware configuration
-  num_ctx_servers: 4  # Number of context servers
-  num_gen_servers: 1  # Number of generation servers
-
-# Environment Configuration
-environment:
-  container_mount: "<container_mount>"  # Format: path1:path1,path2:path2
-  container_image: "<container_image>"
-  model_path: "<model_path>"
-  trtllm_repo: "<trtllm_repo>"
-  build_wheel: false  # Don't build the wheel when launching multiple jobs
-  trtllm_wheel_path: ""  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead
-  work_dir: "<full_path_to_work_dir>"
-  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
-  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
-
-# Worker Configuration
-worker_config:
-  gen:
-    tensor_parallel_size: 32
-    moe_expert_parallel_size: 32
-    enable_attention_dp: true
-    enable_lm_head_tp_in_adp: true
-    pipeline_parallel_size: 1
-    max_batch_size: 128
-    max_num_tokens: 128
-    max_seq_len: 9236
-    cuda_graph_config:
-      enable_padding: true
-      batch_sizes:
-      - 1
-      - 2
-      - 4
-      - 8
-      - 16
-      - 32
-      - 64
-      - 128
-      - 256
-      - 512
-      - 768
-      - 1024
-      - 2048
-    print_iter_log: true
-    kv_cache_config:
-      enable_block_reuse: false
-      free_gpu_memory_fraction: 0.6
-      dtype: fp8
-    moe_config:
-      backend: WIDEEP
-      use_low_precision_moe_combine: true
-      load_balancer:
-        num_slots: 416
-        layer_updates_per_iter: 1
-    cache_transceiver_config:
-      backend: UCX
-      max_tokens_in_buffer: 8448
-    stream_interval: 20
-    num_postprocess_workers: 4
-    trust_remote_code: true
-  ctx:
-    max_batch_size: 1
-    max_num_tokens: 8448
-    max_seq_len: 8212
-    tensor_parallel_size: 4
-    moe_expert_parallel_size: 4
-    enable_attention_dp: true
-    pipeline_parallel_size: 1
-    print_iter_log: true
-    cuda_graph_config: null
-    disable_overlap_scheduler: true
-    kv_cache_config:
-      enable_block_reuse: false
-      free_gpu_memory_fraction: 0.75
-      dtype: fp8
-    cache_transceiver_config:
-      backend: UCX
-      max_tokens_in_buffer: 8448
-    trust_remote_code: true
+```shell
+TRTLLM_DIR=/app/tensorrt_llm # change as needed to match your environment
+SLURM_CONFIG_FILE=${TRTLLM_DIR}/examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml
 ```
+
+Note: if you don't have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.
+
+````{admonition} Show code
+:class: dropdown
+
+```{literalinclude} ../../../examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml
+---
+language: shell
+prepend: |
+  SLURM_CONFIG_FILE=/tmp/slurm-config.yml
+
+  cat << EOF > ${SLURM_CONFIG_FILE}
+append: EOF
+---
+```
+````
 
 It includes SLURM-specific configurations, benchmark and hardware details, and environment settings. The `worker_config` field includes detailed settings for context and generation servers when deploying a disaggregated server, with each specified as a list of LLM API arguments.
 
 To launch SLURM jobs with the YAML config file, execute the following command:
 ```shell
 cd <TensorRT LLM root>/examples/disaggregated/slurm/benchmark
-python3 submit.py -c config.yaml
+python3 submit.py -c ${SLURM_CONFIG_FILE}
 ```
 
 ## Query the OpenAI-compatible API Endpoint
