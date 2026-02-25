@@ -29,3 +29,6 @@
 - model: nvidia/Llama-4-Scout-17B-16E-Instruct-FP8
   arch: Llama4ForConditionalGeneration
   config_path: examples/configs/curated/llama-4-scout.yaml
+- model: nvidia/Kimi-K2-Thinking-NVFP4
+  arch: DeepseekV3ForCausalLM
+  config_path: examples/configs/curated/kimi-k2-thinking.yaml

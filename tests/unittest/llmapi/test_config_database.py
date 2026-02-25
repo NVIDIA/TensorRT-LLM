@@ -153,6 +153,32 @@ def test_all_configs_have_lookup_entry():
     )
 
 
+@pytest.mark.part0
+def test_all_lookup_entries_have_arch():
+    """Every entry in the lookup files must have the required 'arch' field."""
+    entries_missing_arch = []
+    for lookup_path in ALL_LOOKUP_PATHS:
+        if not lookup_path.exists():
+            continue
+        with open(lookup_path, encoding="utf-8") as f:
+            entries = yaml.safe_load(f)
+        if not entries:
+            continue
+        for entry in entries:
+            if not isinstance(entry, dict) or "config_path" not in entry:
+                continue
+            config_path = entry.get("config_path", "")
+            if not entry.get("arch"):
+                entries_missing_arch.append(
+                    f"  {lookup_path.relative_to(REPO_ROOT)}: {config_path}"
+                )
+    assert not entries_missing_arch, (
+        "The following lookup entries are missing the required 'arch' field. "
+        "Add 'arch: <MODEL_CLASS_MAPPING key>' to each entry:\n"
+        + "\n".join(sorted(entries_missing_arch))
+    )
+
+
 def _serve_cli_args(config_path: Path, port: int = 17999):
     """CLI argv for serve, like: trtllm-serve <model> --config <config.yaml> --port <port>."""
     return [
