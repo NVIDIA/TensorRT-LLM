@@ -261,14 +261,14 @@ pipeline {
             parallel {
                 stage("Source Code OSS Scanning"){
                     stages {
-                        //stage("Generate Lock Files"){
-                            //steps
-                            //{
-                                //script {
-                                    //generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
-                                //}
-                            //}
-                        //}
+                        stage("Generate Lock Files"){
+                            steps
+                            {
+                                script {
+                                    generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                                }
+                            }
+                        }
                         stage("Run Pulse Scanning"){
                             steps
                             {
