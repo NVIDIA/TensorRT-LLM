@@ -273,6 +273,8 @@ class JobManager:
     def upload_artifacts(final_dir: str):
         """Upload artifacts to Artifactory as both directory and tar.gz archive.
         
+        Can be disabled by setting ENABLE_ARTIFACT_UPLOAD=false environment variable.
+        
         Args:
             final_dir: Local directory path to upload
             
@@ -280,6 +282,12 @@ class JobManager:
             bool: True if successful, False otherwise
         """
         try:
+            # Check if artifact upload is enabled (default: true)
+            enable_upload = os.getenv("ENABLE_ARTIFACT_UPLOAD", "true").lower()
+            if enable_upload in ("false", "0", "no", "off"):
+                logger.info("Artifact upload disabled (ENABLE_ARTIFACT_UPLOAD=false)")
+                return False
+            
             # Get environment configuration
             artifacts_user = EnvManager.get_artifacts_user()
             artifacts_token = EnvManager.get_artifacts_token()
@@ -405,8 +413,18 @@ class JobManager:
                 logger.info(f"Cleaned up temporary config: {temp_config_path}")
             else:
                 logger.warning(f"Temporary config not found: {temp_config_path}")
-            # Upload artifacts to Artifactory
-            JobManager.upload_artifacts(final_dir)
+            
+            # Upload artifacts to Artifactory (non-blocking, failures won't affect test result)
+            try:
+                logger.info("Uploading artifacts to Artifactory...")
+                upload_success = JobManager.upload_artifacts(final_dir)
+                if upload_success:
+                    logger.success("Artifacts uploaded successfully")
+                else:
+                    logger.warning("Artifact upload failed or skipped")
+            except Exception as upload_error:
+                logger.error(f"Exception during artifact upload (non-fatal): {upload_error}")
+                logger.info("Continuing with test completion despite upload failure")
             
             return final_dir
 

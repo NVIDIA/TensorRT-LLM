@@ -1,11 +1,15 @@
 """Artifactory Uploader"""
 import os
+import socket
 import urllib.request
 import urllib.error
 import base64
 import tarfile
 import tempfile
 from pathlib import Path
+
+# Default timeout for upload operations (10 minutes for large files up to 300MB)
+DEFAULT_UPLOAD_TIMEOUT = 600
 
 
 class ArtifactoryUploader:
@@ -31,7 +35,7 @@ class ArtifactoryUploader:
         encoded_credentials = base64.b64encode(credentials.encode()).decode()
         self.auth_header = f"Basic {encoded_credentials}"
     
-    def upload_file(self, local_path, remote_path, properties=None):
+    def upload_file(self, local_path, remote_path, properties=None, timeout=None):
         """
         Upload a single file to Artifactory
         
@@ -39,10 +43,15 @@ class ArtifactoryUploader:
             local_path: Local file path
             remote_path: Remote target path (relative to repository root)
             properties: Optional metadata properties dict (e.g., {"gpu": "GB300", "branch": "main"})
+            timeout: Request timeout in seconds (default: 600s for large files)
         
         Returns:
             bool: True if successful, False otherwise
         """
+        # Use default timeout if not specified
+        if timeout is None:
+            timeout = DEFAULT_UPLOAD_TIMEOUT
+        
         # Check if local file exists
         if not os.path.isfile(local_path):
             print(f"File not found: {local_path}")
@@ -63,6 +72,7 @@ class ArtifactoryUploader:
         file_size = os.path.getsize(local_path)
         file_size_mb = file_size / (1024 * 1024)
         print(f"   Size: {file_size_mb:.2f} MB")
+        print(f"   Timeout: {timeout}s")
         
         try:
             # Read file content
@@ -74,8 +84,8 @@ class ArtifactoryUploader:
             request.add_header('Authorization', self.auth_header)
             request.add_header('Content-Type', 'application/octet-stream')
             
-            # Send request
-            with urllib.request.urlopen(request) as response:
+            # Send request with timeout
+            with urllib.request.urlopen(request, timeout=timeout) as response:
                 status_code = response.getcode()
                 
                 if 200 <= status_code < 300:
@@ -85,6 +95,10 @@ class ArtifactoryUploader:
                     print(f"   Failed (HTTP {status_code})")
                     return False
         
+        except socket.timeout:
+            print(f"   Timeout Error: Upload exceeded {timeout}s timeout")
+            print(f"   Suggestion: File size is {file_size_mb:.2f} MB, consider increasing timeout")
+            return False
         except urllib.error.HTTPError as e:
             print(f"   HTTP Error: {e.code} - {e.reason}")
             try:
@@ -95,6 +109,8 @@ class ArtifactoryUploader:
             return False
         except urllib.error.URLError as e:
             print(f"   URL Error: {e.reason}")
+            if isinstance(e.reason, socket.timeout):
+                print(f"   (Connection timeout after {timeout}s)")
             return False
         except Exception as e:
             print(f"   Exception: {str(e)}")
