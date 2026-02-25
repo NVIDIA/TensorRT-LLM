@@ -59,8 +59,7 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            get_from_waiting_queue, merge_requests,
-                            schedule_attention_dp_requests)
+                            get_from_waiting_queue, merge_requests)
 from .resource_manager import (ResourceManager, ResourceManagerType,
                                request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
@@ -68,6 +67,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
+from .scheduler.adp_router import ADPRouter, DefaultADPRouter
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -282,7 +282,8 @@ class PyExecutor:
             virtual_memory_pools: Optional[dict] = None,
             hang_detection_timeout: Optional[int] = None,
             execution_stream: Optional[torch.cuda.Stream] = None,
-            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS):
+            waiting_queue_policy: WaitingQueuePolicy = WaitingQueuePolicy.FCFS,
+            adp_router: Optional[ADPRouter] = None):
         super(PyExecutor, self).__init__()
         self.device_id = torch.cuda.current_device()
         self.global_rank = dist.rank
@@ -308,12 +309,13 @@ class PyExecutor:
         self.scheduler = scheduler
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
+        self.dist = dist
+        self.adp_router: ADPRouter = (adp_router or DefaultADPRouter(dist=dist))
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
                                           None)
         self.guided_decoder = guided_decoder
-        self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
         self.virtual_memory_pools = virtual_memory_pools
 
@@ -2375,27 +2377,26 @@ class PyExecutor:
     @nvtx_range("_fetch_new_requests")
     def _fetch_new_requests(
             self, waiting_queue: WaitingQueue,
-            activate_requests: List[LlmRequest]) -> List[LlmRequest]:
+            active_requests: List[LlmRequest]) -> List[LlmRequest]:
         """Fetch new requests and return LlmRequests ready for execution."""
-        # 1. Gather info and calculate total_num_active_requests
+        # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
-            all_ranks_num_active_requests = []
-            all_ranks_num_active_tokens = []
-            if self.dist.has_cp_helix:
-                num_active_tokens = sum(
-                    [req.total_input_len_cp for req in activate_requests])
-            else:
-                num_active_tokens = sum(
-                    [req.py_orig_prompt_len for req in activate_requests])
-            responses_list = self.dist.tp_allgather(
-                [len(activate_requests), num_active_tokens])
-            for num_active_requests, num_active_tokens in responses_list:
-                all_ranks_num_active_requests.append(num_active_requests)
-                all_ranks_num_active_tokens.append(num_active_tokens)
+            # NOTE: gather_all_rank_states is called here (before step 3)
+            # because _pop_from_waiting_queue needs all_ranks_num_active_requests
+            # from the allgather result. Moving it to step 5 would require an
+            # extra allgather. When introducing new router implementations
+            # (e.g. KV-cache-aware) that need new_requests to gather additional
+            # info, the allgather position may need to be revisited.
+            all_rank_states = self.adp_router.gather_all_rank_states(
+                active_requests)
+            all_ranks_num_active_requests = [
+                s.num_active_requests for s in all_rank_states
+            ]
             total_num_active_requests = sum(all_ranks_num_active_requests)
         else:
-            total_num_active_requests = len(activate_requests)
+            total_num_active_requests = len(active_requests)
             all_ranks_num_active_requests = None
+            all_rank_states = None
 
         # 2. Fetch and enqueue to waiting queue
         self._fetch_and_enqueue_requests(waiting_queue,
@@ -2413,9 +2414,8 @@ class PyExecutor:
         # 5. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
             all_ranks_new_requests, self.expected_num_active_requests = \
-                schedule_attention_dp_requests(
-                    new_requests, all_ranks_num_active_requests,
-                    all_ranks_num_active_tokens, self.dist.tp_size,
+                self.adp_router.route_requests(
+                    all_rank_states, new_requests,
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
