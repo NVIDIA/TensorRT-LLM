@@ -1034,3 +1034,60 @@ def _register_fake():
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
+
+    @torch.library.register_fake("trtllm::build_decoder_info")
+    def _(seq_q_offsets, seq_kv_offsets, padding_offsets, tokens_info,
+          encoder_padding_offsets, packed_mask_row_offsets,
+          seq_cp_partial_offsets, attention_mask, seq_q_lengths, seq_kv_lengths,
+          cp_size, fmha_tile_counter, dequant_scale_qkv, separate_qkv_scales,
+          quant_scale_o, fmha_host_bmm1_scale, fmha_bmm1_scale, fmha_bmm2_scale,
+          batch_size, max_q_seq_length, max_encoder_q_seq_length,
+          attention_window_size, sink_token_length, num_tokens, remove_padding,
+          attention_mask_type, rotary_embedding_scale, rotary_embedding_base,
+          rotary_embedding_dim, rotary_scaling_type, rotary_embedding_inv_freq,
+          rotary_embedding_inv_freq_cache, rotary_embedding_max_positions):
+        return None
+
+    @torch.library.register_fake("trtllm::qkv_preprocessing")
+    def _(qkv_input, cross_kv_input, quantized_qkv_output, q_output,
+          kv_cache_block_offsets, host_kv_cache_pool_pointers,
+          host_kv_cache_pool_mapping, qkv_bias, qkv_scale_quant_orig,
+          qkv_scale_orig_quant, o_scale_orig_quant, fmha_bmm1_scale,
+          fmha_bmm2_scale, fmha_tile_counter, logn_scaling, tokens_info,
+          seq_lens, cache_seq_lens, encoder_seq_lens, cu_seq_lens,
+          cu_kv_seq_lens, sparse_kv_offsets, sparse_kv_indices,
+          rotary_embedding_inv_freq, rotary_coef_cache_buffer,
+          spec_decoding_position_offsets, mrope_rotary_cos_sin,
+          mrope_position_deltas, batch_size, max_input_seq_len, max_kv_seq_len,
+          cyclic_kv_cache_len, sink_token_len, token_num, remove_padding,
+          is_last_chunk, cross_attention, head_num, kv_head_num,
+          qheads_per_kv_head, size_per_head, fmha_host_bmm1_scale,
+          rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
+          rotary_embedding_scale, rotary_embedding_max_positions,
+          position_embedding_type, position_shift_enabled, cache_type,
+          separate_q_kv_output, quantized_fp8_output, generation_phase,
+          rotary_vision_start, rotary_vision_length, layer_idx,
+          tokens_per_block, max_attention_window_size, kv_cache_quant_mode):
+        return None
+
+    @torch.library.register_fake("trtllm::kv_cache_postprocessing")
+    def _(qkv_input, cross_kv_input, quantized_qkv_output, q_output,
+          kv_cache_block_offsets, host_kv_cache_pool_pointers,
+          host_kv_cache_pool_mapping, qkv_bias, qkv_scale_quant_orig,
+          qkv_scale_orig_quant, o_scale_orig_quant, fmha_bmm1_scale,
+          fmha_bmm2_scale, fmha_tile_counter, logn_scaling, tokens_info,
+          seq_lens, cache_seq_lens, encoder_seq_lens, cu_seq_lens,
+          cu_kv_seq_lens, sparse_kv_offsets, sparse_kv_indices,
+          rotary_embedding_inv_freq, rotary_coef_cache_buffer,
+          spec_decoding_position_offsets, mrope_rotary_cos_sin,
+          mrope_position_deltas, batch_size, max_input_seq_len, max_kv_seq_len,
+          cyclic_kv_cache_len, sink_token_len, token_num, remove_padding,
+          is_last_chunk, cross_attention, head_num, kv_head_num,
+          qheads_per_kv_head, size_per_head, fmha_host_bmm1_scale,
+          rotary_embedding_dim, rotary_embedding_base, rotary_scale_type,
+          rotary_embedding_scale, rotary_embedding_max_positions,
+          position_embedding_type, position_shift_enabled, cache_type,
+          separate_q_kv_output, quantized_fp8_output, generation_phase,
+          rotary_vision_start, rotary_vision_length, layer_idx,
+          tokens_per_block, max_attention_window_size, kv_cache_quant_mode):
+        return None

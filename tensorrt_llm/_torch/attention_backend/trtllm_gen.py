@@ -43,9 +43,11 @@ from tensorrt_llm._utils import (
     is_sm_100f,
     torch_dtype_to_binding,
 )
+from tensorrt_llm.bindings import DataType
 from tensorrt_llm.functional import AttentionMaskType
 from tensorrt_llm.logger import logger
 from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization import mode as quant_mode
 
 # Default KV layout for flashinfer
 # HND = [max_num_pages, kv_factor, num_kv_heads, page_size, head_dim]
@@ -62,39 +64,38 @@ class TrtllmGenSupportChecker:
 
     # Supported data types
     SUPPORTED_INPUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
-    SUPPORTED_KV_CACHE_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
+    SUPPORTED_KV_CACHE_DTYPES = {DataType.HALF, DataType.BF16, DataType.FP8}
     SUPPORTED_OUT_DTYPES = {torch.float16, torch.bfloat16, torch.float8_e4m3fn}
 
     # Supported Q:KV:O dtype combinations for trtllm-gen kernels
-    # Format: (q_dtype, kv_dtype, o_dtype)
+    # Format: (q_dtype: torch.dtype, kv_dtype: DataType, o_dtype: torch.dtype)
     # Context phase supported combinations
     SUPPORTED_DTYPE_COMBOS_CONTEXT = {
         # e4m3:e4m3:e4m3
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn),
-        # e4m3:e4m3:e2m1 (FP4 output not directly representable, skip)
+        (torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
         # fp16:fp16:fp16
-        (torch.float16, torch.float16, torch.float16),
+        (torch.float16, DataType.HALF, torch.float16),
         # bf16:bf16:bf16
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
+        (torch.bfloat16, DataType.BF16, torch.bfloat16),
         # e4m3:e4m3:fp16
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float16),
+        (torch.float8_e4m3fn, DataType.FP8, torch.float16),
         # e4m3:e4m3:bf16
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
     }
 
     # Generation phase supported combinations (includes context + additional)
     SUPPORTED_DTYPE_COMBOS_GENERATION = {
         # All context combinations
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float8_e4m3fn),
-        (torch.float16, torch.float16, torch.float16),
-        (torch.bfloat16, torch.bfloat16, torch.bfloat16),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.float16),
-        (torch.float8_e4m3fn, torch.float8_e4m3fn, torch.bfloat16),
+        (torch.float8_e4m3fn, DataType.FP8, torch.float8_e4m3fn),
+        (torch.float16, DataType.HALF, torch.float16),
+        (torch.bfloat16, DataType.BF16, torch.bfloat16),
+        (torch.float8_e4m3fn, DataType.FP8, torch.float16),
+        (torch.float8_e4m3fn, DataType.FP8, torch.bfloat16),
         # Additional generation-only combinations
         # bf16:e4m3:bf16
-        (torch.bfloat16, torch.float8_e4m3fn, torch.bfloat16),
+        (torch.bfloat16, DataType.FP8, torch.bfloat16),
         # fp16:e4m3:fp16
-        (torch.float16, torch.float8_e4m3fn, torch.float16),
+        (torch.float16, DataType.FP8, torch.float16),
     }
 
     # Unsupported head sizes for context FMHA
@@ -113,7 +114,7 @@ class TrtllmGenSupportChecker:
     def is_supported(
         cls,
         q_dtype: torch.dtype,
-        kv_cache_dtype: torch.dtype,
+        kv_cache_dtype: DataType,
         num_heads: int,
         num_kv_heads: int,
         head_size: int,
@@ -152,7 +153,7 @@ class TrtllmGenSupportChecker:
         has_fp4_kv = (
             quant_config.layer_quant_mode.has_fp4_kv_cache()
             if quant_config is not None
-            else kv_cache_dtype == torch.uint8
+            else kv_cache_dtype == DataType.NVFP4
         )
         if has_fp4_kv:
             return False, "NVFP4 KV cache is not supported by flashinfer trtllm-gen kernels."
@@ -251,9 +252,6 @@ class ContextWorkspaceBuffers:
     # Trtllm-gen workspace
     trtllm_gen_workspace: Optional[torch.Tensor] = None
 
-    # Attention mask (only for unfused MHA)
-    attention_mask: Optional[torch.Tensor] = None
-
     # Cumulative sequence lengths
     cu_q_seqlens: Optional[torch.Tensor] = None
     cu_kv_seqlens: Optional[torch.Tensor] = None
@@ -262,10 +260,8 @@ class ContextWorkspaceBuffers:
     # Rotary embedding inverse frequencies
     rotary_inv_freq_buf: Optional[torch.Tensor] = None
 
-    # Q/K/V buffers
+    # Q buffer (FMHA output buffer for qkv_preprocessing)
     q_buf: Optional[torch.Tensor] = None
-    k_buf: Optional[torch.Tensor] = None
-    v_buf: Optional[torch.Tensor] = None
 
     # Token info: (batch_idx, token_idx_in_seq) per token
     tokens_info: Optional[torch.Tensor] = None
@@ -328,15 +324,16 @@ class WorkspaceManager:
     # Alignment for workspace buffers (256 bytes) (same as C++ kCudaMemAlign constant).
     ALIGNMENT = 256
 
-    # Flashinfer's API requires 128MB workspace size for trtllm-gen backend,
-    # but we use 32MB for now.
-    #
-    # 128MB is extremely conservative: it originates as FlashInfer's universal
-    # recommendation, designed to cover all backends (FA2/FA3 split-k paths have
-    # different memory patterns), all architectures, and all configurations. For a
-    # trtllm-gen-only scenario, 32MB is more than enough to cover any generation +
-    # context configuration.
-    TRTLLM_GEN_WORKSPACE_SIZE = 32 * 1024 * 1024
+    # C/CUDA type sizes in bytes, mirroring sizeof() semantics.
+    SIZEOF_INT32 = 4
+    SIZEOF_FLOAT32 = 4
+    SIZEOF_INT2 = 8  # CUDA int2: two int32_t packed
+    SIZEOF_FP8 = 1
+
+    # Flashinfer's API requires 128MB workspace size for trtllm-gen backend.
+    # With long sequences (e.g. max_seq_len=131072), the kernel's internal
+    # split-k operations need substantial workspace for partial results.
+    TRTLLM_GEN_WORKSPACE_SIZE = 128 * 1024 * 1024
 
     @staticmethod
     def _align_size(size: int) -> int:
@@ -367,6 +364,19 @@ class WorkspaceManager:
                 total += alignment - (ws % alignment)
         return total
 
+    @staticmethod
+    def estimate_min_multi_block_count(max_timesteps: int) -> int:
+        """Estimate the minimum number of blocks for multi-block MMHA.
+
+        When a single thread block cannot hold the full KV sequence in shared
+        memory, the generation kernel must split the sequence across multiple
+        blocks. This returns a conservative lower bound on that block count
+        based on ``max_timesteps`` (the number of KV tokens to attend over).
+        """
+        if max_timesteps <= 0:
+            return 1
+        return (max_timesteps + 1023) // 1024
+
     @classmethod
     def get_context_workspace_size(
         cls,
@@ -376,21 +386,8 @@ class WorkspaceManager:
         num_heads: int,
         head_size: int,
         rotary_embedding_dim: int = 0,
-        num_kv_heads: int = None,
-        input_seq_length: int = 0,
-        cross_kv_length: int = 0,
-        enable_context_fmha: bool = True,
-        is_cross_attention: bool = False,
         separate_q_kv_input: bool = True,
         fp8_context_fmha: bool = False,
-        fp8_context_mla: bool = False,
-        is_mla_enabled: bool = False,
-        use_sparse_mla: bool = False,
-        mla_qk_rope_head_dim: int = 0,
-        mla_qk_nope_head_dim: int = 0,
-        mla_v_head_dim: int = 0,
-        mla_kv_lora_rank: int = 0,
-        chunk_prefill_buffer_batch_size: int = 1,
     ) -> int:
         """
         Calculate workspace size for context phase.
@@ -402,21 +399,8 @@ class WorkspaceManager:
             num_heads: Number of query attention heads.
             head_size: Size of each attention head.
             rotary_embedding_dim: Rotary embedding dimension (0 if not used).
-            num_kv_heads: Number of KV heads (defaults to num_heads if None).
-            input_seq_length: Maximum input sequence length.
-            cross_kv_length: Cross attention KV length (for encoder-decoder).
-            enable_context_fmha: Whether context FMHA is enabled.
-            is_cross_attention: Whether this is cross attention.
             separate_q_kv_input: Whether Q and KV inputs are separate (paged FMHA).
             fp8_context_fmha: Whether FP8 context FMHA is used.
-            fp8_context_mla: Whether FP8 context MLA is used.
-            is_mla_enabled: Whether Multi-head Latent Attention is enabled.
-            use_sparse_mla: Whether sparse MLA (absorption mode) is used.
-            mla_qk_rope_head_dim: MLA QK RoPE head dimension.
-            mla_qk_nope_head_dim: MLA QK non-positional head dimension.
-            mla_v_head_dim: MLA value head dimension.
-            mla_kv_lora_rank: MLA KV LoRA rank.
-            chunk_prefill_buffer_batch_size: Batch size for chunked prefill buffer.
 
         Returns:
             Workspace size in bytes.
@@ -424,80 +408,45 @@ class WorkspaceManager:
         if max_num_tokens == 0:
             return 0
 
-        if num_kv_heads is None:
-            num_kv_heads = num_heads
-
         # Convert torch dtype to binding dtype for get_size_in_bytes
         binding_dtype = torch_dtype_to_binding(dtype)
         dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
 
         local_hidden_units_qo = num_heads * head_size
-        local_hidden_units_kv = num_kv_heads * head_size
-
         batch_size = max_num_seq
-        kv_seq_length = cross_kv_length if is_cross_attention else input_seq_length
 
-        # Attention mask size (only for unfused MHA)
-        attention_mask_size = (
-            0 if enable_context_fmha else dtype_size * max_num_tokens * kv_seq_length
-        )
-
-        # Cumulative sequence lengths: sizeof(int) * (batch_size + 1)
-        cu_seqlens_size = 4 * (batch_size + 1)
-
-        # Rotary inv freq buffer: sizeof(float) * batch_size * rotary_dim / 2
+        cu_seqlens_size = cls.SIZEOF_INT32 * (batch_size + 1)
         rotary_inv_freq_size = (
-            4 * batch_size * rotary_embedding_dim // 2 if rotary_embedding_dim > 0 else 0
+            cls.SIZEOF_FLOAT32 * batch_size * rotary_embedding_dim // 2
+            if rotary_embedding_dim > 0
+            else 0
         )
 
-        # Q buffer size calculation
         q_buf_2_size = 0
-        if not enable_context_fmha:
-            # Unfused MHA
-            q_buf_2_size = dtype_size * batch_size * input_seq_length * local_hidden_units_qo
-        elif separate_q_kv_input:
-            # Paged context FMHA
+        if separate_q_kv_input:
             q_buf_2_size = (
-                (1 if fp8_context_fmha else dtype_size) * max_num_tokens * local_hidden_units_qo
+                (cls.SIZEOF_FP8 if fp8_context_fmha else dtype_size)
+                * max_num_tokens
+                * local_hidden_units_qo
             )
 
-        # K, V buffers (only for unfused MHA)
-        k_buf_2_size = (
-            0
-            if enable_context_fmha
-            else dtype_size * batch_size * kv_seq_length * local_hidden_units_kv
-        )
-        v_buf_2_size = (
-            0
-            if enable_context_fmha
-            else dtype_size * batch_size * kv_seq_length * local_hidden_units_kv
-        )
-
-        # Tokens info: (batch_idx, token_idx_in_seq) per token - sizeof(int2) = 8
-        tokens_info_size = 8 * max_num_tokens
-
-        # FMHA scheduler counter
-        fmha_scheduler_counter = 4 if enable_context_fmha else 0  # sizeof(uint32_t)
-
-        # BMM scales for FP8
-        fmha_bmm1_scale_size = 4 * 2 if fp8_context_fmha else 0  # sizeof(float) * 2
-        fmha_bmm2_scale_size = 4 if fp8_context_fmha else 0  # sizeof(float)
+        tokens_info_size = cls.SIZEOF_INT2 * max_num_tokens
+        fmha_scheduler_counter = cls.SIZEOF_INT32
+        fmha_bmm1_scale_size = cls.SIZEOF_FLOAT32 * 2 if fp8_context_fmha else 0
+        fmha_bmm2_scale_size = cls.SIZEOF_FLOAT32 if fp8_context_fmha else 0
 
         # Build workspace array
         workspaces = [
-            cls.TRTLLM_GEN_WORKSPACE_SIZE,  # 0
-            attention_mask_size,  # 1
-            cu_seqlens_size,  # 2: cu_seqlen_q
-            cu_seqlens_size,  # 3: cu_seqlen_kv
-            cu_seqlens_size,  # 4: cu_mask_rows
-            rotary_inv_freq_size,  # 5
-            q_buf_2_size,  # 6
-            k_buf_2_size,  # 7
-            v_buf_2_size,  # 8
-            tokens_info_size,  # 9
-            fmha_scheduler_counter,  # 10
-            fmha_bmm1_scale_size,  # 11
-            fmha_bmm2_scale_size,  # 12
+            cls.TRTLLM_GEN_WORKSPACE_SIZE,
+            cu_seqlens_size,  # cu_seqlen_q
+            cu_seqlens_size,  # cu_seqlen_kv
+            cu_seqlens_size,  # cu_mask_rows
+            rotary_inv_freq_size,
+            q_buf_2_size,
+            tokens_info_size,
+            fmha_scheduler_counter,
+            fmha_bmm1_scale_size,
+            fmha_bmm2_scale_size,
         ]
 
         return cls._calculate_total_workspace_size(workspaces)
@@ -513,6 +462,7 @@ class WorkspaceManager:
         multi_processor_count: int,
         num_kv_heads: int = None,
         max_attention_window_size: int = 0,
+        rotary_embedding_dim: int = 0,
         position_shift_enabled: bool = False,
         is_cross_attention: bool = False,
     ) -> int:
@@ -545,13 +495,13 @@ class WorkspaceManager:
         dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
         batch_beam = max_num_seq
 
-        min_seq_len_tile = max(
-            1, (max_attention_window_size + 1023) // 1024 if max_attention_window_size > 0 else 1
+        estimated_min_multi_block_count = cls.estimate_min_multi_block_count(
+            max_attention_window_size
         )
 
         # Calculate max sequence length tile
         max_seq_len_tile = max(
-            min_seq_len_tile,
+            estimated_min_multi_block_count,
             max(
                 1, (multi_processor_count + batch_beam * num_heads - 1) // (batch_beam * num_heads)
             ),
@@ -560,8 +510,8 @@ class WorkspaceManager:
 
         # Partial output/sum/max buffers for multi-block attention
         partial_out_size = dtype_size * batch_beam * num_heads * head_size * max_seq_len_tile
-        partial_sum_size = 4 * batch_beam * num_heads * max_seq_len_tile
-        partial_max_size = 4 * batch_beam * num_heads * max_seq_len_tile
+        partial_sum_size = cls.SIZEOF_FLOAT32 * batch_beam * num_heads * max_seq_len_tile
+        partial_max_size = cls.SIZEOF_FLOAT32 * batch_beam * num_heads * max_seq_len_tile
 
         # Shift K cache size (for position shift)
         shift_k_cache_size = 0
@@ -570,12 +520,32 @@ class WorkspaceManager:
                 dtype_size * batch_beam * num_heads * head_size * max_attention_window_size
             )
 
+        # Additional buffers needed by split_generation_workspace
+        cu_seqlens_size = cls.SIZEOF_INT32 * (batch_beam + 1)
+        cu_kv_seqlens_size = cls.SIZEOF_INT32 * (batch_beam + 1)
+        rotary_inv_freq_size = (
+            cls.SIZEOF_FLOAT32 * batch_beam * rotary_embedding_dim // 2
+            if rotary_embedding_dim > 0
+            else 0
+        )
+        tokens_info_size = cls.SIZEOF_INT2 * max_num_tokens
+        q_buf_size = dtype_size * max_num_tokens * num_heads * head_size
+        bmm1_scale_size = cls.SIZEOF_FLOAT32 * 2
+        bmm2_scale_size = cls.SIZEOF_FLOAT32
+
         generation_workspaces = [
             cls.TRTLLM_GEN_WORKSPACE_SIZE,  # 0
             partial_out_size,
             partial_sum_size,
             partial_max_size,
             shift_k_cache_size,
+            cu_seqlens_size,
+            cu_kv_seqlens_size,
+            rotary_inv_freq_size,
+            tokens_info_size,
+            q_buf_size,
+            bmm1_scale_size,
+            bmm2_scale_size,
         ]
 
         return cls._calculate_total_workspace_size(generation_workspaces)
@@ -616,9 +586,6 @@ class WorkspaceManager:
             num_heads=num_heads,
             head_size=head_size,
             rotary_embedding_dim=rotary_embedding_dim,
-            num_kv_heads=num_kv_heads,
-            input_seq_length=max_context_length,
-            enable_context_fmha=True,
             separate_q_kv_input=True,
         )
 
@@ -635,6 +602,7 @@ class WorkspaceManager:
             multi_processor_count=multi_processor_count,
             num_kv_heads=num_kv_heads,
             max_attention_window_size=effective_window,
+            rotary_embedding_dim=rotary_embedding_dim,
             position_shift_enabled=position_shift_enabled,
         )
 
@@ -708,11 +676,6 @@ class WorkspaceManager:
         num_heads: int,
         head_size: int,
         rotary_embedding_dim: int = 0,
-        num_kv_heads: int = None,
-        input_seq_length: int = 0,
-        cross_kv_length: int = 0,
-        enable_context_fmha: bool = True,
-        is_cross_attention: bool = False,
         separate_q_kv_input: bool = True,
         fp8_context_fmha: bool = False,
         fp8_context_mla: bool = False,
@@ -728,11 +691,6 @@ class WorkspaceManager:
             num_heads: Number of query attention heads.
             head_size: Size of each attention head.
             rotary_embedding_dim: Rotary embedding dimension.
-            num_kv_heads: Number of KV heads.
-            input_seq_length: Input sequence length.
-            cross_kv_length: Cross attention KV length.
-            enable_context_fmha: Whether context FMHA is enabled.
-            is_cross_attention: Whether this is cross attention.
             separate_q_kv_input: Whether Q and KV inputs are separate.
             fp8_context_fmha: Whether FP8 context FMHA is used.
             fp8_context_mla: Whether FP8 context MLA is used.
@@ -740,75 +698,53 @@ class WorkspaceManager:
         Returns:
             Dictionary containing sub-buffer views and metadata:
             {
-                'attention_mask': Tensor or None,
                 'cu_q_seqlens': Tensor,
                 'cu_kv_seqlens': Tensor,
                 'cu_mask_rows': Tensor,
                 'rotary_inv_freq_buf': Tensor or None,
                 'q_buf': Tensor or None,
-                'k_buf': Tensor or None,
-                'v_buf': Tensor or None,
                 'tokens_info': Tensor,
                 'fmha_tile_counter': Tensor or None,
                 'fmha_bmm1_scale': Tensor or None,
                 'fmha_bmm2_scale': Tensor or None,
             }
         """
-        if num_kv_heads is None:
-            num_kv_heads = num_heads
-
         binding_dtype = torch_dtype_to_binding(dtype)
         dtype_size = get_size_in_bytes(dtype=binding_dtype, num_elements=1)
 
         local_hidden_units_qo = num_heads * head_size
-        local_hidden_units_kv = num_kv_heads * head_size
-        kv_seq_length = cross_kv_length if is_cross_attention else input_seq_length
-
-        attention_mask_size = (
-            0 if enable_context_fmha else dtype_size * batch_size * input_seq_length * kv_seq_length
-        )
-        cu_seqlens_size = 4 * (batch_size + 1)
+        cu_seqlens_size = cls.SIZEOF_INT32 * (batch_size + 1)
         rotary_inv_freq_size = (
-            4 * batch_size * rotary_embedding_dim // 2 if rotary_embedding_dim > 0 else 0
+            cls.SIZEOF_FLOAT32 * batch_size * rotary_embedding_dim // 2
+            if rotary_embedding_dim > 0
+            else 0
         )
 
-        # Q buffer size
+        # Q buffer size (paged context FMHA)
         q_buf_2_size = 0
-        if not enable_context_fmha:
-            q_buf_2_size = dtype_size * batch_size * input_seq_length * local_hidden_units_qo
-        elif separate_q_kv_input:
+        if separate_q_kv_input:
             q_buf_2_size = (
-                (1 if fp8_context_fmha else dtype_size) * num_tokens * local_hidden_units_qo
+                (cls.SIZEOF_FP8 if fp8_context_fmha else dtype_size)
+                * num_tokens
+                * local_hidden_units_qo
             )
 
-        k_buf_2_size = (
-            0
-            if enable_context_fmha
-            else dtype_size * batch_size * kv_seq_length * local_hidden_units_kv
+        tokens_info_size = cls.SIZEOF_INT2 * num_tokens
+        fmha_scheduler_counter = cls.SIZEOF_INT32
+        fmha_bmm1_scale_size = (
+            cls.SIZEOF_FLOAT32 * 2 if (fp8_context_fmha or fp8_context_mla) else 0
         )
-        v_buf_2_size = (
-            0
-            if enable_context_fmha
-            else dtype_size * batch_size * kv_seq_length * local_hidden_units_kv
-        )
-
-        tokens_info_size = 8 * num_tokens  # sizeof(int2)
-        fmha_scheduler_counter = 4 if enable_context_fmha else 0
-        fmha_bmm1_scale_size = 4 * 2 if (fp8_context_fmha or fp8_context_mla) else 0
-        fmha_bmm2_scale_size = 4 if (fp8_context_fmha or fp8_context_mla) else 0
+        fmha_bmm2_scale_size = cls.SIZEOF_FLOAT32 if (fp8_context_fmha or fp8_context_mla) else 0
 
         offset = 0
         trtllm_gen_workspace, offset = cls._next_workspace_ptr(
             offset, cls.TRTLLM_GEN_WORKSPACE_SIZE
         )
-        attention_mask_offset, offset = cls._next_workspace_ptr(offset, attention_mask_size)
         cu_q_seqlens_offset, offset = cls._next_workspace_ptr(offset, cu_seqlens_size)
         cu_kv_seqlens_offset, offset = cls._next_workspace_ptr(offset, cu_seqlens_size)
         cu_mask_rows_offset, offset = cls._next_workspace_ptr(offset, cu_seqlens_size)
         rotary_inv_freq_offset, offset = cls._next_workspace_ptr(offset, rotary_inv_freq_size)
         q_buf_offset, offset = cls._next_workspace_ptr(offset, q_buf_2_size)
-        k_buf_offset, offset = cls._next_workspace_ptr(offset, k_buf_2_size)
-        v_buf_offset, offset = cls._next_workspace_ptr(offset, v_buf_2_size)
         tokens_info_offset, offset = cls._next_workspace_ptr(offset, tokens_info_size)
         fmha_tile_counter_offset, offset = cls._next_workspace_ptr(offset, fmha_scheduler_counter)
         fmha_bmm1_scale_offset, offset = cls._next_workspace_ptr(offset, fmha_bmm1_scale_size)
@@ -817,9 +753,6 @@ class WorkspaceManager:
         result = {
             "trtllm_gen_workspace": cls._get_view(
                 workspace, trtllm_gen_workspace, cls.TRTLLM_GEN_WORKSPACE_SIZE, torch.uint8
-            ),
-            "attention_mask": cls._get_view(
-                workspace, attention_mask_offset, attention_mask_size, dtype
             ),
             "cu_q_seqlens": cls._get_view(
                 workspace, cu_q_seqlens_offset, cu_seqlens_size, torch.int32
@@ -836,8 +769,6 @@ class WorkspaceManager:
             "q_buf": cls._get_view(workspace, q_buf_offset, q_buf_2_size, dtype)
             if not fp8_context_fmha
             else cls._get_view(workspace, q_buf_offset, q_buf_2_size, torch.uint8),
-            "k_buf": cls._get_view(workspace, k_buf_offset, k_buf_2_size, dtype),
-            "v_buf": cls._get_view(workspace, v_buf_offset, v_buf_2_size, dtype),
             "tokens_info": cls._get_view(
                 workspace, tokens_info_offset, tokens_info_size, torch.int32
             ),  # int2 as 2 x int32
@@ -925,9 +856,7 @@ class WorkspaceManager:
             if cyclic_attention_window_size > 0
             else max_past_kv_length
         )
-        estimated_min_multi_block_count = max(
-            1, (max_timesteps + 1023) // 1024 if max_timesteps > 0 else 1
-        )
+        estimated_min_multi_block_count = cls.estimate_min_multi_block_count(max_timesteps)
 
         max_num_seq_len_tiles = max(
             max(
@@ -947,10 +876,14 @@ class WorkspaceManager:
             else 0
         )
         partial_sum_size = (
-            4 * batch_beam * num_heads * max_num_seq_len_tiles if enable_multi_block else 0
+            cls.SIZEOF_FLOAT32 * batch_beam * num_heads * max_num_seq_len_tiles
+            if enable_multi_block
+            else 0
         )
         partial_max_size = (
-            4 * batch_beam * num_heads * max_num_seq_len_tiles if enable_multi_block else 0
+            cls.SIZEOF_FLOAT32 * batch_beam * num_heads * max_num_seq_len_tiles
+            if enable_multi_block
+            else 0
         )
         shift_k_cache_size = (
             0
@@ -958,15 +891,17 @@ class WorkspaceManager:
             else dtype_size * batch_beam * num_heads * head_size * max_attention_window_size
         )
 
-        cu_seqlens_size = 4 * (batch_beam + 1)
-        cu_kv_seqlens_size = 4 * (batch_beam + 1)
+        cu_seqlens_size = cls.SIZEOF_INT32 * (batch_beam + 1)
+        cu_kv_seqlens_size = cls.SIZEOF_INT32 * (batch_beam + 1)
         rotary_inv_freq_size = (
-            4 * batch_beam * rotary_embedding_dim // 2 if rotary_embedding_dim > 0 else 0
+            cls.SIZEOF_FLOAT32 * batch_beam * rotary_embedding_dim // 2
+            if rotary_embedding_dim > 0
+            else 0
         )
-        tokens_info_size = 8 * num_tokens
+        tokens_info_size = cls.SIZEOF_INT2 * num_tokens
         q_buf_size = dtype_size * num_tokens * num_heads * head_size
-        bmm1_scale_size = 4 * 2
-        bmm2_scale_size = 4
+        bmm1_scale_size = cls.SIZEOF_FLOAT32 * 2
+        bmm2_scale_size = cls.SIZEOF_FLOAT32
         sparse_attn_cache_size = (
             4 * (batch_beam + batch_beam * 2 * max_blocks_per_sequence) * num_kv_heads
             if use_sparse_attention
@@ -1081,6 +1016,8 @@ class EnqueueParams:
     attention_output_orig_quant: Optional[torch.Tensor] = None
     bmm1_scale: float = 1.0
     bmm2_scale: float = 1.0
+    rotary_inv_freq: Optional[torch.Tensor] = None
+    rotary_cos_sin: Optional[torch.Tensor] = None
 
 
 @dataclass
@@ -1143,9 +1080,6 @@ class FlashInferTrtllmGenAttention:
             num_heads=params.num_heads,
             head_size=params.head_size,
             rotary_embedding_dim=params.rotary_embedding_dim,
-            num_kv_heads=params.num_kv_heads,
-            input_seq_length=params.input_seq_length,
-            enable_context_fmha=True,
             separate_q_kv_input=True,
             fp8_context_fmha=False,
         )
@@ -1158,13 +1092,13 @@ class FlashInferTrtllmGenAttention:
             encoder_padding_offsets=None,
             packed_mask_row_offsets=ctx_ws.cu_mask_rows,
             seq_cp_partial_offsets=None,
-            attention_mask=ctx_ws.attention_mask,
+            attention_mask=None,
             seq_q_lengths=params.context_lengths,
             seq_kv_lengths=params.sequence_lengths,
             cp_size=1,
             fmha_tile_counter=ctx_ws.fmha_tile_counter,
             dequant_scale_qkv=params.kv_scale_quant_orig,
-            separate_qkv_scales=False,
+            separate_qkv_scales=quant_mode.QuantMode(params.kv_cache_quant_mode).has_fp4_kv_cache(),
             quant_scale_o=params.attention_output_orig_quant,
             fmha_host_bmm1_scale=params.bmm1_scale,
             fmha_bmm1_scale=ctx_ws.fmha_bmm1_scale,
@@ -1181,8 +1115,8 @@ class FlashInferTrtllmGenAttention:
             rotary_embedding_base=params.rotary_embedding_base,
             rotary_embedding_dim=params.rotary_embedding_dim,
             rotary_scaling_type=params.rotary_embedding_scale_type,
-            rotary_embedding_inv_freq=None,
-            rotary_embedding_inv_freq_cache=None,
+            rotary_embedding_inv_freq=ctx_ws.rotary_inv_freq_buf,
+            rotary_embedding_inv_freq_cache=params.rotary_inv_freq,
             rotary_embedding_max_positions=params.rotary_embedding_max_positions,
         )
 
@@ -1202,9 +1136,9 @@ class FlashInferTrtllmGenAttention:
             encoder_seq_lens=None,
             cu_seq_lens=ctx_ws.cu_q_seqlens,
             cu_kv_seq_lens=ctx_ws.cu_kv_seqlens,
-            rotary_embedding_inv_freq=None,
-            rotary_coef_cache_buffer=None,
-            mrope_rotary_cos_sin=None,
+            rotary_embedding_inv_freq=ctx_ws.rotary_inv_freq_buf,
+            rotary_coef_cache_buffer=params.rotary_cos_sin,
+            mrope_rotary_cos_sin=params.mrope_rotary_cos_sin,
             qkv_scale_orig_quant=params.kv_scale_orig_quant,
             spec_decoding_position_offsets=None,
             logn_scaling=None,
@@ -1299,6 +1233,7 @@ class FlashInferTrtllmGenAttention:
             multi_processor_count=torch.cuda.get_device_properties(
                 params.attention_input.device
             ).multi_processor_count,
+            rotary_embedding_dim=params.rotary_embedding_dim,
             num_kv_heads=params.num_kv_heads,
             max_attention_window_size=params.max_attention_window_size,
         )
@@ -1324,8 +1259,8 @@ class FlashInferTrtllmGenAttention:
                 rotary_embedding_base=params.rotary_embedding_base,
                 rotary_embedding_dim=params.rotary_embedding_dim,
                 rotary_scaling_type=params.rotary_embedding_scale_type,
-                rotary_embedding_inv_freq=None,
-                rotary_embedding_inv_freq_cache=None,
+                rotary_embedding_inv_freq=gen_ws.rotary_inv_freq,
+                rotary_embedding_inv_freq_cache=params.rotary_inv_freq,
                 rotary_embedding_max_positions=params.rotary_embedding_max_positions,
                 padding_offsets=None,
                 tokens_info=None,
@@ -1336,7 +1271,9 @@ class FlashInferTrtllmGenAttention:
                 cp_size=1,
                 fmha_tile_counter=None,
                 dequant_scale_qkv=None,
-                separate_qkv_scales=False,
+                separate_qkv_scales=quant_mode.QuantMode(
+                    params.kv_cache_quant_mode
+                ).has_fp4_kv_cache(),
                 quant_scale_o=None,
                 fmha_host_bmm1_scale=0.0,
                 fmha_bmm1_scale=None,
@@ -1346,7 +1283,6 @@ class FlashInferTrtllmGenAttention:
                 sink_token_length=0,
                 attention_mask_type=0,
             )
-
         has_kv_cache_quant = params.kv_cache_quant_mode != 0
         preprocessing_params = dict(
             qkv_input=params.qkv_input,
@@ -1364,8 +1300,8 @@ class FlashInferTrtllmGenAttention:
             cache_seq_lens=params.sequence_lengths,
             cu_seq_lens=gen_ws.cu_seqlens,
             cu_kv_seq_lens=gen_ws.cu_kv_seqlens,
-            rotary_embedding_inv_freq=None,
-            rotary_coef_cache_buffer=None,
+            rotary_embedding_inv_freq=gen_ws.rotary_inv_freq,
+            rotary_coef_cache_buffer=params.rotary_cos_sin,
             qkv_scale_orig_quant=params.kv_scale_orig_quant,
             spec_decoding_position_offsets=None,
             mrope_rotary_cos_sin=None,
@@ -1495,18 +1431,16 @@ def is_supported(
         is_fused_qkv: Whether QKV is fused.
         update_kv_cache: Whether KV cache update is enabled.
         has_cross_kv: Whether cross KV is provided.
-        quant_config: Quantization configuration (QuantConfig). If provided,
-                     will automatically determine kv_cache_dtype based on
-                     has_fp8_kv_cache() or has_fp4_kv_cache().
-        kv_cache_manager: KV cache manager.
+        quant_config: Quantization configuration (QuantConfig).
+        kv_cache_manager: KV cache manager (its .dtype provides KV cache DataType).
         phase: Phase to check ("context", "generation", or "both").
 
     Returns:
         Tuple of (is_supported, reason_if_not_supported).
     """
-    kv_cache_dtype = q.dtype
+    kv_cache_dtype = torch_dtype_to_binding(q.dtype)
     if kv_cache_manager is not None:
-        kv_cache_dtype = kv_cache_manager.get_buffers(0, kv_layout=DEFAULT_KV_LAYOUT).dtype
+        kv_cache_dtype = kv_cache_manager.dtype
 
     return FlashInferTrtllmGenAttention(
         kv_cache_manager=kv_cache_manager, quant_config=quant_config
@@ -1760,7 +1694,12 @@ def trtllm_gen_attention(
     )
 
     if current_workspace_size < required_workspace_size:
+        logger.warning(
+            f"Attention workspace size is not enough, increase the size from "
+            f"{current_workspace_size} bytes to {required_workspace_size} bytes"
+        )
         workspace.resize_(required_workspace_size)
+        workspace.zero_()
 
     # Reshape Tensors
     # Input q shape: [num_tokens, (num_heads + 2*num_kv_heads) * head_size] for fused QKV
@@ -1827,6 +1766,8 @@ def trtllm_gen_attention(
         attention_output_orig_quant=out_scale,
         bmm1_scale=1.0 / (math.sqrt(head_size) * q_scaling),
         bmm2_scale=1.0,
+        rotary_inv_freq=rotary_inv_freq,
+        rotary_cos_sin=rotary_cos_sin,
     )
 
     # Context Phase
@@ -1855,6 +1796,7 @@ def trtllm_gen_attention(
             input_seq_length=max_context_q_len,
             batch_size=num_seqs,
             max_context_length=max_context_length,
+            mrope_rotary_cos_sin=mrope_rotary_cos_sin,
         )
         backend.run_context(ctx_params)
 
