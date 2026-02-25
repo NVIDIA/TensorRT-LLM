@@ -4,9 +4,7 @@ import weakref
 from typing import List, Optional, Union, cast
 
 import torch
-import torch.nn.functional as F
 from torch import nn
-from torch.nn.utils.rnn import pad_sequence
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm._utils import (get_sm_version, is_sm_100f, nvtx_range,
@@ -1068,11 +1066,37 @@ class MLA(nn.Module):
         # False). When apply_rotary_emb is True the dispatch guard skips this
         # path, so the embedding would never be used.
         self._rotary_emb_mha = None
+        self._short_seq_mha = None
         if self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb:
             self._rotary_emb_mha = RotaryEmbedding(
                 pos_embd_params.rope,
                 head_dim=self.qk_rope_head_dim,
                 is_neox=pos_embd_params.is_neox,
+            )
+            # Dense MHA attention backend for the short-seq path. Uses plain
+            # TrtllmAttention (sparse_attention_config=None) because this path
+            # computes dense attention over all tokens. TrtllmAttention has no
+            # weight parameters, so memory overhead is negligible. Stored as a
+            # separate attribute (not self.mha) to preserve the DSA assertion
+            # that self.mha is None in forward_impl_with_dsa.
+            self._short_seq_mha = create_attention(
+                config.attn_backend,
+                self.layer_idx,
+                self.num_heads_tp,
+                head_dim=self.qk_head_dim,
+                num_kv_heads=self.num_key_value_heads_tp,
+                pos_embd_params=pos_embd_params,
+                quant_config=quant_config,
+                q_scaling=q_scaling,
+                is_mla_enable=True,
+                q_lora_rank=self.q_lora_rank,
+                kv_lora_rank=self.kv_lora_rank,
+                qk_nope_head_dim=self.qk_nope_head_dim,
+                qk_rope_head_dim=self.qk_rope_head_dim,
+                v_head_dim=self.v_head_dim,
+                predicted_tokens_per_seq=self.predicted_tokens_per_seq,
+                skip_create_weights_in_init=config.skip_create_weights_in_init,
+                sparse_attention_config=None,
             )
 
         self.llama_4_scaling = False
@@ -1091,6 +1115,8 @@ class MLA(nn.Module):
         # which could be modified after __init__
         if not self.is_dsa:
             self.mha.update_quant_config(self.quant_config)
+        if self._short_seq_mha is not None:
+            self._short_seq_mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
@@ -1632,8 +1658,11 @@ class MLA(nn.Module):
         V-projection) and uses a larger head_dim (kv_lora_rank + rope_dim = 576)
         for the attention kernel, compared to the standard qk_head_dim = 192.
 
-        Uses SDPA instead of self.mha.forward() because DSA models set
-        self.mha = None (only self.mqa is available for MQA/generation).
+        Uses self._short_seq_mha (a dedicated TrtllmAttention backend) for
+        the attention computation. This backend natively handles variable-length
+        packed sequences via attn_metadata, avoiding the need for padding or
+        per-sequence Python loops. latent_cache=None tells the backend to skip
+        RoPE and KV cache append (already done in Step 1).
 
         This method:
         1. Stores latent_cache in paged KV cache and applies RoPE to q via the
@@ -1641,9 +1670,9 @@ class MLA(nn.Module):
         2. Applies RoPE to k_pe manually using the RotaryEmbedding.
         3. Expands compressed KV via kv_b_proj to get full k_nope and v.
         4. Constructs full K = [k_nope, RoPE(k_pe)] per head.
-        5. Computes dense attention via torch SDPA (no sparse routing — for
-           short sequences, dense attention is both faster and higher quality
-           than sparse selection via topk_indices).
+        5. Computes dense attention via fused MHA backend (no sparse routing —
+           for short sequences, dense attention is both faster and higher
+           quality than sparse selection via topk_indices).
         """
         num_ctx_tokens = q.shape[0]
 
@@ -1680,70 +1709,26 @@ class MLA(nn.Module):
         k = torch.cat([k_nope_r, k_pe_expanded], dim=-1)
         # k: [num_ctx_tokens, num_heads_tp, qk_head_dim]
 
-        # Step 5: Reshape Q, V for attention.
-        q_r = q.view(-1, self.num_heads_tp,
-                     self.qk_head_dim)  # [tokens, H, D]
-        v_r = v.view(-1, self.num_heads_tp,
-                     self.v_head_dim)  # [tokens, H, Dv]
+        # Step 5: Flatten Q, K, V to 2D packed layout for the fused attention
+        # backend, which natively handles variable-length sequences via
+        # attn_metadata (no padding/batching needed).
+        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
+        v = v.view(-1, self.num_heads_tp * self.v_head_dim)
 
-        # Step 6: Compute attention using SDPA.
-        # Handle packed variable-length sequences by processing per-sequence.
-        num_contexts = attn_metadata.num_contexts
-        seq_lens = attn_metadata.prompt_lens_cpu_runtime[:num_contexts]
-
-        if num_contexts == 1:
-            # Single sequence: straightforward SDPA with [1, H, S, D] layout.
-            q_b = q_r.unsqueeze(0).transpose(1, 2)
-            k_b = k.unsqueeze(0).transpose(1, 2)
-            v_b = v_r.unsqueeze(0).transpose(1, 2)
-
-            attn_out = F.scaled_dot_product_attention(
-                q_b, k_b, v_b, is_causal=True, scale=self.softmax_scale)
-
-            attn_out = attn_out.transpose(1, 2).squeeze(0)  # [S, H, Dv]
-            output[:num_ctx_tokens].copy_(
-                attn_out.reshape(num_ctx_tokens,
-                                 self.num_heads_tp * self.v_head_dim))
-        else:
-            # Multiple packed sequences: pad to max length and batch SDPA.
-            # For short sequences, padding overhead is minimal and batching
-            # reduces kernel launch overhead vs. a per-sequence Python loop.
-            seq_lens_list = seq_lens.tolist()
-            max_seq_len = max(seq_lens_list)
-
-            # Split packed tensors into per-sequence views
-            q_seqs = torch.split(q_r, seq_lens_list, dim=0)
-            k_seqs = torch.split(k, seq_lens_list, dim=0)
-            v_seqs = torch.split(v_r, seq_lens_list, dim=0)
-
-            # Pad and stack into [B, max_seq_len, H, D],
-            # then transpose to [B, H, S, D] for SDPA
-            q_padded = pad_sequence(q_seqs,
-                                    batch_first=True).transpose(1, 2)
-            k_padded = pad_sequence(k_seqs,
-                                    batch_first=True).transpose(1, 2)
-            v_padded = pad_sequence(v_seqs,
-                                    batch_first=True).transpose(1, 2)
-
-            # Single batched SDPA call. is_causal=True is correct because
-            # real token at position j only attends to positions 0..j, all
-            # of which are real tokens (padding is right-aligned at end).
-            attn_out = F.scaled_dot_product_attention(
-                q_padded, k_padded, v_padded, is_causal=True,
-                scale=self.softmax_scale)
-
-            # [B, H, S, Dv] -> [B, S, H*Dv]
-            hd = self.num_heads_tp * self.v_head_dim
-            attn_out = attn_out.transpose(1, 2).reshape(
-                num_contexts, max_seq_len, hd)
-
-            # Extract valid (non-padded) tokens via boolean mask
-            seq_lens_t = torch.tensor(seq_lens_list, device=q.device)
-            positions = torch.arange(max_seq_len, device=q.device)
-            valid_mask = positions.unsqueeze(0) < seq_lens_t.unsqueeze(1)
-            output[:num_ctx_tokens].copy_(attn_out[valid_mask])
-
-        return output
+        # Step 6: Compute attention via the fused MHA backend.
+        # latent_cache=None signals that RoPE and KV cache append were already
+        # done in Step 1 (mla_rope_append_paged_kv_assign_q), matching the
+        # pattern used by forward_context_with_cached_kv.
+        return self._short_seq_mha.forward(
+            q,
+            k,
+            v,
+            attn_metadata,
+            attention_input_type=AttentionInputType.context_only,
+            latent_cache=None,
+            out_scale=self.out_scale,
+            output=output,
+        )
 
     def forward_generation_dsa(
         self,
