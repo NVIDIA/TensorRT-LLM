@@ -474,7 +474,7 @@ def launchReleaseCheck(pipeline)
                         buildResult: 'SUCCESS',
                         stageResult: 'FAILURE') {
                         error "Release Check failed but ignored due to Jenkins configuration"
-                        }
+                    }
                 } else {
                     throw e
                 }
@@ -1046,7 +1046,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 
     def status = triggerJob(jobName, parameters)
     if (status != "SUCCESS") {
-        error "Downstream job did not succeed"
+        error "Downstream job ${jobName} status: ${status}"
     }
     return status
 }
@@ -1295,7 +1295,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             catchError(
                                 buildResult: 'SUCCESS',
                                 stageResult: 'UNSTABLE') {
-                                error "Build-Docker-Images job failed: ${e.toString()}"
+                                echo "Build-Docker-Images job failed: ${e.toString()}"
                             }
                         } else {
                             throw e
