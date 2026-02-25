@@ -628,8 +628,16 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_FP8 = "Qwen/Qwen3.5-397B-A17B-FP8"
+    MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    CONFIG_PATH = str(
+        Path(__file__).resolve().parents[4] / "examples" / "auto_deploy" /
+        "model_registry" / "configs" / "qwen3.5_moe_400b.yaml")
+    CONFIG_PATH_SMALL = str(
+        Path(__file__).resolve().parents[4] / "examples" / "auto_deploy" /
+        "model_registry" / "configs" / "qwen3.5_moe_35b.yaml")
 
     def get_default_kwargs(self):
         return {
@@ -679,6 +687,52 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_fp8(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "yaml_extra": [self.CONFIG_PATH],
+            "max_seq_len": self.MAX_SEQ_LEN,
+        }
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME_FP8,
+                           tokenizer=self.MODEL_NAME_FP8,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            #llm.args.quant_config.quant_algo = QuantAlgo.FP8
+            #llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            task = MMLU(self.MODEL_NAME_FP8)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME_FP8)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(80000)
+    @pytest.mark.parametrize("world_size", [4])
+    def test_fp16_small(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "yaml_extra": [self.CONFIG_PATH_SMALL],
+            "max_seq_len": self.MAX_SEQ_LEN,
+        }
+        self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME_SMALL,
+                           tokenizer=self.MODEL_NAME_SMALL,
+                           world_size=world_size,
+                           **kwargs) as llm:
+            #llm.args.quant_config.quant_algo = QuantAlgo.FP8
+            #llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+            #task = MMLU(self.MODEL_NAME_FP8)
+            #task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME_SMALL)
             task.evaluate(llm)
 
 
