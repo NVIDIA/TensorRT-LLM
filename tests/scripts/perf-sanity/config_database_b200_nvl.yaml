@@ -15,11 +15,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8192
+  max_num_tokens: 3136
   max_seq_len: 2068
   client_configs:
   - name: con1_isl1024_osl1024
@@ -37,7 +40,7 @@ server_configs:
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 512
-  enable_attention_dp: false
+  enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -45,12 +48,19 @@ server_configs:
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
-    backend: TRTLLM
+    backend: DEEPGEMM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8192
+  max_num_tokens: 3072
   max_seq_len: 2068
   client_configs:
   - name: con64_isl1024_osl1024
@@ -112,11 +122,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8192
+  max_num_tokens: 3136
   max_seq_len: 9416
   client_configs:
   - name: con1_isl1024_osl8192
@@ -143,11 +156,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 3072
+  max_num_tokens: 8192
   max_seq_len: 9416
   client_configs:
   - name: con32_isl1024_osl8192
@@ -178,6 +194,9 @@ server_configs:
     batching_wait_iters: 0
     enable_balance: true
     timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -209,11 +228,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8768
+  max_num_tokens: 10304
   max_seq_len: 9416
   client_configs:
   - name: con1_isl8192_osl1024
@@ -239,16 +261,19 @@ server_configs:
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
-    backend: TRTLLM
+    backend: DEEPGEMM
   attention_dp_config:
     batching_wait_iters: 0
     enable_balance: true
     timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8512
+  max_num_tokens: 9280
   max_seq_len: 9416
   client_configs:
   - name: con64_isl8192_osl1024
@@ -310,6 +335,9 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -331,7 +359,7 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 1024
+    max_batch_size: 32
   enable_attention_dp: false
   print_iter_log: true
   kv_cache_config:
@@ -341,11 +369,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 2048
+  max_num_tokens: 3136
   max_seq_len: 2068
   client_configs:
   - name: con32_isl1024_osl1024
@@ -494,7 +525,7 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 1
   enable_attention_dp: false
   print_iter_log: true
   kv_cache_config:
@@ -504,11 +535,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8192
+  max_num_tokens: 5248
   max_seq_len: 9416
   client_configs:
   - name: con1_isl1024_osl8192
@@ -525,7 +559,7 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 32
   enable_attention_dp: false
   print_iter_log: true
   kv_cache_config:
@@ -535,11 +569,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8192
+  max_num_tokens: 5248
   max_seq_len: 9416
   client_configs:
   - name: con32_isl1024_osl8192
@@ -556,7 +593,7 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 1024
+    max_batch_size: 256
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -565,11 +602,14 @@ server_configs:
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
-    backend: TRTLLM
+    backend: CUTLASS
   attention_dp_config:
     batching_wait_iters: 0
     enable_balance: true
     timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
@@ -591,7 +631,7 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 2048
+    max_batch_size: 256
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -600,11 +640,14 @@ server_configs:
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
-    backend: TRTLLM
+    backend: CUTLASS
   attention_dp_config:
     batching_wait_iters: 0
     enable_balance: true
     timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
@@ -626,7 +669,7 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 1
+    max_batch_size: 512
   enable_attention_dp: false
   print_iter_log: true
   kv_cache_config:
@@ -636,11 +679,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8768
+  max_num_tokens: 10304
   max_seq_len: 9416
   client_configs:
   - name: con1_isl8192_osl1024
@@ -667,11 +713,14 @@ server_configs:
   stream_interval: 10
   moe_config:
     backend: TRTLLM
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 3
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8768
+  max_num_tokens: 10304
   max_seq_len: 9416
   client_configs:
   - name: con32_isl8192_osl1024
@@ -748,38 +797,7 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc32_gpu4
-  model_name: deepseek_r1_0528_fp4_v2
-  gpus: 4
-  match_mode: scenario
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 512
-  enable_attention_dp: false
-  print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.8
-    enable_block_reuse: false
-  stream_interval: 10
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 4
-  moe_expert_parallel_size: 4
-  trust_remote_code: true
-  backend: pytorch
-  max_num_tokens: 8320
-  max_seq_len: 9416
-  client_configs:
-  - name: con32_isl8192_osl1024
-    concurrency: 32
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc2048_gpu4
+- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc64_gpu4
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
@@ -803,7 +821,45 @@ server_configs:
   moe_expert_parallel_size: 4
   trust_remote_code: true
   backend: pytorch
-  max_num_tokens: 8704
+  max_num_tokens: 8320
+  max_seq_len: 9416
+  client_configs:
+  - name: con64_isl8192_osl1024
+    concurrency: 64
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc2048_gpu4
+  model_name: deepseek_r1_0528_fp4_v2
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 256
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8768
   max_seq_len: 9416
   client_configs:
   - name: con2048_isl8192_osl1024

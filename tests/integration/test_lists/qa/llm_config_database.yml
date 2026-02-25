@@ -66,7 +66,7 @@ llm_config_database:
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc8192_gpu4]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc2048_gpu4]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc32_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc64_gpu4]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc2048_gpu4]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc4_gpu4]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc128_gpu4]
