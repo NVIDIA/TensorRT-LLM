@@ -337,7 +337,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
         z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]
         b = self.in_proj_b(hidden_states)  # [B, S, num_v_heads]
         a = self.in_proj_a(hidden_states)  # [B, S, num_v_heads]
 
@@ -379,12 +378,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         # q/k have num_k_heads, v/g/beta have num_v_heads.
         core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
 
-        # 5. Gated RMSNorm
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        # 5. Gated RMSNorm + merge heads
+        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
         # 6. Output projection
