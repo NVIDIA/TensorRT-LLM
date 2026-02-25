@@ -75,18 +75,17 @@ class ArtifactoryUploader:
         print(f"   Timeout: {timeout}s")
         
         try:
-            # Read file content
+            # Use streaming upload for large files (avoids loading entire file into memory)
             with open(local_path, 'rb') as f:
-                file_data = f.read()
-            
-            # Create request
-            request = urllib.request.Request(url, data=file_data, method='PUT')
-            request.add_header('Authorization', self.auth_header)
-            request.add_header('Content-Type', 'application/octet-stream')
-            
-            # Send request with timeout
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                status_code = response.getcode()
+                # Create request with file object for streaming
+                request = urllib.request.Request(url, data=f, method='PUT')
+                request.add_header('Authorization', self.auth_header)
+                request.add_header('Content-Type', 'application/octet-stream')
+                request.add_header('Content-Length', str(file_size))
+                
+                # Send request with timeout
+                with urllib.request.urlopen(request, timeout=timeout) as response:
+                    status_code = response.getcode()
                 
                 if 200 <= status_code < 300:
                     print(f"   Success (HTTP {status_code})")
