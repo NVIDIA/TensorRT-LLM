@@ -391,6 +391,9 @@ class TrtllmAttentionWrapper:
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        sage_attn_num_elts_per_blk_q: Optional[int] = None,
+        sage_attn_num_elts_per_blk_k: Optional[int] = None,
+        sage_attn_num_elts_per_blk_v: Optional[int] = None,
     ):
         """
         Run the attention operation.
@@ -617,6 +620,21 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_manager,
             )
         else:
+            use_sage_attn_separate_qkv = any(v is not None and v > 0 for v in [
+                sage_attn_num_elts_per_blk_q, sage_attn_num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v
+            ])
+
+            if use_sage_attn_separate_qkv:
+                if is_fused_qkv:
+                    raise ValueError(
+                        "SageAttention SeparateQkv requires separate q/k/v tensors (is_fused_qkv must be false)."
+                    )
+                if k is None or v is None:
+                    raise ValueError(
+                        "SageAttention SeparateQkv requires both k and v tensors to be provided."
+                    )
+
             thop.attention(
                 q,
                 k,
@@ -696,6 +714,9 @@ class TrtllmAttentionWrapper:
                 mla_bmm1_scale,
                 mla_bmm2_scale,
                 quant_q_buffer,
+                sage_attn_num_elts_per_blk_q,
+                sage_attn_num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v,
             )
 
         if self.print_skip_softmax_stat:
@@ -1786,6 +1807,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
+        sage_attn_num_elts_per_blk_q: Optional[int] = None,
+        sage_attn_num_elts_per_blk_k: Optional[int] = None,
+        sage_attn_num_elts_per_blk_v: Optional[int] = None,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -1950,7 +1974,10 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          fmha_scheduler_counter=fmha_scheduler_counter,
                          mla_bmm1_scale=mla_bmm1_scale,
                          mla_bmm2_scale=mla_bmm2_scale,
-                         quant_q_buffer=quant_q_buffer)
+                         quant_q_buffer=quant_q_buffer,
+                         sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
+                         sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
+                         sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v)
 
         if output_sf is None:
             return output
