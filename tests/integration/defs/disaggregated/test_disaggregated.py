@@ -964,7 +964,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_mpi(disaggregated_test_root,
     env["TRTLLM_USE_MPI_KVCACHE"] = "1"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_mpi",
-                           env=env)
+                           env=env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1087,7 +1088,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1102,7 +1104,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp_8_attention_dp_overlap",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1118,7 +1121,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph(
     run_disaggregated_test(
         disaggregated_example_root,
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph",
-        env=llm_venv._new_env)
+        env=llm_venv._new_env,
+        model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1133,7 +1137,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_overlap_cuda_graph",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1148,7 +1153,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp_one",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1163,7 +1169,8 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_one_mtp(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp_one_mtp",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1195,7 +1202,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_cache_aware_balance(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_cache_aware_balance",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
@@ -1209,7 +1217,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_conditional(
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_conditional",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_no_hopper
