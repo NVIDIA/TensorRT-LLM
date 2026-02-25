@@ -49,7 +49,8 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
-def get_kv_cache_manager_cls(model_config: ModelConfig):
+def get_kv_cache_manager_cls(model_config: ModelConfig,
+                             kv_cache_config: KvCacheConfig):
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
@@ -57,7 +58,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig):
     elif is_nemotron_hybrid(config) or is_qwen3_next(config):
         return MambaHybridCacheManager
     else:
-        return KVCacheManager
+        return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
 
 
 def is_vswa_enabled(kv_cache_config):
@@ -100,6 +101,8 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
+        # For V2 fallback use only, will be removed after V2 is stable
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -109,10 +112,18 @@ class KvCacheCreator:
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
-            model_engine.model.model_config)
+            model_engine.model.model_config, kv_cache_config)
         self._execution_stream = execution_stream
-        if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2:
-            self._kv_cache_manager_cls = KVCacheManagerV2
+        if self._kv_cache_manager_cls == KVCacheManagerV2:
+            if kv_connector_manager is not None or (
+                    max_beam_width is not None and max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "Falling back to KVCacheManager.")
+                self._kv_cache_manager_cls = KVCacheManager
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -401,6 +412,20 @@ class KvCacheCreator:
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
             finally:
+                # get kv cache stats for both model and draft model
+                kv_stats = py_executor.resource_manager.resource_managers.get(
+                    ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
+                # Get draft KV cache stats if present (either from two-model mode or one-model
+                # mode with separate draft KV cache)
+                draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+                kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
+                ) if draft_kv_cache_manager is not None else None
+
+                # get total allocated bytes
+                allocated_bytes = kv_stats.allocated_bytes + (
+                    kv_stats_draft.allocated_bytes
+                    if kv_stats_draft is not None else 0)
                 py_executor.is_warmup = False
                 py_executor.shutdown()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
@@ -417,20 +442,6 @@ class KvCacheCreator:
                 f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
             )
 
-            # get kv cache stats for both model and draft model
-            kv_stats = py_executor.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
-            # Get draft KV cache stats if present (either from two-model mode or one-model
-            # mode with separate draft KV cache)
-            draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-            kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
-            ) if draft_kv_cache_manager is not None else None
-
-            # get total allocated bytes
-            allocated_bytes = kv_stats.allocated_bytes + (
-                kv_stats_draft.allocated_bytes
-                if kv_stats_draft is not None else 0)
         else:
             peak_memory = total_used_bytes
             allocated_bytes = 0
@@ -612,11 +623,19 @@ class KvCacheCreator:
 
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config)
+            effective_draft_config, self._kv_cache_config)
 
         # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManager and self._kv_cache_config.use_kv_cache_manager_v2:
-            draft_kv_cache_manager_cls = KVCacheManagerV2
+        if draft_kv_cache_manager_cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "Falling back to KVCacheManager for draft model.")
+                draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         return _create_kv_cache_manager(
@@ -1077,7 +1096,9 @@ def create_py_executor_instance(
         if isinstance(kv_cache_manager, KVCacheManagerV2):
             capacity_scheduler = KVCacheV2DummyScheduler(
                 scheduler_capacity,
-                kv_cache_manager if kv_cache_manager is not None else None)
+                kv_cache_manager if kv_cache_manager is not None else None,
+                peft_cache_manager.impl
+                if peft_cache_manager is not None else None)
         else:
             capacity_scheduler = BindCapacityScheduler(
                 scheduler_capacity,
