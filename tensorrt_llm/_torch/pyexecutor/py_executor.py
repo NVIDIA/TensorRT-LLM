@@ -1623,6 +1623,27 @@ class PyExecutor:
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
+        # In gen-only benchmark mode with disaggregated serving, keep fetching
+        # until all real requests have arrived before adding ADP dummies.
+        # This ensures the benchmark starts with the exact number of real
+        # requests specified, since dummies only get added after this loop.
+        if not self.is_warmup and self.benchmark_req_queues_size > 0 \
+                and self.kv_cache_transceiver \
+                and self.num_fetch_requests < self.benchmark_req_queues_size:
+            if self.dist.rank == 0:
+                logger.info(f"Starting benchmark fill loop, "
+                            f"num_fetch_requests={self.num_fetch_requests}/"
+                            f"{self.benchmark_req_queues_size}, "
+                            f"len(active_requests)={len(self.active_requests)}")
+            while self.num_fetch_requests < self.benchmark_req_queues_size:
+                iter_requests = self._fetch_and_activate_new_requests()
+                if self.should_stop_processing:
+                    return None, None
+                new_requests += iter_requests
+                self.hang_detector.checkpoint()
+                if self.num_fetch_requests < self.benchmark_req_queues_size:
+                    time.sleep(1)
+
         iter_stats = None
         if self.enable_iter_perf_stats:
             iter_stats = self._get_init_iter_stats(
@@ -1980,18 +2001,23 @@ class PyExecutor:
                 # to ensure consistent batch sizes for accurate performance measurement.
                 if not self.is_warmup and not can_forward:
                     if self.enable_attention_dp:
-                        local_can_forward = self.num_fetch_requests + \
-                            len(scheduled_batch.generation_requests) >= self.benchmark_req_queues_size
-                        all_can_forward = self.dist.tp_allgather(
-                            local_can_forward)
-                        if all(all_can_forward):
+                        # Allgather per-rank TRANS_COMPLETE generation counts to get the global total.
+                        # num_fetch_requests is not used here because it counts requests dispatched into
+                        # INIT state (before KV transfer), so it reaches the threshold while all requests
+                        # are still waiting for KV transfer and not yet ready for the forward pass.
+                        local_gen_count = len(
+                            scheduled_batch.generation_requests)
+                        all_gen_counts = self.dist.tp_allgather(local_gen_count)
+                        total_gen_count = sum(all_gen_counts)
+                        if total_gen_count >= self.benchmark_req_queues_size:
                             can_forward = True
                             time.sleep(10)
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, scheduled_gen_batch: {len(scheduled_batch.generation_requests)}"
-                                )
+                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
+                                    f"total_gen_count: {total_gen_count}, "
+                                    f"scheduled_gen_batch: {local_gen_count}")
                             time.sleep(10)
                             continue
                     else:
@@ -2715,6 +2741,17 @@ class PyExecutor:
                 if not (req.is_disagg_generation_init_state
                         or req.is_disagg_generation_transmission_in_progress)
             ])
+
+        # In benchmark disagg mode the fill loop saturates all slots with INIT
+        # requests simultaneously. Skip dummy addition until KV transfers
+        # complete and real requests become active (num_active_request > 0).
+        if (self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver
+                and not self.is_warmup and len(self.active_requests) > 0
+                and num_active_request == 0):
+            logger.info(
+                f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
+            )
+            return
 
         if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
             llm_request = self.kv_cache_manager.add_dummy_requests(
