@@ -383,8 +383,8 @@ class KVCacheManager(BaseResourceManager):
                 )
             assert isinstance(
                 kv_cache_config, KvCacheConfig
-            ), "calculate_max_num_blocks_from_cpp only accepts KvCacheConfig"
-            blocks_per_window = self.calculate_max_num_blocks_from_cpp(
+            ), "calculate_max_num_blocks_for_vswa only accepts KvCacheConfig"
+            blocks_per_window = self.calculate_max_num_blocks_for_vswa(
                 kv_cache_config=kv_cache_config,
                 model_config=model_config,
                 extra_cost_memory=0,
