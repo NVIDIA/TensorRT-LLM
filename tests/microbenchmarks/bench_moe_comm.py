@@ -254,36 +254,38 @@ def _time_dispatch_and_combine(
         l2_flush_size = (l2_size * 2) // 4  # Size in int32 elements
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
-    # Warmup iterations (not profiled)
-    for _ in range(warmup):
-        if l2_buffer is not None:
-            l2_buffer.zero_()
-        recv_hidden_states, _, _, _ = backend.dispatch(
-            hidden_states,
-            hidden_states_sf,
-            token_selected_slots,
-            token_final_scales,
-            all_rank_num_tokens,
-        )
-        shape = list(recv_hidden_states.shape)
-        shape[-1] = hidden_size
-        recv_hidden_states_moe = torch.empty(
-            tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
-        )
-        _ = backend.combine(
-            recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
-        )
-
     # Profile with Kineto
     with torch.profiler.profile(
-        # Include CPU so `record_function("dispatch_iter..."/"combine_iter...")` ranges
-        # appear in key_averages() / events(). Without CPU activity those ranges are
-        # missing, causing dispatch/combine attribution to fail.
+        # Include CPU so `record_function("dispatch"/"combine")` ranges appear in
+        # key_averages() / events(). Without CPU activity those ranges are missing,
+        # causing dispatch/combine attribution to fail.
         activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
         record_shapes=False,
         with_stack=False,
     ) as prof:
         _sync()
+
+        # Warmup iterations (not profiled)
+        for _ in range(warmup):
+            if l2_buffer is not None:
+                l2_buffer.zero_()
+            recv_hidden_states, _, _, _ = backend.dispatch(
+                hidden_states,
+                hidden_states_sf,
+                token_selected_slots,
+                token_final_scales,
+                all_rank_num_tokens,
+            )
+            shape = list(recv_hidden_states.shape)
+            shape[-1] = hidden_size
+            recv_hidden_states_moe = torch.empty(
+                tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
+            )
+            _ = backend.combine(
+                recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
+            )
+
+        # Timed iterations
         for _ in range(iters):
             # L2 cache flushing
             if l2_buffer is not None:
@@ -553,9 +555,7 @@ def parse_args() -> argparse.Namespace:
         help="Override quantization algo (defaults to profile.quant_algo).",
     )
     parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
-    parser.add_argument(
-        "--warmup", type=int, default=20, help="Warmup iterations. (Currently ignored.)"
-    )
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
     parser.add_argument(
         "--max_num_tokens_per_rank",
         type=int,
