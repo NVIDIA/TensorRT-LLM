@@ -346,6 +346,15 @@ class ConfigLoader:
         # Override config with environment variables (in memory only, do not write back)
         config_data = self._apply_env_overrides(config_data, model_name)
 
+        # Apply concurrency override if DISAGG_CONCURRENCY_OVERRIDE is set
+        # This enables running a single test case with a specific concurrency level
+        # e.g., DISAGG_CONCURRENCY_OVERRIDE=2048 will override concurrency_list to "2048"
+        concurrency_override = os.getenv("DISAGG_CONCURRENCY_OVERRIDE", "")
+        if concurrency_override:
+            original = config_data.get("benchmark", {}).get("concurrency_list", "")
+            config_data["benchmark"]["concurrency_list"] = concurrency_override
+            logger.info(f"Concurrency overridden: '{original}' -> '{concurrency_override}'")
+
         # Generate benchmark_type from sequence configuration
         benchmark_type = self._generate_benchmark_type(config_data)
 
