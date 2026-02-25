@@ -148,7 +148,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
     int tid = threadIdx.x;
     int const bytes_per_iter = bdx * sizeof(float4);
     int const iters = hidden_dim * sizeof(T) / bytes_per_iter;
-#pragma unroll
+
     for (int i = 0; i < iters; ++i)
     {
         // Each thread loads 16 bytes
@@ -158,7 +158,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
     }
     __syncthreads();
     // Reorder and convert to BF16
-#pragma unroll 4
+
     for (int i = 0; i < elements_per_thread; ++i)
     {
         int offset = tid * elements_per_thread + i;
@@ -167,7 +167,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
     }
     // Reduce to get max
     float maxv = 0, scale = 1.0, r_scale = 1.0;
-#pragma unroll
+
     for (int i = 0; i < elements_per_thread; ++i)
     {
         maxv = cuda_max(maxv, __bfloat162float(cuda_abs(input_frag[i])));
@@ -183,7 +183,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
     r_scale = reciprocal_approximate_ftz(qdq_scale);
     // Quantize each thread's value using PTX hardware instructions
     // Each iteration processes 4 elements using vectorized PTX operations
-#pragma unroll 4
     for (int i = 0; i < elements_per_thread; i += 4)
     {
         // Prepare scaled inputs for quantization
@@ -213,7 +212,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
         if constexpr (arcquant_type == ArcQuantType::ACT)
         {
             maxv = 0;
-#pragma unroll
+
             for (int i = 0; i < elements_per_thread; ++i)
             {
                 maxv = cuda_max(maxv, __bfloat162float(cuda_abs(input_frag[i])));
@@ -223,7 +222,6 @@ __global__ void quantize_reorder_nvfp4_kernel(
             __nv_fp8_e4m3 scale_ue4m3_res = (__nv_fp8_e4m3) scale;
             q_scale_tensor[sf_offset] = scale_ue4m3_res;
             r_scale = reciprocal_approximate_ftz((float) scale_ue4m3_res);
-#pragma unroll 4
             for (int i = 0; i < elements_per_thread; i += 4)
             {
                 // Prepare scaled residuals for quantization
@@ -242,7 +240,7 @@ __global__ void quantize_reorder_nvfp4_kernel(
         {
             sf_offset = get_sf_offset(row_id, pos + 1, K);
             q_scale_tensor[sf_offset] = scale_ue4m3;
-#pragma unroll 4
+
             for (int i = 0; i < elements_per_thread; i += 4)
             {
                 reinterpret_cast<uint16_t*>(output_frag)[(i + elements_per_thread) / 4]
