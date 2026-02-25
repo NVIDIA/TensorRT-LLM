@@ -19,6 +19,7 @@ from dataclasses import astuple, dataclass
 from typing import TYPE_CHECKING, Dict, List, Tuple
 
 if TYPE_CHECKING:
+    from tensorrt_llm._torch.distributed.communicator import Distributed
     from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 
     from ..executor_request_queue import RequestQueueItem
@@ -57,26 +58,42 @@ class ADPRouter(ABC):
         Output: dict[rank, list[Request]]
     """
 
+    def __init__(self, dist: Distributed):
+        self.dist = dist
+
     @abstractmethod
     def create_rank_state(
         self,
-        rank: int,
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem],
     ) -> RankState:
         """Create local RankState from current rank's active and new requests.
 
         Args:
-            rank: The current rank index.
             active_requests: Currently active LlmRequests on this rank.
             new_requests: New requests popped from the waiting queue.
-                Currently unused; reserved for future routers that need
-                new-request info (e.g. KV-cache-aware routing).
 
         Returns:
             RankState for this rank, to be serialized and allgathered.
         """
         raise NotImplementedError
+
+    def gather_all_rank_states(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem] | None = None,
+    ) -> list[RankState]:
+        """Build local RankState, allgather across DP ranks, return all states.
+
+        Args:
+            active_requests: Currently active LlmRequests on this rank.
+            new_requests: New requests popped from the waiting queue.
+                Currently unused; reserved for future routers that need
+                new-request info (e.g. KV-cache-aware routing).
+        """
+        local_state = self.create_rank_state(active_requests, new_requests or [])
+        responses = self.dist.tp_allgather(local_state.serialize())
+        return [RankState.deserialize(data=resp) for resp in responses]
 
     @abstractmethod
     def route_requests(
@@ -117,21 +134,17 @@ class DefaultADPRouter(ADPRouter):
            (descending) for better load balancing.
     """
 
-    def __init__(self, has_cp_helix: bool = False):
-        self.has_cp_helix = has_cp_helix
-
     def create_rank_state(
         self,
-        rank: int,
         active_requests: list[LlmRequest],
         new_requests: list[RequestQueueItem],
     ) -> RankState:
-        if self.has_cp_helix:
+        if self.dist.has_cp_helix:
             num_active_tokens = sum(req.total_input_len_cp for req in active_requests)
         else:
             num_active_tokens = sum(req.py_orig_prompt_len for req in active_requests)
         return RankState(
-            rank=rank,
+            rank=self.dist.tp_rank,
             num_active_requests=len(active_requests),
             num_active_tokens=num_active_tokens,
         )

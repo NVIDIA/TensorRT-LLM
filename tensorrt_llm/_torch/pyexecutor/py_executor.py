@@ -67,7 +67,7 @@ from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
 from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
-from .scheduler.adp_router import ADPRouter, DefaultADPRouter, RankState
+from .scheduler.adp_router import ADPRouter, DefaultADPRouter
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -310,8 +310,7 @@ class PyExecutor:
         self.model_engine = model_engine
         self.enable_attention_dp = model_engine.enable_attention_dp
         self.dist = dist
-        self.adp_router: ADPRouter = (
-            adp_router or DefaultADPRouter(has_cp_helix=dist.has_cp_helix))
+        self.adp_router: ADPRouter = (adp_router or DefaultADPRouter(dist=dist))
         self.sampler = sampler
         self.drafter = drafter
         self.draft_model_engine = getattr(self.drafter, "draft_model_engine",
@@ -2344,17 +2343,6 @@ class PyExecutor:
 
         waiting_queue.add_requests(new_requests)
 
-    def _gather_all_rank_states(
-            self, active_requests: List[LlmRequest]) -> List[RankState]:
-        """Build local RankState, allgather across DP ranks, return all states."""
-        local_state = self.adp_router.create_rank_state(
-            rank=self.dist.tp_rank,
-            active_requests=active_requests,
-            new_requests=[],
-        )
-        responses_list = self.dist.tp_allgather(local_state.serialize())
-        return [RankState.deserialize(data=resp) for resp in responses_list]
-
     def _pop_from_waiting_queue(
         self,
         waiting_queue: WaitingQueue,
@@ -2383,13 +2371,14 @@ class PyExecutor:
         """Fetch new requests and return LlmRequests ready for execution."""
         # 1. Gather rank states and calculate total_num_active_requests
         if self.enable_attention_dp:
-            # NOTE: _gather_all_rank_states is called here (before step 3)
+            # NOTE: gather_all_rank_states is called here (before step 3)
             # because _pop_from_waiting_queue needs all_ranks_num_active_requests
             # from the allgather result. Moving it to step 5 would require an
             # extra allgather. When introducing new router implementations
             # (e.g. KV-cache-aware) that need new_requests to gather additional
             # info, the allgather position may need to be revisited.
-            all_rank_states = self._gather_all_rank_states(active_requests)
+            all_rank_states = self.adp_router.gather_all_rank_states(
+                active_requests)
             all_ranks_num_active_requests = [
                 s.num_active_requests for s in all_rank_states
             ]
