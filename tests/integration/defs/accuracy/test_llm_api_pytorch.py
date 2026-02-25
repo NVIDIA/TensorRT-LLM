@@ -361,6 +361,20 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_blackwell
+    def test_nvfp4_kv_override(self):
+        """Load an FP8 checkpoint and force NVFP4 KV cache via dtype override."""
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        pytorch_config = dict(
+            attn_backend="TRTLLM",
+            kv_cache_config=KvCacheConfig(dtype="nvfp4"),
+        )
+        with LLM(model_path, **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding(self, backend: str, mocker):
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})

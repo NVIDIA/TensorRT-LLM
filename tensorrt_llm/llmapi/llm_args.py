@@ -1798,8 +1798,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    dtype: str = Field(default="auto",
-                       description="The data type to use for the KV cache.")
+    dtype: str = Field(
+        default="auto",
+        description=
+        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -1844,6 +1847,63 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+
+    @field_validator('free_gpu_memory_fraction')
+    @classmethod
+    def validate_free_gpu_memory_fraction(cls, v: float):
+        """Validates that the fraction is between 0.0 and 1.0."""
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
+    @field_validator('dtype')
+    @classmethod
+    def validate_dtype(cls, v: str):
+        v = v.lower()
+        if v not in ("auto", "fp8", "nvfp4"):
+            raise ValueError(
+                'kv_cache_config.dtype must be one of "auto", "fp8", or "nvfp4"'
+            )
+        return v
+
+    @field_validator('max_gpu_total_bytes')
+    @classmethod
+    def validate_max_gpu_total_bytes(cls, v: int):
+        if v < 0:
+            raise ValueError(
+                "kv_cache_config.max_gpu_total_bytes must be non-negative")
+        return v
+
+    @field_validator('max_attention_window')
+    @classmethod
+    def validate_max_attention_window(cls, v: Optional[List[int]]):
+        if v is None:
+            return v
+
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError(
+                "kv_cache_config.max_attention_window must be a non-empty list of positive integers"
+            )
+        for i in v:
+            if not isinstance(i, int):
+                raise ValueError(
+                    "kv_cache_config.max_attention_window must contain only integers"
+                )
+            if i <= 0:
+                raise ValueError(
+                    "kv_cache_config.max_attention_window values must be positive"
+                )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
+        return v
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -3166,6 +3226,8 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
         elif self.kv_cache_config.dtype == 'fp8':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        elif self.kv_cache_config.dtype == 'nvfp4':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "
