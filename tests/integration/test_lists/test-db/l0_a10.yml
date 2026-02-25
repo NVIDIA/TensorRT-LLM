@@ -20,6 +20,7 @@ l0_a10:
   - unittest/_torch/test_model_config.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
+  - unittest/_torch/modeling/test_nemotron_nano_v2_vl_preprocessing.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
