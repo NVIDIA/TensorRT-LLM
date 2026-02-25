@@ -346,9 +346,12 @@ class NemotronHTopkRouter(nn.Module):
         self.topk_group = config.topk_group
         self.norm_topk_prob = config.norm_topk_prob
 
-        self.weight = nn.Parameter(
-            torch.empty((self.n_routed_experts, config.hidden_size), dtype=torch.float32)
-        )
+        # Do NOT set dtype=torch.float32 here. When loaded via HF from_pretrained(dtype="auto"),
+        # an explicit float32 dtype bypasses the torch.set_default_dtype(bfloat16) context,
+        # keeping the weight in float32 and forcing F.linear with float32 input → slow TF32 GEMM.
+        # Without explicit dtype, the weight inherits the model's BF16 default, enabling the
+        # faster dsv3_router_gemm_op path (BF16 weight → float32 logits via nvjet kernels).
+        self.weight = nn.Parameter(torch.empty((self.n_routed_experts, config.hidden_size)))
         self.register_buffer(
             "e_score_correction_bias", torch.zeros(self.n_routed_experts, dtype=torch.float32)
         )

@@ -237,9 +237,20 @@ class GenerationExecutorProxy(GenerationExecutor):
         ) else None
         from tensorrt_llm._torch.models.modeling_auto import MODEL_CLASS_MAPPING
         torch.cuda.Stream()
+
+        # Strip the tokenizer from worker_kwargs to avoid MPI pickle failures.
+        # Tokenizers using trust_remote_code=True reference classes in the
+        # dynamic 'transformers_modules' namespace that cannot be deserialized
+        # on remote MPI worker nodes.  The tokenizer is not needed by workers
+        # (it is only consumed by the proxy / rank-0 leader).
+        mpi_worker_kwargs = {
+            k: v
+            for k, v in worker_kwargs.items() if k != 'tokenizer'
+        }
+
         self.mpi_futures = self.mpi_session.submit(
             worker_main,
-            **worker_kwargs,
+            **mpi_worker_kwargs,
             worker_cls=self.worker_cls,
             tracer_init_kwargs=tracer_init_kwargs,
             _torch_model_class_mapping=MODEL_CLASS_MAPPING,

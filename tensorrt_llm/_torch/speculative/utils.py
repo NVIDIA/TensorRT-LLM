@@ -14,7 +14,8 @@ from .model_drafter import ModelDrafter
 from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
-from .save_hidden_state import SaveHiddenStatesDrafter
+from .save_hidden_state import (SaveHiddenStatesResourceManager,
+                                SaveHiddenStatesSpecMetadata)
 
 
 def get_spec_metadata(spec_config,
@@ -80,22 +81,16 @@ def get_spec_metadata(spec_config,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
-        if spec_config.eagle3_layers_to_capture is None:
-            spec_config.eagle3_layers_to_capture = {
-                1, model_config.num_hidden_layers // 2 - 1,
-                model_config.num_hidden_layers - 4, -1
-            }
-        return Eagle3SpecMetadata(
+        return SaveHiddenStatesSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
-            num_layers=model_config.num_hidden_layers,
+            num_model_layers=model_config.num_hidden_layers,
             hidden_size=model_config.hidden_size,
             max_num_tokens=max_num_tokens,
             dtype=model_config.torch_dtype,
-            is_draft_model=is_draft_model,
-            eagle3_resource_manager=spec_resource_manager,
+            resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
     if  spec_config.spec_dec_mode.is_draft_target() or \
@@ -147,12 +142,11 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_tokens,
         )
     if spec_dec_mode.is_save_hidden_states():
-        return Eagle3ResourceManager(
+        return SaveHiddenStatesResourceManager(
             spec_config,
             model_engine.model.config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
-            max_seq_len,
             max_num_tokens,
         )
     if spec_dec_mode.is_ngram():
@@ -204,9 +198,6 @@ def get_spec_drafter(model_engine,
 
     if spec_config.spec_dec_mode.is_ngram():
         return NGramDrafter(spec_config, spec_resource_manager)
-
-    if spec_config.spec_dec_mode.is_save_hidden_states():
-        return SaveHiddenStatesDrafter(spec_config, spec_resource_manager)
 
     return None
 

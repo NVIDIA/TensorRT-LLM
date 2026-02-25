@@ -13,17 +13,19 @@ from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
     EPShardingInfo,
     FP8EPShardingInfo,
-    MLPType,
     NVFP4EPShardingInfo,
     ShardingTransformConfig,
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils._graph import lint, recompile
+from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
 
-def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
+def _run_ep_shard_job(
+    num_experts: int, enable_attention_dp: bool, rank: int, world_size: int
+) -> None:
     device = "cuda"
     hidden_size = 32
     intermediate_size = 16
@@ -50,25 +52,48 @@ def _run_ep_shard_job(num_experts: int, rank: int, world_size: int) -> None:
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
                 "sharding_dims": ["ep"],
+                "enable_attention_dp": enable_attention_dp,
             },
             "sharding_transform_executor": {
                 "stage": "sharding",
             },
         },
     )(None, gm)
+    if enable_attention_dp:
+        # attention-dp + MoE EP-only all-to-all does not insert explicit
+        # communication nodes. Instead, trtllm_moe uses MoEAlltoAll internally.
+        # Instead, check if input argument to MoE node, `enable_alltoall` is true
+        def transform_check(gm):
+            # get MoE node
+            moe_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_moe)]
+            assert len(moe_nodes) == 1, f"Expected 1 MoE node, got {len(moe_nodes)}"
+            moe_node = moe_nodes[0]
+            print(f"\nMoE node {moe_node.name}, kwargs: {moe_node.kwargs}\n\n")
+            assert "mapping_config" in moe_node.kwargs, (
+                f"Mapping config not found in MoE node {moe_node.name}"
+            )
+            # deserialize the mapping config string to dict
+            mapping_config = deserialize_mapping(moe_node.kwargs["mapping_config"])
+            return mapping_config.enable_attention_dp
+    else:
 
-    op_expected = torch.ops.auto_deploy.torch_dist_all_reduce
+        def transform_check(gm):
+            return any(
+                is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm.graph.nodes
+            ) == (world_size > 1)
 
+    # NOTE: we need to skip output assert when enable_attention_dp is True because
+    # a single rank does not contain the full output (lack of final collective),
+    # so the output will be inherently incomplete w.r.t to the single node.
     run_test_transformed_gm(
         model,
         x,
         gm_transformed,
-        check_transformed_graph=lambda gm: any(is_op(n, op_expected) for n in gm.graph.nodes)
-        == (world_size > 1),
+        check_transformed_graph=transform_check,
         _get_expected_num_params=partial(_get_expected_num_params, rank, world_size),
         test_load_hook=False,
+        skip_output_assert=enable_attention_dp,
     )
 
 
@@ -99,7 +124,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_fp8_moe):
@@ -107,7 +131,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     FP8EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
             elif is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_moe):
@@ -115,7 +138,6 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
                     NVFP4EPShardingInfo(
                         target_node=node.name,
                         config=config,
-                        mlp_type=MLPType.GATED_MLP,
                     )
                 )
 
@@ -125,7 +147,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
+                "sharding_scope": ["ep"],
             },
         },
     )
@@ -140,15 +162,18 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
 
 @pytest.mark.parametrize("device_count", get_device_counts([2, 8]))
 @pytest.mark.parametrize("num_experts", [3, 8])
-def test_ep_shard(device_count: int, num_experts: int):
+@pytest.mark.parametrize("enable_attention_dp", [True, False])
+def test_ep_shard(device_count: int, num_experts: int, enable_attention_dp: bool):
     if device_count > num_experts:
         pytest.skip(f"world_size {device_count} > num_experts {num_experts}")
     dist_common.spawn_multiprocess_job(
-        job=partial(_run_ep_shard_job, num_experts),
+        job=partial(_run_ep_shard_job, num_experts, enable_attention_dp),
         size=device_count,
     )
 
 
+# Note: EP pattern detection is invariant to enable_attention_dp:
+# it is only relevant inside the executor while inserting the right ops.
 @pytest.mark.parametrize("world_size", [1, 8])
 @pytest.mark.parametrize("num_experts", [3, 8])
 def test_sharding_pattern_detection(world_size: int, num_experts: int):
@@ -198,7 +223,7 @@ def test_llama4_stacked_moe_pattern_detection():
         {
             "detect_sharding": {
                 "stage": "sharding",
-                "use_sharding_from_factory": False,
+                "sharding_scope": ["ep"],
             },
         },
     )
@@ -210,3 +235,77 @@ def test_llama4_stacked_moe_pattern_detection():
     detected = optimizer.shared_config.sharding_transform_container.ep_transforms
     assert len(detected) == 1, f"Expected 1 EP transform, got {len(detected)}"
     assert detected[0].target_node == moe_node.name
+
+
+class PreStackedMoEModel(torch.nn.Module):
+    """Minimal model using torch_moe_fused with stacked expert tensors."""
+
+    def __init__(self, hidden_size=32, intermediate_size=16, num_experts=4, top_k=2):
+        super().__init__()
+        self.hidden_size = hidden_size
+        self.top_k = top_k
+        self.gate = torch.nn.Linear(hidden_size, num_experts, bias=False)
+        self.gate_up_proj = torch.nn.Parameter(
+            torch.randn(num_experts, 2 * intermediate_size, hidden_size)
+        )
+        self.down_proj = torch.nn.Parameter(
+            torch.randn(num_experts, hidden_size, intermediate_size)
+        )
+
+    def forward(self, x):
+        router_logits = self.gate(x)
+        routing_weights = torch.nn.functional.softmax(router_logits, dim=-1, dtype=torch.float)
+        routing_weights, selected_experts = torch.topk(routing_weights, self.top_k, dim=-1)
+        routing_weights = (routing_weights / routing_weights.sum(dim=-1, keepdim=True)).to(x.dtype)
+        return torch.ops.auto_deploy.torch_moe_fused(
+            x,
+            selected_experts,
+            routing_weights,
+            self.gate_up_proj,
+            self.down_proj,
+        )
+
+    def get_input(self, device, dtype=torch.bfloat16):
+        return torch.randn(2, self.hidden_size, device=device, dtype=dtype)
+
+
+def test_split_moe_fused_then_ep_sharding_executor():
+    """Verify pre-sharding split enables EP path for torch_moe_fused models."""
+    device = "cuda"
+    model = PreStackedMoEModel().to(device=device, dtype=torch.bfloat16)
+    x = model.get_input(device=device, dtype=torch.bfloat16)
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    optimizer = InferenceOptimizer(
+        None,
+        {
+            "split_moe_fused_for_sharding": {
+                "stage": "pattern_matcher",
+            },
+            "detect_sharding": {
+                "stage": "sharding",
+                "use_sharding_from_factory": False,
+                "sharding_dims": ["ep"],
+            },
+            "sharding_transform_executor": {
+                "stage": "sharding",
+            },
+        },
+    )
+    optimizer.shared_config.local_rank = 0
+    optimizer.shared_config.world_size = 2
+    gm_transformed = optimizer(None, gm)
+
+    has_torch_moe = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe) for n in gm_transformed.graph.nodes
+    )
+    has_torch_moe_fused = any(
+        is_op(n, torch.ops.auto_deploy.torch_moe_fused) for n in gm_transformed.graph.nodes
+    )
+    has_allreduce = any(
+        is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm_transformed.graph.nodes
+    )
+
+    assert has_torch_moe, "Expected converted torch_moe node for EP sharding"
+    assert not has_torch_moe_fused, "torch_moe_fused should be converted before EP sharding"
+    assert has_allreduce, "Expected EP sharding to insert torch_dist_all_reduce"
