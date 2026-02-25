@@ -108,6 +108,10 @@ class Eagle3ResourceManager(BaseResourceManager):
         return 0
 
 
+def _get_eagle3_default_capture_layers(num_layers: int):
+    return (1, num_layers // 2 - 1, num_layers - 4)
+
+
 @dataclass
 class Eagle3SpecMetadata(SpecMetadata):
     hidden_states: List[torch.Tensor] = field(default_factory=list)
@@ -138,8 +142,8 @@ class Eagle3SpecMetadata(SpecMetadata):
                 if self.num_layers <= 5:
                     raise ValueError(
                         "Not enough hidden layers for default EAGLE3 capture")
-                self.layers_to_capture = (1, self.num_layers // 2 - 1,
-                                          self.num_layers - 4)
+                self.layers_to_capture = _get_eagle3_default_capture_layers(
+                    self.num_layers)
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
             if self.layers_to_capture[0] == -1:
@@ -263,7 +267,8 @@ class Eagle3SpecMetadata(SpecMetadata):
                 to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
                 eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
                                      self.hidden_size].index_copy_(
-                                         0, token_idx, to_save)
+                                         0, token_idx,
+                                         to_save[:self.num_tokens])
                 break
 
     def get_hidden_states(self):

@@ -53,7 +53,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-CUTLASS]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRITON]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRITON]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
@@ -76,7 +76,33 @@ l0_b200:
   - unittest/_torch/debugger
   - unittest/_torch/executor
   - unittest/_torch/misc
-  - unittest/_torch/modules
+  # ------------- modules (non-MoE) ---------------
+  - unittest/_torch/modules/test_mla_helix.py
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/test_awq_quantization.py
+  - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/mamba
+  - unittest/_torch/modules/tests_lora_modules
+  # ------------- MoE components tests ---------------
+  - unittest/_torch/modules/test_moe_load_balancer.py
+  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/modules/test_moe_host_sharer.py
+  # ------------- legacy MoE tests ---------------
+  - unittest/_torch/modules/test_fused_moe.py
+  # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  # ------------- MoE: test_single_gpu (by backend) ---------------
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  # --- MoE end
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
   - unittest/_torch/speculative
@@ -102,6 +128,9 @@ l0_b200:
   - unittest/_torch/visual_gen/test_wan.py -k "not TestWanTwoStageTransformer"
   - unittest/_torch/visual_gen/test_wan_i2v.py
   - unittest/_torch/visual_gen/test_model_loader.py
+  - unittest/_torch/visual_gen/test_flux_transformer.py
+  - unittest/_torch/visual_gen/test_flux_attention.py
+  - unittest/_torch/visual_gen/test_flux_pipeline.py
   # - examples/test_visual_gen.py
 - condition:
     ranges:
@@ -188,9 +217,14 @@ l0_b200:
       stage: pre_merge
       backend: autodeploy
   tests:
-  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[flashinfer-False-1]
+  - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-1]
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[torch-True-1]
-  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[1]
-  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronMOE::test_fp8[trtllm-1]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_nvfp4[False-trtllm-1]
+  - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_auto_dtype[trtllm-False]
   - accuracy/test_llm_api_autodeploy.py::TestGLM4Flash::test_nvfp4[False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[False]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_auto_dtype[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_fp8[True]
+  - accuracy/test_llm_api_autodeploy.py::TestNemotronV2::test_nvfp4[True]
   - unittest/_torch/auto_deploy/unit/singlegpu

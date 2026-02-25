@@ -380,7 +380,9 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                 state_dict[weight_name] = weight_fp4
                 state_dict[weight_name + "_scale"] = weight_scale
                 state_dict[weight_name + "_scale_2"] = weight_scale_2
-                state_dict[alpha_name] = 1 / (weight_scale_2 * state_dict[input_scale_name])
+                state_dict[alpha_name] = 1 / torch.clamp(
+                    weight_scale_2 * state_dict[input_scale_name], min=1e-30
+                )
             # Unified HF ckpt path
             else:
                 if (
@@ -389,10 +391,11 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     and input_scale_name in state_dict
                     and float4_sf_dtype
                 ):
-                    state_dict[alpha_name] = (
-                        state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
-                    )
-                    state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
+                    alpha = state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
+                    alpha = torch.clamp(alpha, min=1e-30)
+                    state_dict[alpha_name] = alpha
+                    input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
+                    state_dict[input_scale_name] = 1 / input_scale
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
                     # Round the weight block scale factors to 128x4 and then swizzle.
                     weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(

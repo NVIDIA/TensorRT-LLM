@@ -14,8 +14,13 @@
 # limitations under the License.
 
 import re
+from typing import TYPE_CHECKING
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 from torch import nn
 from transformers import AutoConfig, PretrainedConfig
 
@@ -63,12 +68,14 @@ class MLPLayer(MLP):
         else:
             intermediate_size = config.intermediate_size
 
-        super().__init__(hidden_size=config.hidden_size,
-                         intermediate_size=intermediate_size,
-                         bias=False,
-                         activation=relu2,
-                         dtype=config.torch_dtype,
-                         config=model_config)
+        super().__init__(
+            hidden_size=config.hidden_size,
+            intermediate_size=intermediate_size,
+            bias=False,
+            activation=relu2,
+            dtype=config.torch_dtype,
+            config=model_config,
+        )
         self.layer_idx = layer_idx
 
     def forward(
@@ -135,13 +142,17 @@ class NemotronHMOE(nn.Module):
         self.hidden_dim = config.hidden_size
         self.ffn_dim = config.intermediate_size
         self.layer_idx = layer_idx
-        self.moe_intermediate_size = config.moe_intermediate_size[0] \
-            if isinstance(config.moe_intermediate_size, list) else config.moe_intermediate_size
+        self.moe_intermediate_size = (config.moe_intermediate_size[0]
+                                      if isinstance(
+                                          config.moe_intermediate_size, list)
+                                      else config.moe_intermediate_size)
         self.use_latent_moe: bool = getattr(config, "moe_latent_size",
                                             None) is not None
-        self.moe_hidden_size: int = config.moe_latent_size if self.use_latent_moe else config.hidden_size
+        self.moe_hidden_size: int = (config.moe_latent_size
+                                     if self.use_latent_moe else
+                                     config.hidden_size)
         self.mlp_bias = config.mlp_bias if hasattr(config,
-                                                   'mlp_bias') else False
+                                                   "mlp_bias") else False
         self.moe_n_group = config.n_group
         self.num_experts = config.n_routed_experts
         self.hidden_size = config.hidden_size
@@ -169,7 +180,8 @@ class NemotronHMOE(nn.Module):
                 layer_idx=self.layer_idx,
                 reduce_output=False,
                 overridden_tp_size=1
-                if model_config.mapping.enable_attention_dp else None)
+                if model_config.mapping.enable_attention_dp else None,
+            )
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
             self.hidden_size,
@@ -181,7 +193,8 @@ class NemotronHMOE(nn.Module):
             dtype=config.torch_dtype,
             fuse_routing_kernel=True,
             apply_routing=False,
-            moe_backend=model_config.moe_backend)
+            moe_backend=model_config.moe_backend,
+        )
 
         # Setup MoE experts.
         self.experts = create_moe(
@@ -247,7 +260,6 @@ class NemotronHMOE(nn.Module):
         attn_metadata: AttentionMetadata,
         **kwargs,
     ) -> torch.Tensor:
-
         if isinstance(hidden_states, tuple):
             hidden_states, hidden_states_hp = hidden_states
         else:
@@ -269,16 +281,15 @@ class NemotronHMOE(nn.Module):
             # Gate uses high precision input for accurate routing decisions.
             router_logits = self.gate(hidden_states_hp_2d)
 
-            routed_hidden_states = hidden_states
-            if self.use_latent_moe:
-                routed_hidden_states = self.fc1_latent_proj(
-                    routed_hidden_states)
+            routed_hidden_states = self.fc1_latent_proj(
+                hidden_states_hp) if self.use_latent_moe else hidden_states
 
             final_hidden_states = self.experts(
                 routed_hidden_states,
                 router_logits,
                 all_rank_num_tokens=all_rank_num_tokens,
-                use_dp_padding=False)
+                use_dp_padding=False,
+            )
 
             if self.use_latent_moe:
                 final_hidden_states = self.fc2_latent_proj(final_hidden_states)
@@ -286,9 +297,12 @@ class NemotronHMOE(nn.Module):
             return final_hidden_states
 
         routed_output, shared_output = maybe_execute_in_parallel(
-            _compute_routed_output, _compute_shared_output,
+            _compute_routed_output,
+            _compute_shared_output,
             self.event_dict[EventType.Main],
-            self.event_dict[EventType.MoeShared], self.aux_stream_shared)
+            self.event_dict[EventType.MoeShared],
+            self.aux_stream_shared,
+        )
 
         final_hidden_states = shared_output + routed_output
 
@@ -330,7 +344,8 @@ class NemotronHLayer(DecoderLayer):
             logger.warning_once(
                 f"Layer {layer_idx}: Disabling fused NVFP4 RMSNorm for hidden_size={config.hidden_size}. "
                 f"Supported sizes: {_SUPPORTED_NVFP4_HIDDEN_SIZES}. Using non-fused path.",
-                key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}")
+                key=f"disable_nvfp4_rmsnorm_with_{config.hidden_size}",
+            )
             self.is_nvfp4 = False
 
         self.norm = RMSNorm(
@@ -346,17 +361,19 @@ class NemotronHLayer(DecoderLayer):
         )
 
         if layer_type == "M":
-            self.mixer = Mamba2Mixer(d_model=config.hidden_size,
-                                     d_state=config.ssm_state_size,
-                                     d_conv=config.conv_kernel,
-                                     nheads=config.mamba_num_heads,
-                                     n_groups=config.n_groups,
-                                     head_dim=config.mamba_head_dim,
-                                     chunk_size=config.chunk_size,
-                                     layer_idx=layer_idx,
-                                     rms_norm_eps=config.rms_norm_eps,
-                                     dtype=config.torch_dtype,
-                                     config=model_config)
+            self.mixer = Mamba2Mixer(
+                d_model=config.hidden_size,
+                d_state=config.ssm_state_size,
+                d_conv=config.conv_kernel,
+                nheads=config.mamba_num_heads,
+                n_groups=config.n_groups,
+                head_dim=config.mamba_head_dim,
+                chunk_size=config.chunk_size,
+                layer_idx=layer_idx,
+                rms_norm_eps=config.rms_norm_eps,
+                dtype=config.torch_dtype,
+                config=model_config,
+            )
         elif layer_type == "-":
             self.mixer = MLPLayer(model_config, layer_idx)
         elif layer_type == "*":
@@ -364,7 +381,8 @@ class NemotronHLayer(DecoderLayer):
                 model_config,
                 layer_idx,
                 reduce_output=not model_config.mapping.enable_attention_dp
-                and model_config.mapping.tp_size > 1)
+                and model_config.mapping.tp_size > 1,
+            )
         elif layer_type == "E":
             self.mixer = NemotronHMOE(model_config,
                                       layer_idx=layer_idx,
@@ -374,31 +392,31 @@ class NemotronHLayer(DecoderLayer):
 
     def post_load_weights(self):
         """Post-process after loading weights."""
-        if self.norm.is_nvfp4 and not hasattr(self.norm, 'nvfp4_scale'):
+        if self.norm.is_nvfp4 and not hasattr(self.norm, "nvfp4_scale"):
             self._try_attach_nvfp4_scale()
 
     def _try_attach_nvfp4_scale(self):
         """Attach input_scale from mixer's first linear to norm for fused RMSNorm+Quant."""
         # Normal handling for Mamba, MLP, and Attention layers.
         first_linear_attr = {
-            'M': 'in_proj',
-            '-': 'up_proj',
-            '*': 'qkv_proj'
+            "M": "in_proj",
+            "-": "up_proj",
+            "*": "qkv_proj"
         }.get(self.layer_type)
         if first_linear_attr:
             first_linear = getattr(self.mixer, first_linear_attr, None)
-            if first_linear and hasattr(first_linear, 'input_scale'):
+            if first_linear and hasattr(first_linear, "input_scale"):
                 self.norm.nvfp4_scale = first_linear.input_scale
                 return
 
         # Special handling for MoE layer: fetch shared_expert.up_proj.input_scale
         # as representation of the input scale.
-        if self.layer_type == 'E':
-            if (hasattr(self.mixer, 'shared_experts')
+        if self.layer_type == "E":
+            if (hasattr(self.mixer, "shared_experts")
                     and self.mixer.shared_experts is not None
-                    and hasattr(self.mixer.shared_experts, 'up_proj')
+                    and hasattr(self.mixer.shared_experts, "up_proj")
                     and hasattr(self.mixer.shared_experts.up_proj,
-                                'input_scale') and
+                                "input_scale") and
                     self.mixer.shared_experts.up_proj.input_scale is not None):
                 self.norm.nvfp4_scale = self.mixer.shared_experts.up_proj.input_scale
                 # Enable high precision output for MoE layer.
@@ -516,12 +534,14 @@ class NemotronHModel(DecoderModel):
         hidden_states = inputs_embeds
         residual = torch.zeros_like(hidden_states)
         for layer in self.layers[:self.num_hidden_layers]:
-            hidden_states, residual = layer(position_ids,
-                                            hidden_states,
-                                            residual=residual,
-                                            attn_metadata=attn_metadata,
-                                            spec_metadata=spec_metadata,
-                                            mamba_metadata=mamba_metadata)
+            hidden_states, residual = layer(
+                position_ids,
+                hidden_states,
+                residual=residual,
+                attn_metadata=attn_metadata,
+                spec_metadata=spec_metadata,
+                mamba_metadata=mamba_metadata,
+            )
         hidden_states, _ = self.norm_f(hidden_states, residual)
         return hidden_states
 
@@ -548,7 +568,7 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
 
         if model_config.quant_config.exclude_modules is not None:
             model_config.quant_config.exclude_modules = [
-                re.sub(r'(model\.layers\.)?backbone', 'model', k)
+                re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
 
@@ -557,8 +577,8 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
             model_config=model_config,
         )
         self.model_nextn = 0
-        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
-        ):
+        if (model_config.spec_config is not None
+                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
@@ -591,6 +611,16 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
         new_weights = weight_mapper.preprocess_weights(weights)
         super().load_weights(weights=new_weights, weight_mapper=weight_mapper)
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: "TorchLlmArgs") -> dict:
+        """Model-specific defaults for NemotronH.
+
+        Disables block reuse due to SSM/hybrid architecture constraints.
+        """
+        # TODO: Remove enable_block_reuse=False once KV cache block reuse
+        # is supported for Mamba/SSM-based models
+        return {"kv_cache_config": {"enable_block_reuse": False}}
+
 
 class NemotronHMTPDecoderLayer(NemotronHLayer):
 
@@ -603,7 +633,6 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         has_end_norm: bool,
         layer_type: str,
     ) -> None:
-
         super().__init__(
             model_config=model_config,
             layer_idx=layer_idx,
@@ -611,8 +640,8 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
             aux_stream_dict=aux_stream_dict,
         )
         self.model_nextn = 0
-        if model_config.spec_config is not None and model_config.spec_config.spec_dec_mode.is_mtp_one_model(
-        ):
+        if (model_config.spec_config is not None
+                and model_config.spec_config.spec_dec_mode.is_mtp_one_model()):
             model_nextn = model_config.spec_config.num_nextn_predict_layers
             ckpt_nextn = self.config.num_nextn_predict_layers
             self.num_hidden_layers = self.config.num_hidden_layers
@@ -697,7 +726,6 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         residual: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-
         if self.has_start_projections:
             assert inputs_embeds is not None
             inputs_embeds_normed = self.enorm(inputs_embeds)
@@ -739,12 +767,14 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
 class NemotronHMTP(nn.Module):
     """NemotronH MTP Layer - single MTP layer following DeepseekV3MTP pattern."""
 
-    def __init__(self,
-                 model_config: ModelConfig[NemotronHConfig],
-                 layer_idx: int,
-                 aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False,
-                 prefix: str = ""):
+    def __init__(
+        self,
+        model_config: ModelConfig[NemotronHConfig],
+        layer_idx: int,
+        aux_stream_dict: dict[AuxStreamType, torch.cuda.Stream],
+        is_separate_draft_engine: bool = False,
+        prefix: str = "",
+    ):
         super().__init__()
         config = model_config.pretrained_config
         self.model_config = model_config
@@ -798,6 +828,7 @@ class NemotronHMTP(nn.Module):
         the quant_config for the MTP layer.
         """
         from tensorrt_llm.models.modeling_utils import QuantConfig
+
         quant_config = model_config.quant_config
         # MTP layers are always unquantized, force quant_algo=None
         if quant_config is None:

@@ -123,6 +123,8 @@ class OpenAIServer:
         self.metrics_collector = None
         self.perf_metrics = None
         self.perf_metrics_lock = None
+        self._iteration_stats_collector_task = None
+        self._iteration_stats_wakeup_event = asyncio.Event()
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
@@ -158,8 +160,24 @@ class OpenAIServer:
                 self.disagg_cluster_worker= DisaggClusterWorker(self.server_role, self.host, self.port, self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
 
+            # Start background iteration stats collector if metrics are enabled
+            # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
+            # tensorrt backend does not have this attribute but it always has iter stats enabled.
+            if self.metrics_collector and getattr(self.generator.args, "enable_iter_perf_stats", True):
+                self._iteration_stats_collector_task = asyncio.create_task(self._iteration_stats_collector_loop())
+                logger.info("Started background iteration stats collector task")
+
             # terminate rank0 worker
             yield
+
+            # Stop background iteration stats collector
+            if self._iteration_stats_collector_task is not None:
+                self._iteration_stats_collector_task.cancel()
+                try:
+                    await self._iteration_stats_collector_task
+                except asyncio.CancelledError:
+                    pass
+                logger.info("Stopped background iteration stats collector task")
 
             if self.metadata_server is not None:
                 self.metadata_server.remove(f"trtllm/{self.generator.llm_id}")
@@ -568,7 +586,11 @@ class OpenAIServer:
         if not res.finished:
             return
         if self.metrics_collector:
-            self.metrics_collector.log_metrics_dict(res.metrics_dict)
+            self.metrics_collector.log_request_metrics_dict(res.metrics_dict)
+            # Note: Iteration stats are collected by the background _iteration_stats_collector_loop task
+            # Wake up the stats collector to drain iteration stats
+            if getattr(self.generator.args, "enable_iter_perf_stats", True):
+                self._iteration_stats_wakeup_event.set()
         if self.generator.args.return_perf_metrics:
             output = res.outputs[0]
             item = {
@@ -577,15 +599,23 @@ class OpenAIServer:
             }
             if raw_request:
                 item["server_arrival_time"] = getattr(raw_request.state, "server_arrival_time", None)
-                item["server_first_token_time"] = getattr(raw_request.state, "server_first_token_time", None)
+                if not getattr(raw_request.state, "server_first_token_time", None):
+                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                item["server_first_token_time"] = raw_request.state.server_first_token_time
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
+            # Request-level time breakdown (on GenerationResult/RequestOutput, not CompletionOutput)
+            if getattr(res, 'time_breakdown_metrics', None) is not None:
+                item["time_breakdown_metrics"] = res.time_breakdown_metrics
             if self.perf_metrics is not None:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
 
     async def _create_chat_response(self,
-            promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
+            promise: RequestOutput,
+            postproc_params: PostprocParams,
+            raw_request: Request,
+            disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
         await promise.aresult()
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
@@ -597,7 +627,51 @@ class OpenAIServer:
             raise ValueError(f"disaggregated_params is not set in the response for request"
                              f" {disaggregated_params.disagg_request_id}")
 
+        await self._extract_metrics(promise, raw_request)
         return chat_response
+
+    async def _iteration_stats_collector_loop(self):
+        """
+        Background task that continuously collects iteration statistics from the LLM engine.
+
+        This task runs in the background for the lifetime of the server and drains iteration
+        stats from the engine's stats queue, logging only the latest stats to Prometheus.
+        Since iteration stats are gauges (point-in-time metrics like KV cache hit rate),
+        only the most recent value is needed. This approach avoids blocking request completion
+        while collecting stats and minimizes redundant metric updates.
+
+        The task sleeps when idle and is woken up via _iteration_stats_wakeup_event when
+        requests complete.
+
+        The loop will continue until the task is cancelled during server shutdown.
+        """
+        try:
+            logger.info("Iteration stats collector loop started")
+            while True:
+                # Wait for signal that requests have completed and stats may be available
+                await self._iteration_stats_wakeup_event.wait()
+
+                # Clear the event for next wakeup
+                self._iteration_stats_wakeup_event.clear()
+
+                # Drain all available iteration stats from the queue, but only log the latest
+                # Since metrics are gauges (point-in-time values), only the most recent stat matters
+                try:
+                    latest_stat = None
+                    async for llm_stat in self.generator.get_stats_async(timeout=0.5):
+                        latest_stat = llm_stat  # Keep only the latest
+
+                    # Log only the most recent iteration stats to Prometheus
+                    if latest_stat is not None:
+                        self.metrics_collector.log_iteration_stats(latest_stat)
+                except Exception as e:
+                    # Log errors but continue collecting stats
+                    logger.error(f"Error collecting iteration stats: {e}", exc_info=True)
+                    # Brief sleep to avoid tight loop on persistent errors
+                    await asyncio.sleep(0.1)
+        except asyncio.CancelledError:
+            logger.info("Iteration stats collector loop cancelled")
+            raise
 
     async def openai_chat(self, request: ChatCompletionRequest, raw_request: Request) -> Response:
 
@@ -687,8 +761,15 @@ class OpenAIServer:
 
             trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
+            generate_inputs = prompt
+            preprocess_fn = getattr(self.generator, "preprocess", None)
+            if preprocess_fn is not None:
+                generate_inputs = await asyncio.to_thread(
+                    preprocess_fn, prompt, sampling_params,
+                    disaggregated_params)
+
             promise = self.generator.generate_async(
-                inputs=prompt,
+                inputs=generate_inputs,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
@@ -707,7 +788,7 @@ class OpenAIServer:
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
-                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
+                response = await self._create_chat_response(promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
@@ -821,7 +902,6 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
             await self._extract_metrics(response, raw_request)
             return pp_result
 
@@ -1062,7 +1142,8 @@ class OpenAIServer:
                     media_type="text/event-stream"
                 )
             else:
-                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
+                response = await self._create_chat_response(
+                    promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
         except Exception as e:

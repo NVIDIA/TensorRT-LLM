@@ -97,8 +97,11 @@ def parse_args():
         "--linear_type",
         type=str,
         default="default",
-        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "svd-nvfp4"],
-        help="Linear layer quantization type",
+        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
+        help=(
+            "Dynamic quantization mode for linear layers. "
+            "Quantizes weights on-the-fly during loading from an unquantized checkpoint."
+        ),
     )
 
     # Attention Backend
@@ -126,6 +129,46 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
+    # Cuda graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
+    # torch compile
+    parser.add_argument(
+        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
+    )
+    parser.add_argument(
+        "--torch_compile_models",
+        type=str,
+        nargs="+",
+        default=[],  # empty = auto detect transformer components
+        help="Torch compile models",
+    )
+    parser.add_argument(
+        "--torch_compile_mode",
+        type=str,
+        default="default",
+        help="Torch compile mode",
+        choices=["default", "max-autotune", "reduce-overhead"],
+    )
+    parser.add_argument(
+        "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
+    )
+
+    # Warmup
+    parser.add_argument(
+        "--warmup_steps",
+        type=int,
+        default=1,
+        help="Warmup steps. Useful for performance benchmarking.",
+    )
+
+    # Layerwise nvtx marker
+    parser.add_argument(
+        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise nvtx marker"
+    )
+
     return parser.parse_args()
 
 
@@ -144,7 +187,7 @@ def main():
         quant_config = {"quant_algo": "FP8", "dynamic": True}
     elif args.linear_type == "trtllm-fp8-blockwise":
         quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "svd-nvfp4":
+    elif args.linear_type == "trtllm-nvfp4":
         quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
     # 1. Setup Configuration
@@ -160,6 +203,15 @@ def main():
         "parallel": {
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+        },
+        "pipeline": {
+            "enable_cuda_graph": args.enable_cudagraph,
+            "enable_torch_compile": not args.disable_torch_compile,
+            "torch_compile_models": args.torch_compile_models,
+            "torch_compile_mode": args.torch_compile_mode,
+            "enable_fullgraph": args.enable_fullgraph,
+            "warmup_steps": args.warmup_steps,
+            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     }
 

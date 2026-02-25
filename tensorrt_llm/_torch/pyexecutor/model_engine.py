@@ -41,6 +41,7 @@ from ..distributed.communicator import init_pp_comm
 from ..expert_statistic import ExpertStatistic
 from ..memory_buffer_utils import with_shared_pool
 from ..metadata import KVCacheParams
+from ..models.checkpoints.base_checkpoint_loader import BaseCheckpointLoader
 from ..models.modeling_multimodal_utils import filter_mm_token_from_input_ids
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.fused_moe.moe_load_balancer import (MoeLoadBalancer,
@@ -142,6 +143,7 @@ class PyTorchModelEngine(ModelEngine):
         drafting_loop_wrapper: Optional[Callable[[torch.nn.Module],
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
+        checkpoint_loader: Optional[BaseCheckpointLoader] = None,
     ):
         self.forward_pass_callable = None
         self.ub_buffers = None
@@ -157,9 +159,10 @@ class PyTorchModelEngine(ModelEngine):
         self.max_seq_len = max_seq_len
         self.max_beam_width = max_beam_width
 
-        checkpoint_loader = _construct_checkpoint_loader(
-            llm_args.backend, llm_args.checkpoint_loader,
-            llm_args.checkpoint_format)
+        if checkpoint_loader is None:
+            checkpoint_loader = _construct_checkpoint_loader(
+                llm_args.backend, llm_args.checkpoint_loader,
+                llm_args.checkpoint_format)
 
         self.mapping = mapping
         if mapping.has_pp():
@@ -3255,6 +3258,7 @@ class PyTorchModelEngine(ModelEngine):
         attn_metadata.kv_cache_manager = kv_cache_manager
 
         attn_metadata.prepare()
+
         if self.enable_attention_dp:
             all_rank_num_tokens = self.dist.tp_allgather(
                 attn_metadata.num_tokens)
@@ -3412,7 +3416,7 @@ class PyTorchModelEngine(ModelEngine):
                 return self._prepare_star_attention_inputs(
                     scheduled_requests, kv_cache_manager, attn_metadata,
                     resource_manager)
-            elif CpType.HELIX == cp_type:
+            elif cp_type in (CpType.HELIX, CpType.ULYSSES):
                 # Take the usual route of _prepare_tp_inputs.
                 pass
             else:

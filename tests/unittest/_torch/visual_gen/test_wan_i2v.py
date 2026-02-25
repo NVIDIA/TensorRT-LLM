@@ -108,6 +108,7 @@ def wan21_i2v_pipeline_bf16():
         device="cuda",
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
     yield pipeline
@@ -129,6 +130,7 @@ def wan21_i2v_pipeline_fp8():
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
         quant_config={"quant_algo": "FP8", "dynamic": True},
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
     yield pipeline
@@ -150,6 +152,7 @@ def wan21_i2v_pipeline_fp8_blockwise():
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
     yield pipeline
@@ -170,6 +173,7 @@ def wan21_i2v_pipeline_with_image_encoder():
         device="cuda",
         dtype="bfloat16",
         skip_components=SKIP_WITH_IMAGE,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
     yield pipeline
@@ -190,6 +194,7 @@ def wan22_i2v_pipeline_bf16():
         device="cuda",
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
     yield pipeline
@@ -211,6 +216,7 @@ def wan22_i2v_pipeline_fp8():
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        pipeline={"warmup_steps": 0},
     )
     pipeline = PipelineLoader(args).load()
     yield pipeline
@@ -279,6 +285,7 @@ def _run_cfg_worker_i2v(rank, world_size, checkpoint_path, inputs_list, return_d
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             parallel=ParallelConfig(dit_cfg_size=world_size),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -389,6 +396,7 @@ def _run_all_optimizations_worker_i2v(rank, world_size, checkpoint_path, inputs_
             ),
             attention=AttentionConfig(backend="TRTLLM"),
             parallel=ParallelConfig(dit_cfg_size=world_size),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args_full).load()
         transformer = pipeline.transformer.eval()
@@ -647,6 +655,7 @@ class TestWanI2VIntegration:
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             attention=AttentionConfig(backend=backend),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -703,6 +712,7 @@ class TestWanI2VIntegration:
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -750,6 +760,7 @@ class TestWanI2VIntegration:
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -986,6 +997,7 @@ class TestWanI2VTwoStage:
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -1044,6 +1056,7 @@ class TestWanI2VRobustness:
                 dtype="bfloat16",
                 skip_components=SKIP_MINIMAL,
                 quant_config={"quant_algo": "INVALID_ALGO", "dynamic": True},
+                pipeline={"warmup_steps": 0},
             )
             pipeline = PipelineLoader(args).load()
             del pipeline
@@ -1058,6 +1071,7 @@ class TestWanI2VRobustness:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_WITH_IMAGE,
+            pipeline={"warmup_steps": 0},
         )
         pipeline = PipelineLoader(args).load()
 
@@ -1138,6 +1152,7 @@ class TestWanI2VParallelism(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG (no parallel)
+            pipeline={"warmup_steps": 0},
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         config = pipeline_baseline.transformer.model_config.pretrained_config
@@ -1349,6 +1364,7 @@ class TestWanI2VCombinedOptimizations(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG
+            pipeline={"warmup_steps": 0},
         )
         pipeline_baseline = PipelineLoader(args_baseline).load()
         config = pipeline_baseline.transformer.model_config.pretrained_config
