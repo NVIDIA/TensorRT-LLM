@@ -342,6 +342,8 @@ static inline void set_params(bert::Fused_multihead_attention_params_v2& params,
 
     // Attention sinks.
     params.attention_sinks = reinterpret_cast<float*>(attention_sinks_d);
+    assert((attention_sinks_d == nullptr || launch_params.flash_attention)
+        && "attention sinks are only supported with flash attention");
 
 #if defined(STORE_P)
     params.p_ptr = p_d;

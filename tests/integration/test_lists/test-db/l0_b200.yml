@@ -53,7 +53,7 @@ l0_b200:
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_nvfp4[latency_moe_trtllm-torch_compile=True]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-CUTLASS]
-  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRITON]
+  - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a16_mxfp4[latency-TRITON]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[fp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-TRTLLM]
   - accuracy/test_llm_api_pytorch.py::TestQwen3_30B_A3B::test_w4a8_mxfp4[mxfp8-latency-CUTLASS]
@@ -76,7 +76,33 @@ l0_b200:
   - unittest/_torch/debugger
   - unittest/_torch/executor
   - unittest/_torch/misc
-  - unittest/_torch/modules
+  # ------------- modules (non-MoE) ---------------
+  - unittest/_torch/modules/test_mla_helix.py
+  - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
+  - unittest/_torch/modules/test_fused_activation_quant.py
+  - unittest/_torch/modules/test_awq_quantization.py
+  - unittest/_torch/modules/test_triton_linear.py
+  - unittest/_torch/modules/test_group_rmn_norm.py
+  - unittest/_torch/modules/test_rotary_embedding.py
+  - unittest/_torch/modules/mamba
+  - unittest/_torch/modules/tests_lora_modules
+  # ------------- MoE components tests ---------------
+  - unittest/_torch/modules/test_moe_load_balancer.py
+  - unittest/_torch/modules/test_moe_routing.py
+  - unittest/_torch/modules/test_moe_host_sharer.py
+  # ------------- legacy MoE tests ---------------
+  - unittest/_torch/modules/test_fused_moe.py
+  # ------------- MoE: test_moe_backend (by backend) ---------------
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
+  # ------------- MoE: test_single_gpu (by backend) ---------------
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  # --- MoE end
   - unittest/_torch/multimodal
   - unittest/_torch/sampler
   - unittest/_torch/speculative

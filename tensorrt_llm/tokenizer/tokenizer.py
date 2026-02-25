@@ -1,4 +1,5 @@
 import os
+import pickle  # nosec B403
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -25,6 +26,12 @@ class TokenizerBase(PreTrainedTokenizerBase):
     ''' This is a protocol for the tokenizer. Users can implement their own tokenizer by inheriting this class.  '''
 
 
+def _reconstruct_transformers_tokenizer(inner_bytes: bytes):
+    '''Reconstruct a TransformersTokenizer from cloudpickle-serialized bytes.'''
+    # nosec B301: inner_bytes is from cloudpickle.dumps() in __reduce__, not untrusted data
+    return TransformersTokenizer(pickle.loads(inner_bytes))  # nosec B301
+
+
 class TransformersTokenizer(TokenizerBase):
     ''' A wrapper for the Transformers' tokenizer.
     This is the default tokenizer for LLM. '''
@@ -32,6 +39,34 @@ class TransformersTokenizer(TokenizerBase):
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
         self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
+
+    def __reduce__(self):
+        # In multi-node scenarios, AutoTokenizer.from_pretrained with
+        # trust_remote_code=True may create dynamic Python modules cached at
+        # $HOME/.cache/huggingface/modules/transformers_modules/.
+        # These modules are node-local and won't exist on other nodes.
+        # Standard pickle serializes classes by reference, so deserializing
+        # a tokenizer that uses such a dynamic class fails on other nodes.
+        #
+        # To solve this, we use cloudpickle (if available) to serialize the
+        # inner tokenizer by value, embedding the class definition in the
+        # serialized bytes. This follows vLLM PR #6751.
+        #
+        # See: https://github.com/vllm-project/vllm/pull/6751
+        try:
+            import cloudpickle
+            # Ensure dynamic transformers_modules are registered for by-value
+            # serialization, regardless of how the tokenizer was created.
+            maybe_register_transformers_modules_by_value()
+            inner_bytes = cloudpickle.dumps(self.tokenizer)
+            return (_reconstruct_transformers_tokenizer, (inner_bytes, ))
+        except ImportError:
+            # cloudpickle not installed; fall back to default pickling.
+            # This may fail on other nodes if the tokenizer uses dynamic
+            # modules from trust_remote_code.
+            logger.warning(
+                "cloudpickle is not installed. TransformersTokenizer will not be serializable across nodes in multi-node setups. Install cloudpickle to fix this: pip install cloudpickle")
+            return (TransformersTokenizer, (self.tokenizer, ))
 
     def __call__(self, text: str, *args, **kwargs) -> Any:
         return self.tokenizer(text, *args, **kwargs)
@@ -340,6 +375,41 @@ def _llguidance_tokenizer_info(tokenizer):
     return tokenizer_info
 
 
+def maybe_register_transformers_modules_by_value():
+    '''Register transformers dynamic modules for by-value serialization.
+
+    With trust_remote_code, AutoTokenizer.from_pretrained may create dynamic
+    modules cached at $HOME/.cache/huggingface/modules/transformers_modules/.
+    These modules are node-local and won't exist on other nodes in multi-node
+    setups. This function registers them with cloudpickle for by-value
+    serialization, so that objects from these modules can be pickled and
+    sent to other nodes without needing the module files there.
+
+    References:
+        https://github.com/vllm-project/vllm/pull/6751
+        https://github.com/cloudpipe/cloudpickle#overriding-pickles-serialization-mechanism-for-importable-constructs
+    '''
+    try:
+        import transformers_modules
+    except ImportError:
+        # No dynamic modules were created, nothing to register.
+        return
+
+    try:
+        import cloudpickle
+        cloudpickle.register_pickle_by_value(transformers_modules)
+    except ImportError:
+        logger.warning(
+            "cloudpickle is not installed. Objects from trust_remote_code "
+            "dynamic modules may not be serializable across nodes in "
+            "multi-node setups. Install cloudpickle to fix this: "
+            "pip install cloudpickle")
+    except Exception as e:
+        logger.warning(
+            f"Failed to register transformers_modules for by-value "
+            f"serialization: {e}")
+
+
 def load_hf_tokenizer(model_dir: str,
                       trust_remote_code: bool = True,
                       use_fast: bool = True,
@@ -356,7 +426,7 @@ def load_hf_tokenizer(model_dir: str,
     '''
 
     try:
-        return TransformersTokenizer.from_pretrained(
+        tokenizer = TransformersTokenizer.from_pretrained(
             model_dir,
             legacy=False,
             padding_side='left',
@@ -364,6 +434,11 @@ def load_hf_tokenizer(model_dir: str,
             trust_remote_code=trust_remote_code,
             use_fast=use_fast,
             **kwargs)
+
+        if trust_remote_code:
+            maybe_register_transformers_modules_by_value()
+
+        return tokenizer
 
     except Exception as e:
         logger.warning(
