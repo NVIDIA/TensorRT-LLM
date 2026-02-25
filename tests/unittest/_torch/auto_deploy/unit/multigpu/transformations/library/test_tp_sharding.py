@@ -380,6 +380,7 @@ def _run_sharding_execution_job(
     rank: int,
     world_size: int,
 ) -> None:
+    # global predefined_config
     # init model and input
     batch_size = 4
     sequence_len = 8

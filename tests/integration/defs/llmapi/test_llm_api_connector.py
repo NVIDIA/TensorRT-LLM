@@ -171,7 +171,7 @@ def test_connector_async_onboard(enforce_single_worker, model_with_connector,
     ], SamplingParams(max_tokens=NUM_TOKENS, ignore_eos=True))
 
     # Once for the initial poll, then once for each token. One extra token when using the overlap scheduler.
-    assert worker.get_finished.call_count == NUM_TOKENS + 1 + int(
+    assert worker.get_finished.call_count == NUM_TOKENS + int(
         use_overlap_scheduler)
 
     # In the first iteration, there should be a single request id provided.
@@ -391,16 +391,16 @@ def test_connector_disagg_prefill(enforce_single_worker, model_with_connector,
         scheduler.request_finished.return_value = False
         worker.get_finished.return_value = [], []
 
-    result = generate_and_sleep(prefill_worker, [0] * 48,
-                                sampling_params=sampling_params,
-                                disaggregated_params=disaggregated_params)
+    result = prefill_worker.generate([0] * 48,
+                                     sampling_params=sampling_params,
+                                     disaggregated_params=disaggregated_params)
 
     gen_disagg_params = result.disaggregated_params
     gen_disagg_params.request_type = "generation_only"
 
-    generate_and_sleep(decode_worker, [0] * 48,
-                       sampling_params=sampling_params,
-                       disaggregated_params=gen_disagg_params)
+    decode_worker.generate([0] * 48,
+                           sampling_params=sampling_params,
+                           disaggregated_params=gen_disagg_params)
 
     assert scheduler.build_connector_meta.call_count == 1
 
@@ -432,13 +432,12 @@ def test_connector_multi_request(enforce_single_worker, model_with_connector):
     worker.get_finished.side_effect = lambda finished_gen, load_async: (
         finished_gen, load_async)
 
-    model.generate([[0] * 48, [1] * 48],
-                   sampling_params=[
-                       SamplingParams(ignore_eos=True, max_tokens=4),
-                       SamplingParams(ignore_eos=True, max_tokens=3)
-                   ])
+    generate_and_sleep(model, [[0] * 48, [1] * 48],
+                       sampling_params=[
+                           SamplingParams(ignore_eos=True, max_tokens=4),
+                           SamplingParams(ignore_eos=True, max_tokens=3)
+                       ])
 
-    # The KV cache of both prior requests should be freed, allowing the third request to run.
     model.generate([2] * 110, sampling_params=sampling_params)
 
 

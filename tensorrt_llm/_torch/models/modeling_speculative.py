@@ -298,6 +298,7 @@ class Eagle3DraftModel(DecoderModel):
                 config.hidden_size,
                 bias=getattr(config, "bias", False),
                 dtype=config.torch_dtype,
+                quant_config=model_config.get_quant_config(),
             )
 
         if self.num_layers > 1:

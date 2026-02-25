@@ -48,6 +48,7 @@ from tensorrt_llm.bindings.internal.batch_manager import \
     KvCacheConnectorManager as KvCacheConnectorManagerCpp
 from tensorrt_llm.bindings.internal.batch_manager import LlmRequest
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.logger import logger
 
 from .llm_request import get_draft_token_length
 from .scheduler import ScheduledRequests
@@ -406,9 +407,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # Requests that have been returned from get_finished locally, but haven't yet been returned by all workers.
         self.local_finished_async_requests = AsyncRequests(dict(), dict())
 
-        # Requests that have finished loading asynchronously.
-        self.finished_async_loading_requests = dict()
-
         self._scheduler_output = None
         self.scheduler_output_manager = KvCacheConnectorSchedulerOutputManager()
 
@@ -437,10 +435,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             raise RuntimeError(
                 "load_kv_async must be False when num_tokens is 0!")
 
-        # TODO(jthomson04): This part is a bit ugly.
-        # When the connector indicates that a request will be loaded asynchronously, we need to suspend it's execution.
-        # This is problematic, since at the point when this function is called, the request has already been scheduled!
-        # Because of this, we need to remove it from our list of scheduled requests (see `take_scheduled_requests_pending_load`).
         if load_kv_async:
             self.new_async_requests.loading[request.request_id] = request
 
@@ -449,42 +443,37 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
         return num_tokens
 
-    def should_add_sequence(self, request: LlmRequest) -> bool:
-        req_id = request.request_id
-        return req_id not in self.finished_async_loading_requests
-
     def build_scheduler_output(self, scheduled_batch: ScheduledRequests,
                                kv_cache_manager: "KVCacheManager"):
         self._scheduler_output = self.scheduler_output_manager.build_scheduler_output(
             scheduled_batch, self.new_async_requests, kv_cache_manager)
 
-    def take_scheduled_requests_pending_load(
-            self, scheduled_requests: ScheduledRequests):
+    def mark_ready_requests(
+            self, fitting_disagg_gen_init_requests: List[LlmRequest]
+    ) -> List[LlmRequest]:
         """
-        Remove context requests from our list of scheduled requests that are being loaded asynchronously.
-        This is done to prevent the runtime from attempting to load the KV cache for these requests.
-
-        Args:
-            scheduled_requests: The scheduled requests.
-
-        Returns:
-            The scheduled requests with the context requests that are being loaded asynchronously removed.
+        Mark scheduled KV connector requests as ready.
+        In the py executor, we mark ALL KV connector requests as async loading.
+        However, if we returned (_, False) from get_num_new_matched_tokens, we need to mark the request as ready for the upcoming context forward pass.
+        After we mark the request(s) as ready, we run scheduling again to account for the newly ready requests.
         """
-        allowed_context_requests = []
 
-        for req in scheduled_requests.context_requests:
-            # If this request is being loaded asynchronously, in addition to removing it from the list of scheduled requests,
-            # we also need to update it's state.
-            if req.request_id in self.new_async_requests.loading.keys():
-                req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
-
-                # Replace the request with the canonical request.
-                self.new_async_requests.loading[req.request_id] = req
+        ready_requests = []
+        for req in fitting_disagg_gen_init_requests:
+            # If we're not loading this request asynchronously, mark it as ready for the upcoming forward pass.
+            if req.py_request_id not in self.new_async_requests.loading_ids:
+                ready_requests.append(req)
+                req.state = LlmRequestState.CONTEXT_INIT
             else:
-                allowed_context_requests.append(req)
+                # The req we get from the C++ call is different than the one in python.
+                # Replace it with the canonical request.
+                self.new_async_requests.loading[req.py_request_id] = req
 
-        # Update the list of scheduled requests.
-        scheduled_requests.context_requests = allowed_context_requests
+        logger.debug(
+            f"Marking {len(ready_requests)} requests with as ready IDs {list(map(lambda x: x.py_request_id, ready_requests))}."
+        )
+
+        return ready_requests
 
     def handle_metadata(self) -> object:
         metadata = self._run_on_leader(
@@ -506,14 +495,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
             Whether the request is performing asynchronous saving operations. If true, we do not immediately call free_resources on the request.
         """
 
-        if req.request_id in self.finished_async_loading_requests:
-            del self.finished_async_loading_requests[req.request_id]
-
         saving_async = self._run_on_leader(
             lambda: self.scheduler.request_finished(req, cache_block_ids))
 
-        # This is similar to take_scheduled_requests_pending_load.
-        # We need to update the request's state to indicate that it's still being used, but isn't schedulable.
         if saving_async:
             self.new_async_requests.saving[req.request_id] = req
             req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -565,7 +549,6 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         # For requests that have finished loading, move them back to the context state.
         for id, req in all_finished.loading.items():
             req.state = LlmRequestState.CONTEXT_INIT
-            self.finished_async_loading_requests[id] = req
 
         # Return the requests that have finished saving.
         # The execution loop will call _terminate_request on these requests.
