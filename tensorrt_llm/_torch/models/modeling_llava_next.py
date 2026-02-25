@@ -85,6 +85,52 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
+    def get_dummy_text(self, mm_counts: Dict[str, int]) -> str:
+        """
+        Return minimal placeholder text for tokenized + MM path.
+        """
+        num_images = mm_counts.get("image", 0)
+        processor = self.processor
+        image_token = processor.image_token
+        return image_token * num_images
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_image: List[int],
+        hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[int]:
+        """
+        Apply prompt update: replace each single image token in prompt_token_ids
+        with the corresponding number of MM placeholder tokens.
+
+        hf_processor_mm_kwargs is optional; LLaVA does not use it for expansion.
+        """
+        image_token_id = self.config.image_token_index
+        vocab_size = self.config.vocab_size
+        placeholder_id = vocab_size + 1
+
+        expanded: List[int] = []
+        image_idx = 0
+        for tok in prompt_token_ids:
+            if tok == image_token_id:
+                if image_idx >= len(num_mm_tokens_per_image):
+                    raise ValueError(
+                        "More image placeholder tokens in prompt than "
+                        "num_mm_tokens_per_image entries")
+                n = num_mm_tokens_per_image[image_idx]
+                expanded.extend([placeholder_id] * n)
+                image_idx += 1
+            else:
+                expanded.append(tok)
+
+        if image_idx != len(num_mm_tokens_per_image):
+            raise ValueError(
+                f"Expected {len(num_mm_tokens_per_image)} image placeholders, "
+                f"found {image_idx}. Ensure the prompt contains the model image "
+                f"placeholder (token id {image_token_id}).")
+        return expanded
+
     def _postprocess(
         self, input_ids: torch.Tensor, mm_features: Union[torch.Tensor,
                                                           List[torch.Tensor]]
@@ -254,17 +300,13 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         It replaces/expands image placeholders in the text with appropriate tokens and prepares
         the embeddings for model forward pass.
         Args:
-            inputs: Text prompt containing image placeholders
+            inputs: Text prompt containing image placeholders, or prompt_token_ids (list of int)
             multimodal_embedding: Dictionary containing pre-processed image embedding data
         Returns:
             Tuple of (token_ids, extra_processed_inputs) where:
             - token_ids: List of processed token IDs with image placeholders
             - extra_processed_inputs: Optional dictionary containing multimodal embeddings
         """
-        text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
-
         if not isinstance(multimodal_embedding, dict):
             raise ValueError("multimodal_embedding must be a dictionary")
 
@@ -273,9 +315,19 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 "Only image modality is supported for external multimodal embedding"
             )
 
-        input_ids = self.tokenizer(text_prompt,
-                                   return_tensors="pt").input_ids[0]
-        mm_features = multimodal_embedding['image']
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if prompt_token_ids is not None:
+            # Token IDs already provided (e.g. tokenized+MM path): use directly, skip tokenization.
+            input_ids = torch.tensor(prompt_token_ids, dtype=torch.long)
+        else:
+            text_prompt = inputs.get("prompt")
+            if not text_prompt:
+                raise ValueError(
+                    "Either 'prompt' (text) or 'prompt_token_ids' is required")
+            input_ids = self.tokenizer(text_prompt,
+                                       return_tensors="pt").input_ids[0]
+
+        mm_features = multimodal_embedding["image"]
         fused_input_ids, mm_features = self._postprocess(input_ids, mm_features)
         multimodal_data = {}
         multimodal_data["multimodal_embedding"] = mm_features
