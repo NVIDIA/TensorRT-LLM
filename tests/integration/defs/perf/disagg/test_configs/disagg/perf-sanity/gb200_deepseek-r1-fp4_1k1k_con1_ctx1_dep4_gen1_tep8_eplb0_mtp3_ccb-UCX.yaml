@@ -59,7 +59,7 @@ worker_config:
       max_batch_size: 128
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.8
+      free_gpu_memory_fraction: 0.9
       dtype: fp8
     moe_config:
       backend: TRTLLM
@@ -86,7 +86,7 @@ worker_config:
     cuda_graph_config: null
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.5
+      free_gpu_memory_fraction: 0.6
       dtype: fp8
     moe_config:
       backend: CUTEDSL

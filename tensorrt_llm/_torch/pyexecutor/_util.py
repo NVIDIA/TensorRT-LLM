@@ -434,6 +434,7 @@ class KvCacheCreator:
                 kv_stats_draft.allocated_bytes
                 if kv_stats_draft is not None else 0)
         else:
+            peak_memory = total_used_bytes
             allocated_bytes = 0
 
         # calculate max memory from peak memory and free gpu memory fraction
@@ -889,8 +890,7 @@ def _create_kv_cache_manager(
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager
-        is_vswa = kv_cache_config.max_attention_window is not None and len(
-            set(kv_cache_config.max_attention_window)) > 1
+        is_vswa = is_vswa_enabled(kv_cache_config)
         binding_model_config = _model_config.get_bindings_model_config(
             tokens_per_block=tokens_per_block) if is_vswa else None
 

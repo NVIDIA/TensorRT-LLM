@@ -58,7 +58,7 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.5
+      free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
@@ -124,7 +124,7 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.5
+      free_gpu_memory_fraction: 0.8
     speculative_config:
       decoding_type: 'MTP'
       num_nextn_predict_layers: 1
