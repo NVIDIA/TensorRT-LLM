@@ -14,7 +14,7 @@ llm_perf_core:
 # 9: H100, H20, H200, B200, B300 test cases
 # 10: H100, H20, H200, B200, B300, RTX-6000 Server test cases
 # 11: RTX-6000D, RTX-6000 Server test cases
-# 12: RTX6000-Server test cases
+# 12: RTX6000-Server
 # ===============================================================================
 
 
@@ -142,7 +142,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:128,128-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:2000,200-gpus:8]
   - perf/test_perf.py::test_perf[llama_v3.1_70b_instruct_fp8-bench-pytorch-float8-input_output_len:1000,1000-gpus:8]
-  
+
 
 # 4: H100, H20, H200 test cases
 - condition:
@@ -170,7 +170,7 @@ llm_perf_core:
   - perf/test_perf.py::test_perf[deepseek_v3_lite_fp8-bench-pytorch-streaming-float8-input_output_len:128,128]
   - perf/test_perf.py::test_perf[mistral_small_v3.1_24b-bench-pytorch-bfloat16-maxbs:4096-maxnt:20000-input_output_len:20000,2000-reqs:500-con:200] TIMEOUT(120)
 
- 
+
 # 5: H100, H20, H200, GB200, B200, B300, GB300, RTX6000-D, RTX6000-Server test cases
 - condition:
     ranges:
