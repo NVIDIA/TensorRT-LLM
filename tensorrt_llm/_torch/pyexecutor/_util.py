@@ -624,6 +624,7 @@ def _build_per_layer_num_kv_heads(
     num_key_value_heads: int,
     num_hidden_layers: int,
     spec_config: Optional[SpeculativeConfig] = None,
+    draft_config: Optional[ModelConfig] = None,
 ) -> List[int]:
     """
     Returns:
@@ -631,33 +632,21 @@ def _build_per_layer_num_kv_heads(
     """
     per_layer_kv_heads = [num_key_value_heads] * num_hidden_layers
 
-    if (spec_config is not None
-            and getattr(spec_config, 'speculative_model', None) is not None):
-        try:
-            import json as _json
-
-            from ..speculative.utils import get_num_spec_layers
-            draft_config_path = os.path.join(str(spec_config.speculative_model),
-                                             'config.json')
-            if os.path.exists(draft_config_path):
-                with open(draft_config_path) as f:
-                    draft_cfg = _json.load(f)
-                draft_num_kv_heads = draft_cfg.get('num_key_value_heads')
-                if (draft_num_kv_heads is not None
-                        and draft_num_kv_heads != num_key_value_heads):
-                    num_spec_layers = get_num_spec_layers(spec_config)
-                    per_layer_kv_heads += [draft_num_kv_heads] * num_spec_layers
-                    logger.info(
-                        f"Per-layer KV heads for speculative decoding: "
-                        f"target={num_key_value_heads} x {num_hidden_layers} layers, "
-                        f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "
-                        f"total={num_hidden_layers + num_spec_layers} layers")
-        except Exception as e:
-            logger.warning(
-                f"Failed to build per-layer num_kv_heads for draft model, "
-                f"falling back to uniform num_key_value_heads="
-                f"{num_key_value_heads}: {e}")
-            per_layer_kv_heads = [num_key_value_heads] * num_hidden_layers
+    if spec_config is not None and draft_config is not None:
+        from ..speculative.utils import get_num_spec_layers
+        draft_pretrained = draft_config.pretrained_config
+        draft_num_kv_heads = getattr(
+            draft_pretrained, 'num_key_value_heads',
+            getattr(draft_pretrained, 'num_attention_heads', None))
+        if draft_num_kv_heads is not None:
+            num_spec_layers = get_num_spec_layers(spec_config)
+            per_layer_kv_heads += [draft_num_kv_heads] * num_spec_layers
+            if draft_num_kv_heads != num_key_value_heads:
+                logger.info(
+                    f"Per-layer KV heads for speculative decoding: "
+                    f"target={num_key_value_heads} x {num_hidden_layers} layers, "
+                    f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "
+                    f"total={num_hidden_layers + num_spec_layers} layers")
 
     return per_layer_kv_heads
 
@@ -721,8 +710,10 @@ def _create_kv_cache_manager(
 
     # Use provided num_layers if available, otherwise use config
     num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
+    draft_config = (getattr(model_engine.model, 'draft_config', None)
+                    if model_engine is not None else None)
     per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
-        num_key_value_heads, num_hidden_layers, spec_config)
+        num_key_value_heads, num_hidden_layers, spec_config, draft_config)
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
