@@ -14,7 +14,6 @@
 # limitations under the License.
 """L0 tests for validating curated and database YAML configs against TorchLlmArgs."""
 
-import asyncio
 from pathlib import Path
 from unittest import mock
 
@@ -190,7 +189,7 @@ def _serve_cli_args(config_path: Path, port: int = 17999):
     ]
 
 
-async def _noop_serve(_host, _port, sockets=None):
+async def _noop_serve(_host, _port, _sockets=None):
     pass
 
 
@@ -210,21 +209,11 @@ def test_database_yaml_config_serve_cli(config_path: Path):
     mock_llm = mock.Mock()
     mock_pytorch_llm = mock.Mock(return_value=mock_llm)
 
-    # Run the coroutine (mock server's _noop_serve) so it is awaited and we avoid
-    # "coroutine was never awaited". Must capture the real asyncio.run before
-    # patching: we patch tensorrt_llm.commands.serve.asyncio.run, which is the
-    # same asyncio module this test uses, so asyncio.run would recurse otherwise.
-    _real_asyncio_run = asyncio.run
-
-    def _run_coroutine(coroutine):
-        return _real_asyncio_run(coroutine)
-
     with (
         mock.patch("tensorrt_llm.commands.serve.get_is_diffusion_model", return_value=False),
         mock.patch("tensorrt_llm.commands.serve.device_count", return_value=1),
         mock.patch("tensorrt_llm.commands.serve.PyTorchLLM", mock_pytorch_llm),
         mock.patch("tensorrt_llm.commands.serve.OpenAIServer", _MockOpenAIServer),
-        mock.patch("tensorrt_llm.commands.serve.asyncio.run", side_effect=_run_coroutine),
     ):
         serve_main(args=_serve_cli_args(config_path), standalone_mode=False)
         mock_pytorch_llm.assert_called_once()
