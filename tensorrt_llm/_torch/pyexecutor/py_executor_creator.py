@@ -680,10 +680,10 @@ def create_py_executor(
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
             draft_config=draft_config,
+            skip_est=skip_est,
         )
 
-        if skip_est == True:
-            estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+        estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
 
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else

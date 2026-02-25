@@ -194,7 +194,7 @@ class ServerConfig:
         kv_cache_config = server_config_data.get("kv_cache_config", {})
         self.kv_cache_dtype = kv_cache_config.get("dtype", "fp8")
         self.enable_block_reuse = kv_cache_config.get("enable_block_reuse", False)
-        self.free_gpu_memory_fraction = kv_cache_config.get("free_gpu_memory_fraction", 0.7)
+        self.free_gpu_memory_fraction = kv_cache_config.get("free_gpu_memory_fraction", 0.8)
 
         # cache_transceiver_config
         cache_transceiver_config = server_config_data.get("cache_transceiver_config", {})

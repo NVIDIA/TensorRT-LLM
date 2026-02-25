@@ -689,8 +689,8 @@ class MambaHybridCacheManager(KVCacheManager, MambaCacheManager):
             dtype=dtype,
             spec_config=spec_config,
             layer_mask=layer_mask,
-            execution_stream=execution_stream,
             is_estimating_kv_cache=is_estimating_kv_cache,
+            execution_stream=execution_stream,
         )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
