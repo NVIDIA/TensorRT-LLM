@@ -12,6 +12,7 @@ from tensorrt_llm.models import ChatGLMForCausalLM
 from tensorrt_llm.models.chatglm.config import GLM_VERSIONS
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from examples._deprecation import emit_engine_arch_deprecation
 
 
 def parse_arguments():
@@ -247,6 +248,7 @@ def convert_and_save_hf(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     logger.set_level(args.log_level)
