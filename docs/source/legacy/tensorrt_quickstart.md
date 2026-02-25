@@ -1,3 +1,9 @@
+```{warning}
+**Legacy Workflow:** This page documents the TensorRT engine-build workflow,
+which is deprecated. For new projects, use `trtllm-serve` or the LLM API
+with the PyTorch backend. See the [Quick Start Guide](../quick-start-guide.md).
+```
+
 # LLM API with TensorRT Engine
 A simple inference example with TinyLlama using the LLM API:
 
