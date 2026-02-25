@@ -38,29 +38,46 @@ import json
 import os
 import time
 
-from example_utils import add_common_args, build_diffusion_config, build_generation_params
 from output_handler import OutputHandler
 
 from tensorrt_llm import logger
-from tensorrt_llm.llmapi.visual_gen import VisualGen
+from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
 
 logger.set_level("info")
-
-FLUX_DEFAULTS = {
-    "height": 1024,
-    "width": 1024,
-    "steps": 50,
-    "guidance_scale": 3.5,
-}
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
         description="TRTLLM VisualGen - FLUX Text-to-Image Inference Example (FLUX.1 / FLUX.2)"
     )
-    add_common_args(parser, prompt_required=False)
 
-    # Batch mode (FLUX-specific)
+    # Model & Input
+    parser.add_argument(
+        "--model_path",
+        type=str,
+        required=True,
+        help="Local path or HuggingFace Hub model ID "
+        "(e.g., black-forest-labs/FLUX.1-dev, black-forest-labs/FLUX.2-dev)",
+    )
+    parser.add_argument(
+        "--revision",
+        type=str,
+        default=None,
+        help="HuggingFace Hub revision (branch, tag, or commit SHA)",
+    )
+
+    # Single image mode
+    parser.add_argument(
+        "--prompt", type=str, default=None, help="Text prompt for single image generation"
+    )
+    parser.add_argument(
+        "--output_path",
+        type=str,
+        default="output.png",
+        help="Path to save the output image (single image mode)",
+    )
+
+    # Batch mode
     parser.add_argument(
         "--prompts_file",
         type=str,
@@ -78,6 +95,89 @@ def parse_args():
         type=int,
         default=None,
         help="Limit number of prompts from file (batch mode)",
+    )
+
+    # Generation Params
+    parser.add_argument("--height", type=int, default=1024, help="Image height")
+    parser.add_argument("--width", type=int, default=1024, help="Image width")
+    parser.add_argument("--steps", type=int, default=50, help="Number of denoising steps")
+    parser.add_argument(
+        "--guidance_scale",
+        type=float,
+        default=3.5,
+        help="Embedded guidance scale (3.5 for FLUX.1-dev, 4.0 for FLUX.2-dev)",
+    )
+    parser.add_argument("--seed", type=int, default=42, help="Random seed")
+
+    # TeaCache
+    parser.add_argument(
+        "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
+    )
+    parser.add_argument(
+        "--teacache_thresh",
+        type=float,
+        default=0.2,
+        help="TeaCache similarity threshold (rel_l1_thresh)",
+    )
+
+    # Quantization
+    parser.add_argument(
+        "--linear_type",
+        type=str,
+        default="default",
+        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
+        help=(
+            "Dynamic quantization mode for linear layers. "
+            "Quantizes weights on-the-fly during loading from an unquantized checkpoint."
+        ),
+    )
+
+    # Attention Backend
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        default="VANILLA",
+        choices=["VANILLA", "TRTLLM"],
+        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
+        "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
+    )
+
+    # Parallelism
+    parser.add_argument(
+        "--ulysses_size",
+        type=int,
+        default=1,
+        help="Ulysses (sequence) parallel size within each CFG group.",
+    )
+
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
+    # torch.compile
+    parser.add_argument(
+        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
+    )
+    parser.add_argument(
+        "--torch_compile_models",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Components to torch.compile (empty = auto detect transformer components)",
+    )
+    parser.add_argument(
+        "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
+    )
+
+    # Autotune
+    parser.add_argument(
+        "--disable_autotune", action="store_true", help="Disable autotuning during warmup"
+    )
+
+    # Debug / profiling
+    parser.add_argument(
+        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
     )
 
     args = parser.parse_args()
@@ -101,6 +201,49 @@ def load_prompts(prompts_file, num_prompts=None):
     return prompts
 
 
+def build_diffusion_config(args):
+    """Build diffusion_config dict from parsed args."""
+    quant_config = None
+    if args.linear_type == "trtllm-fp8-per-tensor":
+        quant_config = {"quant_algo": "FP8", "dynamic": True}
+    elif args.linear_type == "trtllm-fp8-blockwise":
+        quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
+    elif args.linear_type == "trtllm-nvfp4":
+        quant_config = {"quant_algo": "NVFP4", "dynamic": True}
+
+    diffusion_config = {
+        "revision": args.revision,
+        "attention": {
+            "backend": args.attention_backend,
+        },
+        "teacache": {
+            "enable_teacache": args.enable_teacache,
+            "teacache_thresh": args.teacache_thresh,
+        },
+        "parallel": {
+            "dit_cfg_size": args.cfg_size,
+            "dit_ulysses_size": args.ulysses_size,
+        },
+        "torch_compile": {
+            "enable_torch_compile": not args.disable_torch_compile,
+            "torch_compile_models": args.torch_compile_models,
+            "enable_fullgraph": args.enable_fullgraph,
+            "enable_autotune": not args.disable_autotune,
+        },
+        "cuda_graph": {
+            "enable_cuda_graph": args.enable_cudagraph,
+        },
+        "pipeline": {
+            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
+        },
+    }
+
+    if quant_config is not None:
+        diffusion_config["quant_config"] = quant_config
+
+    return diffusion_config
+
+
 def main():
     args = parse_args()
 
@@ -119,86 +262,94 @@ def main():
 
     try:
         if args.prompts_file:
-            _run_batch(args, visual_gen)
+            prompts = load_prompts(args.prompts_file, args.num_prompts)
+            os.makedirs(args.output_dir, exist_ok=True)
+
+            logger.info(f"Batch mode: {len(prompts)} prompts -> {args.output_dir}")
+            logger.info(f"Resolution: {args.height}x{args.width}, Steps: {args.steps}")
+
+            timing_records = []
+            total_start = time.time()
+
+            for i, prompt in enumerate(prompts):
+                logger.info(f"[{i + 1}/{len(prompts)}] {prompt[:60]}...")
+                start_time = time.time()
+
+                output = visual_gen.generate(
+                    inputs=prompt,
+                    params=VisualGenParams(
+                        height=args.height,
+                        width=args.width,
+                        num_inference_steps=args.steps,
+                        guidance_scale=args.guidance_scale,
+                        seed=args.seed + i,
+                    ),
+                )
+
+                elapsed = time.time() - start_time
+                output_path = os.path.join(args.output_dir, f"{i:02d}.png")
+                OutputHandler.save(output, output_path)
+                logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
+
+                timing_records.append(
+                    {
+                        "index": i,
+                        "prompt": prompt,
+                        "time": round(elapsed, 2),
+                        "seed": args.seed + i,
+                    }
+                )
+
+            total_elapsed = time.time() - total_start
+            times = [r["time"] for r in timing_records]
+
+            timing_data = {
+                "images": timing_records,
+                "total_time": round(total_elapsed, 2),
+                "avg_time": round(sum(times) / len(times), 2) if times else 0,
+                "config": {
+                    "model_path": args.model_path,
+                    "linear_type": args.linear_type,
+                    "attention_backend": args.attention_backend,
+                    "height": args.height,
+                    "width": args.width,
+                    "steps": args.steps,
+                    "guidance_scale": args.guidance_scale,
+                },
+            }
+            timing_path = os.path.join(args.output_dir, "timing.json")
+            with open(timing_path, "w") as f:
+                json.dump(timing_data, f, indent=2)
+
+            logger.info(
+                f"Batch complete: {len(prompts)} images in {total_elapsed:.1f}s "
+                f"(avg {timing_data['avg_time']:.1f}s/image)"
+            )
+            logger.info(f"Timing saved to {timing_path}")
+
         else:
-            _run_single(args, visual_gen)
+            logger.info(f"Generating image for prompt: '{args.prompt}'")
+            logger.info(f"Resolution: {args.height}x{args.width}, Steps: {args.steps}")
+
+            start_time = time.time()
+
+            output = visual_gen.generate(
+                inputs=args.prompt,
+                params=VisualGenParams(
+                    height=args.height,
+                    width=args.width,
+                    num_inference_steps=args.steps,
+                    guidance_scale=args.guidance_scale,
+                    seed=args.seed,
+                ),
+            )
+
+            logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
+
+            OutputHandler.save(output, args.output_path)
+
     finally:
         visual_gen.shutdown()
-
-
-def _run_single(args, visual_gen):
-    """Single image mode."""
-    params = build_generation_params(args, defaults=FLUX_DEFAULTS)
-
-    logger.info(f"Generating image for prompt: '{args.prompt}'")
-    logger.info(f"Resolution: {params.height}x{params.width}, Steps: {params.num_inference_steps}")
-
-    start_time = time.time()
-
-    output = visual_gen.generate(inputs=args.prompt, params=params)
-
-    logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
-
-    OutputHandler.save(output, args.output_path)
-
-
-def _run_batch(args, visual_gen):
-    """Batch mode: generate images for multiple prompts with timing metadata."""
-    prompts = load_prompts(args.prompts_file, args.num_prompts)
-    os.makedirs(args.output_dir, exist_ok=True)
-
-    base_params = build_generation_params(args, defaults=FLUX_DEFAULTS)
-    logger.info(f"Batch mode: {len(prompts)} prompts -> {args.output_dir}")
-    logger.info(
-        f"Resolution: {base_params.height}x{base_params.width}, "
-        f"Steps: {base_params.num_inference_steps}"
-    )
-
-    timing_records = []
-    total_start = time.time()
-
-    for i, prompt in enumerate(prompts):
-        logger.info(f"[{i + 1}/{len(prompts)}] {prompt[:60]}...")
-        start_time = time.time()
-
-        params = build_generation_params(args, defaults=FLUX_DEFAULTS, seed=args.seed + i)
-        output = visual_gen.generate(inputs=prompt, params=params)
-
-        elapsed = time.time() - start_time
-        output_path = os.path.join(args.output_dir, f"{i:02d}.png")
-        OutputHandler.save(output, output_path)
-        logger.info(f"  Saved {output_path} ({elapsed:.1f}s)")
-
-        timing_records.append(
-            {"index": i, "prompt": prompt, "time": round(elapsed, 2), "seed": args.seed + i}
-        )
-
-    total_elapsed = time.time() - total_start
-    times = [r["time"] for r in timing_records]
-
-    timing_data = {
-        "images": timing_records,
-        "total_time": round(total_elapsed, 2),
-        "avg_time": round(sum(times) / len(times), 2) if times else 0,
-        "config": {
-            "model_path": args.model_path,
-            "linear_type": args.linear_type,
-            "attention_backend": args.attention_backend,
-            "height": base_params.height,
-            "width": base_params.width,
-            "steps": base_params.num_inference_steps,
-            "guidance_scale": base_params.guidance_scale,
-        },
-    }
-    timing_path = os.path.join(args.output_dir, "timing.json")
-    with open(timing_path, "w") as f:
-        json.dump(timing_data, f, indent=2)
-
-    logger.info(
-        f"Batch complete: {len(prompts)} images in {total_elapsed:.1f}s "
-        f"(avg {timing_data['avg_time']:.1f}s/image)"
-    )
-    logger.info(f"Timing saved to {timing_path}")
 
 
 if __name__ == "__main__":
