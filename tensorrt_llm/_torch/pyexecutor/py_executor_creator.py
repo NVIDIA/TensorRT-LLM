@@ -640,6 +640,7 @@ def create_py_executor(
         kv_connector_manager = None
 
     resources = {}
+    estimating_kv_cache = False
     kv_cache_creator = None
 
     # Create the execution stream for model forward operations
@@ -648,7 +649,6 @@ def create_py_executor(
     logger.info(
         f"[create_py_executor] Created execution_stream: {execution_stream}")
 
-    estimating_kv_cache = False
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
@@ -715,9 +715,9 @@ def create_py_executor(
                                    spec_resource_manager=spec_resource_manager,
                                    guided_decoder=guided_decoder)
 
-    with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
-                          RestoreMode.PINNED):
-
+    with allocation_scope(
+            ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
+            ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):
         # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
         gc.collect()
         py_executor = create_py_executor_instance(
@@ -733,7 +733,8 @@ def create_py_executor(
             guided_decoder=guided_decoder,
             lora_config=lora_config,
             garbage_collection_gen0_threshold=garbage_collection_gen0_threshold,
-            kv_connector_manager=kv_connector_manager,
+            kv_connector_manager=kv_connector_manager
+            if not estimating_kv_cache else None,
             max_seq_len=max_seq_len,
             max_batch_size=max_batch_size,
             max_beam_width=max_beam_width,
@@ -741,7 +742,7 @@ def create_py_executor(
             peft_cache_config=peft_cache_config,
             scheduler_config=scheduler_config,
             cache_transceiver_config=cache_transceiver_config,
-            virtual_memory_pools=vm_pools,
+            virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
         )
 

@@ -374,7 +374,7 @@ class KvCacheCreator:
             f"Memory used after loading model weights (outside torch) in memory usage profiling: {((total_used_bytes - model_bytes) if total_used_bytes > model_bytes else 0) / (GB):.2f} GiB"
         )
 
-        if py_executor is not None and self._skip_est == False:
+        if py_executor is not None and not self._skip_est:
             py_executor.set_gather_responses(True)
             origin_iter_stats = py_executor.enable_iter_perf_stats
             py_executor.enable_iter_perf_stats = False
@@ -436,6 +436,7 @@ class KvCacheCreator:
         else:
             peak_memory = total_used_bytes
             allocated_bytes = 0
+            activation_bytes = 0
 
         # calculate max memory from peak memory and free gpu memory fraction
         kv_cache_max_memory = self._cal_max_memory(peak_memory,
