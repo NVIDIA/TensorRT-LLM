@@ -2154,8 +2154,9 @@ __global__ void doActivationKernel(T* output, GemmOutputType const* gemm_result,
             float const quant_scale = fp8_quant ? fp8_quant[act_scale_idx] : 1.f;
 
             // Some globals for FP4
-            float global_scale_val = fc2_act_global_scale ? fc2_act_global_scale[act_scale_idx] : 1.0f;
-            int64_t num_tokens_before_expert = (IsNVFP4 || IsMXFP8) ? expert_first_token_offset[expert] : 0;
+            [[maybe_unused]] float global_scale_val = fc2_act_global_scale ? fc2_act_global_scale[act_scale_idx] : 1.0f;
+            [[maybe_unused]] int64_t num_tokens_before_expert
+                = (IsNVFP4 || IsMXFP8) ? expert_first_token_offset[expert] : 0;
 
             size_t bias_offset = 0;
             if (bias_ptr)
@@ -2399,12 +2400,15 @@ void doActivation(T* output, GemmOutputType const* gemm_result, float const* fp8
                 default: TLLM_CHECK_WITH_INFO(false, "Invalid activation type"); return nullptr;
                 }
             };
-            auto NVFP4 = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
-                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
-            auto MXFPX = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
-                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX>{};
-            auto NONE = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
-                TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE>{};
+            [[maybe_unused]] auto NVFP4
+                = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NVFP4>{};
+            [[maybe_unused]] auto MXFPX
+                = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::MXFPX>{};
+            [[maybe_unused]] auto NONE
+                = tensorrt_llm::common::ConstExprWrapper<TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType,
+                    TmaWarpSpecializedGroupedGemmInput::FpXBlockScalingType::NONE>{};
 #ifdef ENABLE_FP4
             if constexpr (std::is_same_v<T, __nv_fp4_e2m1>)
             {
@@ -4613,7 +4617,6 @@ void GemmProfilerBackend::prepareTmaWsInputs(int num_tokens, char* workspace_ptr
     bool use_w4afp8 = (mDType == nvinfer1::DataType::kFP8 && mWType == nvinfer1::DataType::kINT4);
     bool use_wfp4a16 = ((mDType == nvinfer1::DataType::kHALF || mDType == nvinfer1::DataType::kBF16)
         && mWType == nvinfer1::DataType::kUINT8);
-    bool use_w4_groupwise = use_w4afp8 || use_wfp4a16;
     bool const use_finalize_fusion = fusion == TmaWarpSpecializedGroupedGemmInput::EpilogueFusion::FINALIZE;
     bool const finalize_fusion_not_supported
         = !mInterface->use_fused_finalize_ || mMinLatencyMode || use_wfp4a16 || mGemmToProfile != GemmToProfile::GEMM_2;
