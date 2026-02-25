@@ -390,6 +390,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
 
     def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
         super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        # kv_lens_cuda needs to be handled separately.
         if self._saved_kv_lens_cuda is not None:
             batch_size = self._saved_kv_lens_cuda.shape[0]
             attn_metadata.kv_lens_cuda[:batch_size].copy_(
