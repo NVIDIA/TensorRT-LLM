@@ -197,8 +197,6 @@ class PyExecutor:
         self.batch_wait_max_tokens_ratio = self.llm_args.batch_wait_max_tokens_ratio
         self.enable_batch_waiting = self.batch_wait_timeout_iters > 0 or self.batch_wait_max_tokens_ratio > 0
 
-        self.num_fetch_requests_cur_rank = 0
-        self.num_fetch_requests = 0
         self.shutdown_event = threading.Event()
 
         # Rolling acceptance tracking for spec decode (disable speculation if rolling acceptance is below threshold)
@@ -1282,19 +1280,20 @@ class PyExecutor:
         # requests specified, since dummies only get added after this loop.
         if not self.is_warmup and self.benchmark_req_queues_size > 0 \
                 and self.kv_cache_transceiver \
-                and self.num_fetch_requests < self.benchmark_req_queues_size:
+                and self.executor_request_queue.num_fetch_requests < self.benchmark_req_queues_size:
             if self.dist.rank == 0:
-                logger.info(f"Starting benchmark fill loop, "
-                            f"num_fetch_requests={self.num_fetch_requests}/"
-                            f"{self.benchmark_req_queues_size}, "
-                            f"len(active_requests)={len(self.active_requests)}")
-            while self.num_fetch_requests < self.benchmark_req_queues_size:
+                logger.info(
+                    f"Starting benchmark fill loop, "
+                    f"num_fetch_requests={self.executor_request_queue.num_fetch_requests}/"
+                    f"{self.benchmark_req_queues_size}, "
+                    f"len(active_requests)={len(self.active_requests)}")
+            while self.executor_request_queue.num_fetch_requests < self.benchmark_req_queues_size:
                 iter_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     return None, None
                 new_requests += iter_requests
                 self.hang_detector.checkpoint()
-                if self.num_fetch_requests < self.benchmark_req_queues_size:
+                if self.executor_request_queue.num_fetch_requests < self.benchmark_req_queues_size:
                     time.sleep(1)
 
         iter_stats = None
@@ -1641,7 +1640,7 @@ class PyExecutor:
                         else:
                             if self.dist.rank == 0:
                                 logger.info(
-                                    f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
+                                    f"sleep 10 seconds, num_fetched_requests: {self.executor_request_queue.num_fetch_requests}, "
                                     f"total_gen_count: {total_gen_count}, "
                                     f"scheduled_gen_batch: {local_gen_count}")
                             time.sleep(10)
@@ -2168,7 +2167,7 @@ class PyExecutor:
                 and not self.is_warmup and len(self.active_requests) > 0
                 and num_active_request == 0):
             logger.info(
-                f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
+                f"Skipped adding dummy requests: num_fetch_requests={self.executor_request_queue.num_fetch_requests}, {num_active_request=}"
             )
             return
 
