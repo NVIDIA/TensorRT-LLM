@@ -1402,7 +1402,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
             cuda_graph_config=CudaGraphConfig(),
@@ -4541,9 +4541,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         ids=["tp4", "ep4", "dp4"])
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
-    def test_w4_4gpus(self, kv_cache_dtype, moe_backend, tp_size, pp_size,
-                      ep_size, attention_dp, cuda_graph, overlap_scheduler,
-                      mocker, v2_kv_cache):
+    def test_w4_4gpus(self, v2_kv_cache, kv_cache_dtype, moe_backend, tp_size,
+                      pp_size, ep_size, attention_dp, cuda_graph,
+                      overlap_scheduler, mocker):
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -4837,8 +4837,10 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         pytest.param("TRITON", marks=skip_no_hopper)
     ],
                              ids=["cutlass", "trtllm", "triton"])
-    def test_eagle3_4gpus(self, moe_backend, one_model, overlap_scheduler,
-                          mocker):
+    @pytest.mark.parametrize("v2_kv_cache", [True, False],
+                             ids=["v2_kv_cache", "v1_kv_cache"])
+    def test_eagle3_4gpus(self, v2_kv_cache, moe_backend, one_model,
+                          overlap_scheduler, mocker):
         if get_sm_version() == 90:
             pytest.skip(
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
@@ -4854,11 +4856,17 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         mocker.patch.object(GPQADiamond, "MAX_OUTPUT_LEN", MAX_OUTPUT_LEN)
         mocker.patch.object(GPQADiamond, "MAX_INPUT_LEN", MAX_INPUT_LEN)
 
+        if v2_kv_cache and not one_model and overlap_scheduler:
+            pytest.skip(
+                "KVCacheManagerV2 not compatible with two-model overlap scheduling"
+            )
+
         # https://nvbugs/5590408: 2-Model overlap scheduling has accuracy issue
         pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
                               cuda_graph_config=CudaGraphConfig())
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.4,
-                                        dtype="auto")
+                                        dtype="auto",
+                                        use_kv_cache_manager_v2=v2_kv_cache)
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
