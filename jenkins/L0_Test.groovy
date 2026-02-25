@@ -2133,9 +2133,9 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     return makoOptsJson
 }
 
-def parseMultiNodeTaskConfigFromStageName(String stageName) {
+def parseTaskConfigFromStageName(String stageName) {
     def taskConfig = null
-    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs(?:-(\d+)_Nodes)?/)
+    def matcher = (stageName =~ /([^-]+)(?:-(\d+)_GPUs)?(?:-(\d+)_Nodes)?/)
     if (matcher.find()) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
@@ -2198,7 +2198,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
 
     if (parseSysinfo) {
-        def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
+        def taskConfig = parseTaskConfigFromStageName(stageName)
         if (taskConfig) {
             makoArgs += [
                 "gpu=${taskConfig.gpu}",
