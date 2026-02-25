@@ -231,40 +231,14 @@ install_tensorrt() {
               /usr/local/tensorrt/lib/libnvonnxparser_static.a \
               /usr/local/tensorrt/lib/libnvinfer_builder_resource_win.so.*
         echo "TensorRT installation completed."
-    else
-        echo "Creating symbolic links for pre-installed TensorRT..."
-        # Create symbolic links to make pre-installed TensorRT appear under /usr/local/tensorrt
-        if [ ! -d /usr/local/tensorrt ]; then
-            mkdir -p /usr/local/tensorrt
-            echo "Created directory /usr/local/tensorrt"
-        fi
 
-        # Link library directory
-        if [ ! -e /usr/local/tensorrt/lib ]; then
-            ARCH=$(uname -m)
-            if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "amd64" ]; then
-                ln -sf /usr/lib/x86_64-linux-gnu /usr/local/tensorrt/lib
-                echo "Created symlink: /usr/local/tensorrt/lib -> /usr/lib/x86_64-linux-gnu"
-            elif [ "$ARCH" = "aarch64" ] || [ "$ARCH" = "arm64" ]; then
-                ln -sf /usr/lib/aarch64-linux-gnu /usr/local/tensorrt/lib
-                echo "Created symlink: /usr/local/tensorrt/lib -> /usr/lib/aarch64-linux-gnu"
-            fi
+        # Ensure LD_LIBRARY_PATH is set
+        if ! grep -q "LD_LIBRARY_PATH=/usr/local/tensorrt/lib" "${ENV}" 2>/dev/null; then
+            echo "Setting LD_LIBRARY_PATH in ${ENV}..."
+            echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
+        else
+            echo "LD_LIBRARY_PATH already configured."
         fi
-
-        # Link include directory
-        if [ ! -e /usr/local/tensorrt/include ]; then
-            ln -sf /usr/include /usr/local/tensorrt/include
-            echo "Created symlink: /usr/local/tensorrt/include -> /usr/include"
-        fi
-        echo "Symbolic link setup completed."
-    fi
-
-    # Ensure LD_LIBRARY_PATH is set
-    if ! grep -q "LD_LIBRARY_PATH=/usr/local/tensorrt/lib" "${ENV}" 2>/dev/null; then
-        echo "Setting LD_LIBRARY_PATH in ${ENV}..."
-        echo 'export LD_LIBRARY_PATH=/usr/local/tensorrt/lib:$LD_LIBRARY_PATH' >> "${ENV}"
-    else
-        echo "LD_LIBRARY_PATH already configured."
     fi
 }
 

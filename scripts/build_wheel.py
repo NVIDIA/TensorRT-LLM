@@ -470,7 +470,7 @@ def main(*,
          job_count: int = None,
          extra_cmake_vars: Sequence[str] = tuple(),
          extra_make_targets: str = "",
-         trt_root: str = '/usr/local/tensorrt',
+         trt_root: str = None,
          nccl_root: str = None,
          nixl_root: str = None,
          mooncake_root: str = None,
@@ -567,8 +567,18 @@ def main(*,
         # Don't include duplicate conditions
         cmake_def_args.extend(set(extra_cmake_vars))
 
+    if trt_root is None:
+        trt_root = "/usr/local/tensorrt" if os.path.isdir(
+            "/usr/local/tensorrt") else None
     if trt_root is not None:
-        cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
+        if os.path.isdir(trt_root):
+            cmake_def_args.append(f"-DTensorRT_ROOT={trt_root}")
+        else:
+            print(
+                f"Warning: trt_root '{trt_root}' does not exist. "
+                "Ignoring -DTensorRT_ROOT.",
+                file=sys.stderr,
+            )
 
     if nccl_root is not None:
         cmake_def_args.append(f"-DNCCL_ROOT={nccl_root}")
@@ -1098,7 +1108,7 @@ def add_arguments(parser: ArgumentParser):
         default=[])
     parser.add_argument(
         "--trt_root",
-        default="/usr/local/tensorrt",
+        default=None,
         help="Directory containing TensorRT headers and libraries")
     parser.add_argument("--nccl_root",
                         help="Directory containing NCCL headers and libraries")
