@@ -135,9 +135,10 @@ def parse_args():
         "--attention_backend",
         type=str,
         default="VANILLA",
-        choices=["VANILLA", "TRTLLM"],
-        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
-        "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
+        choices=["VANILLA", "TRTLLM", "FA4"],
+        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
+        "FA4: Flash Attention 4). "
+        "Note: TRTLLM and FA4 automatically fall back to VANILLA for cross-attention.",
     )
 
     # torch.compile
