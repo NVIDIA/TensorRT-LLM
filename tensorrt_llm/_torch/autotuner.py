@@ -1179,8 +1179,8 @@ class AutoTuner:
                     record_global_timer(end_ts.data_ptr(), stream)
 
                 def elapsed_time():
-                    # GPU %globaltimer counts in nanoseconds,
-                    # Torch.cuda.Event.elapsed_time() returns ms
+                    # GPU %globaltimer counts in ns; convert to ms to match the
+                    # units of Torch.cuda.Event.elapsed_time()
                     return (end_ts.item() - start_ts.item()) / 1e6
             else:
                 start_evt = torch.cuda.Event(enable_timing=True)
