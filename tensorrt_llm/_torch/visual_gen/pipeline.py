@@ -48,11 +48,10 @@ class BasePipeline(nn.Module):
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
-        compilation_cfg = self.model_config.compilation
-        if not compilation_cfg.enable_cuda_graph:
+        if not self.model_config.cuda_graph.enable_cuda_graph:
             return
 
-        if compilation_cfg.enable_torch_compile:
+        if self.model_config.torch_compile.enable_torch_compile:
             logger.warning(
                 "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
@@ -177,7 +176,7 @@ class BasePipeline(nn.Module):
         self.cache_backend.enable(model)
 
     def torch_compile(self) -> None:
-        """Apply torch.compile to pipeline components based on CompilationConfig.
+        """Apply torch.compile to pipeline components based on TorchCompileConfig.
 
         For transformer models, compiles each block in the ModuleList individually.
         This enables future block-wise offloading and keeps compilation efficient
@@ -185,12 +184,14 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
-        compilation_config = self.model_config.compilation
+        tc_config = self.model_config.torch_compile
+
+        # Using default as max-autotune mode takes more initialization time and
+        # does not improve performance a lot.
         compile_mode = "default"
 
-        targets = compilation_config.torch_compile_models
-        if not targets:
-            targets = self.transformer_components
+        # Compiling transformer blocks provides max performance value.
+        targets = self.transformer_components
 
         for name in targets:
             model = getattr(self, name, None)
@@ -213,7 +214,7 @@ class BasePipeline(nn.Module):
                                 block,
                                 mode=compile_mode,
                                 dynamic=None,
-                                fullgraph=compilation_config.enable_fullgraph,
+                                fullgraph=tc_config.enable_fullgraph,
                             )
                         )
                     setattr(model, block_name, nn.ModuleList(compiled_blocks))
@@ -223,7 +224,7 @@ class BasePipeline(nn.Module):
                     model,
                     mode=compile_mode,
                     dynamic=None,
-                    fullgraph=compilation_config.enable_fullgraph,
+                    fullgraph=tc_config.enable_fullgraph,
                 )
                 setattr(self, name, compiled)
 

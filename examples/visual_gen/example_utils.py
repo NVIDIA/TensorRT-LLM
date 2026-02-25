@@ -139,13 +139,6 @@ def add_common_args(parser: argparse.ArgumentParser, *, prompt_required: bool = 
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
     )
     parser.add_argument(
-        "--torch_compile_models",
-        type=str,
-        nargs="+",
-        default=[],
-        help="Components to torch.compile (empty = auto detect)",
-    )
-    parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
     )
     parser.add_argument(
@@ -170,12 +163,13 @@ def build_diffusion_config(args: argparse.Namespace) -> Dict[str, Any]:
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "compilation": {
-            "enable_cuda_graph": args.enable_cudagraph,
+        "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,
-            "torch_compile_models": args.torch_compile_models,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
+        },
+        "cuda_graph": {
+            "enable_cuda_graph": args.enable_cudagraph,
         },
         "pipeline": {
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,

@@ -114,9 +114,10 @@ class Flux2Pipeline(BasePipeline):
     HIDDEN_STATE_LAYERS: Tuple[int, ...] = (10, 20, 30)
 
     def __init__(self, model_config):
-        assert model_config.parallel.dit_cfg_size == 1, (
-            "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
-        )
+        if model_config.parallel.dit_cfg_size != 1:
+            raise ValueError(
+                "Flux2Pipeline does not support CFG parallelism. Please set dit_cfg_size to 1."
+            )
 
         super().__init__(model_config)
 

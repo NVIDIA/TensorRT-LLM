@@ -209,14 +209,14 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
-        if config.compilation.enable_torch_compile:
+        if config.torch_compile.enable_torch_compile:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")
 
         if not skip_warmup:
-            if config.compilation.enable_autotune:
+            if config.torch_compile.enable_autotune:
                 with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
                     pipeline.warmup()
             else:
