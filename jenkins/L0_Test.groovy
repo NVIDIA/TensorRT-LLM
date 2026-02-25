@@ -104,7 +104,7 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
+def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName, Boolean stageIsInterrupted) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
@@ -128,9 +128,13 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
-                sh "ls -al ${stageName}/"
-                // Generate timeout test result xml if there are terminated unexpectedly tests
-                hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    sh "ls -al ${stageName}/"
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                }
             }
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
@@ -915,6 +919,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
+    def stageIsInterrupted = false
+
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
@@ -1386,8 +1392,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             echo "Finished test stage execution."
         }
+    } catch (InterruptedException e) {
+        stageIsInterrupted = true
+        throw e
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName)
+        uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1614,8 +1623,12 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
-                // Generate timeout test result xml if there are terminated unexpectedly tests
-                generateTimeoutTestResultXml(pipeline, stageName)
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
@@ -2998,6 +3011,15 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
         sh "bash -c 'pip3 show tensorrt || true'"
     }
 
+    // Upload attribution files when they exist
+    def attrDir = "tensorrt_llm/cpp/build/attribution"
+    def wheelBase = wheelName.replace('.whl', '')
+    for (f in ["missing_files.json", "import_payload.json", "file_mappings.json"]) {
+        if (fileExists("${attrDir}/${f}")) {
+            trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
+        }
+    }
+
     return wheelName
 }
 
@@ -3290,9 +3312,10 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-2": ["b300-x4", "l0_dgx_b300", 2, 2, 4],
         // PerfSanity post-merge tests
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200_perf_sanity", 1, 3, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200_perf_sanity", 2, 3, 8, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_dgx_b200_perf_sanity", 3, 3, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 1, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 2, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 3, 4, 8, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:dgx-b200-flex", "l0_b200_multi_gpus_perf_sanity", 4, 4, 8, 1, true],
     ]
     fullSet += x86SlurmTestConfigs.keySet()
 
@@ -3328,9 +3351,13 @@ def launchTestJobs(pipeline, testFilter)
         // PerfSanity pre-merge tests
         "GB200-4_GPUs-PyTorch-PerfSanity-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 1, 4],
         // PerfSanity post-merge tests
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 3, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 3, 4],
-        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 3, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-1": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 1, 7, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-2": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 2, 7, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-3": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 3, 7, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-4": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 4, 7, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-5": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 5, 7, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-6": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 6, 7, 4],
+        "GB200-4_GPUs-PyTorch-PerfSanity-Post-Merge-7": ["auto:gb200-x4", "l0_gb200_multi_gpus_perf_sanity", 7, 7, 4],
     ]
     fullSet += SBSASlurmTestConfigs.keySet()
 
@@ -3343,36 +3370,47 @@ def launchTestJobs(pipeline, testFilter)
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-2": ["auto:gb200-flex", "l0_gb200_multi_nodes", 2, 3, 8, 2],
         "GB200-8_GPUs-2_Nodes-PyTorch-Post-Merge-3": ["auto:gb200-flex", "l0_gb200_multi_nodes", 3, 3, 8, 2],
     ]
-    // PerfSanity post-merge aggr tests
+    // PerfSanity post-merge aggregated
+    // 2 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
-        "GB200-8_GPUs-2_Nodes-PyTorch-Aggr-PerfSanity-Node2-GPU8-Post-Merge",
+        "GB200-8_GPUs-2_Nodes-PyTorch-PerfSanity-Node2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_aggr_perf_sanity_node2_gpu8",
-        5,
+        "l0_gb200_multi_nodes_perf_sanity_node2_gpu8",
+        7,
         8,
         2
     )
-    // PerfSanity post-merge disagg tests
+    // PerfSanity post-merge disaggregated
+    // 2 Nodes
+    multiNodesSBSAConfigs += buildStageConfigs(
+        "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU2-Post-Merge",
+        "auto:gb200-flex",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu2",
+        3,
+        8,
+        2
+    )
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
-        1,
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4",
+        4,
         8,
         2
     )
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-8_GPUs-2_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE1-GPU4-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node1_gpu4",
         3,
         8,
         2
     )
+    // 3 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU1-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8",
         1,
         12,
         3
@@ -3380,15 +3418,16 @@ def launchTestJobs(pipeline, testFilter)
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-12_GPUs-3_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE1-GPU4-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
-        5,
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu4_gen1_node2_gpu8",
+        3,
         12,
         3
     )
+    // 4 Nodes
     multiNodesSBSAConfigs += buildStageConfigs(
         "GB200-16_GPUs-4_Nodes-PyTorch-Disagg-PerfSanity-CTX1-NODE2-GPU8-GEN1-NODE2-GPU8-Post-Merge",
         "auto:gb200-flex",
-        "l0_gb200_multi_nodes_disagg_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
+        "l0_gb200_multi_nodes_perf_sanity_ctx1_node2_gpu8_gen1_node2_gpu8",
         1,
         16,
         4

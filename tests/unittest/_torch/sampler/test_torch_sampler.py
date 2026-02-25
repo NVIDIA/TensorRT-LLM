@@ -15,25 +15,14 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
-from typing import (
-    Callable,
-    ContextManager,
-    Final,
-    Generator,
-    Optional,
-    Protocol,
-    Type,
-    TypeVar,
-    Union,
-    cast,
-)
+from typing import Callable, ContextManager, Final, Generator, Optional, Type, TypeVar, Union, cast
 
 import flashinfer.sampling
 import numpy as np
 import pytest
 import torch
 from scipy.stats import power_divergence
-from utils.util import assert_no_cuda_sync, force_ampere
+from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
 from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
 from tensorrt_llm._torch.pyexecutor.sampler import (
@@ -363,53 +352,6 @@ class TestStrategySelection:
         assert torch_sampler.should_provide_draft_probs(request) == (not is_greedy)
 
 
-class UutProvider(Protocol):
-    def __call__(self, is_warmup: bool) -> ContextManager[Callable[[], None]]: ...
-
-
-def _run_test_with_warmup(
-    uut_provider: UutProvider,
-    warmup_sizes_bytes: tuple[int] = (4 * 2**30,),
-    *,
-    max_sync_s: Optional[float],
-):
-    """Run UUT including setup and warmup.
-
-    This is mainly used to check that the UUT does not CUDA device sync. Thus,
-    given that PyTorch's caching memory allocator can device sync when it runs
-    out of cached GPU memory segments, the warmup allocates some GPU memory.
-
-    The warmup also runs the test once. This avoids issues with things like lazy loading
-    of device code. The UUT provider can use the 'is_warmup' argument to adapt its
-    behavior to the warmup and final test runs.
-
-    If max_sync_s is provided, this helper checks that the UUT does not device sync,
-    assuming that the sync (CPU) part of the code takes no longer than max_sync_s
-    seconds to complete.
-
-    It is the user's responsibility to ensure that the amount of submitted work
-    does not exceed the CUDA driver/device queue capacity, which would make
-    the execution appear synchronous.
-    """
-    with torch.cuda.Stream():
-        with uut_provider(is_warmup=True) as uut:
-            bufs = []
-            for warmup_size in warmup_sizes_bytes:
-                bufs.append(
-                    torch.ones(warmup_size, device=torch.cuda.current_device(), dtype=torch.int8)
-                )
-            del bufs
-            uut()
-
-        with uut_provider(is_warmup=False) as uut:
-            with (
-                assert_no_cuda_sync(sync_timeout_s=max_sync_s)
-                if max_sync_s is not None
-                else nullcontext()
-            ):
-                uut()
-
-
 @force_ampere
 @pytest.mark.parametrize(
     "draft_len, with_ctx, with_gen",
@@ -630,7 +572,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         torch.testing.assert_close(res.result.req_offsets.to("cpu"), expected_req_offsets)
         torch.testing.assert_close(res.result.selected_logits.to("cpu"), expected_logits)
 
-    _run_test_with_warmup(_test_runner, max_sync_s=0.3)
+    run_test_with_warmup(_test_runner, max_sync_s=0.3)
 
 
 class TestFinishReasons:
@@ -852,7 +794,7 @@ class TestFinishReasons:
             ]
         )
 
-        _run_test_with_warmup(uut_provider, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider, max_sync_s=0.5)
 
     @classmethod
     def test_are_stop_words_isnt_called_when_no_stop_words(cls, monkeypatch: pytest.MonkeyPatch):
@@ -879,13 +821,13 @@ class TestFinishReasons:
             ],
             extra_context=lambda: raising_stop_words_ctx(True),
         )
-        _run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 
         uut_provider_without_stop_words = cls.RequestCase.build(
             [cls.RequestCase(prompt=[1], new_tokens=[4], finish_reasons=[cls.NOT_FINISHED])],
             extra_context=lambda: raising_stop_words_ctx(False),
         )
-        _run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
+        run_test_with_warmup(uut_provider_without_stop_words, max_sync_s=0.5)
 
 
 class TestBatchedSampling:
@@ -1224,24 +1166,6 @@ class TestBatchedSampling:
             )
         )
 
-    @staticmethod
-    def _init_store_for_new_requests(
-        sampler: TorchSampler,
-        scheduled_requests: ScheduledRequests,
-    ) -> None:
-        """Initialize store for request slots that haven't been through setup_sampler_step.
-
-        In production, setup_sampler_step registers each new request's slot in
-        store.slots_needing_recompute so that _group_requests_by_strategy_key
-        knows to compute its strategy.  Tests skip setup_sampler_step, so we
-        replicate the relevant initialization here to exercise the same code
-        path as production.
-        """
-        for req in scheduled_requests.all_requests():
-            slot = req.py_seq_slot
-            if sampler.store.strategies[slot] is None:
-                sampler.store.slots_needing_recompute.add(slot)
-
     def _sample(
         self,
         sampler: TorchSampler,
@@ -1250,15 +1174,13 @@ class TestBatchedSampling:
         *,
         num_repeats: Optional[int] = None,
         allow_sync: bool = True,
+        monkeypatch: pytest.MonkeyPatch,
     ) -> torch.Tensor:
         """Call sample_async.
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
         assert not scheduled_requests.context_requests
-        # Simulate the store initialization that setup_sampler_step performs
-        # for new requests in production.
-        self._init_store_for_new_requests(sampler, scheduled_requests)
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")
@@ -1277,17 +1199,26 @@ class TestBatchedSampling:
                 is_first = False
                 return func()
 
-        sample_states = [
-            maybe_check_no_sync(
-                lambda: sampler.sample_async(
-                    scheduled_requests,
-                    model_outputs=model_outputs,
-                    num_context_logits_prefix_sum=[0],
-                    resource_manager=None,  #  only used for tree sampling, which is not tested here
+        with monkeypatch.context() as patcher:
+            # Ensure that internal sampler data structures are set up for all requests
+            # (production code only considers context requests and examines other not mocked
+            # LlmRequest fields)
+            def _mock_filter(self, requests: ScheduledRequests) -> list[LlmRequest]:
+                return requests.all_requests()
+
+            patcher.setattr(TorchSampler, "_filter_new_requests", _mock_filter)
+
+            sample_states = [
+                maybe_check_no_sync(
+                    lambda: sampler.sample_async(
+                        scheduled_requests,
+                        model_outputs=model_outputs,
+                        num_context_logits_prefix_sum=[0],
+                        resource_manager=None,  #  only used for tree sampling, which is not tested here
+                    )
                 )
-            )
-            for _ in range(num_actual_repeats)
-        ]
+                for _ in range(num_actual_repeats)
+            ]
         new_tokens_tensors = []
         for sample_state in sample_states:
             assert sample_state.sampler_event is not None
@@ -1364,6 +1295,7 @@ class TestBatchedSampling:
         allow_zero_draft_len: bool,  # used by fixtures
         sampling_params_list: list[SamplingParams],
         seq_slot_assignment: tuple[list[int], int],
+        monkeypatch: pytest.MonkeyPatch,
     ):
         """Validate probabilities returned by sample_async.
 
@@ -1405,6 +1337,7 @@ class TestBatchedSampling:
                     scheduled_requests=uut_mock_requests,
                     model_outputs=model_outputs,
                     allow_sync=is_warmup,
+                    monkeypatch=monkeypatch,
                 )
 
             yield _uut
@@ -1532,7 +1465,7 @@ class TestBatchedSampling:
 
                 logit_offset += steps
 
-        _run_test_with_warmup(
+        run_test_with_warmup(
             _uut_provider,
             max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
         )
@@ -1547,6 +1480,7 @@ class TestBatchedSampling:
         vocab_size: int,
         max_draft_len: int,
         draft_lens: list[int],
+        monkeypatch: pytest.MonkeyPatch,
     ) -> ScheduledRequests:
         """Construct a batch of requests with given sampling params and invoke sampler to compute probs.
 
@@ -1591,6 +1525,7 @@ class TestBatchedSampling:
             sampler_with_probs,
             scheduled_requests=mock_requests_with_probs,
             model_outputs=model_outputs_with_probs,
+            monkeypatch=monkeypatch,
         )
         return mock_requests_with_probs
 
@@ -2121,6 +2056,7 @@ class TestBatchedSampling:
                 vocab_size=vocab_size,
                 max_draft_len=max_draft_len,
                 draft_lens=draft_lens,
+                monkeypatch=monkeypatch,
             )
 
             num_samples = 5000 if not (bypass_sampling or is_warmup) else 1
@@ -2154,6 +2090,7 @@ class TestBatchedSampling:
                         model_outputs=model_outputs,
                         num_repeats=num_samples,
                         allow_sync=is_warmup,
+                        monkeypatch=monkeypatch,
                     )
                     res.result = UutResult(new_tokens_repeats=new_tokens_repeats)
 
@@ -2247,7 +2184,7 @@ class TestBatchedSampling:
                         num_samples=num_samples,
                     )
 
-        _run_test_with_warmup(
+        run_test_with_warmup(
             _uut_provider,
             max_sync_s=None,  # NB: assert_no_cuda_sync called in TestBatchedSampler._sample
         )
@@ -2443,4 +2380,4 @@ class TestBatchedSampling:
                 torch.testing.assert_close(new_tokens_host[:steps, seq_slot], req_tokens.cpu())
                 input_offset += steps
 
-        _run_test_with_warmup(_uut_provider, max_sync_s=0.2)
+        run_test_with_warmup(_uut_provider, max_sync_s=0.2)

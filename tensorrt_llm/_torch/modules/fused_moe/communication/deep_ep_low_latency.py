@@ -37,11 +37,11 @@ class DeepEPLowLatency(Communication):
     DeepEP Low Latency strategy supporting both pre-quant and post-quant
     """
 
-    SUPPORTED_HIDDEN_SIZES = {2048, 2560, 3584, 4096, 5120, 6144, 7168}
-    """set[int]: Hidden sizes supported by the low-latency DeepEP kernel (SWITCH_HIDDEN in launch.cuh)."""
+    SUPPORTED_HIDDEN_SIZES: frozenset[int] = frozenset({2048, 2560, 3584, 4096, 5120, 6144, 7168})
+    """frozenset[int]: Hidden sizes supported by the low-latency DeepEP kernel (SWITCH_HIDDEN in launch.cuh)."""
 
-    SUPPORTED_HIDDEN_SIZES_EXTENSION = {4096, 6144, 7168}
-    """set[int]: Hidden sizes supported by extension kernels (nvfp4 post-quant/low-precision combine).
+    SUPPORTED_HIDDEN_SIZES_EXTENSION: frozenset[int] = frozenset({4096, 6144, 7168})
+    """frozenset[int]: Hidden sizes supported by extension kernels (nvfp4 post-quant/low-precision combine).
 
     Sourced from SWITCH_HIDDEN_FOR_EXTENSION_KERNELS in extension_kernels.cu.
     """

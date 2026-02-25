@@ -304,13 +304,15 @@ protected:
         bufferManagers.push_back(mCacheTransBufferManager.get());
         if (isSender)
         {
-            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mSender = std::make_unique<CacheSender>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
         else
         {
-            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), *mCacheState, mlocalRank,
-                createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false));
+            mRequester = std::make_unique<CacheReceiver>(mConnectionManager.get(), mlocalRank,
+                CacheTransferLayer(
+                    *mCacheState, createCacheFormatter(mManager.get(), bufferManagers, /*isMLA=*/false)));
         }
     }
 
@@ -786,12 +788,12 @@ protected:
             if (mIsContext)
             {
                 mSender = std::make_unique<CacheSender>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             else
             {
                 mRequester = std::make_unique<CacheReceiver>(
-                    mConnectionManager.get(), *mCacheState, mRankInInstance, makeFormatter());
+                    mConnectionManager.get(), mRankInInstance, CacheTransferLayer(*mCacheState, makeFormatter()));
             }
             TLLM_LOG_DEBUG("setUpCacheTransceiver mSender");
 
@@ -1606,8 +1608,8 @@ TEST_P(UnexpectedTerminationRaceTest, UnexpectedTerminationRaceTest)
     if (mIsContext || mIsGeneration)
     {
         bool enableDP = mIsContext ? contextDP : generationDP;
-        setUpCacheManager(
-            numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP, isWindow);
+        setUpCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, dataType, kvFactor, isMLA, enableDP,
+            isWindow, isIndexerKCache, indexerDimPerHead, indexerKCacheQuantBlockSize);
         setUpCacheTransceiver();
         std::vector<std::shared_ptr<WrappedLlmRequest>> requests;
         int requestId = 0;
@@ -1849,6 +1851,63 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*generationDP*/ testing::Values(false),
         /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
 
+// Tests high context PP with TP and CP variations on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1, 2),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests high context PP with PP and CP on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(2),
+        /*genCp*/ testing::Values(2),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
+// Tests high context PP with pure CP on gen side with uneven layer distribution.
+INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
+    testing::Combine(/*contextTp*/ testing::Values(1),
+        /*contextPp*/ testing::Values(1, 2, 4),
+        /*contextCp*/ testing::Values(1),
+        /*genTp*/ testing::Values(1),
+        /*genPp*/ testing::Values(1),
+        /*genCp*/ testing::Values(4),
+        /*numLayers*/ testing::Values(5, 6, 7),
+        /*numHeads*/ testing::Values(1),
+        /*sizePerHead*/ testing::Values(4),
+        /*tokensPerBlock*/ testing::Values(8),
+        /*dataType*/ testing::Values(nvinfer1::DataType::kFLOAT, nvinfer1::DataType::kINT8),
+        /*kvFactor*/ testing::Values(1),
+        /*isMLA*/ testing::Values(true),
+        /*contextDP*/ testing::Values(false),
+        /*generationDP*/ testing::Values(false),
+        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheTestWithDP,
     testing::Combine(/*contextTp*/ testing::Values(1, 2),
@@ -2014,7 +2073,7 @@ TEST(targetTest, CacheStateNODP)
             sharedModelConfig, genWC, genAttentionLayerNumPerPP, dataType, attentionType, kvFactor);
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2313,7 +2372,7 @@ TEST(targetTest, CacheStateContextDP)
             genEnableDP, generationDPRank, genTP};
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(genCache, contextCache, contextRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(genCache, contextCache, contextRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);
@@ -2420,7 +2479,7 @@ TEST(targetTest, CacheStateContextDP)
             genEnableDP, generationDPRank, genTP};
 
         auto const contextTargetInfo
-            = tensorrt_llm::executor::kv_cache::TargetRanksInfoForDP(contextCache, genCache, generationRank);
+            = tensorrt_llm::executor::kv_cache::targetIRanks(contextCache, genCache, generationRank);
 
         EXPECT_EQ(expectRanks, contextTargetInfo.mIRanks);
         EXPECT_EQ(expectPPDomain, contextTargetInfo.mDomainPPSize);

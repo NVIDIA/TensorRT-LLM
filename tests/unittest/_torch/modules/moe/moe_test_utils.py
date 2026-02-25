@@ -38,10 +38,12 @@ import pytest
 import torch
 
 from tensorrt_llm._torch.autotuner import AutoTuner
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cute_dsl import CuteDslFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_cutlass import CutlassFusedMoE
+from tensorrt_llm._torch.modules.fused_moe import (
+    CuteDslFusedMoE,
+    CutlassFusedMoE,
+    TRTLLMGenFusedMoE,
+)
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
-from tensorrt_llm._torch.modules.fused_moe.fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
@@ -353,6 +355,44 @@ def should_skip_cutedsl(
     return None
 
 
+def should_skip_cutlass(
+    backend_type: MoeBackendType,
+    comm_method: Optional[str] = None,
+    quant_algo: Optional[QuantAlgo] = None,
+    model_config: "MoeModelConfig" = None,
+) -> Optional[str]:
+    """
+    Check CUTLASS backend specific constraints for multi-GPU tests.
+
+    Returns:
+        Skip reason string if test should be skipped, None otherwise
+    """
+    if backend_type != MoeBackendType.CUTLASS:
+        return None
+
+    # Issue: CUTLASS + DeepEP + (W4A8_MXFP4_MXFP8 or W8A16) has significant accuracy
+    # issues in multi-GPU EP mode. Observed failures:
+    #   - e32_k8_h7168_i2048, seq=8: mismatch 24-37% (rtol=0.15)
+    #   - e8_k1_h512_i512, seq=1/8:  mismatch 86-100% (rtol=0.10), results completely wrong
+    # NVLINK communication with the same configs passes.
+    # Root cause: likely data layout or all-to-all dispatch/combine issue in the
+    # DeepEP communication path for these quantization methods.
+    if comm_method in ("DEEPEP", "DEEPEPLOWLATENCY"):
+        deepep_accuracy_quant_algos = {
+            QuantAlgo.W4A8_MXFP4_MXFP8,
+            QuantAlgo.W8A16,
+        }
+        if quant_algo in deepep_accuracy_quant_algos:
+            return (
+                f"[Potential Bug] CutlassFusedMoE {quant_algo} has significant accuracy "
+                f"issues with DeepEP communication (comm={comm_method}). "
+                f"Mismatch up to 100% on small models (e8_k1). "
+                f"NVLINK communication with the same config passes."
+            )
+
+    return None
+
+
 def should_skip_deepgemm(
     backend_type: MoeBackendType,
     comm_method: Optional[str] = None,
@@ -428,7 +468,7 @@ def should_skip_multi_gpu(
         return (
             f"num_experts={num_experts} is not divisible by ep_size={ep_size} "
             f"in {parallel_mode} mode. Requires EPLB to handle non-uniform "
-            f"expert partitioning (tested separately in test_ConfigurableMoE_multi_gpu_eplb)."
+            f"expert partitioning (tested separately in test_configurable_moe_multi_gpu_eplb)."
         )
 
     return None

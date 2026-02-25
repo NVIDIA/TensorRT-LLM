@@ -2,6 +2,8 @@ metadata:
   model_name: deepseek_r1_0528_fp8
   supported_gpus:
   - B200
+hardware:
+  gpus_per_node: 8
 server_configs:
   # 1k1k configs - TP8 with TRTLLM, MTP3
   - name: "r1_fp8_tp8_mtp3_1k1k"

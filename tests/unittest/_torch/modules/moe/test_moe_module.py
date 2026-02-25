@@ -30,6 +30,8 @@ import logging
 import os
 import pickle
 import sys
+import tempfile
+import traceback
 from contextlib import nullcontext
 from itertools import product
 from typing import List, Optional
@@ -43,9 +45,9 @@ from _torch.modules.moe.moe_test_utils import (
     create_test_param,
     get_quick_skip_reason,
     iter_base_test_configs,
-    module_timer,  # noqa: F401 - imported for pytest fixture registration
     replay_tactics_and_check,
     should_skip_cutedsl,
+    should_skip_cutlass,
     should_skip_deepgemm,
     should_skip_multi_gpu,
     should_skip_trtllm,
@@ -93,7 +95,7 @@ from tensorrt_llm.llmapi.llm_args import MoeLoadBalancerConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
-logger = logging.getLogger(__name__)
+G_LOGGER = logging.getLogger(__name__)
 
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 MPI.pickle.__init__(
@@ -231,7 +233,8 @@ def _run_autotune_test(
         run_all_tactics: If False, skip full tactic replay and only run simple accuracy check
     """
     # Autotune phase
-    with torch.inference_mode(), autotune(cache_path="/tmp/moe_module_autotuner_cache.json"):
+    cache_path = os.path.join(tempfile.gettempdir(), "moe_module_autotuner_cache.json")
+    with torch.inference_mode(), autotune(cache_path=cache_path):
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
@@ -383,8 +386,6 @@ def _test_moe_worker(
         swiglu_beta: SwiGLU beta parameter (default=0, non-gptoss)
         swiglu_limit: SwiGLU limit parameter (default=inf, non-gptoss)
     """
-    import traceback
-
     try:
         _test_moe_worker_impl(
             moe_backend=moe_backend,
@@ -543,7 +544,7 @@ def _test_moe_worker_impl(
                 initial_expert_ids = copy.deepcopy(
                     moe_load_balancer.single_layer_load_balancers[0].get_old_rank_expert_ids()
                 )
-                logger.info(f"[EPLB Debug] Initial expert_ids (after init): {initial_expert_ids}")
+                G_LOGGER.info(f"[EPLB Debug] Initial expert_ids (after init): {initial_expert_ids}")
 
             # Create reference module
             ref_fused_moe = quantize_util.create_ref_module(routing_method)
@@ -702,11 +703,11 @@ DTYPES = [
 # Model configurations for testing
 # (num_experts, top_k, hidden_size, intermediate_size)
 #
-# Default runs the full local config matrix (TRTLLM_TEST_MOE_CI=0).
-# Set TRTLLM_TEST_MOE_CI=1 in CI to run only the smaller subset for speed.
+# Default runs the CI subset (TRTLLM_TEST_MOE_CI=1).
+# Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
 CI_MOE_MODEL_CONFIGS = [
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
-    MoeModelConfig(32, 8, 7168, 2048),  # DeepSeek-V3 (reduced from 256 experts to accelerate test)
+    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
 ]
@@ -725,7 +726,7 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
 
 MOE_MODEL_CONFIGS = (
     CI_MOE_MODEL_CONFIGS
-    if os.environ.get("TRTLLM_TEST_MOE_CI", "0") == "1"
+    if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1"
     else LOCAL_MOE_MODEL_CONFIGS
 )
 
@@ -773,14 +774,21 @@ SWIGLU_ALPHAS = [1, 1.702]  # default, GPT-OSS (modeling_gpt_oss.py)
 SWIGLU_BETAS = [0, 1.0]  # default, GPT-OSS
 SWIGLU_LIMITS = [float("inf"), 7.0]  # default, GPT-OSS
 
-# Single-GPU: full product of all SwiGLU combos
-SWIGLU_COMBOS = list(product(SWIGLU_ALPHAS, SWIGLU_BETAS, SWIGLU_LIMITS))
+# Full product of all SwiGLU combos (local exhaustive testing only)
+LOCAL_SWIGLU_COMBOS = list(product(SWIGLU_ALPHAS, SWIGLU_BETAS, SWIGLU_LIMITS))
 
-# Multi-GPU: only non-gptoss (default) and one gptoss combo
-MULTI_GPU_SWIGLU_COMBOS = [
+# CI / Multi-GPU: only non-gptoss (default) and one gptoss combo
+# All non-default combos trigger the same swiglu_gptoss_style=True code path;
+# different alpha/beta/limit values are just kernel parameters, not code branches.
+CI_SWIGLU_COMBOS = [
     (1, 0, float("inf")),  # non-gptoss (default SwiGLU)
     (1.702, 1.0, 7.0),  # gptoss style (GPT-OSS real values)
 ]
+
+# Default runs CI subset. Set TRTLLM_TEST_MOE_CI=0 for full local matrix.
+SWIGLU_COMBOS = (
+    CI_SWIGLU_COMBOS if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1" else LOCAL_SWIGLU_COMBOS
+)
 
 
 def _get_comm_method_skip_reason(
@@ -831,7 +839,7 @@ def generate_multi_gpu_test_params(
         routing_methods: List of routing method classes
 
     Returns:
-        List of pytest.param objects with appropriate skip marks
+        List of pytest.param objects for runnable test configurations only
     """
     params: List = []
     for parallel_mode, comm_method in product(parallel_modes, comm_methods):
@@ -856,23 +864,28 @@ def generate_multi_gpu_test_params(
             quant_algos,
             routing_methods,
         ):
-            # Check multi-GPU specific skip conditions
+            # Check multi-GPU specific skip conditions (short-circuit on first match)
             if not skip_reason:
-                skip_reason = _get_comm_method_skip_reason(comm_method, model_config)
-            if not skip_reason:
-                skip_reason = should_skip_trtllm(
-                    backend_type, quant_algo, model_config, comm_method=comm_method
-                )
-            if not skip_reason:
-                skip_reason = should_skip_cutedsl(
-                    backend_type, quant_algo, model_config, comm_method
-                )
-            if not skip_reason:
-                skip_reason = should_skip_deepgemm(
-                    backend_type, comm_method, quant_algo=quant_algo, model_config=model_config
-                )
-            if not skip_reason:
-                skip_reason = should_skip_multi_gpu(parallel_mode, model_config, world_size=4)
+                for reason in (
+                    _get_comm_method_skip_reason(comm_method, model_config),
+                    should_skip_trtllm(
+                        backend_type, quant_algo, model_config, comm_method=comm_method
+                    ),
+                    should_skip_cutlass(
+                        backend_type, comm_method, quant_algo=quant_algo, model_config=model_config
+                    ),
+                    should_skip_cutedsl(backend_type, quant_algo, model_config, comm_method),
+                    should_skip_deepgemm(
+                        backend_type, comm_method, quant_algo=quant_algo, model_config=model_config
+                    ),
+                    should_skip_multi_gpu(parallel_mode, model_config, world_size=4),
+                ):
+                    if reason:
+                        skip_reason = reason
+                        break
+
+            if skip_reason:
+                continue
 
             test_id = f"parallel={parallel_mode}-comm={comm_method}-{base_test_id}"
             param_values = (
@@ -888,7 +901,7 @@ def generate_multi_gpu_test_params(
                 swiglu_beta,
                 swiglu_limit,
             )
-            params.append(create_test_param(param_values, test_id, skip_reason))
+            params.append(create_test_param(param_values, test_id))
 
     return params
 
@@ -909,7 +922,7 @@ def generate_base_test_params(
         routing_methods: List of routing method classes
 
     Returns:
-        List of pytest.param objects with appropriate skip marks
+        List of pytest.param objects for runnable test configurations only
     """
     params: List = []
     for (
@@ -927,6 +940,8 @@ def generate_base_test_params(
     ) in iter_base_test_configs(
         swiglu_combos, model_configs, seq_lens, dtypes, backend_types, quant_algos, routing_methods
     ):
+        if skip_reason:
+            continue
         param_values = (
             dtype,
             backend_type.value,
@@ -938,7 +953,7 @@ def generate_base_test_params(
             swiglu_beta,
             swiglu_limit,
         )
-        params.append(create_test_param(param_values, base_test_id, skip_reason))
+        params.append(create_test_param(param_values, base_test_id))
 
     return params
 
@@ -964,7 +979,7 @@ BASE_TEST_PARAMS = generate_base_test_params(
     "swiglu_alpha,swiglu_beta,swiglu_limit",
     BASE_TEST_PARAMS,
 )
-def test_ConfigurableMoE_single_gpu(
+def test_configurable_moe_single_gpu(
     dtype: torch.dtype,
     moe_backend: str,
     quant_algo: Optional[QuantAlgo],
@@ -1015,7 +1030,7 @@ def test_ConfigurableMoE_single_gpu(
 MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     parallel_modes=PARALLEL_MODES,
     comm_methods=COMM_METHODS,
-    swiglu_combos=MULTI_GPU_SWIGLU_COMBOS,
+    swiglu_combos=SWIGLU_COMBOS,
     model_configs=MOE_MODEL_CONFIGS,
     seq_lens=SEQ_LENS,
     dtypes=DTYPES,
@@ -1032,7 +1047,7 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
     MULTI_GPU_TEST_PARAMS,
 )
-def test_ConfigurableMoE_multi_gpu(
+def test_configurable_moe_multi_gpu(
     parallel_mode,
     comm_method_type,
     dtype,
@@ -1202,7 +1217,7 @@ def generate_eplb_test_params(
         routing_methods: List of routing method classes
 
     Returns:
-        List of pytest.param objects with appropriate skip marks
+        List of pytest.param objects for runnable test configurations only
     """
     params: List = []
 
@@ -1236,6 +1251,9 @@ def generate_eplb_test_params(
                 quant_algo, backend_type, num_slots, model_config.num_experts
             )
 
+        if skip_reason:
+            continue
+
         routing_name = routing_method_cls.__name__.replace("MoeRoutingMethod", "")
         test_id = (
             f"parallel={parallel_mode}-comm={comm_method}-{model_config}-slots={num_slots}-"
@@ -1252,7 +1270,7 @@ def generate_eplb_test_params(
             num_slots,
             routing_method_cls,
         )
-        params.append(create_test_param(param_values, test_id, skip_reason))
+        params.append(create_test_param(param_values, test_id))
 
     return params
 
@@ -1280,7 +1298,7 @@ EPLB_TEST_PARAMS = generate_eplb_test_params(
     "parallel_mode,comm_method_type,dtype,moe_backend,quant_algo,model_config,num_slots,routing_method_cls",
     EPLB_TEST_PARAMS,
 )
-def test_ConfigurableMoE_multi_gpu_eplb(
+def test_configurable_moe_multi_gpu_eplb(
     parallel_mode,
     comm_method_type,
     dtype,

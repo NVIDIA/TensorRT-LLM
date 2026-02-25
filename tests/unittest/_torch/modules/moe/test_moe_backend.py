@@ -28,6 +28,7 @@ Design Goals:
 
 import itertools
 import logging
+import os
 from typing import List, Optional
 
 import pytest
@@ -38,7 +39,6 @@ from _torch.modules.moe.moe_test_utils import (
     create_test_param,
     get_backend_class,
     iter_base_test_configs,
-    module_timer,  # noqa: F401 - imported for pytest fixture registration
     replay_tactics_and_check,
     supports_autotuner_capture,
 )
@@ -222,16 +222,21 @@ DTYPES_TO_TEST = [
 ]
 
 # Format: (num_experts, top_k, hidden_size, intermediate_size)
-MOE_MODEL_CONFIGS = [
-    # === Real Model Configs ===
-    MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
-    MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
+#
+# Default runs the CI subset (TRTLLM_TEST_MOE_CI=1).
+# Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
+CI_MOE_MODEL_CONFIGS = [
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
     MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
-    MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
+    MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
+]
+
+LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
+    MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
+    MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
+    MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
     # === Boundary Tests: num_experts / top_k ===
-    MoeModelConfig(8, 1, 512, 512),  # top_k=1, single expert activated
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
     MoeModelConfig(7, 2, 256, 512),  # prime num_experts
     MoeModelConfig(13, 3, 256, 512),  # prime num_experts, odd top_k
@@ -239,6 +244,12 @@ MOE_MODEL_CONFIGS = [
     MoeModelConfig(4, 2, 64, 128),  # very small hidden_size
     MoeModelConfig(4, 2, 128, 64),  # intermediate < hidden
 ]
+
+MOE_MODEL_CONFIGS = (
+    CI_MOE_MODEL_CONFIGS
+    if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1"
+    else LOCAL_MOE_MODEL_CONFIGS
+)
 
 # Sequence lengths to test
 SEQ_LENS_TO_TEST = [1, 8]
@@ -248,20 +259,32 @@ SWIGLU_ALPHAS = [1, 1.702]  # default, GPT-OSS (modeling_gpt_oss.py)
 SWIGLU_BETAS = [0, 1.0]  # default, GPT-OSS
 SWIGLU_LIMITS = [float("inf"), 7.0]  # default, GPT-OSS
 
+# Full product of all SwiGLU combos (local exhaustive testing only)
+LOCAL_SWIGLU_COMBOS = list(itertools.product(SWIGLU_ALPHAS, SWIGLU_BETAS, SWIGLU_LIMITS))
+
+# CI: only non-gptoss (default) and one gptoss combo
+# All non-default combos trigger the same swiglu_gptoss_style=True code path;
+# different alpha/beta/limit values are just kernel parameters, not code branches.
+CI_SWIGLU_COMBOS = [
+    (1, 0, float("inf")),  # non-gptoss (default SwiGLU)
+    (1.702, 1.0, 7.0),  # gptoss style (GPT-OSS real values)
+]
+
+SWIGLU_COMBOS = (
+    CI_SWIGLU_COMBOS if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1" else LOCAL_SWIGLU_COMBOS
+)
+
 
 def generate_test_params() -> List:
     """
-    Generate all test parameter combinations with skip marks for invalid combinations.
+    Generate test parameter combinations, filtering out unsupported configurations.
 
-    This function pre-computes skip decisions at collection time using static rules,
-    avoiding the overhead of entering test functions and calling can_implement().
-    This significantly speeds up test collection and skip execution.
+    Unsupported combinations (those with a skip_reason from get_quick_skip_reason)
+    are excluded entirely so they never appear in pytest collection output.
 
     Returns:
-        List of pytest.param objects with appropriate skip marks
+        List of pytest.param objects for runnable test configurations only
     """
-    swiglu_combos = list(itertools.product(SWIGLU_ALPHAS, SWIGLU_BETAS, SWIGLU_LIMITS))
-
     params: List = []
     for (
         swiglu_alpha,
@@ -276,13 +299,15 @@ def generate_test_params() -> List:
         skip_reason,
         test_id,
     ) in iter_base_test_configs(
-        swiglu_combos,
+        SWIGLU_COMBOS,
         MOE_MODEL_CONFIGS,
         SEQ_LENS_TO_TEST,
         DTYPES_TO_TEST,
         BACKEND_TYPES_TO_TEST,
         QUANT_ALGOS_TO_TEST,
     ):
+        if skip_reason:
+            continue
         param_values = (
             dtype,
             backend_type,
@@ -294,7 +319,7 @@ def generate_test_params() -> List:
             swiglu_beta,
             swiglu_limit,
         )
-        params.append(create_test_param(param_values, test_id, skip_reason))
+        params.append(create_test_param(param_values, test_id))
 
     return params
 

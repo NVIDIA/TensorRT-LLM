@@ -132,13 +132,18 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
-    def test_chunked_prefill(self, attn_backend):
+    # NB: Because greedy sampling is handled via a "fast path", a small non-zero
+    #     temperature is required to also cover the regular (batched) sampling code.
+    @parametrize_with_ids("use_temperature", [False, True])
+    def test_chunked_prefill(self, attn_backend, use_temperature: bool):
         with LLM(self.MODEL_PATH,
                  attn_backend=attn_backend,
                  enable_chunked_prefill=True,
                  max_num_tokens=512) as llm:
             task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm)
+            task.evaluate(llm,
+                          sampling_params=(SamplingParams(
+                              temperature=0.001) if use_temperature else None))
 
     @pytest.mark.skip_less_device_memory(32000)
     def test_dummy_load_format(self):
@@ -335,7 +340,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM"])
-    def test_nvfp4_kv(self, attn_backend, torch_compile):
+    @parametrize_with_ids("v2_kv_cache", [True, False])
+    def test_nvfp4_kv(self, attn_backend, torch_compile, v2_kv_cache):
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             torch_compile_config=torch_compile_config,
@@ -344,7 +350,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             attn_backend=attn_backend,
             disable_overlap_scheduler=torch_compile,
         )
-        pytorch_config["kv_cache_config"] = KvCacheConfig(dtype="nvfp4")
+        pytorch_config["kv_cache_config"] = KvCacheConfig(
+            dtype="nvfp4", use_kv_cache_manager_v2=v2_kv_cache)
         with LLM(f"{llm_models_root()}/Llama-3_1-8B-Instruct_fp8_kv_nvfp4",
                  **pytorch_config) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
@@ -3976,10 +3983,7 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @pytest.mark.parametrize(
-        "moe_backend",
-        ["CUTLASS",
-         pytest.param("TRITON", marks=skip_no_hopper), "TRTLLM"])
+    @pytest.mark.parametrize("moe_backend", ["CUTLASS", "TRTLLM"])
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
             (1, 1, 1, False, True, True),
@@ -4035,11 +4039,15 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
 
-    @skip_pre_blackwell
+    @pytest.mark.parametrize("moe_backend", [
+        pytest.param("TRITON", marks=skip_no_hopper),
+        pytest.param("TRTLLM", marks=skip_pre_blackwell)
+    ])
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,moe_backend",
-        [(1, 1, 1, False, True, True, "TRTLLM")],
-        ids=["latency-TRTLLM"])
+        "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler", [
+            (1, 1, 1, False, True, True),
+        ],
+        ids=["latency"])
     def test_w4a16_mxfp4(self, tp_size, pp_size, ep_size, attention_dp,
                          cuda_graph, overlap_scheduler, moe_backend):
         pytorch_config = dict(
