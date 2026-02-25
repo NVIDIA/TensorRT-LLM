@@ -868,6 +868,7 @@ class SequenceInfo:
         """
         with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
             # Convert to tensor at the boundary (numpy is ~2-3x faster than torch.tensor for large lists)
+            # TODO: move this to self._input_buffer.store() when _args_list get deprecated
             if not isinstance(data, torch.Tensor):
                 _, dtype = self._input_buffer._tensor_specs[name]
                 data = _list_to_tensor(data, dtype)
@@ -1031,14 +1032,10 @@ class SequenceInfo:
             self._store_arg("page_seq_indices", page_seq_indices_t)
             self._store_arg("page_in_seq", page_in_seq_t)
 
-            if cu_num_pages is None:
-                cu_num_pages = cu_pages.tolist()
-
-        # update cumulative number of pages
         if cu_num_pages is None:
-            pages_per_seq = self.pages_per_seq
-            cu_num_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
-            cu_num_pages[1:] = torch.cumsum(torch.tensor(pages_per_seq), dim=0)
+            pps_t = self._args_list["pages_per_seq"]
+            cu_num_pages = torch.zeros(len(pps_t) + 1, dtype=torch.int)
+            cu_num_pages[1:] = pps_t.cumsum(0)
             cu_num_pages = cu_num_pages.tolist()
         self._store_arg("cu_num_pages", cu_num_pages)
 
