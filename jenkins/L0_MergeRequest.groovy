@@ -18,7 +18,7 @@ withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LL
 
 @Field String BOT_REPO = ""
 withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
-    BOT_REPO = "${DEFAULT_GIT_URL}/ftp/llm-bloom-bot.git"
+    BOT_REPO = "https://${DEFAULT_GIT_URL}/ftp/llm-bloom-bot.git"
 }
 @Field String BOT_REVISION = "master"
 @Field String BOT_ROOT = "bot"
