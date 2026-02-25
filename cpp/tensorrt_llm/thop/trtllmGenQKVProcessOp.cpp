@@ -188,7 +188,7 @@ void qkvProcessing(
         auto const kvElemBits = getKvCacheElemSizeInBits<T>(kvQuantMode);
         auto const sizePerToken = static_cast<int32_t>(kv_head_num * size_per_head * kvElemBits / 8);
 
-        QKVPreprocessingParams<T, KVCacheBuffer> params;
+        QKVPreprocessingParams<T, KVCacheBuffer> params{};
 
         params.qkv_input = static_cast<T*>(qkv_input.data_ptr());
         params.cross_kv_input = getDataPtrOrNull<T>(cross_kv_input);
