@@ -420,6 +420,27 @@ def parallel_build(model_config: PretrainedConfig,
 
 
 def main():
+    import warnings
+    warnings.warn(
+        "\n"
+        "=" * 70 + "\n"
+        "DEPRECATION WARNING: trtllm-build\n"
+        "=" * 70 + "\n"
+        "trtllm-build is part of the legacy TensorRT engine-build workflow,\n"
+        "which is deprecated and will be removed in a future release.\n\n"
+        "For new projects, use the PyTorch backend instead:\n\n"
+        "  # Serve a model (recommended):\n"
+        "  trtllm-serve <model_name_or_path>\n\n"
+        "  # Python API:\n"
+        "  from tensorrt_llm import LLM\n"
+        "  llm = LLM(model='<model_name_or_path>')\n"
+        "  output = llm.generate(['Hello, how are you?'])\n\n"
+        "Documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html\n"
+        "=" * 70 + "\n",
+        FutureWarning,
+        stacklevel=2,
+    )
+
     parser = parse_arguments()
     args = parser.parse_args()
 
