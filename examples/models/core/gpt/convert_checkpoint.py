@@ -17,6 +17,7 @@ from tensorrt_llm.models.gpt.convert import (UnpackedNemoCheckpointDir,
                                              update_tokenizer_paths)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
+from examples._deprecation import emit_engine_arch_deprecation
 
 
 def parse_arguments():
@@ -317,6 +318,7 @@ def main():
     # which is included in tensorrt_llm Python package. Otherwise, the convert
     # script does not need to import tensorrt_llm. Will remove it after reimplementing
     # the op with PyTorch.
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
 

@@ -17,6 +17,7 @@ from tensorrt_llm.models.gemma.model import GemmaForCausalLM
 from tensorrt_llm.models.modeling_utils import (QuantConfig, save_checkpoint,
                                                 save_config)
 from tensorrt_llm.quantization import QuantAlgo
+from examples._deprecation import emit_engine_arch_deprecation
 
 
 class CheckpointType(str, Enum):
@@ -197,6 +198,7 @@ def create_quant_config(args: argparse.Namespace) -> QuantConfig:
 
 
 def main() -> None:
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     args = parse_arguments()
     tik = time.time()
     quant_config = create_quant_config(args)
