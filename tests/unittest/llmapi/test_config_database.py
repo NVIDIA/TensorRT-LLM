@@ -216,6 +216,6 @@ def test_database_yaml_config_serve_cli(config_path: Path):
         mock.patch("tensorrt_llm.commands.serve.OpenAIServer", _MockOpenAIServer),
     ):
         serve_main(args=_serve_cli_args(config_path), standalone_mode=False)
-        mock_pytorch_llm.assert_called_once()
+    mock_pytorch_llm.assert_called_once()
     call_kwargs = mock_pytorch_llm.call_args[1]
     llm_args_module.TorchLlmArgs(**call_kwargs)
