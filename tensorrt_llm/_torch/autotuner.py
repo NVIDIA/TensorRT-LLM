@@ -713,7 +713,6 @@ class AutoTuner:
         stream_delay_micro_secs (int): Delay on CUDA stream before the profiled kernel runs in microseconds (default: 1000)
     """
     _CUDA_GRAPH_DELAY_MICRO_SECS = 100
-    _NS_PER_MS = 1e6
     _instance = None
 
     def __init__(self, warmup=2, repeat=10, stream_delay_micro_secs=1000):
@@ -1182,7 +1181,7 @@ class AutoTuner:
                 def elapsed_time():
                     # GPU %globaltimer counts in nanoseconds,
                     # Torch.cuda.Event.elapsed_time() returns ms
-                    return (end_ts.item() - start_ts.item()) / self._NS_PER_MS
+                    return (end_ts.item() - start_ts.item()) / 1e6
             else:
                 start_evt = torch.cuda.Event(enable_timing=True)
                 end_evt = torch.cuda.Event(enable_timing=True)
