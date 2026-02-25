@@ -53,7 +53,7 @@ def session_lifecycle():
     JobTracker.record_pid()
 
     session_tracker.start()
-    
+
     try:
         yield
     finally:

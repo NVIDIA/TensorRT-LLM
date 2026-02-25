@@ -273,12 +273,12 @@ class JobManager:
     @staticmethod
     def upload_artifacts(final_dir: str):
         """Upload artifacts to Artifactory as both directory and tar.gz archive.
-        
+
         Can be disabled by setting ENABLE_ARTIFACT_UPLOAD=false environment variable.
-        
+
         Args:
             final_dir: Local directory path to upload
-            
+
         Returns:
             bool: True if successful, False otherwise
         """
@@ -288,7 +288,7 @@ class JobManager:
             if enable_upload in ("false", "0", "no", "off"):
                 logger.info("Artifact upload disabled (ENABLE_ARTIFACT_UPLOAD=false)")
                 return False
-            
+
             # Get environment configuration
             artifacts_user = EnvManager.get_artifacts_user()
             artifacts_token = EnvManager.get_artifacts_token()
@@ -297,64 +297,71 @@ class JobManager:
             gpu = EnvManager.get_gpu_type()
             trtllm_branch = EnvManager.get_trtllm_branch()
             repo_url = "https://artifactory.nvidia.com/artifactory"
-            
+
             # Validate required environment variables
             if not artifacts_user or not artifacts_token:
                 logger.warning("Artifactory credentials not configured, skipping upload")
-                logger.info(f"Set ARTIFACTORY_USER and ARTIFACTORY_TOKEN to enable upload")
+                logger.info("Set ARTIFACTORY_USER and ARTIFACTORY_TOKEN to enable upload")
                 return False
-            
+
             if not pipeline_id:
                 logger.warning("PIPELINE_ID not set, skipping upload")
                 return False
 
             from utils.artifactory_uploader import ArtifactoryUploader
-            artifactory_uploader = ArtifactoryUploader(repo_url, repo_name, artifacts_user, artifacts_token)
-            
+
+            artifactory_uploader = ArtifactoryUploader(
+                repo_url, repo_name, artifacts_user, artifacts_token
+            )
+
             # Get directory name and remote paths
             dir_name = os.path.basename(final_dir)
             # Replace '/' in branch name with '-' to avoid directory path issues
-            branch_safe = trtllm_branch.replace('/', '-')
+            branch_safe = trtllm_branch.replace("/", "-")
             remote_base = f"trtllm/disagg_test/{gpu}_{branch_safe}/{pipeline_id}/tests"
             remote_dir_path = f"{remote_base}/{dir_name}"
-            
+
             # Upload 1: Upload directory structure
             logger.info(f"Uploading directory to Artifactory: {remote_dir_path}")
             dir_result = artifactory_uploader.upload_directory(final_dir, remote_dir_path)
-            
+
             dir_success = False
-            if isinstance(dir_result, dict) and dir_result['success'] > 0:
+            if isinstance(dir_result, dict) and dir_result["success"] > 0:
                 dir_success = True
-                logger.success(f"Directory uploaded: {dir_result['success']}/{dir_result['total']} files")
+                logger.success(
+                    f"Directory uploaded: {dir_result['success']}/{dir_result['total']} files"
+                )
             else:
-                logger.error(f"Failed to upload directory")
-            
+                logger.error("Failed to upload directory")
+
             # Upload 2: Upload as tar.gz archive to parent directory
             logger.info(f"Creating and uploading tar.gz archive to: {remote_base}")
             archive_result = artifactory_uploader.upload_directory_as_archive(
                 local_dir=final_dir,
                 remote_path=remote_base,
                 archive_name=dir_name,
-                compression='gz'
+                compression="gz",
             )
-            
+
             if archive_result:
                 logger.success(f"Archive uploaded: {dir_name}.tar.gz")
             else:
-                logger.error(f"Failed to upload archive")
-            
+                logger.error("Failed to upload archive")
+
             # Show final locations
             if dir_success or archive_result:
-                logger.info(f"Artifactory locations:")
+                logger.info("Artifactory locations:")
                 if dir_success:
                     logger.info(f"  - Directory: {repo_url}/{repo_name}/{remote_dir_path}")
                 if archive_result:
-                    logger.info(f"  - Archive:   {repo_url}/{repo_name}/{remote_base}/{dir_name}.tar.gz")
+                    logger.info(
+                        f"  - Archive:   {repo_url}/{repo_name}/{remote_base}/{dir_name}.tar.gz"
+                    )
                 return True
             else:
-                logger.error(f"Both uploads failed")
+                logger.error("Both uploads failed")
                 return False
-                
+
         except Exception as e:
             logger.error(f"Failed to upload artifacts: {e}")
             return False
@@ -414,7 +421,7 @@ class JobManager:
                 logger.info(f"Cleaned up temporary config: {temp_config_path}")
             else:
                 logger.warning(f"Temporary config not found: {temp_config_path}")
-            
+
             # Upload artifacts to Artifactory (non-blocking, failures won't affect test result)
             try:
                 logger.info("Uploading artifacts to Artifactory...")
@@ -426,7 +433,7 @@ class JobManager:
             except Exception as upload_error:
                 logger.error(f"Exception during artifact upload (non-fatal): {upload_error}")
                 logger.info("Continuing with test completion despite upload failure")
-            
+
             return final_dir
 
         except Exception as e:

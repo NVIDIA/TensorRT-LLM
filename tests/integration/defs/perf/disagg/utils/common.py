@@ -221,7 +221,7 @@ class EnvManager:
     @staticmethod
     def get_cluster_llm_data() -> str:
         return os.getenv("CLUSTER_LLM_DATA", "")
-    
+
     @staticmethod
     def get_artifacts_user() -> str:
         return os.getenv("ARTIFACTORY_USER", "")
@@ -229,14 +229,15 @@ class EnvManager:
     @staticmethod
     def get_artifacts_token() -> str:
         return os.getenv("ARTIFACTORY_TOKEN", "")
-    
+
     @staticmethod
     def get_pipeline_id() -> str:
         return os.getenv("PIPELINE_ID", "")
-    
+
     @staticmethod
     def get_artifactory_repo_name() -> str:
         return os.getenv("ARTIFACTORY_REPO_NAME", "sw-tensorrt-llm-qa-generic-local")
+
 
 class InfoPrinter:
     """Print environment information for CI/CD and debugging."""
@@ -244,14 +245,14 @@ class InfoPrinter:
     @staticmethod
     def print(test_config=None):
         """Print environment information and optional reproduce command.
-        
+
         Args:
             test_config: TestConfig object containing test configuration information
         """
         from utils.logger import logger
 
         logger.info(f"TRT_LLM_REPO:      {EnvManager.get_trtllm_repo()}")
-        logger.info(f"TRT_LLM_BRANCH:    {EnvManager.get_trtllm_branch()}")   
+        logger.info(f"TRT_LLM_BRANCH:    {EnvManager.get_trtllm_branch()}")
         logger.info(f"TRT_LLM_VERSION:   {EnvManager.get_trtllm_version()}")
         logger.info(f"COMMIT_HASH:       {EnvManager.get_commit_hash()}")
         logger.info(f"COMMIT_TIME:       {EnvManager.get_commit_time()}")
@@ -263,10 +264,12 @@ class InfoPrinter:
         logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
         logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")
         logger.info(f"PIPELINE_ID:       {EnvManager.get_pipeline_id()}")
-        
+
         if test_config:
             config_path = test_config.config_path
-            relative_config_path = config_path[config_path.find('tests/integration/defs/perf/disagg/test_configs/'):]
+            relative_config_path = config_path[
+                config_path.find("tests/integration/defs/perf/disagg/test_configs/") :
+            ]
             reproduce_cmd = (
                 f"Reproduce Steps: cd [TensorRT-LLM] && "
                 f"python3 examples/disaggregated/slurm/benchmark/submit.py "
