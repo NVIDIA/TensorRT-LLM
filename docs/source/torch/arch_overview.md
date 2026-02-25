@@ -17,7 +17,7 @@ The `LLM` also manages the tokenization and detokenization processes of the inpu
 ## PyExecutor
 
 
-Similar to the TensorRT backend, which uses [Executor API](../advanced/executor.md), the PyTorch backend employs a `PyExecutor` class.
+Similar to the TensorRT backend, which uses [Executor API](../legacy/advanced/executor.md), the PyTorch backend employs a `PyExecutor` class.
 This class has a similar interface to Executor, allowing it to be integrated into LLM as an alternative backend.
 Key components of the `PyExecutor` include:
 

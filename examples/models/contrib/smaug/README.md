@@ -4,7 +4,7 @@ This document elaborates how to build the [Smaug-72B-v0.1](https://huggingface.c
 
 ## Overview
 
-The TensorRT LLM support for Smaug-72B-v0.1 is based on the LLaMA model, the implementation can be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py). Smaug model resembles LLaMA very much except it uses bias term in its attention module, we therefore reuse the [LLaMA example code](../../../llama) for Smaug,
+The TensorRT LLM support for Smaug-72B-v0.1 is based on the LLaMA model, the implementation can be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py). Smaug model resembles LLaMA very much except it uses bias term in its attention module, we therefore reuse the [LLaMA example code](../../core/llama) for Smaug,
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the LLaMA model into TensorRT LLM checkpoint format.
 
