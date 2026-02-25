@@ -507,44 +507,8 @@ class SequenceInfo:
         # HOST PREPARE FOR ATTENTION FORWARD #######################################################
         self._host_prepare_functions: List[Tuple[PrepareMetadataHostCallable, List[str]]] = []
 
-        # Padded num_tokens for piecewise CUDA graph bucket alignment.
-        # When set, _shape_for_forward uses this instead of total_num_tokens so that
-        # input tensors match the captured CUDA graph bucket size.
-        self._padded_num_tokens: Optional[int] = None
-
-        # Sorted list of piecewise CUDA graph bucket sizes.
-        # Populated during compilation; used at runtime to find nearest bucket.
-        self._piecewise_bucket_sizes: List[int] = []
-
         # call reset once to set a consistent initial state
         self.reset()
-
-    @property
-    def padded_num_tokens(self) -> Optional[int]:
-        """Return the padded num_tokens for piecewise CG bucket alignment, or None."""
-        return self._padded_num_tokens
-
-    @padded_num_tokens.setter
-    def padded_num_tokens(self, value: Optional[int]):
-        """Set the padded num_tokens for piecewise CG bucket alignment."""
-        self._padded_num_tokens = value
-
-    @property
-    def piecewise_bucket_sizes(self) -> List[int]:
-        """Return the sorted list of piecewise CG bucket sizes."""
-        return self._piecewise_bucket_sizes
-
-    @piecewise_bucket_sizes.setter
-    def piecewise_bucket_sizes(self, value: List[int]):
-        """Set the sorted piecewise CG bucket sizes."""
-        self._piecewise_bucket_sizes = sorted(value)
-
-    def find_nearest_piecewise_bucket(self, num_tokens: int) -> Optional[int]:
-        """Find smallest piecewise bucket >= num_tokens, or None."""
-        for bucket in self._piecewise_bucket_sizes:
-            if bucket >= num_tokens:
-                return bucket
-        return None
 
     @property
     def device(self) -> torch.device:
@@ -567,10 +531,7 @@ class SequenceInfo:
             sl = self.seq_len[0]
         # use [1,total_len] shape to indicate non-generate-only batch for cached attention
         else:
-            # Use padded size if set (for piecewise CG bucket alignment),
-            # otherwise use real total_num_tokens.
-            effective_num_tokens = self._padded_num_tokens or self.total_num_tokens
-            bs, sl = 1, effective_num_tokens
+            bs, sl = 1, self.total_num_tokens
 
         # truncate to effective tokens now, reshape, and return
         return tnsr[: bs * sl].view(bs, sl, *tnsr.shape[1:])

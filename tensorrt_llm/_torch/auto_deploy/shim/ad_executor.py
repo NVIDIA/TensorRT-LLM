@@ -800,19 +800,20 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
-        # Set padded_num_tokens for piecewise CG bucket alignment (prefill/mixed only).
-        # This makes _shape_for_forward return tensors sized to the bucket, while
-        # batch_info_host and other metadata stay unchanged for correct dynamic op behavior.
+        # Zero the tail of token-level device buffers beyond total_num_tokens.
+        # The piecewise CUDA graph runner's _prepare_replay_inputs has a data_ptr()
+        # fast path that skips copying and tail-zeroing when the runtime input shares
+        # the same underlying buffer as the captured static input (common for input_ids
+        # and position_ids which are views of InputBuffer). Without this zeroing, stale
+        # token IDs from previous iterations leak into the padding region and cause
+        # out-of-bounds embedding lookups during graph replay.
         seq_info = self.cache_seq_interface.info
-        if not seq_info.is_generate and seq_info.piecewise_bucket_sizes:
-            total_tokens = seq_info.total_num_tokens
-            bucket = seq_info.find_nearest_piecewise_bucket(total_tokens)
-            if bucket is not None and bucket > total_tokens:
-                seq_info.padded_num_tokens = bucket
-                # Clear padded tails so bucketed piecewise replay never sees stale
-                # values (e.g. overlap-scheduler dummy tokens like -1) in embedding.
-                seq_info.named_args["input_ids"][:, total_tokens:bucket].fill_(0)
-                seq_info.named_args["position_ids"][:, total_tokens:bucket].fill_(0)
+        total_tokens = seq_info.total_num_tokens
+        input_buf = seq_info._input_buffer
+        for buf_name in ("input_ids", "position_ids"):
+            device_view = input_buf.get_view(buf_name)
+            if total_tokens < device_view.numel():
+                device_view[total_tokens:].zero_()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
@@ -831,14 +832,10 @@ class ADEngine(ModelEngine):
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
 
-        # Reset piecewise padding after forward and truncate logits to real token count.
-        seq_info = self.cache_seq_interface.info
-        padded = seq_info.padded_num_tokens
-        if padded is not None:
-            real_tokens = seq_info.total_num_tokens
-            # Truncate logits from [1, padded, vocab] to [1, real, vocab]
+        # Piecewise CG may return bucket-sized logits; truncate to real token count.
+        real_tokens = self.cache_seq_interface.info.total_num_tokens
+        if logits.shape[1] > real_tokens:
             logits = logits[:, :real_tokens, :]
-            seq_info.padded_num_tokens = None
 
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 

@@ -385,11 +385,14 @@ class DualModeCapturedGraph(nn.Module):
       bucket -> use PiecewiseCapturedGraph with the smallest bucket >= num_tokens
     - Otherwise -> fall back to eager
 
-    Padding is handled upstream by SequenceInfo._padded_num_tokens: input_ids and
-    position_ids are shaped to the bucket size via _shape_for_forward, while all
-    metadata (batch_info_host, cu_seqlens, etc.) remains unchanged so dynamic ops
-    process only real tokens. Output logits are truncated back to the real token
-    count after the forward pass.
+    Padding contract for the piecewise path:
+    - Input tensors (input_ids, position_ids) arrive at real size (total_num_tokens).
+      The caller (_prepare_inputs) zeros the tail of the underlying device buffer
+      beyond total_num_tokens to prevent stale values from leaking into the padding
+      region during graph replay (the piecewise runner's data_ptr() fast path
+      skips tail-zeroing when buffers alias).
+    - batch_info reflects real counts so dynamic ops process only real tokens.
+    - Output logits are truncated to total_num_tokens in _compute_logits.
     """
 
     def __init__(
@@ -459,7 +462,6 @@ class DualModeCapturedGraph(nn.Module):
         num_tokens = self._get_num_tokens(**kwargs)
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
-            # Piecewise CG path -- padding is handled upstream by SequenceInfo
             return self.piecewise(*args, num_tokens=bucket, **kwargs)
 
         # No bucket large enough -- eager fallback
