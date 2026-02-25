@@ -8,7 +8,6 @@ import torch
 from torch import nn
 
 from tensorrt_llm._mnnvl_utils import HelixCpMnnvlMemory, MnnvlMemory
-from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.distributed.symm_mem_allreduce import \
     SymmetricMemoryAllReduce
 from tensorrt_llm._utils import mpi_comm, mpi_disabled
@@ -750,61 +749,10 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
-    @torch.compiler.disable
-    def get_effective_strategy_for_shape(
-        self,
-        output_shape: Tuple[int, ...],
-        all_reduce_params: Optional[AllReduceParams] = None,
-    ) -> Optional[AllReduceStrategy]:
-        """When strategy is AUTO, return the cached tactic resolved to a strategy
-        (e.g. NCCL_SYMMETRIC) so callers can gate NCCL window usage on the actual
-        choice. When strategy is not AUTO, return that strategy. On cache miss
-        with AUTO, return None (caller should not assume NCCL_SYMMETRIC)."""
-        if self.strategy != AllReduceStrategy.AUTO:
-            return self.strategy
-        # Deferred import: custom_ops pulls in trtllm_gen_custom_ops -> fused_moe -> ops (reducescatter).
-        from tensorrt_llm._torch.custom_ops.torch_custom_ops import \
-            AllReduceRunner
-        params = all_reduce_params or AllReduceParams()
-        # Same runner and input_shapes as tunable_allreduce so cache matches.
-        runner = AllReduceRunner(
-            len(self.mapping.tp_group),
-            self.mapping.tp_group,
-            int(params.fusion_op),
-            params.eps,
-            params.trigger_completion_at_end,
-        )
-
-        # Match AutoTuner._get_input_sizes: Tensor -> .size(), None -> (0,).
-        def _size(x):
-            if x is None:
-                return torch.Size((0, ))
-            if isinstance(x, torch.Tensor):
-                return x.size()
-            return torch.Size(x)
-
-        input_shapes = (
-            _size(output_shape),
-            _size(params.residual),
-            _size(params.norm_weight),
-            _size(params.scale),
-            _size(params.bias),
-            _size(self.workspace if isinstance(self.workspace, torch.Tensor
-                                               ) else None),
-        )
-        result = AutoTuner.get().get_cached_tactic(
-            "trtllm::tunable_allreduce::allreduce",
-            [runner],
-            AllReduceRunner.tuning_config,
-            input_shapes,
-        )
-        if result is None:
-            return None
-        _, tactic = result
-        try:
-            return AllReduceStrategy(tactic)
-        except ValueError:
-            return None
+    def uses_nccl_window(self) -> bool:
+        """Return True if this allreduce uses an NCCL window (NCCL_SYMMETRIC, NCCL, or AUTO)."""
+        return self.strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
+                                 AllReduceStrategy.NCCL, AllReduceStrategy.AUTO)
 
     def get_nccl_window_for_shape(
         self,
@@ -820,17 +768,7 @@ class AllReduce(nn.Module):
             return None
         if like_tensor is None:
             return None
-        use_window = False
-        if self.strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
-                             AllReduceStrategy.NCCL):
-            use_window = True
-        elif self.strategy == AllReduceStrategy.AUTO:
-            params = all_reduce_params or AllReduceParams()
-            effective = self.get_effective_strategy_for_shape(shape, params)
-            use_window = (effective is None
-                          or effective == AllReduceStrategy.NCCL_SYMMETRIC
-                          or effective == AllReduceStrategy.NCCL)
-        if not use_window:
+        if not self.uses_nccl_window():
             return None
         shape_list = list(shape)
         try:
