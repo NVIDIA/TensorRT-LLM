@@ -20,14 +20,14 @@ import random
 import pytest
 import torch
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
-from utils.util import getSMVersion, isSM100Family
+from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import autotune
 
 
 @pytest.mark.skipif(
-    not isSM100Family(),
-    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize("num_experts", [72])
 @pytest.mark.parametrize("k", [1536])
