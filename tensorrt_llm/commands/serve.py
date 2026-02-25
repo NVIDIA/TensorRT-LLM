@@ -718,12 +718,13 @@ class ChoiceWithAlias(click.Choice):
     help="Run gRPC server instead of OpenAI HTTP server. "
     "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
 @click.option(
-    "--served-model-name",
+    "--served_model_name",
     type=str,
     default=None,
-    help="The model name used in the API. If not specified, the model path is "
-    "used as the model name. This is useful when the model path is long or "
-    "when you want to expose a custom name to clients.")
+    help=help_info_with_stability_tag(
+        "The model name used in the API. If not specified, the model path is "
+        "used as the model name. This is useful when the model path is long or "
+        "when you want to expose a custom name to clients.", "prototype"))
 @click.option("--extra_visual_gen_options",
               type=str,
               default=None,
