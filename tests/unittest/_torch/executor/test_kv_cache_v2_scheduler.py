@@ -83,7 +83,7 @@ def test_kv_cache_v2_policy_consistency(model_path, test_case):
         dtype="auto",
         use_kv_cache_manager_v2=True,
         enable_block_reuse=False,
-        host_kv_cache_size=10737418240,
+        host_cache_size=10737418240,
     )
 
     # Test with GUARANTEED_NO_EVICT
