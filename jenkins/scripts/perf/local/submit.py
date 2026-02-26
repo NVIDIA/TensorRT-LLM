@@ -400,7 +400,7 @@ def main():
         "--install-mode",
         default="source",
         choices=["source", "wheel"],
-        help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)"
+        help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)",
     )
 
     args = parser.parse_args()

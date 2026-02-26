@@ -45,13 +45,13 @@ slurm_install_setup() {
         fi
 
         echo "(Installing TensorRT-LLM and requirements) Install mode: ${INSTALL_MODE:-source}"
-        
+
         # Support two installation modes: source (default) and wheel
         if [ "${INSTALL_MODE:-source}" = "wheel" ]; then
             # Wheel installation mode
             echo "Installing from wheel..."
             WHEEL_FILE=$(find "$llmSrcNode/build" -name "tensorrt_llm-*.whl" -type f 2>/dev/null | head -1)
-            
+
             if [ -n "$WHEEL_FILE" ]; then
                 echo "Found wheel: $WHEEL_FILE"
                 retry_command pip install --retries 10 "$WHEEL_FILE"
