@@ -296,7 +296,6 @@ class GenerationResultBase:
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
 
-            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
                 is_generation_only = (self.disaggregated_params is not None
                                       and self.disaggregated_params.request_type
                                       == "generation_only")
@@ -306,13 +305,13 @@ class GenerationResultBase:
                         f"output.length - 1: {output.length - 1}")
                     if len(output.logprobs) < output.length:
                         logger.warning(
-                            "Disaggregated serving: logprobs for the first "
-                            "generated token were not transferred from the "
-                            "context server. The response will contain %d "
-                            "logprob entries instead of %d. Ensure "
-                            "first_gen_log_probs is propagated in "
-                            "DisaggregatedParams to avoid incomplete "
-                            "results.", len(output.logprobs), output.length)
+                            "Disaggregated serving: the response contains "
+                            "%d logprob entries instead of %d because "
+                            "logprobs for the first generated token were "
+                            "not transferred from the context server. "
+                            "Enable logprobs on both the prefill and "
+                            "decode servers to receive complete results.",
+                            len(output.logprobs), output.length)
                 else:
                     assert len(output.logprobs) == output.length, (
                         f"logprobs length: {len(output.logprobs)} != "
