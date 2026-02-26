@@ -520,7 +520,8 @@ class TrtllmAttentionWrapper:
 
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and trtllm_gen.is_supported(
+        helix_active = self.helix_position_offsets is not None
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
