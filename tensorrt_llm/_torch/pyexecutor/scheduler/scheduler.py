@@ -379,7 +379,6 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
         max_num_tokens = self.max_num_tokens
         max_context_length = self.max_context_length
         ctx_chunk_config = self.ctx_chunk_config
-        enable_block_reuse = self.kv_cache_manager.enable_block_reuse
         # 1. Main Scheduling Loop
         for req in active_requests:
             req_state_value = req.state_value
@@ -425,7 +424,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
                     # Reusable tokens set by capacity scheduler (from radix tree lookup).
                     # Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
-                    reusable = req.estimated_reusable_tokens if req.is_first_context_chunk and enable_block_reuse else 0
+                    reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
                     compute_tokens = max(1, req_num_tokens - reusable)
 
                     assert max_context_length is None or compute_tokens <= max_context_length, (
@@ -449,7 +448,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
                     # Reusable tokens set by capacity scheduler (from radix tree lookup).
                     # Only valid for the first context chunk; subsequent chunks must compute all remaining tokens.
-                    reusable = req.estimated_reusable_tokens if req.is_first_context_chunk and enable_block_reuse else 0
+                    reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
 
                     draft_tokens = (
                         req.num_draft_tokens
@@ -525,7 +524,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
             if req.context_chunk_size > 0:
                 context_requests.append(req)
                 # Reusable credit only applies to the first context chunk.
-                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk and enable_block_reuse else 0
+                reusable = req.estimated_reusable_tokens if req.is_first_context_chunk else 0
                 compute_tokens = max(
                     0, req.context_chunk_size - min(reusable, req.context_chunk_size)
                 )
@@ -657,8 +656,12 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
 
         for req in requests:
             suggested_size = req.context_remaining_length
-            # Only the first context chunk can reuse cached KV blocks; subsequent chunks must compute all remaining tokens.
-            reusable = min(req.estimated_reusable_tokens if req.is_first_context_chunk and self.kv_cache_manager.enable_block_reuse else 0, suggested_size)
+            # Only the first context chunk can reuse cached KV blocks
+            # subsequent chunks must compute all remaining tokens.
+            reusable = min(
+                req.estimated_reusable_tokens if req.is_first_context_chunk else 0,
+                suggested_size,
+            )
             compute_cost = suggested_size - reusable
 
             # Start with full context as the allocation target
