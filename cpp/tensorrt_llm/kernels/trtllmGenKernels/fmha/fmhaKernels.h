@@ -1025,7 +1025,7 @@ private:
             | (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkQ)) << 32)
             | (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkK)) << 35)
             | (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkP)) << 38)
-            | (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkP)) << 41)
+            | (static_cast<uint64_t>(computeLog2BlockSize(numEltsPerSageAttnBlkV)) << 41)
             | (static_cast<uint64_t>(dataTypeQkReinterpret) << 44);
     }
 
