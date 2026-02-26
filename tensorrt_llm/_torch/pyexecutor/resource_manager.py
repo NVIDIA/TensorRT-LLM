@@ -601,6 +601,11 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
+                    # Chunked prefill may schedule the same request across multiple
+                    # context chunks. Sequence allocation must happen only once.
+                    if not req.is_first_context_chunk:
+                        continue
+
                     if self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                               req_beam_width, req):
                         for _ in range(self.num_extra_kv_tokens):

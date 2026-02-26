@@ -573,7 +573,7 @@ class KvCacheCreator:
 
         # PARD: draft is a separate model, layers start from 0.
         # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
-        if self._speculative_config.spec_dec_mode.is_pard():
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
             num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_draft_layers
         else:
