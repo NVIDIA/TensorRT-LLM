@@ -24,6 +24,8 @@
 #include <cstdint>
 #include <optional>
 
+#include <openssl/evp.h>
+
 TRTLLM_NAMESPACE_BEGIN
 
 namespace common
@@ -45,22 +47,22 @@ inline size_t hash32(uint32_t value)
     return static_cast<size_t>(value);
 }
 
-//! \brief Fast 64-bit hasher using MurmurHash3-style mixing and Boost-style hash combining.
+//! \brief SHA-256 based hasher for KV cache block hashing.
 //!
-//! Provides a drop-in replacement for SHA256 in KV cache block hashing with:
-//! - 10-100x faster performance (non-cryptographic hash)
-//! - 4x smaller output (8 bytes vs 32 bytes)
-//! - Sufficient collision resistance for cache operations
+//! Uses OpenSSL's EVP interface for SHA-256 hashing.
+//! Produces a 32-byte (256-bit) digest.
 //!
 //! Example usage:
 //! \code
 //!   Hasher hasher(42);  // seed = 42
 //!   hasher.update(100).update(200);
-//!   uint64_t hash = hasher.digest();
+//!   auto hash = hasher.digestBytes();  // 32-byte SHA-256 digest
 //! \endcode
 class Hasher
 {
 public:
+    static constexpr size_t kDigestSize = 32;
+
     //! Default constructor with seed = 0
     Hasher();
 
@@ -70,46 +72,37 @@ public:
     //! Constructor with optional seed (for Python None support)
     explicit Hasher(std::optional<uint64_t> seed);
 
+    ~Hasher();
+
+    //! Copy constructor
+    Hasher(Hasher const& other);
+
+    //! Copy assignment
+    Hasher& operator=(Hasher const& other);
+
+    //! Move constructor
+    Hasher(Hasher&& other) noexcept;
+
+    //! Move assignment
+    Hasher& operator=(Hasher&& other) noexcept;
+
     //! Update hash with a 64-bit integer value (chainable)
     Hasher& update(uint64_t value);
 
     //! Update hash with raw bytes (chainable)
     Hasher& update(void const* data, size_t size);
 
-    //! Get the final 64-bit hash value
+    //! Get the final 64-bit hash value (first 8 bytes of SHA-256 digest, little-endian)
     [[nodiscard]] uint64_t digest() const;
 
-    //! Get the final hash as an 8-byte array (little-endian)
-    [[nodiscard]] std::array<uint8_t, 8> digestBytes() const;
+    //! Get the final hash as a 32-byte SHA-256 digest
+    [[nodiscard]] std::array<uint8_t, kDigestSize> digestBytes() const;
 
 private:
-    uint64_t mHash;
+    EVP_MD_CTX* mCtx;
 
-    //! Combine a new hash value using Boost-style hash combining
-    //! Formula: seed ^= hash + 0x9e3779b9 + (seed << 6) + (seed >> 2)
-    void combineHash(uint64_t newHash);
+    void initCtx();
 };
-
-// Inline simple methods
-inline Hasher::Hasher()
-    : mHash(0)
-{
-}
-
-inline Hasher::Hasher(uint64_t seed)
-    : mHash(seed)
-{
-}
-
-inline Hasher::Hasher(std::optional<uint64_t> seed)
-    : mHash(seed.value_or(0))
-{
-}
-
-inline uint64_t Hasher::digest() const
-{
-    return mHash;
-}
 
 } // namespace common
 

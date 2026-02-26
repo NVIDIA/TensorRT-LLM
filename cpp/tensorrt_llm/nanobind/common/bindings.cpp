@@ -32,11 +32,19 @@ namespace tensorrt_llm::nanobind::common
 
 void initBindings(nb::module_& m)
 {
-    // Bind Hasher class for fast non-cryptographic hashing
+    // Bind Hasher class for SHA-256 hashing
     nb::class_<tc::Hasher>(m, "Hasher")
         .def(nb::init<>(), "Create hasher with seed = 0")
         .def(nb::init<uint64_t>(), nb::arg("seed"), "Create hasher with explicit seed")
         .def(nb::init<std::optional<uint64_t>>(), nb::arg("seed"), "Create hasher with optional seed")
+        .def(
+            "__init__",
+            [](tc::Hasher* self, nb::bytes data)
+            {
+                new (self) tc::Hasher();
+                self->update(data.data(), data.size());
+            },
+            nb::arg("seed"), "Create hasher with bytes as initial data")
         .def(
             "update", [](tc::Hasher& self, uint64_t value) -> tc::Hasher& { return self.update(value); },
             nb::arg("value"), nb::rv_policy::reference_internal, "Update hash with a 64-bit integer")
@@ -73,9 +81,9 @@ void initBindings(nb::module_& m)
             [](tc::Hasher const& self) -> nb::bytes
             {
                 auto digestBytes = self.digestBytes();
-                return nb::bytes(reinterpret_cast<char const*>(digestBytes.data()), 8);
+                return nb::bytes(reinterpret_cast<char const*>(digestBytes.data()), digestBytes.size());
             },
-            "Get the final hash as 8 bytes")
+            "Get the final hash as 32 bytes (SHA-256)")
         .def("digest_int", &tc::Hasher::digest, "Get the final hash as a 64-bit integer");
 }
 
