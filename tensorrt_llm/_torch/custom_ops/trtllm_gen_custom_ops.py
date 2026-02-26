@@ -367,7 +367,8 @@ class FP4BlockScaleMoERunner(TunableRunner):
         return tuning_config
 
 
-@torch.library.custom_op("trtllm::fp4_block_scale_moe_runner", mutates_args=())
+@torch.library.custom_op("trtllm::fp4_block_scale_moe_runner",
+                         mutates_args=("output", ))
 def fp4_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -725,7 +726,8 @@ class FP8BlockScaleMoERunner(TunableRunner):
         return tuning_config
 
 
-@torch.library.custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
+@torch.library.custom_op("trtllm::fp8_block_scale_moe_runner",
+                         mutates_args=("output", ))
 def fp8_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: torch.Tensor,
@@ -1044,7 +1046,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::mxe4m3_mxe2m1_block_scale_moe_runner",
-                         mutates_args=())
+                         mutates_args=("output", ))
 def mxe4m3_mxe2m1_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -1330,7 +1332,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::e4m3_mxe2m1_block_scale_moe_runner",
-                         mutates_args=())
+                         mutates_args=("output", ))
 def e4m3_mxe2m1_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -1618,7 +1620,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::bf16_mxe2m1_block_scale_moe_runner",
-                         mutates_args=())
+                         mutates_args=("output", ))
 def bf16_mxe2m1_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],
@@ -1892,7 +1894,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_fp4_block_scale_moe_runner",
-                         mutates_args=())
+                         mutates_args=("output", ))
 def fp8_fp4_block_scale_moe_runner(
         routing_logits: Optional[torch.Tensor],
         routing_bias: Optional[torch.Tensor],

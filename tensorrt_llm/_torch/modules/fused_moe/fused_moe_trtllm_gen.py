@@ -984,7 +984,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         moe_output: Optional[torch.Tensor] = None
         use_workspace_output = False
-        if self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided and self.supports_moe_output_in_alltoall_workspace(
+        if do_finalize and self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided and self.supports_moe_output_in_alltoall_workspace(
         ):
             moe_output = self.moe_a2a.get_combine_payload_tensor_in_workspace(
                 runtime_max_tokens_per_rank, self.hidden_size, torch.bfloat16)
