@@ -1517,11 +1517,7 @@ class MLA(nn.Module):
         # the indexer (topk_indices) is not needed for context tokens.
         use_short_mha_for_ctx = (
             num_contexts > 0
-            and self.short_seq_mha_threshold > 0
-            and not self.apply_rotary_emb
-            and self.mapping.cp_size == 1
-            and position_ids is not None
-            and num_ctx_tokens <= self.short_seq_mha_threshold)
+            and self._should_use_short_mha(num_ctx_tokens, position_ids))
 
         # Skip the indexer entirely when the short MHA path handles all
         # context tokens and there are no generation tokens.
@@ -1628,6 +1624,15 @@ class MLA(nn.Module):
 
         return attn_output
 
+    def _should_use_short_mha(self, num_ctx_tokens: int,
+                              position_ids: Optional[torch.Tensor]) -> bool:
+        """Check if the short-seq MHA optimization should be used for context."""
+        return (self.short_seq_mha_threshold > 0
+                and not self.apply_rotary_emb
+                and self.mapping.cp_size == 1
+                and position_ids is not None
+                and num_ctx_tokens <= self.short_seq_mha_threshold)
+
     def forward_context_dsa(
         self,
         q: torch.Tensor,
@@ -1656,11 +1661,7 @@ class MLA(nn.Module):
         # caller already applied RoPE to q and k_pe, and our path would apply
         # it again via mla_rope_append_paged_kv_assign_q / _rotary_emb_mha.
         num_ctx_tokens = q.shape[0]
-        if (self.short_seq_mha_threshold > 0
-                and not self.apply_rotary_emb
-                and self.mapping.cp_size == 1
-                and position_ids is not None
-                and num_ctx_tokens <= self.short_seq_mha_threshold):
+        if self._should_use_short_mha(num_ctx_tokens, position_ids):
             return self.forward_context_short_mha(q, compressed_kv, k_pe,
                                                   position_ids, attn_metadata,
                                                   output, latent_cache)
