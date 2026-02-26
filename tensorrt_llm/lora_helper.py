@@ -57,6 +57,9 @@ def get_default_trtllm_modules_to_hf_modules():
         "moe_4h_to_h": "w2",
         "moe_gate": "w3",
         "moe_router": "gate",
+        "shared_expert_h_to_4h": "shared_expert.gate_proj",
+        "shared_expert_4h_to_h": "shared_expert.down_proj",
+        "shared_expert_gate": "shared_expert.up_proj",
     }
 
 
