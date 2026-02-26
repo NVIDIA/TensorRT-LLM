@@ -21,7 +21,7 @@ By NVIDIA TensorRT LLM team
             - [DeepGEMM MQA Kernel](#deepgemm-mqa-kernel)
             - [Kernel Fusion](#kernel-fusion)
         - [System Optimizations](#system-optimizations)
-            - [Multi-steams](#multi-steams)
+            - [Multi-streams](#multi-steams)
             - [A Fast Path for Short Sequences](#a-fast-path-for-short-sequences)
     - [How to Reproduce](#how-to-reproduce)
         - [Accuracy Evaluation](#accuracy-evaluation)
@@ -215,7 +215,7 @@ Kernel fusion is a standard optimization technique for improving performance. Fo
 
 ### System Optimizations
 
-#### Multi-steams
+#### Multi-streams
 Multi-stream execution is leveraged in the following optimizations:
 
 - [PR-8988](https://github.com/NVIDIA/TensorRT-LLM/pull/8988) employs multi-stream to overlap indexer weight scaling with the indexer K cache update. Combined with torch.compile() optimization for the indexer weight scaling, this yields approximately 2.53% speedup in low-latency scenarios.
