@@ -579,6 +579,9 @@ class Attention(nn.Module):
         # so it produces BF16 output. After combining, the downstream o_proj
         # linear layer handles quantization (FP8/NVFP4) in its apply() method.
         if self.mapping.has_cp_helix() and attn_metadata.num_contexts == 0:
+            assert output is None, (
+                "Helix produces BF16 partial outputs which may not match a pre-allocated FP8/NVFP4 buffer for torch.compile inplace output."
+            )
             softmax_stats = torch.empty((num_tokens, self.num_heads, 2),
                                         device=q.device,
                                         dtype=torch.float32)
