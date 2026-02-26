@@ -5802,6 +5802,69 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_nvfp4_4gpu_mtp_ar(self):
+        max_draft_len = 7
+        mtp_config = MTPDecodingConfig(
+            num_nextn_predict_layers=max_draft_len,
+            mtp_eagle_one_model=True,
+        )
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-NVFP4-FP8KV-011526"
+
+        llm_common_config = dict(
+            model=model_path,
+            tensor_parallel_size=4,
+            moe_expert_parallel_size=4,
+            kv_cache_config=KvCacheConfig(
+                enable_block_reuse=False,
+                mamba_ssm_cache_dtype="float16",
+                free_gpu_memory_fraction=0.5,
+            ),
+            max_batch_size=4,
+            enable_attention_dp=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+                                              enable_padding=True),
+            disable_overlap_scheduler=False,
+            moe_config=MoeConfig(backend="CUTLASS"),
+        )
+
+        llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
+
+        raw_prompts = [
+            "Below is a list of sentences. I'd like you to translate a few of them into Spanish please:\n\n1. The water cycle, an essential process for life on Earth, involves the continuous movement of water through evaporation, condensation, precipitation, and runoff.\n\n2. The phenomenon of bioluminescence, where living organisms produce light, creates magical scenes in the depths of the ocean and in the night landscapes.\n\n3. Black holes, the mysterious cosmic phenomena where gravity is so strong that not even light can escape, serve as gateways to understanding the limits of our physical laws.\n\n4. The exploration of quantum superposition has led to the conceptualization of quantum bits or qubits, which, unlike their classical counterparts, can represent a 0, a 1, or any quantum superposition of these states, a property that allows quantum computers to perform complex calculations at speeds unattainable by classical computers, offering new horizons in drug discovery, materials science, and cryptography, where they could solve problems considered intractable for traditional computing systems.\n\n5. The mystery of the Tunguska event, a massive explosion in Siberia in 1908, thought to be caused by a comet or asteroid, remains one of the 20th century's great enigmas.\n\nPlease translate the following numbered sentences into Spanish: [1, 2, 3, 4, 5]. Don't repeat the sentences in English. Only translate those 5 sentences. Number them in your response. Thank you!",
+            "Below is a list of sentences. I'd like you to translate a few of them into French please:\n\n1. The intricate dance of planets around stars in distant solar systems, known as exoplanets, expands our horizons in the search for extraterrestrial life.\n\n2. The development of smart cities, using technology to improve the efficiency of services and meet residents' needs, represents a new frontier in urban planning.\n\n3. The melting of polar ice caps, accelerated by global warming, contributes to rising sea levels and the loss of habitat for species like the polar bear.\n\n4. The mysteries of dark matter and dark energy, making up most of the universe's mass and energy, challenge our understanding of the cosmos.\n\n5. The Great Barrier Reef, the world's largest coral reef system, is home to a vast array of marine species and is visible from space.\n\nPlease translate the following numbered sentences into French: [1, 2, 3, 4, 5]. Don't repeat the sentences in English. Only translate those 5 sentences. Number them in your response. Thank you!",
+        ]
+        prompts = [
+            llm_spec.tokenizer.apply_chat_template([{
+                "role": "user",
+                "content": p
+            }],
+                                                   tokenize=False,
+                                                   add_generation_prompt=True)
+            for p in raw_prompts
+        ]
+        tok_ids = [llm_spec.tokenizer.encode(p) for p in prompts]
+
+        sampling_params = SamplingParams(max_tokens=128, temperature=0)
+
+        for i in range(len(tok_ids)):
+            num_tokens = 0
+            num_drafted = 0
+            num_accepted = 0
+            for output in llm_spec.generate_async(tok_ids[i],
+                                                  sampling_params,
+                                                  streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_drafted += max_draft_len
+                num_accepted += len(new_tokens) - num_tokens - 1
+                num_tokens = len(new_tokens)
+
+            accept_rate = num_accepted / num_drafted
+            assert accept_rate > 0.35, \
+                f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
+
 
 @skip_pre_hopper
 class TestMiniMaxM2(LlmapiAccuracyTestHarness):
