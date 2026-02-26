@@ -117,6 +117,9 @@ class GatedMLP(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
+        # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
+        # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora
+        # handles them as a single fused operation.
         self.splitted_gate_up_lora = LoraLayer([h_to_4h_type, gate_type], [
             self.intermediate_size // mapping.tp_size,
             self.intermediate_size // mapping.tp_size
