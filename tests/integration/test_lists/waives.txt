@@ -347,4 +347,3 @@ unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_gptoss_style_nvfp4[lim
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/5845943)
 accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph SKIP (https://nvbugs/5860520)
 unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py::test_flashinfer_fused_moe_matches_torch_moe SKIP (https://nvbugs/5920779)
-accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto] SKIP (https://nvbugs/5920771)
