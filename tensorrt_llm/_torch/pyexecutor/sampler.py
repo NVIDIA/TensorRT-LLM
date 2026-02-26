@@ -1507,7 +1507,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
             # Host Tensor for host access of self.store.num_accepted_draft_tokens
             stop_word_seq_slots_tensor_host = torch.tensor(
-                stop_word_seq_slots, device="cpu", dtype=torch.int32, pin_memory=True
+                stop_word_seq_slots, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
             )
             # Device Tensor for device access of self.store.stop_words and self.store.past_tokens
             stop_word_seq_slots_tensor_cuda = stop_word_seq_slots_tensor_host.to(
@@ -1562,7 +1562,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             _ = stop_words_host.fill_(self._EMPTY_STOP_WORD_TOKEN_ID)
             words, cumulative_stop_word_lengths = stop_words_list
-            words_host = torch.tensor(words, device="cpu", dtype=torch.int32, pin_memory=True)
+            words_host = torch.tensor(
+                words, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
+            )
             begin = 0
             max_stop_word_length = 0
             num_stop_words = 0
@@ -1601,7 +1603,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 self._max_beam_width,
                 device="cpu",
                 dtype=torch.int32,
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
             tokens = request.get_tokens()
             for beam_idx in range(self._max_beam_width):
