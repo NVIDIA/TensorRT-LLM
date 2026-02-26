@@ -8,8 +8,9 @@ from abc import ABC, abstractmethod
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Annotated, Any, Dict, List, Literal, Optional, Set, Tuple,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+from typing import (Annotated, Any, Dict, List, Literal, Optional, Sequence,
+                    Set, Tuple, Type, TypeAlias, TypeVar, Union, get_args,
+                    get_origin)
 
 import torch
 import yaml
@@ -3292,13 +3293,37 @@ def update_llm_args_with_extra_dict(
     return llm_args
 
 
-def update_llm_args_with_extra_options(llm_args: Dict,
-                                       extra_llm_api_options: str) -> Dict:
-    if extra_llm_api_options is not None:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
-            llm_args = update_llm_args_with_extra_dict(llm_args, llm_args_dict,
-                                                       extra_llm_api_options)
+def _deep_merge_dicts(base: Dict, override: Dict) -> Dict:
+    """Recursively deep-merge two dicts. Values in override take precedence."""
+    result = base.copy()
+    for key, value in override.items():
+        if key in result and isinstance(result[key], dict) and isinstance(
+                value, dict):
+            result[key] = _deep_merge_dicts(result[key], value)
+        else:
+            result[key] = value
+    return result
+
+
+def update_llm_args_with_extra_options(
+        llm_args: Dict, extra_llm_api_options: Union[None, str,
+                                                     Sequence[str]]) -> Dict:
+    if extra_llm_api_options is None:
+        return llm_args
+
+    if isinstance(extra_llm_api_options, str):
+        extra_llm_api_options = [extra_llm_api_options]
+
+    merged_dict: Dict = {}
+    for options_file in extra_llm_api_options:
+        with open(options_file, 'r') as f:
+            file_dict = yaml.safe_load(f) or {}
+            merged_dict = _deep_merge_dicts(merged_dict, file_dict)
+
+    if merged_dict:
+        files_str = ", ".join(str(f) for f in extra_llm_api_options)
+        llm_args = update_llm_args_with_extra_dict(llm_args, merged_dict,
+                                                   files_str)
     return llm_args
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Literal, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Sequence, Union
 
 from pydantic import (BaseModel, Field, PositiveFloat, field_validator,
                       model_validator)
@@ -34,7 +34,7 @@ class RuntimeConfig(BaseModel):
     decoding_config: Optional[DecodingConfig] = None
     performance_options: PerformanceOptions
     backend: Literal["pytorch", "_autodeploy", None] = None
-    extra_llm_api_options: Optional[str] = None
+    extra_llm_api_options: Optional[Union[str, Sequence[str]]] = None
     iteration_log: Optional[Path] = None
 
     def get_llm_args(self) -> Dict:
