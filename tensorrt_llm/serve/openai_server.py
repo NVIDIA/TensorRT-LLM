@@ -1626,11 +1626,14 @@ class OpenAIServer:
             output = await future.result()
 
             if output.video is None:
-                return self.create_error_response(
-                    message="Video generation failed",
-                    err_type="InternalServerError",
-                    status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
-                )
+                # Update job status to failed since we're in a background task
+                job = await VIDEO_STORE.get(video_id)
+                if job:
+                    job.status = "failed"
+                    job.completed_at = int(time.time())
+                    job.error = "Video generation failed: output.video is None"
+                    await VIDEO_STORE.upsert(video_id, job)
+                return
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
@@ -1750,7 +1753,7 @@ class OpenAIServer:
 
             # Try to use stored output path, otherwise check for both .mp4 and .avi
             video_path = None
-            if hasattr(job, 'output_path') and job.output_path and os.path.exists(job.output_path):
+            if job.output_path and os.path.exists(job.output_path):
                 video_path = Path(job.output_path)
             else:
                 # Fall back to checking common extensions
@@ -1808,7 +1811,7 @@ class OpenAIServer:
 
             # Delete the video file(s) - check for both .mp4 and .avi
             video_path = None
-            if hasattr(job, 'output_path') and job.output_path and os.path.exists(job.output_path):
+            if job.output_path and os.path.exists(job.output_path):
                 video_path = job.output_path
             else:
                 # Fall back to checking common extensions

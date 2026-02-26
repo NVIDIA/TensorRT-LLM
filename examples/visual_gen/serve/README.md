@@ -24,12 +24,12 @@ Before running these examples, ensure you have:
    pip install git+https://github.com/huggingface/diffusers.git
    ```
 
-   **Optional**: For better video compression (H.264/MP4), install ffmpeg:
+   **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
    ```bash
    # Ubuntu/Debian
    apt-get install ffmpeg
    ```
-   If ffmpeg is not available, the server will use a pure Python encoder that outputs MJPEG/AVI format.
+   If ffmpeg is not available, the server will use a pure Python encoder that outputs MJPEG/AVI format. See [FFmpeg download page](https://ffmpeg.org/download.html) for installation instructions on other platforms.
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash

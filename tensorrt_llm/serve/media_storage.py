@@ -22,6 +22,7 @@ from tensorrt_llm.logger import logger
 
 # Video encoder availability flags (cached after first check)
 _FFMPEG_PATH: Optional[str] = None
+_VIDEO_ENCODER: Optional["VideoEncoder"] = None
 
 
 def _check_ffmpeg_available() -> bool:
@@ -454,8 +455,8 @@ class PurePythonEncoder(VideoEncoder):
             f.write(riff_data)
 
 
-def get_video_encoder() -> Optional[VideoEncoder]:
-    """Get the best available video encoder.
+def get_video_encoder() -> Optional["VideoEncoder"]:
+    """Get the best available video encoder (cached singleton).
 
     Checks availability in order:
     1. ffmpeg CLI - Full-featured solution (supports audio)
@@ -464,12 +465,15 @@ def get_video_encoder() -> Optional[VideoEncoder]:
     Returns:
         VideoEncoder instance, or None if no encoder is available
     """
-    if _check_ffmpeg_available():
-        logger.info("Using ffmpeg CLI for video encoding")
-        return FfmpegCliEncoder()
-    else:
-        logger.info("Using pure Python MJPEG/AVI encoder (no audio support)")
-        return PurePythonEncoder()
+    global _VIDEO_ENCODER
+    if _VIDEO_ENCODER is None:
+        if _check_ffmpeg_available():
+            logger.info("Using ffmpeg CLI for video encoding")
+            _VIDEO_ENCODER = FfmpegCliEncoder()
+        else:
+            logger.info("Using pure Python MJPEG/AVI encoder (no audio support)")
+            _VIDEO_ENCODER = PurePythonEncoder()
+    return _VIDEO_ENCODER
 
 
 class MediaStorage:
@@ -660,18 +664,19 @@ class MediaStorage:
             tmp_path = tmp_file.name
 
         try:
-            # Save to temporary file
-            MediaStorage.save_video(video, tmp_path, audio, frame_rate, format)
+            # Save to temporary file (may return different path than requested)
+            actual_path = MediaStorage.save_video(video, tmp_path, audio, frame_rate, format)
 
-            # Read bytes
-            with open(tmp_path, "rb") as f:
+            # Read bytes from the actual saved path
+            with open(actual_path, "rb") as f:
                 video_bytes = f.read()
 
             return video_bytes
         finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            # Clean up temporary file(s) - check both original and actual path
+            for path in [tmp_path, actual_path if "actual_path" in locals() else None]:
+                if path and os.path.exists(path):
+                    os.unlink(path)
 
     @staticmethod
     def _save_mp4(
@@ -679,8 +684,8 @@ class MediaStorage:
     ) -> str:
         """Save video with optional audio as MP4.
 
-        Uses ffmpeg CLI if available (supports audio), otherwise falls back to
-        pure Python MJPEG/AVI encoder (video only).
+        Uses ffmpeg CLI if available (supports audio), otherwise raises an error
+        to prompt ffmpeg installation.
 
         Args:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
@@ -690,19 +695,27 @@ class MediaStorage:
 
         Returns:
             Path where the video was saved
+
+        Raises:
+            RuntimeError: If ffmpeg is not available for MP4 encoding
         """
+        # Check if ffmpeg is required but not available
+        encoder = get_video_encoder()
+        if isinstance(encoder, PurePythonEncoder) and output_path.lower().endswith(".mp4"):
+            raise RuntimeError(
+                "MP4 format requires ffmpeg to be installed. Please install ffmpeg "
+                "(e.g., 'apt-get install ffmpeg' on Ubuntu/Debian) or use AVI format instead. "
+                "See https://ffmpeg.org/download.html for installation instructions."
+            )
+
         try:
-            encoder = get_video_encoder()
             if encoder is not None:
-                # If using pure Python encoder and output is .mp4, change to .avi
-                if isinstance(encoder, PurePythonEncoder) and output_path.lower().endswith(".mp4"):
-                    output_path = output_path[:-4] + ".avi"
                 return encoder.encode_video(video, output_path, frame_rate, audio)
             else:
                 logger.warning(
                     "No video encoder available. Falling back to saving middle frame as PNG."
                 )
-                png_path = output_path.replace(".mp4", ".png")
+                png_path = os.path.splitext(output_path)[0] + ".png"
                 return MediaStorage._save_middle_frame(video, png_path)
         except Exception as e:
             logger.error(f"Error encoding video: {e}")
@@ -710,7 +723,7 @@ class MediaStorage:
 
             logger.error(traceback.format_exc())
             logger.warning("Falling back to saving middle frame as PNG.")
-            png_path = output_path.replace(".mp4", ".png")
+            png_path = os.path.splitext(output_path)[0] + ".png"
             return MediaStorage._save_middle_frame(video, png_path)
 
     @staticmethod
