@@ -171,6 +171,19 @@ class TrtllmAttentionWrapper:
         quant_config = quant_config or QuantConfig()
         self.quant_mode = int(quant_config.layer_quant_mode)
 
+    def ensure_rope_table_size(self, required_max_positions: int) -> None:
+        """Expand the RoPE cos/sin table if it is too small.
+
+        Both MLA-specific kernels (mla_rope_generation,
+        mla_rope_append_paged_kv_assign_q) and the generic attention path
+        (plan()->run()) may need a table that covers `required_max_positions`.
+        Call this before any kernel that reads `rotary_cos_sin`.
+        """
+        if required_max_positions > self.rope_params.max_positions:
+            self.rope_params.max_positions = required_max_positions
+            self.rotary_inv_freq, self.rotary_cos_sin = (
+                self.rope_params.create_rope_const_params())
+
     def plan(
         self,
         *,
@@ -323,10 +336,7 @@ class TrtllmAttentionWrapper:
         self.helix_position_offsets = helix_position_offsets
         self.helix_is_inactive_rank = helix_is_inactive_rank
 
-        if max_sequence_length > self.rope_params.max_positions:
-            self.rope_params.max_positions = max_sequence_length
-            self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
-            )
+        self.ensure_rope_table_size(max_sequence_length)
         self.is_spec_decoding_enabled = is_spec_decoding_enabled
         self.use_spec_decoding = use_spec_decoding
         self.is_spec_dec_tree = is_spec_dec_tree
@@ -807,7 +817,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
     kv_cache_block_offsets: Optional[torch.Tensor] = None
     host_kv_cache_block_offsets: Optional[torch.Tensor] = None
     draft_kv_cache_block_offsets: Optional[torch.Tensor] = None
-    draft_host_kv_cache_block_offsets: Optional[torch.Tensor] = None
 
     @property
     def max_seq_len(self) -> int:
@@ -914,6 +923,7 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 dtype=torch.int32,
                 capture_graph=capture_graph,
             )
+            self.host_kv_cache_block_offsets = self.kv_cache_manager.host_kv_cache_block_offsets
             self.block_ids_per_seq = None
             self.kv_block_ids_per_seq = None
 
@@ -930,11 +940,6 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                     cache_name="draft_kv_cache_block_offsets",
                     dtype=torch.int32,
                     capture_graph=capture_graph,
-                )
-                self.draft_host_kv_cache_block_offsets = torch.empty_like(
-                    self.draft_kv_cache_block_offsets,
-                    device='cpu',
-                    pin_memory=True,
                 )
 
             if self.enable_flash_mla:
@@ -1141,22 +1146,10 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # Also prepare draft KV cache block offsets if draft_kv_cache_manager exists
             if self.draft_kv_cache_manager is not None:
-                # Copy blocks for all context requests
-                self.draft_kv_cache_manager.impl.copy_batch_block_offsets(
-                    self.draft_host_kv_cache_block_offsets,
-                    self.request_ids[:self.num_contexts], 1, 0)
-                # Copy blocks for all generation requests
-                self.draft_kv_cache_manager.impl.copy_batch_block_offsets(
-                    self.draft_host_kv_cache_block_offsets,
-                    self.request_ids[self.num_contexts:], self.beam_width,
-                    self.num_contexts)
-                for pool_idx in range(
-                        self.draft_host_kv_cache_block_offsets.shape[0]):
-                    self.draft_kv_cache_block_offsets[
-                        pool_idx, :self.num_seqs].copy_(
-                            self.draft_host_kv_cache_block_offsets[
-                                pool_idx, :self.num_seqs],
-                            non_blocking=True)
+                # Use the wrapper method which works for both V1 and V2
+                self.draft_kv_cache_manager.copy_batch_block_offsets(
+                    self.draft_kv_cache_block_offsets, self.request_ids,
+                    self.beam_width, self.num_contexts, self.num_seqs)
 
         self.kv_lens_cuda_runtime = self.kv_lens_cuda[:self.num_seqs]
         # Don't use self.kv_lens here because it includes extra tokens.
@@ -2083,6 +2076,12 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
 
+        # Ensure RoPE cos/sin table covers the sequence length before the
+        # kernel reads it.  plan() also calls ensure_rope_table_size, but it
+        # runs AFTER this method in the MLA context path.
+        self.wrapper.ensure_rope_table_size(
+            metadata.kv_cache_manager.max_seq_len)
+
         sink_token_length = 0
         beam_width = 1
 
@@ -2191,6 +2190,11 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         assert self.is_mla_enable and self.mla_params is not None
         assert metadata.kv_cache_manager is not None
         sink_token_length = 0
+
+        # Ensure RoPE cos/sin table covers the sequence length before the
+        # kernel reads it.  plan() also calls ensure_rope_table_size, but it
+        # runs AFTER this method in the MLA generation path.
+        self.wrapper.ensure_rope_table_size(metadata.max_seq_len)
 
         mla_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
