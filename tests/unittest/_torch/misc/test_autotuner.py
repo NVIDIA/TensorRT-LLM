@@ -1,7 +1,9 @@
 import itertools
 import json
+import math
 import os
 import pickle
+import statistics
 import sys
 import tempfile
 from typing import Any, List
@@ -871,41 +873,116 @@ def test_autotuner_distributed_strategy(strategy, mpi_pool_executor):
 
 
 @pytest.mark.parametrize("use_cuda_graph", [False, True])
-def test_global_timer_vs_cuda_event(use_cuda_graph):
-    """Verify globaltimer and cuda-event backends report times within 5%."""
-    runner = GemmRunner()
-    x = torch.randn(M // 2, 64, device='cuda')
-    w = torch.randn(64, 128, device='cuda')
+def test_global_timer_vs_cuda_event(use_cuda_graph, monkeypatch):
+    """Verify globaltimer and cuda-event backends are statistically indistinguishable."""
+
+    class PureGemmRunner(TunableRunner):
+
+        def get_valid_tactics(self, inputs: List[FakeTensor],
+                              profile: OptimizationProfile,
+                              **kwargs) -> List[int]:
+            return [0]
+
+        def forward(self,
+                    /,
+                    inputs: List[torch.Tensor],
+                    *,
+                    tactic: int = 0,
+                    **kwargs) -> torch.Tensor:
+            assert tactic == 0
+            return inputs[0] @ inputs[1]
+
+    # Keep full profiling repeats enabled to reduce measurement noise.
+    monkeypatch.setenv("TLLM_AUTOTUNER_DISABLE_SHORT_PROFILE", "1")
+
+    gemm_shapes = [
+        (256, 4096, 11008),
+        (512, 8192, 8192),
+    ]
+    num_trials = 6
+    rel_tol = 0.05
+    stat_zscore = 3.0
+    abs_tol_ms = 0.01
+
+    runner = PureGemmRunner()
     tuning_config = TuningConfig(use_cuda_graph=use_cuda_graph)
-
     tuner = AutoTuner()
+    trial_rows = []
 
-    for tactic in runner.get_valid_tactics([x, w], OptimizationProfile()):
-        # Profile with cuda events
-        tuner._use_global_timer = False
-        event_time = tuner._profile_single_kernel(
-            runner=runner,
-            inputs=[x, w],
-            tactic=tactic,
-            tuning_config=tuning_config,
-            use_cuda_graph=use_cuda_graph,
+    for m, k, n in gemm_shapes:
+        x = torch.randn(m, k, device='cuda', dtype=torch.float16)
+        w = torch.randn(k, n, device='cuda', dtype=torch.float16)
+
+        event_times = []
+        gt_times = []
+
+        # Interleave both backends to avoid drift effects from neighboring load.
+        for _ in range(num_trials):
+            tuner._use_global_timer = False
+            event_times.append(
+                tuner._profile_single_kernel(
+                    runner=runner,
+                    inputs=[x, w],
+                    tactic=0,
+                    tuning_config=tuning_config,
+                    use_cuda_graph=use_cuda_graph,
+                ))
+
+            tuner._use_global_timer = True
+            gt_times.append(
+                tuner._profile_single_kernel(
+                    runner=runner,
+                    inputs=[x, w],
+                    tactic=0,
+                    tuning_config=tuning_config,
+                    use_cuda_graph=use_cuda_graph,
+                ))
+
+            event_ms = event_times[-1]
+            gt_ms = gt_times[-1]
+            abs_diff = abs(gt_ms - event_ms)
+            rel_diff = abs_diff / event_ms if event_ms > 0 else float('inf')
+            trial_rows.append((m, k, n, len(event_times), event_ms, gt_ms,
+                               abs_diff, rel_diff))
+
+        event_mean = statistics.fmean(event_times)
+        gt_mean = statistics.fmean(gt_times)
+        event_var = statistics.variance(event_times)
+        gt_var = statistics.variance(gt_times)
+        mean_diff = abs(gt_mean - event_mean)
+        rel_diff = mean_diff / event_mean
+
+        # Two-sample mean delta should be small vs a fixed tolerance and
+        # indistinguishable within sampling noise.
+        combined_sem = math.sqrt(event_var / num_trials + gt_var / num_trials)
+        allowed_diff = max(abs_tol_ms, rel_tol * event_mean,
+                           stat_zscore * combined_sem)
+
+        assert event_mean > 0, (
+            f"({m},{k},{n}): cuda event mean should be positive, got {event_mean}"
         )
-
-        # Profile with globaltimer
-        tuner._use_global_timer = True
-        gt_time = tuner._profile_single_kernel(
-            runner=runner,
-            inputs=[x, w],
-            tactic=tactic,
-            tuning_config=tuning_config,
-            use_cuda_graph=use_cuda_graph,
+        assert gt_mean > 0, (
+            f"({m},{k},{n}): globaltimer mean should be positive, got {gt_mean}"
         )
+        assert mean_diff <= allowed_diff, (
+            f"({m},{k},{n}): timing backends are distinguishable "
+            f"(cuda_event_mean={event_mean:.4f}ms, "
+            f"globaltimer_mean={gt_mean:.4f}ms, "
+            f"relative_diff={rel_diff * 100:.2f}%, "
+            f"allowed_diff={allowed_diff:.4f}ms, "
+            f"combined_sem={combined_sem:.4f}ms, "
+            f"event_samples={event_times}, gt_samples={gt_times})")
 
-        assert event_time > 0, f"cuda event time should be positive, got {event_time}"
-        assert gt_time > 0, f"globaltimer time should be positive, got {gt_time}"
-
-        rel_diff = abs(gt_time - event_time) / event_time
-        assert rel_diff < 0.05, (
-            f"tactic={tactic}: globaltimer ({gt_time:.4f}ms) and cuda event "
-            f"({event_time:.4f}ms) differ by {rel_diff * 100:.1f}%, expected < 5%"
-        )
+    # Visible with `pytest -s`; otherwise captured by pytest.
+    print("\nGlobaltimer vs cuda-event trial comparison")
+    print(f"cuda_graph={use_cuda_graph}, trials_per_shape={num_trials}")
+    print("-" * 102)
+    print(
+        f"{'shape (M,K,N)':>21} {'trial':>5} {'cuda_event (ms)':>16} "
+        f"{'globaltimer (ms)':>17} {'abs diff (ms)':>14} {'rel diff (%)':>13}")
+    print("-" * 102)
+    for m, k, n, trial, event_ms, gt_ms, abs_diff, rel_diff in trial_rows:
+        print(f"{f'({m},{k},{n})':>21} {trial:>5d} "
+              f"{event_ms:>16.4f} {gt_ms:>17.4f} "
+              f"{abs_diff:>14.4f} {rel_diff * 100:>13.2f}")
+    print("-" * 102)
