@@ -58,7 +58,7 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
     {
         mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv,
             mFixedParams.dataTypeOut, 1, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
-            mFixedParams.sageBlockSizeV));
+            mFixedParams.sageBlockSizeV, mFixedParams.dataTypeQkReinterpret));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");

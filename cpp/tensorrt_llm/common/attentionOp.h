@@ -504,6 +504,7 @@ public:
     int mSageAttnNumEltsPerBlkQ = 0;
     int mSageAttnNumEltsPerBlkK = 0;
     int mSageAttnNumEltsPerBlkV = 0;
+    bool mSageAttnQkInt8 = false;
 #ifdef SKIP_SOFTMAX_STAT
     uint32_t* mSkipSoftmaxTotalBlocks;
     uint32_t* mSkipSoftmaxSkippedBlocks;
@@ -527,7 +528,7 @@ public:
             mFMHAForceFP32Acc, mMultiBlockMode, mEnableXQA, mUseKVCache, mSkipAttn, mFuseFp4Quant,
             mNbMultiBlockSemaphores, mAttentionChunkSize.value_or(-1), mSkipSoftmaxThresholdScaleFactorPrefill,
             mSkipSoftmaxThresholdScaleFactorDecode, mSageAttnNumEltsPerBlkQ, mSageAttnNumEltsPerBlkK,
-            mSageAttnNumEltsPerBlkV);
+            mSageAttnNumEltsPerBlkV, mSageAttnQkInt8);
     };
 
 private:

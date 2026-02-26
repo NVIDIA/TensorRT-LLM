@@ -1825,7 +1825,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 tc::SageQuantQkParams qkParams{};
                 qkParams.headDim = getHeadSize();
                 qkParams.inputType = std::is_same_v<T, __nv_bfloat16> ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
-                qkParams.quantType = DATA_TYPE_E4M3;
+                qkParams.quantType = mSageAttnQkInt8 ? DATA_TYPE_INT8 : DATA_TYPE_E4M3;
                 qkParams.smCount = mMultiProcessorCount;
                 qkParams.stream = stream;
 
@@ -2898,6 +2898,7 @@ int AttentionOp::initialize() noexcept
         fmhaParams.sageBlockSizeQ = mSageAttnNumEltsPerBlkQ;
         fmhaParams.sageBlockSizeK = mSageAttnNumEltsPerBlkK;
         fmhaParams.sageBlockSizeV = mSageAttnNumEltsPerBlkV;
+        fmhaParams.dataTypeQkReinterpret = mSageAttnQkInt8 ? DATA_TYPE_INT8 : DATA_TYPE_E4M3;
 
         // mFmhaDispatcher is not used for generation MLA, but we still need to modify these values to avoid selecting
         // the wrong kernel, no matter mIsGenerationMLA is true or false

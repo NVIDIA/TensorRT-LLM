@@ -635,7 +635,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
     std::optional<int64_t> sage_attn_num_elts_per_blk_q, std::optional<int64_t> sage_attn_num_elts_per_blk_k,
-    std::optional<int64_t> sage_attn_num_elts_per_blk_v)
+    std::optional<int64_t> sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
@@ -767,6 +767,7 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q.value_or(0));
     op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k.value_or(0));
     op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v.value_or(0));
+    op->mSageAttnQkInt8 = sage_attn_qk_int8;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());
     op->mSkipSoftmaxSkippedBlocks = op->mSkipSoftmaxTotalBlocks + 1;

@@ -394,6 +394,7 @@ class TrtllmAttentionWrapper:
         sage_attn_num_elts_per_blk_q: Optional[int] = None,
         sage_attn_num_elts_per_blk_k: Optional[int] = None,
         sage_attn_num_elts_per_blk_v: Optional[int] = None,
+        sage_attn_qk_int8: bool = False,
     ):
         """
         Run the attention operation.
@@ -717,6 +718,7 @@ class TrtllmAttentionWrapper:
                 sage_attn_num_elts_per_blk_q,
                 sage_attn_num_elts_per_blk_k,
                 sage_attn_num_elts_per_blk_v,
+                sage_attn_qk_int8,
             )
 
         if self.print_skip_softmax_stat:
@@ -1810,6 +1812,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         sage_attn_num_elts_per_blk_q: Optional[int] = None,
         sage_attn_num_elts_per_blk_k: Optional[int] = None,
         sage_attn_num_elts_per_blk_v: Optional[int] = None,
+        sage_attn_qk_int8: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
@@ -1977,7 +1980,8 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                          quant_q_buffer=quant_q_buffer,
                          sage_attn_num_elts_per_blk_q=sage_attn_num_elts_per_blk_q,
                          sage_attn_num_elts_per_blk_k=sage_attn_num_elts_per_blk_k,
-                         sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v)
+                         sage_attn_num_elts_per_blk_v=sage_attn_num_elts_per_blk_v,
+                         sage_attn_qk_int8=sage_attn_qk_int8)
 
         if output_sf is None:
             return output
