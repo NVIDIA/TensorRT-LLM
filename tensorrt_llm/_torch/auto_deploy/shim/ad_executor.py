@@ -800,21 +800,6 @@ class ADEngine(ModelEngine):
             **extra_args,
         )
 
-        # Zero the tail of token-level device buffers beyond total_num_tokens.
-        # The piecewise CUDA graph runner's _prepare_replay_inputs has a data_ptr()
-        # fast path that skips copying and tail-zeroing when the runtime input shares
-        # the same underlying buffer as the captured static input (common for input_ids
-        # and position_ids which are views of InputBuffer). Without this zeroing, stale
-        # token IDs from previous iterations leak into the padding region and cause
-        # out-of-bounds embedding lookups during graph replay.
-        seq_info = self.cache_seq_interface.info
-        total_tokens = seq_info.total_num_tokens
-        input_buf = seq_info._input_buffer
-        for buf_name in ("input_ids", "position_ids"):
-            device_view = input_buf.get_view(buf_name)
-            if total_tokens < device_view.numel():
-                device_view[total_tokens:].zero_()
-
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
         ):
@@ -831,11 +816,6 @@ class ADEngine(ModelEngine):
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
-
-        # Piecewise CG may return bucket-sized logits; truncate to real token count.
-        real_tokens = self.cache_seq_interface.info.total_num_tokens
-        if logits.shape[1] > real_tokens:
-            logits = logits[:, :real_tokens, :]
 
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 

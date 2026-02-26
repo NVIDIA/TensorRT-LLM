@@ -387,12 +387,10 @@ class DualModeCapturedGraph(nn.Module):
 
     Padding contract for the piecewise path:
     - Input tensors (input_ids, position_ids) arrive at real size (total_num_tokens).
-      The caller (_prepare_inputs) zeros the tail of the underlying device buffer
-      beyond total_num_tokens to prevent stale values from leaking into the padding
-      region during graph replay (the piecewise runner's data_ptr() fast path
-      skips tail-zeroing when buffers alias).
+      The tail beyond total_num_tokens is zeroed via reset_val=0 in nest_sequences
+      to prevent stale values from leaking into the padding region during graph replay.
     - batch_info reflects real counts so dynamic ops process only real tokens.
-    - Output logits are truncated to total_num_tokens in _compute_logits.
+    - Output logits are truncated to total_num_tokens in forward().
     """
 
     def __init__(
@@ -462,7 +460,10 @@ class DualModeCapturedGraph(nn.Module):
         num_tokens = self._get_num_tokens(**kwargs)
         bucket = self._find_nearest_bucket(num_tokens)
         if bucket is not None:
-            return self.piecewise(*args, num_tokens=bucket, **kwargs)
+            result = self.piecewise(*args, num_tokens=bucket, **kwargs)
+            if bucket > num_tokens:
+                result = tuple(r[:, :num_tokens] if r.ndim >= 2 else r for r in result)
+            return result
 
         # No bucket large enough -- eager fallback
         ad_logger.debug(

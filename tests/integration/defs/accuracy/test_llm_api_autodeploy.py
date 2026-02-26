@@ -550,6 +550,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "skip_loading_weights": False,
             "disable_overlap_scheduler": False,
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
+            "piecewise_enabled": True,
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.88

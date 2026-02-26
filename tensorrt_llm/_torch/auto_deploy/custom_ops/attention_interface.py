@@ -948,7 +948,7 @@ class SequenceInfo:
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
-        self._store_arg("input_ids", self._flatten(input_ids))
+        self._store_arg("input_ids", self._flatten(input_ids), reset_val=0)
 
         # set new position_ids and make sure to flatten it
         if position_ids is None:
@@ -956,7 +956,7 @@ class SequenceInfo:
                 [num for num in range(in_pos, in_pos + seq_len)]
                 for in_pos, seq_len in zip(self.input_pos, self.seq_len)
             ]
-        self._store_arg("position_ids", self._flatten(position_ids))
+        self._store_arg("position_ids", self._flatten(position_ids), reset_val=0)
 
         ### UPDATE OTHER (DERIVATIVE) METADATA #####################################################
         # check for updated batch_info_tensor
