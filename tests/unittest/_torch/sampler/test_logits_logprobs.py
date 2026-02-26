@@ -9,6 +9,7 @@ from utils.util import force_ampere
 from tensorrt_llm import LLM, SamplingParams
 from tensorrt_llm._torch.pyexecutor.sampling_utils import top_k_top_p_sampling_batch
 from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import _StrategyImpls
+from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.llmapi.llm_utils import KvCacheConfig
 
 prompts = ["A B C"]
@@ -19,7 +20,7 @@ global_kvcache_config = KvCacheConfig(
 
 global_kvcache_config_prompt_logprobs = KvCacheConfig(
     max_tokens=10000,
-    # block reuse is disabled for prompt logprobs
+    # FIXME: block reuse is disabled for prompt logprobs
     # because prompt logprobs are computed from context logits
     # and context logits may not be calculated when using block reuse
     # See https://nvbugs/5577178
@@ -401,22 +402,96 @@ def test_sampled_token_always_in_prompt_logprobs(logprobs_k: int, simple_llm: LL
                         f"but last token is ID={sorted_tokens_by_prob[-1][0]}"
                     )
 
-            for rank_idx, (token_id, logprob_obj) in enumerate(sorted_tokens_by_prob, start=1):
-                token_text = simple_llm.tokenizer.decode([token_id])
-                is_sampled = "← SAMPLED" if token_id == sampled_token_id else ""
-                print(
-                    f"    • Token {token_id:5d} ({token_text:15s}): "
-                    f"logprob={logprob_obj.logprob:8.4f}, "
-                    f"rank={logprob_obj.rank} {is_sampled}"
+        print(f"{'=' * 80}\n")
+
+
+@pytest.mark.parametrize("logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
+@pytest.mark.parametrize("prompt_logprobs_k", [None, 0, 3], ids=["None", "top_0", "top_3"])
+@pytest.mark.threadleak(enabled=False)
+def test_logprobs_against_logits(
+    logprobs_k: int | None, prompt_logprobs_k: int | None, simple_llm: LLM
+):
+    """
+    Test combination of logprobs and prompt_logprobs against manually calculated log probabilities from logits
+    """
+
+    sampling_params = SamplingParams(
+        max_tokens=8,
+        logprobs=logprobs_k,
+        prompt_logprobs=prompt_logprobs_k,
+        return_generation_logits=True,
+        return_context_logits=True,
+    )
+
+    def check_logprobs(
+        num_logprobs: int,
+        tokens: list[int],
+        logprobs: TokenLogprobs,
+        logits_cuda: torch.Tensor,
+        case_str: str,
+    ):
+        """Checks if the provided logprobs match the logprobs calculated from the logits"""
+        expected_logprobs = torch.nn.functional.log_softmax(logits_cuda, dim=-1).to(device="cpu")
+        sorted_expected_logprobs = torch.sort(expected_logprobs, descending=True, dim=-1)[0]
+        for token_idx, token_logprobs in enumerate(logprobs):
+            expected_logprobs_per_token = expected_logprobs[token_idx]
+            sorted_expected_logprobs_per_token = sorted_expected_logprobs[token_idx]
+            # For each rank store the corresponding logprob to ensure that shared ranks have the same logprob
+            processed_ranks_and_logprobs: dict[int, float] = {}
+            for token_id, logprob_obj in token_logprobs.items():
+                # the sampled token may have any rank > 0
+                if token_id != tokens[token_idx]:
+                    # All other tokens should have a rank <= num_logprobs
+                    assert logprob_obj.rank <= num_logprobs, (
+                        f"{case_str} logprob rank is greater than {num_logprobs}"
+                    )
+                assert logprob_obj.rank >= 1, f"{case_str} logprob rank is smaller than 1"
+
+                # Shared ranks should have the same logprob
+                if logprob_obj.rank in processed_ranks_and_logprobs:
+                    assert processed_ranks_and_logprobs[logprob_obj.rank] == logprob_obj.logprob, (
+                        f"Objects with the same rank {logprob_obj.rank} have different logprobs \
+                            {processed_ranks_and_logprobs[logprob_obj.rank]} vs {logprob_obj.logprob}"
+                    )
+                else:
+                    processed_ranks_and_logprobs[logprob_obj.rank] = logprob_obj.logprob
+
+                # Check if the logprob matches the top-rank logprob from the logits
+                assert (
+                    logprob_obj.logprob == sorted_expected_logprobs_per_token[logprob_obj.rank - 1]
+                ), (
+                    f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
+                        {sorted_expected_logprobs_per_token[logprob_obj.rank - 1]} at rank {logprob_obj.rank}"
+                )
+                # Check if the logprob matches the token-id logprob from the logits
+                assert logprob_obj.logprob == expected_logprobs_per_token[token_id], (
+                    f"Returned {case_str} logprob {logprob_obj.logprob} does not match expected logprob \
+                        {expected_logprobs_per_token[token_id]} for token {token_id}"
                 )
 
-                if logprobs_k > 0 and sampled_in_topk:
-                    assert logprob_obj.rank == rank_idx, (
-                        f"Token {token_idx}: Token {token_id} rank mismatch. "
-                        f"Expected rank {rank_idx} (by sorted position), got {logprob_obj.rank}"
-                    )
-
-        print(f"{'=' * 80}\n")
+    for output in simple_llm.generate(["The future of AI is"], sampling_params=sampling_params):
+        if logprobs_k is not None:
+            generation_tokens = output.outputs[0].token_ids
+            generation_logprobs = output.outputs[0].logprobs
+            generation_logits = output.outputs[0].generation_logits.to(device="cuda")
+            check_logprobs(
+                logprobs_k,
+                generation_tokens,
+                generation_logprobs,
+                generation_logits,
+                "generation",
+            )
+        if prompt_logprobs_k is not None:
+            context_tokens = output.prompt_token_ids
+            context_logprobs = output.outputs[0].prompt_logprobs
+            context_logits = output.context_logits.to(device="cuda")
+            check_logprobs(
+                prompt_logprobs_k,
+                context_tokens,
+                context_logprobs,
+                context_logits,
+                "context",
+            )
 
 
 @pytest.mark.parametrize("logprobs_k", [0, 2], ids=["top_0", "top_2"])
@@ -489,68 +564,6 @@ def test_logprobs_with_grouped_samplings_strategies(logprobs_k: int, simple_llm:
             returned_logprob = token_logprobs_dict[sampled_token_id].logprob
 
             logits_for_token = generation_logits[token_idx]
-            expected_logprobs = torch.nn.functional.log_softmax(logits_for_token, dim=-1).to(
-                device="cpu"
-            )
-            expected_logprob = expected_logprobs[sampled_token_id].item()
-            print(
-                f"Req {req_idx}, Token {token_idx}: returned={returned_logprob:.6f}, expected={expected_logprob:.6f}"
-            )
-            torch.testing.assert_close(returned_logprob, expected_logprob)
-
-
-@pytest.mark.parametrize("logprobs_k", [None, 0, 2], ids=["None", "top_0", "top_2"])
-@pytest.mark.threadleak(enabled=False)
-def test_prompt_logprobs_against_logits(logprobs_k: int | None, simple_llm: LLM):
-    """Test prompt_logprobs against manually calculated log probabilities from context_logits"""
-
-    test_prompts = [
-        "The capital of France is",
-        "The future of AI is",
-        "Hello, my name is",
-        "Hello, my name is",
-        "Write a short story about a cat",
-    ]
-
-    # Prompt logprobs are not calculated by the sampler.
-    # Therefore, a single SamplingParams object is used for all requests.
-    sampling_params = SamplingParams(
-        max_tokens=6,
-        temperature=0.8,
-        top_k=50,
-        prompt_logprobs=logprobs_k,
-        return_context_logits=True,  # required for checking prompt_logprobs
-    )
-
-    outputs = list(simple_llm.generate(test_prompts, sampling_params=sampling_params))
-
-    for req_idx, output in enumerate(outputs):
-        assert output.context_logits is not None
-        context_logits = output.context_logits.to(device="cuda")
-        token_ids = output.prompt_token_ids
-        prompt_logprobs = output.outputs[0].prompt_logprobs
-        if sampling_params.prompt_logprobs is None:
-            # Prompt logprobs defaults to an empty list if not requested
-            assert prompt_logprobs is not None
-            assert len(prompt_logprobs) == 0
-            continue
-
-        # Check valid prompt_logprobs values
-        assert sampling_params.prompt_logprobs is not None
-
-        assert context_logits is not None
-        assert prompt_logprobs is not None
-        assert len(prompt_logprobs) == len(token_ids), "Logprobs length mismatch"
-
-        # context_logits might be shorter than token_ids
-        num_logits = len(context_logits)
-
-        for token_idx, (sampled_token_id, token_logprobs_dict) in enumerate(
-            zip(token_ids[:num_logits], prompt_logprobs[:num_logits])
-        ):
-            returned_logprob = token_logprobs_dict[sampled_token_id].logprob
-
-            logits_for_token = context_logits[token_idx]
             expected_logprobs = torch.nn.functional.log_softmax(logits_for_token, dim=-1).to(
                 device="cpu"
             )
