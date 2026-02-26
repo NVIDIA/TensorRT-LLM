@@ -881,8 +881,7 @@ def collectTestResults(pipeline, testFilter, globalVars)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
-        // TODO: CI TEST MODE - Force tag update stage to run in non-PostMerge jobs
-        if (env.JOB_NAME ==~ /.*PostMerge.*/ || true) {
+        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
             stage("Update GitHub Tag") {
                 // Wrap in catchError to ensure tag update failures don't fail the pipeline
                 catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
@@ -1340,7 +1339,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
  */
 def updateGithubTagCommit(pipeline, globalVars) {
     // Only update tag for post-merge builds
-    if (!(env.JOB_NAME ==~ /.*PostMerge.*/ || true)) { // TODO: CI TEST MODE - Force tag update for pre-merge builds
+    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
         echo "Not a PostMerge build - skipping tag update"
         return false
     }

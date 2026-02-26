@@ -104,7 +104,6 @@ def validate_downstream_job_durations(downstream_durations):
             log(f"  - {issue}")
         log("")
         log("Cannot update tag: Required jobs missing or failed too quickly")
-        return True  # TODO: CI TEST MODE - Return True to skip validation
         return False
 
     log(
@@ -480,9 +479,6 @@ def create_github_tag(
 
     Returns True on success.
     """
-    commit_sha = (
-        "c53b8fc2f15086eb0ff6362c502f0d2ad3aca98b"  # TODO: CI TEST MODE - Hardcode commit SHA
-    )
     tag_name = f"latest-ci-stable-commit-{target_branch}"
     tag_message = f"Post-merge tests passed for branch {target_branch}"
 
@@ -531,8 +527,7 @@ def main() -> int:
         return 1
 
     # Only support post-merge builds (triggered by GitLab mirror)
-    # TODO: CI TEST MODE - Allow pre-merge builds for testing
-    if "PostMerge" not in args.job_name and False:  # Set to True to enable test mode
+    if "PostMerge" not in args.job_name:
         log("ERROR: This script only supports post-merge builds")
         return 1
 
@@ -577,7 +572,7 @@ def main() -> int:
     # Step 3: Check if only post-merge tests failed
     if not are_all_failures_post_merge(failed_stages):
         log(f"❌ Found pre-merge failures: {', '.join(failed_stages)}")
-        # return 1  # TODO: CI TEST MODE - Skip pre-merge failure check
+        return 1
 
     # All checks passed → create tag
     log("✓ Only post-merge failures detected - updating tag")
