@@ -413,11 +413,18 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
 
 
 def get_weight_node(node: Node) -> Node:
-    """Get the primary weight node for a compute node."""
+    """Get the primary weight node for a compute node.
+
+    When the node itself is a bias get_attr node (i.e. extract_weight_nodes
+    puts it into .biases rather than .weights), return the bias node so that
+    num_users_of_weight_node gives the correct user count instead of 0.
+    """
     weight_nodes = extract_weight_nodes(node)
-    if len(weight_nodes.weights) == 0:
-        raise ValueError(f"Node {node.name} has no weight")
-    return weight_nodes.weights[0].node
+    if len(weight_nodes.weights) > 0:
+        return weight_nodes.weights[0].node
+    if len(weight_nodes.biases) > 0:
+        return weight_nodes.biases[0].node
+    raise ValueError(f"Node {node.name} has no weight or bias")
 
 
 def num_users_of_weight_node(node: Node) -> int:

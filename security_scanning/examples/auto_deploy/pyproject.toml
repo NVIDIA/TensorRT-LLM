@@ -7,7 +7,6 @@ authors = [
 ]
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "ai-edge-model-explorer (>=0.1.14)",
     "lm-eval[api] (==0.4.5)"
 ]
 
