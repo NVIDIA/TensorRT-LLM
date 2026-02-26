@@ -15,7 +15,7 @@ import re
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, List, Tuple
+from typing import Any, Dict, List, Tuple
 
 
 def extract_isolation_markers(test_db_list: Path) -> Tuple[List[str], List[str]]:
@@ -185,7 +185,7 @@ def main() -> None:
     print(f"Created {isolate_list} with {len(shard_isolated)} isolated tests")
 
     # Output results in key=value format for Groovy parsing
-    result: dict[str, Any] = {
+    result: Dict[str, Any] = {
         "REGULAR_TEST_LIST": str(regular_list),
         "ISOLATE_TEST_LIST": str(isolate_list),
         "REGULAR_COUNT": len(shard_regular),

@@ -54,7 +54,8 @@ def main():
     # Prepare base command tokens
     base_tokens = shlex.split(base_cmd)
 
-    defs_cwd = llm_src.rstrip("/") + "/tests/integration/defs"
+    defs_cwd = llm_src / "tests" / "integration" / "defs"
+    defs_cwd = str(defs_cwd)
     any_failed = False
     failed_tests = []
 
