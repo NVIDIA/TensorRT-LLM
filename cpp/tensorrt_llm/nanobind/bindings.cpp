@@ -232,7 +232,7 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_static("create_lora_modules", &tr::LoraModule::createLoraModules, nb::arg("lora_module_names"),
             nb::arg("hidden_size"), nb::arg("mlp_hidden_size"), nb::arg("num_attention_heads"),
             nb::arg("num_kv_attention_heads"), nb::arg("attention_head_size"), nb::arg("tp_size") = 1,
-            nb::arg("num_experts") = 0);
+            nb::arg("num_experts") = 0, nb::arg("shared_expert_hidden_size") = 0, nb::arg("moe_hidden_size") = 0);
 
     nb::class_<tc::QuantMode>(m, "QuantMode")
         .def_static("none", &tc::QuantMode::none)

@@ -154,9 +154,25 @@ def iterate_hf_lora(
             hf_module = m.group(3) + "." + module_name
         if hf_module not in hf_modules:
             hf_module = module_name
-            assert hf_module in hf_modules, (
-                f"hf_module {hf_module} is not in supported list {hf_modules}"
-            )
+
+            # If module_name contains dots (e.g., "shared_expert.down_proj"),
+            # extract just the final component (e.g., "down_proj")
+            if hf_module not in hf_modules and "." in hf_module:
+                final_component = hf_module.split(".")[-1]
+                if final_component in hf_modules:
+                    hf_module = final_component
+
+            if hf_module not in hf_modules:
+                # Skip modules not in the supported mapping (only log once per module type)
+                if hf_module not in getattr(iterate_hf_lora, "_warned_modules", set()):
+                    logger.warning(
+                        f"Skipping unsupported LoRA module '{hf_module}'. "
+                        f"LoRA weights for this module will be ignored."
+                    )
+                    if not hasattr(iterate_hf_lora, "_warned_modules"):
+                        iterate_hf_lora._warned_modules = set()
+                    iterate_hf_lora._warned_modules.add(hf_module)
+                continue  # Skip this module
 
         is_lora_a_or_b = m.group(8) is not None
         if is_lora_a_or_b:
@@ -658,6 +674,9 @@ class LoraManager(object):
         "moe_router": 16,
         "mlp_router": 17,
         "mlp_gate_up": 18,
+        "shared_expert_h_to_4h": 19,
+        "shared_expert_4h_to_h": 20,
+        "shared_expert_gate": 21,
     }
 
     def __init__(
