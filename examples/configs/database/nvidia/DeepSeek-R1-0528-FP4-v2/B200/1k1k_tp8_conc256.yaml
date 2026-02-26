@@ -1,6 +1,6 @@
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 512
+  max_batch_size: 256
 enable_attention_dp: true
 print_iter_log: true
 kv_cache_config:
@@ -17,5 +17,5 @@ tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true
 backend: pytorch
-max_num_tokens: 1344
+max_num_tokens: 2176
 max_seq_len: 2068

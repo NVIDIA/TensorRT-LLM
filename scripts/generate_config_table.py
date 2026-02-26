@@ -48,6 +48,10 @@ MODEL_INFO = {
         "display_name": "gpt-oss-120b",
         "url": "https://huggingface.co/openai/gpt-oss-120b",
     },
+    "Qwen/Qwen3-235B-A22B": {
+        "display_name": "Qwen3-235B-A22B",
+        "url": "https://huggingface.co/Qwen/Qwen3-235B-A22B",
+    },
 }
 
 

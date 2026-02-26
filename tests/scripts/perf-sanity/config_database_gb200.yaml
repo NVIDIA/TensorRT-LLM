@@ -1,0 +1,618 @@
+server_configs:
+- name: Qwen_Qwen3_235B_A22B_1024_1024_conc1_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 2068
+  client_configs:
+  - name: con1_isl1024_osl1024
+    concurrency: 1
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_1024_conc2_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 2068
+  client_configs:
+  - name: con2_isl1024_osl1024
+    concurrency: 2
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_1024_conc8_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 2068
+  client_configs:
+  - name: con8_isl1024_osl1024
+    concurrency: 8
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_1024_conc16_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 2068
+  client_configs:
+  - name: con16_isl1024_osl1024
+    concurrency: 16
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_1024_conc128_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 2068
+  client_configs:
+  - name: con128_isl1024_osl1024
+    concurrency: 128
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_1024_conc2048_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 2068
+  client_configs:
+  - name: con2048_isl1024_osl1024
+    concurrency: 2048
+    iterations: 10
+    isl: 1024
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc1_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con1_isl1024_osl8192
+    concurrency: 1
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc2_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con2_isl1024_osl8192
+    concurrency: 2
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc16_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con16_isl1024_osl8192
+    concurrency: 16
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc4_gpu1
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 1
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 1
+  moe_expert_parallel_size: 1
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con4_isl1024_osl8192
+    concurrency: 4
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc32_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 256
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con32_isl1024_osl8192
+    concurrency: 32
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc256_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 256
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con256_isl1024_osl8192
+    concurrency: 256
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_1024_8192_conc2048_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 256
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8192
+  max_seq_len: 9416
+  client_configs:
+  - name: con2048_isl1024_osl8192
+    concurrency: 2048
+    iterations: 10
+    isl: 1024
+    osl: 8192
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_8192_1024_conc1_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 10304
+  max_seq_len: 9416
+  client_configs:
+  - name: con1_isl8192_osl1024
+    concurrency: 1
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_8192_1024_conc2_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 10304
+  max_seq_len: 9416
+  client_configs:
+  - name: con2_isl8192_osl1024
+    concurrency: 2
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_8192_1024_conc8_gpu4
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 4
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 4
+  moe_expert_parallel_size: 4
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 10304
+  max_seq_len: 9416
+  client_configs:
+  - name: con8_isl8192_osl1024
+    concurrency: 8
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_8192_1024_conc16_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: false
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 10304
+  max_seq_len: 9416
+  client_configs:
+  - name: con16_isl8192_osl1024
+    concurrency: 16
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_8192_1024_conc128_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 256
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: TRTLLM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8768
+  max_seq_len: 9416
+  client_configs:
+  - name: con128_isl8192_osl1024
+    concurrency: 128
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: Qwen_Qwen3_235B_A22B_8192_1024_conc2048_gpu8
+  model_name: qwen3_235b_a22b_fp4
+  gpus: 8
+  match_mode: scenario
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 256
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.8
+    enable_block_reuse: false
+  stream_interval: 10
+  moe_config:
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  backend: pytorch
+  max_num_tokens: 8768
+  max_seq_len: 9416
+  client_configs:
+  - name: con2048_isl8192_osl1024
+    concurrency: 2048
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
