@@ -1369,13 +1369,9 @@ class PyExecutor:
                                 scheduled_batch, guided_decoder_failed_requests)
 
                             self._update_request_states(scheduled_batch)
-                            for request in scheduled_batch.generation_requests:
-                                if not self.disable_overlap_scheduler:
-                                    if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
-                                    ):
-                                        request.set_exclude_last_generation_logits(
-                                            False)
-                                        request.state = LlmRequestState.GENERATION_TO_COMPLETE
+                            if not self.disable_overlap_scheduler:
+                                self._update_generation_requests_that_will_complete_next_iteration(
+                                    scheduled_batch.generation_requests)
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -2190,11 +2186,8 @@ class PyExecutor:
                 # If set before, the response of a request may be incorrect, as it will
                 # use the wrong indices for generation logits when streaming is enabled.
                 if can_queue:
-                    for request in scheduled_batch.generation_requests:
-                        if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
-                        ):
-                            request.set_exclude_last_generation_logits(False)
-                            request.state = LlmRequestState.GENERATION_TO_COMPLETE
+                    self._update_generation_requests_that_will_complete_next_iteration(
+                        scheduled_batch.generation_requests)
 
                 if can_queue:
                     if self.enable_iter_perf_stats:
@@ -3016,6 +3009,19 @@ class PyExecutor:
                 f"Encountered an error in forward function: {error_msg}")
             self._handle_errors(error_msg)
             return None
+
+    def _update_generation_requests_that_will_complete_next_iteration(
+            self, generation_requests: list[LlmRequest]):
+        """ Update the generation requests that will complete next iteration.
+
+        If overlap scheduling is enabled, we need update the state of generation requests that will complete next iteration
+        and adjust the exclude_last_generation_logits flag accordingly.
+        """
+        for request in generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
+            ):
+                request.set_exclude_last_generation_logits(False)
+                request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
