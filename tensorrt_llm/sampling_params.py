@@ -188,7 +188,8 @@ class SamplingParams:
         logprobs (int, optional): Number of log probabilities to return per output token. When set to 0, return only the sampled token's log probability.
                                   When set to K>0, return top-K log probabilities + the sampled token's log probability (last entry) if it's not in the Top-K. Defaults to None.
         logprobs_mode (LogprobMode): The mode of log probabilities to return. Defaults to LogprobMode.RAW.
-        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. Defaults to None.
+        prompt_logprobs (int, optional): Number of log probabilities to return per prompt token. When set to 0, return only the actual prompt token's log probability.
+                                  When set to K>0, return top-K log probabilities + the actual prompt token's log probability (last entry) if it's not in the Top-K. Defaults to None.
         return_context_logits (bool): Controls if Result should contain the context logits. Defaults to False.
         return_generation_logits (bool): Controls if Result should contain the generation logits. Defaults to False.
         exclude_input_from_output (bool): Controls if output tokens in Result should include the input tokens. Defaults to True.
