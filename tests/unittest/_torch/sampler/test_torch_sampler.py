@@ -630,6 +630,7 @@ class TestFinishReasons:
             *,
             check_no_cuda_sync: bool = True,
             extra_context: Callable[[], ContextManager] | None = None,
+            expect_result: bool = True,
         ) -> UutProvider:
             @contextmanager
             def _uut_provider(is_warmup: bool) -> Generator[Callable[[], None], None, None]:
@@ -659,44 +660,51 @@ class TestFinishReasons:
                 seq_slots_host = torch.tensor(
                     [req.request.py_seq_slot for req in requests], device="cpu", dtype=torch.int64
                 )
-                seq_slots_device = seq_slots_host.to(device="cuda", non_blocking=True)
-                seq_lens = torch.tensor(
+                seq_slots_cuda = seq_slots_host.to(device="cuda", non_blocking=True)
+                seq_lens_cuda = torch.tensor(
                     [req.request.max_beam_num_tokens for req in requests],
                     dtype=torch.int32,
                     device="cuda",
                 )
-                new_tokens = torch.tensor(
+                new_tokens_cuda = torch.tensor(
                     [req.new_tokens for req in requests], dtype=torch.int32, device="cuda"
                 ).T
-                sampler.store.new_tokens[:, seq_slots_device, cls.BEAM] = new_tokens
-                num_accepted_tokens, stop_word_indices, single_token_stop_words_only = (
-                    sampler._finish_reasons_handler._prepare_stop_word_handling_for_finish_reasons(
-                        seq_slots_host,
-                        torch.zeros((0,), dtype=torch.bool),
-                    )
-                )
+                sampler.store.new_tokens[:, seq_slots_cuda, cls.BEAM] = new_tokens_cuda
+
+                is_draft_batch = False
+                is_last_context_chunk = torch.zeros((0,), dtype=torch.bool)
+                # Capture return value of write_finish_reasons for use after _uut() runs.
+                write_finish_reasons_result: list[torch.Tensor] = []
 
                 def _uut():
                     with extra_context() if extra_context is not None else nullcontext():
-                        sampler._finish_reasons_handler._write_finish_reasons(
-                            seq_slots=seq_slots_device,
-                            seq_lens=seq_lens,
-                            new_tokens=sampler.store.new_tokens,
-                            num_accepted_tokens=num_accepted_tokens,
-                            stop_word_indices=stop_word_indices,
-                            single_token_stop_words_only=single_token_stop_words_only,
+                        result = sampler._finish_reasons_handler.write_finish_reasons(
+                            seq_slots_host=seq_slots_host,
+                            is_draft_batch=is_draft_batch,
+                            is_last_context_chunk=is_last_context_chunk,
+                            seq_slots_cuda=seq_slots_cuda,
+                            seq_lens_cuda=seq_lens_cuda,
+                            new_tokens_cuda=sampler.store.new_tokens,
+                            first_finish_reasons_cuda=None,
                         )
+                        write_finish_reasons_result.append(result)
 
                 yield _uut
 
-                reasons = finish_reasons_store.finish_reasons_cuda[
-                    :, seq_slots_device, cls.BEAM
-                ].T.tolist()
+                if not expect_result:
+                    assert len(write_finish_reasons_result) == 0, (
+                        f"Expected no results, got {len(write_finish_reasons_result)}"
+                    )
+                else:
+                    assert len(write_finish_reasons_result) > 0, "Expected results, got none"
+                    # write_finish_reasons_result[0] is the return value from write_finish_reasons.
+                    reasons = write_finish_reasons_result[0][:, seq_slots_cuda, cls.BEAM].T.tolist()
 
-                for actual, request in zip(reasons, requests, strict=True):
-                    expected = request.finish_reasons
-                    msg = f"actual={[FinishReason(reason) for reason in actual]} != expected={expected}\nFor {request}"
-                    assert actual == [reason.value for reason in expected], msg
+                    for actual, request in zip(reasons, requests, strict=True):
+                        expected = request.finish_reasons
+                        msg = f"actual={[FinishReason(reason) for reason in actual]} \
+                            != expected={expected}\nFor {request}"
+                        assert actual == [reason.value for reason in expected], msg
 
             return _uut_provider
 
@@ -818,6 +826,7 @@ class TestFinishReasons:
                 ),
             ],
             extra_context=lambda: raising_stop_words_ctx(True),
+            expect_result=False,
         )
         run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 
@@ -863,6 +872,7 @@ class TestFinishReasons:
                 )
             ],
             extra_context=lambda: raising_single_token_stop_words_ctx(True),
+            expect_result=False,
         )
         run_test_with_warmup(uut_provider_with_stop_words, max_sync_s=0.5)
 

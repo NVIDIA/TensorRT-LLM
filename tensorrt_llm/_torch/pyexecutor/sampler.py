@@ -1158,16 +1158,16 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """Shape: batch_size
             Usage: Stores the end ids for each request"""
             stop_words_cuda: torch.Tensor
-            """ Shape: [max_num_stop_words, max_stop_word_length, batch_size]
+            """Shape: [max_num_stop_words, max_stop_word_length, batch_size]
             Usage: Stores the stop words for each request as a padded tensor."""
             past_tokens_cuda: torch.Tensor
-            """ Shape: [max_stop_word_length,batch_size, beam_width]
+            """Shape: [max_stop_word_length,batch_size, beam_width]
             Usage: Stores the last max_stop_word_length tokens for each beam."""
             max_stop_word_lengths_host: torch.Tensor
-            """ Shape: [batch_size]
+            """Shape: [batch_size]
             Usage: Stores the size of the longest stop word for each request."""
             num_accepted_draft_tokens_host: torch.Tensor
-            """ Shape: [batch_size]
+            """Shape: [batch_size]
             Usage: Stores the number of accepted tokens for each request."""
 
         def __init__(
@@ -1395,15 +1395,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             need to be re-processed.
 
             Args:
-                seq_slots_cuda: The sequence slots of the processed requests. Used to determine where to
-                  read and write from the finish_reasons and new_tokens buffers on the device.
+                seq_slots_cuda: The sequence slots of the processed requests. Used for accessing device buffers.
                   Shape: [len(requests)]
                 max_lengths_cuda: The maximum lengths for each request.
                   Shape: [len(requests)]
                 end_ids_cuda: The end ids for each request.
                   Shape: [len(requests)]
-                seq_slots_host: The sequence slots of the processed requests. Used to determine where to
-                  read and write from the finish_reasons and new_tokens buffers on the host.
+                seq_slots_host: The sequence slots of the processed requests. Used for accessing host buffers.
                   Shape: [len(requests)]
                 scheduled_requests: The scheduled requests. Only used if a resize of the stop words
                   related buffers is necessary
@@ -1462,9 +1460,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             Args:
                 scheduled_requests: The scheduled requests.
             Returns:
-                stop_words_cuda_list: A list of device tensors containing the top words per request with stop words.
+                stop_words_cuda_list: A list of device tensors containing the stop words per request with stop words.
                 past_tokens_cuda_list: A list of device tensors containing the past tokens per request with stop words.
-                stop_word_seq_slots: A list of host tensors containing the sequence slots per request with stop words.
+                stop_word_seq_slots: A list of sequence slot indices (int) per request with stop words.
             """
             stop_words_cuda_list: list[torch.Tensor] = []
             past_tokens_cuda_list: list[torch.Tensor] = []
@@ -1494,8 +1492,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 scheduled_requests: The scheduled requests.
                 total_max_length: The maximum length of the stop words in this batch.
                 total_max_num_stop_words: The maximum number of stop words of a request in this batch.
-                stop_words_cuda_list: A list of device tensors containing the top words per request with stop words.
+                stop_words_cuda_list: A list of device tensors containing the stop words per request with stop words.
                 past_tokens_cuda_list: A list of device tensors containing the past tokens per request with stop words.
+                stop_word_seq_slots: Sequence slot index (int) per request with stop words;
+                  same order as the lists above.
             """
             # Potentially resize the buffers and update
             # stop_words, past_tokens and stop_word_seq_slots
@@ -1545,9 +1545,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
 
             Args:
-                stop_words_list: A List of two lists containing stop words information. The first list contains the
-                  tokens of the stop_sequences the second list contains the prefix sum of the
-                  stop word lengths.
+                stop_words_list: A list of two lists: the first contains the token ids of all stop sequences
+                  (concatenated); the second contains the cumulative lengths (prefix sum) of the stop word lengths.
 
             Returns:
                 stop_words: A padded device tensor containing the stop words
@@ -1617,15 +1616,42 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def write_finish_reasons(
             self,
             seq_slots_host: torch.Tensor,
+            is_draft_batch: bool,
             is_last_context_chunk: torch.Tensor,
             seq_slots_cuda: torch.Tensor,
             seq_lens_cuda: torch.Tensor,
             new_tokens_cuda: torch.Tensor,
             first_finish_reasons_cuda: torch.Tensor | None = None,
         ) -> torch.Tensor:
+            """Calculates the finish reasons for each request and returns the finish reasons tensor.
+
+            Prepares stop word handling for each requests and processes all newly generated tokens
+            per request to determine if any finish reason is met. Returns the device finish reasons
+            tensor from the store, which is updated with the calculated finish reason for each newly
+            generated token.
+
+            Args:
+                seq_slots_host: The sequence slots of the processed requests. Used to determine which
+                requests need stop word processing on the host.
+                  Shape: [len(requests)]
+                is_draft_batch: Whether the batch consists of draft requests.
+                is_last_context_chunk: A mask of context requests that are the last context chunk.
+                  Shape: [len(context_requests)]
+                seq_slots_cuda: The sequence slots of the processed requests. Used for accessing device buffers.
+                  Shape: [len(requests)]
+                seq_lens_cuda: The sequence lengths of the processed requests.
+                  Shape: [len(requests)]
+                new_tokens_cuda: A buffer containing the newly generated tokens.
+                  Shape: [max_tokens, max_batch_size, max_beam_width]
+                first_finish_reasons_cuda: The first finish reason of each beam. Used only for beam search.
+                  Shape: [max_batch_size, max_beam_width]
+            Returns:
+                finish_reasons_cuda: The finish reasons tensor.
+                  Shape: [max_tokens, max_batch_size, max_beam_width]
+            """
             num_accepted_tokens_cuda, stop_word_indices_cuda, single_token_stop_words_only = (
                 self._prepare_stop_word_handling_for_finish_reasons(
-                    seq_slots_host, is_last_context_chunk
+                    seq_slots_host, is_draft_batch, is_last_context_chunk
                 )
             )
             self._write_finish_reasons(
@@ -1642,14 +1668,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         def _prepare_stop_word_handling_for_finish_reasons(
             self,
             seq_slots_host: torch.Tensor,
+            is_draft_batch: bool,
             is_last_context_chunk_host: torch.Tensor,
         ) -> tuple[torch.Tensor | int | None, torch.Tensor | None, bool]:
             """Prepare stop word handling for finish reasons.
 
             Args:
-                seq_slots_host: The sequence slots of the processed requests. Used to determine where to
-                  read and write from the finish_reasons and new_tokens buffers.
+                seq_slots_host: The sequence slots of the processed requests. Used for accessing host buffers.
                   Shape: [len(requests)]
+                is_draft_batch: Whether the batch consists of draft requests.
                 is_last_context_chunk_host: A mask of context requests that are the last context chunk.
                   Shape: [len(context_requests)]
             Returns:
@@ -1661,16 +1688,26 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """
             # Filter all requests, that have stop words
             store = self.store
-            stop_word_mask = store.max_stop_word_lengths_host[seq_slots_host] > 0
-            # NB: draft_mask_host and is_last_context_chunk_host are workarounds
-            # as draft requests and chunked context requests can be in the sampler
-            # without having setup a slot in the FinishReasonsHandler.
-            # These can be removed once this can be avoided.
-            stop_word_mask[: is_last_context_chunk_host.shape[0]] &= is_last_context_chunk_host
-            batch_has_stop_words = stop_word_mask.any()
             num_accepted_tokens_cuda: torch.Tensor | int | None = None
             stop_word_indices_cuda: torch.Tensor | None = None
             single_token_stop_words_only: bool = False
+
+            # NB: is_draft_batch and is_last_context_chunk_host are workarounds
+            # as draft requests and chunked context requests can be in the sampler
+            # without having setup a slot in the FinishReasonsHandler.
+            # These can be removed once this can be avoided.
+            if is_draft_batch:
+                # Do not process stop words for draft requests
+                return (
+                    num_accepted_tokens_cuda,
+                    stop_word_indices_cuda,
+                    single_token_stop_words_only,
+                )
+
+            stop_word_mask = store.max_stop_word_lengths_host[seq_slots_host] > 0
+            stop_word_mask[: is_last_context_chunk_host.shape[0]] &= is_last_context_chunk_host
+            batch_has_stop_words = stop_word_mask.any()
+
             if batch_has_stop_words:
                 num_accepted_tokens_cuda = 1
                 # Only calculate num_accepted_tokens from the accepted draft tokens if speculative decoding is enabled
@@ -1710,8 +1747,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             Later finish reasons overwrite earlier ones, in reverse precedence order.
 
             Args:
-                seq_slots: The sequence slots of the processed requests. Used to determine where to
-                  read and write from the finish_reasons and new_tokens buffers.
+                seq_slots: The sequence slots of the processed requests. Used for accessing device buffers.
                   Shape: [len(requests)]
                 seq_lens: The sequence lengths of the processed requests.
                   Shape: [len(requests)]
@@ -1832,8 +1868,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """Checks if the tokens are stop words
 
             Args:
-                seq_slots: The sequence slots of the processed requests. Used to determine where to
-                  read and write from the finish_reasons and new_tokens buffers.
+                seq_slots: The sequence slots of the processed requests. Used for accessing device buffers.
                   Shape: [len(requests)]
                 tokens: A buffer containing the newly generated tokens.
                   Shape: [max_tokens, len(requests), max_beam_width]
@@ -1918,8 +1953,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """Checks if the tokens are stop words (single token per stop word only)
 
             Args:
-                seq_slots: The sequence slots of the processed requests. Used to determine where to
-                  read and write from the finish_reasons and new_tokens buffers.
+                seq_slots: The sequence slots of the processed requests. Used for accessing device buffers.
                   Shape: [len(requests)]
                 tokens: A buffer containing the newly generated tokens.
                   Shape: [max_tokens, len(requests), max_beam_width]
@@ -2566,7 +2600,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """Setup the sampler step for the requests
 
         Args:
-            requests: list[LlmRequest]. The requests to setup the sampler step for
+            scheduled_requests: The scheduled requests to set up the sampler step for.
         """
         # Used for all store updates
         seq_slots: list[int] = []
@@ -3300,32 +3334,27 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store = self.store.beam_search_store
         assert self._use_beam_search == (beam_search_store is not None)
         # Prepare stop word handling
-        # Draft requests need to be ignored for stop word handling as they never setup
+        # Draft requests need to be ignored for stop word handling as they never set up
         # their buffers in the store.
-        # Assume that either all requests are drafts or None are drafts
-        if len(requests) > 0 and not requests[0].py_is_draft:
-            # Only context requests at their last chunk are setup and should be considered for stop word handling
-            is_last_context_chunk = torch.tensor(
-                [r.is_last_context_chunk for r in scheduled_requests.context_requests],
-                dtype=torch.bool,
-            )
-            finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
-                seq_slots_host=seq_slots_host,
-                is_last_context_chunk=is_last_context_chunk,
-                seq_slots_cuda=seq_slots_cuda,
-                seq_lens_cuda=seq_lens_cuda,
-                new_tokens_cuda=new_tokens,
-                first_finish_reasons_cuda=(
-                    beam_search_store.first_finish_reasons
-                    if beam_search_store is not None
-                    else None
-                ),
-            )
-            finish_reasons_host = self._copy_to_host(finish_reasons_device)
-        else:
-            finish_reasons_host = self._copy_to_host(
-                self._finish_reasons_handler.store.finish_reasons_cuda
-            )
+        # Assume that either all requests are drafts or none are drafts
+        is_draft_batch = requests[0].py_is_draft
+        # Only context requests at their last chunk are setup and should be considered for stop word handling
+        is_last_context_chunk = torch.tensor(
+            [r.is_last_context_chunk for r in scheduled_requests.context_requests],
+            dtype=torch.bool,
+        )
+        finish_reasons_device = self._finish_reasons_handler.write_finish_reasons(
+            seq_slots_host=seq_slots_host,
+            is_draft_batch=is_draft_batch,
+            is_last_context_chunk=is_last_context_chunk,
+            seq_slots_cuda=seq_slots_cuda,
+            seq_lens_cuda=seq_lens_cuda,
+            new_tokens_cuda=new_tokens,
+            first_finish_reasons_cuda=(
+                beam_search_store.first_finish_reasons if beam_search_store is not None else None
+            ),
+        )
+        finish_reasons_host = self._copy_to_host(finish_reasons_device)
 
         beam_history_builders = None
         if self._use_beam_search:
