@@ -24,9 +24,9 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
-| Serve model | `trtllm-serve --model <hf_model> --port 8000` |
-| Serve with config | `trtllm-serve --model <hf_model> --config config.yaml` |
-| Benchmark | `trtllm-bench --model <hf_model> --dataset_path <path>` |
+| Serve model | `trtllm-serve <hf_model> --port 8000` |
+| Serve with config | `trtllm-serve <hf_model> --config config.yaml` |
+| Benchmark | `trtllm-bench --model <hf_model> throughput --dataset <path>` |
 | Find CI stage for test | `python scripts/test_to_stage_mapping.py --tests "test_name"` |
 
 ### Installation & Build
@@ -102,6 +102,7 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **Python import style is enforced** — `from package.subpackage import module`, never `from module import Class`. Pre-commit will not catch this.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
+- **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow
 

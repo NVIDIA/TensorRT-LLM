@@ -104,7 +104,7 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
+def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName, Boolean stageIsInterrupted) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
@@ -128,9 +128,13 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
-                sh "ls -al ${stageName}/"
-                // Generate timeout test result xml if there are terminated unexpectedly tests
-                hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    sh "ls -al ${stageName}/"
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                }
             }
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
@@ -915,9 +919,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
+    def stageIsInterrupted = false
+
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
@@ -1174,6 +1181,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
@@ -1386,8 +1394,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             echo "Finished test stage execution."
         }
+    } catch (InterruptedException e) {
+        stageIsInterrupted = true
+        throw e
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName)
+        uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1614,8 +1625,12 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
-                // Generate timeout test result xml if there are terminated unexpectedly tests
-                generateTimeoutTestResultXml(pipeline, stageName)
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
@@ -2793,6 +2808,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
+                string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 usernamePassword(
                     credentialsId: 'svc_tensorrt_gitlab_read_api_token',
                     usernameVariable: 'GITLAB_API_USER',
@@ -2996,6 +3012,15 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
+    }
+
+    // Upload attribution files when they exist
+    def attrDir = "tensorrt_llm/cpp/build/attribution"
+    def wheelBase = wheelName.replace('.whl', '')
+    for (f in ["missing_files.json", "import_payload.json", "file_mappings.json"]) {
+        if (fileExists("${attrDir}/${f}")) {
+            trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
+        }
     }
 
     return wheelName

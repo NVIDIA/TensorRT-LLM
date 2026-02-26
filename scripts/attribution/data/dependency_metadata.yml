@@ -1,0 +1,100 @@
+cppzmq/v4.10.0:
+  license: bd784f7765275865fbdb1bcb522b3c0a
+  source: https://github.com/zeromq/cppzmq/tree/v4.10.0
+cpython/3.10.12:
+  license: 6b70c6504cc6568717ab251175a8699d
+cpython/3.12.3:
+  license: 6b70c6504cc6568717ab251175a8699d
+cpython/3.12.3-1ubuntu0.10:
+  license: 372bbae375b8828b3a20ea23c46c7ada
+cpython/3.12.3-1ubuntu0.9:
+  license: 372bbae375b8828b3a20ea23c46c7ada
+cublas/13.2.0.9-1:
+  license: 2c87cfab9e957b479ea6a78eb0216e3e
+cuda/13.1:
+  license: fea620923810592cdac232cf283cf62c
+cutlass/v4.2.1:
+  copyright: d947127725edf33c1500800079a57db6
+  license: d20f16a5b120b638d901622bcebaaacf
+cutlass/v4.3.0:
+  copyright: 501a1dd5925b22dbe66ce8f195440dec
+  license: 0d49472f2c1269d573d79e5603778a9f
+  source: https://github.com/NVIDIA/cutlass/tree/v4.3.0
+deep_ep/5be51b228a7c82dbdb213ea58e77bffd12b38af8:
+  license: 452b3ef002dc6ec283fb723f0dd84997
+  source: https://github.com/deepseek-ai/DeepEP/tree/5be51b228a7c82dbdb213ea58e77bffd12b38af8
+deepgemm/4ff3f54d9b7ed3129e4f36f9871232ea7ecab86b:
+  license: 452b3ef002dc6ec283fb723f0dd84997
+  source: https://github.com/deepseek-ai/DeepGEMM/tree/4ff3f54d9b7ed3129e4f36f9871232ea7ecab86b
+dlpack/v1.0:
+  license: cd9881918c97ec7b4962691660bb733e
+flashmla/1408756a88e52a25196b759eaf8db89d2b51b5a1:
+  license: 452b3ef002dc6ec283fb723f0dd84997
+  source: https://github.com/deepseek-ai/FlashMLA/tree/1408756a88e52a25196b759eaf8db89d2b51b5a1
+fmt/11.2.0-57-g553ec11e:
+  license: a0b1787992db284ce6c0cb61aa9e108f
+hedley/v3.12.0:
+  copyright: 94349394ce5f07a6fc28143558983279
+  license: e23c9c69cba7543a7479a24dc961a84e
+json/v3.12.0:
+  license: 079884642cc93615abc8f1d3d23c48c1
+  source: https://github.com/nlohmann/json/tree/v3.12.0
+libnuma/2.0.16-4.el8:
+  copyright: a71c7565a6ee7ecc9f3d493edbb22d0a
+  license: 6f979dbe9caceaac8680acfa684c834f
+mooncake/v0.3.7.post2:
+  license: 6ae7ec8c53625a28e72c6efd05db1642
+nanobind/a0ed2587f1089ef7657e2ed49ad6756b01c74e9f:
+  license: 79df324968e086693ff395c0aa33621f
+  source: https://github.com/wjakob/nanobind/tree/a0ed2587f1089ef7657e2ed49ad6756b01c74e9f
+nccl/2.28.9-1+cuda13.0:
+  license: 4298d3289e0199f28acd651c007e42fb
+nixl/0.8.0:
+  copyright: cb99251e73f1a5b0d1b0b8f439706f6c
+  license: bbeeb3b0c2f141b529675daf92632dc6
+nixl/0.9.0:
+  copyright: cb99251e73f1a5b0d1b0b8f439706f6c
+  license: bbeeb3b0c2f141b529675daf92632dc6
+numa/2.0.18-1ubuntu0.24.04.1:
+  license: 2bab525522185871b02a33e926ccdeae
+nvshmem/3.2.5.1:
+  license: 460c4479b2cedf74e86130e1eabaf453
+openmpi/4.1.1-5.el8:
+  license: 13640eac54a806316e436e666ef12a55
+openmpi/hpcx-2.25.1:
+  license: 70cd775803521351cd30d6ad46565b55
+picojson/v0.1.25:
+  copyright: 4d5c86a77cf89f124f49ab3080cfaef9
+  license: 900a5d79a846ce0e6d3615f60fef1053
+pybind11/f99ffd7e03001810a3e722bf48ad1a9e08415d7d:
+  license: 4167bc9126d6d28ae80bd81dd2352a41
+  source: https://github.com/pybind/pybind11/tree/f99ffd7e03001810a3e722bf48ad1a9e08415d7d
+rdma-core/48.0-1.el8:
+  copyright: 49ab001d3c3df4ce2070e10e05362582
+  license: eec97e837a0d52da36561c007217addc
+rdma-core/50.0-2ubuntu0.2:
+  license: 4c30c6f2038e5bb7fa56d509956f4187
+robin-map/v1.4.0:
+  license: 4b2ffa3f44ee005bc77967654efc7ef4
+tensorrt/10.14.1:
+  attribution: 3d6f1c5a5d39f490512aecda3308b671
+  license: 73272e698bb6e98cc54f28f871c764aa
+torch/2.10.0a0+b4e4ee81d3.nv25.12:
+  attribution: 48d075fc0e5fbb2ba08f86611b695294
+  license: 169131c8cef5eadb022ea205db4d2740
+torch/2.9.1+cu130:
+  attribution: 48d075fc0e5fbb2ba08f86611b695294
+  license: 77373b86cfc1cd5b85d571fa55dda65f
+ucx/1.20:
+  license: adc512c379af7740671ad8283090ee74
+ucxx/16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5:
+  license: 759cb066f14805ef4068f633d9071e1d
+  source: https://github.com/rapidsai/ucxx/tree/16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5
+xgrammar/v0.1.25:
+  copyright: 989a9441d689f61fba9f797cc253e51b
+  license: 8e1c96809a7467593130ecc62ae12be9
+zeromq/4.3.4-3.el8:
+  copyright: d6f49f46e6ba518129cd14268946dfc1
+  license: a89669f666e2b445210665d4523c04d6
+zeromq/4.3.5-1build2:
+  license: e920bef1781be7c5fdaeca506cfbf679

@@ -149,6 +149,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_mixed.yaml",
         "overlap":
         f"{test_configs_root}/disagg_config_overlap.yaml",
+        "overlap_transceiver_runtime_python":
+        f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml",
         "tool_calls":
         f"{test_configs_root}/disagg_config_overlap.yaml",
         "perf_metrics":
@@ -181,14 +183,16 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_ucx.yaml",
         "deepseek_v3_lite_fp8_nixl":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml",
+        "deepseek_v3_lite_fp8_transceiver_runtime_python":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_transceiver_runtime_python.yaml",
         "deepseek_v3_lite_fp8_tp1":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml",
         "deepseek_v3_lite_fp8_tp1_mtp":
         f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_one_mtp.yaml",
-        "deepseek_v3_lite_fp_8_overlap_dp":
-        f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite_overlap_dp.yaml",
         "deepseek_v3_lite_fp8_attention_dp":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml",
+        "deepseek_v3_lite_fp8_attention_dp_gen_only":
+        f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml",
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp_overlap.yaml",
         "deepseek_v3_lite_fp8_attention_dp_overlap_cuda_graph":
@@ -384,7 +388,7 @@ def run_client_tests(example_dir,
         if client_test_set.chat_streaming and client_test_set.verify_streaming_chat:
             output_files.append('output_streaming_chat.json')
 
-        if test_desc.startswith("gen_only"):
+        if test_desc.endswith("gen_only") or test_desc.startswith("gen_only"):
             continue
 
         for output_file in output_files:
@@ -730,6 +734,19 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
 @pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
                          indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
+                           env=llm_venv._new_env)
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
 def test_disaggregated_perf_metrics(disaggregated_test_root, llm_venv,
                                     disaggregated_example_root,
                                     llama_model_root):
@@ -1061,6 +1078,23 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
 @skip_arm
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
                          indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = "^ib,gdr_copy"
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_transceiver_runtime_python",
+                           env=env,
+                           model_path=deepseek_v3_model_root)
+
+
+@skip_no_hopper
+@skip_arm
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
 def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
         disaggregated_test_root, disaggregated_example_root, llm_venv,
         deepseek_v3_model_root):
@@ -1089,6 +1123,24 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp",
                            env=llm_venv._new_env,
+                           model_path=deepseek_v3_model_root)
+
+
+@skip_no_hopper
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_attention_dp_gen_only",
+                           env=env,
                            model_path=deepseek_v3_model_root)
 
 
@@ -1736,7 +1788,8 @@ def test_disaggregated_deepseek_v3_lite_bf16_tllm_gen_helix(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_bf16_tllm_gen_helix",
                            env=llm_venv._new_env,
-                           prompt_file="long_prompts.json")
+                           prompt_file="long_prompts.json",
+                           model_path=deepseek_v3_model_root)
 
 
 @skip_pre_blackwell
@@ -1746,17 +1799,12 @@ def test_disaggregated_gpt_oss_120b_harmony(disaggregated_test_root,
                                             disaggregated_example_root,
                                             llm_venv, model_path):
     model_dir = f"{llm_models_root()}/{model_path}"
-    src_dst_dict = {
-        model_dir: f"{llm_venv.get_working_directory()}/{model_path}",
-    }
-    for src, dst in src_dst_dict.items():
-        if not os.path.islink(dst):
-            os.makedirs(os.path.dirname(dst), exist_ok=True)
-            os.symlink(src, dst, target_is_directory=True)
+    setup_model_symlink(llm_venv, model_dir, model_path)
 
     run_disaggregated_test(disaggregated_example_root,
                            "gpt_oss_120b_harmony",
-                           env=llm_venv._new_env)
+                           env=llm_venv._new_env,
+                           model_path=model_dir)
 
 
 @pytest.mark.timeout(12600)

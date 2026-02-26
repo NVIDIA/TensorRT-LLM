@@ -192,6 +192,14 @@ class TorchCudagraphCompiler(CompilerBackend):
         assert self.get_args_kwargs_for_compile is not None, (
             "get_args_kwargs_for_compile must be provided"
         )
-        captured_model.capture_graph(self.get_args_kwargs_for_compile, self.cuda_graph_batch_sizes)
+
+        # wrap get_args_kwargs_for_compile with CudaGraphWarmUpPhase. Note that host-side prepare
+        # functions may be called as part of get_args_kwargs. We want to let these functions know it's
+        # a warm-up phase.
+        def get_args_kwargs_warmup(batch_size: int):
+            with CudaGraphWarmUpPhase():
+                return self.get_args_kwargs_for_compile(batch_size)
+
+        captured_model.capture_graph(get_args_kwargs_warmup, self.cuda_graph_batch_sizes)
 
         return captured_model

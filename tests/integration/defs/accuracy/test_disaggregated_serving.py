@@ -214,8 +214,8 @@ def launch_disaggregated_llm(
     with open(gen_server_config_path, "w") as f:
         yaml.dump(gen_server_config, f)
 
-    args = LlmArgs.from_kwargs(model=model_name,
-                               tensor_parallel_size=tensor_parallel_size)
+    args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
+
     if "FP4" in model_name:
         args.quant_config.quant_algo = "NVFP4"
 
@@ -1490,4 +1490,75 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
                                       model_path) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+
+@pytest.mark.timeout(DEFAULT_TEST_TIMEOUT)
+@skip_pre_blackwell
+@pytest.mark.skip_less_device_memory(80000)
+class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
+    MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
+    MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"
+
+    @pytest.mark.skip_less_device(8)
+    def test_auto_dtype(self):
+        ctx_server_config = {
+            "max_batch_size": 32,
+            "disable_overlap_scheduler": True,
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "tensor_parallel_size": 4,
+            "moe_expert_parallel_size": 4,
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "mamba_ssm_cache_dtype": "float16",
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "moe_config": {
+                "backend": "CUTLASS"
+            }
+        }
+
+        gen_server_config = {
+            "max_batch_size": 32,
+            "disable_overlap_scheduler": False,
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "tensor_parallel_size": 2,
+            "moe_expert_parallel_size": 2,
+            "pipeline_parallel_size": 2,
+            "cuda_graph_config": {
+                "max_batch_size": 32,
+                "enable_padding": True,
+            },
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "mamba_ssm_cache_dtype": "float16",
+                "free_gpu_memory_fraction": 0.5,
+            },
+            "moe_config": {
+                "backend": "CUTLASS"
+            }
+        }
+
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

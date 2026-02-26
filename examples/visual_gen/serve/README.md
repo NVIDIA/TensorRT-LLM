@@ -34,6 +34,8 @@ Before running these examples, ensure you have:
 
    ```bash
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
@@ -48,24 +50,29 @@ Before running these examples, ensure you have:
 Current supported & tested models:
 
 1. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
+2. FLUX.1 for image generation (t2i)
+3. FLUX.2 for image generation (t2i)
 
-### 1. Synchronous Image Generation (`sync_t2i.py`)
+### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
-Demonstrates synchronous text-to-image generation using the OpenAI SDK.
+Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports FLUX.1 and FLUX.2.
 
 **Features:**
 - Generates images from text prompts
-- Supports configurable image size and quality
+- Supports configurable model, image size, and quality
 - Returns base64-encoded images or URLs
 - Saves generated images to disk
 
 **Usage:**
 ```bash
-# Use default localhost server
+# FLUX.2 (default)
 python sync_image_gen.py
 
-# Specify custom server URL
-python sync_image_gen.py http://your-server:8000/v1
+# FLUX.1
+python sync_image_gen.py --model flux1
+
+# Custom server and prompt
+python sync_image_gen.py --base-url http://your-server:8000/v1 --prompt "A sunset"
 ```
 
 **API Endpoint:** `POST /v1/images/generations`
@@ -228,7 +235,7 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "wan")
+- `model`: Model identifier (e.g., "flux1", "flux2")
 - `prompt`: Text description
 - `n`: Number of images to generate
 - `size`: Image dimensions (e.g., "512x512", "1024x1024")

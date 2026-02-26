@@ -6,7 +6,7 @@ def createKubernetesPodConfig()
     def selectors = """
                   nvidia.com/node_type: builder
                   kubernetes.io/os: linux"""
-    def image = "urm.nvidia.com/docker/ubuntu:22.04"
+    def image = "urm.nvidia.com/docker/ubuntu:24.04"
     def podConfig = [
         cloud: targetCloud,
         namespace: "sw-tensorrt",
@@ -16,7 +16,7 @@ def createKubernetesPodConfig()
             spec:
                 nodeSelector: ${selectors}
                 containers:
-                  - name: alpine
+                  - name: cpu
                     image: ${image}
                     command: ['cat']
                     tty: true
@@ -54,6 +54,11 @@ def createKubernetesPodConfig()
     return podConfig
 }
 
+boolean isValidGithubUser(String owner) {
+    def pattern = ~/^(?!-)(?!.*--)[A-Za-z0-9-]{1,39}(?<!-)$/
+    return owner ==~ pattern
+}
+
 def getLLMRepo () {
     def LLM_REPO = "https://github.com/NVIDIA/TensorRT-LLM.git"
     if (params.repoUrlKey == "tensorrt_llm_internal") {
@@ -61,26 +66,25 @@ def getLLMRepo () {
             LLM_REPO = DEFAULT_LLM_REPO
         }
     }
-    if (params.repoUrlKey == "custom_repo") {
-        if (params.customRepoUrl == "") {
-            throw new Exception("Invalid custom repo url provided")
+    if (params.repoUrlKey == "github_fork") {
+        if (!isValidGithubUser(params.forkOwner)) {
+            throw new Exception("Invalid fork owner provided")
         }
-        LLM_REPO = params.customRepoUrl
+        LLM_REPO = "https://github.com/${params.forkOwner}/TensorRT-LLM.git"
     }
     return LLM_REPO
 }
 
 def installTools() {
-    container("alpine") {
-        sh "mkdir -p $JENKINS_HOME"
+    container("cpu") {
         sh "apt update"
-        sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl unzip"
+        sh "apt install -y git git-lfs openjdk-17-jdk python3-dev python3-venv curl unzip wget"
     }
 }
 
 def checkoutSource ()
 {
-    container("alpine") {
+    container("cpu") {
         trtllm_utils.setupGitMirror()
         stage("Checkout TRTLLM Source") {
             def LLM_REPO = getLLMRepo()
@@ -98,15 +102,19 @@ def getPulseToken() {
         usernameVariable: 'SF_CLIENT_ID',
         passwordVariable: 'SF_CLIENT_SECRET'
     )]) {
-        def AuthHeader = sh(script: "set +x && echo -n $SF_CLIENT_ID:$SF_CLIENT_SECRET | base64 -w0", returnStdout: true).trim()
-        token= sh(script: "curl -s --request POST --header \"Authorization: Basic ${AuthHeader}\" --header \"Content-Type: application/x-www-form-urlencoded\" \"https://4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i.ssa.nvidia.com/token?grant_type=client_credentials&scope=verify:nspectid%20sourcecode:blackduck%20update:report\" | jq \".access_token\" |  tr -d '\"'", returnStdout: true).trim()
+        // Do not save AUTH_HEADER to a groovy variable since that
+        // will expose the auth_header without being masked
+        token= sh(script: '''
+            AUTH_HEADER=$(echo -n $SF_CLIENT_ID:$SF_CLIENT_SECRET | base64 -w0)
+            curl -s --request POST --header "Authorization: Basic $AUTH_HEADER" --header "Content-Type: application/x-www-form-urlencoded" "https://4ubglassowmtsi7ogqwarmut7msn1q5ynts62fwnr1i.ssa.nvidia.com/token?grant_type=client_credentials&scope=verify:nspectid%20sourcecode:blackduck%20update:report" | jq ".access_token" |  tr -d '"'
+        ''', returnStdout: true).trim()
     }
     return token
 }
 
 def generateLockFiles(llmRepo, branchName)
 {
-    container("alpine") {
+    container("cpu") {
         sh "python3 --version"
         sh "curl -sSL https://install.python-poetry.org | python3 -"
         sh "/root/.local/bin/poetry -h"
@@ -149,10 +157,13 @@ def generateLockFiles(llmRepo, branchName)
 
 def sonar_scan()
 {
-    container("alpine") {
-        def scannerHome = tool 'sonarScanner'
+    container("cpu") {
+        def sonarScannerCliVer = "8.0.0.6341"
+        sh "wget https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
+        sh "mv sonar-scanner-${sonarScannerCliVer} ./sonar-scanner"
         withSonarQubeEnv() {
-          sh "${scannerHome}/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
+          sh "./sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
         }
     }
 }
@@ -161,6 +172,9 @@ def pulseScan(llmRepo, branchName) {
     container("docker") {
         sh "apk add jq curl"
         def token = getPulseToken()
+        if (!token) {
+            throw new Exception("Invalid token get")
+        }
         withCredentials([
             usernamePassword(
                 credentialsId: "svc_tensorrt_gitlab_read_api_token",
@@ -177,18 +191,22 @@ def pulseScan(llmRepo, branchName) {
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
-                        "PULSE_REPO_BRANCH=${branchName}",
+                        "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
                         "PULSE_SCAN_PROJECT_VERSION=${branchName.replace("release/", "")}",
                         "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
                     ]) {
-                        sh 'pulse scan --no-fail --sbom --override .'
+                        if (params.repoUrlKey == "github_fork") {
+                            sh 'pulse scan --no-fail --sbom .'
+                        } else {
+                            sh 'pulse scan --no-fail --sbom --override .'
+                        }
                     }
                   }
             }
         }
     }
-    container("alpine") {
+    container("cpu") {
         sh "cat nspect_scan_report.json"
         sh "cat sbom.cdx.json"
         sh """
@@ -224,8 +242,8 @@ pipeline {
     }
     parameters {
         string(name: 'branchName', defaultValue: 'main', description: 'the branch to generate the lock files')
-        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'custom_repo'], description: "The repo url to process, choose \"custom_repo\" if you want to set your own repo")
-        string(name: 'customRepoUrl', defaultValue: '', description: 'Your custom repo to get processed, need to select \"custom_repo\" for repoUrlKey, otherwise it will be ignored')
+        choice(name: 'repoUrlKey', choices: ['tensorrt_llm_github','tensorrt_llm_internal', 'github_fork'], description: "The repo url to process")
+        string(name: 'forkOwner', defaultValue: '', description: 'Name of the fork owner, need to select \"github_fork\" for repoUrlKey, otherwise it will be ignored')
     }
     options {
         skipDefaultCheckout()

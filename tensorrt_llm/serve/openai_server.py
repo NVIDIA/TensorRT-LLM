@@ -599,15 +599,23 @@ class OpenAIServer:
             }
             if raw_request:
                 item["server_arrival_time"] = getattr(raw_request.state, "server_arrival_time", None)
-                item["server_first_token_time"] = getattr(raw_request.state, "server_first_token_time", None)
+                if not getattr(raw_request.state, "server_first_token_time", None):
+                    raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
+                item["server_first_token_time"] = raw_request.state.server_first_token_time
             if output.disaggregated_params:
                 item["ctx_request_id"] = output.disaggregated_params.ctx_request_id
+            # Request-level time breakdown (on GenerationResult/RequestOutput, not CompletionOutput)
+            if getattr(res, 'time_breakdown_metrics', None) is not None:
+                item["time_breakdown_metrics"] = res.time_breakdown_metrics
             if self.perf_metrics is not None:
                 async with self.perf_metrics_lock:
                     self.perf_metrics.append(item)
 
     async def _create_chat_response(self,
-            promise: RequestOutput, postproc_params: PostprocParams, disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
+            promise: RequestOutput,
+            postproc_params: PostprocParams,
+            raw_request: Request,
+            disaggregated_params: Optional[LlmDisaggregatedParams] = None) -> ChatCompletionResponse:
         await promise.aresult()
         if self.postproc_worker_enabled:
             chat_response = promise.outputs[0]._postprocess_result
@@ -619,6 +627,7 @@ class OpenAIServer:
             raise ValueError(f"disaggregated_params is not set in the response for request"
                              f" {disaggregated_params.disagg_request_id}")
 
+        await self._extract_metrics(promise, raw_request)
         return chat_response
 
     async def _iteration_stats_collector_loop(self):
@@ -752,8 +761,15 @@ class OpenAIServer:
 
             trace_headers = (None if raw_request is None else tracing.extract_trace_headers(raw_request.headers))
 
+            generate_inputs = prompt
+            preprocess_fn = getattr(self.generator, "preprocess", None)
+            if preprocess_fn is not None:
+                generate_inputs = await asyncio.to_thread(
+                    preprocess_fn, prompt, sampling_params,
+                    disaggregated_params)
+
             promise = self.generator.generate_async(
-                inputs=prompt,
+                inputs=generate_inputs,
                 sampling_params=sampling_params,
                 _postproc_params=postproc_params if self.postproc_worker_enabled else None,
                 streaming=request.stream,
@@ -772,7 +788,7 @@ class OpenAIServer:
                 return StreamingResponse(content=response_generator,
                                          media_type="text/event-stream")
             else:
-                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
+                response = await self._create_chat_response(promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(content=response.model_dump())
         except CppExecutorError:
             logger.error(traceback.format_exc())
@@ -886,7 +902,6 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
-            raw_request.state.server_first_token_time = get_steady_clock_now_in_seconds()
             await self._extract_metrics(response, raw_request)
             return pp_result
 
@@ -1127,7 +1142,8 @@ class OpenAIServer:
                     media_type="text/event-stream"
                 )
             else:
-                response = await self._create_chat_response(promise, postproc_params, disaggregated_params)
+                response = await self._create_chat_response(
+                    promise, postproc_params, raw_request, disaggregated_params)
                 return JSONResponse(response.model_dump())
 
         except Exception as e:
