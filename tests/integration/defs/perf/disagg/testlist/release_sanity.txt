@@ -5,36 +5,27 @@
 # ============================================================
 
 # ---- disagg: deepseek-r1-fp4 GB200 -------------------------
-# 1k1k, mtp0, NIXL
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_ctx1_gen1_dep32_bs32_eplb0_mtp0_ccb-NIXL]
-# 8k1k, mtp3, NIXL
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_8k1k_ctx8_gen1_dep32_bs16_eplb0_mtp3_ccb-NIXL]
-# 1k1k, mtp3, UCX (transport coverage)
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp3_ccb-UCX]
-# 128k8k, pp8, mtp3 (long context GB200)
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_128k8k_ctx1_pp8_gen1_tep8_bs1_eplb0_mtp3-Default]
 
 # ---- disagg: deepseek-r1-fp4 GB300 -------------------------
-# 1k1k, mtp0, NIXL
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_ccb-NIXL]
-# 1k1k, mtp0, UCX
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_ccb-UCX]
-# 128k8k, pp4, mtp0 (long context GB300)
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_deepseek-r1-fp4_128k8k_ctx1_pp4_gen8_tep8_bs1_eplb0_mtp0-Default]
 
-# ---- disagg: Qwen3-235B-A22B-FP4 (model coverage) ----------
+# ---- disagg: Qwen3-235B-A22B-FP4 ----------
 test_disagg.py::TestDisaggBenchmark::test_benchmark[disagg_perf_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen4_tep8_bs32_eplb0_mtp0_ccb-NIXL]
 
 # ---- wideep: deepseek-r1-fp4 --------------------------------
-# 1k1k, mtp3, NIXL
 test_disagg.py::TestDisaggBenchmark::test_benchmark[wideep_perf_deepseek-r1-fp4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp3_ccb-NIXL]
-# 8k1k, mtp3, NIXL
 test_disagg.py::TestDisaggBenchmark::test_benchmark[wideep_perf_deepseek-r1-fp4_8k1k_ctx8_gen1_dep32_bs16_eplb288_mtp3_ccb-NIXL]
 
-# ---- wideep: deepseek-v32-fp4 (model coverage) --------------
+# ---- wideep: deepseek-v32-fp4 --------------
 test_disagg.py::TestDisaggBenchmark::test_benchmark[wideep_perf_deepseek-v32-fp4_8k1k_ctx8_gen1_dep32_bs16_eplb288_mtp3_ccb-NIXL]
 
-# ---- wideep: kimi-k2-thinking-fp4 (model coverage) ----------
+# ---- wideep: kimi-k2-thinking-fp4 ----------
 test_disagg.py::TestDisaggBenchmark::test_benchmark[wideep_perf_kimi-k2-thinking-fp4_1k1k_ctx3_gen1_dep32_bs1024_eplb384_mtp0_ccb-NIXL]
 
 # ---- accuracy -----------------------------------------------
