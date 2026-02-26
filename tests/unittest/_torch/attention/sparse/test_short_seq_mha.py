@@ -374,8 +374,8 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     rope_cos_sin = _make_rope_cos_sin(rope_config, device)
     softmax_scale = _compute_softmax_scale(rope_config)
 
-    # Set threshold high enough that all test sequences take the short MHA path.
-    threshold = max(seq_lens) + 100
+    # Set threshold high enough that total packed tokens take the short MHA path.
+    threshold = sum(seq_lens) + 100
     mla, mapping, sparse_config, model_config = _build_mla(
         rope_config, device, threshold)
     _init_mla_weights(mla)
@@ -423,8 +423,8 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     )
     attn_metadata.prepare()
 
-    # Verify the threshold guard will trigger.
-    assert attn_metadata.max_ctx_seq_len <= threshold
+    # Verify the threshold guard will trigger (total packed tokens <= threshold).
+    assert total_tokens <= threshold
 
     # Clone inputs since forward_context_dsa may modify them in-place.
     q_for_ref = q.clone()
@@ -480,9 +480,9 @@ def test_short_mha_not_triggered_when_threshold_zero():
 @pytest.mark.skipif(get_sm_version() < 90,
                     reason="MLA requires SM90 (Hopper) or later")
 def test_short_mha_boundary_threshold_equals_max_seq():
-    """Test the boundary condition where threshold == max(seq_lens).
+    """Test the boundary condition where threshold == total packed tokens.
 
-    The dispatch guard uses `<=`, so threshold == max_ctx_seq_len should still
+    The dispatch guard uses `<=`, so threshold == num_ctx_tokens should still
     trigger the short MHA path. This verifies correctness at the exact boundary.
     """
     device = torch.device('cuda')
@@ -495,8 +495,8 @@ def test_short_mha_boundary_threshold_equals_max_seq():
     softmax_scale = _compute_softmax_scale(rope_config)
 
     seq_lens = [24, 16]
-    # Threshold exactly equals max seq len — short MHA should trigger.
-    threshold = max(seq_lens)
+    # Threshold exactly equals total packed tokens — short MHA should trigger.
+    threshold = sum(seq_lens)
     mla, mapping, sparse_config, model_config = _build_mla(
         rope_config, device, threshold)
     _init_mla_weights(mla)
@@ -538,8 +538,8 @@ def test_short_mha_boundary_threshold_equals_max_seq():
     )
     attn_metadata.prepare()
 
-    # Verify boundary: max_ctx_seq_len == threshold.
-    assert attn_metadata.max_ctx_seq_len == threshold
+    # Verify boundary: total packed tokens == threshold.
+    assert total_tokens == threshold
 
     q_for_ref = q.clone()
     compressed_kv_for_ref = compressed_kv.clone()
@@ -574,12 +574,13 @@ def test_short_mha_boundary_threshold_equals_max_seq():
 @pytest.mark.skipif(get_sm_version() < 90,
                     reason="MLA requires SM90 (Hopper) or later")
 def test_short_mha_not_triggered_when_seq_exceeds_threshold():
-    """Verify that when max_ctx_seq_len > threshold, the standard path is used.
+    """Verify that when total packed tokens > threshold, the standard path is used.
 
-    We set threshold=16 but use seq_len=32. The output should match the
-    standard absorption path (not the short MHA path). We verify this
-    indirectly: since both paths must produce the same result for correctness,
-    we just confirm the module runs without error and produces finite output.
+    We set threshold=16 but use seq_len=32 (total_tokens=32 > 16). The output
+    should match the standard absorption path (not the short MHA path). We
+    verify this indirectly: since both paths must produce the same result for
+    correctness, we just confirm the module runs without error and produces
+    finite output.
     """
     device = torch.device('cuda')
     dtype = torch.bfloat16
@@ -589,7 +590,7 @@ def test_short_mha_not_triggered_when_seq_exceeds_threshold():
     rope_config = _make_rope_config()
     seq_lens = [32]
 
-    # Threshold is below max seq len — short MHA should NOT trigger.
+    # Threshold is below total packed tokens — short MHA should NOT trigger.
     threshold = 16
     mla, mapping, sparse_config, model_config = _build_mla(
         rope_config, device, threshold)
@@ -635,8 +636,8 @@ def test_short_mha_not_triggered_when_seq_exceeds_threshold():
     )
     attn_metadata.prepare()
 
-    # Threshold is below max_ctx_seq_len; standard path should be used.
-    assert attn_metadata.max_ctx_seq_len > threshold
+    # Threshold is below total packed tokens; standard path should be used.
+    assert total_tokens > threshold
 
     topk_indices = mla.mqa.indexer(
         qr,
@@ -751,7 +752,7 @@ def test_short_mha_agrees_with_absorption_path():
         # does not use sparse routing, so the indexer can be skipped.
         use_short_mha = (
             mla_module.short_seq_mha_threshold > 0
-            and attn_metadata.max_ctx_seq_len
+            and total_tokens
             <= mla_module.short_seq_mha_threshold)
         if use_short_mha:
             topk_indices = None

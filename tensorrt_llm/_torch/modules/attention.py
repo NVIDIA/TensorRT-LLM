@@ -1054,7 +1054,7 @@ class MLA(nn.Module):
         # extra BMMs and larger head_dim (kv_lora_rank + qk_rope_head_dim).
         # Only active when rope_fusion is True (DSA with TrtllmAttention).
         _threshold_str = os.environ.get(
-            'TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD', '0')
+            'TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD', '10240')
         try:
             self.short_seq_mha_threshold = int(_threshold_str)
         except ValueError as err:
@@ -1495,8 +1495,7 @@ class MLA(nn.Module):
             and not self.apply_rotary_emb
             and self.mapping.cp_size == 1
             and position_ids is not None
-            and attn_metadata.max_ctx_seq_len
-            <= self.short_seq_mha_threshold)
+            and num_ctx_tokens <= self.short_seq_mha_threshold)
 
         # Skip the indexer entirely when the short MHA path handles all
         # context tokens and there are no generation tokens.
@@ -1630,12 +1629,12 @@ class MLA(nn.Module):
         # avoid double-RoPE application. When apply_rotary_emb is True, the
         # caller already applied RoPE to q and k_pe, and our path would apply
         # it again via mla_rope_append_paged_kv_assign_q / _rotary_emb_mha.
+        num_ctx_tokens = q.shape[0]
         if (self.short_seq_mha_threshold > 0
                 and not self.apply_rotary_emb
                 and self.mapping.cp_size == 1
                 and position_ids is not None
-                and attn_metadata.max_ctx_seq_len
-                <= self.short_seq_mha_threshold):
+                and num_ctx_tokens <= self.short_seq_mha_threshold):
             return self.forward_context_short_mha(q, compressed_kv, k_pe,
                                                   position_ids, attn_metadata,
                                                   output, latent_cache)
