@@ -145,9 +145,6 @@ class KvCacheCreator:
         """
         kv_size_per_token = self._get_kv_size_per_token()
 
-        if self._skip_est:
-            allocated_bytes = 0
-
         available_kv_mem = (total_gpu_memory - peak_memory +
                             allocated_bytes) * fraction
         logger.info(
@@ -288,10 +285,10 @@ class KvCacheCreator:
         num_extra_tokens_per_seq = 1  # account for generated tokens
         spec_cfg = self._speculative_config
         if not self._llm_args.disable_overlap_scheduler and spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
 
         if self._dummy_reqs is None:
@@ -332,20 +329,21 @@ class KvCacheCreator:
         This updates `kv_cache_config` and returns a boolean indicating whether KV cache
         estimation is to be performend.
         """
+        if self._skip_est:
+            return False
         estimating_kv_cache = False
-        if not self._skip_est:
-            if 'cp_type' not in self._mapping.cp_config:
-                estimating_kv_cache = True
-                estimate_max_tokens = self._get_token_num_for_estimation()
-                self._kv_cache_config.max_tokens = min(
-                    estimate_max_tokens, self._kv_cache_config.max_tokens
-                ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
-            model_config = self._model_engine.model.model_config
-            if model_config.attn_backend == "VANILLA":
-                logger.info(
-                    "KV cache size estimation is not supported for Vanilla attention backend, disable it."
-                )
-                estimating_kv_cache = False
+        if 'cp_type' not in self._mapping.cp_config:
+            estimating_kv_cache = True
+            estimate_max_tokens = self._get_token_num_for_estimation()
+            self._kv_cache_config.max_tokens = min(
+                estimate_max_tokens, self._kv_cache_config.max_tokens
+            ) if self._kv_cache_config.max_tokens is not None else estimate_max_tokens
+        model_config = self._model_engine.model.model_config
+        if model_config.attn_backend == "VANILLA":
+            logger.info(
+                "KV cache size estimation is not supported for Vanilla attention backend, disable it."
+            )
+            estimating_kv_cache = False
         return estimating_kv_cache
 
     def configure_kv_cache_capacity(self,
@@ -527,7 +525,7 @@ class KvCacheCreator:
             layer_mask=spec_dec_layer_mask,
         )
 
-        if self._skip_est == False:
+        if not self._skip_est:
             # KVCacheManager (Non-draft) modifies the max_seq_len field, update it to self
             if model_engine.kv_cache_manager_key == ResourceManagerType.KV_CACHE_MANAGER:
                 # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
@@ -596,15 +594,17 @@ class KvCacheCreator:
         # Draft model layers in one-model mode start at target_num_layers.
         target_pretrained_config = self._model_engine.model.model_config.pretrained_config
         target_num_layers = target_pretrained_config.num_hidden_layers
-        # Use get_num_spec_layers to get the correct number of draft layers
-        # for the speculative decoding mode (e.g., num_eagle_layers for Eagle3)
-        num_draft_layers = get_num_spec_layers(self._speculative_config)
 
-        # Create layer_mask: False for target layers, True for draft layers.
-        # This ensures the draft KV cache manager uses the correct layer indices
-        # (e.g., layers 32, 33, ... instead of 0, 1, ...).
-        spec_dec_layer_mask = [False
-                               ] * target_num_layers + [True] * num_draft_layers
+        # PARD: draft is a separate model, layers start from 0.
+        # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
+        if self._speculative_config.spec_dec_mode.is_pard():
+            num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
+            spec_dec_layer_mask = [True] * num_draft_layers
+        else:
+            num_draft_layers = get_num_spec_layers(self._speculative_config)
+            spec_dec_layer_mask = [False] * target_num_layers + [
+                True
+            ] * num_draft_layers
 
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP).
@@ -646,7 +646,7 @@ class KvCacheCreator:
                        resources: Dict,
                        estimating_kv_cache: bool = False) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
-        if self._skip_est == True:
+        if self._skip_est:
             self.configure_kv_cache_capacity()
 
         kv_cache_manager = self._create_kv_cache_manager(

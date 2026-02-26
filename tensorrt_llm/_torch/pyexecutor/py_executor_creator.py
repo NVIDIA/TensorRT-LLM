@@ -223,6 +223,23 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
+    """Create and initialize a PyExecutor instance from the given LLM arguments.
+
+    Loads model configuration, applies model-specific defaults, constructs the
+    resource manager, model engine, scheduler, and decoder, then returns a fully
+    initialized PyExecutor ready for inference.
+
+    Args:
+        llm_args: Configuration arguments for the PyTorch-based LLM executor.
+        checkpoint_dir: Path to the model checkpoint directory. If None, uses
+            the path specified in llm_args.
+        tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
+        profiling_stage_data: Optional dict for collecting per-stage memory
+            profiling data during executor construction.
+
+    Returns:
+        A fully initialized PyExecutor instance.
+    """
 
     skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
     torch.cuda.set_per_process_memory_fraction(1.0)
@@ -462,7 +479,7 @@ def create_py_executor(
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
-        model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
@@ -667,7 +684,7 @@ def create_py_executor(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
-            net_max_seq_len=None if skip_est else net_max_seq_len,
+            net_max_seq_len=net_max_seq_len,
             kv_connector_manager=kv_connector_manager,
             max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
