@@ -2672,7 +2672,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         }
         // Verl environment setup
         if (stageName.contains("-Verl-")) {
-            def verlConfigPath = "${llmSrc}/tests/integration/test_lists/test-db/verl_config.yml"
+            def verlConfigPath = "${llmSrc}/tests/integration/defs/verl/verl_config.yml"
             def verlConfig = readYaml(file: verlConfigPath)
             def verlPath = "${llmPath}/verl"
 
