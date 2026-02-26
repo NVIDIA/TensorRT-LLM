@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
+
+from tensorrt_llm.bindings.internal.common import Hasher as CppHasher
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
@@ -44,31 +45,28 @@ def gen_multi_modal_tokens(
 
 class Hasher:
     __slots__ = "_hasher"
-    _hasher: "hashlib._Hash"
+    _hasher: "CppHasher"
 
     def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
-        self._hasher = hashlib.sha256()
+        self._hasher = CppHasher()
         if data is not None:
-            self.update(data)
+            self._hasher.update(data)
 
     # This function is perf-critical. Expect compromised code quality.
     def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
         if type(data) is int:
             assert NDEBUG or (data >= 0 and data < (1 << 64))
-            self._hasher.update(data.to_bytes(8, "little"))
-        elif type(data) is bytes:
-            self._hasher.update(data)
-        else:
-            for item in data:  # type: ignore
-                assert (
-                    NDEBUG or (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
-                )
-                self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
+        elif not isinstance(data, bytes):
+            if not NDEBUG:
+                assert isinstance(data, Sequence)
+                for item in data:
+                    assert (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
+        self._hasher.update(data)
         return self
 
     @property
     def digest(self) -> bytes:
-        return self._hasher.digest()
+        return self._hasher.digest
 
 
 TokenBlock = list[TokenIdExt]
