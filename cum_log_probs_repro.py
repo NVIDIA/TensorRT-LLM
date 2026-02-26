@@ -43,13 +43,20 @@ class PrefillRequest(BaseModel):
     return_generation_logits: bool = False
 
 
+class SerializedLogprob(BaseModel):
+    token_id: int
+    logprob: float
+    rank: int | None = None
+
+
 class PrefillResponse(BaseModel):
     """Serialized DisaggregatedParams from TRT-LLM context_only result."""
 
     request_type: str
     first_gen_tokens: list[int]
     ctx_request_id: int
-    opaque_state: str  # Base64-encoded bytes (may include embedded logprobs).
+    opaque_state: str  # Base64-encoded bytes.
+    first_gen_log_probs: list[list[SerializedLogprob]] | None = None
 
 
 class PrefillEngine:
@@ -108,16 +115,25 @@ class PrefillEngine:
         out = output.outputs[0]
         logits = out.generation_logits
         logits_info = f"shape={tuple(logits.shape)}" if logits is not None else "None"
+        serialized_lp = None
+        if dp.first_gen_log_probs:
+            serialized_lp = [
+                [
+                    SerializedLogprob(token_id=tid, logprob=lp.logprob, rank=lp.rank)
+                    for tid, lp in entry.items()
+                ]
+                for entry in dp.first_gen_log_probs
+            ]
         print(
             f"  [prefill] tokens={len(out.token_ids)}, logits={logits_info}, "
-            f"logprobs={out.logprobs}, text={out.text!r}"
+            f"logprobs={out.logprobs}, first_gen_log_probs={serialized_lp}, text={out.text!r}"
         )
-        # Logprobs are embedded in opaque_state automatically by the engine.
         return PrefillResponse(
             request_type="context_only",
             first_gen_tokens=dp.first_gen_tokens,
             ctx_request_id=dp.ctx_request_id,
             opaque_state=base64.b64encode(dp.opaque_state).decode(),
+            first_gen_log_probs=serialized_lp,
         )
 
 
@@ -167,6 +183,8 @@ class Engine:
             yield result.outputs[0]
 
     async def _remote_prefill(self, sp: SamplingParams) -> DisaggregatedParams:
+        from tensorrt_llm.executor.result import Logprob
+
         async with httpx.AsyncClient(timeout=120) as client:
             resp = await client.post(
                 PREFILL_URL,
@@ -180,10 +198,20 @@ class Engine:
             resp.raise_for_status()
             data = resp.json()
 
-        # Logprobs are embedded inside opaque_state; no separate handling needed.
+        first_gen_log_probs = None
+        if data.get("first_gen_log_probs"):
+            first_gen_log_probs = [
+                {
+                    entry["token_id"]: Logprob(logprob=entry["logprob"], rank=entry.get("rank"))
+                    for entry in token_topk
+                }
+                for token_topk in data["first_gen_log_probs"]
+            ]
+
         return DisaggregatedParams(
             request_type="generation_only",
             first_gen_tokens=data["first_gen_tokens"],
+            first_gen_log_probs=first_gen_log_probs,
             ctx_request_id=data["ctx_request_id"],
             opaque_state=base64.b64decode(data["opaque_state"]),
         )
@@ -212,7 +240,8 @@ def engine():
         ("agg_logits", False, SamplingParams(max_tokens=20, return_generation_logits=True)),
         ("disagg_logits", True, SamplingParams(max_tokens=20, return_generation_logits=True)),
         ("agg_logprobs", False, SamplingParams(max_tokens=20, logprobs=1)),
-        # Regression test for https://nvbugspro.nvidia.com/bug/5926823.
+        # Without the fix, this fails with:
+        # AttributeError: 'LogProbStorage' object has no attribute 'cum_log_probs'.
         ("disagg_logprobs", True, SamplingParams(max_tokens=20, logprobs=1)),
     ],
     ids=["agg_logits", "disagg_logits", "agg_logprobs", "disagg_logprobs"],

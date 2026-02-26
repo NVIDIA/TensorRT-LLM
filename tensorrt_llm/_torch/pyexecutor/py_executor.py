@@ -2821,19 +2821,18 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
-                # Prepend logprobs for first_gen_tokens if embedded in
-                # opaque_state by the context phase.
+                # Prepend logprobs for first_gen_tokens if transferred from prefill.
                 disagg_params = getattr(req, 'py_disaggregated_params', None)
-                if disagg_params is not None and disagg_params.opaque_state:
-                    from tensorrt_llm.disaggregated_params import \
-                        unwrap_opaque_extras
-                    _, extras = unwrap_opaque_extras(disagg_params.opaque_state)
-                    first_gen_lp = extras.get("first_gen_log_probs")
-                    if first_gen_lp is not None:
-                        # first_gen_lp is one logprob dict per beam.
-                        # append_log_probs expects [beam][tokens...].
-                        req.py_result.append_log_probs([[lp]
-                                                        for lp in first_gen_lp])
+                if (disagg_params is not None
+                        and getattr(disagg_params, 'first_gen_log_probs',
+                                    None) is not None):
+                    if beam_width != 1:
+                        raise ValueError(
+                            "first_gen_log_probs transfer currently assumes "
+                            "beam_width == 1; beam search is not supported "
+                            "with disaggregated logprobs propagation.")
+                    req.py_result.append_log_probs(
+                        [disagg_params.first_gen_log_probs])
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):

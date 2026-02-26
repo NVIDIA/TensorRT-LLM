@@ -310,9 +310,9 @@ class GenerationResultBase:
                             "generated token were not transferred from the "
                             "context server. The response will contain %d "
                             "logprob entries instead of %d. Ensure "
-                            "logprobs are requested on both context and "
-                            "generation servers.", len(output.logprobs),
-                            output.length)
+                            "first_gen_log_probs is propagated in "
+                            "DisaggregatedParams to avoid incomplete "
+                            "results.", len(output.logprobs), output.length)
                 else:
                     assert len(output.logprobs) == output.length, (
                         f"logprobs length: {len(output.logprobs)} != "
@@ -468,21 +468,16 @@ class GenerationResultBase:
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
-            # Logprobs are computed at the Python level and have no
-            # corresponding field in the C++ ContextPhaseParams. Embed them
-            # into opaque_state so the generation_only side can extract them
-            # without adding a new public API field to DisaggregatedParams.
+            # For context_only responses, carry the first gen token's logprobs
+            # so the generation_only side can prepend them.
             if (context_phase_params is not None
                     and self._disaggregated_params is not None):
                 first_gen_lp = [
                     out.logprobs[0] for out in self._outputs if out.logprobs
                 ]
-                if first_gen_lp and self._disaggregated_params.opaque_state:
-                    from ..disaggregated_params import wrap_opaque_extras
-                    self._disaggregated_params.opaque_state = \
-                        wrap_opaque_extras(
-                            self._disaggregated_params.opaque_state,
-                            first_gen_log_probs=first_gen_lp)
+                if first_gen_lp:
+                    self._disaggregated_params.first_gen_log_probs = \
+                        first_gen_lp
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits

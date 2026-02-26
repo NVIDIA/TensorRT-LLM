@@ -514,9 +514,8 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
 @pytest.mark.parametrize("generation_overlap", [False, True])
 def test_disaggregated_logprobs(model, generation_overlap):
     """Verify that logprobs propagate correctly from prefill to decode.
-
-    The generation_only worker must receive the first token's logprob
-    via opaque_state so the final output has one logprob per token.
+    Ensures first_gen_log_probs is carried in DisaggregatedParams
+    so the generation_only worker receives one logprob per token.
     """
     worker_pytorch_configs = [
         dict(disable_overlap_scheduler=True),
@@ -571,9 +570,17 @@ def test_disaggregated_logprobs(model, generation_overlap):
             assert ctx_output.disaggregated_params.request_type == "context_only"
             assert len(ctx_output.token_ids) == 1
 
-            # Logprobs for the first gen token are embedded in opaque_state.
+            # The context phase must populate first_gen_log_probs.
             dp = ctx_output.disaggregated_params
-            assert dp.opaque_state is not None
+            assert dp.first_gen_log_probs is not None, (
+                "first_gen_log_probs should be populated by the context phase")
+            assert len(dp.first_gen_log_probs) >= 1
+            for lp_entry in dp.first_gen_log_probs:
+                assert isinstance(lp_entry, dict)
+                for token_id, logprob_obj in lp_entry.items():
+                    assert isinstance(token_id, int)
+                    assert logprob_obj.logprob <= 0.0, (
+                        "Log probabilities must be non-positive")
 
             # --- Generation-only phase (decode) with logprobs ---
             dp.request_type = "generation_only"
@@ -585,7 +592,7 @@ def test_disaggregated_logprobs(model, generation_overlap):
             gen_responses = send_requests_to_worker(gen_requests, 1, intercomm)
             gen_output = gen_responses[0][0]
 
-            # Without the logprobs propagation, this either crashes
+            # Without first_gen_log_probs propagation this either crashes
             # (AttributeError) or returns fewer logprobs than tokens.
             assert gen_output.logprobs is not None, (
                 "Generation phase should return logprobs")

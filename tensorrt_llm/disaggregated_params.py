@@ -1,4 +1,3 @@
-import pickle
 from dataclasses import dataclass
 from enum import IntEnum
 from typing import Any, Dict, List, Optional
@@ -11,38 +10,6 @@ import tensorrt as trt  # noqa
 # isort: on
 
 from tensorrt_llm.bindings import executor as tllme
-
-_OPAQUE_EXTRAS_MAGIC = b"\x00TLLM_EX\x01"
-
-
-def wrap_opaque_extras(opaque_state: bytes, **extras) -> bytes:
-    """Embed extra Python-level data into opaque_state bytes.
-
-    Format: original_bytes + pickled_extras + 4-byte extras_len + magic.
-    The magic suffix lets unwrap_opaque_extras detect whether extras are present.
-    """
-    extras_blob = pickle.dumps(extras)
-    return opaque_state + extras_blob + len(extras_blob).to_bytes(4, "big") + _OPAQUE_EXTRAS_MAGIC
-
-
-def unwrap_opaque_extras(opaque_state: bytes) -> tuple:
-    """Extract extras from wrapped opaque_state.
-
-    Returns (original_bytes, extras_dict).  If no extras are embedded,
-    returns (opaque_state, {}).
-    """
-    magic_len = len(_OPAQUE_EXTRAS_MAGIC)
-    if (
-        opaque_state is None
-        or len(opaque_state) < magic_len + 4
-        or not opaque_state.endswith(_OPAQUE_EXTRAS_MAGIC)
-    ):
-        return opaque_state, {}
-    extras_len = int.from_bytes(opaque_state[-magic_len - 4 : -magic_len], "big")
-    cut = -magic_len - 4 - extras_len
-    original = opaque_state[:cut]
-    extras = pickle.loads(opaque_state[cut : -magic_len - 4])
-    return original, extras
 
 
 class DisaggScheduleStyle(IntEnum):
@@ -62,6 +29,8 @@ class DisaggregatedParams:
         draft_tokens (List[int]): The draft tokens of the generation request
         disagg_request_id (int): The disaggregated request id, if set, both context and generation requests will use it
          as underlying request id.
+        first_gen_log_probs (List): The logprobs for first_gen_tokens, produced during prefill.
+         Each entry is a list (one per beam) of TokenLogprobs (list of dict[int, Logprob]).
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
@@ -70,6 +39,7 @@ class DisaggregatedParams:
     request_type: Optional[str] = None
     # P-D Disaggregated Params
     first_gen_tokens: Optional[List[int]] = None
+    first_gen_log_probs: Optional[List] = None
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None
@@ -90,16 +60,14 @@ class DisaggregatedParams:
     mrope_position_deltas_handle: Optional[Dict[str, Any]] = None
 
     def get_context_phase_params(self) -> tllme.ContextPhaseParams:
-        # Prefer disagg_request_id over ctx_request_id.
+        # Prefer disagg_request_id over ctx_request_id
         request_id = (
             self.disagg_request_id if self.disagg_request_id is not None else self.ctx_request_id
         )
-        # Strip any Python-level extras before handing the raw bytes to C++.
-        raw_opaque, _ = unwrap_opaque_extras(self.opaque_state)
         return tllme.ContextPhaseParams(
             self.first_gen_tokens,
             request_id,
-            raw_opaque,
+            self.opaque_state,
             self.draft_tokens,
             self.ctx_dp_rank,
             self.ctx_info_endpoint,
