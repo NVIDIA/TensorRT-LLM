@@ -3,6 +3,7 @@
 import java.lang.InterruptedException
 import groovy.transform.Field
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
 import org.jenkinsci.plugins.workflow.cps.CpsThread
@@ -348,10 +349,21 @@ def mergeWaiveList(pipeline, globalVars)
     def targetBranchTOTCommit = ""
     def isGetTOTWaiveList = false
     try {
-        trtllm_utils.checkoutSource("https://github.com/NVIDIA/TensorRT-LLM.git", targetBranch, LLM_TOT_ROOT, false, false)
-        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+        withCredentials([string(credentialsId: 'svc_tensorrt_gitlab_api_token', variable: 'GITHUB_TOKEN')]) {
+            try {
+                def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
+                def connection = new URL(apiUrl).openConnection()
+                connection.setRequestProperty("Authorization", "Bearer ${GITHUB_TOKEN}")
+                connection.setRequestMethod("GET")
+                def response = connection.inputStream.text
+                def json = new JsonSlurper().parseText(response)
+                targetBranchTOTCommit = json[0].sha
+            } catch (Exception e) {
+                echo "Could not get target branch commit from GitHub API: ${e.message}"
+            }
+        }
         echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-        sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+        sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
         isGetTOTWaiveList = true
     } catch (InterruptedException e) {
         throw e
