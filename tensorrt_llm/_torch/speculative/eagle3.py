@@ -375,6 +375,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        # Save kv_lens_cuda values separately instead of routing through
+        # prepare_for_spec_dec, which would clone the tensor and break the
+        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
+        batch_size = attn_metadata.num_seqs
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                  batch_size].clone(
+                                                                  )
+        else:
+            self._saved_kv_lens_cuda = None
+
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
+
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
     def forward(self,
