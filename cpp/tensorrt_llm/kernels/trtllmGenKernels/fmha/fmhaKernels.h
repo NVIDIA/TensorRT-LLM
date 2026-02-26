@@ -845,11 +845,11 @@ private:
     // Select a kernel based on the heuristic.
     void selectKernel(RunnerParams const& params, SelectKernelParams& selectKernelParams) const
     {
-        // SageAttention context kernels currently use a fixed kernel family in meta tables.
+        // VisualGen context kernels currently use a fixed kernel family in meta tables.
         // (e.g. tileSizeQ=128, tileSizeKv=128).
         if (isContextKernel(params.mKernelType) && isSeparateQkv(params.mQkvLayout)
-            && (params.mLogNumEltsPerSageAttnBlkQ > 0 || params.mLogNumEltsPerSageAttnBlkK > 0
-                || params.mLogNumEltsPerSageAttnBlkV > 0))
+            && (mNumEltsPerSageAttnBlkQ > 0 || mNumEltsPerSageAttnBlkK > 0 || mNumEltsPerSageAttnBlkP > 0
+                || mNumEltsPerSageAttnBlkV > 0 || mDataTypeQkReinterpret != DATA_TYPE_E4M3))
         {
             selectKernelParams.mKernelType = FmhaKernelType::Context;
             selectKernelParams.mMultiCtasKvMode = MultiCtasKvMode::Disabled;
