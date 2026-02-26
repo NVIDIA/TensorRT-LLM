@@ -216,7 +216,10 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("MOE_GATE", tr::LoraModule::ModuleType::kMOE_GATE)
         .value("MOE_ROUTER", tr::LoraModule::ModuleType::kMOE_ROUTER)
         .value("MLP_ROUTER", tr::LoraModule::ModuleType::kMLP_ROUTER)
-        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP);
+        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP)
+        .value("SHARED_EXPERT_H_TO_4H", tr::LoraModule::ModuleType::kSHARED_EXPERT_H_TO_4H)
+        .value("SHARED_EXPERT_4H_TO_H", tr::LoraModule::ModuleType::kSHARED_EXPERT_4H_TO_H)
+        .value("SHARED_EXPERT_GATE", tr::LoraModule::ModuleType::kSHARED_EXPERT_GATE);
 
     nb::class_<tr::LoraModule>(m, "LoraModule")
         .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),

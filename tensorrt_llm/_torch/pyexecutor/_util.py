@@ -974,8 +974,10 @@ def create_py_executor_instance(
         # the adapter (e.g., upcycled models).
         shared_expert_hidden_size = 0
         if lora_config.lora_dir:
-            shared_expert_hidden_size = _infer_shared_expert_size_from_adapter(
-                lora_config.lora_dir[0], mapping.tp_size)
+            shared_expert_global = _infer_shared_expert_size_from_adapter(
+                lora_config.lora_dir[0])
+            if shared_expert_global > 0:
+                shared_expert_hidden_size = shared_expert_global // mapping.tp_size
 
         moe_hidden_size = 0
         moe_intermediate = getattr(pretrained_config, 'moe_intermediate_size',
@@ -1257,16 +1259,15 @@ def get_decoding_mode(
     return decoding_mode
 
 
-def _infer_shared_expert_size_from_adapter(adapter_dir: str,
-                                           tp_size: int) -> int:
+def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
     """Infer shared expert intermediate size from LoRA adapter weights.
 
     Scans the adapter for shared_expert.down_proj lora_A weights and
-    returns the intermediate size dimension. This is more reliable than
-    the model config, which may not match the adapter (e.g., upcycled models).
+    returns the global (unsharded) intermediate size. This is more reliable
+    than the model config, which may not match the adapter (e.g., upcycled
+    models).
     """
     import json
-    import os
 
     try:
         from tensorrt_llm.lora_manager import get_model_path, load_state_dict
@@ -1283,8 +1284,9 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str,
                 if rank > 0:
                     return tensor.shape[1] if tensor.shape[
                         0] == rank else tensor.shape[0]
-    except Exception:
-        pass
+    except Exception as e:
+        logger.debug(f"Failed to infer shared expert size from adapter: {e}",
+                     exc_info=True)
     return 0
 
 
