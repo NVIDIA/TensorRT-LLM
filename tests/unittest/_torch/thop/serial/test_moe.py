@@ -22,6 +22,11 @@ import torch
 import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
+# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# and test_moe_module.py. Add new MoE tests there instead of here.
+
 from enum import Enum
 
 from utils.util import getSMVersion
@@ -872,6 +877,10 @@ def are_groups_valid(top_k_groups, n_groups):
     return True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1006,6 +1015,10 @@ class TestMoeFP8:
                        percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1917,6 +1930,10 @@ class TestMoeFp4:
                        percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -2142,6 +2159,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                    percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() != 100,
     reason="The kernel only supports Blackwell. Current SM is %d." %

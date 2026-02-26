@@ -1504,17 +1504,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, False, False, True),
                            (True, False, True, True), (True, True, True, True)])
     @parametrize_with_ids("mtp", ["disable", "eagle", "vanilla"])
-    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                             ids=lambda x: ""
-                             if x == 0 else "enable_configurable_moe")
     def test_fp8_block_scales(self, mtp, fp8kv, attention_dp, cuda_graph,
-                              overlap_scheduler, torch_compile,
-                              enable_configurable_moe, mocker):
-        # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 else "0"
-        patch_mpi_pool_session_for_env(mocker,
-                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
-
+                              overlap_scheduler, torch_compile):
         if torch_compile and mtp != "disable":
             pytest.skip("https://nvbugs/5252313")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
@@ -1940,28 +1931,9 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                              ids=["tp4", "ep4", "tp2pp2", "pp4"])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
-    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                             ids=lambda x: ""
-                             if x == 0 else "enable_configurable_moe")
     def test_nvfp4_4gpus(self, fp8kv, attention_dp, cuda_graph,
                          overlap_scheduler, tp_size, pp_size, ep_size,
-                         torch_compile, mtp_nextn, moe_backend,
-                         enable_configurable_moe, mocker):
-        # Handle ENABLE_CONFIGURABLE_MOE environment variable
-        if enable_configurable_moe == 1 and moe_backend not in [
-                "TRTLLM", "CUTLASS"
-        ]:
-            pytest.skip(
-                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
-                f"current backend is {moe_backend}")
-
-        # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
-            "TRTLLM", "CUTLASS"
-        ] else "0"
-        patch_mpi_pool_session_for_env(mocker,
-                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
-
+                         torch_compile, mtp_nextn, moe_backend):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -4025,27 +3997,9 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
         ids=["latency", "ep2", "ep4"])
     @pytest.mark.parametrize("activation_dtype", ["static_fp8", "mxfp8"],
                              ids=["fp8", "mxfp8"])
-    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                             ids=lambda x: ""
-                             if x == 0 else "enable_configurable_moe")
     def test_w4a8_mxfp4(self, moe_backend, tp_size, pp_size, ep_size,
                         attention_dp, cuda_graph, overlap_scheduler,
-                        activation_dtype, enable_configurable_moe, mocker):
-        # Handle ENABLE_CONFIGURABLE_MOE environment variable
-        if enable_configurable_moe == 1 and moe_backend not in [
-                "TRTLLM", "CUTLASS"
-        ]:
-            pytest.skip(
-                f"ENABLE_CONFIGURABLE_MOE=1 is only supported with TRTLLM and CUTLASS backend, "
-                f"current backend is {moe_backend}")
-
-        # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 and moe_backend in [
-            "TRTLLM", "CUTLASS"
-        ] else "0"
-        patch_mpi_pool_session_for_env(mocker,
-                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
-
+                        activation_dtype):
         if moe_backend in ["CUTLASS", "TRTLLM"] and get_sm_version() < 100:
             pytest.skip(
                 "CUTLASS or TRTLLM moe backend requires Blackwell or newer.")
@@ -5136,17 +5090,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize(
         "kv_cache_dtype",
         ["auto", pytest.param("fp8", marks=skip_pre_blackwell)])
-    @pytest.mark.parametrize("enable_configurable_moe", [0, 1],
-                             ids=lambda x: ""
-                             if x == 0 else "enable_configurable_moe")
-    def test_w4_4gpus_online_eplb(self, kv_cache_dtype, enable_configurable_moe,
-                                  mocker):
+    def test_w4_4gpus_online_eplb(self, kv_cache_dtype, mocker):
         """Test GPTOSS with online expert parallel load balancer using TRTLLM backend and attention DP."""
-        # Patch MpiPoolSession to propagate env vars to MPI worker processes
-        env_value = "1" if enable_configurable_moe == 1 else "0"
-        patch_mpi_pool_session_for_env(mocker,
-                                       {"ENABLE_CONFIGURABLE_MOE": env_value})
-
         mocker.patch.object(GSM8K, "MAX_OUTPUT_LEN", 8192)
         mocker.patch.dict(GSM8K.EVALUATE_KWARGS,
                           {"scores_filter": "exact_match,flexible-extract"})
