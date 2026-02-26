@@ -471,7 +471,10 @@ def get_video_encoder() -> Optional["VideoEncoder"]:
             logger.info("Using ffmpeg CLI for video encoding")
             _VIDEO_ENCODER = FfmpegCliEncoder()
         else:
-            logger.info("Using pure Python MJPEG/AVI encoder (no audio support)")
+            logger.warning(
+                "FFmpeg is unavailable so no MP4 generation support."
+                "Using pure Python MJPEG/AVI encoder (no audio support)"
+            )
             _VIDEO_ENCODER = PurePythonEncoder()
     return _VIDEO_ENCODER
 
