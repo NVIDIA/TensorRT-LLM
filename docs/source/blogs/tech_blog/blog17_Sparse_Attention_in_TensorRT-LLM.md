@@ -24,9 +24,11 @@ Before diving into the framework design, this section provides a high-level over
 We begin with two demo videos that compare RocketKV and DSA against full attention under long-context workloads. Both demos use `max_batch_size=64` and `samples=128`. The results show clear improvements in both max-throughput and min-latency scenarios.
 
 https://github.com/user-attachments/assets/26ad6ba4-8254-4eb7-bf28-e40e4434d2f0
+
 <p align="center"><sub><em>Video 1: RocketKV v.s. Full Attention on 16k/2k workloads​.</em></sub></p>
 
 https://github.com/user-attachments/assets/eeaa4eef-e822-4f60-9aa1-1653c95c2df8
+
 <p align="center"><sub><em>Video 2: DSA v.s. Full Attention on 128k/1k workloads​.</em></sub></p>
 
 TensorRT LLM currently supports three sparse attention algorithms. These algorithms span two complementary levels:
