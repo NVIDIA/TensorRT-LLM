@@ -345,7 +345,6 @@ unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy[2-Di
 accuracy/test_disaggregated_serving.py::TestQwen3_30B_A3B::test_mixed_ctx_gen_model[ctxpp2gentp2] SKIP (https://nvbugs/5748664)
 perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_fp4_v2_grace_blackwell-r1_fp4_v2_tep4_mtp3_8k1k] SKIP (https://nvbugs/5819053)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_gptoss_style_nvfp4[limitinf-beta0-alpha0.1-RoutingGPTOSS-512-512-1] SKIP (https://nvbugs/5819042)
-accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_fp8_blockscale[throughput_mtp] SKIP (https://nvbugs/5839155)
 accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=1-ctx_pp=4] SKIP (https://nvbugs/5845943)
 accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph SKIP (https://nvbugs/5860520)
 unittest/_torch/thop/serial/test_moe.py::TestMoeFp4::test_online_eplb288_topk_input[RoutingDSv3-1024-1024-256] SKIP (https://nvbugs/5859881)
