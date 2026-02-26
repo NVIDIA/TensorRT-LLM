@@ -28,6 +28,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
+import numpy as np
 import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
@@ -35,10 +36,33 @@ from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-from ...._utils import nvtx_range, str_dtype_to_torch
+from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
+
+# Torch dtype → numpy dtype for fast list-to-tensor conversion.
+# numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
+_TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {
+    torch.int: np.int32,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.long: np.int64,
+    torch.float: np.float32,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.double: np.float64,
+    torch.float16: np.float16,
+    torch.bool: np.bool_,
+}
+
+
+def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a Python list to a tensor, using numpy for speed."""
+    np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
+    if np_dtype is not None:
+        return torch.from_numpy(np.array(data, dtype=np_dtype))
+    return torch.tensor(data, dtype=dtype)
 
 
 class PrepareMetadataHostCallable(Protocol):
@@ -111,7 +135,7 @@ class InputBuffer:
         if self._total_bytes > 0:
             self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
             self._host_buffer = torch.empty(
-                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
             )
         else:
             self._device_buffer = torch.empty(0, dtype=torch.uint8)
@@ -130,7 +154,7 @@ class InputBuffer:
             byte_size = numel * dtype.itemsize
             self._trunc_device_bufs[name] = torch.empty(byte_size, dtype=torch.uint8)
             self._trunc_host_bufs[name] = torch.empty(
-                byte_size, dtype=torch.uint8, device="cpu", pin_memory=True
+                byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
             )
             # Create typed views
             self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
@@ -184,15 +208,15 @@ class InputBuffer:
     def store(
         self,
         name: str,
-        data: List[Number],
+        data: torch.Tensor,
         fill_value: Optional[Number] = None,
     ) -> int:
-        """Store data into the host buffer.
+        """Store a tensor into the pinned host buffer.
 
         Args:
             name: Name of the tensor to store to.
-            data: List of values to store.
-            fill_value: Optional value to fill the entire tensor with before storing.
+            data: 1-D torch.Tensor to store.
+            fill_value: Optional value to fill the entire buffer with before storing.
 
         Returns:
             Number of elements stored.
@@ -203,11 +227,12 @@ class InputBuffer:
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        length = len(data)
+        length = data.numel()
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
-
-        temp_tensor = torch.tensor(data, dtype=dtype)
-        host_view[:length].copy_(temp_tensor)
+        # Use numpy for the memcpy into pinned memory — avoids torch dispatcher overhead
+        dst = host_view[:length].numpy()
+        src = (data if data.dtype == dtype else data.to(dtype)).numpy()
+        np.copyto(dst, src)
 
         self._current_lengths[name] = length
         return length
@@ -262,7 +287,7 @@ class InputBuffer:
         # Host buffer must be re-allocated for pinned memory
         old_host = self._trunc_host_bufs[name]
         self._trunc_host_bufs[name] = torch.empty(
-            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=True
+            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
         )
         self._trunc_host_bufs[name][: old_host.numel()].copy_(old_host)
         del old_host
@@ -481,8 +506,10 @@ class SequenceInfo:
             f"{name}_host" for name in self._input_buffer.tensor_names
         }
 
-        # Initialize args_list from tensor specs
-        self._args_list: Dict[str, List[int]] = {spec[0]: [0] * spec[1] for spec in tensor_specs}
+        # Initialize args_list from tensor specs (all entries are tensors)
+        self._args_list: Dict[str, torch.Tensor] = {
+            spec[0]: torch.zeros(spec[1], dtype=spec[2]) for spec in tensor_specs
+        }
 
         self._active_args = ("input_ids", "position_ids")
         self._shapeable_args = ("input_ids", "position_ids", "input_ids_host", "position_ids_host")
@@ -577,19 +604,19 @@ class SequenceInfo:
 
     @property
     def seq_len(self) -> List[int]:
-        return self._args_list["seq_len"].copy()
+        return self._args_list["seq_len"].tolist()
 
     @property
     def input_pos(self) -> List[int]:
-        return self._args_list["input_pos"].copy()
+        return self._args_list["input_pos"].tolist()
 
     @property
     def cache_loc(self) -> List[int]:
-        return self._args_list["cache_loc"].copy()
+        return self._args_list["cache_loc"].tolist()
 
     @property
     def pages_per_seq(self) -> List[int]:
-        return self._args_list["pages_per_seq"].copy()
+        return self._args_list["pages_per_seq"].tolist()
 
     @property
     def num_sequences(self) -> int:
@@ -661,8 +688,7 @@ class SequenceInfo:
             # Resize all truncatable page tensors together (they share the same max size)
             for tensor_name in ("cache_loc", "page_seq_indices", "page_in_seq"):
                 self._input_buffer.resize(tensor_name, estimated_capacity)
-                old_size = len(self._args_list[tensor_name])
-                self._args_list[tensor_name].extend([0] * (estimated_capacity - old_size))
+                self._args_list[tensor_name] = torch.zeros(estimated_capacity, dtype=torch.int)
 
     @staticmethod
     def _get_page_assignments(
@@ -824,7 +850,7 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[Number],
+        data: "Union[List[Number], torch.Tensor]",
         reset_val: Optional[Number] = None,
     ) -> None:
         """Store the argument into the pinned host buffer for later batch transfer to device.
@@ -832,14 +858,22 @@ class SequenceInfo:
         The data is stored in the host-side pinned memory buffer managed by InputBuffer.
         The actual H2D transfer happens in a single batch at the end of nest_sequences().
 
+        Lists are converted to tensors at the boundary so the rest of the pipeline is
+        tensor-only.
+
         Args:
             name: Name of the argument to store.
-            tnsr_like: List of values to store.
+            data: List of values or a 1-D torch.Tensor to store.
             reset_val: Value to reset/fill the tensor with before writing data.
         """
         with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
-            # Always store list object for Python access
-            self._args_list[name] = tnsr_like.copy()
+            # Convert to tensor at the boundary (numpy is ~2-3x faster than torch.tensor for large lists)
+            # TODO: move this to self._input_buffer.store() when _args_list get deprecated
+            if not isinstance(data, torch.Tensor):
+                _, dtype = self._input_buffer._tensor_specs[name]
+                data = _list_to_tensor(data, dtype)
+
+            self._args_list[name] = data
 
             # Only store to buffer when the argument is active or requires copy
             is_active = name in self._active_args or f"{name}_host" in self._active_args
@@ -848,7 +882,7 @@ class SequenceInfo:
                 return
 
             # Store to the InputBuffer's pinned host memory
-            self._input_buffer.store(name, tnsr_like, fill_value=reset_val)
+            self._input_buffer.store(name, data, fill_value=reset_val)
 
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
@@ -981,24 +1015,27 @@ class SequenceInfo:
             self._store_arg("cache_loc", cache_loc)
             self._store_arg("pages_per_seq", pages_per_seq)
 
-            # Auto-compute page_seq_indices and page_in_seq from pages_per_seq.
+            # Resolve cu_num_pages: use caller-provided value or derive from pages_per_seq
+            if cu_num_pages is None:
+                pps_t = self._args_list["pages_per_seq"]
+                cu_num_pages = torch.zeros(len(pps_t) + 1, dtype=torch.int)
+                cu_num_pages[1:] = pps_t.cumsum(0)
+            self._store_arg("cu_num_pages", cu_num_pages)
+
+            # Compute page_seq_indices and page_in_seq using vectorized torch ops,
+            # reusing the stored cu_num_pages tensor instead of recomputing the cumsum.
             # page_seq_indices[j] = which sequence page j belongs to
             # page_in_seq[j] = which page within that sequence (0-indexed)
-            page_seq_indices = []
-            page_in_seq_vals = []
-            for i, n_pages in enumerate(pages_per_seq):
-                page_seq_indices.extend([i] * n_pages)
-                page_in_seq_vals.extend(range(n_pages))
-            self._store_arg("page_seq_indices", page_seq_indices)
-            self._store_arg("page_in_seq", page_in_seq_vals)
-
-        # update cumulative number of pages
-        if cu_num_pages is None:
-            pages_per_seq = self.pages_per_seq
-            cu_num_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
-            cu_num_pages[1:] = torch.cumsum(torch.tensor(pages_per_seq), dim=0)
-            cu_num_pages = cu_num_pages.tolist()
-        self._store_arg("cu_num_pages", cu_num_pages)
+            pages_per_seq_t = self._args_list["pages_per_seq"]
+            cu_pages_t = self._args_list["cu_num_pages"]
+            seq_indices = torch.arange(len(pages_per_seq), dtype=torch.int)
+            page_seq_indices_t = torch.repeat_interleave(seq_indices, pages_per_seq_t)
+            total_pages = cu_pages_t[-1].item()
+            page_in_seq_t = torch.arange(total_pages, dtype=torch.int) - torch.repeat_interleave(
+                cu_pages_t[:-1], pages_per_seq_t
+            )
+            self._store_arg("page_seq_indices", page_seq_indices_t)
+            self._store_arg("page_in_seq", page_in_seq_t)
 
         # update sequence length with cache
         if seq_len_with_cache is None:
