@@ -185,8 +185,8 @@ mock_reponse = {
     "acceptance_rate": [[0.0]],
     "total_accepted_draft_tokens": [[0]],
     "total_draft_tokens": [[0]],
-    "num_input_tokens": None,
-    "num_output_tokens": None
+    "num_input_tokens": [[0]],
+    "num_output_tokens": [[0]]
 }
 
 mock_request = {"text_input": [["Hello world"]], "max_tokens": [[24]]}

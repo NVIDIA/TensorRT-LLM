@@ -230,29 +230,28 @@ decode_testcases = [
         "text_input":
         "Deep learning is",
         "max_tokens":
-        10,
+        6,
         "use_speculative":
         True,
         "num_draft_tokens":
         3,
         "use_draft_logits":
         False,
-        "exclude_input_in_output":
+        "exclude_input_in_output_on_request":
         True,
         "input_ids": [1, 10, 11, 23],
         "target_output": [{
-            "output_ids": [1, 10, 11, 23, 7, 9, 21],
-            "output_text": "Deep learning is a subset of"
+            "output_ids": [7, 9, 21, 22],
+            "output_text": " a subset of Machine"
         }, {
-            "output_ids": [1, 10, 11, 23, 7, 9, 21, 22, 11],
-            "output_text":
-            "Deep learning is a subset of Machine learning"
+            "output_ids": [11, 19, 27],
+            "output_text": " learning method which"
         }],
         "draft_output": [{
             "output_ids": [7, 9, 21],
             "sequence_length": 3,
         }, {
-            "output_ids": [22, 11],
+            "output_ids": [11, 19],
             "sequence_length": 2,
         }]
     },
@@ -273,8 +272,9 @@ def test_decode(test_case):
                           if "use_draft_logits" in test_case else None),
         stop_words=np.array([[[]]]),
         exclude_input_in_output=(np.array(
-            [[test_case["exclude_input_in_output"]]],
-            dtype=bool) if "exclude_input_in_output" in test_case else None))
+            [[test_case["exclude_input_in_output_on_request"]]], dtype=bool)
+                                 if "exclude_input_in_output_on_request"
+                                 in test_case else None))
     # Last index is the expected response
     expected_res = Response(text_output=np.array(
         [test_case["target_output"][-1]["output_text"]], dtype=object))
