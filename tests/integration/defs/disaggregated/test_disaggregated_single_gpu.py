@@ -129,14 +129,18 @@ async def run_worker(kv_cache_config,
             if requests is None:
                 break
 
+            request_metas = []
             futures = []
             for i, request in enumerate(requests):
                 print(f"Worker {rank}: submitting request {i}/{len(requests)}",
                       flush=True)
+                streaming = request[3] if len(request) > 3 else False
+                request_metas.append(streaming)
                 futures.append(
                     llm.generate_async(request[0],
                                        sampling_params=request[1],
-                                       disaggregated_params=request[2]))
+                                       disaggregated_params=request[2],
+                                       streaming=streaming))
             print(f"Worker {rank}: all {len(futures)} requests submitted",
                   flush=True)
 
@@ -166,18 +170,39 @@ async def run_worker(kv_cache_config,
                         intercomm.send(str(e), dest=0, tag=MPI_RESULT)
             else:
                 for i, future in enumerate(futures):
-                    try:
+                    is_streaming = request_metas[i]
+                    if is_streaming:
                         print(
-                            f"Worker {rank}: awaiting future {i}/{len(futures)}",
+                            f"Worker {rank}: awaiting streaming future {i}/{len(futures)}",
                             flush=True)
-                        result = await future
-                        print(f"Worker {rank}: got result {i}, sending",
+                        per_chunk_logits = []
+                        chunk_idx = 0
+                        async for _ in future:
+                            out = future.outputs[0]
+                            logits = out.generation_logits
+                            shape = logits.shape if logits is not None else None
+                            print(
+                                f"Worker {rank}: streaming chunk {chunk_idx}, "
+                                f"logits shape: {shape}",
+                                flush=True)
+                            per_chunk_logits.append(shape)
+                            chunk_idx += 1
+                        print(f"Worker {rank}: got streaming result {i}, sending",
                               flush=True)
-                        intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
-                    except Exception as e:
-                        print(f"Worker {rank}: error on future {i}: {e}",
-                              flush=True)
-                        intercomm.send(str(e), dest=0, tag=MPI_RESULT)
+                        intercomm.send(per_chunk_logits, dest=0, tag=MPI_RESULT)
+                    else:
+                        try:
+                            print(
+                                f"Worker {rank}: awaiting future {i}/{len(futures)}",
+                                flush=True)
+                            result = await future
+                            print(f"Worker {rank}: got result {i}, sending",
+                                flush=True)
+                            intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
+                        except Exception as e:
+                            print(f"Worker {rank}: error on future {i}: {e}",
+                                flush=True)
+                            intercomm.send(str(e), dest=0, tag=MPI_RESULT)
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
             raise e
@@ -770,6 +795,141 @@ def test_disaggregated_cancel_gen_requests(model):
             mpi_send_termination_request(intercomm)
 
             print("Waiting for all workers to terminate.", flush=True)
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
+
+
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+@pytest.mark.parametrize("generation_overlap", [False, True])
+def test_disaggregated_logits(model, generation_overlap):
+    """Verify that generation logits propagate from prefill to decode in disagg."""
+    worker_pytorch_configs = []
+
+    # Context worker
+    worker_pytorch_configs.append(dict(disable_overlap_scheduler=True))
+
+    # Generation worker
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=not generation_overlap))
+
+    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+    ranks = [0, 1]
+    worker_args = list(
+        zip(kv_cache_configs, cache_transceiver_configs, worker_pytorch_configs,
+            model_names, ranks))
+
+    port_name = mpi_publish_name()
+
+    prompt = "What is the capital of Germany?"
+    max_tokens = 10
+
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_MM_ERROR_HANDLING": "y"
+                         }) as executor:
+        futures = []
+        try:
+            for worker_arg in worker_args:
+                future = executor.submit(worker_entry_point, *worker_arg)
+                futures.append(future)
+        except Exception as e:
+            print(f"Error in worker {worker_arg}: {e}")
+            raise e
+
+        intercomm = None
+        try:
+            print("Launched all the workers.", flush=True)
+            intercomm = mpi_initialize_intercomm(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+
+            # --- Run aggregated request for reference ---
+            agg_sp = SamplingParams(max_tokens=max_tokens,
+                                    ignore_eos=True,
+                                    return_generation_logits=True)
+            agg_requests = [(prompt, agg_sp, None)]
+            # Use context worker (rank 0) for aggregated request
+            agg_responses = send_requests_to_worker(agg_requests, 0, intercomm)
+            agg_output = agg_responses[0][0]
+            agg_logits = agg_output.generation_logits
+            assert agg_logits is not None, \
+                "Aggregated request should produce generation_logits"
+            print(f"Aggregated logits shape: {agg_logits.shape}")
+
+            # --- Run disaggregated: context_only ---
+            ctx_sp = SamplingParams(max_tokens=max_tokens,
+                                    ignore_eos=True,
+                                    return_generation_logits=True)
+            ctx_requests = [(prompt, ctx_sp,
+                             DisaggregatedParams(request_type="context_only"))]
+            ctx_responses = send_requests_to_worker(ctx_requests, 0, intercomm)
+            ctx_output = ctx_responses[0][0]
+            dp = ctx_output.disaggregated_params
+
+            assert dp is not None
+            assert dp.request_type == "context_only"
+            assert dp.first_gen_logits is not None, \
+                "context_only should produce first_gen_logits"
+            assert len(dp.first_gen_logits) > 0
+            print(f"first_gen_logits[0] shape: {dp.first_gen_logits[0].shape}")
+
+            # --- Run disaggregated: generation_only (non-streaming) ---
+            dp.request_type = "generation_only"
+            gen_sp = SamplingParams(max_tokens=max_tokens,
+                                    ignore_eos=True,
+                                    return_generation_logits=True)
+            gen_requests = [(prompt, gen_sp, dp)]
+            gen_responses = send_requests_to_worker(gen_requests, 1, intercomm)
+            gen_output = gen_responses[0][0]
+            gen_logits = gen_output.generation_logits
+
+            assert gen_logits is not None, \
+                "generation_only with first_gen_logits should produce " \
+                "generation_logits"
+            print(f"Disagg gen logits shape: {gen_logits.shape}, "
+                  f"output tokens: {len(gen_output.token_ids)}")
+
+            # Logits should cover all generated tokens (including the
+            # first token whose logits were transferred from prefill).
+            assert gen_logits.shape[0] == len(gen_output.token_ids), \
+                (f"generation_logits length {gen_logits.shape[0]} != "
+                 f"output token count {len(gen_output.token_ids)}")
+
+            # --- Run disaggregated: generation_only (streaming) ---
+            # Re-run context_only to get fresh disagg params.
+            ctx_responses2 = send_requests_to_worker(ctx_requests, 0, intercomm)
+            dp2 = ctx_responses2[0][0].disaggregated_params
+            dp2.request_type = "generation_only"
+            stream_sp = SamplingParams(max_tokens=max_tokens,
+                                       ignore_eos=True,
+                                       return_generation_logits=True)
+            stream_requests = [(prompt, stream_sp, dp2, True)]
+            stream_responses = send_requests_to_worker(stream_requests, 1,
+                                                       intercomm)
+            per_chunk_logits = stream_responses[0]
+            print(f"Streaming per-chunk logits shapes: {per_chunk_logits}")
+            assert len(per_chunk_logits) > 0, \
+                "Expected at least one streaming chunk"
+            assert per_chunk_logits[0] is not None, \
+                ("First streaming chunk should have generation_logits "
+                 "(first_gen_logits from prefill), but got None")
+
+        except Exception as e:
+            print(f"Exception encountered: {e}", flush=True)
+            raise e
+        finally:
+            print("Sending termination request", flush=True)
+            mpi_send_termination_request(intercomm)
+
+            print("Waiting for all workers to terminate. ", flush=True)
             for future in futures:
                 future.result()
             print("All workers terminated.")

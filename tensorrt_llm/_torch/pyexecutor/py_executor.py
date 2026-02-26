@@ -2821,18 +2821,36 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
-                # Prepend logprobs for first_gen_tokens if transferred from prefill.
-                disagg_params = getattr(req, 'py_disaggregated_params', None)
-                if (disagg_params is not None
-                        and getattr(disagg_params, 'first_gen_log_probs',
-                                    None) is not None):
-                    if beam_width != 1:
-                        raise ValueError(
-                            "first_gen_log_probs transfer currently assumes "
-                            "beam_width == 1; beam search is not supported "
-                            "with disaggregated logprobs propagation.")
-                    req.py_result.append_log_probs(
-                        [disagg_params.first_gen_log_probs])
+                self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+    def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
+        """Prepend logprobs and generation logits for first_gen_tokens
+        if transferred from prefill."""
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return
+
+        if getattr(disagg_params, 'first_gen_log_probs', None) is not None:
+            if beam_width != 1:
+                logger.warning(
+                    "Skipping first_gen_log_probs prepend for "
+                    "request %s: beam_width=%s is not supported.",
+                    req.py_request_id, beam_width)
+            else:
+                req.py_result.append_log_probs(
+                    [disagg_params.first_gen_log_probs])
+
+        if getattr(disagg_params, 'first_gen_logits', None) is not None:
+            if beam_width != 1:
+                logger.warning(
+                    "Skipping first_gen_logits prepend for "
+                    "request %s: beam_width=%s is not supported.",
+                    req.py_request_id, beam_width)
+            else:
+                device = torch.device('cuda', self.device_id)
+                for logits_tensor in disagg_params.first_gen_logits:
+                    req.py_result.append_generation_logits(
+                        logits_tensor.to(device))
 
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
@@ -3260,7 +3278,27 @@ class PyExecutor:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
+                # Snapshot the prepended first_gen_logits before creating
+                # the response.  py_result is shared across all streaming
+                # responses, so the lazy generation_logits property would
+                # read stale state by the time the consumer processes it.
+                # Setting the snapshot as an instance attribute on LlmResult
+                # shadows __getattr__ so the consumer gets the correct logits.
+                has_prepended_logits = (
+                    self.should_exclude_last_generation_logits and getattr(
+                        req, 'py_disaggregated_params', None) is not None
+                    and getattr(req.py_disaggregated_params, 'first_gen_logits',
+                                None) is not None)
+                logits_snapshot = None
+                if has_prepended_logits:
+                    req.set_exclude_last_generation_logits(False)
+                    try:
+                        logits_snapshot = req.py_result.generation_logits
+                    finally:
+                        req.set_exclude_last_generation_logits(True)
                 response = req.create_response(False, self.dist.rank)
+                if has_prepended_logits and response is not None:
+                    response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)

@@ -119,6 +119,7 @@ class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
     first_gen_log_probs: Optional[List] = None
+    first_gen_logits: Optional[List] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
@@ -1133,6 +1134,48 @@ def _deserialize_first_gen_log_probs(
     return result
 
 
+def _serialize_first_gen_logits(
+    first_gen_logits: Optional[list], ) -> Optional[List]:
+    """Serialize list[torch.Tensor] to JSON-safe list[dict] with base64 data."""
+    if first_gen_logits is None:
+        return None
+    result = []
+    for i, tensor in enumerate(first_gen_logits):
+        t = tensor.contiguous().cpu()
+        if t.dtype == torch.bfloat16:
+            t = t.to(torch.float16)
+        np_array = t.numpy()
+        result.append({
+            "data": base64.b64encode(np_array.tobytes()).decode(),
+            "shape": list(np_array.shape),
+            "dtype": str(np_array.dtype),
+        })
+    return result
+
+
+def _deserialize_first_gen_logits(
+    serialized: Optional[List], ) -> Optional[list]:
+    """Deserialize JSON list[dict] back to list[torch.Tensor]."""
+    if serialized is None:
+        return None
+    import numpy as np
+    result = []
+    for i, item in enumerate(serialized):
+        if not isinstance(item, dict):
+            raise ValueError(
+                f"first_gen_logits[{i}] must be a dict, got {type(item)}")
+        for key in ("data", "shape", "dtype"):
+            if key not in item:
+                raise ValueError(
+                    f"first_gen_logits[{i}] missing required key '{key}'")
+        np_array = np.frombuffer(
+            base64.b64decode(item["data"]),
+            dtype=np.dtype(item["dtype"]),
+        ).reshape(item["shape"])
+        result.append(torch.from_numpy(np_array.copy()))
+    return result
+
+
 def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
@@ -1142,6 +1185,8 @@ def to_disaggregated_params(
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
         first_gen_log_probs=_serialize_first_gen_log_probs(
             tllm_disagg_params.first_gen_log_probs),
+        first_gen_logits=_serialize_first_gen_logits(
+            tllm_disagg_params.first_gen_logits),
         ctx_request_id=tllm_disagg_params.ctx_request_id,
         encoded_opaque_state=encode_opaque_state(
             tllm_disagg_params.opaque_state),
@@ -1162,6 +1207,8 @@ def to_llm_disaggregated_params(
         first_gen_tokens=disaggregated_params.first_gen_tokens,
         first_gen_log_probs=_deserialize_first_gen_log_probs(
             disaggregated_params.first_gen_log_probs),
+        first_gen_logits=_deserialize_first_gen_logits(
+            disaggregated_params.first_gen_logits),
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
