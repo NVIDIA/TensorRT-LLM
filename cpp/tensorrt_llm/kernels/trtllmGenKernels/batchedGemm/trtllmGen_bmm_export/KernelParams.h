@@ -646,7 +646,30 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             tg::Dtype const dTypeSf = (options.mDtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
             int32_t const numEltsPerSfA = options.mSfBlockSizeA;
 
-            if (options.mRouteSfsImpl.value() == batchedGemm::RouteImpl::NoRoute)
+            if (batchedGemm::doesRouteImplUseTma(options.mRouteSfsImpl.value()))
+            {
+
+                // The input is NOT padded:
+                // [act0, act1, act2, ...]
+
+                // Build TMA descriptor for gmem A block scaling factors.
+                // Pad number of scaling factors to the nearest multiple of 16 because of the TMA 16B
+                // alignment requirement.
+                auto numSfsInK = options.mK / numEltsPerSfA;
+                numSfsInK = ceilDiv(numSfsInK, 16) * 16;
+
+                auto numSfsInValidK = options.mValidK / numEltsPerSfA;
+                numSfsInValidK = ceilDiv(numSfsInValidK, 16) * 16;
+
+                auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideAbc(options, options.mNumTokens,
+                    options.mN, numSfsInK, 1 /* tileM */, options.mTileN, options.mTileK / numEltsPerSfA,
+                    MatrixType::MatrixA, options.mNumTokens, options.mValidN, numSfsInValidK);
+                params.tmaSfA[0]
+                    = gemm::buildNdTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA),
+                        /*doPad=*/false,
+                        /*doSwizzle=*/true);
+            }
+            else if (options.mRouteSfsImpl.value() == batchedGemm::RouteImpl::NoRoute)
             {
 
                 // The input is padded:

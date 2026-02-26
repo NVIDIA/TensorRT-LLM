@@ -242,7 +242,7 @@ TrtllmGenBatchedGemmRunner::TrtllmGenBatchedGemmRunner(TrtllmGenBatchedGemmRunne
 
         if (options.mUseDeepSeekFp8)
         {
-            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrixA should be false for DeepSeek Fp8"))
+            if (!acceptIf(options.mUseShuffledMatrix == false, "useShuffledMatrix should be false for DeepSeek Fp8"))
             {
                 continue;
             }
