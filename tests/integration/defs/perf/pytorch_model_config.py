@@ -150,6 +150,28 @@ def get_model_yaml_config(model_label: str,
                 'enable_chunked_prefill': True,
             }
         },
+        # Deepseek R1 NVFP4 with chunked prefill, large seq len, and fp8 KV cache
+        {
+            'patterns': [
+                'deepseek_r1_nvfp4-bench-pytorch-float4-maxbs:32-maxnt:4096-kv_frac:0.80-input_output_len:8192,512-reqs:3000-ep:2-tp:4-gpus:4',
+            ],
+            'config': {
+                'enable_attention_dp': True,
+                'enable_chunked_prefill': True,
+                'max_num_tokens': 4096,
+                'max_batch_size': 32,
+                'max_seq_len': 81920,
+                'kv_cache_config': {
+                    'dtype': 'fp8',
+                    'free_gpu_memory_fraction': 0.80,
+                    'enable_block_reuse': False,
+                },
+                'cuda_graph_config': {
+                    'enable_padding': True,
+                    'max_batch_size': 32,
+                },
+            }
+        },
         # Deepseek R1 model with CUTLASS backend
         {
             'patterns': [
