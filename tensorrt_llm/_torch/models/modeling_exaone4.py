@@ -29,7 +29,8 @@ except ImportError:
     class Exaone4Config(PretrainedConfig):
         model_type = "exaone4"
 
-    AutoConfig.register(Exaone4Config.model_type, Exaone4Config)
+    AutoConfig.register(Exaone4Config.model_type, Exaone4Config,
+                        exist_ok=True)
 
 
 def check_is_sliding(config: Exaone4Config, layer_idx: int) -> bool:
