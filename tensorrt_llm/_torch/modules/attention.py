@@ -1823,8 +1823,8 @@ class MLA(nn.Module):
             v_head_dim, dtype, device):
         """Warmup torch.compile for cat operations with different tensor layouts.
 
-        Warmup with two different num_tokens values for each unique tensor layout
-        to ensure torch.compile generates specialized kernels that won't trigger
+        Warmup with multiple num_tokens values for each unique tensor layout to
+        ensure torch.compile generates specialized kernels that won't trigger
         recompilation at runtime. Do not use torch.compile with dynamic=True here
         because it completely ignores tensor layout/stride information, resulting
         in significantly degraded performance.
@@ -1854,7 +1854,8 @@ class MLA(nn.Module):
 
         # Use two different num_tokens values (>1) to trigger torch.compile to
         # generate kernels that generalize across varying num_tokens at runtime.
-        # Avoid num_tokens=1 because torch.compile may specialize for that case.
+        # Warmup num_tokens=1 separately since torch.compile may specialize for it.
+        warmup(1)
         warmup(2)
         warmup(3)
 
