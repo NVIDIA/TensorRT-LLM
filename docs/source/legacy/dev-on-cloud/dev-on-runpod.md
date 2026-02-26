@@ -19,7 +19,7 @@ Please refer to the [Build Image to DockerHub](build-image-to-dockerhub.md).
 Note that the docker image must enable ssh access. See on [Enable ssh access to the container](build-image-to-dockerhub.md#enable-ssh-access-to-the-container).
 
 ## Create a Pod Template
-Click "Template" bottom on the menus and click "Create Template" bottom.
+Click "Template" button on the menus and click "Create Template" button.
 
 Fill the docker image link of DockerHub such as `docker.io/<your_dockerhub_username>/tensorrt_llm:devel` on "Docker Image" field.
 
