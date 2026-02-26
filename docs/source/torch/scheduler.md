@@ -68,7 +68,7 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
             else:
                 pending_requests.append(request)
 
-        avaiable_blocks = max_blocks - reserved_blocks
+        available_blocks = max_blocks - reserved_blocks
         for request in pending_requests:
             req_state = request.state
             if len(scheduled_requests) >= self.max_num_requests:
@@ -76,10 +76,10 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
             elif req_state == LlmRequestState.CONTEXT_INIT:
                 needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(
                     request)
-                if needed_blocks <= avaiable_blocks:
+                if needed_blocks <= available_blocks:
                     scheduled_requests.append(request)
-                    avaiable_blocks -= needed_blocks
-                elif needed_blocks > avaiable_blocks:
+                    available_blocks -= needed_blocks
+                elif needed_blocks > available_blocks:
                     # If one requests fails to be scheduled, break
                     break
 
@@ -91,11 +91,11 @@ class GuaranteedNoEvictScheduler(CapacityScheduler):
 
 After implementing your own scheduler, integrate it into the PyExecutor.
 For the PyTorch backend, the code is in [py_executor_creator.py](https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/py_executor_creator.py).
-In the `create_pytorch_model_based_executor` function, there are two lines creating `CapacityScheduler`:
+In the `create_py_executor` function, there are two lines creating `CapacityScheduler`:
 
 ```python
-    capacitor_scheduler = BindCapacityScheduler(max_num_requests,
-                                                kv_cache_manager.impl)
+    capacity_scheduler = BindCapacityScheduler(max_num_requests,
+                                               kv_cache_manager.impl)
 ```
 
 Similar adjustments can be made for `MicroBatchScheduler`. This allows the `PyExecutor` to execute with your customized scheduling logic.
