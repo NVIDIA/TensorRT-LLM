@@ -28,6 +28,7 @@ import trace
 import traceback
 import weakref
 from contextlib import contextmanager
+from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
@@ -1259,24 +1260,27 @@ def confidential_compute_enabled() -> bool:
     Query NVML for the confidential compute state
     """
 
+    try:
+        import pynvml
+    except ImportError:
+        logger.error("pynvml not available; assuming CC=off")
+        return False
+
     cc_enabled = False
 
     try:
-        # Init
-        import pynvml
         pynvml.nvmlInit()
 
         # Hopper and newer supports a more nuanced query of confidential
         # compute settings
         cc_settings = pynvml.c_nvmlSystemConfComputeSettings_v1_t()
-        if (pynvml.nvmlSystemGetConfComputeSettings(cc_settings) ==
-                pynvml.NVML_SUCCESS):
-            cc_enabled = (cc_settings.ccFeature
-                          == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
-                          or cc_settings.multiGpuMode
-                          == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
+        ret = pynvml.nvmlSystemGetConfComputeSettings(byref(cc_settings))
+        pynvml._nvmlCheckReturn(ret)
+        cc_enabled = (
+            cc_settings.ccFeature == pynvml.NVML_CC_SYSTEM_FEATURE_ENABLED
+            or cc_settings.multiGpuMode
+            == pynvml.NVML_CC_SYSTEM_MULTIGPU_PROTECTED_PCIE
+            or cc_settings.multiGpuMode == pynvml.NVML_CC_SYSTEM_MULTIGPU_NVLE)
     except pynvml.NVMLError_NotSupported:
         # Simple query for older GPUs
         try:
@@ -1296,6 +1300,32 @@ def confidential_compute_enabled() -> bool:
             pass
 
     return cc_enabled
+
+
+@lru_cache(maxsize=None)
+def prefer_pinned() -> bool:
+    """
+    Returns whether pinned memory is beneficial for performance.
+
+    While pinned memory is typically preferred for H2D and D2H transfers, it
+    offers no advantage when Confidential Compute (CC) is enabled. In fact, CC
+    forces most transfers to be synchronous. The exception is pageable H2D
+    copies smaller than 2MB, which remain asynchronous.
+
+    Since input preparation relies heavily on these small H2D copies, usage of
+    pageable (and not pinned) memory across the board is preferred in CC mode
+    to maintain asynchronous execution.
+    """
+    return not confidential_compute_enabled()
+
+
+def maybe_pin_memory(tensor: torch.Tensor) -> torch.Tensor:
+    """
+    Pin the Tensor memory if pinning is preferred/beneficial for performance
+    """
+    if prefer_pinned():
+        return tensor.pin_memory()
+    return tensor
 
 
 P = ParamSpec("P")
