@@ -481,6 +481,7 @@ class Llama4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Only enable min-latency mode on Blackwell
@@ -505,6 +506,7 @@ class Llama4DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            lora_params=lora_params,
             **kwargs,
         )
 
