@@ -22,22 +22,11 @@ import torch
 from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion
 
-from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.autotuner import AutoTuner
 
 
-@pytest.mark.skipif(
-    getSMVersion() not in (100, 103),
-    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
-)
-@pytest.mark.parametrize("num_experts", [72])
-@pytest.mark.parametrize("k", [1536])
-@pytest.mark.parametrize("n", [2560])
-@pytest.mark.parametrize("max_tokens_per_group", [10, 50, 100, 128, 256, 512, 1000, 1024])
-@pytest.mark.parametrize("dtype", [torch.bfloat16])
-@pytest.mark.parametrize("use_tvm_ffi", [True, False])
-def test_cute_dsl_fp8_block_scale_grouped_gemm(
-    dtype, use_tvm_ffi, num_experts, k, n, max_tokens_per_group
-):
+def _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_experts, k, n, max_tokens_per_group):
+    """Prepare inputs and reference output for fp8 block-scale grouped GEMM."""
     random.seed(0)
     torch.random.manual_seed(0)
 
@@ -69,32 +58,59 @@ def test_cute_dsl_fp8_block_scale_grouped_gemm(
         b_fp8[i, :, :] = cur_b
         b_scale[i, :, :] = cur_b_scale
 
-    with autotune():
+    return a_fp8, a_scale, b_fp8, b_scale, group_offset, output_expected
+
+
+@pytest.mark.skipif(
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
+)
+@pytest.mark.parametrize("num_experts", [72])
+@pytest.mark.parametrize("k", [1536])
+@pytest.mark.parametrize("n", [2560])
+@pytest.mark.parametrize("max_tokens_per_group", [10, 50, 100, 128, 256, 512, 1000, 1024])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_experts, k, n, max_tokens_per_group):
+    a_fp8, a_scale, b_fp8, b_scale, group_offset, output_expected = (
+        _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_experts, k, n, max_tokens_per_group)
+    )
+
+    with AutoTuner.get().capture() as tactics_capture:
         output = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
             input=a_fp8,
             weight=b_fp8,
             input_scale=a_scale,
             weight_scale=b_scale,
             group_offset=group_offset,
-            use_tvm_ffi=use_tvm_ffi,
             num_experts=num_experts,
             top_k=1,
             num_local_experts=num_experts,
             local_expert_offset=0,
         )
-    output = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
-        input=a_fp8,
-        weight=b_fp8,
-        input_scale=a_scale,
-        weight_scale=b_scale,
-        group_offset=group_offset,
-        use_tvm_ffi=use_tvm_ffi,
-        num_experts=num_experts,
-        top_k=1,
-        num_local_experts=num_experts,
-        local_expert_offset=0,
-    )
 
-    diff = calc_diff(output, output_expected)
-    assert diff < 1e-3
-    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+    tactics_list = list(tactics_capture)
+    print(f"  Found {len(tactics_list)} tactics")
+    assert len(tactics_list) > 0, "No valid tactics found"
+
+    for tactic_idx, tactic_config in enumerate(tactics_list):
+        runner, tactic_value = tactic_config[0]
+        runner_name = runner.__class__.__name__
+
+        with AutoTuner.get().replay(tactic_config):
+            output = torch.ops.trtllm.cute_dsl_fp8_blockwise_grouped_gemm_blackwell(
+                input=a_fp8,
+                weight=b_fp8,
+                input_scale=a_scale,
+                weight_scale=b_scale,
+                group_offset=group_offset,
+                num_experts=num_experts,
+                top_k=1,
+                num_local_experts=num_experts,
+                local_expert_offset=0,
+            )
+
+        diff = calc_diff(output, output_expected)
+        assert diff < 1e-3, (
+            f"Tactic {tactic_idx} ({runner_name}, tactic={tactic_value}) failed: diff={diff}"
+        )
+        torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
