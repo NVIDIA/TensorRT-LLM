@@ -11,12 +11,23 @@ from tensorrt_llm.bench.dataset.prepare_dataset import prepare_dataset
 from tensorrt_llm.logger import logger, severity_map
 
 
+class NotRequiredForHelp(click.Option):
+    """A click.Option that is not enforced as required when --help is in args."""
+
+    def handle_parse_result(self, ctx, opts, args):
+        help_flags = ctx.help_option_names or ['--help']
+        if any(arg in help_flags for arg in args):
+            self.required = False
+        return super().handle_parse_result(ctx, opts, args)
+
+
 @click.group(name="trtllm-bench", context_settings={'show_default': True})
 @click.option(
     "--model",
     "-m",
     required=True,
     type=str,
+    cls=NotRequiredForHelp,
     help="The Huggingface name of the model to benchmark.",
 )
 @click.option(
@@ -54,6 +65,9 @@ def main(
     revision: Optional[str],
 ) -> None:
     logger.set_level(log_level)
+    if model is None:
+        return
+
     ctx.obj = BenchmarkEnvironment(model=model,
                                    checkpoint_path=model_path,
                                    workspace=workspace,
