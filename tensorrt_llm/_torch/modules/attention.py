@@ -26,7 +26,7 @@ from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compiled_cat,
+                     is_torch_compiling, maybe_compile, maybe_compiled_cat,
                      maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
@@ -727,6 +727,22 @@ def fp8_block_scaling_bmm_out(
                       out=out)
     else:
         raise NotImplementedError(f"SM{sm_version} is not supported")
+
+
+@maybe_compile(dynamic=True)
+def _short_mha_reshape_kv(kv, k_pe_roped, num_heads_tp, qk_nope_head_dim,
+                           v_head_dim, qk_rope_head_dim, qk_head_dim):
+    """Fused split + reshape + expand + cat for short-seq MHA KV construction."""
+    k_nope, v = kv.split(
+        [num_heads_tp * qk_nope_head_dim, num_heads_tp * v_head_dim], -1)
+    k_nope_r = k_nope.view(-1, num_heads_tp, qk_nope_head_dim)
+    k_pe_expanded = k_pe_roped.view(-1, 1,
+                                    qk_rope_head_dim).expand(
+                                        -1, num_heads_tp, -1)
+    k = torch.cat([k_nope_r, k_pe_expanded], dim=-1)
+    k = k.view(-1, num_heads_tp * qk_head_dim)
+    v = v.view(-1, num_heads_tp * v_head_dim)
+    return k, v
 
 
 class MLA(nn.Module):
@@ -1707,31 +1723,15 @@ class MLA(nn.Module):
         ctx_position_ids = position_ids[..., :num_ctx_tokens]
         [k_pe_roped] = self._rotary_emb_mha(ctx_position_ids, [k_pe])
 
-        # Step 3: Expand KV via kv_b_proj.
+        # Step 3: Expand KV via kv_b_proj, construct full K, flatten.
+        # The reshape/cat ops are compiled via _short_mha_reshape_kv to fuse
+        # split + view + expand + cat into fewer kernels.
         kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim
-            ],
-            -1,
-        )
+        k, v = _short_mha_reshape_kv(kv, k_pe_roped, self.num_heads_tp,
+                                      self.qk_nope_head_dim, self.v_head_dim,
+                                      self.qk_rope_head_dim, self.qk_head_dim)
 
-        # Step 4: Construct full K = [k_nope, k_pe_roped] per head.
-        k_nope_r = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        k_pe_expanded = k_pe_roped.view(-1, 1,
-                                        self.qk_rope_head_dim).expand(
-                                            -1, self.num_heads_tp, -1)
-        k = torch.cat([k_nope_r, k_pe_expanded], dim=-1)
-        # k: [num_ctx_tokens, num_heads_tp, qk_head_dim]
-
-        # Step 5: Flatten Q, K, V to 2D packed layout for the fused attention
-        # backend, which natively handles variable-length sequences via
-        # attn_metadata (no padding/batching needed).
-        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
-        v = v.view(-1, self.num_heads_tp * self.v_head_dim)
-
-        # Step 6: Compute attention via the fused MHA backend.
+        # Step 4: Compute attention via the fused MHA backend.
         # latent_cache=None signals that RoPE and KV cache append were already
         # done in Step 1 (mla_rope_append_paged_kv_assign_q), matching the
         # pattern used by forward_context_with_cached_kv.
