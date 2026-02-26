@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@ from typing import Dict, List, Optional, Union
 import torch
 
 from .. import profiler
-from .._utils import mpi_broadcast
+from .._utils import maybe_pin_memory, mpi_broadcast
 from ..bindings import DataType, GptJsonConfig, ModelConfig, WorldConfig
 from ..bindings import executor as trtllm
 from ..bindings.executor import (DecodingMode, ExternalDraftTokensConfig,
@@ -854,8 +854,10 @@ class ModelRunnerCpp(ModelRunnerMixin):
                 # CUDA Stream Overlapping Requirements:
                 # 1. Both memory copy stream and kernel execution stream must be non-default streams
                 # 2. For host<->device transfers (H2D/D2H), host memory MUST be page-locked (pinned)
-                prompt_table_data = self._prepare_embedding_table(
-                    prompt_table).pin_memory()
+                # NOTE: pinning is skipped under Confidential Compute
+                # (see maybe_pin_memory() and prefer_pinned())
+                prompt_table_data = maybe_pin_memory(
+                    self._prepare_embedding_table(prompt_table))
             else:
                 prompt_table_data = self._prepare_embedding_table(
                     prompt_table).cuda()

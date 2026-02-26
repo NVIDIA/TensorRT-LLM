@@ -11,7 +11,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version
+from ..._utils import get_sm_version, prefer_pinned
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -365,15 +365,13 @@ class SpecMetadata:
                 device='cuda')
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=True),
+            temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
                                                     non_blocking=True)
-        self.top_ks[:len(top_ks)].copy_(torch.tensor(top_ks,
-                                                     dtype=torch.int32,
-                                                     pin_memory=True),
+        self.top_ks[:len(top_ks)].copy_(torch.tensor(
+            top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
-        self.top_ps[:len(top_ps)].copy_(torch.tensor(top_ps,
-                                                     dtype=torch.float32,
-                                                     pin_memory=True),
+        self.top_ps[:len(top_ps)].copy_(torch.tensor(
+            top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
 
 
