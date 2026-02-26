@@ -190,7 +190,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     using tensorrt_llm::kernels::moe_comm::PayloadDescriptor;
     using tensorrt_llm::kernels::moe_comm::MoeA2ADispatchParams;
     using tensorrt_llm::kernels::moe_comm::moe_a2a_dispatch_launch;
-    using tensorrt_llm::kernels::moe_comm::moe_a2a_prepare_dispatch_launch;
     using tensorrt_llm::kernels::moe_comm::kMaxTopK;
     using tensorrt_llm::kernels::moe_comm::kMaxPayloads;
 
@@ -365,9 +364,6 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
 
     params.stream = at::cuda::getCurrentCUDAStream();
 
-    // Prepare for dispatch (zero counters/indices)
-    moe_a2a_prepare_dispatch_launch(params);
-
     // Launch the dispatch kernel
     moe_a2a_dispatch_launch(params);
     cudaError_t result = cudaGetLastError();
@@ -511,6 +507,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
 
     params.dev_comm = g_moeDevComm;
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
+    params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
     params.topk_send_indices = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_SEND_INDICES_OFFSET_INDEX]);
     params.recv_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[RECV_COUNTERS_OFFSET_INDEX]);

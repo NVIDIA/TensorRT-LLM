@@ -337,25 +337,6 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
     }
 }
 
-__global__ void moeA2APrepareDispatchKernel(int* send_counters, int* local_token_counter, int ep_size)
-{
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
-    int idx = blockIdx.x * blockDim.x + threadIdx.x;
-    // Zero send_counters
-    if (idx < ep_size)
-    {
-        send_counters[idx] = 0;
-    }
-    // Zero local_token_counter
-    if (idx == 0)
-    {
-        *local_token_counter = 0;
-    }
-}
-
 // ============================================================================
 // Dispatch Kernels
 // ============================================================================
@@ -501,7 +482,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
                 *ptrs.local_token_counter = 0;
             }
 
-// Store send_counters to recv_counters
+// Store send_counters to recv_counters.
 #pragma unroll 1 // No unroll as one iter is typically enough
             for (int target_rank = lane_id; target_rank < ep_size; target_rank += warpSize)
             {
@@ -542,12 +523,6 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 #endif
         }
     }
-}
-
-void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params)
-{
-    launchWithPdlWhenEnabled("moeA2APrepareDispatchKernel", moeA2APrepareDispatchKernel, 1, params.ep_size, 0,
-        params.stream, params.send_counters, params.local_token_counter, params.ep_size);
 }
 
 // ============================================================================
@@ -969,11 +944,6 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
-    if (payload_bytes == nullptr)
-    {
-        return;
-    }
-
     int global_token_idx = ThreadingPolicy::token_idx();
 
     int global_token_num = ep_size * max_tokens_per_rank;
@@ -1034,10 +1004,17 @@ __global__ void moeA2ACombineKernel(
                 ncclCoopWarp coop;
                 ncclLsaBarrierSession barrier(coop, *ptrs.dev_comm, ncclTeamTagLsa{}, /*index=*/1);
                 barrier.sync(coop, cuda::memory_order_relaxed);
+
                 // Signal all other blocks that the inter-rank barrier is done.
                 if (lane_id == 0)
                 {
                     asm volatile("st.relaxed.gpu.s32 [%0], %1;" ::"l"(ptrs.local_token_counter), "r"(1));
+                }
+
+                // Zero send_counters for the next dispatch round.
+                for (int i = lane_id; i < ep_size; i += warpSize)
+                {
+                    ptrs.send_counters[i] = 0;
                 }
             }
             else
@@ -1087,6 +1064,12 @@ __global__ void moeA2ACombineKernel(
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
 {
+    // If payload is already in workspace, nothing to copy.
+    if (params.prepare_payload == nullptr)
+    {
+        return;
+    }
+
     constexpr int kBlockSize = 256;
     constexpr int kWarpsPerBlock = kBlockSize / 32; // 8 warps per block
 
@@ -1101,7 +1084,7 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     }
 
     int bytes_per_token = params.elements_per_token * element_size;
-    int global_token_num = params.prepare_payload == nullptr ? 1 : params.ep_size * params.max_tokens_per_rank;
+    int global_token_num = params.ep_size * params.max_tokens_per_rank;
     int grid_size_warp = ceilDiv(global_token_num, kWarpsPerBlock);
     int grid_size_block = global_token_num; // one block per token
     int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
@@ -1162,6 +1145,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
     // NCCL device communicator and intra-rank barrier flag
     kernel_ptrs.dev_comm = params.dev_comm;
     kernel_ptrs.local_token_counter = params.local_token_counter;
+    kernel_ptrs.send_counters = params.send_counters;
 
     // Copy communication tracking pointers
     kernel_ptrs.topk_target_ranks = params.topk_target_ranks;

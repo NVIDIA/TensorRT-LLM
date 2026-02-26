@@ -81,8 +81,11 @@ struct CombineKernelPointers
     ncclDevComm const* dev_comm;
 
     // Atomic counter reused for intra-rank barrier notification.
-    // Block 0 sets it to 1 after NCCL barrier; other blocks spin on it.
+    // Elected CTA sets it to 1 after NCCL barrier; other CTAs spin on it.
     int* local_token_counter;
+
+    // To zero out send_counters in the combine kernel for the next dispatch round.
+    int* send_counters;
 
     // Top-K compact routing info per local token (size: [local_num_tokens, top_k])
     int const* topk_target_ranks; // target rank per k, -1 for duplicates
@@ -139,8 +142,6 @@ struct MoeA2ADispatchParams
 
 // Dispatch kernels
 void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params);
-// Prepare for dispatch: zero send_counters and local_token_counter
-void moe_a2a_prepare_dispatch_launch(MoeA2ADispatchParams const& params);
 
 // Combine phase parameters
 struct MoeA2ACombineParams
@@ -170,6 +171,7 @@ struct MoeA2ACombineParams
 
     // Local aux data
     int* local_token_counter; // Reused as a flag for intra-rank synchronization for combine
+    int* send_counters;       // Zeroed in combine for next dispatch round
     int* topk_target_ranks; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), target rank
                             // per k, -1 for duplicates
     int* topk_send_indices; // Top-K compact routing info per local token (size: [local_num_tokens, top_k]), dst index
