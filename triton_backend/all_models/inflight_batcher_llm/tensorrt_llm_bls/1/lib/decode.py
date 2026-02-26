@@ -322,14 +322,31 @@ class Decoder:
 
         target_response: GenerationResponse = None
 
+        is_input_excluded_from_output_for_draft: bool = self._is_exclude_input_in_output(
+            request,
+            self.is_input_excluded_from_output_for_draft(assume_loaded=True))
+        is_input_excluded_from_output_for_target: bool = self._is_exclude_input_in_output(
+            request,
+            self.is_input_excluded_from_output_for_target(assume_loaded=True))
+
+        output_len_limit: int = 0
+        if is_input_excluded_from_output_for_target:
+            # When `exclude_input_in_output` for target or
+            # entire request is True, output should be managed
+            # only by given max length.
+            output_len_limit = output_len
+        else:
+            # Otherwise, output should be managed by
+            # the length of input prompt and given max length.
+            output_len_limit = len(prompt_input_ids) + output_len
+
         cur_preproc = preproc
 
         counter = 0
         while True:
             counter += 1
-            num_draft_tokens = min(
-                request.num_draft_tokens[0][0],
-                len(prompt_input_ids) + output_len - len(input_ids) - 1)
+            num_draft_tokens = min(request.num_draft_tokens[0][0],
+                                   output_len_limit - len(input_ids) - 1)
 
             draft_request = None
             if num_draft_tokens > 0:
@@ -347,10 +364,7 @@ class Decoder:
                         draft_logits = draft_response.generation_logits[0][0]
 
                 draft_output_id_head_index = len(input_ids)
-                if self._is_exclude_input_in_output(
-                        request,
-                        self.is_input_excluded_from_output_for_draft(
-                            assume_loaded=True)):
+                if is_input_excluded_from_output_for_draft:
                     # Input is excluded from draft output
                     # when `exclude_input_in_output` is specified.
                     draft_output_id_head_index = 0
@@ -370,10 +384,7 @@ class Decoder:
                 draft_request = DraftRequest()
             target_response = self._generate_non_streaming(
                 cur_preproc, request, draft_request)
-            if self._is_exclude_input_in_output(
-                    request,
-                    self.is_input_excluded_from_output_for_target(
-                        assume_loaded=True)):
+            if is_input_excluded_from_output_for_target:
 
                 if last_input_ids is None:
                     last_input_ids = input_ids
@@ -400,7 +411,7 @@ class Decoder:
 
             # Evaluate criteria to stop generation loop.
             # If we've hit or exceeded the max output length, should stop
-            length_stop = (len(input_ids) >= len(prompt_input_ids) + output_len)
+            length_stop = (len(input_ids) >= output_len_limit)
             if length_stop:
                 break
             # If draft and target have same outputs, should stop. Normally target should return 1 more token.
