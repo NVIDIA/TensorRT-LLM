@@ -196,308 +196,97 @@ def are_all_failures_post_merge(failed_stage_list):
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Create / update GitHub tag
+# Step 4: Create / update GitHub tag via REST API
 # ---------------------------------------------------------------------------
-def verify_github_token_permissions(github_token, repo):
-    """Verify that the GitHub token has necessary permissions.
+GITHUB_REPO = "NVIDIA/TensorRT-LLM"
+GITHUB_API_BASE = f"https://api.github.com/repos/{GITHUB_REPO}"
 
-    Args:
-        github_token: GitHub token
-        repo: Repository in format "owner/repo"
 
-    Returns:
-        (has_read, has_write) tuple, or (False, False) on error
+def _github_api(method, endpoint, token, data=None):
+    """Make a GitHub REST API request via curl.
+
+    Returns (http_status_code: str, response_body: dict | None).
     """
-    api_base = f"https://api.github.com/repos/{repo}"
-
-    # Test read permission
-    cmd_read = [
+    cmd = [
         "curl",
         "-s",
         "-X",
-        "GET",
-        f"{api_base}",
+        method,
+        f"{GITHUB_API_BASE}{endpoint}",
         "-H",
-        f"Authorization: Bearer {github_token}",
+        f"Authorization: Bearer {token}",
         "-H",
         "Accept: application/vnd.github.v3+json",
         "-w",
         "\\nHTTP_CODE:%{http_code}",
     ]
+    if data is not None:
+        cmd += ["-H", "Content-Type: application/json", "-d", json.dumps(data)]
 
-    result_read = subprocess.run(cmd_read, capture_output=True, text=True)
-    output_read = result_read.stdout
-    read_code = (
-        output_read.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_read else "unknown"
-    )
-    has_read = read_code in ["200", "201"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    output = result.stdout
 
-    # Test write permission by checking if we can access refs
-    cmd_write = [
-        "curl",
-        "-s",
-        "-X",
-        "GET",
-        f"{api_base}/git/refs/tags",
-        "-H",
-        f"Authorization: Bearer {github_token}",
-        "-H",
-        "Accept: application/vnd.github.v3+json",
-        "-w",
-        "\\nHTTP_CODE:%{http_code}",
-    ]
+    code = output.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output else "unknown"
+    body = None
+    try:
+        body = json.loads(output.split("HTTP_CODE:")[0])
+    except (json.JSONDecodeError, ValueError):
+        pass
 
-    result_write = subprocess.run(cmd_write, capture_output=True, text=True)
-    output_write = result_write.stdout
-    write_code = (
-        output_write.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_write else "unknown"
-    )
-    has_write = write_code in ["200", "201"]
-
-    return (has_read, has_write)
+    return code, body
 
 
-def create_github_tag_via_api(commit_sha, tag_name, tag_message, github_token):
-    """Create GitHub tag using REST API (no clone required).
+def create_github_tag(commit_sha, target_branch):
+    """Create or update tag 'latest-ci-stable-commit-<branch>' via GitHub REST API.
 
-    Args:
-        commit_sha: Git commit SHA
-        tag_name: Tag name
-        tag_message: Tag message
-        github_token: GitHub token
-
-    Returns True on success.
+    Requires GITHUB_TOKEN env var. Returns True on success.
     """
-    repo = "NVIDIA/TensorRT-LLM"
-    api_base = f"https://api.github.com/repos/{repo}"
-
-    # Verify token permissions first
-    log("Verifying GitHub token permissions...")
-    has_read, has_write = verify_github_token_permissions(github_token, repo)
-
-    if not has_read:
-        log("ERROR: Token lacks read permission for repository")
-        return False
-
-    if not has_write:
-        log("ERROR: Token lacks write permission for repository")
-        return False
-
-    log("✓ Token has required read/write permissions")
-
-    # Check if tag ref already exists
-    log(f"Checking if tag '{tag_name}' already exists...")
-    cmd_check = [
-        "curl",
-        "-s",
-        "-X",
-        "GET",
-        f"{api_base}/git/refs/tags/{tag_name}",
-        "-H",
-        f"Authorization: Bearer {github_token}",
-        "-H",
-        "Accept: application/vnd.github.v3+json",
-        "-w",
-        "\\nHTTP_CODE:%{http_code}",
-    ]
-
-    result_check = subprocess.run(cmd_check, capture_output=True, text=True)
-    output_check = result_check.stdout
-    check_code = (
-        output_check.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_check else "unknown"
-    )
-
-    if check_code == "200":
-        # Tag ref exists - update it to point to new commit directly
-        # Note: This updates the ref to point to commit SHA directly (lightweight tag)
-        # If you need to preserve annotated tag with message, we'd need to create new tag object first
-        log(f"Tag '{tag_name}' already exists, updating ref to point to new commit {commit_sha}")
-
-        # Use PATCH to update existing ref to point to new commit
-        ref_data = {"sha": commit_sha, "force": True}
-
-        cmd_update = [
-            "curl",
-            "-s",
-            "-X",
-            "PATCH",
-            f"{api_base}/git/refs/tags/{tag_name}",
-            "-H",
-            f"Authorization: Bearer {github_token}",
-            "-H",
-            "Accept: application/vnd.github.v3+json",
-            "-H",
-            "Content-Type: application/json",
-            "-d",
-            json.dumps(ref_data),
-            "-w",
-            "\\nHTTP_CODE:%{http_code}",
-        ]
-
-        result_update = subprocess.run(cmd_update, capture_output=True, text=True)
-        output_update = result_update.stdout
-        update_code = (
-            output_update.split("HTTP_CODE:")[-1].strip()
-            if "HTTP_CODE:" in output_update
-            else "unknown"
-        )
-
-        if update_code == "200":
-            log(f"✓ Successfully updated tag '{tag_name}' to point to {commit_sha}")
-            return True
-
-        log(f"ERROR: Failed to update tag ref (HTTP {update_code})")
-        if result_update.stderr:
-            log(f"STDERR: {result_update.stderr}")
-        if output_update:
-            log(f"Response: {output_update.split('HTTP_CODE:')[0]}")
-        return False
-
-    # Tag ref doesn't exist - create new tag object and ref
-    log(f"Tag '{tag_name}' does not exist, creating new tag...")
-
-    # Step 1: Create tag object
-    tag_data = {"tag": tag_name, "message": tag_message, "object": commit_sha, "type": "commit"}
-
-    cmd_create_tag = [
-        "curl",
-        "-s",
-        "-X",
-        "POST",
-        f"{api_base}/git/tags",
-        "-H",
-        f"Authorization: Bearer {github_token}",
-        "-H",
-        "Accept: application/vnd.github.v3+json",
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        json.dumps(tag_data),
-        "-w",
-        "\\nHTTP_CODE:%{http_code}",
-    ]
-
-    result_tag = subprocess.run(cmd_create_tag, capture_output=True, text=True)
-    output_tag = result_tag.stdout
-    tag_code = (
-        output_tag.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_tag else "unknown"
-    )
-
-    if tag_code != "201":
-        log(f"ERROR: Failed to create tag object (HTTP {tag_code})")
-        if result_tag.stderr:
-            log(f"STDERR: {result_tag.stderr}")
-        # Check if tag object already exists (422)
-        if tag_code == "422":
-            log("Tag object already exists, attempting to get tag SHA...")
-            cmd_get = [
-                "curl",
-                "-s",
-                "-X",
-                "GET",
-                f"{api_base}/git/tags/{tag_name}",
-                "-H",
-                f"Authorization: Bearer {github_token}",
-                "-H",
-                "Accept: application/vnd.github.v3+json",
-                "-w",
-                "\\nHTTP_CODE:%{http_code}",
-            ]
-            result_get = subprocess.run(cmd_get, capture_output=True, text=True)
-            output_get = result_get.stdout
-            if "HTTP_CODE:200" in output_get:
-                try:
-                    tag_sha = json.loads(output_get.split("HTTP_CODE:")[0])["sha"]
-                except (json.JSONDecodeError, KeyError):
-                    log("ERROR: Failed to parse existing tag object")
-                    return False
-            else:
-                log("ERROR: Could not retrieve existing tag object")
-                return False
-        else:
-            return False
-    else:
-        # Successfully created tag object
-        try:
-            tag_sha = json.loads(output_tag.split("HTTP_CODE:")[0])["sha"]
-        except (json.JSONDecodeError, KeyError):
-            log("ERROR: Failed to parse tag object response")
-            return False
-
-    # Step 2: Create ref pointing to tag
-    ref_data = {"ref": f"refs/tags/{tag_name}", "sha": tag_sha}
-
-    cmd_create_ref = [
-        "curl",
-        "-s",
-        "-X",
-        "POST",
-        f"{api_base}/git/refs",
-        "-H",
-        f"Authorization: Bearer {github_token}",
-        "-H",
-        "Accept: application/vnd.github.v3+json",
-        "-H",
-        "Content-Type: application/json",
-        "-d",
-        json.dumps(ref_data),
-        "-w",
-        "\\nHTTP_CODE:%{http_code}",
-    ]
-
-    result_ref = subprocess.run(cmd_create_ref, capture_output=True, text=True)
-    output_ref = result_ref.stdout
-    ref_code = (
-        output_ref.split("HTTP_CODE:")[-1].strip() if "HTTP_CODE:" in output_ref else "unknown"
-    )
-
-    if ref_code == "201":
-        log(f"✓ Successfully created tag '{tag_name}'")
-        return True
-
-    log(f"ERROR: Failed to create ref (HTTP {ref_code})")
-    if result_ref.stderr:
-        log(f"STDERR: {result_ref.stderr}")
-    return False
-
-
-def create_github_tag(
-    commit_sha,
-    target_branch,
-    llm_repo,
-):
-    """Create or update the GitHub tag for the given commit.
-
-    Uses GitHub REST API to avoid cloning the repository.
-
-    Requires GITHUB_TOKEN environment variable to be set.
-
-    Args:
-        commit_sha: Git commit SHA
-        target_branch: Target branch name
-        llm_repo: Repository URL (not used with API method, kept for compatibility)
-
-    Returns True on success.
-    """
-    tag_name = f"latest-ci-stable-commit-{target_branch}"
-    tag_message = f"Post-merge tests passed for branch {target_branch}"
-
-    log(f"Creating tag '{tag_name}' for post-merge commit {commit_sha}")
-
     github_token = os.environ.get("GITHUB_TOKEN", "")
     if not github_token:
         log("ERROR: GITHUB_TOKEN environment variable is not set")
         return False
 
-    # Use GitHub REST API (no clone required)
-    log("Using GitHub REST API to create tag (no repository clone needed)")
-    success = create_github_tag_via_api(commit_sha, tag_name, tag_message, github_token)
+    tag_name = f"latest-ci-stable-commit-{target_branch}"
+    tag_message = f"Post-merge tests passed for branch {target_branch}"
+    log(f"Creating/updating tag '{tag_name}' for commit {commit_sha}")
 
-    if success:
-        log(f"✓ Successfully created GitHub tag: {tag_name}")
+    # If the tag ref already exists, update it
+    code, _ = _github_api("GET", f"/git/refs/tags/{tag_name}", github_token)
+    if code == "200":
+        code, _ = _github_api(
+            "PATCH",
+            f"/git/refs/tags/{tag_name}",
+            github_token,
+            {"sha": commit_sha, "force": True},
+        )
+        if code == "200":
+            log(f"✓ Updated tag '{tag_name}' → {commit_sha}")
+            return True
+        log(f"ERROR: Failed to update tag ref (HTTP {code})")
+        return False
+
+    # Tag doesn't exist — create tag object + ref
+    code, body = _github_api(
+        "POST",
+        "/git/tags",
+        github_token,
+        {"tag": tag_name, "message": tag_message, "object": commit_sha, "type": "commit"},
+    )
+    if code != "201" or not body or "sha" not in body:
+        log(f"ERROR: Failed to create tag object (HTTP {code})")
+        return False
+
+    code, _ = _github_api(
+        "POST",
+        "/git/refs",
+        github_token,
+        {"ref": f"refs/tags/{tag_name}", "sha": body["sha"]},
+    )
+    if code == "201":
+        log(f"✓ Created tag '{tag_name}' → {commit_sha}")
         return True
 
-    log(f"WARNING: Failed to create GitHub tag: {tag_name}")
+    log(f"ERROR: Failed to create tag ref (HTTP {code})")
     return False
 
 
@@ -537,11 +326,7 @@ def main() -> int:
     # Fast path: SUCCESS → update tag directly
     if args.build_result == "SUCCESS":
         log("✓ Pipeline succeeded - updating tag")
-        ok = create_github_tag(
-            args.commit_sha,
-            args.target_branch,
-            args.llm_repo,
-        )
+        ok = create_github_tag(args.commit_sha, args.target_branch)
         return 0 if ok else 1
 
     # Slow path: Analyze failures
@@ -576,11 +361,7 @@ def main() -> int:
 
     # All checks passed → create tag
     log("✓ Only post-merge failures detected - updating tag")
-    ok = create_github_tag(
-        args.commit_sha,
-        args.target_branch,
-        args.llm_repo,
-    )
+    ok = create_github_tag(args.commit_sha, args.target_branch)
     return 0 if ok else 1
 
 
