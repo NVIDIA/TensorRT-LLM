@@ -968,6 +968,8 @@ class FlashinferOpBackend(MoEOpBackend):
                 tune_max_num_tokens=tune_max_num_tokens,
             )
         if not do_finalize:
+            if outputs[2].dim() != 2:
+                outputs[2] = outputs[2].view(-1, top_k)
             return outputs
         else:
             final_hidden_states = outputs[0]
