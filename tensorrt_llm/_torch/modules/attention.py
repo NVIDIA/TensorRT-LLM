@@ -1823,11 +1823,13 @@ class MLA(nn.Module):
             v_head_dim, dtype, device):
         """Warmup torch.compile for cat operations with different tensor layouts.
 
-        Warmup with multiple num_tokens values for each unique tensor layout to
-        ensure torch.compile generates specialized kernels that won't trigger
-        recompilation at runtime. Do not use torch.compile with dynamic=True here
-        because it completely ignores tensor layout/stride information, resulting
-        in significantly degraded performance.
+        Tensors are marked with torch._dynamo.mark_dynamic(..., 0) on the
+        num_tokens dimension, so for num_tokens != 1 a single warmup run is
+        enough and the compiled kernel generalizes across varying num_tokens at
+        runtime. num_tokens=1 still triggers recompile (torch.compile specializes
+        for it), so it is warmed up separately. Do not use torch.compile with
+        dynamic=True here because it completely ignores tensor layout/stride
+        information, resulting in significantly degraded performance.
         """
 
         def warmup(num_tokens):
@@ -1849,15 +1851,18 @@ class MLA(nn.Module):
                                dtype=dtype,
                                device=device)[:, :, -qk_rope_head_dim:].expand(
                                    -1, num_heads_tp, -1)
+            torch._dynamo.maybe_mark_dynamic(chunked_k_nope, 0)
+            torch._dynamo.maybe_mark_dynamic(chunked_k_pe, 0)
+            torch._dynamo.maybe_mark_dynamic(k_pe, 0)
             maybe_compiled_cat((chunked_k_nope, chunked_k_pe), dim=-1)
             maybe_compiled_cat((k_nope, k_pe), dim=-1)
 
-        # Use two different num_tokens values (>1) to trigger torch.compile to
-        # generate kernels that generalize across varying num_tokens at runtime.
-        # Warmup num_tokens=1 separately since torch.compile may specialize for it.
-        warmup(1)
+        # With dim 0 (num_tokens) marked dynamic, one warmup suffices for all
+        # num_tokens != 1 at runtime.
         warmup(2)
-        warmup(3)
+
+        # num_tokens=1 still triggers recompile; warm it separately.
+        warmup(1)
 
     def forward_context(
         self,
