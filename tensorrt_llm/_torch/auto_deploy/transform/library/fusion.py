@@ -264,6 +264,113 @@ class FuseGemms(BaseTransform):
         return gm, info
 
 
+def _insert_fused_gemm_narrow(
+    gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]
+):
+    """Fuse GEMMs sharing the same input, splitting output via narrow (zero-copy view).
+
+    Unlike _insert_fused_gemm which uses torch.split + .contiguous(), this uses
+    torch.narrow to return views into the fused output tensor without copying.
+
+    # before fusion:
+    w1 = out1 x in,  w2 = out2 x in
+    y1 = x @ w1.T,   y2 = x @ w2.T
+
+    # after fusion:
+    w = (out1+out2) x in
+    y = x @ w.T
+    y1 = y.narrow(-1, 0, out1)          # view, no copy
+    y2 = y.narrow(-1, out1, out2)        # view, no copy
+    """
+    keys_unfused = [extract_weight_name(n) for n in linear_nodes]
+    params_unfused = [gm.get_parameter(k) for k in keys_unfused]
+    sizes_unfused = [p.size(0) for p in params_unfused]
+
+    dtypes = {p.dtype for p in params_unfused}
+    if len(dtypes) != 1:
+        ad_logger.warning(f"Skipping GDN GEMM fusion for {keys_unfused}: mixed dtypes {dtypes}")
+        return False
+    weight_dtype = dtypes.pop()
+
+    key_fused = f"fused_weight_{idx}"
+    fused_weight = torch.cat(params_unfused, dim=0).to(weight_dtype)
+    param_fused = nn.Parameter(fused_weight, requires_grad=False)
+    setattr(gm, key_fused, param_fused)
+
+    ad_logger.warning(
+        f"taylor) Fusing {len(linear_nodes)} GDN GEMMs ({keys_unfused}) "
+        f"into {key_fused} (dtype={weight_dtype})"
+    )
+
+    fused_kwargs = dict(linear_nodes[0].kwargs)
+
+    with gm.graph.inserting_before(linear_nodes[0]):
+        get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
+
+    with gm.graph.inserting_before(linear_nodes[0]):
+        fused_linear_node = gm.graph.call_function(
+            linear_nodes[0].target,
+            args=(parent_node, get_param_node, None),
+            kwargs=fused_kwargs,
+        )
+
+    offset = 0
+    for i, n in enumerate(linear_nodes):
+        size = sizes_unfused[i]
+        with gm.graph.inserting_before(n):
+            narrow_node = gm.graph.call_function(
+                torch.narrow, args=(fused_linear_node, -1, offset, size)
+            )
+        n.replace_all_uses_with(narrow_node)
+        offset += size
+
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
+    return True
+
+
+@TransformRegistry.register("fuse_gdn_gemms")
+class FuseGdnGemms(BaseTransform):
+    """Fuse linear projections sharing the same input, even when the parent has
+    non-linear users (e.g., shape access).
+
+    This is a relaxed variant of FuseGemms: it does NOT require all children of
+    the parent to be linear ops — only that at least 2 linear children exist.
+    The fused output is split via torch.narrow (zero-copy view).
+    """
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        linear_nodes = defaultdict(list)
+        for node in gm.graph.nodes:
+            if is_linear_op(node) and node.args[2] is None:
+                linear_nodes[node.args[0]].append(node)
+
+        idx = -1
+        num_matches = 0
+        with cuda_memory_tracker():
+            for parent_node, lin_children in linear_nodes.items():
+                if len(lin_children) < 2:
+                    continue
+                if _insert_fused_gemm_narrow(gm, idx := idx + 1, parent_node, lin_children):
+                    num_matches += 1
+
+        torch.cuda.empty_cache()
+
+        info = TransformInfo(
+            skipped=False,
+            num_matches=num_matches,
+            is_clean=num_matches == 0,
+            has_valid_shapes=num_matches == 0,
+        )
+        return gm, info
+
+
 @TransformRegistry.register("fuse_fp8_gemms")
 class FuseFP8Gemms(QuantizationFusionMixin, BaseTransform):
     target_op = torch.ops.auto_deploy.torch_fake_quant_fp8_linear

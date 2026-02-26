@@ -293,3 +293,96 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
     reset_parameters(gm_transformed)
     y_random = gm_transformed(x)
     assert not all_close(y_model, y_random)
+
+
+# ===========================================================================
+# Tests for fuse_gdn_gemms (relaxed fusion with narrow / zero-copy views)
+# ===========================================================================
+
+
+class GdnLikeFusableModel(TestModel):
+    """Mimics GatedDeltaNet projection pattern: 4 linears sharing the same
+    input *plus* a non-linear user (shape access) on that input.  Standard
+    fuse_gemms will skip this because check_same_children fails.
+    """
+
+    def __init__(self, batch_size=4, seq_len=8, hidden=64, qkv_dim=48, v_dim=32, heads=4):
+        super().__init__()
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.hidden = hidden
+        self.v_dim = v_dim
+        self.heads = heads
+
+        self.in_proj_qkv = nn.Linear(hidden, qkv_dim, bias=False)
+        self.in_proj_z = nn.Linear(hidden, v_dim, bias=False)
+        self.in_proj_b = nn.Linear(hidden, heads, bias=False)
+        self.in_proj_a = nn.Linear(hidden, heads, bias=False)
+
+    def get_input(self, **kwargs) -> torch.Tensor:
+        return torch.randn(self.batch_size, self.seq_len, self.hidden, **kwargs)
+
+    @property
+    def keys_to_pop(self):
+        return ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight")
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape
+        qkv = self.in_proj_qkv(x)
+        z = self.in_proj_z(x)
+        b = self.in_proj_b(x)
+        a = self.in_proj_a(x)
+        z = z.reshape(batch_size, seq_len, -1)
+        return qkv.sum(-1, keepdim=True) + z.sum(-1, keepdim=True) + b + a
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_fuse_gdn_gemms(dtype: str):
+    torch_dtype = getattr(torch, dtype)
+    model = GdnLikeFusableModel().to(device="cuda", dtype=torch_dtype)
+    x = model.get_input(device="cuda", dtype=torch_dtype)
+
+    y_model = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Verify fuse_gemms does NOT fuse (shape user blocks it)
+    num_linears_before = sum(is_linear_op(n) for n in gm.graph.nodes)
+    assert num_linears_before == 4, f"Expected 4 linears before fusion, got {num_linears_before}"
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_gdn_gemms": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        lambda gm: sum(is_linear_op(n) for n in gm.graph.nodes) == model.num_gemms_after_fusion,
+        lambda num_p_og: num_p_og,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=False,
+    )
+
+    # Verify narrow nodes exist (zero-copy view splitting)
+    narrow_count = sum(
+        1
+        for n in gm_transformed.graph.nodes
+        if n.op == "call_function" and n.target is torch.narrow
+    )
+    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
+
+    reset_parameters(gm_transformed)
+    y_random = gm_transformed(x)
+    assert not all_close(y_model, y_random)
