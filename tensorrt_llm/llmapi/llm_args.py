@@ -3252,7 +3252,8 @@ def update_llm_args_with_extra_dict(
         llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
             'kv_cache_config']
 
-    if llm_args_dict.get("context_parallel_size", 1) > 1:
+    if llm_args_dict.get("context_parallel_size", 1) > 1 and llm_args_dict.get(
+            "cp_config", None) is None:
         llm_args_dict["cp_config"] = {"cp_type": CpType.ULYSSES}
 
     field_mapping = {
