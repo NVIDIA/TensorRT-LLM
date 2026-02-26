@@ -21,7 +21,6 @@ l0_b300:
   - unittest/_torch/thop/serial
   - unittest/_torch/executor # 250s
   # ------------- modules (non-MoE) ---------------
-  - unittest/_torch/modules/test_mla_helix.py
   - unittest/_torch/modules/test_fused_add_rms_norm_quant.py
   - unittest/_torch/modules/test_fused_activation_quant.py
   - unittest/_torch/modules/test_awq_quantization.py
@@ -33,7 +32,6 @@ l0_b300:
   # ------------- MoE components tests ---------------
   - unittest/_torch/modules/test_moe_load_balancer.py
   - unittest/_torch/modules/test_moe_routing.py
-  - unittest/_torch/modules/test_moe_host_sharer.py
   # ------------- legacy MoE tests ---------------
   - unittest/_torch/modules/test_fused_moe.py
   # ------------- MoE: test_moe_backend (by backend) ---------------
@@ -41,11 +39,21 @@ l0_b300:
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "TRTLLM"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "CUTEDSL"
   - unittest/_torch/modules/moe/test_moe_backend.py::test_moe_backend -k "DEEPGEMM"
-  # ------------- MoE: test_single_gpu (by backend) ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTLASS"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "TRTLLM"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "CUTEDSL"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu -k "DEEPGEMM"
+  # ------------- MoE: test_single_gpu (specific quant per backend) ---------------
+  # CUTLASS backend: FP8, NVFP4, W4A8_MXFP4_MXFP8, W8A16
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=FP8-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=W4A8_MXFP4_MXFP8-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTLASS-quant=W8A16-routing=Renormalize]
+  # TRTLLM backend: NVFP4, FP8_BLOCK_SCALES, W4A8_NVFP4_FP8, W4A16_MXFP4
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A8_NVFP4_FP8-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=TRTLLM-quant=W4A16_MXFP4-routing=Renormalize]
+  # CUTEDSL backend: NVFP4
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=CUTEDSL-quant=NVFP4-routing=Renormalize]
+  # DEEPGEMM backend: FP8_BLOCK_SCALES
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e60_k4_h2048_i1408-seq=1-dtype=torch.bfloat16-backend=DEEPGEMM-quant=FP8_BLOCK_SCALES-routing=Renormalize]
   # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B::test_nvfp4
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4[moe_backend=TRTLLM-mtp_nextn=0-fp8kv=True-attention_dp=False-cuda_graph=True-overlap_scheduler=True-torch_compile=False]

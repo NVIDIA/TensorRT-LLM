@@ -1900,7 +1900,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
             [torch.stack(all_w3_scales),
              torch.stack(all_w1_scales)], dim=-2)
 
-        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16).view(module.dtype)
+        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16)
         w3_w1_s_shape = w3_w1_scales.shape
         w3_w1_scales_interleaved = w3_w1_scales.reshape(
             w3_w1_s_shape[0], w3_w1_s_shape[1],
@@ -1928,8 +1928,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 w2_scales_shard, (0, pad_size_inter, 0, pad_size_hidden))
             all_w2_scales.append(w2_scales_shard)
 
-        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
-            module.dtype)
+        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
             w2_s_shape[0], w2_s_shape[1],
