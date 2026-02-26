@@ -7,9 +7,8 @@ from typing import Optional, Tuple
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.op import exp
-from tensorrt_llm._torch.modules.fla.utils import input_guard
+from fla.ops.utils.op import exp
+from fla.utils import input_guard
 
 
 @triton.heuristics({

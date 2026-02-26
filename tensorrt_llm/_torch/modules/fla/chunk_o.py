@@ -7,11 +7,9 @@ from typing import Optional
 import torch
 import triton
 import triton.language as tl
-
-from tensorrt_llm._torch.modules.fla.index import prepare_chunk_indices
-from tensorrt_llm._torch.modules.fla.op import exp, safe_exp
-from tensorrt_llm._torch.modules.fla.utils import (check_shared_mem,
-                                                   is_nvidia_hopper)
+from fla.ops.utils import prepare_chunk_indices
+from fla.ops.utils.op import exp, safe_exp
+from fla.utils import check_shared_mem, is_nvidia_hopper
 
 BKV_LIST = [64, 128] if check_shared_mem() else [32, 64]
 NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
@@ -21,16 +19,19 @@ NUM_WARPS = [2, 4] if is_nvidia_hopper else [2, 4, 8]
     "USE_G": lambda args: args["g"] is not None,
     "IS_VARLEN": lambda args: args["cu_seqlens"] is not None,
 })
-# @triton.autotune(
-#     configs=[
-#         triton.Config({"BK": BK, "BV": BV}, num_warps=num_warps, num_stages=num_stages)
-#         for BK in BKV_LIST
-#         for BV in BKV_LIST
-#         for num_warps in NUM_WARPS
-#         for num_stages in [2, 3, 4]
-#     ],
-#     key=["H", "K", "V", "BT"],
-# )
+@triton.autotune(
+    configs=[
+        triton.Config({
+            "BK": BK,
+            "BV": BV
+        },
+                      num_warps=num_warps,
+                      num_stages=num_stages) for BK in BKV_LIST
+        for BV in BKV_LIST for num_warps in NUM_WARPS
+        for num_stages in [2, 3, 4]
+    ],
+    key=["H", "K", "V", "BT"],
+)
 @triton.jit(do_not_specialize=["T"])
 def chunk_fwd_kernel_o(
     q,
@@ -44,7 +45,7 @@ def chunk_fwd_kernel_o(
     scale,
     T,
     H: tl.constexpr,
-    Hg: tl.constexpr,
+    Hqk: tl.constexpr,
     K: tl.constexpr,
     V: tl.constexpr,
     BT: tl.constexpr,
@@ -70,8 +71,8 @@ def chunk_fwd_kernel_o(
         bos, eos = i_b * T, i_b * T + T
 
     # offset calculation
-    q += (bos * Hg + i_h // (H // Hg)) * K
-    k += (bos * Hg + i_h // (H // Hg)) * K
+    q += (bos * Hqk + i_h // (H // Hqk)) * K
+    k += (bos * Hqk + i_h // (H // Hqk)) * K
     v += (bos * H + i_h) * V
     o += (bos * H + i_h) * V
     h += (i_tg * H + i_h).to(tl.int64) * K * V
@@ -80,9 +81,9 @@ def chunk_fwd_kernel_o(
     b_A = tl.zeros([BT, BT], dtype=tl.float32)
 
     for i_k in range(tl.cdiv(K, BK)):
-        p_q = tl.make_block_ptr(q, (T, K), (Hg * K, 1), (i_t * BT, i_k * BK),
+        p_q = tl.make_block_ptr(q, (T, K), (Hqk * K, 1), (i_t * BT, i_k * BK),
                                 (BT, BK), (1, 0))
-        p_k = tl.make_block_ptr(k, (K, T), (1, Hg * K), (i_k * BK, i_t * BT),
+        p_k = tl.make_block_ptr(k, (K, T), (1, Hqk * K), (i_k * BK, i_t * BT),
                                 (BK, BT), (0, 1))
         p_h = tl.make_block_ptr(h, (K, V), (V, 1), (i_k * BK, i_v * BV),
                                 (BK, BV), (1, 0))
@@ -131,7 +132,7 @@ def chunk_fwd_o(
     cu_seqlens: Optional[torch.LongTensor] = None,
     chunk_size: int = 64,
 ) -> torch.Tensor:
-    B, T, Hg, K, V = *q.shape, v.shape[-1]
+    B, T, Hqk, K, V = *q.shape, v.shape[-1]
     H = v.shape[-2]
     BT = min(chunk_size, max(16, triton.next_power_of_2(T)))
     chunk_indices = (prepare_chunk_indices(cu_seqlens, BT)
@@ -145,25 +146,19 @@ def chunk_fwd_o(
     def grid(meta):
         return (triton.cdiv(V, meta["BV"]), NT, B * H)
 
-    chunk_fwd_kernel_o[grid](
-        q,
-        k,
-        v,
-        h,
-        g,
-        o,
-        cu_seqlens,
-        chunk_indices,
-        scale,
-        T=T,
-        H=H,
-        Hg=Hg,
-        K=K,
-        V=V,
-        BT=BT,
-        BK=128,
-        BV=64,
-        num_warps=4,
-        num_stages=2,
-    )
+    chunk_fwd_kernel_o[grid](q,
+                             k,
+                             v,
+                             h,
+                             g,
+                             o,
+                             cu_seqlens,
+                             chunk_indices,
+                             scale,
+                             T=T,
+                             H=H,
+                             Hqk=Hqk,
+                             K=K,
+                             V=V,
+                             BT=BT)
     return o
