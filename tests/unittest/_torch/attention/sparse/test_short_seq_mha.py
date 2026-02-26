@@ -15,10 +15,10 @@
 """
 Test suite for the short-sequence MHA optimization path in MLA.
 
-When TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD is set and the max context sequence
-length is within the threshold, MLA.forward_context_dsa dispatches to
-forward_context_short_mha which uses dense MHA (kv_b_proj expansion + SDPA)
-instead of the absorption path.
+When TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD is set and the total number of
+packed context tokens is within the threshold, MLA.forward_context_dsa
+dispatches to forward_context_short_mha which uses dense MHA (kv_b_proj
+expansion + SDPA) instead of the absorption path.
 """
 import math
 import os
