@@ -178,10 +178,24 @@ def load_state_dict(
     model_params = {}
     if file_path.suffix == '.safetensors':
         # load from safetensors file
-        from safetensors import safe_open
-        with safe_open(file_path, framework='pt', device=device) as f:
-            for name in f.keys():
-                tensor = f.get_tensor(name)
+        try:
+            from safetensors import safe_open
+            with safe_open(file_path, framework='pt', device=device) as f:
+                for name in f.keys():
+                    tensor = f.get_tensor(name)
+                    if dtype is not None:
+                        tensor = tensor.to(dtype)
+                    model_params[name] = tensor
+        except Exception as e:
+            # Fallback to safetensors.torch.load_file() for better compatibility
+            # with some HuggingFace-style adapters (e.g., PEFT-saved files)
+            logger.warning(
+                f"Failed to load {file_path} with safe_open(), "
+                f"falling back to safetensors.torch.load_file(): {e}")
+            import safetensors.torch
+            state_dict = safetensors.torch.load_file(str(file_path),
+                                                     device=device)
+            for name, tensor in state_dict.items():
                 if dtype is not None:
                     tensor = tensor.to(dtype)
                 model_params[name] = tensor
