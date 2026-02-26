@@ -1812,9 +1812,12 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
-            self.cached_warmup_forward_context_with_chunked_prefill(
-                self.num_heads_tp, self.qk_nope_head_dim, self.qk_rope_head_dim,
-                self.kv_lora_rank, self.v_head_dim, q.dtype, q.device)
+            if trtllm_attention.is_chunked_prefill_mla_context_for_warmup(
+                    attn_metadata):
+                self.cached_warmup_forward_context_with_chunked_prefill(
+                    self.num_heads_tp, self.qk_nope_head_dim,
+                    self.qk_rope_head_dim, self.kv_lora_rank, self.v_head_dim,
+                    q.dtype, q.device)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
                 return self.forward_context_with_chunked_prefill(
