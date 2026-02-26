@@ -49,6 +49,7 @@ from typing import Any, Optional
 
 import aiohttp
 import numpy as np
+import yaml
 from tqdm.asyncio import tqdm
 
 AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
@@ -92,6 +93,8 @@ class VisualGenBenchmarkMetrics:
     min_e2e_latency_ms: float
     max_e2e_latency_ms: float
     percentiles_e2e_latency_ms: list[tuple[float, float]]
+    num_gpus: int = 1
+    per_gpu_throughput: float = 0.0
     mean_ttff_ms: float = -1.0
     mean_gen_fps: float = -1.0
 
@@ -219,6 +222,7 @@ def calculate_metrics(
     outputs: list[VisualGenRequestOutput],
     dur_s: float,
     selected_percentiles: list[float],
+    num_gpus: int = 1,
 ) -> VisualGenBenchmarkMetrics:
     e2e_latencies: list[float] = []
     error_counts: dict[str, int] = {}
@@ -246,10 +250,11 @@ def calculate_metrics(
 
     e2e_ms = [v * SECONDS_TO_MILLISECONDS for v in e2e_latencies]
 
+    request_throughput = completed / dur_s if dur_s > 0 else 0
     return VisualGenBenchmarkMetrics(
         completed=completed,
         total_requests=len(outputs),
-        request_throughput=completed / dur_s if dur_s > 0 else 0,
+        request_throughput=request_throughput,
         mean_e2e_latency_ms=float(np.mean(e2e_ms)) if e2e_ms else 0,
         median_e2e_latency_ms=float(np.median(e2e_ms)) if e2e_ms else 0,
         std_e2e_latency_ms=float(np.std(e2e_ms)) if e2e_ms else 0,
@@ -260,6 +265,8 @@ def calculate_metrics(
         ]
         if e2e_ms
         else [(p, 0.0) for p in selected_percentiles],
+        num_gpus=num_gpus,
+        per_gpu_throughput=request_throughput / num_gpus,
     )
 
 
@@ -277,6 +284,7 @@ async def benchmark(
     extra_body: Optional[dict],
     no_test_input: bool = False,
     request_timeout: float = 6 * 60 * 60,
+    num_gpus: int = 1,
 ) -> dict[str, Any]:
     if backend not in VISUAL_GEN_REQUEST_FUNCS:
         raise ValueError(
@@ -357,6 +365,7 @@ async def benchmark(
         outputs=outputs,
         dur_s=benchmark_duration,
         selected_percentiles=selected_percentiles,
+        num_gpus=num_gpus,
     )
 
     _print_results(backend, model_id, benchmark_duration, metrics)
@@ -365,9 +374,11 @@ async def benchmark(
         "backend": backend,
         "model": model_id,
         "duration": benchmark_duration,
+        "num_gpus": metrics.num_gpus,
         "total_requests": metrics.total_requests,
         "completed": metrics.completed,
         "request_throughput": metrics.request_throughput,
+        "per_gpu_throughput": metrics.per_gpu_throughput,
         "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
         "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
         "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
@@ -396,6 +407,8 @@ def _print_results(
     print("{:<40} {:<10}".format("Failed requests:", metrics.total_requests - metrics.completed))
     print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
     print("{:<40} {:<10.4f}".format("Request throughput (req/s):", metrics.request_throughput))
+    print("{:<40} {:<10}".format("Number of GPUs:", metrics.num_gpus))
+    print("{:<40} {:<10.4f}".format("Per-GPU throughput (req/s/GPU):", metrics.per_gpu_throughput))
 
     if metrics.total_requests - metrics.completed > 0:
         print("=" * 60)
@@ -451,6 +464,24 @@ def load_prompts(args: argparse.Namespace) -> list[VisualGenSampleRequest]:
     return [VisualGenSampleRequest(prompt=p) for p in prompts]
 
 
+def _resolve_num_gpus(args: argparse.Namespace) -> int:
+    """Determine the number of GPUs from explicit arg or server config YAML.
+
+    Priority: --num-gpus (explicit) > --extra-visual-gen-options YAML > default 1.
+    """
+    if args.num_gpus is not None:
+        return args.num_gpus
+
+    if args.extra_visual_gen_options is not None:
+        with open(args.extra_visual_gen_options, encoding="utf-8") as f:
+            config = yaml.safe_load(f) or {}
+        from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
+
+        return get_visual_gen_num_gpus(config)
+
+    return 1
+
+
 def main(args: argparse.Namespace):
     print(args)
     random.seed(args.seed)
@@ -503,6 +534,8 @@ def main(args: argparse.Namespace):
         except json.JSONDecodeError as e:
             raise ValueError(f"Invalid JSON in --extra-body: {e}") from e
 
+    num_gpus = _resolve_num_gpus(args)
+
     gc.disable()
 
     benchmark_result = asyncio.run(
@@ -520,6 +553,7 @@ def main(args: argparse.Namespace):
             extra_body=extra_body,
             no_test_input=args.no_test_input,
             request_timeout=args.request_timeout,
+            num_gpus=num_gpus,
         )
     )
 
@@ -551,6 +585,7 @@ def main(args: argparse.Namespace):
         )
         result_json["burstiness"] = args.burstiness
         result_json["max_concurrency"] = args.max_concurrency
+        result_json["num_gpus"] = num_gpus
 
         base_model_id = model_id.split("/")[-1]
         max_concurrency_str = (
@@ -676,6 +711,22 @@ if __name__ == "__main__":
         type=float,
         default=6 * 60 * 60,
         help="Request timeout in seconds (default: 6 hours).",
+    )
+
+    parser.add_argument(
+        "--extra-visual-gen-options",
+        type=str,
+        default=None,
+        help="Path to the server config YAML (same file passed to trtllm-serve "
+        "via --extra_visual_gen_options). Parallelism settings are read to "
+        "automatically determine the number of GPUs.",
+    )
+    parser.add_argument(
+        "--num-gpus",
+        type=int,
+        default=None,
+        help="Number of GPUs used by the server. Overrides the value inferred "
+        "from --extra-visual-gen-options. Defaults to 1 if neither is given.",
     )
 
     output_group = parser.add_argument_group("Output")
