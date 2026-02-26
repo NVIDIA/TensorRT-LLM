@@ -192,20 +192,17 @@ class TestFirstGenLogProbsSerializeRoundtrip:
         for orig_pos, rec_pos in zip(original, recovered):
             assert set(orig_pos.keys()) == set(rec_pos.keys())
             for tid in orig_pos:
-                assert rec_pos[tid].logprob == pytest.approx(
-                    orig_pos[tid].logprob)
+                assert rec_pos[tid].logprob == pytest.approx(orig_pos[tid].logprob)
                 assert rec_pos[tid].rank == orig_pos[tid].rank
 
     def test_rank_none_preserved(self):
         original = [{42: Logprob(logprob=-1.0, rank=None)}]
-        recovered = _deserialize_first_gen_log_probs(
-            _serialize_first_gen_log_probs(original))
+        recovered = _deserialize_first_gen_log_probs(_serialize_first_gen_log_probs(original))
         assert recovered[0][42].rank is None
 
     def test_empty_list_roundtrip(self):
         original = []
-        recovered = _deserialize_first_gen_log_probs(
-            _serialize_first_gen_log_probs(original))
+        recovered = _deserialize_first_gen_log_probs(_serialize_first_gen_log_probs(original))
         assert recovered == []
 
     def test_serialize_rejects_non_list(self):

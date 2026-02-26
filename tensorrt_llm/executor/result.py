@@ -291,7 +291,8 @@ class GenerationResultBase:
 
             # overcome some WAR in the cpp executor
             if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
-                if len(output.logprobs) > output.length:
+                if self.use_trtllm_sampler and len(
+                        output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
