@@ -26,7 +26,7 @@ from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
-                     is_torch_compiling, maybe_compiled_cat,
+                     is_torch_compiling, maybe_compile, maybe_compiled_cat,
                      maybe_compiled_copy_)
 from .linear import Linear, TensorParallelMode, WeightMode, WeightsLoadingConfig
 from .multi_stream_utils import maybe_execute_in_parallel
@@ -38,6 +38,32 @@ try:
     from tensorrt_llm.flash_mla import flash_mla_sparse_fwd
 except ImportError:
     flash_mla_sparse_fwd = None
+
+
+@maybe_compile
+def _apply_rope_single_packed(x, cos_sin_cache, position_ids, is_neox):
+    """Fused RoPE for a single packed 2D tensor [N, head_dim].
+
+    Optimized replacement for RotaryEmbedding.forward() when called with a
+    single target and remove_input_padding=True (2D input).  Avoids the
+    unnecessary view/transpose/contiguous reshape dance (since there is
+    effectively 1 head) and fuses gather + rotation into a single compiled
+    kernel via @maybe_compile.
+    """
+    cos_sin = cos_sin_cache[position_ids]  # [N, 2, head_dim//2]
+    cos = cos_sin[:, 0, :].to(x.dtype)  # [N, head_dim//2]
+    sin = cos_sin[:, 1, :].to(x.dtype)  # [N, head_dim//2]
+    if is_neox:
+        half = x.shape[-1] // 2
+        x1 = x[:, :half]
+        x2 = x[:, half:]
+        return torch.cat([x1 * cos - x2 * sin, x2 * cos + x1 * sin], dim=-1)
+    else:
+        x1 = x[:, ::2]
+        x2 = x[:, 1::2]
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+        return torch.stack((o1, o2), dim=-1).flatten(-2)
 
 
 def extract_extra_attrs(layer_idx: str, attn_type: str):
@@ -1702,10 +1728,15 @@ class MLA(nn.Module):
         trtllm_mqa.mla_rope_append_paged_kv_assign_q(q, latent_cache,
                                                       attn_metadata)
 
-        # Step 2: Apply RoPE to k_pe using the RotaryEmbedding.
+        # Step 2: Apply RoPE to k_pe via the fused compiled helper.
         # position_ids covers all tokens; slice to context tokens only.
         ctx_position_ids = position_ids[..., :num_ctx_tokens]
-        [k_pe_roped] = self._rotary_emb_mha(ctx_position_ids, [k_pe])
+        k_pe_roped = _apply_rope_single_packed(
+            k_pe,
+            self._rotary_emb_mha.rotary_cos_sin,
+            ctx_position_ids.view(-1),
+            self._rotary_emb_mha.is_neox,
+        )
 
         # Step 3: Expand KV via kv_b_proj.
         kv = self.kv_b_proj(compressed_kv)
