@@ -12,12 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Test benchmark_visual_gen.py against a live trtllm-serve server.
+"""E2E tests for VisualGen benchmarking (online serving and offline trtllm-bench).
 
-Follows the same subprocess pattern as
-``tests/unittest/llmapi/apps/_test_trtllm_serve_benchmark.py``.
+Online tests launch a trtllm-serve server and run benchmark_visual_gen.py against it.
+Offline tests run trtllm-bench visual-gen directly (no server).
+Both require GPU and model weights.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -30,24 +32,58 @@ import pytest
 import requests
 import yaml
 
+from defs import conftest
 from tensorrt_llm._utils import get_free_port
 
 # ---------------------------------------------------------------------------
 # Model discovery
 # ---------------------------------------------------------------------------
 
-_LLM_MODELS_ROOT = Path(
-    os.environ.get("LLM_MODELS_ROOT", "/home/scratch.trt_llm_data_ci/llm-models/")
-)
-if not _LLM_MODELS_ROOT.exists():
-    _LLM_MODELS_ROOT = Path("/scratch.trt_llm_data/llm-models/")
-
 _WAN_T2V_MODEL = "Wan2.1-T2V-1.3B-Diffusers"
-_WAN_T2V_PATH = _LLM_MODELS_ROOT / _WAN_T2V_MODEL
+
+
+def _wan_t2v_path() -> Path:
+    """Resolve the Wan T2V model path, or call pytest.skip if unavailable."""
+    root = Path(conftest.llm_models_root())
+    model_path = root / _WAN_T2V_MODEL
+    if not model_path.is_dir():
+        pytest.skip(
+            f"Wan T2V model not found: {model_path} "
+            f"(set LLM_MODELS_ROOT or place {_WAN_T2V_MODEL} under scratch)"
+        )
+    return model_path
+
+
+# Common small-scale generation params for fast CI
+_SMALL_GEN_PARAMS = {
+    "size": "480x320",
+    "num_frames": "9",
+    "fps": "8",
+    "num_inference_steps": "4",
+    "seed": "42",
+}
+
+
+def _make_visual_gen_options(**extra) -> dict:
+    """Build a minimal VisualGen YAML config dict."""
+    config = {
+        "linear": {"type": "default"},
+        "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
+    }
+    config.update(extra)
+    return config
+
+
+def _write_config_file(config: dict, tmp_dir: Path) -> str:
+    """Write config dict to a temp YAML file and return the path."""
+    config_file = tmp_dir / "visual_gen_config.yml"
+    with open(config_file, "w") as f:
+        yaml.dump(config, f)
+    return str(config_file)
 
 
 # ---------------------------------------------------------------------------
-# Remote server (mirrors RemoteVisualGenServer from test_trtllm_serve_e2e.py)
+# Remote server helper (for online benchmark tests)
 # ---------------------------------------------------------------------------
 
 
@@ -131,19 +167,11 @@ class RemoteVisualGenServer:
 # ---------------------------------------------------------------------------
 
 
-def _make_visual_gen_options(**extra) -> dict:
-    config = {
-        "linear": {"type": "default"},
-        "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
-    }
-    config.update(extra)
-    return config
-
-
 @pytest.fixture(scope="module")
 def server():
+    model_path = _wan_t2v_path()
     with RemoteVisualGenServer(
-        model=str(_WAN_T2V_PATH),
+        model=str(model_path),
         extra_visual_gen_options=_make_visual_gen_options(),
     ) as srv:
         yield srv
@@ -154,21 +182,28 @@ def benchmark_script():
     llm_root = os.getenv("LLM_ROOT")
     if llm_root is None:
         llm_root = str(Path(__file__).resolve().parents[4])
-    return os.path.join(llm_root, "tensorrt_llm", "serve", "scripts", "benchmark_visual_gen.py")
+    return os.path.join(
+        llm_root,
+        "tensorrt_llm",
+        "serve",
+        "scripts",
+        "benchmark_visual_gen.py",
+    )
 
 
-# ---------------------------------------------------------------------------
-# Tests
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Online benchmark tests (trtllm-serve + benchmark_visual_gen.py)
+# ===========================================================================
 
 
-@pytest.mark.skipif(not _WAN_T2V_PATH.is_dir(), reason=f"Model not found at {_WAN_T2V_PATH}")
 @pytest.mark.parametrize("backend", ["openai-videos"])
-def test_visual_gen_benchmark_video(
-    server: RemoteVisualGenServer, benchmark_script: str, backend: str
+def test_online_benchmark_video(
+    server: RemoteVisualGenServer,
+    benchmark_script: str,
+    backend: str,
 ):
     """Run benchmark_visual_gen.py for video generation and validate output."""
-    benchmark_cmd = [
+    cmd = [
         sys.executable,
         benchmark_script,
         "--backend",
@@ -184,36 +219,42 @@ def test_visual_gen_benchmark_video(
         "--num-prompts",
         "2",
         "--size",
-        "480x320",
+        _SMALL_GEN_PARAMS["size"],
         "--num-frames",
-        "9",
+        _SMALL_GEN_PARAMS["num_frames"],
         "--fps",
-        "8",
+        _SMALL_GEN_PARAMS["fps"],
         "--num-inference-steps",
-        "4",
+        _SMALL_GEN_PARAMS["num_inference_steps"],
         "--seed",
-        "42",
+        _SMALL_GEN_PARAMS["seed"],
         "--max-concurrency",
         "1",
         "--disable-tqdm",
     ]
 
     result = subprocess.run(
-        benchmark_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
     )
 
     assert result.returncode == 0
-    assert "Serving Benchmark Result (VisualGen)" in result.stdout
+    assert "Benchmark Result (VisualGen)" in result.stdout
 
 
-@pytest.mark.skipif(not _WAN_T2V_PATH.is_dir(), reason=f"Model not found at {_WAN_T2V_PATH}")
 @pytest.mark.parametrize("backend", ["openai-videos"])
-def test_visual_gen_benchmark_save_result(
-    server: RemoteVisualGenServer, benchmark_script: str, backend: str, tmp_path
+def test_online_benchmark_save_result(
+    server: RemoteVisualGenServer,
+    benchmark_script: str,
+    backend: str,
+    tmp_path,
 ):
-    """Verify --save-result produces a valid JSON output file."""
+    """Verify online benchmark --save-result produces a valid JSON file."""
     result_dir = str(tmp_path / "results")
-    benchmark_cmd = [
+    cmd = [
         sys.executable,
         benchmark_script,
         "--backend",
@@ -229,15 +270,15 @@ def test_visual_gen_benchmark_save_result(
         "--num-prompts",
         "1",
         "--size",
-        "480x320",
+        _SMALL_GEN_PARAMS["size"],
         "--num-frames",
-        "9",
+        _SMALL_GEN_PARAMS["num_frames"],
         "--fps",
-        "8",
+        _SMALL_GEN_PARAMS["fps"],
         "--num-inference-steps",
-        "4",
+        _SMALL_GEN_PARAMS["num_inference_steps"],
         "--seed",
-        "42",
+        _SMALL_GEN_PARAMS["seed"],
         "--max-concurrency",
         "1",
         "--save-result",
@@ -247,13 +288,125 @@ def test_visual_gen_benchmark_save_result(
     ]
 
     result = subprocess.run(
-        benchmark_cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, check=True
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
     )
 
     assert result.returncode == 0
-    assert "Serving Benchmark Result (VisualGen)" in result.stdout
+    assert "Benchmark Result (VisualGen)" in result.stdout
 
-    import json
+    result_files = list(Path(result_dir).glob("*.json"))
+    assert len(result_files) >= 1, f"No JSON result file found in {result_dir}"
+
+    with open(result_files[0]) as f:
+        data = json.load(f)
+    assert "completed" in data
+    assert data["completed"] >= 1
+    assert "mean_e2e_latency_ms" in data
+
+
+# ===========================================================================
+# Offline benchmark tests (trtllm-bench visual-gen)
+# ===========================================================================
+
+
+def test_offline_benchmark(tmp_path):
+    """Run trtllm-bench visual-gen and validate output."""
+    model_path = _wan_t2v_path()
+    config_file = _write_config_file(_make_visual_gen_options(), tmp_path)
+
+    cmd = [
+        "trtllm-bench",
+        "--model",
+        str(model_path),
+        "--model_path",
+        str(model_path),
+        "visual-gen",
+        "--extra_visual_gen_options",
+        config_file,
+        "--prompt",
+        "A cat walking in a garden",
+        "--num_prompts",
+        "2",
+        "--size",
+        _SMALL_GEN_PARAMS["size"],
+        "--num_frames",
+        _SMALL_GEN_PARAMS["num_frames"],
+        "--fps",
+        _SMALL_GEN_PARAMS["fps"],
+        "--num_inference_steps",
+        _SMALL_GEN_PARAMS["num_inference_steps"],
+        "--seed",
+        _SMALL_GEN_PARAMS["seed"],
+        "--max_concurrency",
+        "1",
+        "--warmup",
+        "1",
+    ]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+
+    assert result.returncode == 0
+    assert "Benchmark Result (VisualGen)" in result.stdout
+
+
+def test_offline_benchmark_save_result(tmp_path):
+    """Verify trtllm-bench visual-gen --save_result produces valid JSON."""
+    model_path = _wan_t2v_path()
+    config_file = _write_config_file(_make_visual_gen_options(), tmp_path)
+    result_dir = str(tmp_path / "results")
+
+    cmd = [
+        "trtllm-bench",
+        "--model",
+        str(model_path),
+        "--model_path",
+        str(model_path),
+        "visual-gen",
+        "--extra_visual_gen_options",
+        config_file,
+        "--prompt",
+        "A bird flying over the ocean",
+        "--num_prompts",
+        "1",
+        "--size",
+        _SMALL_GEN_PARAMS["size"],
+        "--num_frames",
+        _SMALL_GEN_PARAMS["num_frames"],
+        "--fps",
+        _SMALL_GEN_PARAMS["fps"],
+        "--num_inference_steps",
+        _SMALL_GEN_PARAMS["num_inference_steps"],
+        "--seed",
+        _SMALL_GEN_PARAMS["seed"],
+        "--max_concurrency",
+        "1",
+        "--warmup",
+        "0",
+        "--save_result",
+        "--result_dir",
+        result_dir,
+    ]
+
+    result = subprocess.run(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=True,
+    )
+
+    assert result.returncode == 0
+    assert "Benchmark Result (VisualGen)" in result.stdout
 
     result_files = list(Path(result_dir).glob("*.json"))
     assert len(result_files) >= 1, f"No JSON result file found in {result_dir}"

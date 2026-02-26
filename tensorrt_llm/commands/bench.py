@@ -5,6 +5,7 @@ import click
 
 from tensorrt_llm.bench.benchmark.low_latency import latency_command
 from tensorrt_llm.bench.benchmark.throughput import throughput_command
+from tensorrt_llm.bench.benchmark.visual_gen import visual_gen_command
 from tensorrt_llm.bench.build.build import build_command
 from tensorrt_llm.bench.dataclasses.general import BenchmarkEnvironment
 from tensorrt_llm.bench.dataset.prepare_dataset import prepare_dataset
@@ -67,6 +68,7 @@ main.add_command(build_command)
 main.add_command(throughput_command)
 main.add_command(latency_command)
 main.add_command(prepare_dataset)
+main.add_command(visual_gen_command)
 
 if __name__ == "__main__":
     main()
