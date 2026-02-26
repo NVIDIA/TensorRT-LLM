@@ -3,6 +3,7 @@
 import java.lang.InterruptedException
 import groovy.transform.Field
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
 import org.jenkinsci.plugins.workflow.cps.CpsThread
