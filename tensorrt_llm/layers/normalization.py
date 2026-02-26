@@ -12,13 +12,14 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from typing import Optional
+from typing import Optional, Tuple
 
 from ..functional import (ACT2FN, Tensor, chunk, group_norm, layer_norm,
                           rms_norm, unsqueeze)
 from ..mapping import Mapping
 from ..module import Module
 from ..parameter import Parameter
+from .activation import SiLU
 from .embedding import CombinedTimestepLabelEmbeddings, Embedding
 from .linear import Linear
 
@@ -61,6 +62,20 @@ class LayerNorm(Module):
         return layer_norm(x, normalized_shape, weight, bias, self.eps)
 
 
+class FP32LayerNorm(LayerNorm):
+
+    def forward(self, x, normalized_shape=None):
+        origin_dtype = x.dtype
+        weight = 1. if self.weight is None else self.weight.value
+        bias = 0. if self.bias is None else self.bias.value
+        if normalized_shape is None:
+            normalized_shape = self.normalized_shape
+        output = layer_norm(x.cast('float32'), normalized_shape,
+                            weight.cast('float32'), bias.cast('float32'),
+                            self.eps)
+        return output.cast(origin_dtype)
+
+
 class RmsNorm(Module):
 
     def __init__(self,
@@ -91,6 +106,158 @@ class RmsNorm(Module):
         if normalized_shape is None:
             normalized_shape = self.normalized_shape
         return rms_norm(x, normalized_shape, self.num_groups, weight, self.eps)
+
+
+class AdaLayerNormZero(Module):
+    r"""
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/normalization.py#L100
+
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self,
+                 embedding_dim: int,
+                 num_embeddings: Optional[int] = None,
+                 norm_type="layer_norm",
+                 bias=True,
+                 mapping=None,
+                 dtype=None):
+        super().__init__()
+        if num_embeddings is not None:
+            raise NotImplementedError()
+        else:
+            self.emb = None
+
+        self.silu = SiLU()
+        self.linear = Linear(embedding_dim,
+                             6 * embedding_dim,
+                             bias=bias,
+                             tp_group=mapping.tp_group,
+                             tp_size=mapping.tp_size,
+                             dtype=dtype)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim,
+                                  elementwise_affine=False,
+                                  eps=1e-6)
+        elif norm_type == "fp32_layer_norm":
+            self.norm = FP32LayerNorm(embedding_dim,
+                                      elementwise_affine=False,
+                                      bias=False)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: Tensor,
+        timestep: Optional[Tensor] = None,
+        class_labels: Optional[Tensor] = None,
+        hidden_dtype: str = None,
+        emb: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        if self.emb is not None:
+            emb = self.emb(timestep, class_labels, hidden_dtype=hidden_dtype)
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = chunk(
+            emb, chunks=6, dim=1)
+        x = self.norm(x) * (1 + unsqueeze(scale_msa, 1)) + unsqueeze(
+            shift_msa, 1)
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
+
+
+class AdaLayerNormZeroSingle(Module):
+    r"""
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/normalization.py#L143
+
+    Norm layer adaptive layer norm zero (adaLN-Zero).
+
+    Parameters:
+        embedding_dim (`int`): The size of each embedding vector.
+        num_embeddings (`int`): The size of the embeddings dictionary.
+    """
+
+    def __init__(self,
+                 embedding_dim: int,
+                 norm_type="layer_norm",
+                 bias=True,
+                 mapping=None,
+                 dtype=None):
+        super().__init__()
+
+        self.silu = SiLU()
+        self.linear = Linear(embedding_dim,
+                             3 * embedding_dim,
+                             bias=bias,
+                             tp_group=mapping.tp_group,
+                             tp_size=mapping.tp_size,
+                             dtype=dtype)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim,
+                                  elementwise_affine=False,
+                                  eps=1e-6)
+        else:
+            raise ValueError(
+                f"Unsupported `norm_type` ({norm_type}) provided. Supported ones are: 'layer_norm', 'fp32_layer_norm'."
+            )
+
+    def forward(
+        self,
+        x: Tensor,
+        emb: Optional[Tensor] = None,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor]:
+        emb = self.linear(self.silu(emb))
+        shift_msa, scale_msa, gate_msa = chunk(emb, 3, dim=1)
+        x = self.norm(x) * (1 + unsqueeze(scale_msa, 1)) + unsqueeze(
+            shift_msa, 1)
+        return x, gate_msa
+
+
+class AdaLayerNormContinuous(Module):
+    """
+    Adapted from: https://github.com/huggingface/diffusers/blob/66eef9a6dc8a97815a69fdf97aa20c8ece63d3f6/src/diffusers/models/normalization.py#L277
+    """
+
+    def __init__(
+            self,
+            embedding_dim: int,
+            conditioning_embedding_dim: int,
+            # NOTE: It is a bit weird that the norm layer can be configured to have scale and shift parameters
+            # because the output is immediately scaled and shifted by the projected conditioning embeddings.
+            # Note that AdaLayerNorm does not let the norm layer have scale and shift parameters.
+            # However, this is how it was implemented in the original code, and it's rather likely you should
+            # set `elementwise_affine` to False.
+            elementwise_affine=True,
+            eps=1e-5,
+            bias=True,
+            norm_type="layer_norm",
+            mapping=None,
+            dtype=None):
+        super().__init__()
+        self.silu = SiLU()
+        self.linear = Linear(conditioning_embedding_dim,
+                             embedding_dim * 2,
+                             bias=bias,
+                             tp_group=mapping.tp_group,
+                             tp_size=mapping.tp_size,
+                             dtype=dtype)
+        if norm_type == "layer_norm":
+            self.norm = LayerNorm(embedding_dim, eps, elementwise_affine, bias)
+        elif norm_type == "rms_norm":
+            self.norm = RmsNorm(embedding_dim, eps, elementwise_affine)
+        else:
+            raise ValueError(f"unknown norm_type {norm_type}")
+
+    def forward(self, x: Tensor, conditioning_embedding: Tensor) -> Tensor:
+        # convert back to the original dtype in case `conditioning_embedding`` is upcasted to float32 (needed for hunyuanDiT)
+        emb = self.linear(self.silu(conditioning_embedding).cast(x.dtype))
+        scale, shift = chunk(emb, 2, dim=1)
+        x = self.norm(x) * unsqueeze((1 + scale), 1) + unsqueeze(shift, 1)
+        return x
 
 
 class GroupNorm(Module):
