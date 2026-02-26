@@ -686,7 +686,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                 shared_expert_intermediate_size=config.intermediate_size,
                 model_config=model_config,
                 aux_stream=aux_stream,
-                dtype=config.torch_dtype)
+                dtype=config.torch_dtype,
+                layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
