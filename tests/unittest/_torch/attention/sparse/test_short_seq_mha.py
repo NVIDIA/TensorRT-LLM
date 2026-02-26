@@ -29,6 +29,10 @@ from typing import List
 import pytest
 import torch
 
+# DSACacheManager creates background ThreadPoolExecutor threads that outlive
+# the test. Disable pytest-threadleak for this entire module.
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 import tensorrt_llm
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.attention_backend.interface import (
