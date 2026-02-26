@@ -24,6 +24,7 @@ from .remove_copy_pass import remove_copy_for_mutates_args
 class Backend:
 
     _custom_pass_instances: List[PatternMatcherPass] = None
+    _graph_pool: torch.cuda.MemPool = None
     _graph_pool_handle: tuple[int, int] = None
 
     # Following classes are used to let weakref ref the stream and eventlist objects.
@@ -60,7 +61,8 @@ class Backend:
         inductor_config.enable_auto_functionalized_v2 = False
 
         if Backend._graph_pool_handle is None:
-            Backend._graph_pool_handle = torch.cuda.graph_pool_handle()
+            Backend._graph_pool = torch.cuda.MemPool()
+            Backend._graph_pool_handle = Backend._graph_pool.id
 
         self.match_count = []
 
