@@ -20,8 +20,6 @@
 #include "tensorrt_llm/common/vec_dtypes.cuh"
 #include "tensorrt_llm/kernels/communicationKernels/moeAlltoAllKernels.h"
 #include "tensorrt_llm/kernels/quantization.cuh"
-#include "tensorrt_llm/runtime/utils/mpiUtils.h"
-#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
 #include <cooperative_groups.h>
 #include <cstdint>
 #include <nccl.h>
@@ -344,6 +342,7 @@ __device__ void vectorized_dispatch(uint8_t const* src_ptr, int bytes_per_token,
 template <typename ThreadingPolicy, int TOP_K, bool ENABLE_EPLB>
 __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [local_num_tokens, TOP_K]
     const DispatchKernelPointers ptrs,                                      // Struct containing all kernel pointers
+    ncclDevComm dev_comm,                                                   // NCCL device communicator
     int num_payloads,                                                       // Number of payloads
     int max_tokens_per_rank,                                                // Maximum tokens per rank
     int local_num_tokens, int rank_id, int ep_size, int num_experts, int eplb_stats_num_experts)
@@ -518,7 +517,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // Barrier index 0 is reserved for dispatch.
             // Only the last-token warp (one warp across all CTAs) participates as a coop.
             ncclCoopWarp coop = ncclCoopWarp();
-            ncclLsaBarrierSession barrier(coop, *ptrs.dev_comm, ncclTeamTagLsa{}, /*index=*/0, /*multimem=*/true);
+            ncclLsaBarrierSession barrier(coop, dev_comm, ncclTeamTagLsa{}, /*index=*/0, /*multimem=*/true);
             barrier.sync(coop, cuda::memory_order_relaxed);
 #endif
         }
@@ -559,9 +558,6 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         }
     }
 
-    // NCCL device communicator for LSA barrier
-    kernel_ptrs.dev_comm = params.dev_comm;
-
     // Copy communication tracking pointers
     kernel_ptrs.send_counters = params.send_counters;
     kernel_ptrs.local_token_counter = params.local_token_counter;
@@ -586,7 +582,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
             auto kernel_fn = moeA2ADispatchKernel<BlockPolicy, TOP_K, EPLB_STATS>;
             launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                params.stream, params.token_selected_experts, kernel_ptrs, *params.dev_comm, params.num_payloads,
                 params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
                 params.eplb_stats_num_experts);
         }))
@@ -603,7 +599,7 @@ void moe_a2a_dispatch_launch(MoeA2ADispatchParams const& params)
         SWITCH_BOOL(params.enable_eplb, EPLB_STATS, SWITCH_TOP_K(params.top_k, TOP_K, {
             auto kernel_fn = moeA2ADispatchKernel<WarpPolicy, TOP_K, EPLB_STATS>;
             launchWithPdlWhenEnabled("moeA2ADispatchKernel", kernel_fn, grid_size, kBlockSize, shared_bytes,
-                params.stream, params.token_selected_experts, kernel_ptrs, params.num_payloads,
+                params.stream, params.token_selected_experts, kernel_ptrs, *params.dev_comm, params.num_payloads,
                 params.max_tokens_per_rank, params.local_num_tokens, params.ep_rank, params.ep_size, params.num_experts,
                 params.eplb_stats_num_experts);
         }))
@@ -974,6 +970,7 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t c
 template <typename T, typename ThreadingPolicy, int TOP_K>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
+    ncclDevComm dev_comm,             // NCCL device communicator
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -1002,7 +999,7 @@ __global__ void moeA2ACombineKernel(
             if (elected)
             {
                 ncclCoopWarp coop;
-                ncclLsaBarrierSession barrier(coop, *ptrs.dev_comm, ncclTeamTagLsa{}, /*index=*/1);
+                ncclLsaBarrierSession barrier(coop, dev_comm, ncclTeamTagLsa{}, /*index=*/1);
                 barrier.sync(coop, cuda::memory_order_relaxed);
 
                 // Signal all other blocks that the inter-rank barrier is done.
@@ -1142,8 +1139,7 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
         kernel_ptrs.recv_buffers[rank][0] = params.recv_buffers[rank];
     }
 
-    // NCCL device communicator and intra-rank barrier flag
-    kernel_ptrs.dev_comm = params.dev_comm;
+    // Intra-rank barrier flag and send_counters for cleanup
     kernel_ptrs.local_token_counter = params.local_token_counter;
     kernel_ptrs.send_counters = params.send_counters;
 
@@ -1157,8 +1153,8 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
             SWITCH_TOP_K(params.top_k, TOP_K, {
                 auto kernel_fn = moeA2ACombineKernel<TKernelType, Policy, TOP_K>;
                 launchWithPdlWhenEnabled("moeA2ACombineKernel", kernel_fn, grid_size, kBlockSize, 0, params.stream,
-                    kernel_ptrs, params.max_tokens_per_rank, params.elements_per_token, params.local_num_tokens,
-                    params.ep_rank, params.ep_size);
+                    kernel_ptrs, *params.dev_comm, params.max_tokens_per_rank, params.elements_per_token,
+                    params.local_num_tokens, params.ep_rank, params.ep_size);
             });
         });
     });
@@ -1198,65 +1194,6 @@ void moe_a2a_sanitize_expert_ids_launch(int32_t* expert_ids, int32_t const* recv
     int grid = ceilDiv(total_tokens, kBlockSize);
     launchWithPdlWhenEnabled("moeA2ASanitizeExpertIdsKernel", moeA2ASanitizeExpertIdsKernel, grid, kBlockSize, 0,
         stream, expert_ids, recv_counters, ep_size, max_tokens_per_rank, top_k, invalid_id);
-}
-
-// ============================================================================
-// NCCL DevComm Lifecycle Helpers
-// ============================================================================
-
-// Static storage for the NCCL communicator used by the DevComm.
-// The NCCL comm is kept alive because ncclDevCommDestroy needs it.
-static ncclComm_t g_moeNcclComm = nullptr;
-
-ncclDevComm* create_moe_nccl_dev_comm(int ep_size, int ep_rank, int num_lsa_barriers)
-{
-    // 1. Create NCCL communicator via MPI bootstrap (collective call)
-    ncclUniqueId ncclId;
-    if (ep_rank == 0)
-    {
-        TLLM_NCCL_CHECK(ncclGetUniqueId(&ncclId));
-    }
-    tensorrt_llm::mpi::MpiComm::world().bcastValue(ncclId, 0);
-
-    ncclComm_t ncclComm;
-    TLLM_NCCL_CHECK(ncclCommInitRank(&ncclComm, ep_size, ncclId, ep_rank));
-
-    // 2. Create device communicator with LSA barrier support (collective call)
-    ncclDevCommRequirements reqs = {};
-    reqs.lsaBarrierCount = num_lsa_barriers;
-    reqs.lsaMultimem = true;
-
-    ncclDevComm hostDevComm;
-    TLLM_NCCL_CHECK(ncclDevCommCreate(ncclComm, &reqs, &hostDevComm));
-
-    // 3. Copy to device memory so kernels can access it via pointer
-    ncclDevComm* deviceDevComm = nullptr;
-    TLLM_CUDA_CHECK(cudaMalloc(&deviceDevComm, sizeof(ncclDevComm)));
-    TLLM_CUDA_CHECK(cudaMemcpy(deviceDevComm, &hostDevComm, sizeof(ncclDevComm), cudaMemcpyHostToDevice));
-
-    // Store the NCCL comm so we can clean up later
-    g_moeNcclComm = ncclComm;
-
-    return deviceDevComm;
-}
-
-void destroy_moe_nccl_dev_comm(ncclDevComm* dev_comm)
-{
-    if (dev_comm != nullptr)
-    {
-        // Copy back to host for ncclDevCommDestroy
-        ncclDevComm hostDevComm;
-        cudaMemcpy(&hostDevComm, dev_comm, sizeof(ncclDevComm), cudaMemcpyDeviceToHost);
-
-        if (g_moeNcclComm != nullptr)
-        {
-            ncclDevCommDestroy(g_moeNcclComm, &hostDevComm);
-            ncclCommDestroy(g_moeNcclComm);
-            g_moeNcclComm = nullptr;
-        }
-
-        cudaFree(dev_comm);
-    }
 }
 
 } // namespace kernels::moe_comm

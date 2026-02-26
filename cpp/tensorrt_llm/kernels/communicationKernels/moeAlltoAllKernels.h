@@ -20,9 +20,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 
-// Forward declarations for NCCL device API types
-struct ncclComm;
-typedef struct ncclComm* ncclComm_t;
+// Forward declaration for NCCL device communicator (passed by value to kernels)
 struct ncclDevComm;
 
 TRTLLM_NAMESPACE_BEGIN
@@ -52,9 +50,6 @@ struct DispatchKernelPointers
     void* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers
     int payload_bytes_per_token[kMaxPayloads];   // Bytes per token for each payload
 
-    // NCCL device communicator for LSA barrier synchronization
-    ncclDevComm const* dev_comm;
-
     // Local aux data pointers
     int* send_counters;            // [ep_size] How many tokens have been sent to each target rank
     int* recv_counters[kMaxRanks]; // How many tokens have been received from each source rank. Each rank has [ep_size]
@@ -76,9 +71,6 @@ struct CombineKernelPointers
     // Payload pointers
     void* src_data_ptrs[kMaxPayloads];                 // src_data_ptrs[0] is output
     void const* recv_buffers[kMaxRanks][kMaxPayloads]; // 2D array of receive buffer pointers (const)
-
-    // NCCL device communicator for LSA barrier synchronization
-    ncclDevComm const* dev_comm;
 
     // Atomic counter reused for intra-rank barrier notification.
     // Elected CTA sets it to 1 after NCCL barrier; other CTAs spin on it.
@@ -189,14 +181,6 @@ struct MoeA2ACombineParams
 void moe_a2a_combine_launch(MoeA2ACombineParams const& params);
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params);
-
-// NCCL DevComm lifecycle helpers (defined in .cu, callable from host code).
-// create_moe_nccl_dev_comm creates an NCCL communicator + device communicator with the
-// specified number of LSA barriers. The returned pointer is a DEVICE pointer to ncclDevComm
-// that can be passed directly to kernel parameters.
-// This is a collective call -- all ranks in the group must call it.
-ncclDevComm* create_moe_nccl_dev_comm(int ep_size, int ep_rank, int num_lsa_barriers);
-void destroy_moe_nccl_dev_comm(ncclDevComm* dev_comm);
 
 // Sanitize expert IDs for invalid tokens
 // expert_ids: [ep_size, max_tokens_per_rank, top_k] (int32)

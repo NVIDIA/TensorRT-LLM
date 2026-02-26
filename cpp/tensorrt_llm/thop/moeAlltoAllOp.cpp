@@ -25,8 +25,10 @@
 #include <torch/types.h>
 #include <vector>
 
-// Forward declaration for NCCL device communicator (defined in moeAlltoAllKernels.cu)
-struct ncclDevComm;
+// NCCL headers for communicator lifecycle and device comm.
+#include "tensorrt_llm/runtime/utils/multiDeviceUtils.h"
+#include <nccl.h>
+#include <nccl_device/impl/comm__types.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -104,8 +106,80 @@ MoeA2ADataOffsets calculateOffsets(int epSize, int maxNumTokens, int eplbStatsNu
 // Returns:
 //   - metainfo: Tensor containing offsets for auxiliary data
 
-// Global storage for NCCL device communicator (persistent across dispatch/combine calls).
-static ncclDevComm* g_moeDevComm = nullptr;
+// Singleton managing NCCL communicator + device communicator lifecycle.
+// Initialized lazily by moeA2AInitializeOp; destructor cleans up at static destruction time.
+class MoeA2AComm
+{
+public:
+    static MoeA2AComm& instance()
+    {
+        static MoeA2AComm inst;
+        return inst;
+    }
+
+    void initialize(int epSize, int epRank, int numLsaBarriers, bool multimem)
+    {
+        if (mInitialized)
+        {
+            TORCH_CHECK(
+                mEpSize == epSize && mEpRank == epRank && mNumLsaBarriers == numLsaBarriers && mMultimem == multimem,
+                "MoeA2AComm already initialized with different parameters");
+            return;
+        }
+
+        // Create NCCL communicator via MPI bootstrap (collective call)
+        ncclUniqueId ncclId;
+        if (epRank == 0)
+        {
+            TLLM_NCCL_CHECK(ncclGetUniqueId(&ncclId));
+        }
+        tensorrt_llm::mpi::MpiComm::world().bcastValue(ncclId, 0);
+        TLLM_NCCL_CHECK(ncclCommInitRank(&mNcclComm, epSize, ncclId, epRank));
+
+        // Create device communicator with LSA barrier support (collective call)
+        ncclDevCommRequirements reqs = {};
+        reqs.lsaBarrierCount = numLsaBarriers;
+        reqs.lsaMultimem = multimem;
+        TLLM_NCCL_CHECK(ncclDevCommCreate(mNcclComm, &reqs, &mDevComm));
+
+        mEpSize = epSize;
+        mEpRank = epRank;
+        mNumLsaBarriers = numLsaBarriers;
+        mMultimem = multimem;
+        mInitialized = true;
+    }
+
+    ncclDevComm const* getDevComm() const
+    {
+        TORCH_CHECK(mInitialized, "MoeA2AComm not initialized");
+        return &mDevComm;
+    }
+
+    ~MoeA2AComm()
+    {
+        if (mInitialized)
+        {
+            ncclDevCommDestroy(mNcclComm, &mDevComm);
+            ncclCommDestroy(mNcclComm);
+            mNcclComm = nullptr;
+            mInitialized = false;
+        }
+    }
+
+    MoeA2AComm(MoeA2AComm const&) = delete;
+    MoeA2AComm& operator=(MoeA2AComm const&) = delete;
+
+private:
+    MoeA2AComm() = default;
+
+    ncclComm_t mNcclComm = nullptr;
+    ncclDevComm mDevComm = {};
+    int mEpSize = 0;
+    int mEpRank = 0;
+    int mNumLsaBarriers = 0;
+    bool mMultimem = false;
+    bool mInitialized = false;
+};
 
 torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank, int64_t epSize, int64_t maxNumTokens,
     torch::optional<int64_t> eplbStatsNumExperts)
@@ -143,12 +217,8 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     //   - Index 0: dispatch barrier (warp 0 of last-token CTA)
     //   - Index 1: combine barrier (warp 0 of an elected CTA, other CTAs wait via local_token_counter)
     // This is a collective call -- all EP ranks must participate.
-    if (g_moeDevComm == nullptr)
-    {
-        using tensorrt_llm::kernels::moe_comm::create_moe_nccl_dev_comm;
-        g_moeDevComm
-            = create_moe_nccl_dev_comm(static_cast<int>(epSize), static_cast<int>(epRank), /*num_lsa_barriers=*/2);
-    }
+    MoeA2AComm::instance().initialize(
+        static_cast<int>(epSize), static_cast<int>(epRank), /*numLsaBarriers=*/2, /*multimem=*/true);
 
     return metainfo;
 }
@@ -324,7 +394,7 @@ std::tuple<std::vector<torch::Tensor>, int64_t, torch::Tensor> moeA2ADispatchOp(
     params.num_payloads = num_payloads;
     std::copy(payloadDescriptors.begin(), payloadDescriptors.end(), &params.payloads[0]);
 
-    params.dev_comm = g_moeDevComm;
+    params.dev_comm = MoeA2AComm::instance().getDevComm();
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
@@ -505,7 +575,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;
 
-    params.dev_comm = g_moeDevComm;
+    params.dev_comm = MoeA2AComm::instance().getDevComm();
     params.local_token_counter = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[LOCAL_TOKEN_COUNTER_OFFSET_INDEX]);
     params.send_counters = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[SEND_COUNTERS_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
