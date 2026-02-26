@@ -33,6 +33,7 @@ from _torch.modules.helix_test_utils import (
     split_inputs_for_rank,
 )
 from mpi4py import MPI
+from utils.util import skip_pre_blackwell
 
 from tensorrt_llm._torch.attention_backend.interface import (
     KVCacheParams,
@@ -342,6 +343,7 @@ def _full_test_multi_gpu(
 
 
 @pytest.mark.skipif(torch.cuda.device_count() < 2, reason="needs 2 GPUs to run this test")
+@skip_pre_blackwell
 @pytest.mark.parametrize("scenario", test_scenarios, ids=lambda x: f"scenario: {x}")
 @pytest.mark.parametrize("comms_medium", ["nccl", "fifo_v1", "fifo_v2"])
 def test_mha_helix_distributed(
