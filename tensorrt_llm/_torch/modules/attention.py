@@ -1,3 +1,4 @@
+import functools
 import math
 import weakref
 from typing import List, Optional, Union, cast
@@ -1815,6 +1816,48 @@ class MLA(nn.Module):
 
         return attn_output
 
+    @staticmethod
+    @functools.cache
+    def cached_warmup_forward_context_with_chunked_prefill(
+            num_heads_tp, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank,
+            v_head_dim, dtype, device):
+        """Warmup torch.compile for cat operations with different tensor layouts.
+
+        Warmup with two different num_tokens values for each unique tensor layout
+        to ensure torch.compile generates specialized kernels that won't trigger
+        recompilation at runtime. Do not use torch.compile with dynamic=True here
+        because it completely ignores tensor layout/stride information, resulting
+        in significantly degraded performance.
+        """
+
+        def warmup(num_tokens):
+            chunked_k_nope = k_nope = torch.empty(
+                num_tokens,
+                num_heads_tp * (qk_nope_head_dim + v_head_dim),
+                dtype=dtype,
+                device=device)[:, :num_heads_tp * qk_nope_head_dim].view(
+                    num_tokens, num_heads_tp, qk_nope_head_dim)
+            chunked_k_pe = torch.empty(num_tokens,
+                                       1,
+                                       qk_rope_head_dim,
+                                       dtype=dtype,
+                                       device=device).expand(
+                                           -1, num_heads_tp, -1)
+            k_pe = torch.empty(num_tokens,
+                               1,
+                               kv_lora_rank + qk_rope_head_dim,
+                               dtype=dtype,
+                               device=device)[:, :, -qk_rope_head_dim:].expand(
+                                   -1, num_heads_tp, -1)
+            maybe_compiled_cat((chunked_k_nope, chunked_k_pe), dim=-1)
+            maybe_compiled_cat((k_nope, k_pe), dim=-1)
+
+        # Use two different num_tokens values (>1) to trigger torch.compile to
+        # generate kernels that generalize across varying num_tokens at runtime.
+        # Avoid num_tokens=1 because torch.compile may specialize for that case.
+        warmup(2)
+        warmup(3)
+
     def forward_context(
         self,
         q: torch.Tensor,
@@ -1828,6 +1871,9 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
+            self.cached_warmup_forward_context_with_chunked_prefill(
+                self.num_heads_tp, self.qk_nope_head_dim, self.qk_rope_head_dim,
+                self.kv_lora_rank, self.v_head_dim, q.dtype, q.device)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
                 return self.forward_context_with_chunked_prefill(
