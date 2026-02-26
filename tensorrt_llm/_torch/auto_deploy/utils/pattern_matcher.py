@@ -81,10 +81,23 @@ class _WrapperModule(torch.nn.Module):
 
 
 def _trace_to_gm(fn: Callable, args: Sequence[torch.Tensor]) -> GraphModule:
-    """
-    Exports a function or Module into a GraphModule via torch_export_to_gm.
-    """
+    """Exports a function or Module into a GraphModule via torch_export_to_gm."""
+    import torch.utils._python_dispatch as pd
+    from torch._guards import detect_fake_mode
+
     module = fn if isinstance(fn, torch.nn.Module) else _WrapperModule(fn)
+
+    # Convert FakeTensors to meta tensors to avoid mode mismatch with torch.export
+    if detect_fake_mode(args) is not None:
+        with pd._disable_current_modes():
+
+            def _to_meta(t):
+                if not isinstance(t, torch.Tensor):
+                    return t
+                return torch.empty(tuple(int(s) for s in t.shape), dtype=t.dtype, device="meta")
+
+            args = tuple(_to_meta(t) for t in args)
+
     return torch_export_to_gm(module, tuple(args))
 
 
