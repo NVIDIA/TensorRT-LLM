@@ -18,7 +18,7 @@ from .trt_test_alternative import print_info, print_warning
 
 # from misc.reorder_venv_tests import reorder_tests
 
-kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT"]
+kVALID_TEST_LIST_MARKERS = ["XFAIL", "SKIP", "UNSTABLE", "TIMEOUT", "ISOLATION"]
 record_invalid_tests = True
 
 kSTRIP_PARENS_PAT = re.compile(r'\((.*?)\)')
@@ -151,6 +151,9 @@ def parse_test_list_lines(test_list, lines, test_prefix, convert_unittest=True):
                             f'{test_list}:{lineno}: Invalid syntax for TIMEOUT value: "{reason_raw}". '
                             "Expected a numeric value in parentheses.")
                     timeout = int(timeout) * 60
+                elif marker == "ISOLATION":
+                    # ISOLATION marker does not require a reason
+                    print_info(f"Isolation mode enabled for {test_name}")
                 elif len(reason_raw) > 0:
                     reason = strip_parens(reason_raw.strip())
                     if not reason:
@@ -667,6 +670,9 @@ def modify_by_test_list(test_list, items, config):
             if marker:
                 if marker == "TIMEOUT" and timeout:
                     item.add_marker(pytest.mark.timeout(timeout))
+                elif marker == "ISOLATION":
+                    # Apply pytest-forked marker for isolated tests
+                    item.add_marker(pytest.mark.forked)
                 else:
                     mark_func = getattr(pytest.mark, marker.lower())
                     mark = mark_func(reason=reason)
