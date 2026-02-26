@@ -52,6 +52,24 @@ def help_info_with_stability_tag(
     return f":tag:`{tag}` {help_str}"
 
 
+def _resolve_chunked_prefill(enable: Optional[bool],
+                             disable: bool) -> bool:
+    """Resolve --enable_chunked_prefill / --disable_chunked_prefill flags.
+
+    Chunked prefill is enabled by default. The two flags are mutually
+    exclusive: passing both is an error.  --enable_chunked_prefill is
+    kept for backward compatibility.
+    """
+    if enable and disable:
+        raise click.UsageError(
+            "--enable_chunked_prefill and --disable_chunked_prefill "
+            "are mutually exclusive.")
+    if disable:
+        return False
+    # Default is True (enable is None when not passed, or True when passed)
+    return True
+
+
 def _signal_handler_cleanup_child(signum, frame):
     """Signal handler to clean up the child process."""
     global _child_p_global
@@ -153,7 +171,7 @@ def get_llm_args(
         reasoning_parser: Optional[str] = None,
         fail_fast_on_attention_window_too_large: bool = False,
         otlp_traces_endpoint: Optional[str] = None,
-        enable_chunked_prefill: bool = False,
+        enable_chunked_prefill: bool = True,
         **llm_args_extra_dict: Any):
 
     if gpus_per_node is None:
@@ -691,9 +709,17 @@ class ChoiceWithAlias(click.Choice):
                   "URI of the disaggregated cluster.", "prototype"))
 @click.option("--enable_chunked_prefill",
               is_flag=True,
+              default=None,
+              help=help_info_with_stability_tag(
+                  "Enable chunked prefill (now enabled by default; "
+                  "kept for backward compatibility)",
+                  "prototype"))
+@click.option("--disable_chunked_prefill",
+              is_flag=True,
               default=False,
-              help=help_info_with_stability_tag("Enable chunked prefill",
-                                                "prototype"))
+              help=help_info_with_stability_tag(
+                  "Disable chunked prefill (enabled by default)",
+                  "prototype"))
 @click.option("--media_io_kwargs",
               type=str,
               default=None,
@@ -731,7 +757,9 @@ def serve(
         tool_parser: Optional[str], metadata_server_config_file: Optional[str],
         server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
-        otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
+        otlp_traces_endpoint: Optional[str],
+        enable_chunked_prefill: Optional[bool],
+        disable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
         custom_module_dirs: list[Path], chat_template: Optional[str],
         grpc: bool, extra_visual_gen_options: Optional[str]):
@@ -774,7 +802,8 @@ def serve(
             fail_fast_on_attention_window_too_large=
             fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
-            enable_chunked_prefill=enable_chunked_prefill)
+            enable_chunked_prefill=_resolve_chunked_prefill(
+                enable_chunked_prefill, disable_chunked_prefill))
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:
