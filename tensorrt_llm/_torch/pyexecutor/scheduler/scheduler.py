@@ -50,6 +50,11 @@ class ScheduledRequests:
         return len(self.context_requests) + len(self.generation_requests)
 
     def all_requests(self) -> list[LlmRequest]:
+        # Fast path: returns generation_requests directly when context_requests
+        # is empty (decode-only) to avoid list concatenation. Callers must not
+        # structurally modify (append/remove) the returned list.
+        if not self.context_requests:
+            return self.generation_requests
         return self.context_requests + self.generation_requests
 
 
