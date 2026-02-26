@@ -1786,9 +1786,6 @@ class PyExecutor:
 
                 finished_requests = []
 
-                if self.kv_connector_manager:
-                    self.kv_connector_manager.handle_metadata()
-
                 can_queue, _ = self._can_queue(scheduled_batch)
                 if can_queue:
                     if self.kv_cache_transceiver:
@@ -1800,6 +1797,10 @@ class PyExecutor:
                         self._handle_first_token_response(scheduled_batch)
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
@@ -2040,9 +2041,6 @@ class PyExecutor:
 
                 self._terminate_requests(scheduled_batch.paused_requests)
 
-                if self.kv_connector_manager:
-                    self.kv_connector_manager.handle_metadata()
-
                 can_queue, can_queue_this_rank = self._can_queue(
                     scheduled_batch)
                 if can_queue:
@@ -2070,6 +2068,10 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
+                if self.kv_connector_manager:
+                    self.kv_connector_manager.handle_metadata()
+
+                if can_queue:
                     self._kv_connector_start_batch(scheduled_batch)
 
                 # if using a kv connector, we need to call can_queue again since scheduled_batch might have changed
