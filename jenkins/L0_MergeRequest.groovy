@@ -368,13 +368,13 @@ def mergeWaiveList(pipeline, globalVars)
     } catch (InterruptedException e) {
         throw e
     } catch (Exception e) {
-        echo "Failed to checkout TOT waive list from github repository. Error: ${e.toString()}"
+        echo "Failed to checkout TOT waive list from public GitHub repository. Error: ${e.toString()}"
     }
 
     if (!isGetTOTWaiveList) {
         try {
             withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-                trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
+                trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
             }
             targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
             echo "Target branch TOT commit: ${targetBranchTOTCommit}"
@@ -383,7 +383,7 @@ def mergeWaiveList(pipeline, globalVars)
         } catch (InterruptedException e) {
             throw e
         } catch (Exception e) {
-            echo "Failed to checkout TOT waive list from gitlab repository. Error: ${e.toString()}"
+            echo "Failed to checkout TOT waive list from internal GitLab repository. Error: ${e.toString()}"
         }
     }
 
