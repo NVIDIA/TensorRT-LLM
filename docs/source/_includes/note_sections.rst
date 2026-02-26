@@ -23,15 +23,15 @@
    values in each configuration represent the **maximum supported values** for that config.
    Requests exceeding these limits may result in errors.
 
-   To handle requests with input sequences **longer than the configured ISL**, add the following
-   to your config file:
+   To handle requests with input sequences **longer than the configured ISL**, chunked prefill
+   is enabled by default. If you need to explicitly disable it, add the following to your config file:
 
    .. code-block:: yaml
 
-      enable_chunked_prefill: true
+      enable_chunked_prefill: false
 
-   This enables chunked prefill, which processes long input sequences in chunks rather than
-   requiring them to fit within a single prefill operation. Note that enabling chunked prefill
+   Chunked prefill processes long input sequences in chunks rather than
+   requiring them to fit within a single prefill operation. Note that chunked prefill
    does **not** guarantee optimal performance—these configs are tuned for the specified ISL/OSL.
 
 .. end-note-traffic-patterns
