@@ -1,6 +1,6 @@
 import math
 import weakref
-from typing import List, Optional, Tuple, Union, cast
+from typing import List, Optional, Union, cast
 
 import torch
 from torch import nn
@@ -2302,7 +2302,7 @@ class MLA(nn.Module):
         return hidden_states
 
     def _pad_for_cp(self, tensor: torch.Tensor,
-                    num_tokens: int) -> Tuple[torch.Tensor, int]:
+                    num_tokens: int) -> tuple[torch.Tensor, int]:
         """Pad tensor along dim-0 so its length is divisible by cp_size.
 
         Returns the (possibly padded) tensor and the per-rank chunk size.
@@ -2312,8 +2312,10 @@ class MLA(nn.Module):
         padded_size = chunk_size * cp_size
 
         if num_tokens < padded_size:
-            pad = tensor.new_zeros(padded_size - num_tokens, tensor.shape[1])
-            tensor = torch.cat([tensor, pad], dim=0)
+            tensor = torch.nn.functional.pad(
+                tensor, (0, 0, 0, padded_size - num_tokens),
+                mode="constant",
+                value=0)
 
         return tensor, chunk_size
 
@@ -2334,8 +2336,8 @@ class MLA(nn.Module):
         attn_output: torch.Tensor,
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams],
-        residual: torch.Tensor,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Apply output projection (o_proj) and reduce across parallel ranks.
 
         With CP reduce-scatter, o_proj produces partial sums (each CP rank
@@ -2362,7 +2364,7 @@ class MLA(nn.Module):
 
             # For the first layer, the residual comes from the embedding and
             # has not been through a prior RS. Slice it to match.
-            if self.layer_idx == 0:
+            if self.layer_idx == 0 and residual is not ...:
                 residual = self._slice_for_cp(residual, attn_metadata)
         else:
             attn_output = self.o_proj(attn_output,
@@ -2377,8 +2379,8 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
-        residual: torch.Tensor = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
 
         hidden_states = self._maybe_allgather_input(hidden_states,
                                                     attn_metadata)
@@ -2409,8 +2411,13 @@ class MLA(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
 
-        return self._output_projection(attn_output, attn_metadata,
-                                       all_reduce_params, residual)
+        attn_output, residual = self._output_projection(attn_output,
+                                                        attn_metadata,
+                                                        all_reduce_params,
+                                                        residual)
+        if residual is ...:
+            return attn_output
+        return attn_output, residual
 
     def resmooth_parameters(self,
                             module_weight,
