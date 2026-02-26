@@ -277,10 +277,10 @@ class KvCacheCreator:
         num_extra_tokens_per_seq = 1  # account for generated tokens
         spec_cfg = self._speculative_config
         if not self._llm_args.disable_overlap_scheduler and spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
 
         if spec_cfg is not None:
-            num_extra_tokens_per_seq += spec_cfg.max_total_draft_tokens
+            num_extra_tokens_per_seq += spec_cfg.tokens_per_gen_step - 1
             num_extra_tokens_per_seq += get_num_extra_kv_tokens(spec_cfg)
 
         if self._dummy_reqs is None:
@@ -570,15 +570,17 @@ class KvCacheCreator:
         # Draft model layers in one-model mode start at target_num_layers.
         target_pretrained_config = self._model_engine.model.model_config.pretrained_config
         target_num_layers = target_pretrained_config.num_hidden_layers
-        # Use get_num_spec_layers to get the correct number of draft layers
-        # for the speculative decoding mode (e.g., num_eagle_layers for Eagle3)
-        num_draft_layers = get_num_spec_layers(self._speculative_config)
 
-        # Create layer_mask: False for target layers, True for draft layers.
-        # This ensures the draft KV cache manager uses the correct layer indices
-        # (e.g., layers 32, 33, ... instead of 0, 1, ...).
-        spec_dec_layer_mask = [False
-                               ] * target_num_layers + [True] * num_draft_layers
+        # PARD: draft is a separate model, layers start from 0.
+        # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
+        if self._speculative_config.spec_dec_mode.is_pard():
+            num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
+            spec_dec_layer_mask = [True] * num_draft_layers
+        else:
+            num_draft_layers = get_num_spec_layers(self._speculative_config)
+            spec_dec_layer_mask = [False] * target_num_layers + [
+                True
+            ] * num_draft_layers
 
         # Get the effective draft config (explicit draft_config if available,
         # otherwise fall back to target model config for MTP).
@@ -1091,8 +1093,8 @@ def create_py_executor_instance(
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
-        max_total_draft_tokens=spec_config.max_total_draft_tokens
-        if spec_config is not None else 0,
+        max_total_draft_tokens=(spec_config.tokens_per_gen_step -
+                                1) if spec_config is not None else 0,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,
@@ -1120,7 +1122,7 @@ def create_torch_sampler_args(
     max_draft_len = (0 if speculative_config is None else
                      speculative_config.max_draft_len)
     max_total_draft_tokens = (0 if speculative_config is None else
-                              speculative_config.max_total_draft_tokens)
+                              speculative_config.tokens_per_gen_step - 1)
 
     return TorchSampler.Args(
         max_seq_len=max_seq_len,

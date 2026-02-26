@@ -173,7 +173,11 @@ class PyTorchModelEngine(ModelEngine):
             ExpertStatistic.create(self.dist.rank)
         self.llm_args = llm_args
         self.original_max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
-        self.original_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+        self.original_max_total_draft_tokens = (
+            spec_config.tokens_per_gen_step -
+            1) if spec_config is not None else 0
+        # Saved before zeroing for draft models; used by update_spec_dec_param.
+        self._spec_dec_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
         # The draft model won't have any draft tokens attached to
         # generation requests when we invoke it autoregressively
@@ -342,7 +346,7 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_draft_len = spec_config.max_draft_len
-            self.max_total_draft_tokens = spec_config.max_total_draft_tokens
+            self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         else:
             self.without_logits = False
             self.max_draft_len = 0
@@ -389,8 +393,9 @@ class PyTorchModelEngine(ModelEngine):
         # Pre-allocated buffers for draft model to avoid implicit synchronization
         # These are used to build index tensors without creating tensors from Python lists
         max_first_draft_tokens = self.batch_size * (
-            self.original_max_draft_len + 1) if spec_config else self.batch_size
-        tokens_per_draft = self.original_max_draft_len + 1
+            self.original_max_total_draft_tokens +
+            1) if spec_config else self.batch_size
+        tokens_per_draft = self.original_max_total_draft_tokens + 1
         self.idx_accepted_tokens_cache = None
         self.draft_token_positions_cache = None
         if spec_config:
@@ -1892,7 +1897,7 @@ class PyTorchModelEngine(ModelEngine):
         # Pre-compute constants
         extend_requests = scheduled_requests.generation_requests
         num_extend_requests = len(extend_requests)
-        num_tokens_per_extend_request = self.original_max_draft_len + 1
+        num_tokens_per_extend_request = self.original_max_total_draft_tokens + 1
         spec_config = self.spec_config
 
         prompt_lengths = torch.empty(num_extend_requests,
@@ -3480,7 +3485,7 @@ class PyTorchModelEngine(ModelEngine):
                 is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
                 max_draft_len=self.original_max_draft_len,
-                max_total_draft_tokens=self.original_max_total_draft_tokens,
+                max_total_draft_tokens=self._spec_dec_max_total_draft_tokens,
                 model_is_wrapped=self.model_is_wrapped,
                 spec_metadata=spec_metadata,
                 spec_tree_manager=spec_tree_manager,

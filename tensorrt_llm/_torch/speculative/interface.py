@@ -66,6 +66,7 @@ class SpeculativeDecodingMode(IntEnum):
     DRAFT_TARGET = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
+    PARD = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -85,10 +86,14 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_eagle3_one_model() or self.is_mtp_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_one_model(
+        ) or self.is_pard()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
+
+    def is_pard(self):
+        return self == SpeculativeDecodingMode.PARD
 
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
@@ -106,21 +111,23 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
     def without_logits(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_pard()
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram()
+        ) or self.is_ngram() or self.is_pard()
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.has_draft_model()
+        ) or self.has_draft_model() or self.is_pard()
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_pard()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -138,11 +145,11 @@ class SpeculativeDecodingMode(IntEnum):
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_pard()
 
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model()
+        ) or self.is_eagle3_one_model() or self.is_pard()
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
@@ -521,7 +528,6 @@ class SpecWorkerBase(nn.Module, ABC):
         gen_target_tokens = target_tokens[num_contexts:].reshape(
             num_gens, self.max_draft_len + 1)
         accepted_tokens[num_contexts:, :] = gen_target_tokens
-
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
         num_accepted_tokens[num_contexts:] += torch.cumprod(
@@ -633,6 +639,14 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Only TrtllmAttentionMetadata supports separate draft KV cache layouts
         if not isinstance(attn_metadata, TrtllmAttentionMetadata):
+            yield
+            return
+
+        # Check if draft KV cache block offsets are allocated
+        draft_block_offsets = getattr(attn_metadata,
+                                      'draft_kv_cache_block_offsets', None)
+        if draft_block_offsets is None:
+            # Draft KV cache block offsets not allocated, skip switching
             yield
             return
 
