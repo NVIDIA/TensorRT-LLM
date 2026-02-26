@@ -5800,6 +5800,46 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
+    @pytest.mark.parametrize(
+        "tp_size, ep_size, pp_size, attention_dp",
+        [
+            (4, 1, 2, False),
+            (4, 4, 2, False),
+            (8, 1, 1, False),
+            (8, 8, 1, False),
+            (8, 1, 1, True),
+        ],
+        ids=["TP4_PP2", "TEP4_PP2", "TP8_PP1", "TEP8_PP1", "TP8_PP1_ADP"],
+    )
+    def test_nvfp4_parallelism(self, tp_size, ep_size, pp_size, attention_dp):
+        with LLM(
+                f"{llm_models_root()}/Nemotron-SuperV3-phase1-mtp-nvfp4-fp8kv",
+                kv_cache_config=KvCacheConfig(
+                    enable_block_reuse=False,
+                    mamba_ssm_cache_dtype="float16",
+                    free_gpu_memory_fraction=0.8,
+                ),
+                max_batch_size=512,
+                tensor_parallel_size=tp_size,
+                moe_expert_parallel_size=ep_size,
+                pipeline_parallel_size=pp_size,
+                enable_attention_dp=attention_dp,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=512,
+                                                  enable_padding=True),
+                disable_overlap_scheduler=False,
+                moe_config=MoeConfig(backend="TRTLLM"),
+        ) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            # TODO: GSM8K will be failed due to mamba cache issue for pp_size > 1.
+            if pp_size == 1:
+                task = GSM8K(self.MODEL_NAME)
+                task.evaluate(
+                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_mpi_world_size(8)
     def test_nvfp4_8gpus_mtp(self):
         # Test MTP (Multi-Token Prediction) accuracy with nvfp4-fp8kv model.
         # This test uses MTP with max_draft_len=3 and one_model mode.
