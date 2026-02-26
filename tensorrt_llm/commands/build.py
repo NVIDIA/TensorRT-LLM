@@ -424,10 +424,10 @@ def main():
     warnings.warn(
         "\n"
         "=" * 70 + "\n"
-        "DEPRECATION WARNING: trtllm-build\n"
+        "LEGACY WARNING: trtllm-build\n"
         "=" * 70 + "\n"
-        "trtllm-build is part of the legacy TensorRT engine-build workflow,\n"
-        "which is deprecated and will be removed in a future release.\n\n"
+        "trtllm-build is part of the legacy TensorRT engine-build workflow.\n"
+        "New projects should use the PyTorch backend instead.\n\n"
         "For new projects, use the PyTorch backend instead:\n\n"
         "  # Serve a model (recommended):\n"
         "  trtllm-serve <model_name_or_path>\n\n"
