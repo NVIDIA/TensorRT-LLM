@@ -163,10 +163,10 @@ class ModelWeightsLoader:
             shard_files = [dict(self.model_dir.named_parameters())]
         elif isinstance(self.model_dir, dict):
             shard_files = [self.model_dir]
-        elif os.path.isdir(self.model_dir):
-            shard_files = glob.glob(self.model_dir + "/*." + self.format.value)
         elif os.path.isfile(self.model_dir):
             shard_files = [self.model_dir]
+        elif os.path.isdir(self.model_dir):
+            shard_files = glob.glob(self.model_dir + "/*." + self.format.value)
         else:
             raise NotImplementedError(
                 "args.model_dir is not a directory, a file or an in-memory module!"
