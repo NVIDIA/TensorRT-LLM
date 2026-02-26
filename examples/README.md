@@ -50,8 +50,8 @@ See [`configs/database/lookup.yaml`](configs/database/lookup.yaml) for the full 
 
 ## Legacy Engine-Build Workflow
 
-> **⚠️ Deprecated:** The `convert_checkpoint.py` → `trtllm-build` → `run.py`
-> workflow is deprecated and will be removed in a future release.
+> **⚠️ Legacy:** The `convert_checkpoint.py` → `trtllm-build` → `run.py`
+> workflow is legacy and may not receive new features.
 > For new projects, use `trtllm-serve` or the LLM API as shown above.
 
 The [`models/`](models/) directory contains per-model scripts for the legacy
