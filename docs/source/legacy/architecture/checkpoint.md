@@ -109,7 +109,7 @@ Here is the model specific config list:
 Like PyTorch, the tensor (weight) name is a string containing hierarchical information,
 which is uniquely mapped to a certain parameter of a TensorRT LLM model.
 
-For example, each transformer layer of the OPT model contains an `Attention` layer, an `MLP` layer. and two `LayerNorm` layers.
+For example, each transformer layer of the OPT model contains an `Attention` layer, an `MLP` layer, and two `LayerNorm` layers.
 
 #### Attention Weights
 
