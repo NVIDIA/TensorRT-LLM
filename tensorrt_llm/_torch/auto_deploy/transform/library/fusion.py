@@ -14,7 +14,12 @@ from ...shim.interface import CachedSequenceInterface
 from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
-from ...utils.node_utils import extract_weight_name, is_linear_op, is_op
+from ...utils.node_utils import (
+    extract_weight_name,
+    is_fake_quantized_linear_op,
+    is_linear_op,
+    is_op,
+)
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
@@ -329,6 +334,141 @@ def _insert_fused_gemm_narrow(
     return True
 
 
+_QUANT_FUSERS = {}
+
+
+def _get_op_key(node: Node):
+    """Get canonical op key for grouping nodes by quantization scheme.
+
+    Resolves specific overloads (e.g., torch_fake_quant_fp8_linear.default) back
+    to their overload packet so that all overloads of the same op are grouped together.
+    """
+    target = node.target
+    return target.overloadpacket if hasattr(target, "overloadpacket") else target
+
+
+def _get_quant_fuser(op_key):
+    """Get or create a lightweight QuantizationFusionMixin adapter for quantized GDN fusion.
+
+    Reuses fuse_rule and build_custom_args_for_linear from the existing FP8/FP4
+    fusion classes without requiring BaseTransform config.
+    """
+    if op_key in _QUANT_FUSERS:
+        return _QUANT_FUSERS[op_key]
+
+    # Lazily resolved: fusion classes are defined later in this module
+    _OP_TO_CLS = {
+        torch.ops.auto_deploy.torch_fake_quant_fp8_linear: FuseFP8Gemms,
+        torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear: FuseFP4Gemms,
+        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear: FuseFineGrainedFP8Gemms,
+    }
+    src_cls = _OP_TO_CLS.get(op_key)
+    if src_cls is None:
+        _QUANT_FUSERS[op_key] = None
+        return None
+
+    adapter = type(
+        f"_Gdn{src_cls.__name__}",
+        (QuantizationFusionMixin,),
+        {
+            "target_op": src_cls.target_op,
+            "scale_groups": src_cls.scale_groups,
+            "fuse_rule": src_cls.fuse_rule,
+            "build_custom_args_for_linear": src_cls.build_custom_args_for_linear,
+        },
+    )()
+    _QUANT_FUSERS[op_key] = adapter
+    return adapter
+
+
+def _insert_fused_quant_gemm_narrow(
+    gm: GraphModule,
+    idx: int,
+    parent_node: Node,
+    linear_nodes: List[Node],
+    fuser: QuantizationFusionMixin,
+) -> bool:
+    """Fuse quantized GEMMs sharing the same input, splitting output via narrow (zero-copy view).
+
+    Combines quantized weight fusion (via the provided fuser's rules) with the
+    narrow-based output splitting used by _insert_fused_gemm_narrow.
+    """
+    keys_unfused = [extract_weight_name(n) for n in linear_nodes]
+    params_unfused = [gm.get_parameter(k) for k in keys_unfused]
+    sizes_unfused = [p.size(0) for p in params_unfused]
+    key_fused = f"fused_weight_{idx}"
+
+    flat_scale_names = list(chain.from_iterable(fuser.scale_groups))
+    scales: Dict[str, List[torch.Tensor]] = {}
+    for weight_key in keys_unfused:
+        key = weight_key.rsplit(".", 1)[0]
+        for scale_name in flat_scale_names:
+            buffer_name = key + "." + scale_name
+            scales.setdefault(scale_name, []).append(gm.get_buffer(buffer_name))
+
+    try:
+        weights_fused, buffers_fused = fuser.fuse_rule(params_unfused, **scales)
+    except NotImplementedError as e:
+        ad_logger.warning(f"Cannot fuse quantized ops {keys_unfused}, skipping: {e}")
+        return False
+
+    param_fused = nn.Parameter(weights_fused, requires_grad=False)
+    setattr(gm, key_fused, param_fused)
+    for name, buf in buffers_fused.items():
+        gm.register_buffer(f"{key_fused}_{name}", buf)
+
+    ad_logger.warning(
+        f"taylor) Fusing {len(linear_nodes)} quantized GDN GEMMs ({keys_unfused}) into {key_fused}"
+    )
+
+    fused_kwargs = dict(linear_nodes[0].kwargs)
+
+    with gm.graph.inserting_before(linear_nodes[0]):
+        get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
+        get_param_node.meta["val"] = torch.empty(
+            param_fused.shape, dtype=param_fused.dtype, device="meta"
+        )
+        scale_getattrs: Dict[str, Node] = {}
+        for name in flat_scale_names:
+            attr_node = gm.graph.create_node("get_attr", f"{key_fused}_{name}")
+            buf = buffers_fused[name]
+            attr_node.meta["val"] = torch.empty(buf.shape, dtype=buf.dtype, device="meta")
+            scale_getattrs[name] = attr_node
+        custom_tail_args = fuser.build_custom_args_for_linear(scale_getattrs)
+
+    ref_val = linear_nodes[0].meta.get("val")
+
+    with gm.graph.inserting_before(linear_nodes[0]):
+        fused_linear_node = gm.graph.call_function(
+            linear_nodes[0].target,
+            args=(parent_node, get_param_node, None, *custom_tail_args),
+            kwargs=fused_kwargs,
+        )
+        if ref_val is not None:
+            fused_out_shape = (*ref_val.shape[:-1], sum(sizes_unfused))
+            fused_linear_node.meta["val"] = torch.empty(
+                fused_out_shape, dtype=ref_val.dtype, device="meta"
+            )
+
+    offset = 0
+    for i, n in enumerate(linear_nodes):
+        size = sizes_unfused[i]
+        with gm.graph.inserting_before(n):
+            narrow_node = gm.graph.call_function(
+                torch.narrow, args=(fused_linear_node, -1, offset, size)
+            )
+            if ref_val is not None:
+                narrow_node.meta["val"] = torch.empty(
+                    (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
+                )
+        n.replace_all_uses_with(narrow_node)
+        offset += size
+
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
+    return True
+
+
 @TransformRegistry.register("fuse_gdn_gemms")
 class FuseGdnGemms(BaseTransform):
     """Fuse linear projections sharing the same input, even when the parent has
@@ -337,6 +477,10 @@ class FuseGdnGemms(BaseTransform):
     This is a relaxed variant of FuseGemms: it does NOT require all children of
     the parent to be linear ops — only that at least 2 linear children exist.
     The fused output is split via torch.narrow (zero-copy view).
+
+    Handles both non-quantized and quantized (FP8, FP4) linear ops. Nodes are
+    grouped by (parent, quantization scheme) so only linears with the same parent
+    AND the same op target are fused together.
     """
 
     def _apply(
@@ -346,19 +490,29 @@ class FuseGdnGemms(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        linear_nodes = defaultdict(list)
+        grouped_nodes: Dict[tuple, List[Node]] = defaultdict(list)
         for node in gm.graph.nodes:
-            if is_linear_op(node) and node.args[2] is None:
-                linear_nodes[node.args[0]].append(node)
+            if (is_linear_op(node) or is_fake_quantized_linear_op(node)) and node.args[2] is None:
+                grouped_nodes[(node.args[0], _get_op_key(node))].append(node)
 
         idx = -1
         num_matches = 0
         with cuda_memory_tracker():
-            for parent_node, lin_children in linear_nodes.items():
+            for (parent_node, op_key), lin_children in grouped_nodes.items():
                 if len(lin_children) < 2:
                     continue
-                if _insert_fused_gemm_narrow(gm, idx := idx + 1, parent_node, lin_children):
-                    num_matches += 1
+                if is_linear_op(lin_children[0]):
+                    if _insert_fused_gemm_narrow(gm, idx := idx + 1, parent_node, lin_children):
+                        num_matches += 1
+                else:
+                    fuser = _get_quant_fuser(op_key)
+                    if fuser is None:
+                        ad_logger.warning(f"No quantized fuser for {op_key}, skipping GDN fusion")
+                        continue
+                    if _insert_fused_quant_gemm_narrow(
+                        gm, idx := idx + 1, parent_node, lin_children, fuser
+                    ):
+                        num_matches += 1
 
         torch.cuda.empty_cache()
 
@@ -450,6 +604,66 @@ class FuseFP4Gemms(QuantizationFusionMixin, BaseTransform):
         return (
             [scale_getattrs["input_scale"]],
             [scale_getattrs["weight_scale"], scale_getattrs["alpha"]],
+            [],
+            [],
+        )
+
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        return self._apply_fusion_pass(gm, cm, factory, shared_config)
+
+
+@TransformRegistry.register("fuse_finegrained_fp8_gemms")
+class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
+    """Fuse FineGrained (block-wise) FP8 GEMMs sharing the same input activation.
+
+    FineGrained FP8 uses per-block weight scales (weight_scale_inv) and dynamic
+    input quantization, so fusion simply concatenates weights and their block scales
+    along the output dimension.
+    """
+
+    target_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
+    scale_groups = [["weight_scale_inv"]]
+
+    def fuse_rule(
+        self, weights: List[torch.Tensor], **scales
+    ) -> Tuple[torch.Tensor, Dict[str, torch.Tensor]]:
+        weight_scale_inv: List[torch.Tensor] = scales["weight_scale_inv"]
+
+        # The kernel infers block_n = N // scale_n at runtime.  After catting
+        # weights and scales along dim-0 the fused block_n must still be
+        # consistent, i.e.  sum(N_i) // sum(scale_n_i) == each per-weight
+        # block_n_i.  This only holds when every N_i is an exact multiple of
+        # the true block size (typically 128).
+        block_ns = [w.size(0) // ws.size(0) for w, ws in zip(weights, weight_scale_inv)]
+        if len(set(block_ns)) != 1:
+            raise NotImplementedError(
+                f"Cannot fuse finegrained FP8: inconsistent per-weight block sizes {block_ns}"
+            )
+        block_n = block_ns[0]
+
+        total_N = sum(w.size(0) for w in weights)
+        total_scale_n = sum(ws.size(0) for ws in weight_scale_inv)
+        if total_scale_n == 0 or total_N // total_scale_n != block_n:
+            raise NotImplementedError(
+                f"Cannot fuse finegrained FP8: fused block_n "
+                f"({total_N // total_scale_n if total_scale_n else 'N/A'}) != {block_n}"
+            )
+
+        fused_weights = torch.cat(weights, dim=0)
+        fused_weight_scale_inv = torch.cat(weight_scale_inv, dim=0)
+
+        return fused_weights, {"weight_scale_inv": fused_weight_scale_inv}
+
+    def build_custom_args_for_linear(self, scale_getattrs: Dict[str, Node]) -> Tuple[object, ...]:
+        return (
+            [],
+            [scale_getattrs["weight_scale_inv"]],
             [],
             [],
         )
