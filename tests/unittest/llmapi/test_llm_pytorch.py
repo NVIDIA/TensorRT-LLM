@@ -971,9 +971,10 @@ def test_qwen_moe_shared_expert_lora():
         tokens_differ = tokens_with != tokens_without
         logprobs_differ = False
         if logprobs_with and logprobs_without:
-            for lp_w, lp_wo in zip(logprobs_with, logprobs_without):
-                lp_val_w = list(lp_w.values())[0].logprob
-                lp_val_wo = list(lp_wo.values())[0].logprob
+            for lp_w, lp_wo in zip(logprobs_with, logprobs_without,
+                                   strict=True):
+                lp_val_w = next(iter(lp_w.values())).logprob
+                lp_val_wo = next(iter(lp_wo.values())).logprob
                 if abs(lp_val_w - lp_val_wo) > 1e-6:
                     logprobs_differ = True
                     break
