@@ -1586,8 +1586,6 @@ class KVCacheManagerV2(BaseResourceManager):
         else:
             self.max_attention_window_vec = [None]
 
-        self._scheduler_prepared_resources = False  # Track if scheduler handled resources
-
         if isinstance(num_kv_heads, int):
             self.num_kv_heads_per_layer = [
                 (num_kv_heads + tp_size - 1) // tp_size
@@ -1916,18 +1914,16 @@ class KVCacheManagerV2(BaseResourceManager):
         """
         Prepare resources for scheduled requests.
 
-        For MAX_UTILIZATION policy, resources are already allocated by the scheduler's
-        prepare_resources method, so we check the flag and skip allocation.
-        For other policies (GUARANTEED_NO_EVICT), we allocate resources here.
+        For KVCacheManagerV2, resources are always allocated during scheduling via
+        KVCacheV2MaxUtilizationPolicy.prepare_resources() which delegates to
+        prepare_resources_for_max_utilization(). This method is intentionally a no-op
+        to avoid double allocation.
+
+        Note: The scheduled_batch may have been modified by the scheduler's prepare_resources
+        to reflect which requests actually got resources allocated.
         """
-        # Check if the scheduler already prepared resources
-        # TODO: remove this flag and make it assertion after kv_cache_v2 dummy scheduler is removed
-        if self._scheduler_prepared_resources:
-            # Reset flag for next round
-            self._scheduler_prepared_resources = False
-        else:
-            # Resources not allocated by scheduler, do it here (GUARANTEED_NO_EVICT path)
-            self._prepare_resources_guaranteed_no_evict(scheduled_batch)
+        # Resources are allocated during scheduling via prepare_resources_for_max_utilization()
+        # This method is a no-op for KVCacheManagerV2
 
     def _prepare_resources_guaranteed_no_evict(
             self, scheduled_batch: ScheduledRequests):
@@ -2220,8 +2216,6 @@ class KVCacheManagerV2(BaseResourceManager):
             self.kv_connector_manager.build_scheduler_output(
                 scheduled_batch, self)
 
-        # Set flag to indicate scheduler handled resource preparation
-        self._scheduler_prepared_resources = True
         # TODO: return evicted_requests as paused requests, not empty list
         return new_context_batch, new_generation_batch, []
 

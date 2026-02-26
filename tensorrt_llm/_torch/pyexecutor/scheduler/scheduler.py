@@ -169,109 +169,6 @@ class BindCapacityScheduler(CapacityScheduler):
         return self.impl(active_requests, self.kv_cache_manager, self.peft_cache_manager)
 
 
-class KVCacheV2DummyScheduler(CapacityScheduler):
-    # only schedule requests has no_schedule_until_state <= state < no_schedule_after_state
-    no_schedule_until_state = LlmRequestState.CONTEXT_INIT
-    no_schedule_after_state = LlmRequestState.GENERATION_COMPLETE
-
-    def __init__(self, max_num_requests: int, kv_cache_manager, peft_cache_manager=None):
-        super(KVCacheV2DummyScheduler, self).__init__()
-        self.max_num_requests = max_num_requests
-        self.kv_cache_manager = kv_cache_manager
-        self.peft_cache_manager = peft_cache_manager
-
-    def _get_max_peft_pages(self) -> int:
-        if self.peft_cache_manager is None:
-            return 2**31 - 1
-        return self.peft_cache_manager.max_device_pages
-
-    def _get_peft_task_info(
-        self, req: LlmRequest, seen_task_ids: set[int]
-    ) -> tuple[Optional[int], bool, int]:
-        lora_task_id = getattr(req, "lora_task_id", None)
-        is_new_task = lora_task_id is not None and lora_task_id not in seen_task_ids
-        if is_new_task and self.peft_cache_manager is not None:
-            required_pages = self.peft_cache_manager.determine_num_pages(req)
-        else:
-            required_pages = 0
-        return lora_task_id, is_new_task, required_pages
-
-    def schedule_request(
-        self, active_requests: RequestList
-    ) -> tuple[list[LlmRequest], list[LlmRequest], list[LlmRequest]]:
-        scheduled_requests = []
-        scheduled_disagg_gen_init_requests = []
-        pending_requests = []
-        reserved_blocks = 0
-        max_blocks = self.kv_cache_manager.get_max_resource_count()
-
-        has_peft = self.peft_cache_manager is not None
-        claimed_peft_pages = 0
-        available_peft_pages = self._get_max_peft_pages() if has_peft else 0
-        uniq_task_ids: set[int] = set() if has_peft else None
-
-        for request in active_requests:
-            req_state = request.state
-            # if request cannot be scheduled yet or request should no longer be scheduled, skip
-            if not req_state == LlmRequestState.DISAGG_GENERATION_INIT and (
-                req_state.value < self.no_schedule_until_state.value
-                or req_state.value >= self.no_schedule_after_state.value
-            ):
-                continue
-
-            if len(scheduled_requests) >= self.max_num_requests or reserved_blocks >= max_blocks:
-                break
-            elif (
-                req_state == LlmRequestState.GENERATION_IN_PROGRESS
-                or req_state == LlmRequestState.GENERATION_TO_COMPLETE
-            ):
-                scheduled_requests.append(request)
-                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(request)
-
-                if has_peft:
-                    lora_task_id, is_new_task, peft_pages = self._get_peft_task_info(
-                        request, uniq_task_ids
-                    )
-                    if is_new_task:
-                        claimed_peft_pages += peft_pages
-                        uniq_task_ids.add(lora_task_id)
-
-            elif req_state == LlmRequestState.DISAGG_GENERATION_INIT:
-                scheduled_disagg_gen_init_requests.append(request)
-                reserved_blocks += self.kv_cache_manager.get_needed_resource_to_completion(request)
-            else:
-                pending_requests.append(request)
-
-        if has_peft:
-            available_peft_pages -= claimed_peft_pages
-
-        available_blocks = max_blocks - reserved_blocks
-        for request in pending_requests:
-            req_state = request.state
-            if len(scheduled_requests) >= self.max_num_requests:
-                break
-            elif req_state == LlmRequestState.CONTEXT_INIT:
-                needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(request)
-                if needed_blocks <= available_blocks:
-                    if has_peft:
-                        lora_task_id, is_new_task, needed_peft_pages = self._get_peft_task_info(
-                            request, uniq_task_ids
-                        )
-                        if needed_peft_pages > available_peft_pages:
-                            continue
-                        available_peft_pages -= needed_peft_pages
-                        if is_new_task:
-                            uniq_task_ids.add(lora_task_id)
-
-                    scheduled_requests.append(request)
-                    available_blocks -= needed_blocks
-                elif needed_blocks > available_blocks:
-                    # If one requests fails to be scheduled, break
-                    break
-
-        return scheduled_requests, scheduled_disagg_gen_init_requests, []
-
-
 class KVCacheV2MaxUtilizationScheduler(CapacityScheduler):
     """
     Max Utilization scheduler for KVCacheManagerV2.
@@ -1054,64 +951,43 @@ class MaxUtilizationPolicy(SchedulerPolicyBase):
         return True
 
 
-class KVCacheV2DummyPolicy(SchedulerPolicyBase):
-    """
-    Policy wrapper for KVCacheV2DummyScheduler.
-    Delegates to KVCacheV2DummyScheduler for scheduling logic.
-    """
-
-    def __init__(self):
-        self.delegate_scheduler = None
-
-    def schedule(
-        self, scheduler: "PyCapacityScheduler", active_requests: RequestList
-    ) -> tuple[RequestList, RequestList]:
-        # Lazy initialization of delegate scheduler
-        if self.delegate_scheduler is None:
-            self.delegate_scheduler = KVCacheV2DummyScheduler(
-                max_num_requests=scheduler.max_num_requests,
-                kv_cache_manager=scheduler.kv_cache_manager,
-            )
-
-        # Delegate to KVCacheV2DummyScheduler
-        scheduled_requests, scheduled_disagg_gen_init_requests, paused_requests = (
-            self.delegate_scheduler.schedule_request(active_requests)
-        )
-
-        # Combine scheduled and disagg requests (PyCapacityScheduler will classify them later)
-        all_scheduled = scheduled_requests + scheduled_disagg_gen_init_requests
-
-        return all_scheduled, paused_requests
-
-
 class KVCacheV2MaxUtilizationPolicy(SchedulerPolicyBase):
     """
-    Policy wrapper for KVCacheV2MaxUtilizationScheduler.
-    Delegates to KVCacheV2MaxUtilizationScheduler for scheduling logic.
+    Policy for KVCacheManagerV2 with max utilization scheduling.
+
+    This policy schedules requests and allocates KV cache resources using
+    KVCacheManagerV2's try-and-see allocation model. Resources are allocated
+    during prepare_resources() via KVCacheManagerV2.prepare_resources_for_max_utilization().
     """
 
     def __init__(self):
-        self.delegate_scheduler = None
+        self._kv_cache_manager = None
 
     def schedule(
         self, scheduler: "PyCapacityScheduler", active_requests: RequestList
     ) -> tuple[RequestList, RequestList]:
-        # Lazy initialization of delegate scheduler
-        if self.delegate_scheduler is None:
-            self.delegate_scheduler = KVCacheV2MaxUtilizationScheduler(
-                max_num_requests=scheduler.max_num_requests,
-                kv_cache_manager=scheduler.kv_cache_manager,
-            )
+        """
+        Schedule requests based on state filtering and max request count.
 
-        # Delegate to KVCacheV2MaxUtilizationScheduler
-        scheduled_requests, scheduled_disagg_gen_init_requests, paused_requests = (
-            self.delegate_scheduler.schedule_request(active_requests)
-        )
+        Uses the scheduler's _can_be_scheduled_with_disagg_exception() for state filtering.
+        Resource allocation happens in prepare_resources().
+        """
+        # Store reference to kv_cache_manager for prepare_resources()
+        self._kv_cache_manager = scheduler.kv_cache_manager
 
-        # Combine scheduled and disagg requests (PyCapacityScheduler will classify them later)
-        all_scheduled = scheduled_requests + scheduled_disagg_gen_init_requests
+        scheduled_requests: RequestList = []
 
-        return all_scheduled, paused_requests
+        for request in active_requests:
+            # Use scheduler's state check (handles disagg exception internally)
+            if not scheduler._can_be_scheduled_with_disagg_exception(request):
+                continue
+
+            if len(scheduled_requests) >= scheduler.max_num_requests:
+                break
+
+            scheduled_requests.append(request)
+
+        return scheduled_requests, []
 
     def prepare_resources(
         self,
@@ -1120,14 +996,22 @@ class KVCacheV2MaxUtilizationPolicy(SchedulerPolicyBase):
         paused_requests: RequestList,
     ) -> tuple[RequestList, RequestList, RequestList]:
         """
-        Prepare resources for MAX_UTILIZATION policy.
-        Delegates to KVCacheV2MaxUtilizationScheduler.prepare_resources().
+        Prepare resources for max utilization scheduling.
+
+        Delegates to KVCacheManagerV2.prepare_resources_for_max_utilization()
+        which handles resource allocation with eviction support.
+
+        Returns:
+            Tuple of (new_context_batch, new_generation_batch, evicted_requests).
+            evicted_requests are requests evicted to free capacity and should be
+            exposed as paused_requests.
         """
-        if self.delegate_scheduler is not None and hasattr(
-            self.delegate_scheduler, "prepare_resources"
-        ):
-            return self.delegate_scheduler.prepare_resources(context_requests, generation_requests)
-        return context_requests, generation_requests, paused_requests
+        if self._kv_cache_manager is None:
+            return context_requests, generation_requests, paused_requests
+
+        return self._kv_cache_manager.prepare_resources_for_max_utilization(
+            context_requests, generation_requests
+        )
 
 
 class NoEvictScheduledBlocksManager:
@@ -1288,15 +1172,10 @@ class PyCapacityScheduler:
         is_kv_cache_v2 = isinstance(self.kv_cache_manager, KVCacheManagerV2)
 
         if is_kv_cache_v2:
-            # For KVCacheManagerV2, use specialized policies
-            if self.scheduler_policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
-                return KVCacheV2DummyPolicy()
-            elif self.scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
-                return KVCacheV2MaxUtilizationPolicy()
-            else:
-                raise ValueError(
-                    f"Unsupported scheduler policy for KVCacheManagerV2: {self.scheduler_policy}"
-                )
+            # For KVCacheManagerV2, use KVCacheV2MaxUtilizationPolicy for all scheduling policies.
+            # Resource allocation is handled by KVCacheManagerV2.prepare_resources_for_max_utilization()
+            # which supports both GUARANTEED_NO_EVICT and MAX_UTILIZATION semantics.
+            return KVCacheV2MaxUtilizationPolicy()
         elif self.kv_cache_manager is None:
             return MaxRequestsPolicy()
         elif self.scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
