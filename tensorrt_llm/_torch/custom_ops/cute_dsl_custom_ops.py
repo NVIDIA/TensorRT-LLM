@@ -376,8 +376,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         def __init__(self,
                      output_dtype: torch.dtype,
-                     to_userbuffers: bool = False,
-                     use_tvm_ffi: bool = True):
+                     to_userbuffers: bool = False):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -386,10 +385,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
             self.output_dtype = output_dtype
             self.to_userbuffers = to_userbuffers
-            self.use_tvm_ffi = use_tvm_ffi
 
         def unique_id(self):
-            return (self.output_dtype, self.to_userbuffers, self.use_tvm_ffi)
+            return (self.output_dtype, self.to_userbuffers)
 
         def get_valid_tactics(
             self,
@@ -616,25 +614,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
             b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
 
-            if not self.use_tvm_ffi:
-                a_ptr = self.make_cute_dsl_global_pointer(
-                    a_tensor, cutlass.Float4E2M1FN, 32)
-                b_ptr = self.make_cute_dsl_global_pointer(
-                    b_tensor, cutlass.Float4E2M1FN, 32)
-                a_sf_ptr = self.make_cute_dsl_global_pointer(
-                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
-                b_sf_ptr = self.make_cute_dsl_global_pointer(
-                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
-                c_ptr = self.make_cute_dsl_global_pointer(
-                    c_tensor, cutlass.BFloat16, 16)
-                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
-
-                # get stream
-                torch_stream = torch.cuda.current_stream()
-                stream = cuda.CUstream(torch_stream.cuda_stream)
-
             cache_key = (sf_vec_size, mma_tiler_mn, cluster_shape_mn, swap_ab,
-                         use_prefetch, self.use_tvm_ffi)
+                         use_prefetch)
             if swap_ab:
                 kernel_m = n
                 kernel_n = m
@@ -645,12 +626,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_a_sf_tensor = b_sf_tensor
                 kernel_b_tensor = a_tensor
                 kernel_b_sf_tensor = a_sf_tensor
-
-                if not self.use_tvm_ffi:
-                    kernel_a_ptr = b_ptr
-                    kernel_a_sf_ptr = b_sf_ptr
-                    kernel_b_ptr = a_ptr
-                    kernel_b_sf_ptr = a_sf_ptr
             else:
                 kernel_m = m
                 kernel_n = n
@@ -662,39 +637,31 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 kernel_b_tensor = b_tensor
                 kernel_b_sf_tensor = b_sf_tensor
 
-                if not self.use_tvm_ffi:
+            if cache_key not in self.__class__.kernel_cache:
+                a_ptr = self.make_cute_dsl_global_pointer(
+                    a_tensor, cutlass.Float4E2M1FN, 32)
+                b_ptr = self.make_cute_dsl_global_pointer(
+                    b_tensor, cutlass.Float4E2M1FN, 32)
+                a_sf_ptr = self.make_cute_dsl_global_pointer(
+                    a_sf_tensor, cutlass.Float8E4M3FN, 16)
+                b_sf_ptr = self.make_cute_dsl_global_pointer(
+                    b_sf_tensor, cutlass.Float8E4M3FN, 16)
+                c_ptr = self.make_cute_dsl_global_pointer(
+                    c_tensor, cutlass.BFloat16, 16)
+                alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
+
+                if swap_ab:
+                    kernel_a_ptr = b_ptr
+                    kernel_a_sf_ptr = b_sf_ptr
+                    kernel_b_ptr = a_ptr
+                    kernel_b_sf_ptr = a_sf_ptr
+                else:
                     kernel_a_ptr = a_ptr
                     kernel_a_sf_ptr = a_sf_ptr
                     kernel_b_ptr = b_ptr
                     kernel_b_sf_ptr = b_sf_ptr
-
-            if cache_key not in self.__class__.kernel_cache:
-                if self.use_tvm_ffi:
-                    a_ptr = self.make_cute_dsl_global_pointer(
-                        a_tensor, cutlass.Float4E2M1FN, 32)
-                    b_ptr = self.make_cute_dsl_global_pointer(
-                        b_tensor, cutlass.Float4E2M1FN, 32)
-                    a_sf_ptr = self.make_cute_dsl_global_pointer(
-                        a_sf_tensor, cutlass.Float8E4M3FN, 16)
-                    b_sf_ptr = self.make_cute_dsl_global_pointer(
-                        b_sf_tensor, cutlass.Float8E4M3FN, 16)
-                    c_ptr = self.make_cute_dsl_global_pointer(
-                        c_tensor, cutlass.BFloat16, 16)
-                    alpha_cute_tensor = cute.runtime.from_dlpack(alpha_tensor)
-                    # make faked stream
-                    stream = cute.runtime.make_fake_stream(
-                        use_tvm_ffi_env_stream=True)
-
-                    if swap_ab:
-                        kernel_a_ptr = b_ptr
-                        kernel_a_sf_ptr = b_sf_ptr
-                        kernel_b_ptr = a_ptr
-                        kernel_b_sf_ptr = a_sf_ptr
-                    else:
-                        kernel_a_ptr = a_ptr
-                        kernel_a_sf_ptr = a_sf_ptr
-                        kernel_b_ptr = b_ptr
-                        kernel_b_sf_ptr = b_sf_ptr
 
                 gemm = self.__class__.kernel_class(
                     sf_vec_size,
@@ -702,13 +669,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     cluster_shape_mn,
                     use_prefetch,
                 )
-                # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
 
-                # Note: when tvm_ffi fake stream is used, at least one parameter shoube be tensor type,
-                # so we make alpha as the cute.Tensor type in the jit func.
                 compiled_gemm = cute.compile(
                     gemm.wrapper,
                     kernel_m,
@@ -727,48 +691,27 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     max_active_clusters,
                     stream,
                     swap_ab,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
+                    options="--opt-level 2 --enable-tvm-ffi",
                 )
 
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            # launch gemm kernel
-            if self.use_tvm_ffi:
-                # call with torch pointer types and no need to pass stream.
-                compiled_gemm(
-                    kernel_m,
-                    kernel_n,
-                    real_k,
-                    kernel_sf_m // 128,
-                    kernel_sf_n // 128,
-                    sf_k // 4,
-                    kernel_a_tensor.data_ptr(),
-                    kernel_b_tensor.data_ptr(),
-                    kernel_a_sf_tensor.data_ptr(),
-                    kernel_b_sf_tensor.data_ptr(),
-                    c_tensor.data_ptr(),
-                    alpha_tensor,
-                )
-            else:
-                # call with cute types and need to pass torch stream.
-                compiled_gemm(
-                    kernel_m,
-                    kernel_n,
-                    real_k,
-                    kernel_sf_m // 128,
-                    kernel_sf_n // 128,
-                    sf_k // 4,
-                    kernel_a_ptr,
-                    kernel_b_ptr,
-                    kernel_a_sf_ptr,
-                    kernel_b_sf_ptr,
-                    c_ptr,
-                    alpha_cute_tensor,
-                    stream,
-                )
+            compiled_gemm(
+                kernel_m,
+                kernel_n,
+                real_k,
+                kernel_sf_m // 128,
+                kernel_sf_n // 128,
+                sf_k // 4,
+                kernel_a_tensor.data_ptr(),
+                kernel_b_tensor.data_ptr(),
+                kernel_a_sf_tensor.data_ptr(),
+                kernel_b_sf_tensor.data_ptr(),
+                c_tensor.data_ptr(),
+                alpha_tensor,
+            )
 
             if swap_ab:
                 c_tensor = c_tensor.permute(1, 0)
@@ -786,7 +729,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based NVFP4 GEMM optimized for Blackwell.
 
@@ -798,7 +740,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             alpha: Scaling factor
             output_dtype: Output data type (must be bfloat16)
             to_userbuffers: Whether to allocate output from UserBuffers pool
-            use_tvm_ffi: Whether to use TVM-FFI to call the kernel. Enable this option could help reduce the kernel host launch overhead.
 
         Note:
             This function is primarily used internally by nvfp4_gemm.
@@ -814,8 +755,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers,
-                                             use_tvm_ffi)
+        runner = CuteDSLNVFP4BlackwellRunner(output_dtype, to_userbuffers)
         inputs = [input, weight, input_scale, weight_scale, alpha]
         _, best_tactic = tuner.choose_one(
             "trtllm::cute_dsl_nvfp4_gemm_blackwell",
@@ -836,7 +776,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         alpha: torch.Tensor,  # Match custom op signature
         output_dtype: torch.dtype,
         to_userbuffers: bool = False,
-        use_tvm_ffi: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -2218,16 +2157,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_cold_l2_cache=True,
         )
 
-        def __init__(self,
-                     output_dtype: torch.dtype = torch.bfloat16,
-                     use_tvm_ffi: bool = True):
+        def __init__(self, output_dtype: torch.dtype = torch.bfloat16):
             super().__init__()
             if output_dtype != torch.bfloat16:
                 raise ValueError(
                     f"CuteDSL FP8 GEMM only supports bfloat16 output, got {output_dtype}"
                 )
             self.output_dtype = output_dtype
-            self.use_tvm_ffi = use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -2328,7 +2264,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             c_tmp = c_tensor.view((1, m, n))
             c_tmp = c_tmp.permute(1, 2, 0)
 
-            if not self.use_tvm_ffi:
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
+            if cache_key not in self.__class__.kernel_cache:
                 a_ptr = make_ptr(
                     cutlass.Float8E4M3FN,
                     a_tensor.data_ptr(),
@@ -2355,47 +2296,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 c_cute_tensor = cute.runtime.from_dlpack(
                     c_tmp).mark_layout_dynamic(leading_dim=1)
-
-                # get stream
-                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-            cache_key = (
-                use_2cta_instrs,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                self.use_tvm_ffi,
-            )
-            if cache_key not in self.__class__.kernel_cache:
-                if self.use_tvm_ffi:
-                    a_ptr = make_ptr(
-                        cutlass.Float8E4M3FN,
-                        a_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    b_ptr = make_ptr(
-                        cutlass.Float8E4M3FN,
-                        b_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    a_sf_ptr = make_ptr(
-                        cutlass.Float32,
-                        a_sf_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    b_sf_ptr = make_ptr(
-                        cutlass.Float32,
-                        b_sf_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    # Convert c_tensor to cute tensor for TVM FFI for env stream detection
-                    c_cute_tensor = cute.runtime.from_dlpack(
-                        c_tmp).mark_layout_dynamic(leading_dim=1)
-                    stream = cute.runtime.make_fake_stream(
-                        use_tvm_ffi_env_stream=True)
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
 
                 gemm = self.__class__.kernel_class(
                     cutlass.Float32,  # acc_dtype,
@@ -2403,7 +2305,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
-                # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
@@ -2424,47 +2325,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
+                    options="--opt-level 2 --enable-tvm-ffi",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            # launch gemm kernel
-            if self.use_tvm_ffi:
-                # call with torch pointer types and no need to pass stream.
-                compiled_gemm(
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    1,  # batch
-                    a_tensor.data_ptr(),
-                    b_tensor.data_ptr(),
-                    a_sf_tensor.data_ptr(),
-                    b_sf_tensor.data_ptr(),
-                    c_tmp,
-                )
-            else:
-                # call with cute types and need to pass torch stream.
-                compiled_gemm(
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    1,  # batch
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_cute_tensor,
-                    stream=stream,
-                )
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                1,  # batch
+                a_tensor.data_ptr(),
+                b_tensor.data_ptr(),
+                a_sf_tensor.data_ptr(),
+                b_sf_tensor.data_ptr(),
+                c_tmp,
+            )
             return c_tensor
 
     # a/b: fp8, scale: fp32, output: bf16
@@ -2477,7 +2357,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         output_dtype: torch.dtype = torch.bfloat16,
-        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         if output_dtype != torch.bfloat16:
             raise ValueError(
@@ -2489,8 +2368,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 f"CuteDSL FP8 GEMM only supports SM100 and SM103.")
         tuner = AutoTuner.get()
 
-        runner = CuteDSLFp8BlackwellRunner(output_dtype=output_dtype,
-                                           use_tvm_ffi=use_tvm_ffi)
+        runner = CuteDSLFp8BlackwellRunner(output_dtype=output_dtype)
 
         inputs = [input, weight, input_scale, weight_scale]
         _, best_tactic = tuner.choose_one(
@@ -2508,7 +2386,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         output_dtype: torch.dtype = torch.bfloat16,
-        use_tvm_ffi: bool = True,
     ):
         # [m, k]
         shape = list(mat_a.shape)
@@ -2530,16 +2407,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_cold_l2_cache=True,
         )
 
-        def __init__(self,
-                     output_dtype: torch.dtype = torch.bfloat16,
-                     use_tvm_ffi: bool = True):
+        def __init__(self, output_dtype: torch.dtype = torch.bfloat16):
             super().__init__()
             if output_dtype != torch.bfloat16:
                 raise ValueError(
                     f"CuteDSL FP8 BMM only supports bfloat16 output, got {output_dtype}"
                 )
             self.output_dtype = output_dtype
-            self.use_tvm_ffi = use_tvm_ffi
 
         def get_valid_tactics(
             self,
@@ -2642,7 +2516,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             sf_k = ceil_div(k, 128)
             sf_n = ceil_div(n, 128)
 
-            if not self.use_tvm_ffi:
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
+            if cache_key not in self.__class__.kernel_cache:
                 a_ptr = make_ptr(
                     cutlass.Float8E4M3FN,
                     a_tensor.data_ptr(),
@@ -2669,48 +2548,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 c_cute_tensor = cute.runtime.from_dlpack(
                     c_tmp).mark_layout_dynamic(leading_dim=1)
-
-                # get stream
-                stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-            cache_key = (
-                use_2cta_instrs,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                self.use_tvm_ffi,
-            )
-            if cache_key not in self.__class__.kernel_cache:
-                if self.use_tvm_ffi:
-                    a_ptr = make_ptr(
-                        cutlass.Float8E4M3FN,
-                        a_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    b_ptr = make_ptr(
-                        cutlass.Float8E4M3FN,
-                        b_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    a_sf_ptr = make_ptr(
-                        cutlass.Float32,
-                        a_sf_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    b_sf_ptr = make_ptr(
-                        cutlass.Float32,
-                        b_sf_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    # Convert c_tensor to cute tensor for TVM FFI for env stream detection)
-                    c_cute_tensor = cute.runtime.from_dlpack(
-                        c_tmp).mark_layout_dynamic(leading_dim=1)
-                    # make faked stream for TVM FFI
-                    stream = cute.runtime.make_fake_stream(
-                        use_tvm_ffi_env_stream=True)
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
 
                 gemm = self.__class__.kernel_class(
                     cutlass.Float32,  # acc_dtype,
@@ -2718,7 +2557,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
-                # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
@@ -2739,47 +2577,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     c_cute_tensor,
                     max_active_clusters=max_active_clusters,
                     stream=stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
+                    options="--opt-level 2 --enable-tvm-ffi",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            # launch gemm kernel
-            if self.use_tvm_ffi:
-                # call with torch pointer types and no need to pass stream.
-                compiled_gemm(
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    batch_size,
-                    a_tensor.data_ptr(),
-                    b_tensor.data_ptr(),
-                    a_sf_tensor.data_ptr(),
-                    b_sf_tensor.data_ptr(),
-                    c_tmp,
-                )
-            else:
-                # call with cute types and need to pass torch stream.
-                compiled_gemm(
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    batch_size,
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_cute_tensor,
-                    stream=stream,
-                )
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                batch_size,
+                a_tensor.data_ptr(),
+                b_tensor.data_ptr(),
+                a_sf_tensor.data_ptr(),
+                b_sf_tensor.data_ptr(),
+                c_tmp,
+            )
 
     # a/b: fp8, scale: fp32, output: bf16
     @torch.library.custom_op("trtllm::cute_dsl_fp8_bmm_blackwell",
@@ -2792,7 +2609,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         output: torch.Tensor,
         output_dtype: torch.dtype = torch.bfloat16,
-        use_tvm_ffi: bool = True,
     ) -> None:
         if output_dtype != torch.bfloat16:
             raise ValueError(
@@ -2805,8 +2621,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
         tuner = AutoTuner.get()
 
-        runner = CuteDSLFp8BlackwellBmmRunner(output_dtype=output_dtype,
-                                              use_tvm_ffi=use_tvm_ffi)
+        runner = CuteDSLFp8BlackwellBmmRunner(output_dtype=output_dtype)
 
         inputs = [input, weight, input_scale, weight_scale, output]
 
@@ -2826,7 +2641,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         weight_scale: torch.Tensor,
         output: torch.Tensor,
         output_dtype: torch.dtype = torch.bfloat16,
-        use_tvm_ffi: bool = True,
     ) -> None:
         batch_size, m, k = mat_a.shape[0], mat_a.shape[1], mat_a.shape[2]
         n = mat_b.shape[1]
@@ -2839,12 +2653,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
         tuning_config_cache = dict()
 
-        def __init__(self,
-                     num_experts: int,
-                     top_k: int,
-                     num_local_experts: int,
-                     local_expert_offset: int,
-                     use_tvm_ffi: bool = True):
+        def __init__(self, num_experts: int, top_k: int, num_local_experts: int,
+                     local_expert_offset: int):
             super().__init__()
             if (sm_version := get_sm_version()) not in (100, 103):
                 raise ValueError(
@@ -2854,7 +2664,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             self.top_k = top_k
             self.num_local_experts = num_local_experts
             self.local_expert_offset = local_expert_offset
-            self.use_tvm_ffi = use_tvm_ffi
 
         def unique_id(self):
             return (
@@ -2979,7 +2788,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                    dtype=torch.bfloat16,
                                    device=a_tensor.device)
 
-            if not self.use_tvm_ffi:
+            cache_key = (
+                use_2cta_instrs,
+                mma_tiler_mn,
+                cluster_shape_mn,
+            )
+            if cache_key not in self.__class__.kernel_cache:
                 a_ptr = make_ptr(
                     cutlass.Float8E4M3FN,
                     a_tensor.data_ptr(),
@@ -3012,53 +2826,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 )
                 group_offset_cute_tensor = cute.runtime.from_dlpack(
                     group_offset_tensor).mark_layout_dynamic(leading_dim=0)
-
-            # get stream
-            stream = cuda.CUstream(torch.cuda.current_stream().cuda_stream)
-
-            cache_key = (
-                use_2cta_instrs,
-                mma_tiler_mn,
-                cluster_shape_mn,
-                self.use_tvm_ffi,
-            )
-            if cache_key not in self.__class__.kernel_cache:
-                if self.use_tvm_ffi:
-                    a_ptr = make_ptr(
-                        cutlass.Float8E4M3FN,
-                        a_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    b_ptr = make_ptr(
-                        cutlass.Float8E4M3FN,
-                        b_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    c_ptr = make_ptr(
-                        cutlass.BFloat16,
-                        c_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    a_sf_ptr = make_ptr(
-                        cutlass.Float32,
-                        a_sf_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    b_sf_ptr = make_ptr(
-                        cutlass.Float32,
-                        b_sf_tensor.data_ptr(),
-                        cute.AddressSpace.gmem,
-                        assumed_align=16,
-                    )
-                    group_offset_cute_tensor = cute.runtime.from_dlpack(
-                        group_offset_tensor).mark_layout_dynamic(leading_dim=0)
-                    # make faked stream for TVM FFI
-                    stream = cute.runtime.make_fake_stream(
-                        use_tvm_ffi_env_stream=True)
+                stream = cute.runtime.make_fake_stream(
+                    use_tvm_ffi_env_stream=True)
 
                 gemm = self.__class__.kernel_class(
                     cutlass.Float32,  # acc_dtype,
@@ -3066,7 +2835,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     mma_tiler_mn=mma_tiler_mn,
                     cluster_shape_mn=cluster_shape_mn,
                 )
-                # Compute max active clusters on current device
                 hardware_info = cutlass.utils.HardwareInfo()
                 max_active_clusters = hardware_info.get_max_active_clusters(
                     cluster_shape_mn[0] * cluster_shape_mn[1])
@@ -3089,49 +2857,28 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     group_offset_cute_tensor,
                     max_active_clusters,
                     stream,
-                    options=f"--opt-level 2 --enable-tvm-ffi"
-                    if self.use_tvm_ffi else "--opt-level 2",
+                    options="--opt-level 2 --enable-tvm-ffi",
                 )
                 self.__class__.kernel_cache[cache_key] = compiled_gemm
             else:
                 compiled_gemm = self.__class__.kernel_cache[cache_key]
 
-            # launch gemm kernel
-            if self.use_tvm_ffi:
-                compiled_gemm(
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    1,  # batch
-                    group_size,
-                    a_tensor.data_ptr(),
-                    b_tensor.data_ptr(),
-                    a_sf_tensor.data_ptr(),
-                    b_sf_tensor.data_ptr(),
-                    c_tensor.data_ptr(),
-                    group_offset_tensor,
-                )
-            else:
-                compiled_gemm(
-                    m,
-                    n,
-                    k,
-                    sf_m,
-                    sf_n,
-                    sf_k,
-                    1,  # batch
-                    group_size,
-                    a_ptr,
-                    b_ptr,
-                    a_sf_ptr,
-                    b_sf_ptr,
-                    c_ptr,
-                    group_offset_cute_tensor,
-                    stream=stream,
-                )
+            compiled_gemm(
+                m,
+                n,
+                k,
+                sf_m,
+                sf_n,
+                sf_k,
+                1,  # batch
+                group_size,
+                a_tensor.data_ptr(),
+                b_tensor.data_ptr(),
+                a_sf_tensor.data_ptr(),
+                b_sf_tensor.data_ptr(),
+                c_tensor.data_ptr(),
+                group_offset_tensor,
+            )
             return c_tensor
 
     # a/b: fp8, scale: fp32, out: bf16
@@ -3149,7 +2896,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         num_local_experts: int,
         local_expert_offset: int,
-        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
 
         tuner = AutoTuner.get()
@@ -3157,8 +2903,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_experts=num_experts,
             top_k=top_k,
             num_local_experts=num_local_experts,
-            local_expert_offset=local_expert_offset,
-            use_tvm_ffi=use_tvm_ffi)
+            local_expert_offset=local_expert_offset)
 
         if group_offset.dtype != torch.int32:
             group_offset = group_offset.to(torch.int32)
@@ -3180,7 +2925,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
         group_offset: torch.Tensor,
-        use_tvm_ffi: bool = True,
     ) -> torch.Tensor:
         m, n = input.shape[0], weight.shape[0]
         return input.new_empty((m, n), dtype=torch.bfloat16)
