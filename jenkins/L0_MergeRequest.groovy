@@ -1046,7 +1046,9 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 
     def status = triggerJob(jobName, parameters)
     if (status != "SUCCESS") {
-        error "Downstream job ${jobName} status: ${status}"
+        echo "Downstream job ${jobName} status: ${status}"
+        // throw a normal exception so that callers can inspect the text
+        throw new Exception("Downstream job ${jobName} status: ${status}")
     }
     return status
 }
@@ -1295,7 +1297,7 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                             catchError(
                                 buildResult: 'SUCCESS',
                                 stageResult: 'UNSTABLE') {
-                                echo "Build-Docker-Images job failed: ${e.toString()}"
+                                error "Build-Docker-Images job failed: ${e.toString()}"
                             }
                         } else {
                             throw e
