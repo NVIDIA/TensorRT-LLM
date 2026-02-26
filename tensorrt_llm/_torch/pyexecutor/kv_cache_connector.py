@@ -483,6 +483,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return ready_requests
 
     def handle_metadata(self) -> object:
+        if self._scheduler_output is None:
+            return
+
         metadata = self._run_on_leader(
             lambda: self.scheduler.build_connector_meta(self._scheduler_output))
 
