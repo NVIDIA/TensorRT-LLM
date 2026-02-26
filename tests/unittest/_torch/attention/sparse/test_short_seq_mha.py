@@ -20,6 +20,7 @@ packed context tokens is within the threshold, MLA.forward_context_dsa
 dispatches to forward_context_short_mha which uses dense MHA (kv_b_proj
 expansion + SDPA) instead of the absorption path.
 """
+
 import math
 import os
 from dataclasses import dataclass
@@ -29,31 +30,29 @@ from typing import List
 import pytest
 import torch
 
-# DSACacheManager creates background ThreadPoolExecutor threads that outlive
-# the test. Disable pytest-threadleak for this entire module.
-pytestmark = pytest.mark.threadleak(enabled=False)
-
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.interface import (
-    PositionalEmbeddingParams, RopeParams)
+from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.attention import MLA
-from tensorrt_llm._utils import (get_sm_version, str_dtype_to_binding,
-                                 torch_dtype_to_str)
+from tensorrt_llm._utils import get_sm_version, str_dtype_to_binding, torch_dtype_to_str
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.functional import PositionEmbeddingType, RopeEmbeddingUtils
 from tensorrt_llm.llmapi.llm_args import DeepSeekSparseAttentionConfig
 from tensorrt_llm.mapping import Mapping
 
+# DSACacheManager creates background ThreadPoolExecutor threads that outlive
+# the test. Disable pytest-threadleak for this entire module.
+pytestmark = pytest.mark.threadleak(enabled=False)
+
 
 def rotate_half(x):
     """Rotates half the hidden dims of the input."""
-    x1 = x[..., :x.shape[-1] // 2]
-    x2 = x[..., x.shape[-1] // 2:]
+    x1 = x[..., : x.shape[-1] // 2]
+    x2 = x[..., x.shape[-1] // 2 :]
     return torch.cat((-x2, x1), dim=-1)
 
 
@@ -63,20 +62,28 @@ def apply_rotary_embedding(x, cos_sin):
     cos, sin = cos_sin.chunk(2, dim=-2)
     cos = cos.squeeze(1)
     sin = sin.squeeze(1)
-    x_interleaved = x.unflatten(-1, [-1, 2]).transpose(-2,
-                                                        -1).flatten(start_dim=-2)
+    x_interleaved = x.unflatten(-1, [-1, 2]).transpose(-2, -1).flatten(start_dim=-2)
     cos_expanded = cos.view(cos.shape[0], *([1] * (x.ndim - 2)), cos.shape[-1])
     sin_expanded = sin.view(sin.shape[0], *([1] * (x.ndim - 2)), sin.shape[-1])
-    x_rotated = (x_interleaved * cos_expanded) + (rotate_half(x_interleaved) *
-                                                   sin_expanded)
+    x_rotated = (x_interleaved * cos_expanded) + (rotate_half(x_interleaved) * sin_expanded)
     return x_rotated.to(original_dtype)
 
 
-def calculate_reference_output(q, compressed_kv, k_pe, kv_b_proj_weight,
-                               rope_cos_sin, sequence_lengths, num_heads,
-                               kv_lora_rank, qk_nope_head_dim,
-                               qk_rope_head_dim, v_head_dim, softmax_scale,
-                               device):
+def calculate_reference_output(
+    q,
+    compressed_kv,
+    k_pe,
+    kv_b_proj_weight,
+    rope_cos_sin,
+    sequence_lengths,
+    num_heads,
+    kv_lora_rank,
+    qk_nope_head_dim,
+    qk_rope_head_dim,
+    v_head_dim,
+    softmax_scale,
+    device,
+):
     """Reference implementation using kv_b_proj expansion + SDPA.
 
     This mirrors forward_context_short_mha:
@@ -90,9 +97,9 @@ def calculate_reference_output(q, compressed_kv, k_pe, kv_b_proj_weight,
     offset = 0
 
     for seq_len in sequence_lengths:
-        q_seq = q[offset:offset + seq_len].view(-1, num_heads, qk_head_dim)
-        compressed_kv_seq = compressed_kv[offset:offset + seq_len]
-        k_pe_seq = k_pe[offset:offset + seq_len]
+        q_seq = q[offset : offset + seq_len].view(-1, num_heads, qk_head_dim)
+        compressed_kv_seq = compressed_kv[offset : offset + seq_len]
+        k_pe_seq = k_pe[offset : offset + seq_len]
         cos_sin = rope_cos_sin[:seq_len]
 
         # Apply RoPE to q rope portion
@@ -106,12 +113,10 @@ def calculate_reference_output(q, compressed_kv, k_pe, kv_b_proj_weight,
 
         # Expand via kv_b_proj: weight is [out_features, kv_lora_rank]
         kv = torch.nn.functional.linear(compressed_kv_seq, kv_b_proj_weight)
-        k_nope, v = kv.split(
-            [num_heads * qk_nope_head_dim, num_heads * v_head_dim], -1)
+        k_nope, v = kv.split([num_heads * qk_nope_head_dim, num_heads * v_head_dim], -1)
 
         k_nope_r = k_nope.view(-1, num_heads, qk_nope_head_dim)
-        k_pe_expanded = k_pe_roped.view(-1, 1, qk_rope_head_dim).expand(
-            -1, num_heads, -1)
+        k_pe_expanded = k_pe_roped.view(-1, 1, qk_rope_head_dim).expand(-1, num_heads, -1)
         k_full = torch.cat([k_nope_r, k_pe_expanded], dim=-1)
 
         v_r = v.view(-1, num_heads, v_head_dim)
@@ -122,7 +127,8 @@ def calculate_reference_output(q, compressed_kv, k_pe, kv_b_proj_weight,
         v_b = v_r.unsqueeze(0).transpose(1, 2)
 
         attn_out = torch.nn.functional.scaled_dot_product_attention(
-            q_b, k_b, v_b, is_causal=True, scale=softmax_scale)
+            q_b, k_b, v_b, is_causal=True, scale=softmax_scale
+        )
         attn_out = attn_out.transpose(1, 2).squeeze(0)
         results.append(attn_out.reshape(seq_len, num_heads * v_head_dim))
         offset += seq_len
@@ -188,21 +194,25 @@ def _make_rope_config():
 
 
 def _make_rope_cos_sin(rope_config, device):
-    return torch.tensor(
-        RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
-            rope_config.max_position_embeddings,
-            rope_config.qk_rope_head_dim,
-            rope_config.rope_theta,
-            rope_config.rope_scaling['factor'],
-            rope_config.rope_scaling['original_max_position_embeddings'],
-            rope_config.rope_scaling['beta_fast'],
-            rope_config.rope_scaling['beta_slow'],
-            rope_config.rope_scaling['mscale'],
-            rope_config.rope_scaling['mscale_all_dim'],
-        )[1],
-        dtype=torch.float32,
-        device=device,
-    ).reshape(rope_config.max_position_embeddings, -1, 2).transpose(-2, -1)
+    return (
+        torch.tensor(
+            RopeEmbeddingUtils.create_sinusoidal_positions_yarn(
+                rope_config.max_position_embeddings,
+                rope_config.qk_rope_head_dim,
+                rope_config.rope_theta,
+                rope_config.rope_scaling["factor"],
+                rope_config.rope_scaling["original_max_position_embeddings"],
+                rope_config.rope_scaling["beta_fast"],
+                rope_config.rope_scaling["beta_slow"],
+                rope_config.rope_scaling["mscale"],
+                rope_config.rope_scaling["mscale_all_dim"],
+            )[1],
+            dtype=torch.float32,
+            device=device,
+        )
+        .reshape(rope_config.max_position_embeddings, -1, 2)
+        .transpose(-2, -1)
+    )
 
 
 def _compute_softmax_scale(rope_config):
@@ -211,8 +221,8 @@ def _compute_softmax_scale(rope_config):
             return 1.0
         return 0.1 * mscale * math.log(scale) + 1.0
 
-    mscale_all_dim = rope_config.rope_scaling['mscale_all_dim']
-    scaling_factor = rope_config.rope_scaling['factor']
+    mscale_all_dim = rope_config.rope_scaling["mscale_all_dim"]
+    scaling_factor = rope_config.rope_scaling["factor"]
     mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
     q_scaling = 1.0 / (mscale * mscale)
     return 1.0 / (math.sqrt(QK_HEAD_DIM) * q_scaling)
@@ -239,8 +249,8 @@ def _build_mla(rope_config, device, threshold):
     )
 
     # Set env var BEFORE constructing MLA so __init__ picks it up.
-    old_val = os.environ.get('TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD')
-    os.environ['TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD'] = str(threshold)
+    old_val = os.environ.get("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD")
+    os.environ["TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD"] = str(threshold)
     try:
         mla = MLA(
             hidden_size=HIDDEN_SIZE,
@@ -262,14 +272,14 @@ def _build_mla(rope_config, device, threshold):
     finally:
         # Restore env var.
         if old_val is None:
-            os.environ.pop('TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD', None)
+            os.environ.pop("TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD", None)
         else:
-            os.environ['TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD'] = old_val
+            os.environ["TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD"] = old_val
 
     # mla.mqa (DSATrtllmAttention) does not inherit from nn.Module, so
     # mla.to(device) does NOT recursively move its children. Explicitly
     # move the indexer (which IS an nn.Module) so its weights are on CUDA.
-    if hasattr(mla, 'mqa') and hasattr(mla.mqa, 'indexer'):
+    if hasattr(mla, "mqa") and hasattr(mla.mqa, "indexer"):
         mla.mqa.indexer.to(device)
 
     return mla, mapping, sparse_config, model_config
@@ -292,27 +302,35 @@ def _init_mla_weights(mla):
         # Generate k_nope and v weights separately, then concatenate in the
         # loaded layout: [all_k_nope || all_v].
         k_nope_weight = torch.empty(
-            NUM_HEADS, QK_NOPE_HEAD_DIM, KV_LORA_RANK,
+            NUM_HEADS,
+            QK_NOPE_HEAD_DIM,
+            KV_LORA_RANK,
             dtype=mla.kv_b_proj.weight.dtype,
-            device=mla.kv_b_proj.weight.device)
+            device=mla.kv_b_proj.weight.device,
+        )
         k_nope_weight.normal_(mean=0.0, std=NN_INIT_STD)
 
         v_weight = torch.empty(
-            NUM_HEADS, V_HEAD_DIM, KV_LORA_RANK,
+            NUM_HEADS,
+            V_HEAD_DIM,
+            KV_LORA_RANK,
             dtype=mla.kv_b_proj.weight.dtype,
-            device=mla.kv_b_proj.weight.device)
+            device=mla.kv_b_proj.weight.device,
+        )
         v_weight.normal_(mean=0.0, std=NN_INIT_STD)
 
         # kv_b_proj.weight: [num_heads*(qk_nope+v_head), kv_lora_rank]
         # Loaded layout: first num_heads*qk_nope rows are k_nope, rest are v.
-        mla.kv_b_proj.weight.data = torch.cat([
-            k_nope_weight.reshape(NUM_HEADS * QK_NOPE_HEAD_DIM, KV_LORA_RANK),
-            v_weight.reshape(NUM_HEADS * V_HEAD_DIM, KV_LORA_RANK),
-        ], dim=0)
+        mla.kv_b_proj.weight.data = torch.cat(
+            [
+                k_nope_weight.reshape(NUM_HEADS * QK_NOPE_HEAD_DIM, KV_LORA_RANK),
+                v_weight.reshape(NUM_HEADS * V_HEAD_DIM, KV_LORA_RANK),
+            ],
+            dim=0,
+        )
 
         # k_b_proj_trans: [num_heads, kv_lora_rank, qk_nope_head_dim]
-        mla.k_b_proj_trans.data = k_nope_weight.transpose(1,
-                                                          2).contiguous()
+        mla.k_b_proj_trans.data = k_nope_weight.transpose(1, 2).contiguous()
 
         # v_b_proj: [num_heads, v_head_dim, kv_lora_rank]
         mla.v_b_proj.data = v_weight.contiguous()
@@ -322,8 +340,7 @@ def _init_mla_weights(mla):
         mla.mqa.indexer.weights_proj.weight.normal_(mean=0.0, std=NN_INIT_STD)
 
 
-def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens,
-                             device):
+def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device):
     """Build a DSACacheManager for the given batch."""
     max_seqlen = max(seq_lens)
     max_tokens = 16384
@@ -356,11 +373,8 @@ def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens,
     return kv_cache_manager
 
 
-@pytest.mark.skipif(get_sm_version() < 90,
-                    reason="MLA requires SM90 (Hopper) or later")
-@pytest.mark.parametrize("batch_name,seq_lens",
-                         BATCH_SPECS,
-                         ids=[b[0] for b in BATCH_SPECS])
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
+@pytest.mark.parametrize("batch_name,seq_lens", BATCH_SPECS, ids=[b[0] for b in BATCH_SPECS])
 def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     """Test that forward_context_short_mha produces correct attention output.
 
@@ -368,7 +382,7 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     reference implementation that performs the same math: kv_b_proj expansion,
     RoPE application, and causal SDPA.
     """
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     dtype = torch.bfloat16
 
     torch.manual_seed(42)
@@ -380,8 +394,7 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
 
     # Set threshold high enough that total packed tokens take the short MHA path.
     threshold = sum(seq_lens) + 100
-    mla, mapping, sparse_config, model_config = _build_mla(
-        rope_config, device, threshold)
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
 
     # Verify short-seq MHA is configured.
@@ -389,26 +402,22 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     assert mla._rotary_emb_mha is not None
     assert not mla.apply_rotary_emb, "Expected rope_fusion=True for DSA"
 
-    kv_cache_manager = _build_kv_cache_manager(mapping, sparse_config,
-                                                model_config, seq_lens, device)
+    kv_cache_manager = _build_kv_cache_manager(
+        mapping, sparse_config, model_config, seq_lens, device
+    )
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
 
     # Generate inputs.
     total_tokens = sum(seq_lens)
     num_contexts = len(seq_lens)
-    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype,
-                     device=device)
-    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype,
-                                device=device)
-    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype,
-                        device=device)
+    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-    position_ids = torch.cat([
-        torch.arange(slen, device=device, dtype=torch.int32)
-        for slen in seq_lens
-    ])
-    output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype,
-                          device=device)
+    position_ids = torch.cat(
+        [torch.arange(slen, device=device, dtype=torch.int32) for slen in seq_lens]
+    )
+    output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
@@ -452,9 +461,20 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     # Compute reference.
     kv_b_proj_weight = mla.kv_b_proj.weight.data
     ref_output = calculate_reference_output(
-        q_for_ref, compressed_kv_for_ref, k_pe_for_ref, kv_b_proj_weight,
-        rope_cos_sin, seq_lens, NUM_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM,
-        QK_ROPE_HEAD_DIM, V_HEAD_DIM, softmax_scale, device)
+        q_for_ref,
+        compressed_kv_for_ref,
+        k_pe_for_ref,
+        kv_b_proj_weight,
+        rope_cos_sin,
+        seq_lens,
+        NUM_HEADS,
+        KV_LORA_RANK,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        softmax_scale,
+        device,
+    )
 
     # Compare.
     assert output.shape == ref_output.shape
@@ -463,17 +483,17 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
 
     abs_error = (output - ref_output).abs()
     torch.testing.assert_close(output, ref_output, rtol=0.05, atol=0.05)
-    print(f"[{batch_name}] PASSED: max_error={abs_error.max():.4f}, "
-          f"mean_error={abs_error.mean():.6f}")
+    print(
+        f"[{batch_name}] PASSED: max_error={abs_error.max():.4f}, mean_error={abs_error.mean():.6f}"
+    )
 
     kv_cache_manager.shutdown()
 
 
-@pytest.mark.skipif(get_sm_version() < 90,
-                    reason="MLA requires SM90 (Hopper) or later")
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
 def test_short_mha_not_triggered_when_threshold_zero():
     """Verify that with threshold=0, the short MHA path is NOT active."""
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     rope_config = _make_rope_config()
     mla, _, _, _ = _build_mla(rope_config, device, threshold=0)
 
@@ -481,15 +501,14 @@ def test_short_mha_not_triggered_when_threshold_zero():
     assert mla._rotary_emb_mha is None
 
 
-@pytest.mark.skipif(get_sm_version() < 90,
-                    reason="MLA requires SM90 (Hopper) or later")
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
 def test_short_mha_boundary_threshold_equals_max_seq():
     """Test the boundary condition where threshold == total packed tokens.
 
     The dispatch guard uses `<=`, so threshold == num_ctx_tokens should still
     trigger the short MHA path. This verifies correctness at the exact boundary.
     """
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -501,29 +520,24 @@ def test_short_mha_boundary_threshold_equals_max_seq():
     seq_lens = [24, 16]
     # Threshold exactly equals total packed tokens — short MHA should trigger.
     threshold = sum(seq_lens)
-    mla, mapping, sparse_config, model_config = _build_mla(
-        rope_config, device, threshold)
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
 
-    kv_cache_manager = _build_kv_cache_manager(mapping, sparse_config,
-                                                model_config, seq_lens, device)
+    kv_cache_manager = _build_kv_cache_manager(
+        mapping, sparse_config, model_config, seq_lens, device
+    )
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
 
     total_tokens = sum(seq_lens)
     num_contexts = len(seq_lens)
-    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype,
-                     device=device)
-    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype,
-                                device=device)
-    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype,
-                        device=device)
+    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-    position_ids = torch.cat([
-        torch.arange(slen, device=device, dtype=torch.int32)
-        for slen in seq_lens
-    ])
-    output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype,
-                          device=device)
+    position_ids = torch.cat(
+        [torch.arange(slen, device=device, dtype=torch.int32) for slen in seq_lens]
+    )
+    output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
@@ -563,20 +577,32 @@ def test_short_mha_boundary_threshold_equals_max_seq():
 
     kv_b_proj_weight = mla.kv_b_proj.weight.data
     ref_output = calculate_reference_output(
-        q_for_ref, compressed_kv_for_ref, k_pe_for_ref, kv_b_proj_weight,
-        rope_cos_sin, seq_lens, NUM_HEADS, KV_LORA_RANK, QK_NOPE_HEAD_DIM,
-        QK_ROPE_HEAD_DIM, V_HEAD_DIM, softmax_scale, device)
+        q_for_ref,
+        compressed_kv_for_ref,
+        k_pe_for_ref,
+        kv_b_proj_weight,
+        rope_cos_sin,
+        seq_lens,
+        NUM_HEADS,
+        KV_LORA_RANK,
+        QK_NOPE_HEAD_DIM,
+        QK_ROPE_HEAD_DIM,
+        V_HEAD_DIM,
+        softmax_scale,
+        device,
+    )
 
     abs_error = (output - ref_output).abs()
     torch.testing.assert_close(output, ref_output, rtol=0.05, atol=0.05)
-    print(f"[boundary_threshold] PASSED: max_error={abs_error.max():.4f}, "
-          f"mean_error={abs_error.mean():.6f}")
+    print(
+        f"[boundary_threshold] PASSED: max_error={abs_error.max():.4f}, "
+        f"mean_error={abs_error.mean():.6f}"
+    )
 
     kv_cache_manager.shutdown()
 
 
-@pytest.mark.skipif(get_sm_version() < 90,
-                    reason="MLA requires SM90 (Hopper) or later")
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
 def test_short_mha_not_triggered_when_seq_exceeds_threshold():
     """Verify that when total packed tokens > threshold, the standard path is used.
 
@@ -586,7 +612,7 @@ def test_short_mha_not_triggered_when_seq_exceeds_threshold():
     correctness, we just confirm the module runs without error and produces
     finite output.
     """
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -596,32 +622,26 @@ def test_short_mha_not_triggered_when_seq_exceeds_threshold():
 
     # Threshold is below total packed tokens — short MHA should NOT trigger.
     threshold = 16
-    mla, mapping, sparse_config, model_config = _build_mla(
-        rope_config, device, threshold)
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
 
-    kv_cache_manager = _build_kv_cache_manager(mapping, sparse_config,
-                                                model_config, seq_lens, device)
+    kv_cache_manager = _build_kv_cache_manager(
+        mapping, sparse_config, model_config, seq_lens, device
+    )
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
 
     total_tokens = sum(seq_lens)
     num_contexts = len(seq_lens)
-    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype,
-                     device=device)
-    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype,
-                                device=device)
-    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype,
-                        device=device)
-    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype,
-                                device=device)
+    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
+    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype, device=device)
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-    position_ids = torch.cat([
-        torch.arange(slen, device=device, dtype=torch.int32)
-        for slen in seq_lens
-    ])
-    output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype,
-                          device=device)
+    position_ids = torch.cat(
+        [torch.arange(slen, device=device, dtype=torch.int32) for slen in seq_lens]
+    )
+    output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
 
     attn_metadata = AttentionCls.Metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
@@ -663,14 +683,15 @@ def test_short_mha_not_triggered_when_seq_exceeds_threshold():
     )
 
     assert torch.isfinite(output).all(), "Output contains non-finite values"
-    print(f"[threshold_exceeded] PASSED: standard path ran without error, "
-          f"output mean={output.abs().mean():.4f}")
+    print(
+        f"[threshold_exceeded] PASSED: standard path ran without error, "
+        f"output mean={output.abs().mean():.4f}"
+    )
 
     kv_cache_manager.shutdown()
 
 
-@pytest.mark.skipif(get_sm_version() < 90,
-                    reason="MLA requires SM90 (Hopper) or later")
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
 def test_short_mha_agrees_with_absorption_path():
     """Compare short MHA path output against the absorption path output.
 
@@ -678,7 +699,7 @@ def test_short_mha_agrees_with_absorption_path():
     This is an A/B test: run the same inputs through both paths and verify
     they agree within tolerance.
     """
-    device = torch.device('cuda')
+    device = torch.device("cuda")
     dtype = torch.bfloat16
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -689,7 +710,8 @@ def test_short_mha_agrees_with_absorption_path():
 
     # Build two MLA instances: one with short MHA, one without.
     mla_short, mapping, sparse_config, model_config = _build_mla(
-        rope_config, device, threshold=total_tokens + 100)
+        rope_config, device, threshold=total_tokens + 100
+    )
     mla_absorption, _, _, _ = _build_mla(rope_config, device, threshold=0)
 
     # Copy weights from short to absorption so they are identical.
@@ -697,44 +719,41 @@ def test_short_mha_agrees_with_absorption_path():
         _init_mla_weights(mla_short)
         # Copy all nn.Module parameters (registered on MLA directly).
         for (name_s, param_s), (name_a, param_a) in zip(
-                mla_short.named_parameters(), mla_absorption.named_parameters()):
+            mla_short.named_parameters(), mla_absorption.named_parameters()
+        ):
             assert name_s == name_a, f"Parameter name mismatch: {name_s} vs {name_a}"
             param_a.data.copy_(param_s.data)
         # mla.mqa is NOT an nn.Module, so named_parameters() above misses the
         # indexer weights. Copy them explicitly so both paths use the same
         # sparse routing (topk_indices).
         for (name_s, param_s), (name_a, param_a) in zip(
-                mla_short.mqa.indexer.named_parameters(),
-                mla_absorption.mqa.indexer.named_parameters()):
+            mla_short.mqa.indexer.named_parameters(), mla_absorption.mqa.indexer.named_parameters()
+        ):
             assert name_s == name_a, f"Indexer param mismatch: {name_s} vs {name_a}"
             param_a.data.copy_(param_s.data)
 
     # Shared KV cache managers (need separate ones since they have state).
     kv_cache_manager_short = _build_kv_cache_manager(
-        mapping, sparse_config, model_config, seq_lens, device)
+        mapping, sparse_config, model_config, seq_lens, device
+    )
     kv_cache_manager_absorption = _build_kv_cache_manager(
-        mapping, sparse_config, model_config, seq_lens, device)
+        mapping, sparse_config, model_config, seq_lens, device
+    )
     AttentionCls = get_attention_backend("TRTLLM", sparse_config)
 
     num_contexts = len(seq_lens)
-    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype,
-                     device=device)
-    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype,
-                                device=device)
-    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype,
-                        device=device)
-    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype,
-                                device=device)
+    q = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
+    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype, device=device)
     qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
     latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
-    position_ids = torch.cat([
-        torch.arange(slen, device=device, dtype=torch.int32)
-        for slen in seq_lens
-    ])
+    position_ids = torch.cat(
+        [torch.arange(slen, device=device, dtype=torch.int32) for slen in seq_lens]
+    )
 
     def _run_forward(mla_module, kv_cache_mgr):
-        output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype,
-                              device=device)
+        output = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
         attn_metadata = AttentionCls.Metadata(
             seq_lens=torch.tensor(seq_lens, dtype=torch.int),
             request_ids=list(range(num_contexts)),
@@ -756,8 +775,8 @@ def test_short_mha_agrees_with_absorption_path():
         # does not use sparse routing, so the indexer can be skipped.
         use_short_mha = (
             mla_module.short_seq_mha_threshold > 0
-            and total_tokens
-            <= mla_module.short_seq_mha_threshold)
+            and total_tokens <= mla_module.short_seq_mha_threshold
+        )
         if use_short_mha:
             topk_indices = None
         else:
@@ -790,10 +809,8 @@ def test_short_mha_agrees_with_absorption_path():
     abs_error = (output_short - output_absorption).abs()
     # Use relaxed tolerance because the two paths use different math
     # (kv_b_proj expansion + SDPA vs absorption BMMs + sparse MLA kernel).
-    torch.testing.assert_close(output_short, output_absorption, rtol=0.15,
-                               atol=0.15)
-    print(f"[a_b_test] PASSED: max_error={abs_error.max():.4f}, "
-          f"mean_error={abs_error.mean():.6f}")
+    torch.testing.assert_close(output_short, output_absorption, rtol=0.15, atol=0.15)
+    print(f"[a_b_test] PASSED: max_error={abs_error.max():.4f}, mean_error={abs_error.mean():.6f}")
 
     kv_cache_manager_short.shutdown()
     kv_cache_manager_absorption.shutdown()

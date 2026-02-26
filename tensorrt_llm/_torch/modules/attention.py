@@ -1079,8 +1079,8 @@ class MLA(nn.Module):
         # attention) instead of the absorption path, which has overhead from
         # extra BMMs and larger head_dim (kv_lora_rank + qk_rope_head_dim).
         # Only active when rope_fusion is True (DSA with TrtllmAttention).
-        _threshold_str = os.environ.get(
-            'TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD', '10240')
+        _threshold_str = os.environ.get('TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD',
+                                        '10240')
         try:
             self.short_seq_mha_threshold = int(_threshold_str)
         except ValueError as err:
@@ -1515,9 +1515,9 @@ class MLA(nn.Module):
 
         # Check if the short-seq MHA path will handle context, in which case
         # the indexer (topk_indices) is not needed for context tokens.
-        use_short_mha_for_ctx = (
-            num_contexts > 0
-            and self._should_use_short_mha(num_ctx_tokens, position_ids))
+        use_short_mha_for_ctx = (num_contexts > 0
+                                 and self._should_use_short_mha(
+                                     num_ctx_tokens, position_ids))
 
         # Skip the indexer entirely when the short MHA path handles all
         # context tokens and there are no generation tokens.
@@ -1554,7 +1554,8 @@ class MLA(nn.Module):
                 attn_metadata,
                 output[:num_ctx_tokens, :],
                 latent_cache_ctx,
-                topk_indices=topk_indices[:num_ctx_tokens, :] if topk_indices is not None else None,
+                topk_indices=topk_indices[:num_ctx_tokens, :]
+                if topk_indices is not None else None,
                 position_ids=position_ids,
             )
 
@@ -1627,10 +1628,8 @@ class MLA(nn.Module):
     def _should_use_short_mha(self, num_ctx_tokens: int,
                               position_ids: Optional[torch.Tensor]) -> bool:
         """Check if the short-seq MHA optimization should be used for context."""
-        return (self.short_seq_mha_threshold > 0
-                and not self.apply_rotary_emb
-                and self.mapping.cp_size == 1
-                and position_ids is not None
+        return (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
+                and self.mapping.cp_size == 1 and position_ids is not None
                 and num_ctx_tokens <= self.short_seq_mha_threshold)
 
     def forward_context_dsa(
@@ -1727,7 +1726,7 @@ class MLA(nn.Module):
         # rope_fusion is True), so q and k_pe arrive WITHOUT RoPE applied.
         trtllm_mqa = cast(TrtllmAttention, self.mqa)
         trtllm_mqa.mla_rope_append_paged_kv_assign_q(q, latent_cache,
-                                                      attn_metadata)
+                                                     attn_metadata)
 
         # Step 2: Apply RoPE to k_pe via the fused compiled helper.
         # position_ids covers all tokens; slice to context tokens only.
@@ -1751,9 +1750,8 @@ class MLA(nn.Module):
 
         # Step 4: Construct full K = [k_nope, k_pe_roped] per head.
         k_nope_r = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        k_pe_expanded = k_pe_roped.view(-1, 1,
-                                        self.qk_rope_head_dim).expand(
-                                            -1, self.num_heads_tp, -1)
+        k_pe_expanded = k_pe_roped.view(-1, 1, self.qk_rope_head_dim).expand(
+            -1, self.num_heads_tp, -1)
         k = maybe_compiled_cat([k_nope_r, k_pe_expanded], dim=-1)
         # k: [num_ctx_tokens, num_heads_tp, qk_head_dim]
 
