@@ -1602,8 +1602,8 @@ class PyExecutor:
     def _can_queue(self, scheduled_batch):
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
-        # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
-        # 1 for dummy request, 1 for the to complete but haven't updated request.
+        # With attention DP, dummy padding ensures scheduled_batch_size >= 1
+        # even when the only active request is GENERATION_TO_COMPLETE.
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
@@ -2734,12 +2734,15 @@ class PyExecutor:
 
         assert self.expected_num_active_requests >= len(self.active_requests)
         if self.kv_cache_transceiver is None:
-            num_active_request = len(self.active_requests)
+            num_active_request = sum(
+                1 for req in self.active_requests
+                if req.state != LlmRequestState.GENERATION_TO_COMPLETE)
         else:
             num_active_request = len([
                 req for req in self.active_requests
                 if not (req.is_disagg_generation_init_state
                         or req.is_disagg_generation_transmission_in_progress)
+                and req.state != LlmRequestState.GENERATION_TO_COMPLETE
             ])
 
         # In benchmark disagg mode the fill loop saturates all slots with INIT
