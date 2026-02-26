@@ -243,6 +243,7 @@ class KVCacheBlock
 {
 public:
     using IdType = std::int32_t;
+    using BaseEvictionPolicy = tensorrt_llm::batch_manager::eviction_policy::BaseEvictionPolicy;
 
     static constexpr IdType kCachedBlocksRootId = -1;
 
@@ -288,8 +289,8 @@ public:
 
     void removeNextBlock(BlockKey const& blockKey);
 
-    void freeDescendantsRecursively();
-    void freeBlockAndAllDescendants();
+    void freeDescendantsRecursively(std::shared_ptr<BaseEvictionPolicy> evictionPolicy);
+    void freeBlockAndAllDescendants(std::shared_ptr<BaseEvictionPolicy> evictionPolicy);
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
     //! blockKey.
@@ -353,9 +354,6 @@ private:
 
     // Next block(s) in sequence(s)
     NextBlockMap mNextBlocks;
-
-    // Iterator pointing to this block in mFreeBlocks.
-    std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
 
     // Flag indicating if block is full
     bool mIsFull;
