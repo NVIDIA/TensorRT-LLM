@@ -36,7 +36,7 @@ Set a sufficiently high  `max_batch_size` when building the engine so that it do
 
 #### `max_seq_len`
 
-`max_seq_len` defines the maximum sequence length of single request​
+`max_seq_len` defines the maximum sequence length of a single request.
 
 Starting from TensorRT LLM v0.11, when `--remove_input_padding` and `--context_fmha` are enabled, `max_seq_len` can replace `max_input_len` and `max_output_len`, and is set to `max_position_embeddings` by default.
 
@@ -58,13 +58,13 @@ sequence batching is enabled, requests in context phase will be executed with
 requests in generation phase. Those latter requests produce a lot fewer tokens
 than `max_input_len` (at most, `beam_width` tokens).
 
-max_num_tokens affects workspace buffer sizes to be allocated as well as one of the matrix multiplication(s) dimension. Hence, Using a more realistic value for `max_num_tokens` allows TensorRT LLM to
+max_num_tokens affects workspace buffer sizes to be allocated as well as one of the matrix multiplication dimensions. Hence, using a more realistic value for `max_num_tokens` allows TensorRT LLM to
 allocate more memory to store the KV cache and execute more requests together.
-It leads to an increased efficiency. 
+It leads to increased efficiency.
 
-GPUs yield higher utilization with larger matrix multiplications. Hence, Increasing `max_num_tokens` appropriately will be beneficial to performance. At some point, GPU utilization will plateau,
+GPUs yield higher utilization with larger matrix multiplications. Hence, increasing `max_num_tokens` appropriately will be beneficial to performance. At some point, GPU utilization will plateau,
 going beyond that saturation point may hurt both first token latency as well as
-total end-to-end latency. In summary, One should select reasonably high max_num_tokens for high token throughput/good GPU math utilization  but not very high in order to meet SLO TTFT (time to first token) and TPOT (Time per output token)
+total end-to-end latency. In summary, one should select reasonably high max_num_tokens for high token throughput/good GPU math utilization but not very high in order to meet SLO TTFT (time to first token) and TPOT (time per output token).
 
 
 ## Chunked Context (a.k.a Chunked Prefill)
