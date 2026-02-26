@@ -40,7 +40,6 @@ import random
 import sys
 import time
 import traceback
-import warnings
 from argparse import ArgumentParser as FlexibleArgumentParser
 from collections.abc import AsyncGenerator
 from dataclasses import dataclass
@@ -52,13 +51,22 @@ import numpy as np
 import yaml
 from tqdm.asyncio import tqdm
 
-AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
+from tensorrt_llm.bench.benchmark.visual_gen_utils import (
+    VisualGenRequestOutput,
+    VisualGenSampleRequest,
+    build_visual_gen_result_dict,
+    calculate_metrics,
+    load_visual_gen_prompts,
+    print_visual_gen_results,
+)
 
-SECONDS_TO_MILLISECONDS = 1000
+AIOHTTP_TIMEOUT = aiohttp.ClientTimeout(total=6 * 60 * 60)
 
 
 @dataclass
 class VisualGenRequestInput:
+    """HTTP request payload for online (server) benchmarking."""
+
     prompt: str
     api_url: str
     model: str
@@ -70,33 +78,6 @@ class VisualGenRequestInput:
     negative_prompt: Optional[str] = None
     seed: Optional[int] = None
     extra_body: Optional[dict] = None
-
-
-@dataclass
-class VisualGenRequestOutput:
-    success: bool = False
-    e2e_latency: float = 0.0
-    ttff: float = -1.0
-    gen_fps: float = -1.0
-    error: str = ""
-    exception_type: Optional[str] = None
-
-
-@dataclass
-class VisualGenBenchmarkMetrics:
-    completed: int
-    total_requests: int
-    request_throughput: float
-    mean_e2e_latency_ms: float
-    median_e2e_latency_ms: float
-    std_e2e_latency_ms: float
-    min_e2e_latency_ms: float
-    max_e2e_latency_ms: float
-    percentiles_e2e_latency_ms: list[tuple[float, float]]
-    num_gpus: int = 1
-    per_gpu_throughput: float = 0.0
-    mean_ttff_ms: float = -1.0
-    mean_gen_fps: float = -1.0
 
 
 def _build_payload_common(request_input: VisualGenRequestInput) -> dict:
@@ -197,11 +178,6 @@ VISUAL_GEN_REQUEST_FUNCS = {
 }
 
 
-@dataclass
-class VisualGenSampleRequest:
-    prompt: str
-
-
 async def get_request(
     input_requests: list[VisualGenSampleRequest],
     request_rate: float,
@@ -216,58 +192,6 @@ async def get_request(
             continue
         interval = np.random.gamma(shape=burstiness, scale=theta)
         await asyncio.sleep(interval)
-
-
-def calculate_metrics(
-    outputs: list[VisualGenRequestOutput],
-    dur_s: float,
-    selected_percentiles: list[float],
-    num_gpus: int = 1,
-) -> VisualGenBenchmarkMetrics:
-    e2e_latencies: list[float] = []
-    error_counts: dict[str, int] = {}
-    completed = 0
-
-    for out in outputs:
-        if out.exception_type:
-            error_counts[out.exception_type] = error_counts.get(out.exception_type, 0) + 1
-        if out.success:
-            e2e_latencies.append(out.e2e_latency)
-            completed += 1
-
-    total_error_count = sum(error_counts.values())
-    for exception_type, count in error_counts.items():
-        print(f"Error type: {exception_type}, Count: {count} requests")
-    if total_error_count:
-        print(f"Total failed requests: {total_error_count}")
-
-    if completed == 0:
-        warnings.warn(
-            "All requests failed. This is likely due to a misconfiguration "
-            "on the benchmark arguments.",
-            stacklevel=2,
-        )
-
-    e2e_ms = [v * SECONDS_TO_MILLISECONDS for v in e2e_latencies]
-
-    request_throughput = completed / dur_s if dur_s > 0 else 0
-    return VisualGenBenchmarkMetrics(
-        completed=completed,
-        total_requests=len(outputs),
-        request_throughput=request_throughput,
-        mean_e2e_latency_ms=float(np.mean(e2e_ms)) if e2e_ms else 0,
-        median_e2e_latency_ms=float(np.median(e2e_ms)) if e2e_ms else 0,
-        std_e2e_latency_ms=float(np.std(e2e_ms)) if e2e_ms else 0,
-        min_e2e_latency_ms=float(np.min(e2e_ms)) if e2e_ms else 0,
-        max_e2e_latency_ms=float(np.max(e2e_ms)) if e2e_ms else 0,
-        percentiles_e2e_latency_ms=[
-            (p, float(np.percentile(e2e_ms, p))) for p in selected_percentiles
-        ]
-        if e2e_ms
-        else [(p, 0.0) for p in selected_percentiles],
-        num_gpus=num_gpus,
-        per_gpu_throughput=request_throughput / num_gpus,
-    )
 
 
 async def benchmark(
@@ -368,100 +292,23 @@ async def benchmark(
         num_gpus=num_gpus,
     )
 
-    _print_results(backend, model_id, benchmark_duration, metrics)
+    print_visual_gen_results(backend, model_id, benchmark_duration, metrics)
 
-    result: dict[str, Any] = {
-        "backend": backend,
-        "model": model_id,
-        "duration": benchmark_duration,
-        "num_gpus": metrics.num_gpus,
-        "total_requests": metrics.total_requests,
-        "completed": metrics.completed,
-        "request_throughput": metrics.request_throughput,
-        "per_gpu_throughput": metrics.per_gpu_throughput,
-        "mean_e2e_latency_ms": metrics.mean_e2e_latency_ms,
-        "median_e2e_latency_ms": metrics.median_e2e_latency_ms,
-        "std_e2e_latency_ms": metrics.std_e2e_latency_ms,
-        "min_e2e_latency_ms": metrics.min_e2e_latency_ms,
-        "max_e2e_latency_ms": metrics.max_e2e_latency_ms,
-        "percentiles_e2e_latency_ms": {
-            f"p{int(p) if int(p) == p else p}": v for p, v in metrics.percentiles_e2e_latency_ms
-        },
-        "e2e_latencies": [out.e2e_latency for out in outputs],
-        "errors": [out.error for out in outputs],
-        "gen_params": gen_params,
-    }
+    result = build_visual_gen_result_dict(
+        backend=backend,
+        model_id=model_id,
+        benchmark_duration=benchmark_duration,
+        metrics=metrics,
+        outputs=outputs,
+        gen_params=gen_params,
+    )
 
     return result
 
 
-def _print_results(
-    backend: str, model_id: str, benchmark_duration: float, metrics: VisualGenBenchmarkMetrics
-):
-    """Print benchmark results to stdout."""
-    print("{s:{c}^{n}}".format(s=" Serving Benchmark Result (VisualGen) ", n=60, c="="))
-    print("{:<40} {:<10}".format("Backend:", backend))
-    print("{:<40} {:<10}".format("Model:", model_id))
-    print("{:<40} {:<10}".format("Total requests:", metrics.total_requests))
-    print("{:<40} {:<10}".format("Successful requests:", metrics.completed))
-    print("{:<40} {:<10}".format("Failed requests:", metrics.total_requests - metrics.completed))
-    print("{:<40} {:<10.2f}".format("Benchmark duration (s):", benchmark_duration))
-    print("{:<40} {:<10.4f}".format("Request throughput (req/s):", metrics.request_throughput))
-    print("{:<40} {:<10}".format("Number of GPUs:", metrics.num_gpus))
-    print("{:<40} {:<10.4f}".format("Per-GPU throughput (req/s/GPU):", metrics.per_gpu_throughput))
-
-    if metrics.total_requests - metrics.completed > 0:
-        print("=" * 60)
-        print(
-            f"  !!! {metrics.total_requests - metrics.completed} "
-            "FAILED REQUESTS - CHECK LOG FOR ERRORS !!!"
-        )
-        print("=" * 60)
-
-    print("{s:{c}^{n}}".format(s=" E2E Latency ", n=60, c="-"))
-    print("{:<40} {:<10.2f}".format("Mean E2E Latency (ms):", metrics.mean_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Median E2E Latency (ms):", metrics.median_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Std Dev E2E Latency (ms):", metrics.std_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Min E2E Latency (ms):", metrics.min_e2e_latency_ms))
-    print("{:<40} {:<10.2f}".format("Max E2E Latency (ms):", metrics.max_e2e_latency_ms))
-    for p, v in metrics.percentiles_e2e_latency_ms:
-        p_word = str(int(p)) if int(p) == p else str(p)
-        print("{:<40} {:<10.2f}".format(f"P{p_word} E2E Latency (ms):", v))
-
-    print("{s:{c}^{n}}".format(s=" Placeholder Metrics ", n=60, c="-"))
-    print("{:<40} {:<10}".format("TTFF (ms):", "N/A (placeholder)"))
-    print("{:<40} {:<10}".format("GenFPS:", "N/A (placeholder)"))
-    print("=" * 60)
-
-
 def load_prompts(args: argparse.Namespace) -> list[VisualGenSampleRequest]:
-    """Load prompts from --prompt or --prompt-file."""
-    prompts: list[str] = []
-
-    if args.prompt_file:
-        with open(args.prompt_file, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    data = json.loads(line)
-                    prompts.append(data.get("text", data.get("prompt", line)))
-                except json.JSONDecodeError:
-                    prompts.append(line)
-    elif args.prompt:
-        prompts.append(args.prompt)
-    else:
-        raise ValueError("Either --prompt or --prompt-file must be specified.")
-
-    num_prompts = args.num_prompts
-    if len(prompts) < num_prompts:
-        repeats = (num_prompts // len(prompts)) + 1
-        prompts = (prompts * repeats)[:num_prompts]
-    else:
-        prompts = prompts[:num_prompts]
-
-    return [VisualGenSampleRequest(prompt=p) for p in prompts]
+    """Load prompts from --prompt or --prompt-file (delegates to shared util)."""
+    return load_visual_gen_prompts(args.prompt, args.prompt_file, args.num_prompts)
 
 
 def _resolve_num_gpus(args: argparse.Namespace) -> int:
