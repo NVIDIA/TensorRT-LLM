@@ -29,6 +29,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
 
 import tensorrt_llm
 import tensorrt_llm.profiler
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 
@@ -314,6 +315,7 @@ def print_output(tokenizer,
 
 
 def main(args):
+    emit_engine_arch_deprecation("run.py")
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
 

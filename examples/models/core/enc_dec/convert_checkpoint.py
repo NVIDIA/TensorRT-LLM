@@ -18,13 +18,12 @@ from transformers import (AutoModelForSeq2SeqLM, Blip2ForConditionalGeneration,
                           Pix2StructForConditionalGeneration,
                           T5ForConditionalGeneration, VisionEncoderDecoderModel)
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.functional import (LayerNormPositionType, LayerNormType,
                                      MLPType)
 from tensorrt_llm.layers import LanguageAdapterConfig
 from tensorrt_llm.models import PretrainedConfig
-
-from examples._deprecation import emit_engine_arch_deprecation
 
 dir_path = os.path.dirname(os.path.realpath(__file__))
 LOGGER = logging.getLogger(__name__)

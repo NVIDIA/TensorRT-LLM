@@ -1,5 +1,11 @@
 # Command R
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document explains how to build the [C4AI Command-R](https://huggingface.co/CohereForAI/c4ai-command-r-v01), [C4AI Command R+](https://huggingface.co/CohereForAI/c4ai-command-r-plus), [Aya-23-8B](https://huggingface.co/CohereForAI/aya-23-8B), [Aya-23-35B](https://huggingface.co/CohereForAI/aya-23-35B) models using TensorRT LLM and run on a single GPU or a single node with multiple GPUs.
 
 - [Command R](#Command-R)

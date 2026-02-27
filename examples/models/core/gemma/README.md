@@ -1,5 +1,11 @@
 # Run Gemma on TensorRT-LLM
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 ## Table Of Contents
 
 - [Run Gemma on TensorRT-LLM](#run-gemma-on-tensorrt-llm)

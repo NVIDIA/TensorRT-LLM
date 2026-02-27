@@ -29,6 +29,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, add_common_args, get_beam_width_array,
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import mpi_broadcast, str_dtype_to_torch
 from tensorrt_llm.builder import EngineConfig
 from tensorrt_llm.functional import RopeEmbeddingUtils, RotaryScalingType
@@ -81,6 +82,7 @@ def ensemble_mrope_params(batch_input_ids, max_position_embeddings,
 
 
 def main(args):
+    emit_engine_arch_deprecation("summarize.py")
     is_integration_test = os.getenv('INTEGRATION_TEST', '0') == '1'
     if is_integration_test:
         logger.info(

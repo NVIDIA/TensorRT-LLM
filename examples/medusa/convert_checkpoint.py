@@ -12,6 +12,7 @@ from transformers import (LlamaConfig, LlamaForCausalLM, LlamaTokenizer,
                           Qwen2Config)
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import numpy_to_torch
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -179,6 +180,7 @@ def parse_arguments():
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.fastertransformer.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert

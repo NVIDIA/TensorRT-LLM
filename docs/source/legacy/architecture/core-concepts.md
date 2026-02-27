@@ -2,6 +2,11 @@
 
 # Model Definition
 
+> [!WARNING]
+> This page describes the **legacy** TensorRT engine-build workflow.
+> For new projects, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 TensorRT-LLM has a Model Definition API that can be used to define
 Large Language Models. This API is built on top of the powerful
 [TensorRT Python API](https://docs.nvidia.com/deeplearning/tensorrt/latest/_static/python-api/index.html)

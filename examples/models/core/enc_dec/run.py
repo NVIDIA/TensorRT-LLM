@@ -25,6 +25,7 @@ from transformers import (AutoConfig, AutoModelForSeq2SeqLM, AutoTokenizer,
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.runtime import EncDecModelRunner
 
 
@@ -309,6 +310,7 @@ def output_npy(args, tokenized_inputs, tllm_output, output_ids):
 if __name__ == "__main__":
     import os
 
+    emit_engine_arch_deprecation("run.py")
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     args = parse_arguments()
     logger.set_level(args.log_level)
