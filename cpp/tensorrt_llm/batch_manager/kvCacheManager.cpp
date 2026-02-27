@@ -178,7 +178,8 @@ bool BlockKey::operator==(BlockKey const& other) const noexcept
 
 BlockKey BlockKey::shorten(int newNumTokens) const
 {
-    TLLM_CHECK_WITH_INFO(newNumTokens >= 0 && newNumTokens <= getNumTokens(), "newNumTokens must be >= 0 and <= getNumTokens()");
+    TLLM_CHECK_WITH_INFO(
+        newNumTokens >= 0 && newNumTokens <= getNumTokens(), "newNumTokens must be >= 0 and <= getNumTokens()");
     BlockKey result(*this);
     result.uniqueTokens.resize(newNumTokens);
     return result;
