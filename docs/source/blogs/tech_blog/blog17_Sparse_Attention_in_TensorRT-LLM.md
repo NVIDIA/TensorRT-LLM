@@ -123,7 +123,7 @@ Figure 1 summarizes how these components work together along the request path. I
 
 The prediction module is the heart of the framework. Its job is to turn model inputs and internal states into sparse indices that describe which tokens or blocks matter most. Different sparse attention algorithms use different predictors (heuristics, learned indexers, or model-native modules), but they all emit standardized indices with a shared meaning.
 
-The most important output is `sparse_attn_indices`, which specify which KV entries the attention operator should read during generation. These indices are the contract between prediction and `AttentionOp`, and they come in two granularities: **page-level** (used by MQA/MHA/GQA) and **token-level** (used by MLA). Today TensorRT LLM supports page-level sparse attention for MQA/MHA/GQA and token-level sparse attention for MLA; finer-grained support for MQA/MHA/GQA remains future work.
+The first is `sparse_attn_indices`, which specify which KV entries the attention operator should read during generation. These indices are the contract between prediction and `AttentionOp`, and they come in two granularities: **page-level** (used by MQA/MHA/GQA) and **token-level** (used by MLA). Today TensorRT LLM supports page-level sparse attention for MQA/MHA/GQA and token-level sparse attention for MLA; finer-grained support for MQA/MHA/GQA remains future work.
 
 The second is `sparse_kv_indices`, which indicate which tokens to keep in the KV cache after the context phase. Different KV heads can have different retention patterns, providing fine-grained control over what information is preserved.
 
@@ -168,7 +168,7 @@ Most practical sparse attention algorithms need **auxiliary memory** beyond the 
 
 TensorRT LLM currently provides two KV cache manager implementations: `KVCacheManager`, which is primarily implemented in C++, and `KVCacheManagerV2`, which is primarily implemented in Python. We recommend that developers prioritize `KVCacheManagerV2` for new integrations, as it offers several advantages for managing complex memory pool configurations.
 
-**KVCacheManagerV2** is designed around a flexible, hierarchical storage model. Its key strength is the ability to support **heterogeneous memory pools across layers**: different layers can have pools of different types and sizes, which is essential for sparse attention algorithms that attach auxiliary buffers (such as KT caches or indexer K caches) alongside standard KV data. Under the hood, KVCacheManagerV2 groups layers by their *lifecycle* (eviction strategy and buffer configuration) and automatically coalesces buffers of the same size within each group. Layers with identical lifecycle configurations share the same pool group, and slots within a pool group are allocated and freed in lockstep across all constituent pools. This automatic coalescing minimizes memory fragmentation even in complex multi-pool scenarios—for instance, when a model has both full-attention layers and sliding-window layers, or when auxiliary caches have different sizes from the main KV buffers. The trade-off is a modest amount of management overhead compared with a monolithic, fixed-layout allocator, but this cost is negligible in practice and well justified by the gains in flexibility and reduced fragmentation. KVCacheManagerV2 also provides a clean Python API for defining custom `AttentionLayerConfig` and `BufferConfig` per layer, making it straightforward to extend the memory layout for new sparse attention algorithms without touching the C++ runtime. We have new sparse attention which is in developing is using KVCacheManagerV2 to manage the required buffers.
+**KVCacheManagerV2** is designed around a flexible, hierarchical storage model. Its key strength is the ability to support **heterogeneous memory pools across layers**: different layers can have pools of different types and sizes, which is essential for sparse attention algorithms that attach auxiliary buffers (such as KT caches or indexer K caches) alongside standard KV data. Under the hood, KVCacheManagerV2 groups layers by their *lifecycle* (eviction strategy and buffer configuration) and automatically coalesces buffers of the same size within each group. Layers with identical lifecycle configurations share the same pool group, and slots within a pool group are allocated and freed in lockstep across all constituent pools. This automatic coalescing minimizes memory fragmentation even in complex multi-pool scenarios—for instance, when a model has both full-attention layers and sliding-window layers, or when auxiliary caches have different sizes from the main KV buffers. The trade-off is a modest amount of management overhead compared with a monolithic, fixed-layout allocator, but this cost is negligible in practice and well justified by the gains in flexibility and reduced fragmentation. KVCacheManagerV2 also provides a clean Python API for defining custom `AttentionLayerConfig` and `BufferConfig` per layer, making it straightforward to extend the memory layout for new sparse attention algorithms without touching the C++ runtime. We plan to use KVCacheManagerV2 to support new sparse attention in the future.
 
 For `KVCacheManager`, which is the manager currently used by the existing sparse attention algorithms, TensorRT LLM supports two approaches for managing auxiliary memory:
 
@@ -176,7 +176,7 @@ For `KVCacheManager`, which is the manager currently used by the existing sparse
 
 **C++ integrated managers shared with `KVCacheManagerCpp`**. Here, auxiliary memory is integrated directly into the C++ KV cache manager, gaining access to the full set of KV cache features including reuse and transmission between engines. This path is well suited for production, long-lived deployments, but is significantly more complex to implement—there is currently no generic plugin-style interface for custom pools, so each algorithm needs its own integration. DSA's indexer K cache follows this approach.
 
-As a rule of thumb, we recommend starting with Python-level managers when experimenting with new ideas, and moving to a C++-integrated design once the algorithm is stable and you need advanced features like KV cache reuse at scale.
+As a rule of thumb, we recommend prioritizing `KVCacheManagerV2` for new integrations; if you must build on `KVCacheManager`, start with Python-level managers when experimenting with new ideas, and migrate to a C++-integrated design once the algorithm is stable and you need advanced features like KV cache reuse at scale.
 
 ## Algorithm Implementations
 
@@ -184,7 +184,7 @@ In this section, we walk through the three sparse attention algorithms currently
 
 ### RocketKV
 
-#### Overview
+#### Introduction
 
 RocketKV is a training-free, two-stage sparse attention method that reduces the KV cache bottleneck in long-context LLM inference. In the **context phase**, it performs permanent KV cache eviction, selecting and retaining only a `prompt_budget` of the most important tokens based on attention scores. In the **generation phase**, it maintains a lightweight, compressed auxiliary cache (KT Cache) to dynamically predict which tokens are most relevant for each new query, loading only those tokens for attention computation.
 
@@ -199,9 +199,7 @@ For more technical details, please refer to the paper: [RocketKV: Accelerating L
 
 #### How It Works in TensorRT LLM
 
-Within TensorRT LLM, RocketKV is integrated as a specialized sparse attention backend, accessible via the standard LLM API.
-
-Directly adapting the original research implementation to a production inference engine required addressing several practical limitations. The original code only supported a batch size of one, stored the auxiliary KT Cache as a single monolithic tensor (severely limiting system throughput), and relied on standard PyTorch operations for prediction steps (introducing significant latency). To address these issues, we implemented the following optimizations.
+Within TensorRT LLM, RocketKV is integrated as a specialized sparse attention backend, accessible via the standard LLM API. Below we highlight the key design choices in prediction, operator integration, and memory management that make this integration performant and scalable.
 
 **Prediction module.** We provide two backend implementations—`RocketVanillaAttention` and `RocketTrtllmAttention`—which inherit from `VanillaAttention` and `TrtllmAttention`, respectively. At runtime, the system dispatches to the appropriate backend based on the user-specified `attention_backend` and `sparse_config`. Within each backend, the core work centers on implementing `sparse_kv_predict` and `sparse_attn_predict`, which produce `sparse_kv_indices` and `sparse_attn_indices` as described earlier.
 
@@ -224,7 +222,7 @@ The concrete implementation can be found in `tensorrt_llm/_torch/attention_backe
 
 ### DeepSeek Sparse Attention (DSA)
 
-#### Overview
+#### Introduction
 
 DeepSeek Sparse Attention (DSA) is a model-native sparse attention mechanism introduced with [DeepSeek V3.2](https://api-docs.deepseek.com/news/news251201). Unlike RocketKV, which is a training-free technique applicable to standard attention architectures, DSA is an architectural modification that uses a learned indexer for fine-grained token-level sparse MLA computation.
 
@@ -356,5 +354,5 @@ The framework's design ensures that new sparse attention algorithms can be integ
 - **Sparse Computation in Context Phase**: We plan to introduce sparse computation support for the context phase for MQA/MHA/GQA, allowing the framework to cover a broader range of scenarios.
 - **Dynamic Eviction in Generation Phase**: Dynamically evicting KV cache blocks during the generation phase poses significant challenges to KV cache flexibility. Block-level eviction appears to be a promising compromise and is under further exploration.
 - **Unified Auxiliary Memory Management**: We are exploring a unified mechanism to manage auxiliary memory pools. This would allow users to define custom auxiliary spaces more flexibly while automatically inheriting advanced features from the KV cache, such as reuse and offloading.
-- **Fine-grained Sparsity and Feature Integration**: We are pursuing fine-grained token-level sparse computation for MQA/MHA/GQA, and deeper integration with advanced features like Disaggregated Serving and MTP.
+- **Fine-grained Sparsity and Feature Integration**: We are pursuing fine-grained token-level sparse computation for MQA/MHA/GQA, and deeper integration with advanced features like Disaggregated Serving, chunked prefill or KV cache reuse.
 - **Code Refactoring**: As more sparse attention algorithms are integrated, the framework will undergo refactoring to unify code and improve maintainability.
