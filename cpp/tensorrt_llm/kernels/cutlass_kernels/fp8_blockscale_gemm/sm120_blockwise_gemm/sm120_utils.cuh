@@ -104,9 +104,10 @@ struct SM120BlockScaledBuilder
         auto N = cute::get<1>(problem_shape);
         auto K = cute::get<2>(problem_shape);
         auto L = cute::get<3>(problem_shape);
-        auto scale_m = get_tma_aligned_size(M);
-        auto scale_k = ceil_div(K, 128 * 4);
-        return make_ordered_layout(make_shape(scale_m, scale_k, L), Step<_1, _2, _3>{});
+        int64_t scale_m = static_cast<int64_t>(get_tma_aligned_size(M));
+        int64_t scale_k = static_cast<int64_t>(ceil_div(K, 128 * 4));
+        return make_layout(
+            make_shape(scale_m, scale_k, L), make_stride(Int<1>{}, scale_m, scale_m * scale_k)); // column major
     }
 
     CUTE_HOST_DEVICE
@@ -116,9 +117,10 @@ struct SM120BlockScaledBuilder
         auto N = cute::get<1>(problem_shape);
         auto K = cute::get<2>(problem_shape);
         auto L = cute::get<3>(problem_shape);
-        auto scale_n = get_tma_aligned_size(N);
-        auto scale_k = ceil_div(K, 128 * 4);
-        return make_ordered_layout(make_shape(scale_n, scale_k, L), Step<_1, _2, _3>{});
+        int64_t scale_n = static_cast<int64_t>(get_tma_aligned_size(N));
+        int64_t scale_k = static_cast<int64_t>(ceil_div(K, 128 * 4));
+        return make_layout(
+            make_shape(scale_n, scale_k, L), make_stride(Int<1>{}, scale_n, scale_n * scale_k)); // column major
     }
 
     template <class SFATensor, class Atom, class TiledThr, class TiledPerm>
@@ -260,15 +262,15 @@ struct SM120BlockScaledBuilder
         make_shape(shape<1>(TileShape{}), shape<2>(TileShape{}), Int<AB_Stages>{}), Step<_1, _2, _3>{}));
 
     // ====== TMA config ======
-    using StrideA = Stride<int32_t, Int<1>, int32_t>;
-    using StrideB = Stride<int32_t, Int<1>, int32_t>;
+    using StrideA = Stride<int64_t, Int<1>, int64_t>;
+    using StrideB = Stride<int64_t, Int<1>, int64_t>;
 
     using TMA_A = decltype(make_tma_copy(SM90_TMA_LOAD{},
-        make_tensor(recast_ptr<ElementA>(nullptr), repeat_like(StrideA{}, int32_t(0)), StrideA{}),
+        make_tensor(recast_ptr<ElementA>(nullptr), repeat_like(StrideA{}, int64_t(0)), StrideA{}),
         SmemLayoutA{}(_, _, Int<0>{}), make_shape(shape<0>(TileShape{}), shape<2>(TileShape{})), _1{}));
 
     using TMA_B = decltype(make_tma_copy(SM90_TMA_LOAD{},
-        make_tensor(recast_ptr<ElementB>(nullptr), repeat_like(StrideB{}, int32_t(0)), StrideB{}),
+        make_tensor(recast_ptr<ElementB>(nullptr), repeat_like(StrideB{}, int64_t(0)), StrideB{}),
         SmemLayoutB{}(_, _, Int<0>{}), make_shape(shape<1>(TileShape{}), shape<2>(TileShape{})), _1{}));
 
     // ====== scale ======
@@ -284,16 +286,16 @@ struct SM120BlockScaledBuilder
     using SmemLayoutSFB = decltype(tile_to_shape(SmemLayoutAtomSFB{},
         make_shape(shape<1>(ScaleTileShape{}), shape<2>(ScaleTileShape{}), Int<SF_Stages>{}), Step<_1, _2, _3>{}));
 
-    using StrideSFA = Stride<Int<1>, int32_t, int32_t>; // column major
-    using StrideSFB = Stride<Int<1>, int32_t, int32_t>; // column major
+    using StrideSFA = Stride<Int<1>, int64_t, int64_t>; // column major
+    using StrideSFB = Stride<Int<1>, int64_t, int64_t>; // column major
 
     using TMA_SFA = decltype(make_tma_copy(SM90_TMA_LOAD{},
-        make_tensor(recast_ptr<ElementSFLoad>(nullptr), repeat_like(StrideSFA{}, int32_t(0)), StrideSFA{}),
+        make_tensor(recast_ptr<ElementSFLoad>(nullptr), repeat_like(StrideSFA{}, int64_t(0)), StrideSFA{}),
         SmemLayoutSFA{}(_, _, cute::Int<0>{}), make_shape(shape<0>(ScaleTileShape{}), shape<2>(ScaleTileShape{})),
         _1{}));
 
     using TMA_SFB = decltype(make_tma_copy(SM90_TMA_LOAD{},
-        make_tensor(recast_ptr<ElementSFLoad>(nullptr), repeat_like(StrideSFB{}, int32_t(0)), StrideSFB{}),
+        make_tensor(recast_ptr<ElementSFLoad>(nullptr), repeat_like(StrideSFB{}, int64_t(0)), StrideSFB{}),
         SmemLayoutSFB{}(_, _, cute::Int<0>{}), make_shape(shape<1>(ScaleTileShape{}), shape<2>(ScaleTileShape{})),
         _1{}));
 
@@ -309,7 +311,7 @@ struct SM120BlockScaledBuilder
     static constexpr uint32_t TmaSFTransactionBytes = TmaTransactionBytesSFA + TmaTransactionBytesSFB;
 
     // ====== TMA store ======
-    using StrideD = Stride<int32_t, Int<1>, int32_t>;
+    using StrideD = Stride<int64_t, Int<1>, int64_t>;
     using EpilogueTile_MN = Shape<Int<kTileM>, Int<kTileN>>;
 
     using CopyAtomC = Copy_Atom<SM90_U32x2_STSM_N, cutlass::half_t>;
@@ -323,7 +325,7 @@ struct SM120BlockScaledBuilder
     using CopyOpR2S = SM90_U32x2_STSM_N;
     using CopyOpS2G = SM90_TMA_STORE;
     using TMA_D = decltype(make_tma_copy_C_sm90(CopyOpS2G{},
-        make_tensor(make_gmem_ptr(static_cast<ElementD*>(nullptr)), repeat_like(StrideD{}, int32_t(0)), StrideD{}),
+        make_tensor(make_gmem_ptr(static_cast<ElementD*>(nullptr)), repeat_like(StrideD{}, int64_t(0)), StrideD{}),
         take<0, 2>(SmemLayoutD{}), EpilogueTile_MN{}));
 
     struct SharedStorageLoad : cute::aligned_struct<128, _0>
