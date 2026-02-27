@@ -19,5 +19,5 @@ TEST_F(BlockKeyTest, PartialMatch)
     auto ptr = reinterpret_cast<char*>(bk1.uniqueTokens.data());
     std::fill(ptr, ptr + bk1.uniqueTokens.capacity() * sizeof(UniqueToken), 0);
 
-    EXPECT_EQ(bk0.partialMatch(bk1), 1);
+    EXPECT_EQ(bk0.numMatchingTokens(bk1), 1);
 }
