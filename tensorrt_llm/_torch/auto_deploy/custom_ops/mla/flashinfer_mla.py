@@ -636,13 +636,6 @@ def flashinfer_mla_with_cache(
             # Expand compressed_kv to K, V and use ragged attention
             # =================================================================
 
-            # Cast to compute dtype if needed (e.g. when KV cache uses FP8)
-            compute_dtype = q_nope.dtype
-            if compressed_kv_prefill.dtype != compute_dtype:
-                compressed_kv_prefill = compressed_kv_prefill.to(compute_dtype)
-            if kpe_prefill.dtype != compute_dtype:
-                kpe_prefill = kpe_prefill.to(compute_dtype)
-
             # Expand compressed_kv using kv_b_proj_weight to get k_nope and v
             # compressed_kv: [num_prefill_tokens, kv_lora_rank]
             # kv_b_proj_weight: [N * (qk_nope_head_dim + v_head_dim), kv_lora_rank]

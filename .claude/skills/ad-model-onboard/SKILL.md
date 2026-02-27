@@ -16,12 +16,11 @@ python -c "import transformers; print(transformers.__file__)"
 ```
 Look for `models/{model_type}/modeling_*.py` under that path. If found, use it directly — no network needed.
 
-**Step 2 — If not found, clone the HF repo (code only, skip weights):**
+**Step 2 — If not found, download the HF repo (code only, skip weights):**
 ```bash
-CLONE_DIR="$PWD/tmp_ad_onboard_{model_name}"
-GIT_LFS_SKIP_SMUDGE=1 git clone --depth 1 https://huggingface.co/{org}/{model} "$CLONE_DIR"
+huggingface-cli download {org}/{model} --exclude "*.safetensors" "*.bin" "*.pt" "*.gguf"
 ```
-`GIT_LFS_SKIP_SMUDGE=1` skips LFS blobs (model weights, binaries) so only code/config files are downloaded. This is far faster and safer than fetching individual files. Once cloned you can work fully offline — read `config.json` and `modeling_*.py` directly from `$CLONE_DIR`.
+This downloads config, code, and tokenizer files into the standard HF cache (`$HF_HOME` or `~/.cache/huggingface/`) while skipping large weight files. Files cached here are automatically found by `transformers.AutoConfig.from_pretrained` and similar APIs — no extra path wiring needed. Once downloaded you can work fully offline — read `config.json` and `modeling_*.py` from the cache snapshot directory printed by the command.
 
 ## Phase 1 — Analyze HF Model
 Study the locally-available `config.json` and `modeling_*.py` (NOT from `tensorrt_llm/_torch/models/`). Identify attention type (MHA/GQA/MLA), MoE config, RoPE variant, normalization, activation, and any data-dependent ops that break `torch.export` (e.g. `torch.nonzero`, data-conditioned `if`).
