@@ -413,12 +413,12 @@ class Qwen35GdnMixedQuantModel(TestModel):
         self.num_heads = num_heads
         self.head_dim = head_dim
 
-        # FP8 quantized projections
+        # FP8 quantized projections (handle dtype internally via custom op)
         self.in_proj_qkv = FakeFP8Linear(hidden, qkv_dim, bias=False)
         self.in_proj_z = FakeFP8Linear(hidden, z_dim, bias=False)
-        # bf16 projections
-        self.in_proj_b = nn.Linear(hidden, num_heads, bias=False)
-        self.in_proj_a = nn.Linear(hidden, num_heads, bias=False)
+        # bf16 projections (cast to half to match FP8 input dtype)
+        self.in_proj_b = nn.Linear(hidden, num_heads, bias=False).half()
+        self.in_proj_a = nn.Linear(hidden, num_heads, bias=False).half()
 
     def get_input(self, **kwargs) -> torch.Tensor:
         return torch.randn(self.batch_size, self.seq_len, self.hidden, **kwargs)
