@@ -1,6 +1,7 @@
+max_batch_size: 256
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 256
+  max_batch_size: 16
 enable_attention_dp: true
 print_iter_log: true
 kv_cache_config:
