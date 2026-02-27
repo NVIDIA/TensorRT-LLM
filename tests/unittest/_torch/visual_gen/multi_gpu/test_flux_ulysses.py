@@ -135,7 +135,7 @@ _FLUX2_TEST_CONFIG = dict(
 )
 
 
-def _make_model_config(pretrained_dict, ulysses_size=1):
+def _make_model_config(pretrained_dict, ulysses_size=1, backend="VANILLA"):
     """Create DiffusionModelConfig for testing."""
     pretrained_config = SimpleNamespace(**pretrained_dict)
     parallel = ParallelConfig(dit_ulysses_size=ulysses_size)
@@ -144,7 +144,7 @@ def _make_model_config(pretrained_dict, ulysses_size=1):
         pretrained_config=pretrained_config,
         quant_config=QuantConfig(),
         torch_compile=TorchCompileConfig(enable_torch_compile=False),
-        attention=AttentionConfig(backend="VANILLA"),
+        attention=AttentionConfig(backend=backend),
         parallel=parallel,
         teacache=TeaCacheConfig(),
         skip_create_weights_in_init=False,
@@ -406,6 +406,79 @@ def _logic_flux2_ulysses_vs_single_gpu(rank, world_size):
 
 
 # =============================================================================
+# FLUX.2 TRTLLM backend test (fused QKV A2A path)
+# =============================================================================
+
+
+def _logic_flux2_ulysses_trtllm_vs_vanilla(rank, world_size):
+    """FLUX.2: TRTLLM backend (fused 5D A2A) matches VANILLA backend (unfused 4D A2A).
+
+    When UlyssesAttention wraps TRTLLM, it auto-selects the fused path
+    (stack → all_to_all_5d → direct fused passthrough). This test validates
+    the fused path produces the same results as the unfused VANILLA path.
+    """
+    from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux2 import Flux2Transformer2DModel
+
+    device = torch.device(f"cuda:{rank}")
+    compute_dtype = torch.bfloat16
+
+    batch = 1
+    img_seq = 16
+    txt_seq = 8
+
+    # Create VANILLA reference model
+    torch.manual_seed(123)
+    vanilla_config = _make_model_config(
+        _FLUX2_TEST_CONFIG, ulysses_size=world_size, backend="VANILLA"
+    )
+    vanilla_model = Flux2Transformer2DModel(vanilla_config).to(device).to(compute_dtype)
+    _stabilize_model_weights(vanilla_model)
+    shared_state = vanilla_model.state_dict()
+
+    # Create TRTLLM model with same weights (uses fused 5D A2A)
+    torch.manual_seed(123)
+    trtllm_config = _make_model_config(
+        _FLUX2_TEST_CONFIG, ulysses_size=world_size, backend="TRTLLM"
+    )
+    trtllm_model = Flux2Transformer2DModel(trtllm_config).to(device).to(compute_dtype)
+    trtllm_model.load_state_dict(shared_state)
+
+    # Same inputs on all ranks
+    torch.manual_seed(456)
+    hidden_states = torch.randn(batch, img_seq, 128, device=device, dtype=compute_dtype) * 0.1
+    encoder_hidden_states = (
+        torch.randn(batch, txt_seq, 256, device=device, dtype=compute_dtype) * 0.1
+    )
+    timestep = torch.tensor([0.5], device=device, dtype=compute_dtype)
+    img_ids = torch.randn(img_seq, 4, device=device)
+    txt_ids = torch.randn(txt_seq, 4, device=device)
+
+    with torch.no_grad():
+        vanilla_output = vanilla_model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+        )
+        trtllm_output = trtllm_model(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            timestep=timestep,
+            img_ids=img_ids,
+            txt_ids=txt_ids,
+        )
+
+    torch.testing.assert_close(
+        trtllm_output["sample"],
+        vanilla_output["sample"],
+        rtol=1e-2,
+        atol=1e-2,
+        msg=f"Rank {rank}: FLUX.2 TRTLLM (fused 5D A2A) differs from VANILLA (unfused 4D A2A)",
+    )
+
+
+# =============================================================================
 # Test classes
 # =============================================================================
 
@@ -432,6 +505,10 @@ class TestFlux2Ulysses:
     def test_flux2_ulysses_vs_single_gpu(self):
         """FLUX.2 Ulysses 2-GPU output matches single-GPU reference."""
         run_test_in_distributed(world_size=2, test_fn=_logic_flux2_ulysses_vs_single_gpu)
+
+    def test_flux2_ulysses_trtllm_vs_vanilla(self):
+        """FLUX.2 TRTLLM fused 5D A2A matches VANILLA unfused 4D A2A."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_flux2_ulysses_trtllm_vs_vanilla)
 
 
 if __name__ == "__main__":
