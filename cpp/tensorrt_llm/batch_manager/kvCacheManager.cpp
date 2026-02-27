@@ -1252,8 +1252,8 @@ SizeType32 WindowBlockManager::countReusableBlocks(
         searchRoot = std::move(matchingBlock);
     }
 
-    TLLM_LOG_DEBUG("%s::countReusableBlocks - Found %d reusable blocks (onlyAllocated=%d)",
-        mLogPrefix.c_str(), reusableBlocks, onlyAllocated);
+    TLLM_LOG_DEBUG("%s::countReusableBlocks - Found %d reusable blocks (onlyAllocated=%d)", mLogPrefix.c_str(),
+        reusableBlocks, onlyAllocated);
     return reusableBlocks;
 }
 

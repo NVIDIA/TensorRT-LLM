@@ -5992,9 +5992,9 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
     // getRemainingBlocksToCompletion must NOT subtract free reusable blocks.
     // Needs all 5 context + 3 generation = 8 blocks.
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
-    auto const numContextBlocks = promptLength / tokensPerBlock;  // 5 blocks
-    auto const numGenBlocks = maxNewTokens / tokensPerBlock;      // 3 blocks
-    EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);        // 5 context + 3 generation = 8
+    auto const numContextBlocks = promptLength / tokensPerBlock; // 5 blocks
+    auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 3 blocks
+    EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);       // 5 context + 3 generation = 8
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
