@@ -2281,13 +2281,9 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract only reusable blocks that are already allocated (have active refs from another
-        // sequence). Sharing an allocated block doesn't consume from the free pool. We must NOT
-        // subtract free reusable blocks (blocks cached in the radix tree but without active refs),
-        // because those are already counted in the eviction policy's free block count — subtracting
-        // them would double-count (once as reducing demand, once as inflating supply), causing the
-        // scheduler to over-admit requests and leading to "No free block found" errors.
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv())
+        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
+        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
+            && !req.isDisaggGenerationInitState())
         {
             auto const uniqueTokens = req.getUniqueTokens(0);
             auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
@@ -2295,7 +2291,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
-            req.setEstimatedReusableTokens(numReusableBlocks * getTokensPerBlock());
+            req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
     }
@@ -2374,7 +2370,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
         numReusableContextBlocks = std::min(numReusableBlocks, numContextBlocks);
         // Store on request so the micro batch scheduler can use it for token budget
-        req.setEstimatedReusableTokens(numReusableBlocks * getTokensPerBlock());
+        req.setEstimatedReusableTokens(numReusableContextBlocks * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, numReusableBlocks=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
