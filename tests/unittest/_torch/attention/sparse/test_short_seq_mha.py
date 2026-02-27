@@ -17,8 +17,8 @@ Test suite for the short-sequence MHA optimization path in MLA.
 
 When TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD is set and the total number of
 packed context tokens is within the threshold, MLA.forward_context_dsa
-dispatches to forward_context_short_mha which uses dense MHA (kv_b_proj
-expansion + SDPA) instead of the absorption path.
+dispatches to forward_context_default which uses dense MHA (kv_b_proj
+expansion + standard attention) instead of the absorption path.
 """
 
 import math
@@ -84,13 +84,13 @@ def calculate_reference_output(
     softmax_scale,
     device,
 ):
-    """Reference implementation using kv_b_proj expansion + SDPA.
+    """Reference implementation using kv_b_proj expansion + causal SDPA.
 
-    This mirrors forward_context_short_mha:
+    This mirrors the short-seq MHA path (forward_context_default):
     1. Apply RoPE to q (rope portion) and k_pe.
     2. Expand compressed_kv via kv_b_proj to get k_nope and v.
     3. Construct K = [k_nope, RoPE(k_pe)] per head.
-    4. Run causal SDPA per sequence.
+    4. Run causal attention per sequence.
     """
     qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
     results = []
@@ -295,7 +295,7 @@ def _init_mla_weights(mla):
     i.e. rows 0..num_heads*qk_nope-1 are k_nope weights for all heads, and
     rows num_heads*qk_nope..end are v weights for all heads.
 
-    This layout is what forward_context_short_mha expects when it does:
+    This layout is what forward_context_default expects when it does:
         kv.split([num_heads * qk_nope, num_heads * v], dim=-1)
     """
     with torch.no_grad():
@@ -376,11 +376,11 @@ def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, devi
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
 @pytest.mark.parametrize("batch_name,seq_lens", BATCH_SPECS, ids=[b[0] for b in BATCH_SPECS])
 def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
-    """Test that forward_context_short_mha produces correct attention output.
+    """Test that the short-seq MHA path produces correct attention output.
 
-    Compares the output of the short-seq MHA path against a standalone
-    reference implementation that performs the same math: kv_b_proj expansion,
-    RoPE application, and causal SDPA.
+    Compares the output of the short-seq MHA path (forward_context_default)
+    against a standalone reference implementation that performs the same math:
+    kv_b_proj expansion, RoPE application, and causal attention.
     """
     device = torch.device("cuda")
     dtype = torch.bfloat16
@@ -444,7 +444,7 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     compressed_kv_for_ref = compressed_kv.clone()
     k_pe_for_ref = k_pe.clone()
 
-    # Run the actual forward (should dispatch to forward_context_short_mha).
+    # Run the actual forward (should dispatch to forward_context_default).
     # topk_indices=None: the short MHA path does not use sparse routing,
     # so the indexer computation can be skipped entirely for short sequences.
     mla.forward_context_dsa(

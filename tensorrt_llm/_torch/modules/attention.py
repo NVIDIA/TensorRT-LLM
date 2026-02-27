@@ -1437,9 +1437,7 @@ class MLA(nn.Module):
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-
-        Returns:
-            torch.Tensor: The output tensor.
+            output (torch.Tensor): Pre-allocated output tensor, written in-place.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
         # split q, k, v into context and gen batches
@@ -1602,22 +1600,10 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        # Short-sequence MHA optimization: for short prefill sequences, use
-        # dense MHA (kv_b_proj expansion + SDPA) instead of the absorption
-        # path. MHA avoids the Q-absorption and V-projection BMMs and uses a
-        # smaller head_dim (qk_head_dim=192 vs kv_lora_rank+rope=576),
-        # yielding faster attention for small sequence lengths.
-        #
-        # topk_indices (sparse routing) is intentionally not used here: for
-        # short sequences, dense attention over all tokens is both faster and
-        # produces higher-quality output than sparse selection. The DSA sparse
-        # routing is an optimization for long sequences where the quadratic
-        # attention cost dominates.
-        #
-        # Guard: only when rope_fusion is True (apply_rotary_emb is False) to
-        # avoid double-RoPE application. When apply_rotary_emb is True, the
-        # caller already applied RoPE to q and k_pe, and our path would apply
-        # it again via the C++ invokeMLARopeContext kernel.
+        # Short-sequence MHA: bypass absorption path for short prefills,
+        # using kv_b_proj expansion + standard attention instead.
+        # See __init__ comment for rationale. topk_indices is not used
+        # because dense attention is faster than sparse routing at this scale.
         num_ctx_tokens = q.shape[0]
         if self._should_use_short_mha(num_ctx_tokens, position_ids):
             return self.forward_context_default(q, compressed_kv, k_pe,
