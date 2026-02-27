@@ -1612,7 +1612,8 @@ class AutoTuner:
             self, all_valid_tactics: List[Any],
             strategy: DistributedTuningStrategy) -> List[Any]:
         """Parallelize tactics across all TP ranks if strategy is PARALLEL."""
-        if strategy == DistributedTuningStrategy.PARALLEL:
+        if strategy == DistributedTuningStrategy.PARALLEL and self._is_distributed(
+        ):
             # only distribute across TP ranks
             # each TP rank will only tune the tactics that are assigned to it
             tp_size = self.mapping.tp_size

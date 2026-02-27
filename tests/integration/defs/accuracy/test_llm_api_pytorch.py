@@ -51,12 +51,14 @@ from defs.conftest import get_sm_version, is_sm_100f
 
 from tensorrt_llm import LLM
 from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
-from tensorrt_llm.llmapi import (AutoDecodingConfig, CudaGraphConfig,
-                                 DeepSeekSparseAttentionConfig,
-                                 Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
-                                 MTPDecodingConfig, NGramDecodingConfig,
-                                 RocketSparseAttentionConfig, SamplingParams,
-                                 SkipSoftmaxAttentionConfig, TorchCompileConfig)
+
+# isort: off
+from tensorrt_llm.llmapi import (
+    AutoDecodingConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
+    Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
+    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
+    SamplingParams, SkipSoftmaxAttentionConfig, TorchCompileConfig)
+# isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
 from ..conftest import (get_device_count, get_device_memory, llm_models_root,
@@ -298,6 +300,36 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
                                            speculative_model=eagle_model_dir,
                                            eagle3_one_model=eagle3_one_model)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @parametrize_with_ids("overlap_scheduler", [True, False])
+    def test_pard(self, overlap_scheduler):
+        pytorch_config = dict(
+            max_batch_size=
+            1,  # add max_batch_size to avoid error in overlap scheduler
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(
+            enable_block_reuse=True, free_gpu_memory_fraction=0.8
+        )  # both one-model and two-model supports this feature
+
+        pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        draft_len = 4
+        spec_config = PARDDecodingConfig(max_draft_len=draft_len,
+                                         speculative_model=pard_model_dir)
 
         with LLM(model=target_model_dir,
                  **pytorch_config,

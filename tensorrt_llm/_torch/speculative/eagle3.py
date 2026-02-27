@@ -43,7 +43,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         from ...llmapi.llm_args import EagleDecodingConfig
 
         if isinstance(config, EagleDecodingConfig):
-            self.max_total_draft_tokens = config.max_total_draft_tokens
+            self.max_total_draft_tokens = config.tokens_per_gen_step - 1
         else:
             self.max_total_draft_tokens = self.max_draft_len
 
