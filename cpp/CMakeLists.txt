@@ -381,9 +381,9 @@ endif()
 # -fno-reorder-blocks-and-partition: Prevents compiler from splitting hot/cold
 # blocks -fno-plt: Removes PLT stubs for additional performance
 # -Wl,--emit-relocs (or -Wl,-q): Preserves relocation info for BOLT Note:
-# Binaries should NOT be stripped for BOLT to work Usage: cmake
-# -DENABLE_BOLT_COMPATIBLE=ON ...
-option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" OFF)
+# Binaries should NOT be stripped for BOLT to work Enabled by default. To
+# disable: cmake -DENABLE_BOLT_COMPATIBLE=OFF ...
+option(ENABLE_BOLT_COMPATIBLE "Enable BOLT-compatible build flags" ON)
 if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
   message(STATUS "BOLT compatible flags enabled")
   # Compiler flags for C/C++
