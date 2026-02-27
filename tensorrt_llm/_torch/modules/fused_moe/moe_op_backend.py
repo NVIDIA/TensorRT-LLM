@@ -494,6 +494,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                     routed_scaling_factor,
                     routing_method_type,
                     do_finalize=do_finalize,
+                    act_type=gated_act_type,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
                 )
