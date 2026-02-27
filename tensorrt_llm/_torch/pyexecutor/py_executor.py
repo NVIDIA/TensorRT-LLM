@@ -2700,6 +2700,19 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
+                # Prepend logprobs for first_gen_tokens if transferred from prefill.
+                disagg_params = getattr(req, 'py_disaggregated_params', None)
+                if (disagg_params is not None
+                        and getattr(disagg_params, 'first_gen_log_probs',
+                                    None) is not None):
+                    if beam_width != 1:
+                        raise ValueError(
+                            "first_gen_log_probs transfer currently assumes "
+                            "beam_width == 1; beam search is not supported "
+                            "with disaggregated logprobs propagation.")
+                    req.py_result.append_log_probs(
+                        [disagg_params.first_gen_log_probs])
+
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
