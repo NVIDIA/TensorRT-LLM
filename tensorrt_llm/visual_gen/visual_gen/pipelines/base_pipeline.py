@@ -134,7 +134,9 @@ class ditBasePipeline(DiffusionPipeline):
                         logger.warning(f"No transformer blocks found in {name}")
                         continue
                     for block_name in transformer_blocks:
-                        logger.info(f"Torch compile {name}.{block_name}, compile mode: {torch_compile_mode}")
+                        logger.info(
+                            f"Torch compile {name}.{block_name}, compile mode: {torch_compile_mode}"
+                        )
                         compiled_blocks = []
                         for block in getattr(model, block_name):
                             block = torch.compile(block, mode=torch_compile_mode)
@@ -151,9 +153,7 @@ class ditBasePipeline(DiffusionPipeline):
 
     @property
     def _execution_device(self):
-        """
-        Override the _execution_device in diffusers's pipeline to return the current device.
-        """
+        """Override the _execution_device in diffusers's pipeline to return the current device."""
         if PipelineConfig.model_wise_offloading or PipelineConfig.block_wise_offloading:
             return torch.device(f"cuda:{torch.cuda.current_device()}")
         return super()._execution_device
@@ -178,13 +178,17 @@ class ditBasePipeline(DiffusionPipeline):
         if model_wise is None:
             model_wise = []
         if set(model_wise) & set(block_wise):
-            raise ValueError(f"model_wise and block_wise cannot have the same model, got {model_wise} and {block_wise}")
+            raise ValueError(
+                f"model_wise and block_wise cannot have the same model, got {model_wise} and {block_wise}"
+            )
 
         device = torch.device(f"cuda:{torch.cuda.current_device()}")
 
         for name in block_wise:
             if not isinstance(getattr(self, name), ditBaseTransformer):
-                raise ValueError(f"Currently, only support block-wise offloading for transformer, got {name}")
+                raise ValueError(
+                    f"Currently, only support block-wise offloading for transformer, got {name}"
+                )
             if offloading_stride <= 0:
                 logger.warning(
                     f"Block-wise offloading of {name} is not enabled because offloading_stride={offloading_stride}"
@@ -209,7 +213,9 @@ class ditBasePipeline(DiffusionPipeline):
                     # offload the weight to cpu
                     offloading_weight = module.get_offloading_weights()
                     offloading_weight.data = offloading_weight.data.cpu()
-            PipelineConfig.set_config(block_wise_offloading=block_wise, offloading_stride=offloading_stride)
+            PipelineConfig.set_config(
+                block_wise_offloading=block_wise, offloading_stride=offloading_stride
+            )
         torch.cuda.empty_cache()
 
         skiped_models = []
@@ -253,7 +259,6 @@ class ditBasePipeline(DiffusionPipeline):
         Returns:
             ditBasePipeline: A new instance of the pipeline with pretrained weights loaded
         """
-
         # Call parent's from_pretrained to get base pipeline
         with MemoryMonitor("visual_gen.pipeline", "model_loading"):
             pipeline = super().from_pretrained(pretrained_model_name_or_path, *args, **kwargs)
@@ -271,7 +276,9 @@ class ditBasePipeline(DiffusionPipeline):
         logger.info("Pipeline loaded successfully")
         return pipeline
 
-    def dit_dp_split(self, batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds):
+    def dit_dp_split(
+        self, batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+    ):
         logger.debug(f"Data parallel split: batch_size={batch_size}")
 
         # Check if batch size is compatible with data parallel size
@@ -289,7 +296,9 @@ class ditBasePipeline(DiffusionPipeline):
 
         # Ensure batch size is divisible by dp_size
         if batch_size % dit_dp_size != 0:
-            error_msg = f"Batch size ({batch_size}) must be divisible by data parallel size ({dit_dp_size})"
+            error_msg = (
+                f"Batch size ({batch_size}) must be divisible by data parallel size ({dit_dp_size})"
+            )
             logger.error(error_msg)
             raise ValueError(error_msg)
 
@@ -327,10 +336,14 @@ class ditBasePipeline(DiffusionPipeline):
             dp_group = DiTParallelConfig.dp_group()
             if dp_group is not None:
                 logger.debug(f"Gathering latents with shape {latents.shape}")
-                gathered_latents = [torch.zeros_like(latents) for _ in range(DiTParallelConfig.dp_size())]
+                gathered_latents = [
+                    torch.zeros_like(latents) for _ in range(DiTParallelConfig.dp_size())
+                ]
                 dist.all_gather(gathered_latents, latents, group=dp_group)
                 # Reorder the gathered results to match the original batch order
-                latents = torch.cat([gathered_latents[i] for i in range(DiTParallelConfig.dp_size())], dim=0)
+                latents = torch.cat(
+                    [gathered_latents[i] for i in range(DiTParallelConfig.dp_size())], dim=0
+                )
                 logger.debug(f"Gathered latents shape: {latents.shape}")
         else:
             logger.debug("No gathering needed (dp_size=1)")
@@ -382,20 +395,33 @@ class ditBasePipeline(DiffusionPipeline):
 
     def _reset_teacache_config(self, num_inference_steps, do_classifier_free_guidance):
         logger.debug(f"Updating TeaCache config for {num_inference_steps} inference steps")
+        TeaCacheConfig.reset()
         step_size = 2 if do_classifier_free_guidance else 1
         if TeaCacheConfig.use_ret_steps():
             TeaCacheConfig.set_config(
-                cutoff_steps=num_inference_steps * step_size, num_steps=num_inference_steps * step_size, cnt=0
+                cutoff_steps=num_inference_steps * step_size,
+                num_steps=num_inference_steps * step_size,
+                cnt=0,
             )
             logger.debug(
                 f"TeaCache ret_steps mode: cutoff_steps={num_inference_steps * step_size}, num_steps={num_inference_steps * step_size}, cnt=0"
             )
         else:
             TeaCacheConfig.set_config(
-                cutoff_steps=num_inference_steps * step_size - 2, num_steps=num_inference_steps * step_size, cnt=0
+                cutoff_steps=num_inference_steps * step_size - 2,
+                num_steps=num_inference_steps * step_size,
+                cnt=0,
             )
             logger.debug(
                 f"TeaCache standard mode: cutoff_steps={num_inference_steps * step_size - 2}, num_steps={num_inference_steps * step_size}, cnt=0"
+            )
+
+    def _log_teacache_stats(self):
+        if TeaCacheConfig.enable_teacache():
+            stats = TeaCacheConfig.get_stats()
+            logger.info(
+                f"TeaCache: {stats['hit_rate']:.1f}% hit rate "
+                f"({stats['cached']}/{stats['total']} cached)"
             )
 
     def visual_gen_transformer(
@@ -407,8 +433,7 @@ class ditBasePipeline(DiffusionPipeline):
         cfg_negative_inputs: Optional[Dict] = None,
         do_classifier_free_guidance: bool = False,
     ) -> Tuple[torch.Tensor, None | torch.Tensor]:
-        """
-        This function is designed to handle the CFG parallel processing and set some global configs
+        """This function is designed to handle the CFG parallel processing and set some global configs
 
         Args:
             transformer: The transformer model to use.
