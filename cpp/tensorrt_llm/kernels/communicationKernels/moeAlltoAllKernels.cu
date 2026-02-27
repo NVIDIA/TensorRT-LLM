@@ -36,6 +36,12 @@ using tensorrt_llm::common::launchWithPdlWhenEnabled;
 #define ENABLE_DEBUG_PRINT 0
 #define DISABLE_SYNC_FOR_PROFILING 0
 
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900)
+#define SUPPORTS_PDL 1
+#else
+#define SUPPORTS_PDL 0
+#endif
+
 // Macros for concise launch-time specialization
 #define SWITCH_BOOL(flag, NAME, ...)                                                                                   \
     if (flag)                                                                                                          \
@@ -357,7 +363,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
         // Other threads should return.
         if (local_token_idx > 0)
             return;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if SUPPORTS_PDL
         cudaGridDependencySynchronize();
 #endif
     }
@@ -387,7 +393,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         uint64_t already_copied = 0;
         int num_experts_per_rank = num_experts / ep_size;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if SUPPORTS_PDL
         cudaGridDependencySynchronize();
 #endif
         for (int k = 0; k < TOP_K; k++)
@@ -449,7 +455,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
         ThreadingPolicy::sync();
     }
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if SUPPORTS_PDL
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
@@ -506,7 +512,7 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
 
 #if !DISABLE_SYNC_FOR_PROFILING
 // Issue an release barrier to ensure that the data is visible to other ranks after the synchronization.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 900
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
             // .acquire and .release qualifiers for fence instruction require sm_90 or higher.
             asm volatile("fence.release.sys;");
 #else
@@ -935,7 +941,7 @@ template <typename ThreadingPolicy>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, uint8_t const* payload_bytes,
     int bytes_per_token, int ep_size, int max_tokens_per_rank, int const* recv_counters)
 {
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if SUPPORTS_PDL
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
@@ -973,6 +979,11 @@ __global__ void moeA2ACombineKernel(
     ncclDevComm dev_comm,             // NCCL device communicator
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size)
 {
+#if SUPPORTS_PDL
+    cudaGridDependencySynchronize();
+    cudaTriggerProgrammaticLaunchCompletion();
+#endif
+
 #if !DISABLE_SYNC_FOR_PROFILING
 
     // The first warp in each CTA performs the synchronization.
@@ -1054,9 +1065,6 @@ __global__ void moeA2ACombineKernel(
 
     // Accumulate across ranks in registers, then store once per segment
     vectorized_combine<TOP_K, ThreadingPolicy, T>(token_output, size_per_token, rank_id, max_tokens_per_rank, ptrs);
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaTriggerProgrammaticLaunchCompletion();
-#endif
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
@@ -1172,7 +1180,7 @@ __global__ void moeA2ASanitizeExpertIdsKernel(int32_t* expert_ids_ptr, int32_t c
     int source_rank = tid / max_tokens_per_rank;
     int token_idx = tid % max_tokens_per_rank;
 
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+#if SUPPORTS_PDL
     cudaGridDependencySynchronize();
     cudaTriggerProgrammaticLaunchCompletion();
 #endif
