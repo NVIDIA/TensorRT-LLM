@@ -147,8 +147,18 @@ class FluxJointAttention(Attention):
             enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
             enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-            enc_q = self.norm_added_q(enc_q.reshape(-1, enc_q.shape[-1])).view(enc_q.shape)
-            enc_k = self.norm_added_k(enc_k.reshape(-1, enc_k.shape[-1])).view(enc_k.shape)
+            enc_q = torch.nn.functional.rms_norm(
+                enc_q,
+                (enc_q.shape[-1],),
+                self.norm_added_q.weight,
+                self.norm_added_q.variance_epsilon,
+            )
+            enc_k = torch.nn.functional.rms_norm(
+                enc_k,
+                (enc_k.shape[-1],),
+                self.norm_added_k.weight,
+                self.norm_added_k.variance_epsilon,
+            )
 
             # Concatenate text + image for joint attention
             query = torch.cat([enc_q, query], dim=1)

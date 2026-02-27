@@ -76,6 +76,7 @@ class Attention(nn.Module):
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
+        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -216,10 +217,13 @@ class Attention(nn.Module):
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
-            if q.ndim == 4:
-                shape = q.shape
-                q = self.norm_q(q.reshape(-1, shape[-1])).view(shape)
-                k = self.norm_k(k.reshape(-1, k.shape[-1])).view(k.shape)
+            if self.qk_norm_mode == "per_head":
+                q = torch.nn.functional.rms_norm(
+                    q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon
+                )
+                k = torch.nn.functional.rms_norm(
+                    k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon
+                )
             else:
                 q = self.norm_q(q)
                 k = self.norm_k(k)
