@@ -269,7 +269,7 @@ class NemotronHMOE(nn.Module):
         orig_shape = hidden_states_hp.shape
         hidden_states_hp_2d = hidden_states_hp.view(-1, self.hidden_dim)
         all_rank_num_tokens = kwargs.get('all_rank_num_tokens',
-                                     attn_metadata.all_rank_num_tokens)
+                                         attn_metadata.all_rank_num_tokens)
 
         def _compute_shared_output():
             if self.shared_experts is not None:
