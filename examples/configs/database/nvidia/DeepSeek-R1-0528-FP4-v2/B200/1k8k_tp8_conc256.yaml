@@ -1,3 +1,4 @@
+max_batch_size: 256
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 256

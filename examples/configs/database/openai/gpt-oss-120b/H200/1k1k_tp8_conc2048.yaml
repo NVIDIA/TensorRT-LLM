@@ -1,8 +1,9 @@
 env_overrides:
   TRTLLM_ENABLE_PDL: 1
+max_batch_size: 256
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 2048
+  max_batch_size: 256
 enable_attention_dp: true
 print_iter_log: true
 kv_cache_config:

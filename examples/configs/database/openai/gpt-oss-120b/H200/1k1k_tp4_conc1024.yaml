@@ -1,5 +1,6 @@
 env_overrides:
   TRTLLM_ENABLE_PDL: 1
+max_batch_size: 1024
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 1024

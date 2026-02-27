@@ -1,3 +1,4 @@
+max_batch_size: 128
 cuda_graph_config:
   enable_padding: true
 enable_attention_dp: true

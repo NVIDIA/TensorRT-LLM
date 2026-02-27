@@ -3,9 +3,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -35,9 +36,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 32
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -67,9 +69,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 2048
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -104,9 +107,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -136,9 +140,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 32
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -167,6 +172,7 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 256
@@ -204,9 +210,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -236,6 +243,7 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 32
@@ -273,6 +281,7 @@ server_configs:
   model_name: deepseek_r1_0528_fp8
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 2048
@@ -310,9 +319,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -341,6 +351,7 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 32
@@ -373,6 +384,7 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 512
@@ -402,105 +414,14 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc4_gpu4
-  model_name: deepseek_r1_0528_fp4_v2
-  gpus: 4
-  match_mode: scenario
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 512
-  print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.8
-    enable_block_reuse: false
-  stream_interval: 10
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 4
-  moe_expert_parallel_size: 4
-  trust_remote_code: true
-  max_num_tokens: 1152
-  max_seq_len: 2068
-  client_configs:
-  - name: con4_isl1024_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc32_gpu4
-  model_name: deepseek_r1_0528_fp4_v2
-  gpus: 4
-  match_mode: scenario
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 512
-  print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.8
-    enable_block_reuse: false
-  stream_interval: 10
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 4
-  moe_expert_parallel_size: 4
-  trust_remote_code: true
-  max_num_tokens: 1152
-  max_seq_len: 2068
-  client_configs:
-  - name: con32_isl1024_osl1024
-    concurrency: 32
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc256_gpu4
-  model_name: deepseek_r1_0528_fp4_v2
-  gpus: 4
-  match_mode: scenario
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 512
-  enable_attention_dp: true
-  print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.8
-    enable_block_reuse: false
-  stream_interval: 10
-  moe_config:
-    backend: CUTLASS
-  attention_dp_config:
-    batching_wait_iters: 0
-    enable_balance: true
-    timeout_iters: 60
-  tensor_parallel_size: 4
-  moe_expert_parallel_size: 4
-  trust_remote_code: true
-  max_num_tokens: 1344
-  max_seq_len: 2068
-  client_configs:
-  - name: con256_isl1024_osl1024
-    concurrency: 256
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
 - name: nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc1_gpu8
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 1024
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 1
+    max_batch_size: 1024
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -530,9 +451,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 1024
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 32
+    max_batch_size: 1024
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -562,6 +484,7 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 256
@@ -598,9 +521,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 256
+    max_batch_size: 512
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -634,9 +558,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -666,9 +591,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 8
   match_mode: scenario
+  max_batch_size: 512
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 16
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -700,7 +626,6 @@ server_configs:
   match_mode: scenario
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -731,42 +656,14 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc4_gpu4
+- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc1024_gpu4
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 512
-  print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.8
-    enable_block_reuse: false
-  stream_interval: 10
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 4
-  moe_expert_parallel_size: 4
-  trust_remote_code: true
-  max_num_tokens: 8320
-  max_seq_len: 9416
-  client_configs:
-  - name: con4_isl8192_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc64_gpu4
-  model_name: deepseek_r1_0528_fp4_v2
-  gpus: 4
-  match_mode: scenario
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 512
+    max_batch_size: 256
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -780,14 +677,17 @@ server_configs:
     batching_wait_iters: 0
     enable_balance: true
     timeout_iters: 60
+  speculative_config:
+    decoding_type: MTP
+    num_nextn_predict_layers: 1
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
-  max_num_tokens: 8320
+  max_num_tokens: 8768
   max_seq_len: 9416
   client_configs:
-  - name: con64_isl8192_osl1024
-    concurrency: 64
+  - name: con1024_isl8192_osl1024
+    concurrency: 1024
     iterations: 10
     isl: 8192
     osl: 1024
@@ -798,9 +698,10 @@ server_configs:
   model_name: deepseek_r1_0528_fp4_v2
   gpus: 4
   match_mode: scenario
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 256
+    max_batch_size: 512
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -838,6 +739,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 1
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 1
@@ -871,6 +773,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 384
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 384
@@ -904,9 +807,10 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 2048
+    max_batch_size: 256
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -934,261 +838,68 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc4_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 4
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 2068
-  client_configs:
-  - name: con4_isl1024_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc16_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 16
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 2068
-  client_configs:
-  - name: con16_isl1024_osl1024
-    concurrency: 16
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc64_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 64
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 2068
-  client_configs:
-  - name: con64_isl1024_osl1024
-    concurrency: 64
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc4_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 4
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 2068
-  client_configs:
-  - name: con4_isl1024_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc16_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 16
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 2068
-  client_configs:
-  - name: con16_isl1024_osl1024
-    concurrency: 16
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc64_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 64
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 2068
-  client_configs:
-  - name: con64_isl1024_osl1024
-    concurrency: 64
-    iterations: 10
-    isl: 1024
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc4_gpu4
+- name: openai_gpt_oss_120b_1024_1024_conc8_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 8
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 4
+    max_batch_size: 8
+  print_iter_log: true
   kv_cache_config:
     dtype: fp8
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
-  print_iter_log: true
   stream_interval: 20
-  num_postprocess_workers: 4
   moe_config:
     backend: TRTLLM
+  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 2068
   client_configs:
-  - name: con4_isl1024_osl1024
-    concurrency: 4
+  - name: con8_isl1024_osl1024
+    concurrency: 8
     iterations: 10
     isl: 1024
     osl: 1024
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc64_gpu4
+- name: openai_gpt_oss_120b_1024_1024_conc256_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 64
+    max_batch_size: 256
+  print_iter_log: true
   kv_cache_config:
     dtype: fp8
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
-  print_iter_log: true
   stream_interval: 20
-  num_postprocess_workers: 4
   moe_config:
     backend: TRTLLM
+  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 2068
   client_configs:
-  - name: con64_isl1024_osl1024
-    concurrency: 64
+  - name: con256_isl1024_osl1024
+    concurrency: 256
     iterations: 10
     isl: 1024
     osl: 1024
@@ -1202,6 +913,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 1536
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 1536
@@ -1235,6 +947,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 1
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 1
@@ -1261,33 +974,39 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc64_gpu8
+- name: openai_gpt_oss_120b_1024_8192_conc512_gpu8
   model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 64
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 64
+  enable_attention_dp: true
+  print_iter_log: true
   kv_cache_config:
     dtype: fp8
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
-  print_iter_log: true
   stream_interval: 20
-  num_postprocess_workers: 4
   moe_config:
-    backend: TRTLLM
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 9236
   client_configs:
-  - name: con64_isl1024_osl8192
-    concurrency: 64
+  - name: con512_isl1024_osl8192
+    concurrency: 512
     iterations: 10
     isl: 1024
     osl: 8192
@@ -1301,9 +1020,10 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 2048
+    max_batch_size: 256
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -1331,102 +1051,6 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc4_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 4
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con4_isl1024_osl8192
-    concurrency: 4
-    iterations: 10
-    isl: 1024
-    osl: 8192
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc16_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 16
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con16_isl1024_osl8192
-    concurrency: 16
-    iterations: 10
-    isl: 1024
-    osl: 8192
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc64_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 64
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con64_isl1024_osl8192
-    concurrency: 64
-    iterations: 10
-    isl: 1024
-    osl: 8192
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
 - name: openai_gpt_oss_120b_1024_8192_conc4_gpu2
   model_name: gpt_oss_120b_fp4
   gpus: 2
@@ -1434,6 +1058,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 4
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 4
@@ -1454,39 +1079,6 @@ server_configs:
   client_configs:
   - name: con4_isl1024_osl8192
     concurrency: 4
-    iterations: 10
-    isl: 1024
-    osl: 8192
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc16_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 16
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con16_isl1024_osl8192
-    concurrency: 16
     iterations: 10
     isl: 1024
     osl: 8192
@@ -1500,6 +1092,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 256
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 256
@@ -1526,49 +1119,51 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc4_gpu4
+- name: openai_gpt_oss_120b_1024_8192_conc10_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 10
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 4
+    max_batch_size: 10
+  print_iter_log: true
   kv_cache_config:
     dtype: fp8
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
-  print_iter_log: true
   stream_interval: 20
-  num_postprocess_workers: 4
   moe_config:
     backend: TRTLLM
+  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 9236
   client_configs:
-  - name: con4_isl1024_osl8192
-    concurrency: 4
+  - name: con10_isl1024_osl8192
+    concurrency: 10
     iterations: 10
     isl: 1024
     osl: 8192
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_8192_conc64_gpu4
+- name: openai_gpt_oss_120b_1024_8192_conc384_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 384
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 64
+    max_batch_size: 384
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -1584,8 +1179,8 @@ server_configs:
   max_num_tokens: 20000
   max_seq_len: 9236
   client_configs:
-  - name: con64_isl1024_osl8192
-    concurrency: 64
+  - name: con384_isl1024_osl8192
+    concurrency: 384
     iterations: 10
     isl: 1024
     osl: 8192
@@ -1599,9 +1194,10 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 384
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 1536
+    max_batch_size: 384
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
@@ -1637,6 +1233,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 1
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 1
@@ -1663,33 +1260,34 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc16_gpu4
+- name: openai_gpt_oss_120b_8192_1024_conc32_gpu4
   model_name: gpt_oss_120b_fp4
   gpus: 4
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 32
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 16
+    max_batch_size: 32
+  print_iter_log: true
   kv_cache_config:
     dtype: fp8
     free_gpu_memory_fraction: 0.85
     enable_block_reuse: false
-  print_iter_log: true
   stream_interval: 20
-  num_postprocess_workers: 4
   moe_config:
     backend: TRTLLM
+  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 9236
   client_configs:
-  - name: con16_isl8192_osl1024
-    concurrency: 16
+  - name: con32_isl8192_osl1024
+    concurrency: 32
     iterations: 10
     isl: 8192
     osl: 1024
@@ -1703,6 +1301,7 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 1792
   cuda_graph_config:
     enable_padding: true
     max_batch_size: 1792
@@ -1729,248 +1328,17 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc4_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 4
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con4_isl8192_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc16_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 16
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con16_isl8192_osl1024
-    concurrency: 16
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc64_gpu1
-  model_name: gpt_oss_120b_fp4
-  gpus: 1
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 64
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  moe_expert_parallel_size: 1
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con64_isl8192_osl1024
-    concurrency: 64
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc4_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 4
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con4_isl8192_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc32_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 32
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con32_isl8192_osl1024
-    concurrency: 32
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc1280_gpu2
-  model_name: gpt_oss_120b_fp4
-  gpus: 2
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 1280
-  enable_attention_dp: true
-  print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  stream_interval: 20
-  moe_config:
-    backend: TRTLLM
-  attention_dp_config:
-    batching_wait_iters: 0
-    enable_balance: true
-    timeout_iters: 60
-  num_postprocess_workers: 4
-  tensor_parallel_size: 2
-  moe_expert_parallel_size: 2
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con1280_isl8192_osl1024
-    concurrency: 1280
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc4_gpu8
+- name: openai_gpt_oss_120b_8192_1024_conc8_gpu8
   model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 8
   cuda_graph_config:
     enable_padding: true
-    max_batch_size: 4
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  print_iter_log: true
-  stream_interval: 20
-  num_postprocess_workers: 4
-  moe_config:
-    backend: TRTLLM
-  tensor_parallel_size: 8
-  moe_expert_parallel_size: 8
-  trust_remote_code: true
-  max_num_tokens: 20000
-  max_seq_len: 9236
-  client_configs:
-  - name: con4_isl8192_osl1024
-    concurrency: 4
-    iterations: 10
-    isl: 8192
-    osl: 1024
-    random_range_ratio: 0.0
-    backend: openai
-    streaming: true
-- name: openai_gpt_oss_120b_8192_1024_conc128_gpu8
-  model_name: gpt_oss_120b_fp4
-  gpus: 8
-  match_mode: scenario
-  env_overrides:
-    TRTLLM_ENABLE_PDL: 1
-    NCCL_GRAPH_REGISTER: 0
-  cuda_graph_config:
-    enable_padding: true
+    max_batch_size: 8
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
@@ -1986,8 +1354,41 @@ server_configs:
   max_num_tokens: 20000
   max_seq_len: 9236
   client_configs:
-  - name: con128_isl8192_osl1024
-    concurrency: 128
+  - name: con8_isl8192_osl1024
+    concurrency: 8
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_8192_1024_conc384_gpu8
+  model_name: gpt_oss_120b_fp4
+  gpus: 8
+  match_mode: scenario
+  env_overrides:
+    TRTLLM_ENABLE_PDL: 1
+    NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 384
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 384
+  print_iter_log: true
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRTLLM
+  num_postprocess_workers: 4
+  tensor_parallel_size: 8
+  moe_expert_parallel_size: 8
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 9236
+  client_configs:
+  - name: con384_isl8192_osl1024
+    concurrency: 384
     iterations: 10
     isl: 8192
     osl: 1024
@@ -2021,6 +1422,123 @@ server_configs:
   client_configs:
   - name: con2048_isl8192_osl1024
     concurrency: 2048
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_8192_1024_conc768_gpu2
+  model_name: gpt_oss_120b_fp4
+  gpus: 2
+  match_mode: scenario
+  env_overrides:
+    TRTLLM_ENABLE_PDL: 1
+    NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 384
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 384
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRTLLM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  num_postprocess_workers: 4
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 2
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 9236
+  client_configs:
+  - name: con768_isl8192_osl1024
+    concurrency: 768
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_8192_1024_conc1024_gpu2
+  model_name: gpt_oss_120b_fp4
+  gpus: 2
+  match_mode: scenario
+  env_overrides:
+    TRTLLM_ENABLE_PDL: 1
+    NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 512
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 512
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: CUTLASS
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  num_postprocess_workers: 4
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 2
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 9236
+  client_configs:
+  - name: con1024_isl8192_osl1024
+    concurrency: 1024
+    iterations: 10
+    isl: 8192
+    osl: 1024
+    random_range_ratio: 0.0
+    backend: openai
+    streaming: true
+- name: openai_gpt_oss_120b_8192_1024_conc1280_gpu2
+  model_name: gpt_oss_120b_fp4
+  gpus: 2
+  match_mode: scenario
+  env_overrides:
+    TRTLLM_ENABLE_PDL: 1
+    NCCL_GRAPH_REGISTER: 0
+  max_batch_size: 640
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 640
+  enable_attention_dp: true
+  print_iter_log: true
+  kv_cache_config:
+    dtype: fp8
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  stream_interval: 20
+  moe_config:
+    backend: TRTLLM
+  attention_dp_config:
+    batching_wait_iters: 0
+    enable_balance: true
+    timeout_iters: 60
+  num_postprocess_workers: 4
+  tensor_parallel_size: 2
+  moe_expert_parallel_size: 2
+  trust_remote_code: true
+  max_num_tokens: 20000
+  max_seq_len: 9236
+  client_configs:
+  - name: con1280_isl8192_osl1024
+    concurrency: 1280
     iterations: 10
     isl: 8192
     osl: 1024

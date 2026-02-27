@@ -1,3 +1,4 @@
+max_batch_size: 512
 cuda_graph_config:
   enable_padding: true
 print_iter_log: true
