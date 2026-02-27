@@ -24,66 +24,92 @@ from ...utils.node_utils import (
 from ..interface import BaseTransform, SharedConfig, TransformInfo, TransformRegistry
 
 
-def _insert_fused_gemm(gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]):
-    """Fuse GEMMs that have the same input activation.
+def _insert_fused_gemm(
+    gm: GraphModule,
+    idx: int,
+    parent_node: Node,
+    linear_nodes: List[Node],
+    use_narrow: bool = True,
+) -> bool:
+    """Fuse GEMMs sharing the same input activation.
 
-    Below, is a simple example of how the fusion works:
+    Args:
+        use_narrow: If True, split output via torch.narrow (zero-copy view).
+            If False, split via torch.split + .contiguous() (independent copies).
 
     # before fusion:
-    w1 = out1 x in
-    w2 = out2 x in
-    x = b x in
-    y1 = x @ w1.T = b x out1
-    y2 = x @ w2.T = b x out2
+    w1 = out1 x in,  w2 = out2 x in
+    y1 = x @ w1.T,   y2 = x @ w2.T
 
-    # after fusion
-    w = out1+out2 x in
-    y = x @ w.T = b x (out1+out2)
-    y1 = y[:, :out1]
-    y2 = y[:, out1:out1+out2]
+    # after fusion (use_narrow=True):
+    w = (out1+out2) x in
+    y = x @ w.T
+    y1 = y.narrow(-1, 0, out1)          # view, no copy
+    y2 = y.narrow(-1, out1, out2)        # view, no copy
+
+    # after fusion (use_narrow=False):
+    w = (out1+out2) x in
+    y = x @ w.T
+    y1, y2 = split(y)                   # contiguous copies
     """
-    # some info we need
     keys_unfused = [extract_weight_name(n) for n in linear_nodes]
     params_unfused = [gm.get_parameter(k) for k in keys_unfused]
     sizes_unfused = [p.size(0) for p in params_unfused]
+
+    dtypes = {p.dtype for p in params_unfused}
+    if len(dtypes) != 1:
+        ad_logger.warning(f"Skipping GEMM fusion for {keys_unfused}: mixed dtypes {dtypes}")
+        return False
+    weight_dtype = dtypes.pop()
+
     key_fused = f"fused_weight_{idx}"
-
-    def fuse_weights(tensors: List[torch.Tensor]) -> torch.Tensor:
-        """Fuse weights of linear nodes."""
-        return torch.cat(tensors, dim=0)
-
-    def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-        """Split the output tensor of the fused linear node to obtain the original outputs."""
-        return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
-
-    param_fused = nn.Parameter(fuse_weights([gm.get_parameter(k) for k in keys_unfused]))
-
+    fused_weight = torch.cat(params_unfused, dim=0).to(weight_dtype)
+    param_fused = nn.Parameter(fused_weight, requires_grad=False)
     setattr(gm, key_fused, param_fused)
 
-    # Handle fused_kwargs for quantized fused gemm.
+    ad_logger.warning(
+        f"Fusing {len(linear_nodes)} GEMMs ({keys_unfused}) into {key_fused} (dtype={weight_dtype})"
+    )
+
     fused_kwargs = dict(linear_nodes[0].kwargs)
 
     with gm.graph.inserting_before(linear_nodes[0]):
         get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
 
-    # add new linear node + split node
     with gm.graph.inserting_before(linear_nodes[0]):
         fused_linear_node = gm.graph.call_function(
             linear_nodes[0].target,
             args=(parent_node, get_param_node, None),
-            kwargs=fused_kwargs,  # Assuming the scaling factors are the same
+            kwargs=fused_kwargs,
         )
-        split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
 
-    # now we need to replace all the linear nodes with the correct index of the split node
-    for i, n in enumerate(linear_nodes):
-        with gm.graph.inserting_before(n):
-            get_split_node = gm.graph.call_function(operator.getitem, args=(split_node, i))
-        n.replace_all_uses_with(get_split_node)
+    if use_narrow:
+        offset = 0
+        for i, n in enumerate(linear_nodes):
+            size = sizes_unfused[i]
+            with gm.graph.inserting_before(n):
+                narrow_node = gm.graph.call_function(
+                    torch.narrow, args=(fused_linear_node, -1, offset, size)
+                )
+            n.replace_all_uses_with(narrow_node)
+            offset += size
+    else:
+
+        def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+            return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
+
+        with gm.graph.inserting_before(linear_nodes[0]):
+            split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
+
+        for i, n in enumerate(linear_nodes):
+            with gm.graph.inserting_before(n):
+                get_split_node = gm.graph.call_function(operator.getitem, args=(split_node, i))
+            n.replace_all_uses_with(get_split_node)
 
     # Clean up deleted modules to save GPU memory
     eliminate_dead_code(gm)
     delete_all_unused_submodules(gm)
+    return True
 
 
 def check_same_children(parent_node: Node, is_desired_child: Callable[[Node], bool]) -> bool:
@@ -133,16 +159,23 @@ class QuantizationFusionMixin(ABC):
         raise NotImplementedError
 
     def _insert_fused_quant_gemm(
-        self, gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]
-    ):
+        self,
+        gm: GraphModule,
+        idx: int,
+        parent_node: Node,
+        linear_nodes: List[Node],
+        use_narrow: bool = True,
+    ) -> bool:
+        """Fuse quantized GEMMs sharing the same input activation.
+
+        Args:
+            use_narrow: If True, split output via torch.narrow (zero-copy view).
+                If False, split via torch.split + .contiguous() (independent copies).
+        """
         keys_unfused = [extract_weight_name(n) for n in linear_nodes]
         params_unfused = [gm.get_parameter(k) for k in keys_unfused]
         sizes_unfused = [p.size(0) for p in params_unfused]
         key_fused = f"fused_weight_{idx}"
-
-        def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
-            """Split the output tensor of the fused linear node to obtain the original outputs."""
-            return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
 
         # Load scale buffers grouped by flattened scale names
         flat_scale_names = list(chain.from_iterable(self.scale_groups))
@@ -157,43 +190,80 @@ class QuantizationFusionMixin(ABC):
             weights_fused, buffers_fused = self.fuse_rule(params_unfused, **scales)
         except NotImplementedError as e:
             ad_logger.warning(f"Cannot fuse ops {keys_unfused}, skipping: {e}")
-            return
+            return False
         param_fused = nn.Parameter(weights_fused, requires_grad=False)
         setattr(gm, key_fused, param_fused)
         for name, buf in buffers_fused.items():
             gm.register_buffer(f"{key_fused}_{name}", buf)
 
+        ad_logger.warning(
+            f"Fusing {len(linear_nodes)} quantized GEMMs ({keys_unfused}) into {key_fused}"
+        )
+
         # Handle fused_kwargs for quantized fused gemm.
         fused_kwargs = dict(linear_nodes[0].kwargs)
         with gm.graph.inserting_before(linear_nodes[0]):
             get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
+            get_param_node.meta["val"] = torch.empty(
+                param_fused.shape, dtype=param_fused.dtype, device="meta"
+            )
 
             # For each kwarg group (e.g., input_scale, weight_scale[, alpha]),
             # create a list of get_attr nodes in the same structure the op expects.
-            scale_getattrs: Dict[str, Node] = {
-                name: gm.graph.create_node("get_attr", f"{key_fused}_{name}")
-                for name in flat_scale_names
-            }
+            scale_getattrs: Dict[str, Node] = {}
+            for name in flat_scale_names:
+                attr_node = gm.graph.create_node("get_attr", f"{key_fused}_{name}")
+                buf = buffers_fused[name]
+                attr_node.meta["val"] = torch.empty(buf.shape, dtype=buf.dtype, device="meta")
+                scale_getattrs[name] = attr_node
             custom_tail_args = self.build_custom_args_for_linear(scale_getattrs)
 
-        # add new linear node + split node
+        ref_val = linear_nodes[0].meta.get("val")
+
+        # add new linear node + output splitting
         with gm.graph.inserting_before(linear_nodes[0]):
             fused_linear_node = gm.graph.call_function(
                 linear_nodes[0].target,
                 args=(parent_node, get_param_node, None, *custom_tail_args),
                 kwargs=fused_kwargs,
             )
-            split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
+            if ref_val is not None:
+                fused_out_shape = (*ref_val.shape[:-1], sum(sizes_unfused))
+                fused_linear_node.meta["val"] = torch.empty(
+                    fused_out_shape, dtype=ref_val.dtype, device="meta"
+                )
 
-        # now we need to replace all the linear nodes with the correct index of the split node
-        for i, n in enumerate(linear_nodes):
-            with gm.graph.inserting_before(n):
-                get_split_node = gm.graph.call_function(operator.getitem, args=(split_node, i))
-            n.replace_all_uses_with(get_split_node)
+        if use_narrow:
+            offset = 0
+            for i, n in enumerate(linear_nodes):
+                size = sizes_unfused[i]
+                with gm.graph.inserting_before(n):
+                    narrow_node = gm.graph.call_function(
+                        torch.narrow, args=(fused_linear_node, -1, offset, size)
+                    )
+                    if ref_val is not None:
+                        narrow_node.meta["val"] = torch.empty(
+                            (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
+                        )
+                n.replace_all_uses_with(narrow_node)
+                offset += size
+        else:
+
+            def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+                return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
+
+            with gm.graph.inserting_before(linear_nodes[0]):
+                split_node = gm.graph.call_function(split_output, args=(fused_linear_node,))
+
+            for i, n in enumerate(linear_nodes):
+                with gm.graph.inserting_before(n):
+                    get_split_node = gm.graph.call_function(operator.getitem, args=(split_node, i))
+                n.replace_all_uses_with(get_split_node)
 
         # Clean up deleted modules to save GPU memory
         eliminate_dead_code(gm)
         delete_all_unused_submodules(gm)
+        return True
 
     def _apply_fusion_pass(
         self,
@@ -217,8 +287,10 @@ class QuantizationFusionMixin(ABC):
                 if not check_same_children(parent_node, partial(is_op, ops=self.target_op)):
                     # Mixed children (e.g., quantized or non-linear) — skip fusion
                     continue
-                self._insert_fused_quant_gemm(gm, idx := idx + 1, parent_node, lin_children)
-                num_matches += 1
+                if self._insert_fused_quant_gemm(
+                    gm, idx := idx + 1, parent_node, lin_children, use_narrow=False
+                ):
+                    num_matches += 1
 
         torch.cuda.empty_cache()
         return gm, TransformInfo(
@@ -255,9 +327,11 @@ class FuseGemms(BaseTransform):
                 if not check_same_children(parent_node, is_linear_op):
                     # Mixed children (e.g., quantized or non-linear) — skip fusion
                     continue
-                # linear nodes to fuse
-                _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children)
-                num_matches += 1
+                # linear nodes to fuse (split+copy for contiguous outputs)
+                if _insert_fused_gemm(
+                    gm, idx := idx + 1, parent_node, lin_children, use_narrow=False
+                ):
+                    num_matches += 1
 
         torch.cuda.empty_cache()
 
@@ -268,73 +342,6 @@ class FuseGemms(BaseTransform):
             has_valid_shapes=num_matches == 0,
         )
         return gm, info
-
-
-def _insert_fused_gemm_narrow(
-    gm: GraphModule, idx: int, parent_node: Node, linear_nodes: List[Node]
-):
-    """Fuse GEMMs sharing the same input, splitting output via narrow (zero-copy view).
-
-    Unlike _insert_fused_gemm which uses torch.split + .contiguous(), this uses
-    torch.narrow to return views into the fused output tensor without copying.
-
-    # before fusion:
-    w1 = out1 x in,  w2 = out2 x in
-    y1 = x @ w1.T,   y2 = x @ w2.T
-
-    # after fusion:
-    w = (out1+out2) x in
-    y = x @ w.T
-    y1 = y.narrow(-1, 0, out1)          # view, no copy
-    y2 = y.narrow(-1, out1, out2)        # view, no copy
-    """
-    keys_unfused = [extract_weight_name(n) for n in linear_nodes]
-    params_unfused = [gm.get_parameter(k) for k in keys_unfused]
-    sizes_unfused = [p.size(0) for p in params_unfused]
-
-    dtypes = {p.dtype for p in params_unfused}
-    if len(dtypes) != 1:
-        ad_logger.warning(
-            f"Skipping mixed-children GEMM fusion for {keys_unfused}: mixed dtypes {dtypes}"
-        )
-        return False
-    weight_dtype = dtypes.pop()
-
-    key_fused = f"fused_weight_{idx}"
-    fused_weight = torch.cat(params_unfused, dim=0).to(weight_dtype)
-    param_fused = nn.Parameter(fused_weight, requires_grad=False)
-    setattr(gm, key_fused, param_fused)
-
-    ad_logger.warning(
-        f"taylor) Fusing {len(linear_nodes)} mixed-children GEMMs ({keys_unfused}) "
-        f"into {key_fused} (dtype={weight_dtype})"
-    )
-
-    fused_kwargs = dict(linear_nodes[0].kwargs)
-
-    with gm.graph.inserting_before(linear_nodes[0]):
-        get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
-
-    with gm.graph.inserting_before(linear_nodes[0]):
-        fused_linear_node = gm.graph.call_function(
-            linear_nodes[0].target,
-            args=(parent_node, get_param_node, None),
-            kwargs=fused_kwargs,
-        )
-
-    offset = 0
-    for i, n in enumerate(linear_nodes):
-        size = sizes_unfused[i]
-        with gm.graph.inserting_before(n):
-            narrow_node = gm.graph.call_function(
-                torch.narrow, args=(fused_linear_node, -1, offset, size)
-            )
-        n.replace_all_uses_with(narrow_node)
-        offset += size
-
-    # Graph cleanup (eliminate_dead_code + delete_all_unused_submodules)
-    # is deferred to FuseGemmsMixedChildren._apply to avoid repeated O(G) traversals.
-    return True
 
 
 _QUANT_FUSERS = {}
@@ -387,95 +394,6 @@ def _get_quant_fuser(op_key):
     return adapter
 
 
-def _insert_fused_quant_gemm_narrow(
-    gm: GraphModule,
-    idx: int,
-    parent_node: Node,
-    linear_nodes: List[Node],
-    fuser: QuantizationFusionMixin,
-) -> bool:
-    """Fuse quantized GEMMs sharing the same input, splitting output via narrow (zero-copy view).
-
-    Combines quantized weight fusion (via the provided fuser's rules) with the
-    narrow-based output splitting used by _insert_fused_gemm_narrow.
-    """
-    keys_unfused = [extract_weight_name(n) for n in linear_nodes]
-    params_unfused = [gm.get_parameter(k) for k in keys_unfused]
-    sizes_unfused = [p.size(0) for p in params_unfused]
-    key_fused = f"fused_weight_{idx}"
-
-    flat_scale_names = list(chain.from_iterable(fuser.scale_groups))
-    scales: Dict[str, List[torch.Tensor]] = {}
-    for weight_key in keys_unfused:
-        key = weight_key.rsplit(".", 1)[0]
-        for scale_name in flat_scale_names:
-            buffer_name = key + "." + scale_name
-            scales.setdefault(scale_name, []).append(gm.get_buffer(buffer_name))
-
-    try:
-        weights_fused, buffers_fused = fuser.fuse_rule(params_unfused, **scales)
-    except NotImplementedError as e:
-        ad_logger.warning(f"Cannot fuse quantized ops {keys_unfused}, skipping: {e}")
-        return False
-
-    param_fused = nn.Parameter(weights_fused, requires_grad=False)
-    setattr(gm, key_fused, param_fused)
-    for name, buf in buffers_fused.items():
-        gm.register_buffer(f"{key_fused}_{name}", buf)
-
-    ad_logger.warning(
-        f"taylor) Fusing {len(linear_nodes)} quantized mixed-children GEMMs "
-        f"({keys_unfused}) into {key_fused}"
-    )
-
-    fused_kwargs = dict(linear_nodes[0].kwargs)
-
-    with gm.graph.inserting_before(linear_nodes[0]):
-        get_param_node = gm.graph.get_attr(key_fused, torch.Tensor)
-        get_param_node.meta["val"] = torch.empty(
-            param_fused.shape, dtype=param_fused.dtype, device="meta"
-        )
-        scale_getattrs: Dict[str, Node] = {}
-        for name in flat_scale_names:
-            attr_node = gm.graph.create_node("get_attr", f"{key_fused}_{name}")
-            buf = buffers_fused[name]
-            attr_node.meta["val"] = torch.empty(buf.shape, dtype=buf.dtype, device="meta")
-            scale_getattrs[name] = attr_node
-        custom_tail_args = fuser.build_custom_args_for_linear(scale_getattrs)
-
-    ref_val = linear_nodes[0].meta.get("val")
-
-    with gm.graph.inserting_before(linear_nodes[0]):
-        fused_linear_node = gm.graph.call_function(
-            linear_nodes[0].target,
-            args=(parent_node, get_param_node, None, *custom_tail_args),
-            kwargs=fused_kwargs,
-        )
-        if ref_val is not None:
-            fused_out_shape = (*ref_val.shape[:-1], sum(sizes_unfused))
-            fused_linear_node.meta["val"] = torch.empty(
-                fused_out_shape, dtype=ref_val.dtype, device="meta"
-            )
-
-    offset = 0
-    for i, n in enumerate(linear_nodes):
-        size = sizes_unfused[i]
-        with gm.graph.inserting_before(n):
-            narrow_node = gm.graph.call_function(
-                torch.narrow, args=(fused_linear_node, -1, offset, size)
-            )
-            if ref_val is not None:
-                narrow_node.meta["val"] = torch.empty(
-                    (*ref_val.shape[:-1], size), dtype=ref_val.dtype, device="meta"
-                )
-        n.replace_all_uses_with(narrow_node)
-        offset += size
-
-    # Graph cleanup (eliminate_dead_code + delete_all_unused_submodules)
-    # is deferred to FuseGemmsMixedChildren._apply to avoid repeated O(G) traversals.
-    return True
-
-
 @TransformRegistry.register("fuse_gemms_mixed_children")
 class FuseGemmsMixedChildren(BaseTransform):
     """Fuse linear projections sharing the same input, even when the parent has
@@ -509,7 +427,7 @@ class FuseGemmsMixedChildren(BaseTransform):
                 if len(lin_children) < 2:
                     continue
                 if is_linear_op(lin_children[0]):
-                    if _insert_fused_gemm_narrow(gm, idx := idx + 1, parent_node, lin_children):
+                    if _insert_fused_gemm(gm, idx := idx + 1, parent_node, lin_children):
                         num_matches += 1
                 else:
                     fuser = _get_quant_fuser(op_key)
@@ -518,16 +436,11 @@ class FuseGemmsMixedChildren(BaseTransform):
                             f"No quantized fuser for {op_key}, skipping mixed-children fusion"
                         )
                         continue
-                    if _insert_fused_quant_gemm_narrow(
-                        gm, idx := idx + 1, parent_node, lin_children, fuser
+                    if fuser._insert_fused_quant_gemm(
+                        gm, idx := idx + 1, parent_node, lin_children
                     ):
                         num_matches += 1
 
-        # Run graph cleanup once after all fusions instead of per-fusion.
-        # This eliminates dead nodes first, then removes unreferenced parameters.
-        if num_matches > 0:
-            eliminate_dead_code(gm)
-            delete_all_unused_submodules(gm)
         torch.cuda.empty_cache()
 
         info = TransformInfo(
