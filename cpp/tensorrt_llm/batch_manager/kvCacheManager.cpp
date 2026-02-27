@@ -2274,8 +2274,8 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
         // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
-        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv() && req.isContextInitState()
-            && req.isFirstContextChunk())
+        if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv()
+            && !req.isDisaggGenerationInitState())
         {
             auto const uniqueTokens = req.getUniqueTokens(0);
             auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
@@ -2283,7 +2283,7 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
             numRequiredBlocks -= reusableSharedBlocks;
             // Store on request so the micro batch scheduler can use it for token budget
-            req.setEstimatedReusableTokens(numReusableBlocks * getTokensPerBlock());
+            req.setEstimatedReusableTokens(reusableSharedBlocks * getTokensPerBlock());
         }
         return numRequiredBlocks;
     }
@@ -2366,7 +2366,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
         numReusableContextBlocks = std::min(numReusableBlocks, numContextBlocks);
         // Store on request so the micro batch scheduler can use it for token budget
-        req.setEstimatedReusableTokens(numReusableBlocks * getTokensPerBlock());
+        req.setEstimatedReusableTokens(numReusableContextBlocks * getTokensPerBlock());
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, numReusableBlocks=%d, "
             "numReusableContextBlocks=%d, numGenBlocksPerBeam=%d",
