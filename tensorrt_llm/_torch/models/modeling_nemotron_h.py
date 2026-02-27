@@ -250,7 +250,8 @@ class NemotronHMOE(nn.Module):
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
         hidden_states = hidden_states.view(-1, self.hidden_dim)
-        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        all_rank_num_tokens = kwargs.get('all_rank_num_tokens',
+                                         attn_metadata.all_rank_num_tokens)
 
         def _compute_shared_output():
             if self.shared_experts is not None:
@@ -633,6 +634,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
         attn_metadata: Optional[AttentionMetadata] = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
 
         if self.has_start_projections:
@@ -662,6 +664,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states = self.mixer(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **kwargs,
         )
 
         if self.has_end_norm:
@@ -768,6 +771,7 @@ class NemotronHMTP(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 attn_metadata=attn_metadata,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
         return hidden_states
 
