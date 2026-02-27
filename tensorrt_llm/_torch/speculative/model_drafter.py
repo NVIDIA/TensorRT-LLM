@@ -363,7 +363,7 @@ class ModelDrafter(Drafter):
         is_first_draft_token: bool,
         previous_tensors: Optional[SampleStateTensors] = None,
         num_accepted_tokens_device: Optional[torch.Tensor] = None
-    ) -> Dict[str, Any]:
+    ) -> Tuple[Dict[str, Any], Optional[torch.Tensor]]:
         """Forward pass through the draft model."""
         if self._should_disable_cuda_graph(is_first_draft_token):
             with self.draft_model_engine.no_cuda_graph():
@@ -383,18 +383,20 @@ class ModelDrafter(Drafter):
 
         # Handle d2t data if available. Static drafting loops should incorporate d2t
         # in their implementations.
+        d2t = None
         if not self.use_static_draft_loop and hasattr(
                 self.draft_model_engine.model.model, 'd2t'):
-            outputs['d2t'] = self.draft_model_engine.model.model.d2t.data
+            d2t = self.draft_model_engine.model.model.d2t.data
 
-        return outputs
+        return outputs, d2t
 
     @nvtx_range("sample_async")
     def sample_async(
         self,
         draft_batch: ScheduledRequests,
         outputs: Dict[str, Any],
-        resource_manager: Optional[ResourceManager] = None
+        *,
+        d2t: Optional[torch.Tensor] = None,
     ) -> Optional[SampleState]:
         """Sample tokens from draft model outputs."""
         try:
@@ -410,9 +412,10 @@ class ModelDrafter(Drafter):
                            num_context_logits_prefix_sum,
                            self.sampler.is_generation_model())
 
-            return self.sampler.sample_async(draft_batch, outputs,
+            return self.sampler.sample_async(draft_batch,
+                                             outputs,
                                              num_context_logits_prefix_sum,
-                                             resource_manager)
+                                             d2t=d2t)
         except Exception as e:
             logger.error(f"Error in sampling: {str(e)}")
             return None
@@ -442,9 +445,11 @@ class ModelDrafter(Drafter):
     def update_requests(
             self,
             sample_state: SampleState,
+            *,
             resource_manager: Optional[ResourceManager] = None) -> None:
         """Update requests with sample state."""
-        self.sampler.update_requests(sample_state, resource_manager)
+        self.sampler.update_requests(sample_state,
+                                     resource_manager=resource_manager)
 
     def process_decoded_tokens(
             self,
@@ -698,7 +703,7 @@ class ModelDrafter(Drafter):
         """
         Process outputs from dynamic draft loop, update target requests, and clean up resources.
         """
-        self.update_requests(outputs, resource_manager)
+        self.update_requests(outputs, resource_manager=resource_manager)
 
         # Create accumulator for draft tokens and process them
         self.process_decoded_tokens(outputs.scheduled_requests,
@@ -722,7 +727,7 @@ class ModelDrafter(Drafter):
             cur_draft_layer_idx, resource_manager
         )  # Update the current draft layer index in the resource manager.
         """Forward pass through the draft model."""
-        outputs = self.forward_draft_model(
+        outputs, d2t = self.forward_draft_model(
             draft_batch,
             resource_manager,
             is_first_draft_token=False,
@@ -731,14 +736,14 @@ class ModelDrafter(Drafter):
             num_accepted_tokens_device=num_accepted_tokens_device)
 
         if previous_draft_state is not None:
-            self.update_requests(previous_draft_state, resource_manager)
+            self.update_requests(previous_draft_state,
+                                 resource_manager=resource_manager)
 
         if self.guided_decoder is not None:
             self.guided_decoder.add_batch(draft_batch)
-            self.guided_decoder.execute(outputs['logits'],
-                                        d2t=outputs.get('d2t'))
+            self.guided_decoder.execute(outputs['logits'], d2t=d2t)
 
-        sample_state = self.sample_async(draft_batch, outputs, resource_manager)
+        sample_state = self.sample_async(draft_batch, outputs, d2t=d2t)
         self.update_request_states(draft_batch)
 
         return outputs, sample_state
@@ -884,7 +889,7 @@ class ModelDrafter(Drafter):
         self.update_cur_draft_layer_idx(
             0, resource_manager
         )  # Update the current draft layer index in the resource manager.
-        outputs = self.forward_draft_model(
+        outputs, d2t = self.forward_draft_model(
             draft_batch,
             resource_manager,
             is_first_draft_token=True,
@@ -928,10 +933,8 @@ class ModelDrafter(Drafter):
         # Handle guided decoder and sampling for non-static loop
         if self.guided_decoder is not None:
             self.guided_decoder.add_batch(draft_batch)
-            self.guided_decoder.execute(outputs['logits'],
-                                        d2t=outputs.get('d2t'))
-        draft_sample_state = self.sample_async(draft_batch, outputs,
-                                               resource_manager)
+            self.guided_decoder.execute(outputs['logits'], d2t=d2t)
+        draft_sample_state = self.sample_async(draft_batch, outputs, d2t=d2t)
 
         # Update target inputs with first iteration results
         draft_tensors = draft_sample_state and draft_sample_state.device and draft_sample_state.device.new_tokens
@@ -993,9 +996,9 @@ class ModelDrafter(Drafter):
             )  # Update the current draft layer index in the resource manager.
             # Initial forward pass. May do the complete drafting loop
             # if use_static_draft_loop is set.
-            outputs = self.forward_draft_model(draft_batch,
-                                               resource_manager,
-                                               is_first_draft_token=True)
+            outputs, d2t = self.forward_draft_model(draft_batch,
+                                                    resource_manager,
+                                                    is_first_draft_token=True)
 
             if self.use_static_draft_loop:
                 self.process_static_draft_outputs(outputs, draft_batch)
@@ -1010,10 +1013,8 @@ class ModelDrafter(Drafter):
 
             if self.guided_decoder is not None:
                 self.guided_decoder.add_batch(draft_batch)
-                self.guided_decoder.execute(outputs['logits'],
-                                            d2t=outputs.get('d2t'))
-            sample_state = self.sample_async(draft_batch, outputs,
-                                             resource_manager)
+                self.guided_decoder.execute(outputs['logits'], d2t=d2t)
+            sample_state = self.sample_async(draft_batch, outputs, d2t=d2t)
             self.update_request_states(draft_batch)
 
             # Execute the iterative draft loop
