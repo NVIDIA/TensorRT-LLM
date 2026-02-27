@@ -31,6 +31,22 @@ TRTLLM_NAMESPACE_BEGIN
 namespace common
 {
 
+inline size_t hash64(uint64_t value)
+{
+    value = (value ^ (value >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
+    value = (value ^ (value >> 27)) * UINT64_C(0x94d049bb133111eb);
+    value = value ^ (value >> 31);
+    return value;
+}
+
+inline size_t hash32(uint32_t value)
+{
+    value = ((value >> 16) ^ value) * 0x45d9f3b;
+    value = ((value >> 16) ^ value) * 0x45d9f3b;
+    value = (value >> 16) ^ value;
+    return static_cast<size_t>(value);
+}
+
 //! \brief SHA-256 based hasher for KV cache block hashing.
 //!
 //! Uses OpenSSL's EVP interface for SHA-256 hashing.
@@ -75,6 +91,9 @@ public:
 
     //! Update hash with raw bytes (chainable)
     Hasher& update(void const* data, size_t size);
+
+    //! Get the final 64-bit hash value (first 8 bytes of SHA-256 digest, little-endian)
+    [[nodiscard]] uint64_t digest() const;
 
     //! Get the final hash as a 32-byte SHA-256 digest
     [[nodiscard]] std::array<uint8_t, kDigestSize> digestBytes() const;

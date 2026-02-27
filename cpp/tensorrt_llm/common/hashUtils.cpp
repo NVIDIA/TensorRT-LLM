@@ -159,6 +159,18 @@ Hasher& Hasher::update(void const* data, size_t size)
     return *this;
 }
 
+uint64_t Hasher::digest() const
+{
+    auto bytes = digestBytes();
+    // Return first 8 bytes as little-endian uint64_t
+    uint64_t result = 0;
+    for (int i = 7; i >= 0; --i)
+    {
+        result = (result << 8) | bytes[i];
+    }
+    return result;
+}
+
 std::array<uint8_t, Hasher::kDigestSize> Hasher::digestBytes() const
 {
     // Finalize on a copy so the hasher remains usable
