@@ -108,7 +108,7 @@ At a system level, the sparse attention framework is built around three key comp
 - An **attention operator** that consumes these indices and, via a small set of pre/post kernels, turns them into concrete KV cache layouts and attention workloads.
 - An **auxiliary memory subsystem** that manages extra structures such as KT caches or low-rank K caches alongside the main KV cache.
 
-From a user perspective, all of this is controlled by a high-level `sparse_attention_config`. When such a config is provided, the system automatically selects the appropriate sparse attention backend. Compared with full attention, the key addition is the prediction module that decides *which* tokens or blocks to keep or attend to; the attention computation then runs only on that selected subset.
+From a user perspective, all of this is controlled by a high-level `sparse_attention_config`. When such a config is provided, the system automatically selects the appropriate sparse attention backend. Compared with full attention, the key addition is the prediction module that decides which tokens or blocks to keep or attend to; the attention computation then runs only on that selected subset.
 
 <div align="center">
 <figure>
@@ -121,11 +121,11 @@ Figure 1 summarizes how these components work together along the request path. I
 
 ### Prediction Module
 
-The prediction module is the heart of the framework. Its job is to turn model inputs and internal states into sparse indices that describe which tokens or blocks matter most. It produces two main types of indices.
+The prediction module is the heart of the framework. Its job is to turn model inputs and internal states into sparse indices that describe which tokens or blocks matter most. Different sparse attention algorithms use different predictors (heuristics, learned indexers, or model-native modules), but they all emit standardized indices with a shared meaning.
 
-The first is `sparse_kv_indices`, which indicate which tokens to keep in the KV cache after the context phase. Different KV heads can have different retention patterns, providing fine-grained control over what information is preserved. After context attention finishes, a kernel called `updateSparseKvCacheAfterFmha` uses these indices to rewrite the KV cache in-place, leaving only the selected tokens. Because the gather operates in-place, the indices must be **sorted** to avoid overwriting data that has not yet been read. This approach is fully compatible with existing context attention flows—including features like chunked prefill—but it does write the KV cache twice: once in full during the context phase, and once in compressed form afterward.
+The most important output is `sparse_attn_indices`, which specify which KV entries the attention operator should read during generation. These indices are the contract between prediction and `AttentionOp`, and they come in two granularities: **page-level** (used by MQA/MHA/GQA) and **token-level** (used by MLA). Today TensorRT LLM supports page-level sparse attention for MQA/MHA/GQA and token-level sparse attention for MLA; finer-grained support for MQA/MHA/GQA remains future work.
 
-The second is `sparse_attn_indices`, which indicate which parts of the KV cache to actually attend to during generation. The granularity of these indices varies by attention type: for MQA/MHA/GQA this is typically at **page** granularity, while for MLA it can be **token**-level. Before running the attention kernel, a kernel called `gatherKvPageOffsetsKernel` takes potentially unordered and fine-grained indices and maps them to ordered, page-aligned offsets, also computing the effective KV length per head. Moving this logic into a separate kernel keeps the core attention kernel relatively simple and stable, and makes it easier to evolve the selection strategy independently. The downside is an extra kernel launch per generation step and the current restriction to page-level sparsity for MQA/MHA/GQA.
+The second is `sparse_kv_indices`, which indicate which tokens to keep in the KV cache after the context phase. Different KV heads can have different retention patterns, providing fine-grained control over what information is preserved.
 
 The framework's generality is illustrated by how different algorithms implement their prediction:
 
@@ -138,7 +138,7 @@ Because the prediction step can be computationally heavy—especially in low-lat
 
 ### Attention Operator Design
 
-From an operator perspective, sparse attention in TensorRT LLM is realized inside a common attention operator. The prediction module produces indices, but it is `AttentionOp` that turns them into concrete KV cache layouts and attention workloads. Figure 2 shows how these pieces work together.
+From an operator perspective, we recommend integrating sparse attention through the TRTLLM attention backend (`TrtllmAttention`). Under this backend, sparse attention is realized inside a common attention operator: the prediction module produces indices, and `AttentionOp` turns them into concrete KV cache layouts and attention workloads. Figure 2 shows how these pieces work together.
 
 <div align="center">
 <figure>
@@ -153,11 +153,9 @@ The `AttentionOp` supports two main categories of sparse behavior: **sparse comp
 
 For fine-grained sparse MLA, the attention kernel is modified to directly support token-level sparse computation. The framework supplies `sparse_attn_indices` that specify, for each query token, exactly which KV tokens to attend to. Notably, the current sparse MLA implementation expects **global** KV cache pool addresses with token-level offsets, rather than logical KV positions within a request.
 
-For coarse-grained sparse MQA/GQA/MHA, the framework employs `gatherKvPageOffsetsKernel` before each generation step. This kernel converts `sparse_attn_indices` into page-aligned KV cache offsets and updates the effective KV length per KV head. The subsequent attention kernel then runs a standard dense computation on this reduced set of pages, achieving sparse attention without deeply modifying the core attention logic.
+For coarse-grained sparse MQA/GQA/MHA, the framework employs `gatherKvPageOffsetsKernel` before each generation step. It takes potentially unordered or fine-grained indices and maps them to ordered, page-aligned KV cache offsets, while also computing the effective KV length per KV head. By isolating this logic in a separate pre-kernel, the core attention kernel stays simple and stable, and the selection strategy can evolve independently. The trade-off is an extra kernel launch per generation step, and page-level sparsity remains the only supported mode for MQA/MHA/GQA today.
 
-**Sparse KV cache.** TensorRT LLM supports token-level sparse KV cache during the context phase. After context attention finishes, a kernel called `updateSparseKvCacheAfterFmha` rewrites the KV cache in-place according to `sparse_kv_indices`, keeping only the selected tokens. This effectively compresses the KV cache while remaining fully compatible with features like chunked prefill, since the context attention itself runs in the standard dense manner and compression is applied as a post-processing step.
-
-It is worth noting that the **sparse MLA** path bypasses `updateSparseKvCacheAfterFmha` and `gatherKvPageOffsetsKernel` entirely. Because the sparse MLA kernel natively supports token-level sparsity, it only requires the framework to supply correct sparse indices—no intermediate page-alignment or KV cache rewriting is needed.
+**Sparse KV cache.** TensorRT LLM supports token-level sparse KV cache during the context phase. After context attention finishes, a kernel called `updateSparseKvCacheAfterFmha` rewrites the KV cache in-place according to `sparse_kv_indices`, keeping only the selected tokens. Because the gather operates in-place, the indices must be **sorted** to avoid overwriting data that has not yet been read. This approach is fully compatible with existing context attention flows—including features like chunked prefill—but it does write the KV cache twice: once in full during the context phase, and once in compressed form afterward.
 
 This separation of responsibilities—prediction module → `AttentionOp` pre/post kernels → core attention—provides a clean layering: algorithms can iterate on prediction and indexing strategies while relying on a stable, high-performance attention kernel underneath.
 
