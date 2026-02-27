@@ -90,7 +90,7 @@ class WideEPMoE(MoE):
         # The default value is max_num_tokens * dp_size
         self.moe_max_num_tokens = model_config.moe_max_num_tokens
         # The auxiliary CUDA stream and CUDA events are only used when MoE chunking is applied
-        default_moe_max_num_tokens = model_config.max_num_tokens * model_config.mapping.dp_size
+        default_moe_max_num_tokens = model_config.max_num_tokens * self.mapping.dp_size
         if self.moe_max_num_tokens < default_moe_max_num_tokens:
             self.aux_stream = aux_stream_dict[
                 AuxStreamType.
@@ -114,7 +114,7 @@ class WideEPMoE(MoE):
         self.has_been_profiled = False
 
         self.alltoall_method_type = self.select_alltoall_method_type(
-            model_config.mapping, routing_method.experts_per_token, dtype,
+            self.mapping, routing_method.experts_per_token, dtype,
             model_config.use_cuda_graph)
         logger.info_once(
             f"{self.__class__.__name__} selects alltoall_method_type {self.alltoall_method_type!r}",
@@ -129,12 +129,11 @@ class WideEPMoE(MoE):
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 MnnvlMemory.initialize()
                 self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
-                    model_config.mapping)
+                    self.mapping)
                 self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
-                    model_config.mapping)
+                    self.mapping)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEP:
-                self.deep_ep_buffer = buffer_pool.get_buffer(
-                    model_config.mapping)
+                self.deep_ep_buffer = buffer_pool.get_buffer(self.mapping)
                 self.deep_ep_buffer.reserve(hidden_size, dtype)
             elif self.alltoall_method_type == AlltoallMethodType.DeepEPLowLatency:
                 self.deep_ep_max_num_tokens = int(
@@ -147,7 +146,7 @@ class WideEPMoE(MoE):
                 os.environ['NVSHMEM_QP_DEPTH'] = str(
                     2 * (self.deep_ep_max_num_tokens + 1))
                 self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(
-                    model_config.mapping)
+                    self.mapping)
                 self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens,
                                             hidden_size, self.num_slots)
             else:

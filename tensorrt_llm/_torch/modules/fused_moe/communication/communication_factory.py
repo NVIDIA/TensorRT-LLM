@@ -85,8 +85,12 @@ class CommunicationFactory:
             Most parameters are extracted from model_config. Only MoE-specific parameters
             (num_experts, num_slots, top_k, expert_size_per_partition) need to be provided separately.
         """
-        # Extract parameters from model_config
+        # Extract parameters from model_config.
+        # For HELIX CP, fold the CP dimension into TP so that MoE
+        # communication uses the correct effective parallelism.
         mapping = model_config.mapping
+        if mapping.has_cp_helix():
+            mapping = mapping.repurpose_helix_cp_to_tp()
         hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype
         quant_config = model_config.quant_config
@@ -211,8 +215,12 @@ class CommunicationFactory:
             RuntimeError: If the forced method is not supported on this platform
             ValueError: If method name is unknown
         """
-        # Extract parameters from model_config
+        # Extract parameters from model_config.
+        # For HELIX CP, fold the CP dimension into TP so that MoE
+        # communication uses the correct effective parallelism.
         mapping = model_config.mapping
+        if mapping.has_cp_helix():
+            mapping = mapping.repurpose_helix_cp_to_tp()
         hidden_size = model_config.pretrained_config.hidden_size
         act_dtype = model_config.torch_dtype
         quant_config = model_config.quant_config

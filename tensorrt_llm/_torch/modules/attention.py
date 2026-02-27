@@ -752,7 +752,6 @@ class MLA(nn.Module):
         dense_bias: Optional[bool] = None,
         config: Optional[ModelConfig] = None,
         enable_helix_test: bool = False,
-        mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
         """
@@ -825,13 +824,7 @@ class MLA(nn.Module):
 
         # tensor parallel
         config = config or ModelConfig()
-        if mapping_with_cp is not None:
-            logger.warning_once(
-                "[MLA::__init__] Overriding mapping with CP detected.",
-                key="mla_init_mapping_with_cp")
-            self.mapping = mapping_with_cp
-        else:
-            self.mapping = config.mapping
+        self.mapping = config.mapping
         tp_size = self.mapping.tp_size
         pp_size = self.mapping.pp_size
         cp_size = self.mapping.cp_size

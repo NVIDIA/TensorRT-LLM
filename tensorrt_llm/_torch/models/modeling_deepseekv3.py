@@ -715,7 +715,6 @@ class DeepseekV3Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
-        mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
@@ -740,7 +739,6 @@ class DeepseekV3Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream,
-                         mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
         self.kv_a_proj_with_mqa = DeepseekV3Linear(
             config.hidden_size,
@@ -930,7 +928,14 @@ class Deepseekv3MoE(nn.Module):
         super().__init__()
         config = model_config.pretrained_config
         self.top_k = top_k
-        self.use_dp = model_config.mapping.enable_attention_dp
+
+        # For HELIX CP, attention TP+CP ranks become MoE TP/EP ranks.
+        ffn_mapping = model_config.mapping
+        if ffn_mapping.has_cp_helix():
+            ffn_mapping = ffn_mapping.repurpose_helix_cp_to_tp()
+        self.mapping = ffn_mapping
+
+        self.use_dp = ffn_mapping.enable_attention_dp
         self.use_cute_dsl_blockscaling_mm = model_config.use_cute_dsl_blockscaling_mm
         gate_cls = DeepseekV3Gate
         if hasattr(model_config.pretrained_config, "gate_cls"):
@@ -967,8 +972,6 @@ class Deepseekv3MoE(nn.Module):
                 else MoEWeightLoadingMode.VANILLA),
         )
 
-        self.mapping = model_config.mapping
-
         # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
         block_size = 1
         if model_config.quant_config and model_config.quant_config.group_size is not None:
@@ -990,7 +993,7 @@ class Deepseekv3MoE(nn.Module):
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
-            self.allreduce = AllReduce(mapping=model_config.mapping,
+            self.allreduce = AllReduce(mapping=ffn_mapping,
                                        strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
@@ -1007,7 +1010,7 @@ class Deepseekv3MoE(nn.Module):
             precompute_common_perfect_router_logits(
                 num_experts=num_experts,
                 experts_per_token=top_k,
-                moe_ep_size=model_config.mapping.moe_ep_size,
+                moe_ep_size=self.mapping.moe_ep_size,
                 dtype=dtype)
 
     def _compute_shared_expert_tp_size(
@@ -1068,7 +1071,7 @@ class Deepseekv3MoE(nn.Module):
             num_tokens=num_tokens,
             num_experts=num_experts,
             experts_per_token=self.top_k,
-            moe_ep_size=self.model_config.mapping.moe_ep_size,
+            moe_ep_size=self.mapping.moe_ep_size,
             device=device,
             dtype=self.dtype)
 
@@ -1173,8 +1176,7 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  model_config: ModelConfig[PretrainedConfig],
                  layer_idx: int,
                  aux_stream_dict: Dict[AuxStreamType, torch.cuda.Stream],
-                 is_separate_draft_engine: bool = False,
-                 mapping_with_cp: Optional[Mapping] = None):
+                 is_separate_draft_engine: bool = False):
         super().__init__()
         self.model_config = model_config
         self.config = model_config.pretrained_config
@@ -1189,12 +1191,15 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.mapping = model_config.mapping
         mapping = self.mapping
         self.enable_attention_dp = mapping.enable_attention_dp
-        self.mlp_tp_size = mapping.tp_size
+
+        # For HELIX CP, attention TP+CP ranks become FFN TP ranks.
+        ffn_mapping = mapping.repurpose_helix_cp_to_tp(
+        ) if mapping.has_cp_helix() else mapping
+        self.mlp_tp_size = ffn_mapping.tp_size
         self.is_p2p_supported = can_access_peer(mapping)
 
         layer_idx_for_attention = layer_idx
         if is_separate_draft_engine:
-            #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
         if config.model_type == "deepseek_v32":
@@ -1205,18 +1210,12 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 reduce_output=not self.enable_attention_dp
                 and self.mapping.tp_size > 1)
         else:
-            # When enable_attention_dp is True, TP reduction is skipped since each DP rank
-            # works on different batch elements. However, with CP > 1, attention is split
-            # across CP ranks for the SAME batch element, so reduction is still needed
-            # within the CP group.
-            needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
-            needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
-            )
+            needs_tp_reduce = not self.enable_attention_dp and mapping.tp_size > 1
+            needs_cp_reduce = mapping.has_cp_helix()
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                mapping_with_cp=mapping_with_cp,
                 reduce_output=needs_tp_reduce or needs_cp_reduce)
 
         self.fusion_config = EagerFusionConfig()
@@ -1234,13 +1233,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         self.allreduce = None
         self.moe_allreduce = None
-        if not self.enable_attention_dp and self.mapping.tp_size > 1:
-            self.allreduce = AllReduce(mapping=model_config.mapping,
+        if not self.enable_attention_dp and ffn_mapping.tp_size > 1:
+            self.allreduce = AllReduce(mapping=ffn_mapping,
                                        strategy=model_config.allreduce_strategy,
                                        dtype=config.torch_dtype)
-            self.moe_allreduce = MoEAllReduce(self.mapping)
+            self.moe_allreduce = MoEAllReduce(ffn_mapping)
 
-        has_tp = mapping.has_tp()
+        has_tp = ffn_mapping.has_tp()
         if (config.n_routed_experts is not None
                 and layer_idx >= config.first_k_dense_replace
                 and layer_idx % config.moe_layer_freq == 0):
@@ -1287,14 +1286,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                                        eps=config.rms_norm_eps,
                                        dtype=config.torch_dtype)
 
-        # When enable_attention_dp is True, we normally skip attention all-reduce since each
-        # DP rank works on different batch elements. However, with CP > 1, attention is split
-        # across CP ranks for the SAME batch element, so all-reduce is still needed.
-        has_cp = mapping_with_cp is not None and mapping_with_cp.cp_size > 1
+        has_cp = mapping.has_cp_helix()
         can_skip_for_attention_dp = self.enable_attention_dp and not has_cp
+        needs_any_attn_reduce = (not self.enable_attention_dp and
+                                 mapping.tp_size > 1) or mapping.has_cp_helix()
         self.disable_attn_allreduce = (self.fusion_config.PRE_MOE_FUSION
                                        or self.fusion_config.PRE_MLP_FUSION
-                                       or self.mapping.tp_size == 1
+                                       or not needs_any_attn_reduce
                                        or can_skip_for_attention_dp)
 
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
@@ -1338,20 +1336,19 @@ class DeepseekV3DecoderLayer(DecoderLayer):
 
         assert intermediate_size % block_size == 0, "intermediate_size must be divisible by block_size."
         if self.enable_attention_dp:
-            # If using attention DP, the MLP also uses DP instead of TP.
             mlp_tp_size = 1
         else:
-            # The two math.gcd operations ensure that mlp_tp_size falls in the candidate TP sizes.
+            # self.mlp_tp_size is the effective FFN TP size (tp*cp for HELIX).
             tp = math.gcd(
                 intermediate_size // block_size,
-                self.mapping.tp_size,
+                self.mlp_tp_size,
             )
 
             if tp > self.mapping.gpus_per_node:
                 mlp_tp_size = math.gcd(
                     tp,
                     self.mapping.gpus_per_node,
-                )  # Avoid costly inter-node TP
+                )
             else:
                 mlp_tp_size = tp
         return mlp_tp_size
@@ -1693,9 +1690,7 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
 
 class DeepseekV3Model(DecoderModel):
 
-    def __init__(self,
-                 model_config: ModelConfig[PretrainedConfig],
-                 mapping_with_cp: Optional[Mapping] = None):
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         super().__init__(model_config)
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
@@ -1717,10 +1712,8 @@ class DeepseekV3Model(DecoderModel):
         )
 
         self.layers = nn.ModuleList([
-            DeepseekV3DecoderLayer(model_config,
-                                   layer_idx,
-                                   self.aux_stream_dict,
-                                   mapping_with_cp=mapping_with_cp)
+            DeepseekV3DecoderLayer(model_config, layer_idx,
+                                   self.aux_stream_dict)
             for layer_idx in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(hidden_size=config.hidden_size,
@@ -1777,23 +1770,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                                                         PretrainedConfig]):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
-        self.mapping_with_cp = None
-        # Note: Currently the usage of mapping is all over the place making its usage brittle
-        # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
-        # is in action. This shall be passed on to attention which is the only layer that's
-        # affected by CP. For other layers, CP ranks are repurposed to TP. This shall be undone
-        # at the end of __init__.
-        if model_config.mapping.has_cp_helix():
-            print(
-                f"[DeepseekV3ForCausalLM::__init__] Repurposing KVP ranks to TP while keeping other details the same."
-            )
-            self.mapping_with_cp = copy.deepcopy(model_config.mapping)
-            # Repurpose KVP ranks to TP while keeping other details the same.
-            model_config._frozen = False
-            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
-            )
-            model_config._frozen = True
-
         # Rename some keys of quant_config_dict to support legacy checkpoints
         if model_config.quant_config_dict is not None:
             model_config = copy.deepcopy(model_config)
@@ -1807,8 +1783,7 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
 
-        super().__init__(model=DeepseekV3Model(
-            model_config, mapping_with_cp=self.mapping_with_cp),
+        super().__init__(model=DeepseekV3Model(model_config),
                          model_config=model_config)
 
         self.model_nextn = 0
@@ -1839,15 +1814,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                     self.model_config.quant_config.exclude_modules.extend(
                         extend_exclude_modules)
             self.model.layers.extend(self.draft_model.mtp_layers)
-
-        # Undo any manipulations done to mapping.
-        if self.mapping_with_cp is not None:
-            print(
-                f"[DeepseekV3ForCausalLM::__init__] Restoring original mapping."
-            )
-            model_config._frozen = False
-            model_config.mapping = self.mapping_with_cp
-            model_config._frozen = True
 
     def forward(
         self,

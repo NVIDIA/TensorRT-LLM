@@ -66,28 +66,32 @@ class VanillaMoE(nn.ModuleList):
         # could be modified later
         self.quant_config = model_config.quant_config
 
-        self.cluster_rank = model_config.mapping.moe_cluster_rank
-        self.cluster_size = model_config.mapping.moe_cluster_size
+        # For HELIX CP, attention TP+CP ranks become MoE TP/EP ranks.
+        ffn_mapping = model_config.mapping
+        if ffn_mapping.has_cp_helix():
+            ffn_mapping = ffn_mapping.repurpose_helix_cp_to_tp()
+
+        self.cluster_rank = ffn_mapping.moe_cluster_rank
+        self.cluster_size = ffn_mapping.moe_cluster_size
         self.smart_router = True if self.cluster_size > 1 else False
         assert not self.smart_router, (
             "Smart router is not supported in vanilla MoE, "
             "please set moe_cluster_size to 1.")
 
-        self.rank = model_config.mapping.rank
+        self.rank = ffn_mapping.rank
 
-        self.tp_rank = model_config.mapping.moe_tp_rank
-        self.tp_size = model_config.mapping.moe_tp_size
+        self.tp_rank = ffn_mapping.moe_tp_rank
+        self.tp_size = ffn_mapping.moe_tp_size
 
-        self.ep_size = model_config.mapping.moe_ep_size
-        self.ep_rank = model_config.mapping.moe_ep_rank
+        self.ep_size = ffn_mapping.moe_ep_size
+        self.ep_rank = ffn_mapping.moe_ep_rank
         self.moe_backend = model_config.moe_backend
-        self.use_dp = model_config.mapping.enable_attention_dp
+        self.use_dp = ffn_mapping.enable_attention_dp
 
-        # All ranks participate in allreduce regardless of EP/TP combination
-        self.mapping = model_config.mapping
-        self.parallel_size = self.mapping.tp_size
+        self.mapping = ffn_mapping
+        self.parallel_size = ffn_mapping.tp_size
 
-        self.all_reduce = AllReduce(mapping=self.mapping,
+        self.all_reduce = AllReduce(mapping=ffn_mapping,
                                     strategy=model_config.allreduce_strategy)
 
         self.intermediate_size_per_partition = intermediate_size // self.tp_size
