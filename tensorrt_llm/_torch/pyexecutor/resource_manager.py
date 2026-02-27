@@ -1736,7 +1736,7 @@ class KVCacheManagerV2(BaseResourceManager):
         ] for pool_id in range(self.num_pools)],
                                               dtype=torch.int64,
                                               device="cpu",
-                                              pin_memory=True)
+                                              pin_memory=prefer_pinned())
 
         if self.dtype == DataType.NVFP4:
             kv_cache_pool_pointers = torch.stack([
@@ -1748,7 +1748,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 ] for pool_id in range(self.num_pools)],
                              dtype=torch.int64,
                              device="cpu",
-                             pin_memory=True)
+                             pin_memory=prefer_pinned())
             ],
                                                  dim=-1)
 
@@ -1784,7 +1784,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
                                              dtype=torch.int32,
                                              device="cpu",
-                                             pin_memory=True)
+                                             pin_memory=prefer_pinned())
         return kv_cache_pool_pointers, kv_cache_pool_mapping
 
     def _build_cache_config(
