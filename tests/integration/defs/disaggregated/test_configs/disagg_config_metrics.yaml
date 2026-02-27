@@ -20,8 +20,6 @@ context_servers:
     enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
-  router:
-    type: round_robin
 generation_servers:
   num_instances: 1
   max_batch_size: 256
@@ -37,5 +35,3 @@ generation_servers:
     enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
-  router:
-    type: round_robin

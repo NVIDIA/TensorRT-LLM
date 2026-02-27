@@ -4,8 +4,6 @@ backend: pytorch
 cuda_graph_config: null
 context_servers:
   num_instances: 0
-  router:
-    type: round_robin
 generation_servers:
   num_instances: 2
   tensor_parallel_size: 1
@@ -17,5 +15,3 @@ generation_servers:
   cache_transceiver_config:
     backend: DEFAULT
   print_iter_log: true
-  router:
-    type: round_robin

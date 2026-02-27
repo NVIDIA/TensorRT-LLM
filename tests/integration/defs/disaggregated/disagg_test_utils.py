@@ -160,7 +160,7 @@ def run_gen_worker(model_name, gen_worker_config, work_dir, port=0, device=1, en
     return _run_worker(model_name, gen_worker_config, "gen", port, work_dir, device, env=env)
 
 
-def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None):
+def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, env=None, cwd=None):
     """Launch the disaggregated server.
 
     Args:
@@ -188,7 +188,7 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False, e
     else:
         stdout = sys.stdout
         stderr = sys.stderr
-    p = subprocess.Popen(cmds, env=env, stdout=stdout, stderr=stderr)
+    p = subprocess.Popen(cmds, env=env, stdout=stdout, stderr=stderr, cwd=cwd)
     return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
 
 

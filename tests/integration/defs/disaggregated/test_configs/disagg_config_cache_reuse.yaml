@@ -15,8 +15,6 @@ context_servers:
     free_gpu_memory_fraction: 0.15
   cache_transceiver_config:
     backend: DEFAULT
-  router:
-    type: round_robin
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1

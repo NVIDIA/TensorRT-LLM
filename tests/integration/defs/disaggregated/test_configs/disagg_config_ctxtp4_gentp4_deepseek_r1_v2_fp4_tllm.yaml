@@ -23,8 +23,6 @@ context_servers:
   cache_transceiver_config:
     backend: DEFAULT
     max_tokens_in_buffer: 16384
-  router:
-    type: round_robin
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 4
@@ -61,5 +59,3 @@ generation_servers:
   cache_transceiver_config:
     backend: DEFAULT
     max_tokens_in_buffer: 16384
-  router:
-    type: round_robin

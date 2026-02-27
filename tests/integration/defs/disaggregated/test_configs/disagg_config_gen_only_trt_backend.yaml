@@ -3,8 +3,6 @@ model: TinyLlama/TinyLlama-1.1B-Chat-v1.0
 backend: trt
 context_servers:
   num_instances: 0
-  router:
-    type: round_robin
 generation_servers:
   num_instances: 2
   tensor_parallel_size: 1
@@ -15,5 +13,3 @@ generation_servers:
     enable_partial_reuse: false
   cache_transceiver_config:
     backend: DEFAULT
-  router:
-    type: round_robin

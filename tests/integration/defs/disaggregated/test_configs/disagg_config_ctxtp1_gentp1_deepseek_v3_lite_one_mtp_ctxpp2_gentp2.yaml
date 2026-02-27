@@ -14,8 +14,6 @@ context_servers:
     num_nextn_predict_layers: 1
   cache_transceiver_config:
     backend: DEFAULT
-  router:
-    type: round_robin
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 2
@@ -26,5 +24,3 @@ generation_servers:
     num_nextn_predict_layers: 1
   cache_transceiver_config:
     backend: DEFAULT
-  router:
-    type: round_robin
