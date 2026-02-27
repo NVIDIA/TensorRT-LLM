@@ -157,10 +157,9 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
 
-    // For NIXL agent connections, all send buffers must be pre-allocated and registered.
-    auto const* agentConnection
-        = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
-    if (agentConnection != nullptr)
+    bool isAgentConnection
+        = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN)).has_value();
+    if (isAgentConnection)
     {
         TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent needs all RNN send buffers pre-allocated");
         TLLM_CHECK(onlyUseDynamicBuffer == false);
@@ -314,16 +313,11 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     size_t bufferCoverSourceNum = 0;
     std::optional<int> cacheBufferId = std::nullopt;
 
-    // For NIXL agent connections, the data has already been RDMA-written into the pre-registered
-    // recv buffer. Retrieve the RNN buffer ID (the last one in the combined KV+RNN buffer IDs)
-    // instead of allocating a new empty buffer.
-    auto const* agentConnection
-        = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
-    if (agentConnection != nullptr)
+    auto preAssignedRnnId
+        = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
+    if (preAssignedRnnId.has_value())
     {
-        size_t rnnBufferIdx = agentConnection->getCacheBufferIdCount() - 1;
-        cacheBufferId = agentConnection->getCacheBufferId(rnnBufferIdx);
-        TLLM_CHECK(cacheBufferId.has_value());
+        cacheBufferId = static_cast<int>(*preAssignedRnnId);
     }
     else
     {
@@ -338,8 +332,7 @@ void RnnCacheFormatter::unformat(TransferSession& session)
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
 
-    // For NIXL agent connections, all recv buffers must be pre-allocated (data is already RDMA-written).
-    if (agentConnection != nullptr)
+    if (preAssignedRnnId.has_value())
     {
         TLLM_CHECK_WITH_INFO(bufferCoverSourceNumTmp == sourceNum, "Agent needs all RNN recv buffers pre-allocated");
         TLLM_CHECK(onlyUseDynamicBuffer == false);

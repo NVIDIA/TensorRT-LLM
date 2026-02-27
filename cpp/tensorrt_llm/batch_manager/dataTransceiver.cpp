@@ -886,18 +886,6 @@ public:
                                   .mIRanks;
         }
 
-        std::vector<std::optional<size_t>> kvCacheBufferIds;
-        std::vector<std::optional<size_t>> rnnCacheBufferIds;
-        if (hasRnn && cacheBufferIds.size() > 1)
-        {
-            kvCacheBufferIds.assign(cacheBufferIds.begin(), cacheBufferIds.end() - 1);
-            rnnCacheBufferIds.assign(cacheBufferIds.end() - 1, cacheBufferIds.end());
-        }
-        else
-        {
-            kvCacheBufferIds = cacheBufferIds;
-        }
-
         TLLM_LOG_INFO("[GEN] kvCounterParts.size()=%zu, rnnCounterParts.size()=%zu, allCounterparts.size()=%zu",
             kvCounterParts.size(), rnnCounterParts.size(), allCounterparts.size());
 
@@ -909,66 +897,61 @@ public:
             allConnections.emplace_back(connection);
         }
 
-        for (size_t i = 0; i < kvCounterParts.size(); i++)
+        for (size_t ci = 0; ci < allCounterparts.size(); ci++)
         {
-            auto const* connection = connections.at(kvCounterParts[i]);
+            auto rank = allCounterparts[ci];
+            auto const* connection = connections.at(rank);
+
+            bool isKvCounterpart
+                = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) != kvCounterParts.end();
+            bool isRnnCounterpart
+                = hasRnn && std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) != rnnCounterParts.end();
+
             if (agentConnectionManager)
             {
-                // Check if this KV counterpart is also an RNN counterpart
-                bool isAlsoRnn = hasRnn
-                    && std::find(rnnCounterParts.begin(), rnnCounterParts.end(), kvCounterParts[i])
-                        != rnnCounterParts.end();
+                auto idsForRank = cacheBufferIds;
+                auto const& managers = agentConnectionManager->getCacheTransBufferManagers();
+                for (size_t i = 0; i < idsForRank.size(); i++)
+                {
+                    auto kind = managers[i]->getBufferKind();
+                    bool include = (kind != BufferKind::kRNN) ? isKvCounterpart : isRnnCounterpart;
+                    if (!include)
+                    {
+                        idsForRank[i] = std::nullopt;
+                    }
+                }
 
-                auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
-                    allCounterparts.size(), mSelfState.getCacheState().value(),
-                    mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
-                auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), i) - localRankIdx.begin();
+                int validConnectionIdx = 0;
+                if (isKvCounterpart)
+                {
+                    auto kvCpIdx
+                        = std::find(kvCounterParts.begin(), kvCounterParts.end(), rank) - kvCounterParts.begin();
+                    auto [pickUpIdx, localRankIdx] = mCacheTransferLayer.getKvFormatter()->pickRecvConnections(
+                        allCounterparts.size(), mSelfState.getCacheState().value(),
+                        mSelfState.getCommState().value().getSelfIdx(), destCacheState, allCounterparts);
+                    validConnectionIdx
+                        = std::find(localRankIdx.begin(), localRankIdx.end(), kvCpIdx) - localRankIdx.begin();
+                }
+                else if (isRnnCounterpart)
+                {
+                    auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destCacheState,
+                        mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx());
+                    auto rnnCpIdx
+                        = std::find(rnnCounterParts.begin(), rnnCounterParts.end(), rank) - rnnCounterParts.begin();
+                    auto [pickUpIdx, localRankIdx] = cache_formatter_utils::pickRecvConnections(rnnCounterParts.size(),
+                        mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(),
+                        destCacheState, rnnCounterParts, rnnTargetInfo);
+                    validConnectionIdx
+                        = std::find(localRankIdx.begin(), localRankIdx.end(), rnnCpIdx) - localRankIdx.begin();
+                }
+
                 auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
                 TLLM_CHECK(agentConnection != nullptr);
 
-                // For overlapping ranks, send combined KV+RNN buffer IDs to preserve positional mapping;
-                // otherwise send only KV buffer IDs.
-                auto const& bufferIdsToSend = isAlsoRnn ? cacheBufferIds : kvCacheBufferIds;
-                TLLM_LOG_INFO("Sending KV%s request info to agent (bufferIds=%zu)", isAlsoRnn ? "+RNN" : "",
-                    bufferIdsToSend.size());
-                TLLM_CHECK(!bufferIdsToSend.empty());
+                TLLM_LOG_INFO("Sending request info to agent for rank %d (KV=%d, RNN=%d)", rank,
+                    static_cast<int>(isKvCounterpart), static_cast<int>(isRnnCounterpart));
                 const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, bufferIdsToSend, validConnectionIdx);
-            }
-            else
-            {
-                sendRequestInfo(connection, requestInfo);
-            }
-        }
-
-        for (size_t j = 0; j < rnnCounterParts.size(); j++)
-        {
-            // Skip ranks already handled in the KV loop (overlapping counterparts)
-            if (std::find(kvCounterParts.begin(), kvCounterParts.end(), rnnCounterParts[j]) != kvCounterParts.end())
-            {
-                continue;
-            }
-            // RNN-only counterparts (not in kvCounterParts) are not supported with NIXL agent connections
-            // because the buffer ID positional mapping assumes combined KV+RNN IDs sent in the KV loop.
-            // Currently, KV and RNN counterparts always overlap, so this path should not be reached.
-            TLLM_CHECK_WITH_INFO(!agentConnectionManager,
-                "RNN-only counterpart rank %d has no KV counterpart; not supported with agent connections",
-                rnnCounterParts[j]);
-            auto const* connection = connections.at(rnnCounterParts[j]);
-            if (agentConnectionManager)
-            {
-                TLLM_LOG_INFO("Sending RNN request info to agent");
-                auto rnnTargetInfo = executor::kv_cache::targetIRanksForRnn(destCacheState,
-                    mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx());
-                auto [pickUpIdx, localRankIdx] = cache_formatter_utils::pickRecvConnections(rnnCounterParts.size(),
-                    mCacheTransferLayer.getCacheState(), mSelfState.getCommState().value().getSelfIdx(), destCacheState,
-                    rnnCounterParts, rnnTargetInfo);
-                auto validConnectionIdx = std::find(localRankIdx.begin(), localRankIdx.end(), j) - localRankIdx.begin();
-                auto* agentConnection = dynamic_cast<executor::kv_cache::AgentConnection const*>(connection);
-                TLLM_CHECK(agentConnection != nullptr);
-                TLLM_CHECK(!rnnCacheBufferIds.empty());
-                const_cast<executor::kv_cache::AgentConnection*>(agentConnection)
-                    ->sendRequestAndBufferInfo(requestInfo, rnnCacheBufferIds, validConnectionIdx);
+                    ->sendRequestAndBufferInfo(requestInfo, idsForRank, validConnectionIdx);
             }
             else
             {
