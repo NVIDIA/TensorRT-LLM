@@ -48,7 +48,7 @@ def config_file_lock(timeout: int = 10):
     try:
         with lock:
             yield
-    except (PermissionError, filelock.Timeout):
+    except (PermissionError, filelock.Timeout, OSError):
         # Fallback to tempdir
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
