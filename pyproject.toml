@@ -1470,10 +1470,24 @@ max-args = 10
 
 
 [tool.mypy]
-files = ["**/auto_deploy/**"]
 install_types = true
 non_interactive = true
+follow_imports = "silent"
+explicit_package_bases = true
+namespace_packages = true
+strict = true
 show_error_codes = true
+# NB:
+#   .   -> 'tensorrt_llm'
+#   tests/unittest   -> 'utils'
+#   tests/unittest/_torch/sampler   -> for 'test_beam_search_util'
+mypy_path = ".:tests/unittest:tests/unittest/_torch/sampler"
+
+[[tool.mypy.overrides]]
+module = [
+    "tensorrt_llm.auto_deploy.*",
+]
+ignore_errors = true
 disable_error_code = [
     "import",
     "assignment",
@@ -1483,20 +1497,39 @@ disable_error_code = [
     "operator",
     "call-arg",
 ]
-explicit_package_bases = true
-namespace_packages = true
 # strict checks
-strict = true
 disallow_subclassing_any = false
 disallow_untyped_decorators = false
-disallow_any_generics = false
 disallow_untyped_calls = false
 disallow_incomplete_defs = false
 disallow_untyped_defs = false
 warn_return_any = false
-exclude = ["triton_kernels"]
-
 
 [[tool.mypy.overrides]]
-module = ["tests.*"]
+module = ["tensorrt_llm.runtime.kv_cache_manager_v2.*"]
+disallow_any_generics = false
+
+[[tool.mypy.overrides]]
+module = ["tensorrt_llm.bindings.*"]
 ignore_errors = true
+
+[[tool.mypy.overrides]]
+module = [
+    "tensorrt_llm._torch.pyexecutor.sampler",
+]
+disable_error_code = [
+    "no-untyped-call"
+]
+
+[[tool.mypy.overrides]]
+module = [
+    "tests.*",
+    "_torch.*",  # tests/unittest/_torch/*, cf. mypy_path
+    "test_torch_sampler",  # tests/unittest/_torch/sampler/..., cf. mypy_path
+    "test_beam_search",  # tests/unittest/_torch/sampler/..., cf. mypy_path
+    "test_beam_search_util",  # tests/unittest/_torch/sampler/..., cf. mypy_path
+]
+disable_error_code = [
+    "no-untyped-def",
+    "no-untyped-call",
+]

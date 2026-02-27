@@ -58,7 +58,8 @@ def main():
 
     # Run pre-commit on all files
     try:
-        run_cmd("pre-commit run -a --show-diff-on-failure")
+        # NB: The type-check hook requires all dependencies to be installed
+        run_cmd("SKIP='type-check' pre-commit run -a --show-diff-on-failure")
     except SystemExit:
         handle_check_failure("pre-commit checks failed")
 
