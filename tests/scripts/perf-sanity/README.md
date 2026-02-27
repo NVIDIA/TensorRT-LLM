@@ -38,7 +38,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 ### Aggregated Mode Config Files
 
-**Location**: `tests/scripts/perf-sanity`
+**Location**: `tests/scripts/perf-sanity/aggregated`
 
 **File Naming**: `xxx.yaml` where words are connected by `_` (underscore), not `-` (hyphen).
 
@@ -52,7 +52,7 @@ There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (
 
 ### Disaggregated Mode Config Files
 
-**Location**: `tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity`
+**Location**: `tests/scripts/perf-sanity/disaggregated`
 
 **File Naming**: `xxx.yaml` (can contain `-` hyphen).
 
@@ -66,7 +66,7 @@ In each test db yml file (with keyword `perf_sanity`), there are four test types
 
 ### 1. Normal Aggregated Test
 
-Uses aggregated config files from `tests/scripts/perf-sanity`.
+Uses aggregated config files from `tests/scripts/perf-sanity/aggregated`.
 
 **Format**:
 ```
@@ -199,8 +199,8 @@ When working with perf sanity tests, use these paths:
 | Resource | Path |
 |----------|------|
 | Pytest script | `tests/integration/defs/perf/test_perf_sanity.py` |
-| Aggregated configs | `tests/scripts/perf-sanity/*.yaml` |
-| Disaggregated configs | `tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity/*.yaml` |
+| Aggregated configs | `tests/scripts/perf-sanity/aggregated/*.yaml` |
+| Disaggregated configs | `tests/scripts/perf-sanity/disaggregated/*.yaml` |
 | CI submit (disagg only) | `jenkins/scripts/perf/disaggregated/submit.py` |
 | Local submit (all) | `jenkins/scripts/perf/local/submit.py` |
 | Jenkins pipeline | `jenkins/L0_Test.groovy` |

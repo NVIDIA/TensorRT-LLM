@@ -4,7 +4,7 @@ import os
 
 import yaml
 
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
 
 
 def get_hardware_config(config, benchmark_mode):
@@ -356,15 +356,19 @@ def main():
             f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
             f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
         )
+    worker_env_vars = f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache {worker_env_vars}"
 
     script_prefix_lines.extend(
         [
             worker_pytest_command,
             disagg_server_pytest_command,
             benchmark_pytest_command,
-            f'export pytestCommandWorker="unset UCX_TLS && {worker_env_vars} $partialPytestCommandWorker"',
-            f'export pytestCommandDisaggServer="{server_env_vars} $partialPytestCommandDisaggServer"',
-            f'export pytestCommandBenchmark="{env_config["benchmark_env_var"]} $partialPytestCommandBenchmark"',
+            f'export WORKER_ENV_VARS="{worker_env_vars}"',
+            f'export SERVER_ENV_VARS="{server_env_vars}"',
+            f'export BENCHMARK_ENV_VARS="{env_config["benchmark_env_var"]}"',
+            'export pytestCommandWorker="unset UCX_TLS && $WORKER_ENV_VARS $partialPytestCommandWorker"',
+            'export pytestCommandDisaggServer="$SERVER_ENV_VARS $partialPytestCommandDisaggServer"',
+            'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $partialPytestCommandBenchmark"',
             f"export runScript={args.run_sh}",
             f"export installScript={install_script}",
             f"export configYamlPath={config_yaml}",

@@ -1,8 +1,28 @@
 # Local SLURM Launch Scripts
 
-You can use `python3 submit.py ... ` to generate slurm scripts.
+## Overview
 
-Then launch the job: `sbatch {timestamp}/slurm_launch.sh`.
+This directory contains scripts for running perf sanity tests locally via SLURM. The workflow has three steps:
+
+1. **`submit.py`** generates a complete `slurm_launch.sh` script. It reads the test config YAML, detects aggregated vs disaggregated mode, and combines SBATCH parameters + environment variables + the appropriate draft template (`jenkins/scripts/perf/aggregated/slurm_launch_draft.sh` or `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh`) into a single launch script. A `test_list.txt` is also written to the work directory.
+
+2. **`sbatch slurm_launch.sh`** submits the job to SLURM. Inside the launch script:
+   - For **aggregated** mode, a single `srun` invokes `slurm_run.sh`.
+   - For **disaggregated** mode, `srun` first runs `slurm_install.sh` on all nodes, then launches separate `srun` commands for gen workers, ctx workers, the disagg server, and the benchmark client.
+
+3. **`slurm_install.sh`** handles build and installation inside the container. It optionally builds the TensorRT-LLM wheel (when `--build-wheel` is set) and then runs `pip install -e .` plus dev requirements. A lock-file mechanism ensures only one process per node performs the install while others wait.
+
+4. **`slurm_run.sh`** runs the pytest command. In aggregated mode, it first sources `slurm_install.sh` to run the install step, then executes the pytest command. In disaggregated mode, the install has already been done by the launch script, so `slurm_run.sh` runs pytest directly.
+
+```
+submit.py
+  |
+  v
+slurm_launch.sh  (generated)
+  |
+  |-- srun --> slurm_install.sh   (build wheel + pip install)
+  |-- srun --> slurm_run.sh       (run pytest)
+```
 
 ## Optional Arguments
 
@@ -18,6 +38,8 @@ Then launch the job: `sbatch {timestamp}/slurm_launch.sh`.
 - `--install-sh`: Path to slurm_install.sh script.
 - `--llm-src`: Path to LLM source code.
 - `--build-wheel`: Add this flag to build the wheel before running tests.
+- `--capture-nsys`: Add this flag to capture an nsys profile during the test run.
+- `--nsys-start-stop`: Nsys start-stop range (default: `1-100`).
 
 `--image` can be obtained by:
 
@@ -26,114 +48,47 @@ image=$(grep LLM_SBSA_DOCKER_IMAGE  $trtllm/jenkins/current_image_tags.propertie
 image=$(echo $image | sed 's|urm.nvidia.com/|urm.nvidia.com#|g')
 ```
 
-## OCI
+## Cluster Settings
+
+| Cluster | `--partition` | `--account` |
+|---------|---------------|-------------|
+| OCI | `batch` | `coreai_comparch_trtllm` |
+| DLCluster | `gb200nvl72_preprod` | `coreai_comparch_trtllm` |
+
+## Examples
 
 ### Aggregated Mode
 
-Using `--test-list`:
-
 ```bash
 python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_tep8_mtp3]" \
-    --partition batch \
-    --account coreai_comparch_trtllm \
+    --draft-launch-sh $trtllm/jenkins/scripts/perf/aggregated/slurm_launch_draft.sh \
+    --launch-sh $work_dir/slurm_launch.sh \
+    --install-sh $trtllm/jenkins/scripts/perf/local/slurm_install.sh \
+    --run-sh $trtllm/jenkins/scripts/perf/local/slurm_run.sh \
+    --llm-src $trtllm \
+    --work-dir $work_dir \
+    --partition $partition \
+    --account $account \
     --job-name aggr_test \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
-    --mounts $mounts \
-    --llm-models-root $llm_models_path
-```
-
-Using `--config-file` and `--test-name`:
-
-```bash
-python3 submit.py --config-file $trtllm/tests/scripts/perf-sanity/deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml \
-    --test-name r1_fp4_v2_tep8_mtp3 \
-    --partition batch \
-    --account coreai_comparch_trtllm \
-    --job-name aggr_test \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
+    --image $image \
     --mounts $mounts \
     --llm-models-root $llm_models_path
 ```
 
 ### Disaggregated Mode
 
-Using `--test-list`:
-
 ```bash
-python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-gb200-deepseek-r1-fp4_1k1k_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-UCX]" \
-    --partition batch \
-    --account coreai_comparch_trtllm \
+python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-e2e-gb200_deepseek-r1-fp4_1k1k_con1_ctx1_dep4_gen1_tep8_eplb0_mtp3_ccb-UCX]" \
+    --draft-launch-sh $trtllm/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh \
+    --launch-sh $work_dir/slurm_launch.sh \
+    --install-sh $trtllm/jenkins/scripts/perf/local/slurm_install.sh \
+    --run-sh $trtllm/jenkins/scripts/perf/local/slurm_run.sh \
+    --llm-src $trtllm \
+    --work-dir $work_dir \
+    --partition $partition \
+    --account $account \
     --job-name disagg_test \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
-    --mounts $mounts \
-    --llm-models-root $llm_models_path
-```
-
-Using `--config-file`:
-
-```bash
-python3 submit.py --config-file $trtllm/tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity/gb200-deepseek-r1-fp4_1k1k_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-UCX.yaml \
-    --benchmark-mode gen_only \
-    --partition batch \
-    --account coreai_comparch_trtllm \
-    --job-name disagg_test \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
-    --mounts $mounts \
-    --llm-models-root $llm_models_path
-```
-
-## DLCluster
-
-### Aggregated Mode
-
-Using `--test-list`:
-
-```bash
-python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[aggr-deepseek_r1_fp4_v2_2_nodes_grace_blackwell-r1_fp4_v2_tep8_mtp3]" \
-    --partition gb200nvl72_preprod \
-    --account coreai_comparch_trtllm \
-    --job-name coreai_comparch_trtllm \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
-    --mounts $mounts \
-    --llm-models-root $llm_models_path
-```
-
-Using `--config-file` and `--test-name`:
-
-```bash
-python3 submit.py --config-file $trtllm/tests/scripts/perf-sanity/deepseek_r1_fp4_v2_2_nodes_grace_blackwell.yaml \
-    --test-name r1_fp4_v2_tep8_mtp3 \
-    --partition gb200nvl72_preprod \
-    --account coreai_comparch_trtllm \
-    --job-name coreai_comparch_trtllm \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
-    --mounts $mounts \
-    --llm-models-root $llm_models_path
-```
-
-### Disaggregated Mode
-
-Using `--test-list`:
-
-```bash
-python3 submit.py --test-list "perf/test_perf_sanity.py::test_e2e[disagg-gb200-deepseek-r1-fp4_1k1k_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-UCX]" \
-    --partition gb200nvl72_preprod \
-    --account coreai_comparch_trtllm \
-    --job-name coreai_comparch_trtllm \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
-    --mounts $mounts \
-    --llm-models-root $llm_models_path
-```
-
-Using `--config-file`:
-
-```bash
-python3 submit.py --config-file $trtllm/tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity/gb200-deepseek-r1-fp4_1k1k_ctx1_dep4_gen1_dep4_eplb0_mtp1_ccb-UCX.yaml \
-    --benchmark-mode gen_only \
-    --partition gb200nvl72_preprod \
-    --account coreai_comparch_trtllm \
-    --job-name coreai_comparch_trtllm \
-    --image "urm.nvidia.com#sw-tensorrt-docker/tensorrt-llm:pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-skip-tritondevel-202602011118-10901" \
+    --image $image \
     --mounts $mounts \
     --llm-models-root $llm_models_path
 ```

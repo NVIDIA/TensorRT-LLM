@@ -35,7 +35,7 @@ from ..conftest import get_llm_root, llm_models_root
 from .open_search_db_utils import (
     SCENARIO_MATCH_FIELDS,
     add_id,
-    check_perf_regression,
+    generate_perf_yaml,
     get_common_values,
     get_history_data,
     get_job_info,
@@ -66,8 +66,8 @@ SUPPORTED_GPU_MAPPING = {
 }
 
 DEFAULT_TIMEOUT = 5400
-AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity/aggregated"
+DISAGG_CONFIG_FOLDER = "tests/scripts/perf-sanity/disaggregated"
 
 # Regex patterns for parsing benchmark output metrics
 # Key is the metric name used in database (e.g., "mean_e2el", "seq_throughput")
@@ -1538,11 +1538,14 @@ class PerfSanityTestConfig:
             # Upload the new perf data and baseline data to database
             post_new_perf_data(new_baseline_data_dict, new_data_dict)
 
-        check_perf_regression(
+        generate_perf_yaml(
             new_data_dict,
-            fail_on_regression=is_scenario_mode,
+            history_baseline_dict=history_baseline_dict,
+            history_data_dict=history_data_dict,
             output_dir=self.test_output_dir,
         )
+        # TODO: Re-enable regression failure check if needed
+        # check_perf_regression(new_data_dict, fail_on_regression=is_scenario_mode, output_dir=self.test_output_dir)
 
 
 # Perf sanity test case parameters

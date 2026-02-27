@@ -396,6 +396,14 @@ def main():
     parser.add_argument(
         "--build-wheel", action="store_true", help="Build wheel before running tests"
     )
+    parser.add_argument(
+        "--capture-nsys", action="store_true", help="Capture nsys profile"
+    )
+    parser.add_argument(
+        "--nsys-start-stop",
+        default="1-100",
+        help="Nsys start-stop range (default: 1-100)",
+    )
 
     args = parser.parse_args()
 
@@ -516,6 +524,25 @@ def main():
         ]
     )
 
+    nsys_prefix = ""
+    tllm_profile_start_stop = ""
+    if args.capture_nsys:
+        nsys_prefix = (
+            "nsys profile"
+            " -t cuda,nvtx,python-gil"
+            " --sample cpu"
+            " --cuda-graph-trace node"
+            " -e TLLM_PROFILE_RECORD_GC=1,TLLM_LLMAPI_ENABLE_NVTX=1,TLLM_TORCH_PROFILE_TRACE=trace.json"
+            " --trace-fork-before-exec=true"
+            " -f true"
+            " --gpu-metrics-devices=none"
+            " -c cudaProfilerApi"
+            " --capture-range-end=stop"
+            " --export=sqlite"
+            f" -o {work_dir}/nsys.rank%q{{SLURM_PROCID}}"
+        )
+        tllm_profile_start_stop = args.nsys_start_stop    
+
     pytest_common_vars = (
         f"LLM_ROOT='{llm_src}' "
         f"LLM_BACKEND_ROOT='{llm_src}/triton_backend' "
@@ -523,6 +550,23 @@ def main():
     )
     llmapi_launch = f"{llm_src}/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 
+    # Add shared exports
+    script_prefix_lines.extend(
+        [
+            f"export CAPTURE_NSYS={'true' if args.capture_nsys else 'false'}",
+            f'export NSYS_PREFIX="{nsys_prefix}"',
+            f'export LLM_API_LAUNCH="{llmapi_launch}"',
+            f'export PYTEST_COMMON_VARS="{pytest_common_vars}"',
+            f'export PYTEST_COMMAND="{pytest_command}"',
+        ]
+    )
+
+    worker_env_vars = (
+        f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "
+        f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+    )
+    server_env_vars = ""
+    benchmark_env_var = ""
     if runtime_mode == "disaggregated":
         # Build worker env vars
         worker_env_vars = env_config.get("worker_env_var", "")
@@ -541,15 +585,19 @@ def main():
                 f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
             )
 
-        pytest_cmd_worker = (
-            f"unset UCX_TLS && {worker_env_vars} {pytest_common_vars} "
-            f"{llmapi_launch} {pytest_command} --junitxml={work_dir}/report.xml"
-        )
         script_prefix_lines.extend(
             [
-                f'export pytestCommandWorker="{pytest_cmd_worker}"',
-                f'export pytestCommandDisaggServer="{server_env_vars} {pytest_common_vars} {pytest_command}"',
-                f'export pytestCommandBenchmark="{benchmark_env_var} {pytest_common_vars} {pytest_command}"',
+                f'export WORKER_ENV_VARS="{worker_env_vars}"',
+                f'export SERVER_ENV_VARS="{server_env_vars}"',
+                f'export BENCHMARK_ENV_VARS="{benchmark_env_var}"',
+                (
+                    'export pytestCommandWorker="unset UCX_TLS &&'
+                    " $WORKER_ENV_VARS $PYTEST_COMMON_VARS"
+                    " $NSYS_PREFIX $LLM_API_LAUNCH"
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
+                'export pytestCommandDisaggServer="$SERVER_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
+                'export pytestCommandBenchmark="$BENCHMARK_ENV_VARS $PYTEST_COMMON_VARS $PYTEST_COMMAND"',
                 f"export numCtxServers={hardware_config.get('num_ctx_servers', '')}",
                 f"export numGenServers={hardware_config.get('num_gen_servers', '')}",
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
@@ -575,9 +623,10 @@ def main():
         # Aggregated mode (including ctx_only)
         script_prefix_lines.extend(
             [
+                f'export WORKER_ENV_VARS="{worker_env_vars}"',
                 (
-                    f'export pytestCommand="{pytest_common_vars} {llmapi_launch} '
-                    f'{pytest_command} --junitxml={work_dir}/report.xml"'
+                    'export pytestCommand="$WORKER_ENV_VARS $PYTEST_COMMON_VARS $NSYS_PREFIX $LLM_API_LAUNCH'
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
                 f"export gpusPerNode={hardware_config.get('gpus_per_node', '')}",
                 f"export gpusPerNodePerServer={hardware_config.get('gpus_per_node_per_server', '')}",

@@ -1,6 +1,17 @@
 import os
 
-ERROR_KEYWORDS = ["RuntimeError", "out of memory", "ValueError", "FileNotFoundError"]
+ERROR_KEYWORDS = [
+    "RuntimeError",
+    "out of memory",
+    "ValueError",
+    "FileNotFoundError",
+    "ConnectionRefusedError",
+    "ClientConnectorError",
+    "CancelledError",
+    "TimeoutError",
+    "PMI2_Init failed to intialize",
+    "OSError",
+]
 SLURM_LOG_TAIL_LINES = 200  # Number of lines to print from slurm job logs
 ERROR_CONTEXT_LINES = 100  # Number of lines to print before and after error line
 
