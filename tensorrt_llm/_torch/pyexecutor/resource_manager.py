@@ -1672,8 +1672,8 @@ class KVCacheManagerV2(BaseResourceManager):
             for layer_id in typed_range(LayerId(num_layers))
         }
 
-        (self.kv_cache_pool_pointers, self.kv_cache_pool_mapping
-         ) = self._build_pool_mapping_tensors(kv_cache_config)
+        (self.kv_cache_pool_pointers,
+         self.kv_cache_pool_mapping) = self._build_pool_mapping_tensors()
 
         # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
         self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
@@ -1729,9 +1729,7 @@ class KVCacheManagerV2(BaseResourceManager):
     def _get_cache_quota(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
-    def _build_pool_mapping_tensors(
-            self, kv_cache_config: KvCacheConfig
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+    def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
         kv_cache_pool_pointers = torch.tensor([[
             self.impl.get_mem_pool_base_address(
                 self.impl.layer_grouping[pool_id][0], Role.KEY), 0
@@ -1740,7 +1738,7 @@ class KVCacheManagerV2(BaseResourceManager):
                                               device="cpu",
                                               pin_memory=True)
 
-        if kv_cache_config.dtype == "nvfp4":
+        if self.dtype == DataType.NVFP4:
             kv_cache_pool_pointers = torch.stack([
                 kv_cache_pool_pointers,
                 torch.tensor([[
@@ -1757,7 +1755,7 @@ class KVCacheManagerV2(BaseResourceManager):
         kv_cache_pool_mapping_list = []
         for layer_id in typed_range(LayerId(self.num_local_layers)):
             layer_group_id = self.impl.get_layer_group_id(layer_id)
-            if kv_cache_config.dtype != "nvfp4":
+            if self.dtype != DataType.NVFP4:
                 addr_offset = self.impl.get_mem_pool_base_address(
                     layer_id, Role.KEY) - int(
                         kv_cache_pool_pointers[layer_group_id][0])
@@ -1778,7 +1776,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 self.get_layer_bytes_per_token(layer_id, Role.KEY) *
                 self.kv_factor * self.tokens_per_block)
 
-            if kv_cache_config.dtype == "nvfp4":
+            if self.dtype == DataType.NVFP4:
                 assert block_scale_offset == offset, "Block scale offset and offset should be the same"
 
             kv_cache_pool_mapping_list.append([layer_group_id, offset])
