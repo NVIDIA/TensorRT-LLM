@@ -223,6 +223,23 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
+    """Create and initialize a PyExecutor instance from the given LLM arguments.
+
+    Loads model configuration, applies model-specific defaults, constructs the
+    resource manager, model engine, scheduler, and decoder, then returns a fully
+    initialized PyExecutor ready for inference.
+
+    Args:
+        llm_args: Configuration arguments for the PyTorch-based LLM executor.
+        checkpoint_dir: Path to the model checkpoint directory. If None, uses
+            the path specified in llm_args.
+        tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
+        profiling_stage_data: Optional dict for collecting per-stage memory
+            profiling data during executor construction.
+
+    Returns:
+        A fully initialized PyExecutor instance.
+    """
     torch.cuda.set_per_process_memory_fraction(1.0)
 
     # Apply model-specific defaults early, before destructuring llm_args fields
@@ -337,7 +354,8 @@ def create_py_executor(
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
-        if cache_transceiver_config is not None or kv_connector_config is not None:
+        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
+        if cache_transceiver_config is not None:
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
@@ -415,12 +433,12 @@ def create_py_executor(
                     if use_tree_drafter:
                         return TreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, max_batch_size,
+                            spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)
                     else:
                         return LinearDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, model)
+                            spec_config.tokens_per_gen_step - 1, model)
             else:
                 drafting_loop_wrapper = None
 
@@ -460,11 +478,11 @@ def create_py_executor(
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
-        model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
-        model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(
@@ -546,7 +564,7 @@ def create_py_executor(
                 }
                 if spec_config is not None:
                     kwargs[
-                        "max_num_draft_tokens"] = spec_config.max_total_draft_tokens
+                        "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):

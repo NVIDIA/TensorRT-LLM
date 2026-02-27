@@ -42,10 +42,19 @@
 namespace tensorrt_llm::batch_manager
 {
 /// Used for KV and RNN cache format()
+/// localIdx decomposes as (cpRank, tpRank, ppRank) with ppRank varying fastest.
+/// When duplicate heads exist, multiple destination ranks share the same buffer,
+/// so the returned bufferIdx < localIdx for some connections.
 size_t computeBufferIdx(size_t localIdx, executor::kv_cache::TargetRanksInfo const& targetInfo)
 {
-    size_t bufferTpRank = (localIdx / targetInfo.mDomainPPSize) / targetInfo.mPeerDupHeadFactor;
-    return (bufferTpRank * targetInfo.mDomainPPSize) + (localIdx % targetInfo.mDomainPPSize);
+    size_t const ppDomainSize = targetInfo.mDomainPPSize;
+    size_t const tpDomainSize = targetInfo.mDomainTPSize;
+    size_t const ppRank = localIdx % ppDomainSize;
+    size_t const tpRank = (localIdx / ppDomainSize) % tpDomainSize;
+    size_t const cpRank = localIdx / (ppDomainSize * tpDomainSize);
+    size_t const bufferTpRank = tpRank / targetInfo.mPeerDupHeadFactor;
+    size_t const numTPCaches = tpDomainSize / targetInfo.mPeerDupHeadFactor;
+    return cpRank * (numTPCaches * ppDomainSize) + bufferTpRank * ppDomainSize + ppRank;
 }
 
 void sendBuffer(TransferSession& session, int deviceId, size_t localIdx,
@@ -351,8 +360,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
     auto& blockManager = mCacheManager->getBlockManager();
     auto const& lastBlockKey = session.getLastBlockKey();
     auto const ppSize = selfConfig.getParallelConfig().mPipelineParallelism;
-    auto blockRange = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd,
-        /*recvSideHasCP=*/false, ppSize);
+    bool const recvSideHasCP = destConfig.getParallelConfig().mContextParallelism > 1;
+    auto blockRange
+        = getBlockRangeForSending(mCacheManager, llmRequest, lastBlockKey, indexFromEnd, recvSideHasCP, ppSize);
     auto const numPools
         = blockManager.getNumPools(/*includeBlockScalePools=*/false, /*includeIndexerKCachePools=*/false);
     // TODO(oargov): are we sure the other side has the same number of pools? this might not hold for pp_size>1...
@@ -480,22 +490,38 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
 
         auto getBufferSizeForTarget = [&]()
         {
-            std::vector<size_t> bufferSizeForTarget(targetNum, 0);
-            // only first bufferTargetNum is used.
+            std::vector<size_t> bufferSizeForTarget(bufferTargetNum, 0);
+            size_t const cPDomainSize = targetInfo.mDomainCPSize;
+            size_t const numTPCaches = targetInfo.mDomainTPSize / peerDuplicateHeadFactor;
+            size_t const ppDomainSize = targetInfo.mDomainPPSize;
+
             if (inputKvCacheBlocksPerWindow.size() > 1)
             {
                 // for VWSA
-                for (size_t i = 0; i < targetNum; i++)
+                for (size_t i = 0; i < bufferTargetNum; i++)
                 {
                     bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetNum;
                 }
                 return bufferSizeForTarget;
             }
 
-            for (size_t i = 0; i < targetNum; i++)
+            // Per-block, per-layer size for one TP head group.
+            size_t const sizePerBlockPerLayerPerTP = allCacheBlockSize * peerDuplicateHeadFactor
+                / targetInfo.mDomainTPSize / selfAttentionLayerNum / blockNum;
+
+            for (size_t cpIdx = 0; cpIdx < cPDomainSize; cpIdx++)
             {
-                bufferSizeForTarget[i] = allCacheBlockSize * peerDuplicateHeadFactor / targetInfo.mDomainTPSize
-                    / selfAttentionLayerNum * targetInfo.getPeerPPDomainLayerNum(i);
+                size_t const peerBlockNum
+                    = executor::kv_cache::getBlockNumAccountingForCP(cpIdx, cPDomainSize, blockNum);
+                for (size_t tpIdx = 0; tpIdx < numTPCaches; tpIdx++)
+                {
+                    for (size_t ppIdx = 0; ppIdx < ppDomainSize; ppIdx++)
+                    {
+                        size_t const bufIdx = cpIdx * (numTPCaches * ppDomainSize) + tpIdx * ppDomainSize + ppIdx;
+                        size_t const peerLayerNum = targetInfo.getPeerPPDomainLayerNum(ppIdx);
+                        bufferSizeForTarget[bufIdx] = sizePerBlockPerLayerPerTP * peerLayerNum * peerBlockNum;
+                    }
+                }
             }
 
             return bufferSizeForTarget;
@@ -560,9 +586,9 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
     auto const selfIdx = session.getSelfState().getCommState().value().getSelfIdx();
     auto& bufferManager = session.getBufferManager();
     auto const srcPpSize = destConfig.getParallelConfig().mPipelineParallelism;
+    bool const recvSideHasCP = selfConfig.getParallelConfig().mContextParallelism > 1;
     auto blockRange = getBlockRangeForReceiving(mCacheManager, llmRequest, destConfig.getEnableBlockReuse(),
-        destConfig.getEnablePartialReuse(),
-        /*recvSideHasCP=*/false, srcPpSize);
+        destConfig.getEnablePartialReuse(), recvSideHasCP, srcPpSize);
 
     auto pickRecvConnResult
         = pickRecvConnections(connections.size(), selfConfig, selfIdx, destConfig, session.getCounterPartRanks());
@@ -955,11 +981,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
         TLLM_LOG_WARNING("CacheFormatter::inquireSupport: only support non-MLA");
         return false;
     }
+    // Helix CP for disagg serving: one side (context) must have CP=1, the other side (gen) can have CP>=1.
     if (selfConfig.getParallelConfig().mContextParallelism != 1
-        || destConfig.getParallelConfig().mContextParallelism != 1)
+        && destConfig.getParallelConfig().mContextParallelism != 1)
     {
-        TLLM_LOG_WARNING(
-            "CacheFormatter::inquireSupport: context parallelism is not currently supported (selfCP=%d, destCP=%d).",
+        TLLM_LOG_WARNING("CacheFormatter::inquireSupport: Helix CP is decode-only (selfCP=%d, destCP=%d).",
             selfConfig.getParallelConfig().mContextParallelism, destConfig.getParallelConfig().mContextParallelism);
         return false;
     }

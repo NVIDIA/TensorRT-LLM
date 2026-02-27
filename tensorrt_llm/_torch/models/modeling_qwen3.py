@@ -1,3 +1,4 @@
+import copy
 from typing import Optional
 
 import torch
@@ -5,6 +6,7 @@ from torch import nn
 from transformers import Qwen3Config
 
 from tensorrt_llm.functional import PositionEmbeddingType
+from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
@@ -32,6 +34,7 @@ class Qwen3Attention(QKNormRoPEAttention):
         use_gemma_rms_norm: bool = False,
         disable_deep_gemm: bool = False,
         reduce_output: bool = True,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         config = model_config.pretrained_config
         self.pretrained_config = config
@@ -76,6 +79,7 @@ class Qwen3Attention(QKNormRoPEAttention):
             use_gemma_rms_norm=use_gemma_rms_norm,
             disable_deep_gemm=disable_deep_gemm,
             reduce_output=reduce_output,
+            mapping_with_cp=mapping_with_cp,
         )
 
 
@@ -85,16 +89,27 @@ class Qwen3DecoderLayer(DecoderLayer):
         self,
         model_config: ModelConfig[Qwen3Config],
         layer_idx: int,
+        mapping_with_cp: Optional[Mapping] = None,
     ):
         super().__init__()
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
+        self.mapping = model_config.mapping
+        self.enable_attention_dp = self.mapping.enable_attention_dp
+
+        # When enable_attention_dp is True, TP reduction is skipped since each DP rank
+        # works on different batch elements. However, with CP > 1, attention is split
+        # across CP ranks for the SAME batch element, so reduction is still needed
+        # within the CP group.
+        needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        )
         self.self_attn = Qwen3Attention(
             model_config,
             layer_idx=layer_idx,
+            mapping_with_cp=mapping_with_cp,
+            reduce_output=needs_tp_reduce or needs_cp_reduce,
         )
-        self.mapping = model_config.mapping
-        self.enable_attention_dp = self.mapping.enable_attention_dp
 
         self.mlp = GatedMLP(
             hidden_size=config.hidden_size,
@@ -111,8 +126,19 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.disable_allreduce = (self.mapping.tp_size == 1
-                                  or self.enable_attention_dp)
+
+        # Attention allreduce: needed unless tp_size==1 or attention_dp
+        # without CP. With helix CP, attention ranks process the SAME batch
+        # element, so all-reduce across CP ranks is still required.
+        has_cp = mapping_with_cp is not None and mapping_with_cp.cp_size > 1
+        can_skip_attn_for_dp = self.enable_attention_dp and not has_cp
+        self.disable_attn_allreduce = (self.mapping.tp_size == 1
+                                       or can_skip_attn_for_dp)
+
+        # MLP allreduce: when enable_attention_dp, MLP uses
+        # overridden_tp_size=1 (data-parallel), so no all-reduce is needed.
+        self.disable_mlp_allreduce = (self.mapping.tp_size == 1
+                                      or self.enable_attention_dp)
 
     def forward(
         self,
@@ -138,7 +164,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_allreduce),
+                enable_allreduce=not self.disable_attn_allreduce),
             mrope_config=mrope_config,
             **kwargs,
         )
@@ -150,7 +176,7 @@ class Qwen3DecoderLayer(DecoderLayer):
             hidden_states,
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
-                enable_allreduce=not self.disable_allreduce),
+                enable_allreduce=not self.disable_mlp_allreduce),
             cutlass_min_latency_mode=False,
             **kwargs,
         )
@@ -167,7 +193,9 @@ class Qwen3DecoderLayer(DecoderLayer):
 
 class Qwen3Model(DecoderModel):
 
-    def __init__(self, model_config: ModelConfig[Qwen3Config]):
+    def __init__(self,
+                 model_config: ModelConfig[Qwen3Config],
+                 mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
         config = self.model_config
 
@@ -183,6 +211,7 @@ class Qwen3Model(DecoderModel):
             Qwen3DecoderLayer(
                 model_config,
                 layer_idx,
+                mapping_with_cp=mapping_with_cp,
             ) for layer_idx in range(config.pretrained_config.num_hidden_layers)
         ])
         self.norm = RMSNorm(
@@ -237,7 +266,25 @@ class Qwen3ForCausalLM(SpecDecOneEngineForCausalLM[Qwen3Model, Qwen3Config]):
         self,
         model_config: ModelConfig[Qwen3Config],
     ):
+        self.mapping_with_cp = None
+        # When helix CP is enabled, CP is relevant only for the attention layer.
+        # For other layers (e.g., MLP), CP ranks are repurposed to TP. We save
+        # the original mapping with CP, repurpose CP to TP for model construction,
+        # and restore the original mapping afterward.
+        if model_config.mapping.has_cp_helix():
+            self.mapping_with_cp = copy.deepcopy(model_config.mapping)
+            model_config._frozen = False
+            model_config.mapping = model_config.mapping.repurpose_helix_cp_to_tp(
+            )
+            model_config._frozen = True
+
         super().__init__(
-            Qwen3Model(model_config),
+            Qwen3Model(model_config, mapping_with_cp=self.mapping_with_cp),
             model_config,
         )
+
+        # Restore the original mapping with CP after model construction.
+        if self.mapping_with_cp is not None:
+            model_config._frozen = False
+            model_config.mapping = self.mapping_with_cp
+            model_config._frozen = True

@@ -6617,13 +6617,6 @@ def enumerate_kernels():
                   and kspec.cross_mha     == False
                   and kspec.flash_attention == True
                   and kspec.input_layout != InputLayout.SEPARATE_Q_K_V
-                  or (kspec.sm == 90
-                  and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32']
-                  and kspec.head_size     <= 256
-                  and kspec.ldgsts_q  == True
-                  and kspec.version       == 2
-                  and kspec.cross_mha     == False
-                  and kspec.flash_attention == False)
                   # Clip/SigLip support.
                   or  (kspec.sm           == 100
                   and kspec.dtype         in ['fp16', 'bf16', 'fp16_fp32', 'e4m3', 'e4m3_fp32']

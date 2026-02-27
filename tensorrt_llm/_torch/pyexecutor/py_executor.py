@@ -623,6 +623,7 @@ class PyExecutor:
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
                     and self.sampler.async_worker_enabled()):
+                logger.info("Starting the async worker for sampler D2H copies")
                 self.sampler.async_worker_start()
 
     def _set_global_steady_clock_offset(self):
@@ -2820,6 +2821,19 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
+                # Prepend logprobs for first_gen_tokens if transferred from prefill.
+                disagg_params = getattr(req, 'py_disaggregated_params', None)
+                if (disagg_params is not None
+                        and getattr(disagg_params, 'first_gen_log_probs',
+                                    None) is not None):
+                    if beam_width != 1:
+                        raise ValueError(
+                            "first_gen_log_probs transfer currently assumes "
+                            "beam_width == 1; beam search is not supported "
+                            "with disaggregated logprobs propagation.")
+                    req.py_result.append_log_probs(
+                        [disagg_params.first_gen_log_probs])
+
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
@@ -3278,14 +3292,13 @@ class PyExecutor:
                         requests=[request])
                 continue
 
-            if request.is_generation_only_request():
+            if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
-                if not request.is_finished and (
-                        request.is_disagg_generation_transmission_in_progress or
-                    (not self.disable_overlap_scheduler
-                     and request.py_decoding_iter <= 1)):
+                if request.is_disagg_generation_transmission_in_progress or (
+                        not self.disable_overlap_scheduler
+                        and request.py_decoding_iter <= 1):
                     self.perf_manager.append_step_metrics(
                         request,
                         self.iter_counter,
