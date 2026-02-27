@@ -284,7 +284,7 @@ class Qwen3_5MoeTextRotaryEmbedding(nn.Module):
 # =============================================================================
 # Adapted from the Qwen3Next GDN patch:
 #   tensorrt_llm/_torch/auto_deploy/models/patches/qwen3_next.py
-# Uses autodeploy custom ops: torch_causal_conv1d, torch_l2norm, torch_gated_delta_rule
+# Uses autodeploy custom ops: torch_causal_conv1d, torch_gated_delta_rule
 
 
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
@@ -333,7 +333,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
         z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
@@ -367,23 +366,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        # 3. L2 normalize Q and K via autodeploy op
-        query = torch.ops.auto_deploy.torch_l2norm(query)
-        key = torch.ops.auto_deploy.torch_l2norm(key)
-
-        # 4. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
-
-        # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # 5. Gated Delta Rule via autodeploy custom op
-        # Op expects [B, S, H, D] layout (bsnd convention)
-        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
+        # 3. Gated Delta Rule via autodeploy custom op
+        # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
+        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            query, key, value, a, b, self.A_log, self.dt_bias
+        )
 
         # 6. Gated RMSNorm
         z_shape_og = z.shape
