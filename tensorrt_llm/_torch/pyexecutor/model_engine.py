@@ -708,19 +708,25 @@ class PyTorchModelEngine(ModelEngine):
             # Helix CP does not support warmup with context requests.
             if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
                 continue
-            with self._release_batch_context(
-                    self._create_warmup_request(resource_manager, num_tokens,
-                                                num_gen_tokens),
-                    resource_manager) as batch:
-                if batch is None:
-                    continue  # Not enough KV cache space
-                logger.info(
-                    f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
-                )
-                self.forward(batch,
-                             new_tensors_device=None,
-                             resource_manager=resource_manager)
-                torch.cuda.synchronize()
+            try:
+                with self._release_batch_context(
+                        self._create_warmup_request(resource_manager,
+                                                    num_tokens, num_gen_tokens),
+                        resource_manager) as batch:
+                    if batch is None:
+                        continue  # Not enough KV cache space
+                    logger.info(
+                        f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
+                    )
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+                    torch.cuda.synchronize()
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    f"OOM during general warmup with {num_tokens} tokens, "
+                    f"{num_gen_tokens} generation tokens. Skipping.")
+                torch.cuda.empty_cache()
 
     def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
         """Runs warmup iterations to specialize torch.compile kernels."""
