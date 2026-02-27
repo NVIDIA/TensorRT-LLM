@@ -50,6 +50,33 @@ class DemoEngine(ADEngine):
         self.queue.close()
         self.queue.join_thread()
 
+    @staticmethod
+    def _page_assignments_to_ragged(
+        page_assignments: List[List[int]],
+    ) -> Tuple[List[int], List[int]]:
+        """Convert nested page assignments to ragged (cache_loc, cu_num_pages) form.
+
+        Example: [[0, 4], [2]] -> ([0, 4, 2], [0, 2, 3])
+        """
+        cache_loc = [p for pages in page_assignments for p in pages]
+        cu_num_pages = [0]
+        for pages in page_assignments:
+            cu_num_pages.append(cu_num_pages[-1] + len(pages))
+        return cache_loc, cu_num_pages
+
+    @staticmethod
+    def _ragged_to_page_assignments(
+        cache_loc: List[int],
+        cu_num_pages: List[int],
+    ) -> List[List[int]]:
+        """Convert ragged (cache_loc, cu_num_pages) to nested page assignments.
+
+        Example: ([0, 4, 2], [0, 2, 3]) -> [[0, 4], [2]]
+        """
+        return [
+            cache_loc[cu_num_pages[i] : cu_num_pages[i + 1]] for i in range(len(cu_num_pages) - 1)
+        ]
+
     def _assign_pages(self, total_lens: List[int]) -> List[List[int]]:
         """A simple heuristic to assign pages based on current sequence info.
 
@@ -71,9 +98,17 @@ class DemoEngine(ADEngine):
         currently available token slots in the assigned pages and assign a new, previously
         unassigned page if needed.
         """
-        page_assignments = self.cache_seq_interface.info.page_assignments
         num_pages = self.cache_seq_interface.kv_cache_manager.blocks_in_primary_pool
         tokens_per_block = self.cache_seq_interface.kv_cache_manager.tokens_per_block
+
+        # On the first call (after reset), there are no existing assignments
+        if self.cache_seq_interface.info.num_sequences == 0:
+            page_assignments: List[List[int]] = [[] for _ in total_lens]
+        else:
+            info = self.cache_seq_interface.info
+            cache_loc = info.get_arg("cache_loc_host", truncate=True).tolist()
+            cu_num_pages = info.get_arg("cu_num_pages_host", truncate=True).tolist()
+            page_assignments = self._ragged_to_page_assignments(cache_loc, cu_num_pages)
 
         free_pages = set(range(num_pages)) - {i for pages in page_assignments for i in pages}
         updated_assignments = []
@@ -99,28 +134,30 @@ class DemoEngine(ADEngine):
         # set up sequence info object for decode phase
         sequence_info = self.cache_seq_interface.info
 
-        input_ids = []
+        input_ids_flat: List[int] = []
+        cu_seqlen: List[int] = [0]
         total_lens = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         for request in requests:
-            total_lens.append(len(request.prompt_token_ids))
-            input_ids.append(request.prompt_token_ids)
+            prompt = request.prompt_token_ids
+            total_lens.append(len(prompt))
+            input_ids_flat.extend(prompt)
+            cu_seqlen.append(len(input_ids_flat))
             if request.multimodal_params is not None:
                 for k, v in request.multimodal_params.multimodal_data.items():
                     extra_args[k].append(v)
 
         sequence_info.reset()
         page_assignments = self._assign_pages(total_lens)
-        cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
-            page_assignments
-        )
+        cache_loc, cu_num_pages = self._page_assignments_to_ragged(page_assignments)
         sequence_info.nest_sequences(
-            input_ids=input_ids,
-            input_pos=0,
+            input_ids=input_ids_flat,
+            cu_seqlen=cu_seqlen,
+            input_pos=[0] * len(total_lens),
             cache_loc=cache_loc,
-            pages_per_seq=pages_per_seq,
-            slot_idx=list(range(len(input_ids))),
+            cu_num_pages=cu_num_pages,
+            slot_idx=list(range(len(total_lens))),
             **extra_args,
         )
 
@@ -144,19 +181,27 @@ class DemoEngine(ADEngine):
             token_ids, _ = self._decode_tokens(logits_last, sampling_params)  # [b,1]
 
             # update sequence info accordingly for next step (generate phase)
-            input_pos_next = sequence_info.input_pos
-            seq_lens_current = sequence_info.seq_len
-            input_pos_next = [ip + sl for ip, sl in zip(input_pos_next, seq_lens_current)]
+            ip_host = sequence_info.get_arg("input_pos_host", truncate=True)
+            sl_host = sequence_info.get_arg("seq_len_host", truncate=True)
+            input_pos_next = (ip_host + sl_host).tolist()
             total_lens_next = [ip + len(t_ids) for ip, t_ids in zip(input_pos_next, token_ids)]
             page_assignments = self._assign_pages(total_lens_next)
-            cache_loc, pages_per_seq = sequence_info._get_cache_locations_and_pages_per_sequence(
-                page_assignments
-            )
+            cache_loc, cu_num_pages = self._page_assignments_to_ragged(page_assignments)
+
+            # flatten token_ids: each element is a 1D tensor of new tokens for that sequence
+            input_ids_flat: List[int] = []
+            cu_seqlen: List[int] = [0]
+            for t_ids in token_ids:
+                input_ids_flat.extend(t_ids.tolist() if isinstance(t_ids, torch.Tensor) else t_ids)
+                cu_seqlen.append(len(input_ids_flat))
+
             sequence_info.nest_sequences(
-                token_ids,
+                input_ids=input_ids_flat,
+                cu_seqlen=cu_seqlen,
                 input_pos=input_pos_next,
                 cache_loc=cache_loc,
-                pages_per_seq=pages_per_seq,
+                cu_num_pages=cu_num_pages,
+                slot_idx=list(range(batch_size)),
             )
 
             # nest new tokens and run stop check
