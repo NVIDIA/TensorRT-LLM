@@ -357,12 +357,15 @@ def _get_quant_fuser(op_key):
     if op_key in _QUANT_FUSERS:
         return _QUANT_FUSERS[op_key]
 
-    # Lazily resolved: fusion classes are defined later in this module
+    # Lazily resolved: fusion classes are defined later in this module.
+    # Use getattr to avoid AttributeError when an op is not yet registered.
     _OP_TO_CLS = {
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear: FuseFP8Gemms,
         torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear: FuseFP4Gemms,
-        torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear: FuseFineGrainedFP8Gemms,
     }
+    _fg_fp8_op = getattr(torch.ops.auto_deploy, "torch_fake_quant_finegrained_fp8_linear", None)
+    if _fg_fp8_op is not None:
+        _OP_TO_CLS[_fg_fp8_op] = FuseFineGrainedFP8Gemms
     src_cls = _OP_TO_CLS.get(op_key)
     if src_cls is None:
         _QUANT_FUSERS[op_key] = None
@@ -633,7 +636,7 @@ class FuseFineGrainedFP8Gemms(QuantizationFusionMixin, BaseTransform):
     along the output dimension.
     """
 
-    target_op = torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear
+    target_op = getattr(torch.ops.auto_deploy, "torch_fake_quant_finegrained_fp8_linear", None)
     scale_groups = [["weight_scale_inv"]]
 
     def fuse_rule(
