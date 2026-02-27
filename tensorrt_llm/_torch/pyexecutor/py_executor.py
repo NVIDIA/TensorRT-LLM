@@ -3279,14 +3279,13 @@ class PyExecutor:
                         requests=[request])
                 continue
 
-            if request.is_generation_only_request():
+            if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
-                if not request.is_finished and (
-                        request.is_disagg_generation_transmission_in_progress or
-                    (not self.disable_overlap_scheduler
-                     and request.py_decoding_iter <= 1)):
+                if request.is_disagg_generation_transmission_in_progress or (
+                        not self.disable_overlap_scheduler
+                        and request.py_decoding_iter <= 1):
                     self.perf_manager.append_step_metrics(
                         request,
                         self.iter_counter,

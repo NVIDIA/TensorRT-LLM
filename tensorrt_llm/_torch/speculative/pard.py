@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Optional
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
@@ -34,7 +35,9 @@ class PARDSpecMetadata(SpecMetadata):
         assert self.request_ids is not None
 
         num_seqs = len(self.request_ids)
-        batch_indices = torch.arange(num_seqs, dtype=torch.int, device="cpu", pin_memory=True)
+        batch_indices = torch.arange(
+            num_seqs, dtype=torch.int, device="cpu", pin_memory=prefer_pinned()
+        )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
 
