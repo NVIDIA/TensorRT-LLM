@@ -79,6 +79,20 @@ class Buffers:
                 best_fit_block = block
                 smallest_sufficient_size = block.buffer.numel()
 
+        if best_fit_block is not None:
+            if reserve_buffer:
+                # A suitable buffer was found, so reuse it.
+                best_fit_block.is_reserved = True
+                return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
+            # else:
+            # TODO: to reuse tensors both in graph pool and normal pool.
+            # if best_fit_block.is_reserved:
+            #     return self._view_as(best_fit_block.buffer, tensor_shape,
+            #                          dtype)
+            # else:
+            # del best_fit_block.buffer
+            # candidate_blocks.remove(best_fit_block)
+
         for block in list(candidate_blocks):
             if not block.is_reserved:
                 if best_fit_block is not None:
@@ -91,22 +105,8 @@ class Buffers:
                     del block.buffer
                     candidate_blocks.remove(block)
 
-        if best_fit_block is not None:
-            if reserve_buffer:
-                # A suitable buffer was found, so reuse it.
-                best_fit_block.is_reserved = True
-                return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
-            else:
-                # TODO: to reuse tensors both in graph pool and normal pool.
-                if best_fit_block.is_reserved:
-                    return self._view_as(best_fit_block.buffer, tensor_shape,
-                                         dtype)
-                else:
-                    del best_fit_block.buffer
-                    candidate_blocks.remove(best_fit_block)
-
         def _create_buffer():
-            return torch.zeros((required_memory_size, ),
+            return torch.empty((required_memory_size, ),
                                device='cuda',
                                dtype=torch.uint8)
 
