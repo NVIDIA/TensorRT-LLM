@@ -566,9 +566,10 @@ class TRTLLMGenFusedMoE(MoE):
                 self.expert_size_per_partition,
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
-                topk_weights=token_final_scales,
-                topk_ids=token_selected_experts,
-                output=moe_output,
+                token_final_scales,
+                token_selected_experts,
+                0,  # act_type
+                moe_output,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result
@@ -603,11 +604,11 @@ class TRTLLMGenFusedMoE(MoE):
                 self.expert_size_per_partition,
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
-                do_finalize=do_finalize,
-                act_type=act_type,
-                topk_weights=token_final_scales,
-                topk_ids=token_selected_experts,
-                output=moe_output,
+                do_finalize,
+                act_type,
+                token_final_scales,
+                token_selected_experts,
+                moe_output,
             )
 
             if not do_finalize:
@@ -655,7 +656,7 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
-                output=moe_output,
+                moe_output,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result
@@ -685,11 +686,11 @@ class TRTLLMGenFusedMoE(MoE):
                 self.expert_size_per_partition,
                 routed_scaling_factor,
                 self.routing_method.routing_method_type,
-                do_finalize=do_finalize,
-                act_type=0,
-                topk_ids=token_selected_experts,
-                topk_weights=token_final_scales,
-                output=moe_output,
+                do_finalize,
+                0,  # act_type
+                token_final_scales,
+                token_selected_experts,
+                moe_output,
             )
 
             if not do_finalize:
@@ -734,7 +735,7 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
-                output=moe_output,
+                moe_output,
             )
             # When output is provided, use it directly as the result
             final_hidden_states = moe_output if moe_output is not None else result
@@ -777,7 +778,7 @@ class TRTLLMGenFusedMoE(MoE):
                 0,  # act_type
                 token_final_scales,
                 token_selected_experts,
-                output=moe_output,
+                moe_output,
             )
 
             # When output is provided, use it directly as the result
