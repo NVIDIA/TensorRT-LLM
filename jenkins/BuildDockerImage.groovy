@@ -28,11 +28,6 @@ LLM_DEFAULT_TAG = env.defaultTag ?: "${LLM_SHORT_COMMIT}-${LLM_BRANCH_TAG}-${BUI
 
 RUN_SANITY_CHECK = params.runSanityCheck ?: false
 TRIGGER_TYPE = env.triggerType ?: "manual"
-// Default to true to prevent NSPECT check from causing build failure in both pre-merge and post-merge jobs.
-SKIP_NSPECT_FAILURE = true
-// In post-merge job, only warn on the image build failure.
-// RUN_SANITY_CHECK is expected to be set to true only in post-merge job.
-SKIP_BUILD_FAILURE = RUN_SANITY_CHECK
 
 ENABLE_USE_WHEEL_FROM_BUILD_STAGE = params.useWheelFromBuildStage ?: false
 
@@ -506,14 +501,8 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        def buildRes = SKIP_BUILD_FAILURE ? 'UNSTABLE' : 'FAILURE'
-                        def stageRes = SKIP_BUILD_FAILURE ? 'UNSTABLE' : 'FAILURE'
-                        catchError(buildResult: buildRes, stageResult: stageRes) {
-                            echo "Build ${key} failed."
-                            if (!SKIP_BUILD_FAILURE) {
-                                throw e
-                            }
-                        }
+                        echo "Build ${key} failed."
+                        throw e
                     }
                 }
             }
@@ -708,9 +697,7 @@ pipeline {
             }
             steps {
                 script {
-                    def buildRes = SKIP_NSPECT_FAILURE ? 'UNSTABLE' : 'FAILURE'
-                    def stageRes = SKIP_NSPECT_FAILURE ? 'UNSTABLE' : 'FAILURE'
-                    catchError(buildResult: buildRes, stageResult: stageRes) {
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
                         container("python3") {
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
                             trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")

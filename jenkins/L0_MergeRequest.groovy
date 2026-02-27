@@ -49,7 +49,8 @@ STAGE_CHOICE_NORMAL = "normal"
 STAGE_CHOICE_SKIP = "skip"
 STAGE_CHOICE_IGNORE = "ignore"
 
-RELESE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+RELEASE_CHECK_CHOICE = env.releaseCheckChoice ? env.releaseCheckChoice : STAGE_CHOICE_NORMAL
+BUILD_CHECK_CHOICE = env.buildCheckChoice ? env.buildCheckChoice : STAGE_CHOICE_NORMAL
 X86_TEST_CHOICE = env.x86TestChoice ? env.x86TestChoice : STAGE_CHOICE_NORMAL
 SBSA_TEST_CHOICE = env.SBSATestChoice ? env.SBSATestChoice : STAGE_CHOICE_NORMAL
 
@@ -459,7 +460,7 @@ def launchReleaseCheck(pipeline)
     stageName = "Release-Check"
     trtllm_utils.launchKubernetesPod(pipeline, createKubernetesPodConfig(image, "package"), "trt-llm", {
         stage("[${stageName}] Run") {
-            if (RELESE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
+            if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_SKIP) {
                 echo "Release Check job is skipped due to Jenkins configuration"
                 return
             }
@@ -469,7 +470,7 @@ def launchReleaseCheck(pipeline)
             } catch (InterruptedException e) {
                 throw e
             } catch (Exception e) {
-                if (RELESE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
+                if (RELEASE_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
                     catchError(
                         buildResult: 'SUCCESS',
                         stageResult: 'FAILURE') {
@@ -1046,9 +1047,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 
     def status = triggerJob(jobName, parameters)
     if (status != "SUCCESS") {
-        echo "Downstream job ${jobName} status: ${status}"
-        // throw a normal exception so that callers can inspect the text
-        throw new Exception("Downstream job ${jobName} status: ${status}")
+        error "Downstream job did not succeed"
     }
     return status
 }
@@ -1284,20 +1283,14 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         ]
 
                         launchJob("/LLM/helpers/BuildDockerImages", false, enableFailFast, globalVars, "x86_64", additionalParameters)
-                    } catch (hudson.AbortException e) {
-                        // Preserve abort status
-                        throw e
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        // def isOfficialPostMergeJob = (env.JOB_NAME ==~ /.*PostMerge.*/)
-                        // change to true for testing temporarily
-                        def isOfficialPostMergeJob = true
-                        if (isOfficialPostMergeJob) {
+                        if (BUILD_CHECK_CHOICE == STAGE_CHOICE_IGNORE) {
                             catchError(
                                 buildResult: 'SUCCESS',
-                                stageResult: 'UNSTABLE') {
-                                error "Build-Docker-Images job failed: ${e.toString()}"
+                                stageResult: 'FAILURE') {
+                                error "Build-Docker-Images job failed but ignored due to Jenkins configuration"
                             }
                         } else {
                             throw e
