@@ -296,7 +296,7 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
 
 
 # ===========================================================================
-# Tests for fuse_gdn_gemms (relaxed fusion with narrow / zero-copy views)
+# Tests for fuse_gemms_mixed_children (relaxed fusion with narrow / zero-copy views)
 # ===========================================================================
 
 
@@ -443,7 +443,7 @@ class Qwen35GdnMixedQuantModel(TestModel):
 
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
 @torch.inference_mode()
-def test_fuse_gdn_gemms_mixed_quant():
+def test_fuse_gemms_mixed_children_mixed_quant():
     model = Qwen35GdnMixedQuantModel().to(device="cuda")
     x = model.get_input(device="cuda", dtype=torch.half)
 
@@ -462,7 +462,7 @@ def test_fuse_gdn_gemms_mixed_quant():
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "fuse_gdn_gemms": {
+            "fuse_gemms_mixed_children": {
                 "stage": "post_load_fusion",
             },
         },
@@ -496,7 +496,7 @@ def test_fuse_gdn_gemms_mixed_quant():
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @torch.inference_mode()
-def test_fuse_gdn_gemms_qwen35_like(dtype: str):
+def test_fuse_gemms_mixed_children_qwen35_like(dtype: str):
     torch_dtype = getattr(torch, dtype)
     model = Qwen35GdnLikeFusableModel().to(device="cuda", dtype=torch_dtype)
     x = model.get_input(device="cuda", dtype=torch_dtype)
@@ -512,7 +512,7 @@ def test_fuse_gdn_gemms_qwen35_like(dtype: str):
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "fuse_gdn_gemms": {
+            "fuse_gemms_mixed_children": {
                 "stage": "post_load_fusion",
             },
         },
@@ -544,7 +544,7 @@ def test_fuse_gdn_gemms_qwen35_like(dtype: str):
 
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @torch.inference_mode()
-def test_fuse_gdn_gemms(dtype: str):
+def test_fuse_gemms_mixed_children(dtype: str):
     torch_dtype = getattr(torch, dtype)
     model = GdnLikeFusableModel().to(device="cuda", dtype=torch_dtype)
     x = model.get_input(device="cuda", dtype=torch_dtype)
@@ -560,7 +560,7 @@ def test_fuse_gdn_gemms(dtype: str):
     gm_transformed = InferenceOptimizer(
         None,
         {
-            "fuse_gdn_gemms": {
+            "fuse_gemms_mixed_children": {
                 "stage": "post_load_fusion",
             },
         },

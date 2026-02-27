@@ -294,7 +294,9 @@ def _insert_fused_gemm_narrow(
 
     dtypes = {p.dtype for p in params_unfused}
     if len(dtypes) != 1:
-        ad_logger.warning(f"Skipping GDN GEMM fusion for {keys_unfused}: mixed dtypes {dtypes}")
+        ad_logger.warning(
+            f"Skipping mixed-children GEMM fusion for {keys_unfused}: mixed dtypes {dtypes}"
+        )
         return False
     weight_dtype = dtypes.pop()
 
@@ -304,7 +306,7 @@ def _insert_fused_gemm_narrow(
     setattr(gm, key_fused, param_fused)
 
     ad_logger.warning(
-        f"taylor) Fusing {len(linear_nodes)} GDN GEMMs ({keys_unfused}) "
+        f"taylor) Fusing {len(linear_nodes)} mixed-children GEMMs ({keys_unfused}) "
         f"into {key_fused} (dtype={weight_dtype})"
     )
 
@@ -331,7 +333,7 @@ def _insert_fused_gemm_narrow(
         offset += size
 
     # Graph cleanup (eliminate_dead_code + delete_all_unused_submodules)
-    # is deferred to FuseGdnGemms._apply to avoid repeated O(G) traversals.
+    # is deferred to FuseGemmsMixedChildren._apply to avoid repeated O(G) traversals.
     return True
 
 
@@ -372,7 +374,7 @@ def _get_quant_fuser(op_key):
         return None
 
     adapter = type(
-        f"_Gdn{src_cls.__name__}",
+        f"_MixedChildren{src_cls.__name__}",
         (QuantizationFusionMixin,),
         {
             "target_op": src_cls.target_op,
@@ -422,7 +424,8 @@ def _insert_fused_quant_gemm_narrow(
         gm.register_buffer(f"{key_fused}_{name}", buf)
 
     ad_logger.warning(
-        f"taylor) Fusing {len(linear_nodes)} quantized GDN GEMMs ({keys_unfused}) into {key_fused}"
+        f"taylor) Fusing {len(linear_nodes)} quantized mixed-children GEMMs "
+        f"({keys_unfused}) into {key_fused}"
     )
 
     fused_kwargs = dict(linear_nodes[0].kwargs)
@@ -469,12 +472,12 @@ def _insert_fused_quant_gemm_narrow(
         offset += size
 
     # Graph cleanup (eliminate_dead_code + delete_all_unused_submodules)
-    # is deferred to FuseGdnGemms._apply to avoid repeated O(G) traversals.
+    # is deferred to FuseGemmsMixedChildren._apply to avoid repeated O(G) traversals.
     return True
 
 
-@TransformRegistry.register("fuse_gdn_gemms")
-class FuseGdnGemms(BaseTransform):
+@TransformRegistry.register("fuse_gemms_mixed_children")
+class FuseGemmsMixedChildren(BaseTransform):
     """Fuse linear projections sharing the same input, even when the parent has
     non-linear users (e.g., shape access).
 
@@ -511,7 +514,9 @@ class FuseGdnGemms(BaseTransform):
                 else:
                     fuser = _get_quant_fuser(op_key)
                     if fuser is None:
-                        ad_logger.warning(f"No quantized fuser for {op_key}, skipping GDN fusion")
+                        ad_logger.warning(
+                            f"No quantized fuser for {op_key}, skipping mixed-children fusion"
+                        )
                         continue
                     if _insert_fused_quant_gemm_narrow(
                         gm, idx := idx + 1, parent_node, lin_children, fuser

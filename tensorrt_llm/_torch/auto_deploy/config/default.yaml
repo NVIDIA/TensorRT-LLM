@@ -127,7 +127,7 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
-  fuse_gdn_gemms:
+  fuse_gemms_mixed_children:
     stage: post_load_fusion
     enabled: false
   fuse_gemms:
