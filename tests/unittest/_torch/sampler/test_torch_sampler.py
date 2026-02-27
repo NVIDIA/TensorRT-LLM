@@ -672,7 +672,6 @@ class TestFinishReasons:
                 sampler.store.new_tokens[:, seq_slots_cuda, cls.BEAM] = new_tokens_cuda
 
                 is_draft_batch = False
-                is_last_context_chunk = torch.zeros((0,), dtype=torch.bool)
                 # Capture return value of write_finish_reasons for use after _uut() runs.
                 write_finish_reasons_result: list[torch.Tensor] = []
 
@@ -681,7 +680,6 @@ class TestFinishReasons:
                         result = sampler._finish_reasons_handler.write_finish_reasons(
                             seq_slots_host=seq_slots_host,
                             is_draft_batch=is_draft_batch,
-                            is_last_context_chunk=is_last_context_chunk,
                             seq_slots_cuda=seq_slots_cuda,
                             seq_lens_cuda=seq_lens_cuda,
                             new_tokens_cuda=sampler.store.new_tokens,
