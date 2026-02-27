@@ -1082,3 +1082,77 @@ def all_to_all_4d(
             output = output_reshaped.view(batch, seq, heads, head_dim)
 
     return output
+
+
+def all_to_all_5d(
+    input: torch.Tensor,
+    scatter_dim: int,
+    gather_dim: int,
+    process_group: Optional[torch.distributed.ProcessGroup] = None,
+) -> torch.Tensor:
+    """
+    All-to-all for 5D tensors with a fused QKV dimension.
+
+    Operates on [B, S, 3, H, D] tensors where dim 2 is the QKV count.
+    Used for Ulysses sequence parallelism with fused QKV to reduce the
+    number of all-to-all collectives from 3 (one per Q/K/V) to 1.
+
+    Supported scatter/gather combinations:
+    - scatter_dim=3 (heads), gather_dim=1 (seq): [B, S/P, 3, H, D] -> [B, S, 3, H/P, D]
+    - scatter_dim=1 (seq), gather_dim=3 (heads): [B, S, 3, H/P, D] -> [B, S/P, 3, H, D]
+    """
+    if not mpi_disabled():
+        raise NotImplementedError(
+            "all_to_all_5d currently only supports PyTorch distributed mode.")
+
+    world_size = torch.distributed.get_world_size(group=process_group)
+    if world_size == 1:
+        return input
+
+    assert input.dim() == 5, f"Expected 5D tensor, got {input.dim()}D"
+    assert scatter_dim in [1, 3] and gather_dim in [1, 3]
+    assert scatter_dim != gather_dim
+
+    batch, seq, qkv_count, heads, head_dim = input.shape
+    assert input.shape[scatter_dim] % world_size == 0, \
+        f"Dim {scatter_dim} size {input.shape[scatter_dim]} not divisible by world_size {world_size}"
+
+    if scatter_dim == 3 and gather_dim == 1:
+        # [B, S/P, 3, H, D] -> [B, S, 3, H/P, D]
+        sharded_heads = heads // world_size
+        inp = input.reshape(batch, seq, qkv_count, world_size, sharded_heads,
+                            head_dim)
+        inp = inp.permute(3, 0, 1, 2, 4,
+                          5).contiguous()  # [P, B, S/P, 3, H/P, D]
+
+        out_flat = torch.empty_like(inp.flatten())
+        torch.distributed.all_to_all_single(out_flat,
+                                            inp.flatten(),
+                                            group=process_group)
+        out = out_flat.view_as(inp)
+
+        out = out.permute(1, 0, 2, 3, 4,
+                          5).contiguous()  # [B, P, S/P, 3, H/P, D]
+        gathered_seq = seq * world_size
+        return out.reshape(batch, gathered_seq, qkv_count, sharded_heads,
+                           head_dim)
+
+    else:  # scatter_dim == 1, gather_dim == 3
+        # [B, S, 3, H/P, D] -> [B, S/P, 3, H, D]
+        sharded_seq = seq // world_size
+        inp = input.reshape(batch, world_size, sharded_seq, qkv_count, heads,
+                            head_dim)
+        inp = inp.permute(1, 0, 2, 3, 4,
+                          5).contiguous()  # [P, B, S/P, 3, H/P, D]
+
+        out_flat = torch.empty_like(inp.flatten())
+        torch.distributed.all_to_all_single(out_flat,
+                                            inp.flatten(),
+                                            group=process_group)
+        out = out_flat.view_as(inp)
+
+        out = out.permute(1, 2, 0, 3, 4,
+                          5).contiguous()  # [B, S/P, P, 3, H/P, D]
+        gathered_heads = heads * world_size
+        return out.reshape(batch, sharded_seq, qkv_count, gathered_heads,
+                           head_dim)

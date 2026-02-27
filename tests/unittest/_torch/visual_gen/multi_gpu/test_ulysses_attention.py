@@ -21,7 +21,7 @@ import torch.nn.functional as F
 # Try to import the modules - skip tests if not available
 try:
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
-    from tensorrt_llm._torch.distributed import all_to_all_4d
+    from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
     from tensorrt_llm._utils import get_free_port
 
@@ -390,6 +390,152 @@ def _logic_world_size_4(rank, world_size):
     assert output.shape == q.shape
 
 
+def _logic_a2a_5d_seq_to_head(rank, world_size):
+    """all_to_all_5d: scatter heads, gather sequence."""
+    batch = 2
+    seq_per_rank = 4
+    qkv_count = 3
+    heads = world_size * 4
+    head_dim = 64
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+
+    input_tensor = torch.randn(batch, seq_per_rank, qkv_count, heads, head_dim, device=device)
+
+    output = all_to_all_5d(input_tensor, scatter_dim=3, gather_dim=1, process_group=None)
+
+    expected_shape = (batch, seq_per_rank * world_size, qkv_count, heads // world_size, head_dim)
+    assert output.shape == expected_shape, (
+        f"Rank {rank}: Expected {expected_shape}, got {output.shape}"
+    )
+
+
+def _logic_a2a_5d_head_to_seq(rank, world_size):
+    """all_to_all_5d: scatter sequence, gather heads."""
+    batch = 2
+    seq = 16
+    qkv_count = 3
+    heads_per_rank = 2
+    head_dim = 64
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+
+    input_tensor = torch.randn(batch, seq, qkv_count, heads_per_rank, head_dim, device=device)
+
+    output = all_to_all_5d(input_tensor, scatter_dim=1, gather_dim=3, process_group=None)
+
+    expected_shape = (batch, seq // world_size, qkv_count, heads_per_rank * world_size, head_dim)
+    assert output.shape == expected_shape, (
+        f"Rank {rank}: Expected {expected_shape}, got {output.shape}"
+    )
+
+
+def _logic_a2a_5d_roundtrip(rank, world_size):
+    """all_to_all_5d: forward and backward are inverses."""
+    batch = 2
+    seq_per_rank = 4
+    qkv_count = 3
+    heads = world_size * 4
+    head_dim = 64
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+
+    original = torch.randn(batch, seq_per_rank, qkv_count, heads, head_dim, device=device)
+
+    intermediate = all_to_all_5d(original, scatter_dim=3, gather_dim=1, process_group=None)
+    reconstructed = all_to_all_5d(intermediate, scatter_dim=1, gather_dim=3, process_group=None)
+
+    assert reconstructed.shape == original.shape
+    torch.testing.assert_close(reconstructed, original, rtol=1e-5, atol=1e-5)
+
+
+def _logic_ulysses_fused_vs_unfused(rank, world_size):
+    """Fused QKV A2A (fuse_qkv_a2a=True) matches unfused path."""
+    batch = 2
+    seq_per_rank = 8
+    seq_full = seq_per_rank * world_size
+    num_heads = world_size * 4
+    head_dim = 64
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+
+    torch.manual_seed(42 + rank)
+    q = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
+    k = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
+    v = torch.randn(batch, seq_per_rank, num_heads, head_dim, device=device)
+
+    inner_unfused = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    attn_unfused = UlyssesAttention(
+        inner_backend=inner_unfused,
+        process_group=None,
+        fuse_qkv_a2a=False,
+    ).to(device)
+
+    inner_fused = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    attn_fused = UlyssesAttention(
+        inner_backend=inner_fused,
+        process_group=None,
+        fuse_qkv_a2a=True,
+    ).to(device)
+
+    out_unfused = attn_unfused(q, k, v, batch_size=batch, seq_len=seq_full)
+    out_fused = attn_fused(q, k, v, batch_size=batch, seq_len=seq_full)
+
+    torch.testing.assert_close(
+        out_fused,
+        out_unfused,
+        rtol=1e-4,
+        atol=1e-4,
+        msg=f"Rank {rank}: Fused QKV A2A output differs from unfused",
+    )
+
+
+def _logic_ulysses_fused_vs_standard(rank, world_size):
+    """Fused QKV A2A matches standard full-sequence attention."""
+    batch = 2
+    seq_per_rank = 8
+    seq_full = seq_per_rank * world_size
+    num_heads = world_size * 4
+    head_dim = 64
+
+    device = torch.device(f"cuda:{rank}" if torch.cuda.is_available() else "cpu")
+
+    torch.manual_seed(42)
+    q_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    k_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+    v_full = torch.randn(batch, seq_full, num_heads, head_dim, device=device)
+
+    q_shard = q_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+    v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
+
+    inner = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    attn_fused = UlyssesAttention(
+        inner_backend=inner,
+        process_group=None,
+        fuse_qkv_a2a=True,
+    ).to(device)
+
+    fused_output = attn_fused(q_shard, k_shard, v_shard, batch_size=batch, seq_len=seq_full)
+
+    q_std = q_full.transpose(1, 2)
+    k_std = k_full.transpose(1, 2)
+    v_std = v_full.transpose(1, 2)
+    std_output = F.scaled_dot_product_attention(
+        q_std, k_std, v_std, scale=1.0 / math.sqrt(head_dim), dropout_p=0.0
+    )
+    std_output = std_output.transpose(1, 2).contiguous()
+
+    expected_shard = std_output[:, rank * seq_per_rank : (rank + 1) * seq_per_rank]
+    torch.testing.assert_close(
+        fused_output,
+        expected_shard,
+        rtol=1e-4,
+        atol=1e-4,
+        msg=f"Rank {rank}: Fused Ulysses output differs from standard attention",
+    )
+
+
 # =============================================================================
 # Test classes
 # =============================================================================
@@ -413,6 +559,22 @@ class TestAllToAll4D:
     def test_all_to_all_4d_single_process(self):
         """Test that single process returns input unchanged."""
         run_test_in_distributed(world_size=1, test_fn=_logic_a2a_single_process, use_cuda=True)
+
+
+class TestAllToAll5D:
+    """Tests for all_to_all_5d function."""
+
+    def test_all_to_all_5d_scatter_heads_gather_seq(self):
+        """Test 5D all-to-all: scatter heads, gather sequence."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_a2a_5d_seq_to_head, use_cuda=True)
+
+    def test_all_to_all_5d_scatter_seq_gather_heads(self):
+        """Test 5D all-to-all: scatter sequence, gather heads."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_a2a_5d_head_to_seq, use_cuda=True)
+
+    def test_all_to_all_5d_roundtrip(self):
+        """Test that forward and backward 5D all-to-all are inverses."""
+        run_test_in_distributed(world_size=2, test_fn=_logic_a2a_5d_roundtrip, use_cuda=True)
 
 
 class TestUlyssesAttention:
@@ -483,6 +645,18 @@ class TestUlyssesAttention:
     def test_ulysses_attention_invalid_heads(self):
         """Test that invalid head count raises error."""
         run_test_in_distributed(world_size=2, test_fn=_logic_ulysses_invalid_heads, use_cuda=False)
+
+    def test_ulysses_fused_vs_unfused(self):
+        """Test fused QKV A2A matches unfused path."""
+        run_test_in_distributed(
+            world_size=2, test_fn=_logic_ulysses_fused_vs_unfused, use_cuda=True
+        )
+
+    def test_ulysses_fused_vs_standard_attention(self):
+        """Test fused QKV A2A matches standard full-sequence attention."""
+        run_test_in_distributed(
+            world_size=2, test_fn=_logic_ulysses_fused_vs_standard, use_cuda=True
+        )
 
 
 class TestUlyssesAttentionEdgeCases:
