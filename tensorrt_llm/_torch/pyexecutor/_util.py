@@ -1271,8 +1271,10 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
 
     try:
         from tensorrt_llm.lora_manager import get_model_path, load_state_dict
-        adapter_weights = load_state_dict(
-            get_model_path(adapter_dir, "adapter_model"))
+        model_path = get_model_path(adapter_dir, "adapter_model")
+        if model_path is None:
+            return 0
+        adapter_weights = load_state_dict(model_path)
         if adapter_weights is None:
             return 0
         for key, tensor in adapter_weights.items():
@@ -1285,8 +1287,7 @@ def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
                     return tensor.shape[1] if tensor.shape[
                         0] == rank else tensor.shape[0]
     except Exception as e:
-        logger.debug(f"Failed to infer shared expert size from adapter: {e}",
-                     exc_info=True)
+        logger.debug(f"Failed to infer shared expert size from adapter: {e}")
     return 0
 
 
