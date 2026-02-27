@@ -73,20 +73,9 @@ The following tables summarize the current coverage:
 
 The demo videos below show the real-world acceleration that these algorithms deliver on long-context workloads. Both demos use `max_batch_size=64` and `samples=128`.
 
-<div style="display: flex; gap: 16px; align-items: flex-start; flex-wrap: wrap;">
-  <div style="flex: 1 1 420px;">
-    <video controls playsinline style="width: 100%; height: auto;">
-      <source src="https://github.com/user-attachments/assets/26ad6ba4-8254-4eb7-bf28-e40e4434d2f0" />
-    </video>
-    <p align="center"><sub><em>Video 1: RocketKV v.s. Full Attention on 16k/2k workloads​.</em></sub></p>
-  </div>
-  <div style="flex: 1 1 420px;">
-    <video controls playsinline style="width: 100%; height: auto;">
-      <source src="https://github.com/user-attachments/assets/eeaa4eef-e822-4f60-9aa1-1653c95c2df8" />
-    </video>
-    <p align="center"><sub><em>Video 2: DSA v.s. Full Attention on 128k/1k workloads​.</em></sub></p>
-  </div>
-</div>
+https://github.com/user-attachments/assets/26ad6ba4-8254-4eb7-bf28-e40e4434d2f0
+
+https://github.com/user-attachments/assets/eeaa4eef-e822-4f60-9aa1-1653c95c2df8
 
 **Note**: Today, sparse attention support in TensorRT-LLM is primarily targeted at NVIDIA Blackwell and newer architectures.
 
