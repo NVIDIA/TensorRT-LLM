@@ -51,9 +51,9 @@ class ditBaseTransformer(nn.Module):
         self.previous_residual_odd = None
 
     def _calc_teacache_distance(self, modulated_inp: torch.Tensor, x: torch.Tensor) -> torch.Tensor:
-        """
-        Calculate the distance between the modulated input and the previous modulated input.
+        """Calculate the distance between the modulated input and the previous modulated input.
         If the distance is less than the threshold, skip the computation.
+
         Return:
             should_calc: bool, whether to compute the block
             x: torch.Tensor, the hidden states after the computation
@@ -77,18 +77,27 @@ class ditBaseTransformer(nn.Module):
                 ret_steps = 1  # must calculate in the first step
         self.is_even = is_even
         if self.is_even:
-            if TeaCacheConfig.cnt() < ret_steps or TeaCacheConfig.cnt() >= TeaCacheConfig.cutoff_steps():
+            if (
+                TeaCacheConfig.cnt() < ret_steps
+                or TeaCacheConfig.cnt() >= TeaCacheConfig.cutoff_steps()
+            ):
                 should_calc = True
                 self.accumulated_rel_l1_distance_even = 0
             else:
                 rescale_func = np.poly1d(self.teacache_coefficients)
                 xx = (
-                    ((modulated_inp - self.previous_e0_even).abs().mean() / self.previous_e0_even.abs().mean())
+                    (
+                        (modulated_inp - self.previous_e0_even).abs().mean()
+                        / self.previous_e0_even.abs().mean()
+                    )
                     .cpu()
                     .item()
                 )
                 self.accumulated_rel_l1_distance_even += rescale_func(
-                    ((modulated_inp - self.previous_e0_even).abs().mean() / self.previous_e0_even.abs().mean())
+                    (
+                        (modulated_inp - self.previous_e0_even).abs().mean()
+                        / self.previous_e0_even.abs().mean()
+                    )
                     .cpu()
                     .item()
                 )
@@ -102,13 +111,19 @@ class ditBaseTransformer(nn.Module):
             if not should_calc:
                 x += self.previous_residual_even
         else:
-            if TeaCacheConfig.cnt() < ret_steps or TeaCacheConfig.cnt() >= TeaCacheConfig.cutoff_steps():
+            if (
+                TeaCacheConfig.cnt() < ret_steps
+                or TeaCacheConfig.cnt() >= TeaCacheConfig.cutoff_steps()
+            ):
                 should_calc = True
                 self.accumulated_rel_l1_distance_odd = 0
             else:
                 rescale_func = np.poly1d(self.teacache_coefficients)
                 self.accumulated_rel_l1_distance_odd += rescale_func(
-                    ((modulated_inp - self.previous_e0_odd).abs().mean() / self.previous_e0_odd.abs().mean())
+                    (
+                        (modulated_inp - self.previous_e0_odd).abs().mean()
+                        / self.previous_e0_odd.abs().mean()
+                    )
                     .cpu()
                     .item()
                 )
@@ -121,21 +136,24 @@ class ditBaseTransformer(nn.Module):
             if not should_calc:
                 x += self.previous_residual_odd
 
+        TeaCacheConfig.record_step(cached=not should_calc)
+
         TeaCacheConfig.increment_cnt(cnt_stride)
         if TeaCacheConfig.cnt() >= TeaCacheConfig.num_steps():
             TeaCacheConfig.set_cnt(0)
 
         return should_calc, x
 
-    def _update_teacache_residual(self, block_input: torch.Tensor, block_output: torch.Tensor) -> torch.Tensor:
+    def _update_teacache_residual(
+        self, block_input: torch.Tensor, block_output: torch.Tensor
+    ) -> torch.Tensor:
         if self.is_even:
             self.previous_residual_even = block_output - block_input
         else:
             self.previous_residual_odd = block_output - block_input
 
     def transformer_block_names(self):
-        """
-        Return the name of the blocks in the transformer, e.g. ["blocks"] for Wan, ["transformer_blocks", "single_transformer_blocks"] for Flux
+        """Return the name of the blocks in the transformer, e.g. ["blocks"] for Wan, ["transformer_blocks", "single_transformer_blocks"] for Flux
         This will guide torch compile and WeightManagedBlocks to work.
         """
         if hasattr(self, "_transformer_block_names"):

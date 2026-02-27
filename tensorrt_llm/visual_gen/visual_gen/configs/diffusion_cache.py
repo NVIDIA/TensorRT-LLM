@@ -24,13 +24,13 @@ class TeaCacheConfig:
     _instance = None
     _enable_teacache = False
     _teacache_thresh = 0.2  # "Higher speedup will cause to worse quality"
-    _use_ret_steps = (
-        False  # "Using Retention Steps will result in faster generation speed and better generation quality."
-    )
+    _use_ret_steps = False  # "Using Retention Steps will result in faster generation speed and better generation quality."
     _ret_steps = None
     _cutoff_steps = None
     _num_steps = None
     _cnt = 0
+    _total = 0
+    _cached = 0
 
     def __new__(cls):
         if cls._instance is None:
@@ -69,7 +69,9 @@ class TeaCacheConfig:
         ]
 
         if none_attrs:
-            logger.warning(f"The following TeaCacheConfig attributes are None: {', '.join(none_attrs)}")
+            logger.warning(
+                f"The following TeaCacheConfig attributes are None: {', '.join(none_attrs)}"
+            )
             return False
 
         return True
@@ -105,6 +107,8 @@ class TeaCacheConfig:
     def reset(cls):
         """Reset all TeaCache state variables."""
         cls._cnt = 0
+        cls._total = 0
+        cls._cached = 0
 
     # Property-style access for attributes
     @classmethod
@@ -148,6 +152,25 @@ class TeaCacheConfig:
     def set_cnt(cls, cnt: int) -> None:
         """Set cnt to a specific value."""
         cls._cnt = cnt
+
+    @classmethod
+    def record_step(cls, cached: bool) -> None:
+        """Record a TeaCache step as either a cache hit or miss."""
+        cls._total += 1
+        if cached:
+            cls._cached += 1
+
+    @classmethod
+    def get_stats(cls) -> dict:
+        """Return TeaCache hit/miss statistics."""
+        total = max(cls._total, 1)
+        cached = cls._cached
+        return {
+            "total": total,
+            "cached": cached,
+            "compute_steps": total - cached,
+            "hit_rate": cached / total * 100,
+        }
 
     @classmethod
     def to_dict(cls) -> dict:

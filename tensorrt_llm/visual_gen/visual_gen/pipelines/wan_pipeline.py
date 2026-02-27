@@ -36,7 +36,11 @@ from diffusers.pipelines.wan.pipeline_wan import WanPipelineOutput
 from diffusers.utils import is_torch_xla_available
 
 from visual_gen.configs.diffusion_cache import TeaCacheConfig
-from visual_gen.configs.op_manager import AttentionOpManager, SparseVideogenConfig, SparseVideogenConfig2
+from visual_gen.configs.op_manager import (
+    AttentionOpManager,
+    SparseVideogenConfig,
+    SparseVideogenConfig2,
+)
 from visual_gen.configs.parallel import DiTParallelConfig, VAEParallelConfig
 from visual_gen.configs.pipeline import PipelineConfig
 from visual_gen.models.transformers.wan_transformer import ditWanTransformer3DModel
@@ -126,7 +130,10 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
             logger.debug("Loading ditWanTransformer3DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditWanTransformer3DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
@@ -134,7 +141,9 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
             logger.debug("Using ditWanTransformer3DModel from kwargs for transformer")
 
         # wan 2.2 has transformer_2, but wan 2.1 does not
-        if self.transformer_2 is not None and not isinstance(self.transformer_2, ditWanTransformer3DModel):
+        if self.transformer_2 is not None and not isinstance(
+            self.transformer_2, ditWanTransformer3DModel
+        ):
             logger.debug("Loading ditWanTransformer3DModel from diffusers transformer_2")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer_2 = ditWanTransformer3DModel.from_pretrained(
@@ -167,19 +176,31 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
         logger.debug("Post-load hook completed")
 
     def _set_sparse_videogen_attrs(
-        self, context_length, height, width, num_frames, cfg_size, num_head, head_dim, dtype=torch.bfloat16
+        self,
+        context_length,
+        height,
+        width,
+        num_frames,
+        cfg_size,
+        num_head,
+        head_dim,
+        dtype=torch.bfloat16,
     ):
         masks = ["spatial", "temporal"]
         if PipelineConfig.transformer_type == "ditWanTransformer3DModel":
             from svg.models.wan.attention import prepare_flexattention
             from svg.models.wan.utils import get_attention_mask, sparsity_to_width
         else:
-            raise NotImplementedError(f"Sparse VideoGen is not implemented for {PipelineConfig.transformer_type}")
+            raise NotImplementedError(
+                f"Sparse VideoGen is not implemented for {PipelineConfig.transformer_type}"
+            )
 
         sample_mse_max_row = SparseVideogenConfig.sample_mse_max_row()
         sparsity = SparseVideogenConfig.sparsity()
 
-        num_frame = 1 + num_frames // (self.vae_scale_factor_temporal * self.transformer.config.patch_size[0])
+        num_frame = 1 + num_frames // (
+            self.vae_scale_factor_temporal * self.transformer.config.patch_size[0]
+        )
         mod_value = self.vae_scale_factor_spatial * self.transformer.config.patch_size[1]
         frame_size = int(height // mod_value) * int(width // mod_value)
         attention_masks = [
@@ -210,10 +231,19 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
         )
 
     def _set_sparse_videogen2_attrs(
-        self, context_length, height, width, num_frames, cfg_size, num_head, head_dim, dtype=torch.bfloat16
+        self,
+        context_length,
+        height,
+        width,
+        num_frames,
+        cfg_size,
+        num_head,
+        head_dim,
+        dtype=torch.bfloat16,
     ):
-
-        num_frame = 1 + num_frames // (self.vae_scale_factor_temporal * self.transformer.config.patch_size[0])
+        num_frame = 1 + num_frames // (
+            self.vae_scale_factor_temporal * self.transformer.config.patch_size[0]
+        )
         mod_value = self.vae_scale_factor_spatial * self.transformer.config.patch_size[1]
         frame_size = int(height // mod_value) * int(width // mod_value)
         SparseVideogenConfig2.update(
@@ -248,8 +278,7 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
     ):
-        r"""
-        The call function to the pipeline for generation.
+        r"""The call function to the pipeline for generation.
 
         Args:
             prompt (`str` or `List[str]`, *optional*):
@@ -314,7 +343,6 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
                 the first element is a list with the generated images and the second element is a list of `bool`s
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
@@ -334,7 +362,9 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
             logger.warning(
                 f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
             )
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            num_frames = (
+                num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            )
         num_frames = max(num_frames, 1)
 
         num_attention_heads = self.transformer.config.num_attention_heads
@@ -388,8 +418,10 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
             batch_size = prompt_embeds.shape[0]
 
         # Leverage ditBasePipeline's dit_dp_split method, which splits the data for data parallel
-        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = (
+            self.dit_dp_split(
+                batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+            )
         )
 
         # 3. Encode input prompt
@@ -445,7 +477,9 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
         self._num_timesteps = len(timesteps)
 
         if self.config.boundary_ratio is not None:
-            boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            boundary_timestep = (
+                self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            )
         else:
             boundary_timestep = None
 
@@ -522,10 +556,14 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop(
+                        "negative_prompt_embeds", negative_prompt_embeds
+                    )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
 
                 if XLA_AVAILABLE:
@@ -538,6 +576,8 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
 
         self._current_timestep = None
 
+        self._log_teacache_stats()
+
         # Leverage ditBasePipeline's dp_gather method, which gathers the results from all data parallel processes
         latents = self.dit_dp_gather(latents)
 
@@ -548,9 +588,9 @@ class ditWanPipeline(WanPipeline, ditBasePipeline):
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
             latents = latents / latents_std + latents_mean
             nvtx.range_push("vae.decode")
             video = self.vae.decode(latents, return_dict=False)[0]
@@ -648,14 +688,19 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
             logger.debug("Loading ditWanTransformer3DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditWanTransformer3DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
         else:
             logger.debug("Using ditWanTransformer3DModel from kwargs")
 
-        if self.transformer_2 is not None and not isinstance(self.transformer_2, ditWanTransformer3DModel):
+        if self.transformer_2 is not None and not isinstance(
+            self.transformer_2, ditWanTransformer3DModel
+        ):
             logger.debug("Loading ditWanTransformer3DModel from diffusers transformer_2")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer_2 = ditWanTransformer3DModel.from_pretrained(
@@ -682,19 +727,31 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
             self.vae.parallel_vae(split_dim=VAEParallelConfig.parallel_vae_split_dim)
 
     def _set_sparse_videogen_attrs(
-        self, context_length, height, width, num_frames, cfg_size, num_head, head_dim, dtype=torch.bfloat16
+        self,
+        context_length,
+        height,
+        width,
+        num_frames,
+        cfg_size,
+        num_head,
+        head_dim,
+        dtype=torch.bfloat16,
     ):
         masks = ["spatial", "temporal"]
         if PipelineConfig.transformer_type == "ditWanTransformer3DModel":
             from svg.models.wan.attention import prepare_flexattention
             from svg.models.wan.utils import get_attention_mask, sparsity_to_width
         else:
-            raise NotImplementedError(f"Sparse VideoGen is not implemented for {PipelineConfig.transformer_type}")
+            raise NotImplementedError(
+                f"Sparse VideoGen is not implemented for {PipelineConfig.transformer_type}"
+            )
 
         sample_mse_max_row = SparseVideogenConfig.sample_mse_max_row()
         sparsity = SparseVideogenConfig.sparsity()
 
-        num_frame = 1 + num_frames // (self.vae_scale_factor_temporal * self.transformer.config.patch_size[0])
+        num_frame = 1 + num_frames // (
+            self.vae_scale_factor_temporal * self.transformer.config.patch_size[0]
+        )
         mod_value = self.vae_scale_factor_spatial * self.transformer.config.patch_size[1]
         frame_size = int(height // mod_value) * int(width // mod_value)
         attention_masks = [
@@ -725,10 +782,19 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
         )
 
     def _set_sparse_videogen2_attrs(
-        self, context_length, height, width, num_frames, cfg_size, num_head, head_dim, dtype=torch.bfloat16
+        self,
+        context_length,
+        height,
+        width,
+        num_frames,
+        cfg_size,
+        num_head,
+        head_dim,
+        dtype=torch.bfloat16,
     ):
-
-        num_frame = 1 + num_frames // (self.vae_scale_factor_temporal * self.transformer.config.patch_size[0])
+        num_frame = 1 + num_frames // (
+            self.vae_scale_factor_temporal * self.transformer.config.patch_size[0]
+        )
         mod_value = self.vae_scale_factor_spatial * self.transformer.config.patch_size[1]
         frame_size = int(height // mod_value) * int(width // mod_value)
 
@@ -767,8 +833,7 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
         callback_on_step_end_tensor_inputs: List[str] = ["latents"],
         max_sequence_length: int = 512,
     ):
-        r"""
-        The call function to the pipeline for generation.
+        r"""The call function to the pipeline for generation.
 
         Args:
             image (`PipelineImageInput`):
@@ -846,7 +911,6 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
                 the first element is a list with the generated images and the second element is a list of `bool`s
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
 
@@ -868,7 +932,9 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
             logger.warning(
                 f"`num_frames - 1` has to be divisible by {self.vae_scale_factor_temporal}. Rounding to the nearest number."
             )
-            num_frames = num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            num_frames = (
+                num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            )
         num_frames = max(num_frames, 1)
 
         num_attention_heads = self.transformer.config.num_attention_heads
@@ -922,8 +988,10 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
             batch_size = prompt_embeds.shape[0]
 
         # Leverage ditBasePipeline's dit_dp_split method, which splits the data for data parallel
-        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = (
+            self.dit_dp_split(
+                batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+            )
         )
 
         # 3. Encode input prompt
@@ -975,7 +1043,9 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
         # 5. Prepare latent variables
         num_channels_latents = self.vae.config.z_dim
         nvtx.range_push("video_processor.preprocess")
-        image = self.video_processor.preprocess(image, height=height, width=width).to(device, dtype=torch.float32)
+        image = self.video_processor.preprocess(image, height=height, width=width).to(
+            device, dtype=torch.float32
+        )
         if last_image is not None:
             last_image = self.video_processor.preprocess(last_image, height=height, width=width).to(
                 device, dtype=torch.float32
@@ -1007,7 +1077,9 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
         self._num_timesteps = len(timesteps)
 
         if self.config.boundary_ratio is not None:
-            boundary_timestep = self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            boundary_timestep = (
+                self.config.boundary_ratio * self.scheduler.config.num_train_timesteps
+            )
         else:
             boundary_timestep = None
 
@@ -1032,7 +1104,9 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
                     current_guidance_scale = guidance_scale_2
 
                 if self.config.expand_timesteps:
-                    latent_model_input = (1 - first_frame_mask) * condition + first_frame_mask * latents
+                    latent_model_input = (
+                        1 - first_frame_mask
+                    ) * condition + first_frame_mask * latents
                     latent_model_input = latent_model_input.to(transformer_dtype)
 
                     # seq_len: num_latent_frames * (latent_height // patch_size) * (latent_width // patch_size)
@@ -1040,7 +1114,9 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
                     # batch_size, seq_len
                     timestep = temp_ts.unsqueeze(0).expand(latents.shape[0], -1)
                 else:
-                    latent_model_input = torch.cat([latents, condition], dim=1).to(transformer_dtype)
+                    latent_model_input = torch.cat([latents, condition], dim=1).to(
+                        transformer_dtype
+                    )
                     timestep = t.expand(latents.shape[0])
 
                 # Leverage ditBasePipeline's visual_gen_transformer method, which handles cfg parallel, etc.
@@ -1089,10 +1165,14 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop(
+                        "negative_prompt_embeds", negative_prompt_embeds
+                    )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
 
                 if XLA_AVAILABLE:
@@ -1104,6 +1184,8 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
             torch.cuda.empty_cache()
 
         self._current_timestep = None
+
+        self._log_teacache_stats()
 
         # Leverage ditBasePipeline's dit_dp_gather method, which gathers the results from all data parallel processes
         latents = self.dit_dp_gather(latents)
@@ -1118,9 +1200,9 @@ class ditWanImageToVideoPipeline(WanImageToVideoPipeline, ditBasePipeline):
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
             latents = latents / latents_std + latents_mean
             nvtx.range_push("vae.decode")
             video = self.vae.decode(latents, return_dict=False)[0]

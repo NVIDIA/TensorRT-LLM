@@ -30,10 +30,17 @@ from typing import Callable, Dict, List, Optional, Union
 import numpy as np
 import torch
 import torch.cuda.nvtx as nvtx
-from diffusers import Cosmos2TextToImagePipeline, Cosmos2VideoToWorldPipeline, CosmosTextToWorldPipeline
+from diffusers import (
+    Cosmos2TextToImagePipeline,
+    Cosmos2VideoToWorldPipeline,
+    CosmosTextToWorldPipeline,
+)
 from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
-from diffusers.pipelines.cosmos.pipeline_cosmos_video2world import CosmosPipelineOutput, retrieve_timesteps
+from diffusers.pipelines.cosmos.pipeline_cosmos_video2world import (
+    CosmosPipelineOutput,
+    retrieve_timesteps,
+)
 from diffusers.pipelines.cosmos.pipeline_output import CosmosImagePipelineOutput
 
 from visual_gen.configs.diffusion_cache import TeaCacheConfig
@@ -58,7 +65,10 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
             logger.debug("Loading ditCosmosTransformer3DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditCosmosTransformer3DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
@@ -91,8 +101,7 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
         max_sequence_length: int = 512,
         sigma_conditioning: float = 0.0001,
     ):
-        r"""
-        The call function to the pipeline for generation.
+        r"""The call function to the pipeline for generation.
 
         Args:
             image (`PIL.Image.Image`, `np.ndarray`, `torch.Tensor`, *optional*):
@@ -161,7 +170,6 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
                 the first element is a list with the generated images and the second element is a list of `bool`s
                 indicating whether the corresponding generated image contains "not-safe-for-work" (nsfw) content.
         """
-
         if self.safety_checker is None:
             raise ValueError(
                 f"You have disabled the safety checker for {self.__class__}. This is in violation of the "
@@ -219,8 +227,10 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
             batch_size = prompt_embeds.shape[0]
 
         # Leverage ditBasePipeline's dit_dp_split method, which splits the data for data parallel
-        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = (
+            self.dit_dp_split(
+                batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+            )
         )
 
         if "text_encoder" in PipelineConfig.model_wise_offloading:
@@ -248,7 +258,9 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
         # 4. Prepare timesteps
         sigmas_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
         sigmas = torch.linspace(0, 1, num_inference_steps, dtype=sigmas_dtype)
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, device=device, sigmas=sigmas)
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, device=device, sigmas=sigmas
+        )
         if self.scheduler.config.final_sigmas_type == "sigma_min":
             # Replace the last sigma (which is zero) with the minimum sigma value
             self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
@@ -265,18 +277,20 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
 
         nvtx.range_push("prepare_latents")
         num_channels_latents = self.transformer.config.in_channels - 1
-        latents, conditioning_latents, cond_indicator, uncond_indicator, cond_mask, uncond_mask = self.prepare_latents(
-            video,
-            batch_size * num_videos_per_prompt,
-            num_channels_latents,
-            height,
-            width,
-            num_frames,
-            self.do_classifier_free_guidance,
-            torch.float32,
-            device,
-            generator,
-            latents,
+        latents, conditioning_latents, cond_indicator, uncond_indicator, cond_mask, uncond_mask = (
+            self.prepare_latents(
+                video,
+                batch_size * num_videos_per_prompt,
+                num_channels_latents,
+                height,
+                width,
+                num_frames,
+                self.do_classifier_free_guidance,
+                torch.float32,
+                device,
+                generator,
+                latents,
+            )
         )
         nvtx.range_pop()
         unconditioning_latents = None
@@ -313,7 +327,9 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
                 )  # [B, 1, T, 1, 1]
 
                 cond_latent = latents * c_in
-                cond_latent = cond_indicator * conditioning_latents + (1 - cond_indicator) * cond_latent
+                cond_latent = (
+                    cond_indicator * conditioning_latents + (1 - cond_indicator) * cond_latent
+                )
                 cond_latent = cond_latent.to(transformer_dtype)
                 cond_timestep = cond_indicator * t_conditioning + (1 - cond_indicator) * timestep
                 cond_timestep = cond_timestep.to(transformer_dtype)
@@ -330,9 +346,14 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
                 cfg_negative_inputs = None
                 if self.do_classifier_free_guidance:
                     uncond_latent = latents * c_in
-                    uncond_latent = uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * uncond_latent
+                    uncond_latent = (
+                        uncond_indicator * unconditioning_latents
+                        + (1 - uncond_indicator) * uncond_latent
+                    )
                     uncond_latent = uncond_latent.to(transformer_dtype)
-                    uncond_timestep = uncond_indicator * t_conditioning + (1 - uncond_indicator) * timestep
+                    uncond_timestep = (
+                        uncond_indicator * t_conditioning + (1 - uncond_indicator) * timestep
+                    )
                     uncond_timestep = uncond_timestep.to(transformer_dtype)
                     cfg_negative_inputs = {
                         "hidden_states": uncond_latent,
@@ -354,13 +375,18 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
                 )
 
                 noise_pred = (c_skip * latents + c_out * noise_pred.float()).to(transformer_dtype)
-                noise_pred = cond_indicator * conditioning_latents + (1 - cond_indicator) * noise_pred
+                noise_pred = (
+                    cond_indicator * conditioning_latents + (1 - cond_indicator) * noise_pred
+                )
 
                 if self.do_classifier_free_guidance:
                     assert noise_pred_uncond is not None, "noise_uncond is required"
-                    noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(transformer_dtype)
+                    noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(
+                        transformer_dtype
+                    )
                     noise_pred_uncond = (
-                        uncond_indicator * unconditioning_latents + (1 - uncond_indicator) * noise_pred_uncond
+                        uncond_indicator * unconditioning_latents
+                        + (1 - uncond_indicator) * noise_pred_uncond
                     )
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
@@ -375,16 +401,23 @@ class ditCosmos2VideoToWorldPipeline(Cosmos2VideoToWorldPipeline, ditBasePipelin
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop(
+                        "negative_prompt_embeds", negative_prompt_embeds
+                    )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
 
         if "transformer" in PipelineConfig.model_wise_offloading:
             self.transformer.to("cpu")
             torch.cuda.empty_cache()
         self._current_timestep = None
+
+        self._log_teacache_stats()
+
         latents = self.dit_dp_gather(latents)
 
         if not output_type == "latent":
@@ -437,7 +470,10 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
             logger.debug("Loading ditCosmosTransformer3DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditCosmosTransformer3DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
@@ -507,8 +543,10 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
             batch_size = prompt_embeds.shape[0]
 
         # Leverage ditBasePipeline's dit_dp_split method, which splits the data for data parallel
-        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = (
+            self.dit_dp_split(
+                batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+            )
         )
 
         if "text_encoder" in PipelineConfig.model_wise_offloading:
@@ -536,7 +574,9 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
         # 4. Prepare timesteps
         sigmas_dtype = torch.float32 if torch.backends.mps.is_available() else torch.float64
         sigmas = torch.linspace(0, 1, num_inference_steps, dtype=sigmas_dtype)
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, device=device, sigmas=sigmas)
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, device=device, sigmas=sigmas
+        )
         if self.scheduler.config.get("final_sigmas_type", "zero") == "sigma_min":
             # Replace the last sigma (which is zero) with the minimum sigma value
             self.scheduler.sigmas[-1] = self.scheduler.sigmas[-2]
@@ -576,7 +616,9 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
                 c_in = 1 - current_t
                 c_skip = 1 - current_t
                 c_out = -current_t
-                timestep = current_t.expand(latents.shape[0]).to(transformer_dtype)  # [B, 1, T, 1, 1]
+                timestep = current_t.expand(latents.shape[0]).to(
+                    transformer_dtype
+                )  # [B, 1, T, 1, 1]
 
                 latent_model_input = latents * c_in
                 latent_model_input = latent_model_input.to(transformer_dtype)
@@ -608,7 +650,9 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
                 )
                 noise_pred = (c_skip * latents + c_out * noise_pred.float()).to(transformer_dtype)
                 if self.do_classifier_free_guidance:
-                    noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(transformer_dtype)
+                    noise_pred_uncond = (c_skip * latents + c_out * noise_pred_uncond.float()).to(
+                        transformer_dtype
+                    )
                     noise_pred = noise_pred + self.guidance_scale * (noise_pred - noise_pred_uncond)
 
                 noise_pred = (latents - noise_pred) / current_sigma
@@ -622,16 +666,23 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop(
+                        "negative_prompt_embeds", negative_prompt_embeds
+                    )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
         if "transformer" in PipelineConfig.model_wise_offloading:
             self.transformer.to("cpu")
             torch.cuda.empty_cache()
 
         self._current_timestep = None
+
+        self._log_teacache_stats()
+
         latents = self.dit_dp_gather(latents)
 
         if not output_type == "latent":
@@ -640,9 +691,9 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
                 .view(1, self.vae.config.z_dim, 1, 1, 1)
                 .to(latents.device, latents.dtype)
             )
-            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(1, self.vae.config.z_dim, 1, 1, 1).to(
-                latents.device, latents.dtype
-            )
+            latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
+                1, self.vae.config.z_dim, 1, 1, 1
+            ).to(latents.device, latents.dtype)
             latents = latents / latents_std / self.scheduler.config.sigma_data + latents_mean
             video = self.vae.decode(latents.to(self.vae.dtype), return_dict=False)[0]
 
@@ -678,7 +729,6 @@ class ditCosmos2TextToImagePipeline(Cosmos2TextToImagePipeline, ditBasePipeline)
 
 
 class ditCosmosTextToWorldPipeline(CosmosTextToWorldPipeline, ditBasePipeline):
-
     def _after_load(self, pretrained_model_name_or_path, *args, **kwargs) -> None:
         logger.debug(f"TeaCache config: {TeaCacheConfig.get_instance().to_dict()}")
         pipe_config = kwargs.get("pipeline", {})
@@ -688,7 +738,10 @@ class ditCosmosTextToWorldPipeline(CosmosTextToWorldPipeline, ditBasePipeline):
             logger.debug("Loading ditCosmosTransformer3DModel from diffusers transformer")
             torch_dtype = kwargs.get("torch_dtype", torch.float32)
             self.transformer = ditCosmosTransformer3DModel.from_pretrained(
-                pretrained_model_name_or_path, subfolder="transformer", torch_dtype=torch_dtype, low_cpu_mem_usage=True
+                pretrained_model_name_or_path,
+                subfolder="transformer",
+                torch_dtype=torch_dtype,
+                low_cpu_mem_usage=True,
             )
             gc.collect()
             torch.cuda.empty_cache()
@@ -786,8 +839,10 @@ class ditCosmosTextToWorldPipeline(CosmosTextToWorldPipeline, ditBasePipeline):
             batch_size = prompt_embeds.shape[0]
 
         # Leverage ditBasePipeline's dit_dp_split method, which splits the data for data parallel
-        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = self.dit_dp_split(
-            batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+        batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds = (
+            self.dit_dp_split(
+                batch_size, prompt, negative_prompt, prompt_embeds, negative_prompt_embeds
+            )
         )
 
         if "text_encoder" in PipelineConfig.model_wise_offloading:
@@ -813,7 +868,9 @@ class ditCosmosTextToWorldPipeline(CosmosTextToWorldPipeline, ditBasePipeline):
             torch.cuda.empty_cache()
 
         # 4. Prepare timesteps
-        timesteps, num_inference_steps = retrieve_timesteps(self.scheduler, num_inference_steps, device)
+        timesteps, num_inference_steps = retrieve_timesteps(
+            self.scheduler, num_inference_steps, device
+        )
 
         nvtx.range_push("prepare_latents")
         # 5. Prepare latent variables
@@ -891,7 +948,9 @@ class ditCosmosTextToWorldPipeline(CosmosTextToWorldPipeline, ditBasePipeline):
 
                 if self.do_classifier_free_guidance:
                     noise_pred_uncond, noise_pred_cond = noise_pred.chunk(2)
-                    noise_pred = noise_pred_cond + self.guidance_scale * (noise_pred_cond - noise_pred_uncond)
+                    noise_pred = noise_pred_cond + self.guidance_scale * (
+                        noise_pred_cond - noise_pred_uncond
+                    )
 
                 # pred_sample (eps)
                 latents = self.scheduler.step(
@@ -906,21 +965,31 @@ class ditCosmosTextToWorldPipeline(CosmosTextToWorldPipeline, ditBasePipeline):
 
                     latents = callback_outputs.pop("latents", latents)
                     prompt_embeds = callback_outputs.pop("prompt_embeds", prompt_embeds)
-                    negative_prompt_embeds = callback_outputs.pop("negative_prompt_embeds", negative_prompt_embeds)
+                    negative_prompt_embeds = callback_outputs.pop(
+                        "negative_prompt_embeds", negative_prompt_embeds
+                    )
 
                 # call the callback, if provided
-                if i == len(timesteps) - 1 or ((i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0):
+                if i == len(timesteps) - 1 or (
+                    (i + 1) > num_warmup_steps and (i + 1) % self.scheduler.order == 0
+                ):
                     progress_bar.update()
         if "transformer" in PipelineConfig.model_wise_offloading:
             self.transformer.to("cpu")
             torch.cuda.empty_cache()
 
         self._current_timestep = None
+
+        self._log_teacache_stats()
+
         latents = self.dit_dp_gather(latents)
 
         if not output_type == "latent":
             if self.vae.config.latents_mean is not None:
-                latents_mean, latents_std = self.vae.config.latents_mean, self.vae.config.latents_std
+                latents_mean, latents_std = (
+                    self.vae.config.latents_mean,
+                    self.vae.config.latents_std,
+                )
                 latents_mean = (
                     torch.tensor(latents_mean)
                     .view(1, self.vae.config.latent_channels, -1, 1, 1)[:, :, : latents.size(2)]

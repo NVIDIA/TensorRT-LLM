@@ -417,6 +417,8 @@ class ditFluxPipeline(FluxPipeline, ditBasePipeline):
 
         self._current_timestep = None
 
+        self._log_teacache_stats()
+
         # Leverage ditBasePipeline's dp_gather method, which gathers the results from all data parallel processes
         latents = self.dit_dp_gather(latents)
 

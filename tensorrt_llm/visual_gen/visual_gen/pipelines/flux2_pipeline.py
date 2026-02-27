@@ -381,6 +381,8 @@ class ditFlux2Pipeline(Flux2Pipeline, ditBasePipeline):
 
         self._current_timestep = None
 
+        self._log_teacache_stats()
+
         latents = self.dit_dp_gather(latents)
 
         if output_type == "latent":
