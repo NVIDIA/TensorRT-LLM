@@ -66,6 +66,8 @@ boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ 
 
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
 
+genPostMergeBuildsOnly = (env.JOB_NAME?.contains("GenPostMergeBuilds") ?: false)
+
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
 def trimForStageList(stageNameList)
@@ -1048,6 +1050,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     stages = [
         "Release-Check": {
             script {
+                if (genPostMergeBuildsOnly) {
+                    echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
                 launchReleaseCheck(this)
             }
         },
@@ -1061,6 +1067,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                }
+
+                if (genPostMergeBuildsOnly) {
+                    echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
+                    return
                 }
 
                 testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
@@ -1166,6 +1177,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                }
+
+                if (genPostMergeBuildsOnly) {
+                    echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
                 }
 
                 testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
@@ -1278,10 +1294,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     ]
 
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+    if (env.JOB_NAME ==~ /.*PostMerge.*/ && !genPostMergeBuildsOnly) {
         stages += dockerBuildJob
     }
-    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+    if (!genPostMergeBuildsOnly && (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
         stages += dockerBuildJob
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
