@@ -399,7 +399,7 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
 
     # Verify short-seq MHA is configured.
     assert mla.short_seq_mha_threshold == threshold
-    assert mla._rotary_emb_mha is not None
+    assert mla.mha is not None
     assert not mla.apply_rotary_emb, "Expected rope_fusion=True for DSA"
 
     kv_cache_manager = _build_kv_cache_manager(
@@ -498,7 +498,7 @@ def test_short_mha_not_triggered_when_threshold_zero():
     mla, _, _, _ = _build_mla(rope_config, device, threshold=0)
 
     assert mla.short_seq_mha_threshold == 0
-    assert mla._rotary_emb_mha is None
+    assert mla.mha is None
 
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")

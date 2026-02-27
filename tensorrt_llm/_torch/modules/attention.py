@@ -1061,25 +1061,12 @@ class MLA(nn.Module):
             raise ValueError(
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
-        # Create a RotaryEmbedding for the short-seq MHA path only when the
-        # optimization is enabled AND rope_fusion is True (apply_rotary_emb is
-        # False). When apply_rotary_emb is True the dispatch guard skips this
-        # path, so the embedding would never be used.
-        self._rotary_emb_mha = None
-        self._short_seq_mha = None
         if self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb:
-            self._rotary_emb_mha = RotaryEmbedding(
-                pos_embd_params.rope,
-                head_dim=self.qk_rope_head_dim,
-                is_neox=pos_embd_params.is_neox,
-            )
             # Dense MHA attention backend for the short-seq path. Uses plain
             # TrtllmAttention (sparse_attention_config=None) because this path
             # computes dense attention over all tokens. TrtllmAttention has no
-            # weight parameters, so memory overhead is negligible. Stored as a
-            # separate attribute (not self.mha) to preserve the DSA assertion
-            # that self.mha is None in forward_impl_with_dsa.
-            self._short_seq_mha = create_attention(
+            # weight parameters, so memory overhead is negligible.
+            self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
                 self.num_heads_tp,
@@ -1113,10 +1100,8 @@ class MLA(nn.Module):
     def create_weights(self):
         # self.mha/mqa has no weights but has states that are related to quant_config,
         # which could be modified after __init__
-        if not self.is_dsa:
+        if self.mha is not None:
             self.mha.update_quant_config(self.quant_config)
-        if self._short_seq_mha is not None:
-            self._short_seq_mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
 
         # Although we use FP8 MLA for context/generation phase, the output is still in BF16
@@ -1456,7 +1441,7 @@ class MLA(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        assert self.mha is None and self.mqa is not None, "DSA is only supported in MQA mode"
+        assert self.mqa is not None, "DSA is only supported in MQA mode"
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
         num_generations = attn_metadata.num_generations
@@ -1632,12 +1617,12 @@ class MLA(nn.Module):
         # Guard: only when rope_fusion is True (apply_rotary_emb is False) to
         # avoid double-RoPE application. When apply_rotary_emb is True, the
         # caller already applied RoPE to q and k_pe, and our path would apply
-        # it again via mla_rope_append_paged_kv_assign_q / _rotary_emb_mha.
+        # it again via the C++ invokeMLARopeContext kernel.
         num_ctx_tokens = q.shape[0]
         if self._should_use_short_mha(num_ctx_tokens, position_ids):
-            return self.forward_context_short_mha(q, compressed_kv, k_pe,
-                                                  position_ids, attn_metadata,
-                                                  output, latent_cache)
+            return self.forward_context_default(q, compressed_kv, k_pe,
+                                                position_ids, attn_metadata,
+                                                output, latent_cache)
 
         if get_sm_version() >= 100:
             return self.forward_absorption_context(q,
@@ -1654,97 +1639,6 @@ class MLA(nn.Module):
                                                         output,
                                                         topk_indices,
                                                         is_generation=False)
-
-    @nvtx_range("forward_context_short_mha")
-    def forward_context_short_mha(
-        self,
-        q: torch.Tensor,
-        compressed_kv: torch.Tensor,
-        k_pe: torch.Tensor,
-        position_ids: torch.Tensor,
-        attn_metadata: AttentionMetadata,
-        output: torch.Tensor,
-        latent_cache: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """Dense MHA for short sequences during prefill.
-
-        For short sequences, using standard multi-head attention with expanded
-        KV (via kv_b_proj) is more efficient than the absorption path used by
-        DSA. The absorption path requires two extra BMMs (Q-absorption and
-        V-projection) and uses a larger head_dim (kv_lora_rank + rope_dim = 576)
-        for the attention kernel, compared to the standard qk_head_dim = 192.
-
-        Uses self._short_seq_mha (a dedicated TrtllmAttention backend) for
-        the attention computation. This backend natively handles variable-length
-        packed sequences via attn_metadata, avoiding the need for padding or
-        per-sequence Python loops. latent_cache=None tells the backend to skip
-        RoPE and KV cache append (already done in Step 1).
-
-        This method:
-        1. Stores latent_cache in paged KV cache and applies RoPE to q via the
-           MQA backend's mla_rope_append_paged_kv_assign_q.
-        2. Applies RoPE to k_pe manually using the RotaryEmbedding.
-        3. Expands compressed KV via kv_b_proj to get full k_nope and v.
-        4. Constructs full K = [k_nope, RoPE(k_pe)] per head.
-        5. Computes dense attention via fused MHA backend (no sparse routing —
-           for short sequences, dense attention is both faster and higher
-           quality than sparse selection via topk_indices).
-        """
-        num_ctx_tokens = q.shape[0]
-
-        # Step 1: Store latent_cache in paged cache + apply RoPE to q.
-        # mla_rope_append_paged_kv_assign_q modifies q in-place: applies RoPE
-        # to the rope portion of each head, and appends latent_cache (with
-        # RoPE'd k_pe) to the paged KV cache for future generation.
-        # NOTE: This path is only safe when apply_rotary_emb is False (i.e.,
-        # rope_fusion is True), so q and k_pe arrive WITHOUT RoPE applied.
-        trtllm_mqa = cast(TrtllmAttention, self.mqa)
-        trtllm_mqa.mla_rope_append_paged_kv_assign_q(q, latent_cache,
-                                                     attn_metadata)
-
-        # Step 2: Apply RoPE to k_pe via the fused compiled helper.
-        # position_ids covers all tokens; slice to context tokens only.
-        ctx_position_ids = position_ids[..., :num_ctx_tokens]
-        k_pe_roped = self._rotary_emb_mha.apply_rope_single_packed(
-            k_pe, ctx_position_ids.view(-1))
-
-        # Step 3: Expand KV via kv_b_proj.
-        kv = self.kv_b_proj(compressed_kv)
-        k_nope, v = kv.split(
-            [
-                self.num_heads_tp * self.qk_nope_head_dim,
-                self.num_heads_tp * self.v_head_dim
-            ],
-            -1,
-        )
-
-        # Step 4: Construct full K = [k_nope, k_pe_roped] per head.
-        k_nope_r = k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim)
-        k_pe_expanded = k_pe_roped.view(-1, 1, self.qk_rope_head_dim).expand(
-            -1, self.num_heads_tp, -1)
-        k = maybe_compiled_cat([k_nope_r, k_pe_expanded], dim=-1)
-        # k: [num_ctx_tokens, num_heads_tp, qk_head_dim]
-
-        # Step 5: Flatten Q, K, V to 2D packed layout for the fused attention
-        # backend, which natively handles variable-length sequences via
-        # attn_metadata (no padding/batching needed).
-        k = k.view(-1, self.num_heads_tp * self.qk_head_dim)
-        v = v.view(-1, self.num_heads_tp * self.v_head_dim)
-
-        # Step 6: Compute attention via the fused MHA backend.
-        # latent_cache=None signals that RoPE and KV cache append were already
-        # done in Step 1 (mla_rope_append_paged_kv_assign_q), matching the
-        # pattern used by forward_context_with_cached_kv.
-        return self._short_seq_mha.forward(
-            q,
-            k,
-            v,
-            attn_metadata,
-            attention_input_type=AttentionInputType.context_only,
-            latent_cache=None,
-            out_scale=self.out_scale,
-            output=output,
-        )
 
     def forward_generation_dsa(
         self,
