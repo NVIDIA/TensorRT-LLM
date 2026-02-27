@@ -7,6 +7,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from transformers import AutoModelForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.llmapi import QuantConfig
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import GPTJConfig, GPTJForCausalLM
@@ -126,6 +127,7 @@ def convert_and_save_hf(args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
 

@@ -22,10 +22,10 @@ import torch
 from safetensors.torch import save_file
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.functional import LayerNormPositionType, LayerNormType
 from tensorrt_llm.models.convert_utils import weight_only_quantize_dict
 from tensorrt_llm.quantization import QuantAlgo
-from examples._deprecation import emit_engine_arch_deprecation
 
 
 def parse_arguments():

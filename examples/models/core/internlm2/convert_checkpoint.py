@@ -13,10 +13,10 @@ from einops import rearrange
 from transformers import AutoConfig, AutoModelForCausalLM
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.llama import convert
-from examples._deprecation import emit_engine_arch_deprecation
 
 
 def parse_arguments():

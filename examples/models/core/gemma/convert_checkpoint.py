@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Dict, Optional, Type
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import infer_dtype
 from tensorrt_llm.models.gemma.config import GEMMA_ARCHITECTURE, GemmaConfig
@@ -17,7 +18,6 @@ from tensorrt_llm.models.gemma.model import GemmaForCausalLM
 from tensorrt_llm.models.modeling_utils import (QuantConfig, save_checkpoint,
                                                 save_config)
 from tensorrt_llm.quantization import QuantAlgo
-from examples._deprecation import emit_engine_arch_deprecation
 
 
 class CheckpointType(str, Enum):

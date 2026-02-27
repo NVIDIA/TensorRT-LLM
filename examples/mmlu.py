@@ -40,6 +40,7 @@ from utils import (add_common_args, load_tokenizer, prepare_enc_dec_inputs,
                    read_is_enc_dec, read_model_name)
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 
 if PYTHON_BINDINGS:
@@ -356,6 +357,7 @@ def parse_args():
 
 
 def main():
+    emit_engine_arch_deprecation("mmlu.py")
     args = parse_args()
     if args.tokenizer_dir is None:
         args.tokenizer_dir = args.hf_model_dir
