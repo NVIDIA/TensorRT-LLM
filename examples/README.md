@@ -31,7 +31,7 @@ Full documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html
 | [`llm-api/`](llm-api/) | Python LLM API examples (offline inference, quantization, speculative decoding) |
 | [`apps/`](apps/) | Application examples (chat, FastAPI server) |
 | [`configs/`](configs/) | Pre-tuned serving configurations for popular models |
-| [`serving/`](serving/) | `trtllm-serve` deployment guides and examples |
+| [`serve/`](serve/) | `trtllm-serve` deployment guides and examples |
 | [`quantization/`](quantization/) | Quantization workflows with NVIDIA Model Optimizer |
 
 ## Pre-Tuned Model Configurations
@@ -43,7 +43,7 @@ These are validated Pareto-optimal configurations from benchmark data.
 Use them with `trtllm-serve`:
 
 ```bash
-trtllm-serve "deepseek-ai/DeepSeek-R1-0528" --extra_config configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc64.yaml
+trtllm-serve "deepseek-ai/DeepSeek-R1-0528" --config configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc64.yaml
 ```
 
 See [`configs/database/lookup.yaml`](configs/database/lookup.yaml) for the full catalog.
