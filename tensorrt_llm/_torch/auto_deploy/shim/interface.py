@@ -108,6 +108,15 @@ class CachedSequenceInterface:
         """Return all the named arguments owned by this interface."""
         return {**self.info.named_args, **self._caches}
 
+    def get_arg(
+        self, name: str, truncate: Optional[bool] = None, unflatten: Optional[bool] = None
+    ) -> torch.Tensor:
+        """Get the argument from the sequence info or caches."""
+        if name in self._caches:
+            assert not (truncate or unflatten), "truncate or unflatten is not supported for caches"
+            return self._caches[name]
+        return self.info.get_arg(name, truncate=truncate, unflatten=unflatten)
+
     def to(self, *args, **kwargs) -> None:
         self.info.to(*args, **kwargs)
         # Only move locally-allocated caches (paged/state caches are managed by cache managers)
