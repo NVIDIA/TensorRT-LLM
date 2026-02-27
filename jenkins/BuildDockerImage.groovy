@@ -501,8 +501,10 @@ def launchBuildJobs(pipeline, globalVars, imageKeyToTag) {
                     } catch (InterruptedException e) {
                         throw e
                     } catch (Exception e) {
-                        echo "Build ${key} failed."
-                        throw e
+                        catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                            echo "Build ${key} failed."
+                            throw e
+                        }
                     }
                 }
             }
