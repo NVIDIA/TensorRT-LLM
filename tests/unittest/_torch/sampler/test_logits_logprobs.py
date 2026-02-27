@@ -433,28 +433,27 @@ def test_logprobs_against_logits(
         """Checks if the provided logprobs match the logprobs calculated from the logits"""
         expected_logprobs = torch.nn.functional.log_softmax(logits_cuda, dim=-1).to(device="cpu")
         sorted_expected_logprobs = torch.sort(expected_logprobs, descending=True, dim=-1)[0]
-        for token_idx, token_logprobs in enumerate(logprobs):
-            expected_logprobs_per_token = expected_logprobs[token_idx]
-            sorted_expected_logprobs_per_token = sorted_expected_logprobs[token_idx]
+        for generation_idx, token_logprobs in enumerate(logprobs):
+            assert len(token_logprobs) <= num_logprobs + 1, "too many logprobs provided"
+            assert len(token_logprobs) >= num_logprobs, "not enough logprobs provided"
+            expected_logprobs_per_token = expected_logprobs[generation_idx]
+            sorted_expected_logprobs_per_token = sorted_expected_logprobs[generation_idx]
             # For each rank store the corresponding logprob to ensure that shared ranks have the same logprob
             processed_ranks_and_logprobs: dict[int, float] = {}
             for token_id, logprob_obj in token_logprobs.items():
                 # the sampled token may have any rank > 0
-                if token_id != tokens[token_idx]:
+                if token_id != tokens[generation_idx]:
                     # All other tokens should have a rank <= num_logprobs
                     assert logprob_obj.rank <= num_logprobs, (
                         f"{case_str} logprob rank is greater than {num_logprobs}"
                     )
                 assert logprob_obj.rank >= 1, f"{case_str} logprob rank is smaller than 1"
 
-                # Shared ranks should have the same logprob
-                if logprob_obj.rank in processed_ranks_and_logprobs:
-                    assert processed_ranks_and_logprobs[logprob_obj.rank] == logprob_obj.logprob, (
-                        f"Objects with the same rank {logprob_obj.rank} have different logprobs \
-                            {processed_ranks_and_logprobs[logprob_obj.rank]} vs {logprob_obj.logprob}"
-                    )
-                else:
-                    processed_ranks_and_logprobs[logprob_obj.rank] = logprob_obj.logprob
+                # Shared ranks should not exist
+                assert logprob_obj.rank not in processed_ranks_and_logprobs, (
+                    f"Found shared rank {logprob_obj.rank} with logprob {logprob_obj.logprob}"
+                )
+                processed_ranks_and_logprobs[logprob_obj.rank] = logprob_obj.logprob
 
                 # Check if the logprob matches the top-rank logprob from the logits
                 assert (
