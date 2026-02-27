@@ -19,6 +19,7 @@ import numpy as np
 import torch
 from ordered_set import OrderedSet
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import ModelRunnerCpp
 
@@ -128,6 +129,7 @@ def run_dtm_ngram(batch_input_ids,
                   vocab_size,
                   *,
                   target_runner=None):
+    emit_engine_arch_deprecation("run_dtm_ngram.py")
     # `dtm` for Draft-Target-Model, `ngram` for NGram
     is_dtm = (args.draft_target_model_config is not None)
     is_ngram = (args.ngram_config is not None)

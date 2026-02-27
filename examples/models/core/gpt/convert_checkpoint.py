@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import release_gc
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import GPTForCausalLM
@@ -17,7 +18,6 @@ from tensorrt_llm.models.gpt.convert import (UnpackedNemoCheckpointDir,
                                              update_tokenizer_paths)
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
-from examples._deprecation import emit_engine_arch_deprecation
 
 
 def parse_arguments():

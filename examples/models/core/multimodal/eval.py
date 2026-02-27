@@ -25,6 +25,7 @@ from utils import add_common_args
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.runtime import MultimodalModelRunner
 
 SUPPORTED_MODEL_TYPES = {
@@ -218,6 +219,7 @@ def eval(output, task, data) -> bool:
         return data['answer'].lower() in output
 
 
+emit_engine_arch_deprecation("eval.py")
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 args = parse_arguments()
 if args.model_type not in SUPPORTED_MODEL_TYPES:

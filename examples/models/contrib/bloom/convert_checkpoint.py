@@ -18,6 +18,7 @@ from transformers.pytorch_utils import Conv1D
 
 # isort: off
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm import logger
 from tensorrt_llm.quantization import QuantAlgo, QuantMode
 from tensorrt_llm.models.convert_utils import iterate_shard_files, load_state_dict, \
@@ -825,6 +826,7 @@ def convert(worker_rank, world_size, args, convert_args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert

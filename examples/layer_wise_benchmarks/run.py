@@ -9,6 +9,7 @@ import nvtx
 import torch
 import yaml
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.modules.multi_stream_utils import with_multi_stream
 from tensorrt_llm._utils import local_mpi_rank, mpi_rank, mpi_world_size
@@ -16,6 +17,8 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.tools.layer_wise_benchmarks import get_calibrator
 from tensorrt_llm.tools.layer_wise_benchmarks.mark_utils import mark_ranges
 from tensorrt_llm.tools.layer_wise_benchmarks.runner import BalanceMethod, Runner
+
+emit_engine_arch_deprecation("run.py")
 
 
 def comma_separated_ints(s):

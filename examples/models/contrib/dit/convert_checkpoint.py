@@ -11,6 +11,7 @@ import torch
 
 import tensorrt_llm
 from tensorrt_llm import str_dtype_to_torch
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.convert_utils import (split, split_matrix_tp,
                                                split_qkv_bias_tp, split_qkv_tp)
@@ -310,6 +311,7 @@ def execute(workers, func, args):
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
     args = parse_arguments()
     world_size = args.cp_size * args.tp_size * args.pp_size

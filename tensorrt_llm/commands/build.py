@@ -24,6 +24,7 @@ from typing import Optional, Union
 
 import torch
 
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import (local_mpi_rank, local_mpi_size, mpi_barrier,
                                  mpi_comm, mpi_rank, mpi_world_size)
 from tensorrt_llm.builder import BuildConfig, Engine, build
@@ -420,26 +421,7 @@ def parallel_build(model_config: PretrainedConfig,
 
 
 def main():
-    import warnings
-    warnings.warn(
-        "\n"
-        "=" * 70 + "\n"
-        "LEGACY WARNING: trtllm-build\n"
-        "=" * 70 + "\n"
-        "trtllm-build is part of the legacy TensorRT engine-build workflow.\n"
-        "New projects should use the PyTorch backend instead.\n\n"
-        "For new projects, use the PyTorch backend instead:\n\n"
-        "  # Serve a model (recommended):\n"
-        "  trtllm-serve <model_name_or_path>\n\n"
-        "  # Python API:\n"
-        "  from tensorrt_llm import LLM\n"
-        "  llm = LLM(model='<model_name_or_path>')\n"
-        "  output = llm.generate(['Hello, how are you?'])\n\n"
-        "Documentation: https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html\n"
-        "=" * 70 + "\n",
-        FutureWarning,
-        stacklevel=2,
-    )
+    emit_engine_arch_deprecation("trtllm-build")
 
     parser = parse_arguments()
     args = parser.parse_args()

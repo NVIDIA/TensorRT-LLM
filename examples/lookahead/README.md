@@ -1,5 +1,11 @@
 # Lookahead Speculative Decoding
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a model using Lookahead speculative decoding ([Break the Sequential Dependency of LLM Inference Using Lookahead Decoidng](https://arxiv.org/pdf/2402.02057)) in TensorRT-LLM.
 
 ## Overview
