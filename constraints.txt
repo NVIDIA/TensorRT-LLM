@@ -4,3 +4,5 @@
 urllib3>=2.6.3
 # WAR against https://github.com/advisories/GHSA-8rrh-rw8j-w5fx
 wheel>=0.46.2
+# WAR against https://github.com/advisories/GHSA-7gcm-g887-7qv7
+protobuf>=6.33.5
