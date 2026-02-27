@@ -5804,16 +5804,20 @@ TEST(KVCacheManagerReuseAccountingTest, ReuseAwareBlockEstimatesStayConsistentAf
     auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 3 blocks
     EXPECT_EQ(reusableBlocks, expectedReusableBlocks);
 
-    // neededOneStep: 4 shared blocks - 3 reusable = 1
+    // After removeSequence, reusable blocks have no active refs and are free in the eviction queue.
+    // The scheduling functions must NOT subtract free reusable blocks to avoid double-counting
+    // against the eviction policy's free count.
+    auto const numContextBlocks = promptLength / tokensPerBlock; // 4 blocks
+    auto const numGenBlocks = maxNewTokens / tokensPerBlock;     // 2 blocks
+
+    // neededOneStep: all 4 context blocks (no subtraction for free reusable blocks)
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
-    auto const expectedNeededOneStep = (promptLength / tokensPerBlock) - expectedReusableBlocks;
-    EXPECT_EQ(neededOneStep, expectedNeededOneStep);
+    EXPECT_EQ(neededOneStep, numContextBlocks);
 
-    // remainingBeforeAdd: (4 context - 3 reusable) + 2 generation = 3
+    // remainingBeforeAdd: 4 context + 2 generation = 6 (no subtraction)
     auto const remainingBeforeAdd = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
-    auto const expectedRemainingBeforeAdd = expectedNeededOneStep + (maxNewTokens / tokensPerBlock);
-    EXPECT_EQ(remainingBeforeAdd, expectedRemainingBeforeAdd);
+    EXPECT_EQ(remainingBeforeAdd, numContextBlocks + numGenBlocks);
 
     // After addSequence, context blocks are allocated (reuse already applied during allocation)
     // Only generation blocks remain to be allocated
@@ -5925,11 +5929,11 @@ TEST(KVCacheManagerReuseAccountingTest, CountReusableBlocksPartialMatch)
     auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
     EXPECT_EQ(reusableBlocks, 2);
 
-    // getNeededBlocksOneStep should account for 2 reusable blocks
-    // Total needed = 4 context blocks, minus 2 reusable = 2 blocks needed
+    // After removeSequence, reusable blocks are free (no active refs).
+    // getNeededBlocksOneStep must NOT subtract free reusable blocks to avoid double-counting.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
-    EXPECT_EQ(neededOneStep, 2);
+    EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartialReuse)
@@ -5984,14 +5988,13 @@ TEST(KVCacheManagerReuseAccountingTest, GetRemainingBlocksToCompletionWithPartia
         true,
     };
 
-    // Without reuse: would need 5 context + 3 generation = 8 blocks
-    // With reuse: storeContextBlocks only stores (80-1)/16 = 4 full blocks
-    // So: (5 context - 4 reusable) + 3 generation = 4 blocks needed
+    // After removeSequence, reusable blocks are free (no active refs).
+    // getRemainingBlocksToCompletion must NOT subtract free reusable blocks.
+    // Needs all 5 context + 3 generation = 8 blocks.
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
-    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 4 blocks
-    auto const numContextBlocks = promptLength / tokensPerBlock;             // 5 blocks
-    auto const expectedRemaining = (numContextBlocks - expectedReusableBlocks) + (maxNewTokens / tokensPerBlock);
-    EXPECT_EQ(remaining, expectedRemaining);                                 // 1 context + 3 generation = 4
+    auto const numContextBlocks = promptLength / tokensPerBlock;  // 5 blocks
+    auto const numGenBlocks = maxNewTokens / tokensPerBlock;      // 3 blocks
+    EXPECT_EQ(remaining, numContextBlocks + numGenBlocks);        // 5 context + 3 generation = 8
 }
 
 TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
@@ -6046,13 +6049,12 @@ TEST(KVCacheManagerReuseAccountingTest, GetNeededBlocksOneStepWithFullReuse)
         true,
     };
 
-    // storeContextBlocks only stores (48-1)/16 = 2 full blocks
-    // So: 3 shared blocks - 2 reusable = 1 block needed
+    // After removeSequence, reusable blocks are free (no active refs).
+    // getNeededBlocksOneStep must NOT subtract free reusable blocks.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
-    auto const expectedReusableBlocks = (promptLength - 1) / tokensPerBlock; // 2 blocks
-    auto const numSharedBlocks = promptLength / tokensPerBlock;              // 3 blocks
-    EXPECT_EQ(neededOneStep, numSharedBlocks - expectedReusableBlocks);      // 3 - 2 = 1
+    auto const numSharedBlocks = promptLength / tokensPerBlock; // 3 blocks
+    EXPECT_EQ(neededOneStep, numSharedBlocks);                  // All 3 context blocks
 }
 
 TEST(KVCacheManagerReuseAccountingTest, ReuseDisabledReturnsFullBlockCount)
@@ -6172,16 +6174,17 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
         true,
     };
 
-    // Should reuse 2 blocks (shared prefix)
+    // Should reuse 2 blocks (shared prefix) — public API counts all reusable regardless of ref state
     auto const reusableBlocks = kvCacheManager->countReusableBlocks(req1.getUniqueTokens(0), req1);
     EXPECT_EQ(reusableBlocks, sharedPrefixLength / tokensPerBlock);
 
-    // neededBlocksOneStep: 4 total - 2 reusable = 2 blocks
+    // After removeSequence, reusable blocks are free (no active refs).
+    // getNeededBlocksOneStep must NOT subtract free reusable blocks.
     auto const neededOneStep
         = kvCacheManager->getNeededBlocksOneStep(req1, /*twoStepsLookAhead=*/false, onlyWindowSize);
-    EXPECT_EQ(neededOneStep, uniqueSuffixLength / tokensPerBlock);
+    EXPECT_EQ(neededOneStep, promptLength / tokensPerBlock); // All 4 context blocks
 
-    // getRemainingBlocksToCompletion: (4 context - 2 reusable) + 1 gen = 3 blocks
+    // getRemainingBlocksToCompletion: 4 context + 1 gen = 5 blocks (no subtraction)
     auto const remaining = kvCacheManager->getRemainingBlocksToCompletion(req1, onlyWindowSize);
-    EXPECT_EQ(remaining, (uniqueSuffixLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
+    EXPECT_EQ(remaining, (promptLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
 }
