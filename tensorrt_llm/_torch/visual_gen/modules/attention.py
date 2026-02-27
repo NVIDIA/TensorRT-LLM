@@ -87,17 +87,15 @@ class Attention(nn.Module):
 
         if self.qk_norm:
             if qk_norm_mode == "per_head":
-                q_norm_dim = self.head_dim
-                kv_norm_dim = self.head_dim
+                self.norm_q = nn.RMSNorm(self.head_dim, eps=self.eps, dtype=self.dtype)
+                self.norm_k = nn.RMSNorm(self.head_dim, eps=self.eps, dtype=self.dtype)
             else:
-                q_norm_dim = self.q_dim
-                kv_norm_dim = self.kv_dim
-            self.norm_q = RMSNorm(
-                hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
-            )
-            self.norm_k = RMSNorm(
-                hidden_size=kv_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
-            )
+                self.norm_q = RMSNorm(
+                    hidden_size=self.q_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                )
+                self.norm_k = RMSNorm(
+                    hidden_size=self.kv_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                )
 
         # TODO: Use weight mapper to create just a Linear module
         self.to_out = nn.ModuleList(
@@ -217,16 +215,8 @@ class Attention(nn.Module):
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
-            if self.qk_norm_mode == "per_head":
-                q = torch.nn.functional.rms_norm(
-                    q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon
-                )
-                k = torch.nn.functional.rms_norm(
-                    k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon
-                )
-            else:
-                q = self.norm_q(q)
-                k = self.norm_k(k)
+            q = self.norm_q(q)
+            k = self.norm_k(k)
         return q, k
 
     def _attn_impl(

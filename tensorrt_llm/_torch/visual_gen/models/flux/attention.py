@@ -13,7 +13,6 @@ from typing import TYPE_CHECKING, Optional, Tuple, Union
 import torch
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
@@ -90,12 +89,8 @@ class FluxJointAttention(Attention):
                 },
             )
 
-            self.norm_added_q = RMSNorm(
-                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
-            )
-            self.norm_added_k = RMSNorm(
-                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
-            )
+            self.norm_added_q = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
+            self.norm_added_k = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
 
             self.to_add_out = Linear(
                 self.q_dim,
@@ -147,18 +142,8 @@ class FluxJointAttention(Attention):
             enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
             enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-            enc_q = torch.nn.functional.rms_norm(
-                enc_q,
-                (enc_q.shape[-1],),
-                self.norm_added_q.weight,
-                self.norm_added_q.variance_epsilon,
-            )
-            enc_k = torch.nn.functional.rms_norm(
-                enc_k,
-                (enc_k.shape[-1],),
-                self.norm_added_k.weight,
-                self.norm_added_k.variance_epsilon,
-            )
+            enc_q = self.norm_added_q(enc_q)
+            enc_k = self.norm_added_k(enc_k)
 
             # Concatenate text + image for joint attention
             query = torch.cat([enc_q, query], dim=1)
