@@ -180,7 +180,12 @@ struct BlockKey
 
     bool operator==(BlockKey const& other) const noexcept;
 
-    int partialMatch(BlockKey const& other) const noexcept
+    bool supportsPartialMatching() const noexcept
+    {
+        return true;
+    }
+
+    int numMatchingTokens(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
         if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID)
@@ -191,6 +196,13 @@ struct BlockKey
         }
         return numMatched;
     }
+
+    int getNumTokens() const noexcept
+    {
+        return static_cast<int>(uniqueTokens.size());
+    }
+
+    struct BlockKey shorten(int newNumTokens) const;
 };
 
 std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
