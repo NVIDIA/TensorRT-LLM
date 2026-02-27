@@ -2,8 +2,7 @@
 
 aiperf profile \
     -m Qwen2.5-VL-3B-Instruct \
-    --tokenizer Qwen/Qwen2.5-VL-3B-Instruct \
-    --endpoint-type chat \
+    --tokenizer ${AIPERF_TOKENIZER_PATH:-Qwen/Qwen2.5-VL-3B-Instruct} \
     --random-seed 123 \
     --image-width-mean 64 \
     --image-height-mean 64 \

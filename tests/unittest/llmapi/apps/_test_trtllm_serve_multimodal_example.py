@@ -61,12 +61,15 @@ def example_root():
 @pytest.mark.parametrize("exe, script",
                          [("python3", "openai_chat_client_for_multimodal.py"),
                           ("bash", "aiperf_client_for_multimodal.sh")])
-def test_trtllm_serve_examples(exe: str, script: str,
+def test_trtllm_serve_examples(exe: str, script: str, model_name: str,
                                server: RemoteOpenAIServer, example_root: str):
     client_script = os.path.join(example_root, script)
+    custom_env = os.environ.copy()
+    custom_env["AIPERF_TOKENIZER_PATH"] = get_model_path(model_name)
     # CalledProcessError will be raised if any errors occur
     subprocess.run([exe, client_script],
                    stdout=subprocess.PIPE,
                    stderr=subprocess.PIPE,
                    text=True,
-                   check=True)
+                   check=True,
+                   env=custom_env)
