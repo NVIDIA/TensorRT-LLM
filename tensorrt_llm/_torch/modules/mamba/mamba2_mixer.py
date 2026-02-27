@@ -345,6 +345,10 @@ class Mamba2Mixer(nn.Module):
             ssm_states[state_indices_p] = current_ssm_states
 
         if num_decodes > 0:
+            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
+            # Convert dt early so we can do PDL between conv1d and selective state.
+            dt_d = dt_d.to(dtype=torch.float32)
+
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
@@ -395,8 +399,6 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            dt_d = dt_d.to(dtype=torch.float32)
             x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
             B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
