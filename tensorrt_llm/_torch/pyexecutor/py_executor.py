@@ -2843,6 +2843,8 @@ class PyExecutor:
 
         block_transfer = all([
             req.is_disagg_generation_transmission_in_progress
+            and req.py_disaggregated_params.schedule_style
+            != DisaggScheduleStyle.GENERATION_FIRST
             for req in self.active_requests
         ])
         self._check_disagg_gen_cache_transfer_status(1 if block_transfer else 0)

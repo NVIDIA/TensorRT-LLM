@@ -302,7 +302,6 @@ def launch_disaggregated_llm(
             for i, (env, args) in enumerate(server_configs):
                 if enable_redirect_log:
                     f = open(f"output_{server_name}_{i}.log", "w+")
-                    env["TLLM_LOG_LEVEL"] = "INFO"
                     proc = popen(args, env=env, stdout=f, stderr=f)
                     log_files.append(f)
                 else:
@@ -1342,7 +1341,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(2)
     @pytest.mark.parametrize("overlap_scheduler", [False, True])
     @pytest.mark.parametrize("enable_partial_reuse", [True, False])
-    def test_auto_dtype(self, overlap_scheduler, enable_partial_reuse):
+    @pytest.mark.parametrize("schedule_style",
+                             ["context_first", "generation_first"])
+    def test_auto_dtype(self, overlap_scheduler, enable_partial_reuse,
+                        schedule_style):
+        transceiver_runtime = "PYTHON" if schedule_style == "generation_first" else None
+        transceiver_backend = "NIXL" if schedule_style == "generation_first" else "DEFAULT"
         kv_cache_config = {
             "enable_block_reuse": True,
             "enable_partial_reuse": enable_partial_reuse,
@@ -1351,7 +1355,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT"
+                "backend": transceiver_backend,
+                "transceiver_runtime": transceiver_runtime,
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1359,7 +1364,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": overlap_scheduler,
             "cuda_graph_config": None,
             "cache_transceiver_config": {
-                "backend": "DEFAULT"
+                "backend": transceiver_backend,
+                "transceiver_runtime": transceiver_runtime,
             },
             "kv_cache_config": kv_cache_config,
         }
@@ -1374,7 +1380,8 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "generation_servers": {
                 "num_instances": 1,
                 "urls": ["localhost:8002"]
-            }
+            },
+            "schedule_style": schedule_style,
         }
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
