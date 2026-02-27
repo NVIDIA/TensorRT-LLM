@@ -28,7 +28,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank
 
 # yapf: disable
 # isort: off
