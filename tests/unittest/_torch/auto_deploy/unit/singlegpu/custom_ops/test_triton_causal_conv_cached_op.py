@@ -63,9 +63,9 @@ def test_generate_only_triton_vs_cuda(conv_env):
     cu_seqlen = torch.zeros(batch, device=device, dtype=torch.int32)
     seq_len = torch.zeros(batch, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor([0, 0, 0, 0, batch, batch], device=device, dtype=torch.int32)
 
     # Clone inputs for each backend
     x_cuda = x.clone()
@@ -146,9 +146,11 @@ def test_context_flattened_triton_vs_cuda(conv_env):
     # Clone for Triton backend
     conv_state_cache_triton = conv_state_cache_cuda.clone()
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
     num_prefill = len(lens)
-    batch_info_host = torch.tensor([num_prefill, total, 0], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor(
+        [num_prefill, total, 0, 0, 0, 0], device=device, dtype=torch.int32
+    )
     cu_seqlen = torch.tensor([0, lens[0], total], device=device, dtype=torch.int32)
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(num_prefill, device=device, dtype=torch.bool)
@@ -236,9 +238,11 @@ def test_mixed_prefill_decode_triton_vs_cuda(conv_env):
     )
     conv_state_cache_triton = conv_state_cache_cuda.clone()
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
     batch_info_host = torch.tensor(
-        [num_prefill, num_prefill_tokens, num_decode], device=device, dtype=torch.int32
+        [num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode],
+        device=device,
+        dtype=torch.int32,
     )
     cu_seqlen = torch.tensor([0, prefill_lens[0]], device=device, dtype=torch.int32)
     seq_len = torch.tensor(prefill_lens, device=device, dtype=torch.int32)
@@ -323,7 +327,9 @@ def test_larger_batch_triton_vs_cuda(conv_env):
     conv_state_cache_triton = conv_state_cache_cuda.clone()
 
     num_prefill = len(lens)
-    batch_info_host = torch.tensor([num_prefill, total, 0], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor(
+        [num_prefill, total, 0, 0, 0, 0], device=device, dtype=torch.int32
+    )
 
     # Build cumulative sequence lengths
     cu_seqlen_list = [0]

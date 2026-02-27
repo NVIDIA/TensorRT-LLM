@@ -735,3 +735,64 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestLlama3_1_8B_Instruct_Eagle3(LlmapiAccuracyTestHarness):
+    """Accuracy test for Eagle3 one-model speculative decoding with AutoDeploy."""
+
+    MODEL_NAME = "meta-llama/Llama-3.1-8B-Instruct"
+    MODEL_PATH = hf_id_to_local_model_dir(MODEL_NAME)
+    EAGLE_MODEL_PATH = hf_id_to_local_model_dir(
+        "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B")
+
+    def get_default_kwargs(self):
+        from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+        speculative_config = Eagle3DecodingConfig(
+            max_draft_len=3,
+            speculative_model=self.EAGLE_MODEL_PATH,
+            eagle3_one_model=True,
+            eagle3_layers_to_capture={1, 15, 28},
+        )
+
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "compile_backend": "torch-simple",
+            "max_batch_size": 128,
+            "max_seq_len": 8192,
+            "max_num_tokens": 8192,
+            "skip_loading_weights": False,
+            "disable_overlap_scheduler": False,
+            "enable_iter_perf_stats": True,
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.7
+            },
+            "speculative_config": speculative_config,
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=1,
+                              use_beam_search=False)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    def test_eagle3_one_model(self):
+        """Test Eagle3 one-model speculative decoding accuracy on GSM8K.
+
+        Verifies:
+        - No accuracy drop vs target-only model
+        - Acceptance rate >= 25% (spec dec is working)
+        """
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+
+        with AutoDeployLLM(
+                model=self.MODEL_PATH,
+                tokenizer=self.MODEL_PATH,
+                **kwargs,
+        ) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)

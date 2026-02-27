@@ -18,7 +18,8 @@ from _model_test_utils import get_small_model_config
 from build_and_run_ad import ExperimentConfig, main
 from test_common.llm_data import with_mocked_hf_download_for_single_gpu
 
-from tensorrt_llm.llmapi import DraftTargetDecodingConfig, KvCacheConfig
+from tensorrt_llm._torch.auto_deploy.shim.ad_executor import get_extra_seq_len_for_kv_cache
+from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig
 
 
 @pytest.mark.skip(
@@ -84,3 +85,48 @@ def test_ad_speculative_decoding_smoke(use_hf_speculative_model: bool):
     assert len(generated_text) > 0, "Generated text should not be empty"
 
     print("Speculative decoding smoke test passed!")
+
+
+def test_kv_cache_extra_seq_len_for_spec_dec():
+    """Test that get_extra_seq_len_for_kv_cache computes correct extra capacity."""
+    from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs
+
+    # Case 1: No spec config, no overlap
+    args_no_spec = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        disable_overlap_scheduler=True,
+    )
+    assert get_extra_seq_len_for_kv_cache(args_no_spec) == 0
+
+    # Case 2: No spec config, with overlap
+    args_overlap = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        disable_overlap_scheduler=False,
+    )
+    assert get_extra_seq_len_for_kv_cache(args_overlap) == 1  # overlap adds +1
+
+    # Case 3: Eagle3 one-model, overlap disabled
+    spec_config = Eagle3DecodingConfig(
+        max_draft_len=3,
+        speculative_model="some/model",
+        eagle3_one_model=True,
+    )
+    args_eagle = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        speculative_config=spec_config,
+        disable_overlap_scheduler=True,
+    )
+    extra = get_extra_seq_len_for_kv_cache(args_eagle)
+    # Should include max_total_draft_tokens + get_num_extra_kv_tokens (max_draft_len - 1)
+    assert extra > 0
+    assert extra == spec_config.max_total_draft_tokens + (spec_config.max_draft_len - 1)
+
+    # Case 4: Eagle3 one-model, overlap enabled
+    args_eagle_overlap = LlmArgs(
+        model="meta-llama/Meta-Llama-3.1-8B-Instruct",
+        speculative_config=spec_config,
+        disable_overlap_scheduler=False,
+    )
+    extra_overlap = get_extra_seq_len_for_kv_cache(args_eagle_overlap)
+    # Should be more than without overlap
+    assert extra_overlap > extra

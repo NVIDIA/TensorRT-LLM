@@ -525,7 +525,7 @@ class SequenceInfo:
             ("last_page_len", self.max_batch_size, torch.int),
             ("slot_idx", self.max_batch_size, torch.long),
             ### INFO OBJECTS THAT ARE AVAILABLE TO DESCRIBE THE INPUTS IN A MORE COMPACT WAY #######
-            ("batch_info", 3, torch.int),
+            ("batch_info", 6, torch.int),
             ("max_seq_info", 4, torch.int),
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
             ("seq_len", self.max_batch_size, torch.int),
@@ -676,11 +676,11 @@ class SequenceInfo:
 
     @property
     def total_num_tokens(self) -> int:
-        return self.get_arg("batch_info_host")[1:].sum().item()
+        return self.get_arg("batch_info_host")[1::2].sum().item()
 
     @property
     def is_generate_only(self) -> bool:
-        return self.get_arg("batch_info_host")[0].item() == 0
+        return self.get_arg("batch_info_host")[:4].sum().item() == 0
 
     def get_nested_page_assignments(self) -> List[List[int]]:
         """Get nested page assignments from cache locations and pages per sequence as list of lists.
@@ -1016,7 +1016,7 @@ class SequenceInfo:
             num_decode = int((sl_host.flip(0) == 1).cumprod(0).sum())
             num_prefill = len(sl_host) - num_decode
             num_prefill_tokens = int(sl_host.sum()) - num_decode
-            batch_info = [num_prefill, num_prefill_tokens, num_decode]
+            batch_info = [num_prefill, num_prefill_tokens, 0, 0, num_decode, num_decode]
         self._stage_arg("batch_info", batch_info)
 
         # check for updated input_pos (i.e. cache start position)
@@ -1107,7 +1107,8 @@ class SequenceInfo:
             self.rescatter_input_ids(_ungathered_input_ids)
 
         # Run host-prepare functions for attention forward (e.g. trtllm block_offsets computation)
-        self.run_host_prepare_for_attention_forward()
+        # TODO: uncomment again
+        # self.run_host_prepare_for_attention_forward()
 
     @nvtx_range("ad_rescatter_input_ids")
     def rescatter_input_ids(self, ungathered_input_ids: torch.Tensor):
@@ -1161,6 +1162,176 @@ class SequenceInfo:
     def run_host_prepare_for_attention_forward(self) -> None:
         for host_function, args in self._host_prepare_functions:
             host_function(**{arg: self.get_arg(arg) for arg in args})
+
+    def offset_pos_and_cache_(self, offset: torch.Tensor) -> None:
+        """Offset position and cache-related metadata for active arguments.
+
+        Args:
+            offset: 1D tensor [batch_size] with per-sequence position offsets.
+        """
+        # check if we need a d2h sync
+        _REQUIRES_UPDATE = {
+            "input_pos",
+            "cache_loc",
+            "cu_num_pages",
+            "last_page_len",
+            "position_ids",
+            "seq_len_with_cache",
+            "pages_per_seq",
+            "use_initial_states",
+        }
+        needs_d2h_sync = [
+            k + self._host_suffix
+            for k in _REQUIRES_UPDATE
+            if self._is_active(k + self._host_suffix, check_both=False)
+        ]
+        sync_to_host = any(needs_d2h_sync)
+        if sync_to_host:
+            ad_logger.debug(f"d2h sync required in offset_pos_and_cache_ for {needs_d2h_sync}")
+
+        num_sequences = self.num_sequences
+        assert offset.shape[0] == num_sequences, f"{offset.shape[0]=} != {num_sequences=}"
+
+        # --- input_pos (update as always) ---
+        input_pos = self.get_arg("input_pos", truncate=True)
+        input_pos += offset.to(input_pos.dtype)
+
+        # --- cache assignments ---
+        # NOTE: cache_loc and cu_num_pages must be up-to-date together -> enforced in nest_sequences
+        if any(self._is_active(arg) for arg in ("cache_loc", "cu_num_pages", "last_page_len")):
+            last_page_len = self.get_arg("last_page_len", truncate=True)
+            last_page_len += offset
+            # TODO: THIS IS STILL WRONG. RIGHT NOW, I CAN "LOOSE" A PAGE DURING REWIND AND THEN I
+            # NEED IT AGAIN SUBSEQUENTLY. WE NEED TO RETHINK THIS MORE
+            if self._is_active("cache_loc") or self._is_active("cu_num_pages"):
+                delta = (last_page_len > self.tokens_per_block).int() - (last_page_len <= 0).int()
+                torch.ops.auto_deploy.adjust_ragged_triton(
+                    cache_loc=self.get_arg("cache_loc"),
+                    cu_num_blocks=self.get_arg("cu_num_pages", truncate=True),
+                    extra_idx=self.get_arg("extra_page_per_seq", truncate=True),
+                    delta=delta,
+                    num_sequences=num_sequences,
+                )
+            last_page_len -= 1
+            last_page_len %= self.tokens_per_block
+            last_page_len += 1
+
+        # --- position_ids (device, if active) ---
+        if self._is_active("position_ids"):
+            position_ids = self.get_arg("position_ids", truncate=True, unflatten=False)
+            # position_ids is per-token while offset is per-sequence; expand if needed
+            if self.is_generate_only:
+                offset_for_pos_ids = offset
+            else:
+                seq_len = self.get_arg("seq_len", truncate=True)
+                offset_for_pos_ids = torch.repeat_interleave(offset, seq_len.to(torch.int64))
+            position_ids += offset_for_pos_ids
+
+        # --- pages_per_seq (device, if active) ---
+        if self._is_active("pages_per_seq"):
+            # NOTE: if this gets executed, we are guaranteed to have cu_num_pages up-to-date. Why?
+            # this is checked in nest_sequences where we check if cu_num_pages is provided when
+            # pages_per_seq is updated.
+            cu_num_pages = self.get_arg("cu_num_pages", truncate=True)
+            pps = self.get_arg("pages_per_seq", truncate=True)
+            pps[:] = (cu_num_pages[1:] - cu_num_pages[:-1]).to(pps.dtype)
+
+        # --- seq_len_with_cache (device, if active) ---
+        if self._is_active("seq_len_with_cache"):
+            swc = self.get_arg("seq_len_with_cache", truncate=True)
+            swc += offset
+
+        # --- use_initial_states (device, if active) ---
+        if self._is_active("use_initial_states"):
+            use_initial_states = self.get_arg("use_initial_states", truncate=True)
+            use_initial_states[:] = input_pos > 0
+
+        # --- Bulk device-to-host sync ---
+        # TODO: we have to continue thinking about this and dissect more what fields are needed in
+        # the forward pass if we use cudagraph...
+        if sync_to_host:
+            self._input_buffer.copy_to_host()
+
+    def switch_to_generate_(self) -> None:
+        """Switch all sequences metadata to generate (decode) mode.
+
+        Transitions the batch from any layout (prefill/extend/decode or mixed) to
+        an all-decode layout where each sequence has exactly 1 token. We assume that we just take
+        the last position of each sequence for the metadata.
+
+        NOTE: right now, we always update both host and device tensor to ensure this does not
+        interfere with the device-to-host sync in offset_pos_and_cache_.
+
+        NOTE: we assume the same structure as in nest_sequences for when to update the arguments.
+        In particular, arguments that are always updated in nest_sequences are also updated here.
+        Others are updated optionally depending on the argument being active.
+        """
+        # already in generate mode
+        if self.is_generate_only:
+            return
+
+        # check total number of sequences and device
+        num_seq = self.num_sequences
+
+        # NOTE: do host first so batch_info_host is updated first
+        for device, suffix in ((self.host_device, self._host_suffix), (self.device, "")):
+            # --- input_pos ---
+            input_pos = self.get_arg(f"input_pos{suffix}", truncate=True)
+            input_pos += self.get_arg(f"seq_len{suffix}", truncate=True) - 1
+
+            # --- cu_seqlen ---
+            cu_seqlen = torch.arange(num_seq + 1, dtype=torch.int32, device=device)
+            self.copy_(f"cu_seqlen{suffix}", cu_seqlen)
+
+            # --- seq_len ---
+            seq_len = self.get_arg(f"seq_len{suffix}", truncate=True)
+            seq_len.fill_(1)
+
+            # --- batch_info ---
+            batch_info = self.get_arg(f"batch_info{suffix}")
+            batch_info[:4].fill_(0)
+            batch_info[4:].fill_(num_seq)
+
+            # --- input_ids ---
+            # use cu_seqlen as heuristic to get the input_ids if available
+            input_ids_flat = self.get_arg(f"input_ids{suffix}", truncate=False, unflatten=False)
+            extraction_indices = (cu_seqlen[1:] - 1).long()
+            self.copy_(f"input_ids{suffix}", input_ids_flat[extraction_indices], strict=False)
+
+            # --- update derivative metadata that change in generate-only mode if active ---
+            if self._is_active("position_ids"):
+                self.copy_(f"position_ids{suffix}", input_pos, strict=False)
+
+            if self._is_active("use_initial_states"):
+                self.copy_(f"use_initial_states{suffix}", input_pos > 0)
+
+            # --- tokens_gather_info ---
+            tokens_gather_info = torch.zeros(2, dtype=torch.int32, device=device)
+            tokens_gather_info[:1].fill_(num_seq)
+            self.copy_(f"tokens_gather_info{suffix}", tokens_gather_info)
+
+    def copy_(self, name: str, src: torch.Tensor, strict: bool = True) -> None:
+        """Copy a tensor into the buffer. USE WITH CAUTION!
+
+        NOTE: this function will not sync host<>device tensors and only update the tensor on the
+            same device as the provided source.
+
+        Args:
+            name: Name of the tensor in the buffer.
+            src: host-side or device-side source tensor whose elements are copied into the first
+                ``src.numel()`` positions of the buffer views.
+            strict: whether to enforce same numel requirement for the source and target tensors.
+        """
+        device_expected = self.host_device if name.endswith(self._host_suffix) else self.device
+        assert src.device == device_expected, f"{device_expected=} but got {src.device=}"
+        name = name.removesuffix(self._host_suffix)
+        if strict:
+            src_numel = src.numel()
+            current_length = self._input_buffer.get_current_length(name)
+            assert src_numel == current_length, (
+                f"Trying to copy {src_numel} elements into {name} with {current_length=}"
+            )
+        self._input_buffer.copy_(name, src)
 
 
 class ResourceHandler(ABC):

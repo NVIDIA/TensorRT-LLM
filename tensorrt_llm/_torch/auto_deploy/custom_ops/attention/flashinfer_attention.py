@@ -264,9 +264,19 @@ def prepare_flashinfer_metadata(
     to understand the convention.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_tokens = num_prefill_tokens + num_decode
+    num_tokens = num_prefill_tokens + num_decode_tokens
 
     _GlobalFlashInferPlanner.reset(position_ids.device)
 
@@ -304,7 +314,17 @@ def prepare_flashinfer_metadata_host(
     cache_loc_host: torch.Tensor,
     last_page_len_host: torch.Tensor,
 ) -> None:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
 
     if num_prefill == 0:
         _GlobalFlashInferPlanner.plan_generate_only(
@@ -351,9 +371,19 @@ def flashinfer_mha_with_cache(
     v = v.reshape(b * s, -1, head_dim).contiguous()
 
     # convert to flashinfer-style metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
 
     n_heads = q.shape[1]
     n_kv_heads = k.shape[1]

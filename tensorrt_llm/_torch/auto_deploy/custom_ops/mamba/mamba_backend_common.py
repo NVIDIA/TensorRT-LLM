@@ -49,7 +49,17 @@ def _mamba_ssm_prepare_metadata(
     Returns a tuple of (chunk_indices, chunk_offsets, seq_idx_prefill).
     """
     device = cu_seqlen.device
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
 
     if num_prefill > 0:
         chunk_indices, chunk_offsets = cu_seqlens_to_chunk_indices_offsets(
@@ -130,9 +140,19 @@ def _run_ssm_prefill(
     chunk_size: int,
     out: Optional[torch.Tensor] = None,
 ) -> Tuple[Optional[torch.Tensor], int, int, int, int]:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
 
     if num_prefill <= 0:
         return num_prefill, num_prefill_tokens, num_total_tokens, num_seq

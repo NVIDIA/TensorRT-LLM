@@ -447,13 +447,15 @@ class TestTorchBackendMLAWithCache:
         if seq_len == 1:
             # Generate phase
             batch_info_host = torch.tensor(
-                [0, 0, batch_size], device=self.device, dtype=torch.int32
+                [0, 0, 0, 0, batch_size, batch_size], device=self.device, dtype=torch.int32
             )
             cu_seqlen = torch.arange(batch_size, device=self.device, dtype=torch.int32)
         else:
             # Context phase
             batch_info_host = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=self.device, dtype=torch.int32
+                [batch_size, batch_size * seq_len, 0, 0, 0, 0],
+                device=self.device,
+                dtype=torch.int32,
             )
             cu_seqlen = torch.arange(
                 0, batch_size * seq_len, seq_len, device=self.device, dtype=torch.int32

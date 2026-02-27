@@ -147,11 +147,13 @@ def _create_unpaged_cache_and_metadata(
 
     if is_decode:
         # Decode phase
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        batch_info_host = torch.tensor(
+            [0, 0, 0, 0, batch_size, batch_size], dtype=torch.int32, device=device
+        )
     else:
         # Context/prefill phase
         batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device=device
+            [batch_size, total_tokens, 0, 0, 0, 0], dtype=torch.int32, device=device
         )
 
     return {
@@ -247,11 +249,13 @@ def _create_paged_cache_and_metadata(
 
     if is_decode:
         # Decode phase
-        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device=device)
+        batch_info_host = torch.tensor(
+            [0, 0, 0, 0, batch_size, batch_size], dtype=torch.int32, device=device
+        )
     else:
         # Context/prefill phase
         batch_info_host = torch.tensor(
-            [batch_size, total_tokens, 0], dtype=torch.int32, device=device
+            [batch_size, total_tokens, 0, 0, 0, 0], dtype=torch.int32, device=device
         )
 
     return {

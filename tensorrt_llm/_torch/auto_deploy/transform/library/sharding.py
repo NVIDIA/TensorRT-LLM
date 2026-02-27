@@ -864,7 +864,8 @@ class Sharding(BaseTransform):
             # Fallback to creating mapping from dist_mapping config if not provided
             config._init_mapping()
 
-        config.validate_config()
+        if world_size > 1:
+            config.validate_config()
 
         # Extract max_num_tokens from sequence info for MoE all-to-all workspace allocation
         if cm and cm.info:

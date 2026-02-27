@@ -226,9 +226,19 @@ def flattened_mha_with_cache(
     NOTE: this op can also handle seq_len==0, which might be useful for CUDAGRAPH.
     """
     # Extract batch info from batch_info_host
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
 
     # Get cache and head dimensions
     num_kv_heads, qk_head_dim = k_cache.shape[-2:]

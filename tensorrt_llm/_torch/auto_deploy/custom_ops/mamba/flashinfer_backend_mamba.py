@@ -57,9 +57,19 @@ def _flashinfer_cached_ssm(
         hidden_states, B, C, dt
     )
     ssm_state_size = B.shape[3]
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
     # Preallocate output tensor to avoid memcpy cost for merging prefill
     # and decode outputs
     preallocated_ssm_out = torch.empty(

@@ -72,7 +72,17 @@ def fla_cached_delta_rule(
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
     y_flat = y.view(b * s, num_heads, -1)
 
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
 
     # clean up metadata

@@ -40,14 +40,19 @@ class TorchAttentionReference:
             0, batch_size * seq_len, seq_len, device=q.device, dtype=torch.int32
         )
 
-        # Create batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-        # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0]
-        # For generate phase (seq_len == 1): [0, 0, batch_size]
+        # Create batch_info_host:
+        # [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
+        # For context phase (seq_len > 1): [batch_size, batch_size * seq_len, 0, 0, 0, 0]
+        # For generate phase (seq_len == 1): [0, 0, 0, 0, batch_size, batch_size]
         if seq_len == 1:
-            batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
+            batch_info_host = torch.tensor(
+                [0, 0, 0, 0, batch_size, batch_size], device=q.device, dtype=torch.int32
+            )
         else:
             batch_info_host = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=q.device, dtype=torch.int32
+                [batch_size, batch_size * seq_len, 0, 0, 0, 0],
+                device=q.device,
+                dtype=torch.int32,
             )
 
         # Flatten inputs to [1, total_seq_len, ...] format
@@ -144,8 +149,11 @@ class TorchAttentionReference:
         k_flat = k_new.view(1, batch_size, -1)
         v_flat = v_new.view(1, batch_size, -1)
 
-        # Create batch_info_host for decode phase: [num_prefill, num_prefill_tokens, num_decode]
-        batch_info_host = torch.tensor([0, 0, batch_size], device=q.device, dtype=torch.int32)
+        # Create batch_info_host for decode phase:
+        # [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
+        batch_info_host = torch.tensor(
+            [0, 0, 0, 0, batch_size, batch_size], device=q.device, dtype=torch.int32
+        )
 
         # Call torch backend via custom op registry
         output_flat = torch.ops.auto_deploy.torch_cached_attention_with_cache.default(
