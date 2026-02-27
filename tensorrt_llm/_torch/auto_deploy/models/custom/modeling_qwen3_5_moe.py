@@ -333,7 +333,6 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
         z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
@@ -366,17 +365,11 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        # 3. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
-        # Fused gating: g = -exp(A_log) * softplus(a + dt_bias), single kernel via transform.
-        g = torch.ops.auto_deploy.torch_fused_gdn_gating(
-            self.A_log, a, self.dt_bias
-        )  # [B, S, num_v_heads]
-
-        # 4. Gated Delta Rule via autodeploy custom op
-        # Op handles L2 normalization and GVA head expansion (repeat_interleave) internally.
-        # q/k have num_k_heads, v/g/beta have num_v_heads.
-        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
+        # 3. Gated Delta Rule via autodeploy custom op
+        # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
+        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            query, key, value, a, b, self.A_log, self.dt_bias
+        )
 
         # 5. Gated RMSNorm + merge heads
         z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]

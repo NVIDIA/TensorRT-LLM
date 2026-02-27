@@ -50,7 +50,7 @@ from .communication import (
     NVLinkOneSided,
     NVLinkTwoSided,
 )
-from .fused_moe_cute_dsl import CuteDslFusedMoE
+#from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
