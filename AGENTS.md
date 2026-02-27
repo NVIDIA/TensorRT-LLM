@@ -24,9 +24,9 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
-| Serve model | `trtllm-serve --model <hf_model> --port 8000` |
-| Serve with config | `trtllm-serve --model <hf_model> --config config.yaml` |
-| Benchmark | `trtllm-bench --model <hf_model> --dataset_path <path>` |
+| Serve model | `trtllm-serve <hf_model> --port 8000` |
+| Serve with config | `trtllm-serve <hf_model> --config config.yaml` |
+| Benchmark | `trtllm-bench --model <hf_model> throughput --dataset <path>` |
 | Find CI stage for test | `python scripts/test_to_stage_mapping.py --tests "test_name"` |
 
 ### Installation & Build

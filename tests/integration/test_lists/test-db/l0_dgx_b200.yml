@@ -117,6 +117,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus_mtp TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-trtllm] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_8gpus[attention_dp_on-cutlass] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP4_PP2] TIMEOUT (60)
 - condition:
     ranges:
       system_gpu_count:
@@ -146,6 +147,7 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus[baseline_pp4_mtp1] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_nvfp4_multi_gpus_chunked_prefill[baseline_fp8kv] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_fp8[latency_moe_deepgemm] TIMEOUT (60)
+  - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_parallelism[TP8_PP1] TIMEOUT (60)
   - test_e2e.py::test_deepseek_r1_mtp_bench TIMEOUT(60) # Cover https://nvbugs/5670108
 - condition:
     ranges:
@@ -225,12 +227,18 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-ep4-trtllm-fp8]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-cutlass-auto]
   - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v2_kv_cache-dp4-triton-auto]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-one_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-one_model-no_overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[trtllm-two_model-no_overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-one_model-no_overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-two_model-overlap_scheduler]
-  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[cutlass-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtllm-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-one_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-two_model-no_overlap_scheduler]
+  - accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-cutlass-two_model-no_overlap_scheduler]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-v3-8b-hf]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[DeepSeek-V3-Lite-bf16]
   - disaggregated/test_disaggregated.py::test_disaggregated_benchmark_on_diff_backends[llama-3.1-8b-instruct-hf-fp8]

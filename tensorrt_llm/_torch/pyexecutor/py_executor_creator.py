@@ -415,12 +415,12 @@ def create_py_executor(
                     if use_tree_drafter:
                         return TreeDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, max_batch_size,
+                            spec_config.tokens_per_gen_step - 1, max_batch_size,
                             model)
                     else:
                         return LinearDraftingLoopWrapper(
                             spec_config.max_draft_len,
-                            spec_config.max_total_draft_tokens, model)
+                            spec_config.tokens_per_gen_step - 1, model)
             else:
                 drafting_loop_wrapper = None
 
@@ -460,11 +460,11 @@ def create_py_executor(
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler and spec_config is not None:
-        model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
-        model_engine_max_seq_len += spec_config.max_total_draft_tokens
+        model_engine_max_seq_len += spec_config.tokens_per_gen_step - 1
 
     if has_draft_model_engine and not llm_args.disable_overlap_scheduler:
         logger.warning(
@@ -546,7 +546,7 @@ def create_py_executor(
                 }
                 if spec_config is not None:
                     kwargs[
-                        "max_num_draft_tokens"] = spec_config.max_total_draft_tokens
+                        "max_num_draft_tokens"] = spec_config.tokens_per_gen_step - 1
 
                 if spec_config is None or spec_config.spec_dec_mode.support_guided_decoder(
                 ):
