@@ -131,4 +131,4 @@ The table below lists the operators grouped by category.
 | Operator Name | Description |
 |--------------|-------------|
 | `torch.ops.auto_deploy.triton_utils_fused_gather_scatter` | Triton fused gather + scatter for overlap scheduling input_ids reordering |
-| `torch.ops.auto_deploy.gather_tokens` | Gather hidden states using logits indices before LM head |
+| `torch.ops.auto_deploy.gather_tokens` | Gather hidden states using token indices before LM head |
