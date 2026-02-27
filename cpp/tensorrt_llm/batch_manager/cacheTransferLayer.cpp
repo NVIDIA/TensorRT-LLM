@@ -96,20 +96,11 @@ void CacheTransferLayer::format(TransferSession& session) const
     mKvFormatter->format(session);
     if (mRnnFormatter)
     {
-        // For NIXL agent connections, switch the active buffer index to the RNN buffer
-        // before running the RNN formatter. The buffer descs are ordered [KV..., RNN],
-        // so the RNN buffer is always the last one.
-        auto const& sessionConnections = session.getConnections();
-        for (auto const* conn : sessionConnections)
+        for (auto const* conn : session.getConnections())
         {
             if (conn != nullptr)
             {
-                auto const* agentConn = dynamic_cast<executor::kv_cache::AgentConnection const*>(conn);
-                if (agentConn != nullptr && agentConn->getSenderBufferCount() > 1)
-                {
-                    size_t rnnBufferIdx = agentConn->getSenderBufferCount() - 1;
-                    const_cast<executor::kv_cache::AgentConnection*>(agentConn)->setActiveSenderBufferIdx(rnnBufferIdx);
-                }
+                conn->activateBuffer(static_cast<uint8_t>(BufferKind::kRNN));
             }
         }
         mRnnFormatter->format(session);

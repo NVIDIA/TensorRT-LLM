@@ -334,7 +334,7 @@ def hybrid_dtypes(request):
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
 @pytest.mark.parametrize(
     "hybrid_dtypes",
     [
@@ -450,7 +450,7 @@ def test_hybrid_cache_transceiver_single_process(backend, hybrid_dtypes,
 
 
 @pytest.mark.timeout(120)
-@pytest.mark.parametrize("backend", ["UCX"], ids=["UCX"])
+@pytest.mark.parametrize("backend", ["NIXL", "UCX"], ids=["NIXL", "UCX"])
 def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
     monkeypatch.setenv("TRTLLM_USE_CPP_MAMBA", "1")
 
@@ -460,7 +460,7 @@ def test_hybrid_cache_transceiver_cancel_request(backend, monkeypatch):
     hybrid_cache_manager_ctx = create_hybrid_cache_manager(mapping, dtype)
     hybrid_cache_manager_gen = create_hybrid_cache_manager(mapping, dtype)
 
-    cache_transceiver_config = CacheTransceiverConfig(backend="DEFAULT",
+    cache_transceiver_config = CacheTransceiverConfig(backend=backend,
                                                       max_tokens_in_buffer=512)
     dist = Distributed.get(mapping)
 
