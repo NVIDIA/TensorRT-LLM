@@ -13,7 +13,7 @@ l0_verl:
     terms:
       stage: post_merge
       backend: verl
-      orchestrator: ray
+      orchestrator: mpi
   tests:
   # Tests from verl repo - use verl:: prefix to indicate tests from the verl repository
   # The verl:: prefix will be transformed to the actual verl path during test execution
