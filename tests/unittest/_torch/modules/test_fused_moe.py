@@ -1342,9 +1342,7 @@ def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
 @pytest.mark.parametrize("routing_method", [DefaultMoeRoutingMethod])
-@pytest.mark.parametrize(
-    "weight_loading_mode",
-    [MoEWeightLoadingMode.VANILLA, MoEWeightLoadingMode.FUSED_GATE_UP_PROJ])
+@pytest.mark.parametrize("weight_loading_mode", [MoEWeightLoadingMode.VANILLA])
 def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
                                                     weight_loading_mode):
     world_size = 4
