@@ -2,49 +2,42 @@
 
 import os
 
-# GPU resource configuration
-# Centralized configuration for all GPU-specific parameters
+# GPU resource configuration - centralized config for all GPU-specific parameters
 GPU_RESOURCE_CONFIG = {
-    # OCI GB200
-    "GB200": {
-        "slurm_extra_args": "--gres=gpu:4",  # SLURM extra arguments (empty string if not required)
+    "GB200": {  # OCI GB200
+        "slurm_extra_args": "--gres=gpu:4",
         "set_segment": True,
-        "lock_freq_graphics_mhz": 2062,  # GPU graphics clock lock frequency (MHz)
-        "lock_freq_memory_mhz": 3996,  # GPU memory clock lock frequency (MHz)
+        "lock_freq_graphics_mhz": 2062,
+        "lock_freq_memory_mhz": 3996,
     },
-    # Lyris GB200
-    "GB200_LYRIS": {
-        "slurm_extra_args": "",  # GB200 does not require extra args
+    "GB200_LYRIS": {  # Lyris GB200
+        "slurm_extra_args": "",
         "set_segment": True,
-        "lock_freq_graphics_mhz": None,  # TODO: Set GB200 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # Lyris GB300
-    "GB300": {
-        "slurm_extra_args": "",  # GB300 does not require extra args
+    "GB300": {  # Lyris GB300
+        "slurm_extra_args": "",
         "set_segment": True,
-        "lock_freq_graphics_mhz": None,  # TODO: Set GB300 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # H100
     "H100": {
-        "slurm_extra_args": "",  # H100 does not require extra args
+        "slurm_extra_args": "",
         "set_segment": False,
-        "lock_freq_graphics_mhz": None,  # TODO: Set H100 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # B200
-    "B200": {
+    "B200": {  # OCI B200
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
-        "lock_freq_graphics_mhz": None,  # TODO: Set B200 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    # B300
-    "B300": {
+    "B300": {  # OCI B300
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
-        "lock_freq_graphics_mhz": None,  # TODO: Set B300 lock frequency
+        "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
 }
@@ -67,7 +60,18 @@ class EnvManager:
 
     @staticmethod
     def get_slurm_job_name() -> str:
-        return os.getenv("SLURM_JOB_NAME", "unified-benchmark")
+        """Get SLURM job name: {SLURM_ACCOUNT}-{base}.
+
+        Example: myaccount-unified.benchmark
+        Customize base via SLURM_JOB_BASE_NAME env var (default: unified.benchmark)
+        """
+        account = EnvManager.get_slurm_account()
+        base = os.getenv("SLURM_JOB_BASE_NAME", "unified.benchmark")
+
+        # Only use account as prefix if it's set and not a placeholder
+        if account and not account.startswith("<"):
+            return f"{account}-{base}"
+        return base
 
     @staticmethod
     def get_slurm_set_segment() -> bool:
@@ -184,6 +188,94 @@ class EnvManager:
     @staticmethod
     def get_debug_job_id() -> str:
         return os.getenv("DEBUG_JOB_ID", "908390")
+
+    # ========== CI/CD Environment Variables ==========
+    @staticmethod
+    def get_trtllm_branch() -> str:
+        return os.getenv("TRT_LLM_BRANCH", "default")
+
+    @staticmethod
+    def get_trtllm_repo() -> str:
+        return os.getenv("TRT_LLM_REPO", "NVIDIA/TensorRT-LLM")
+
+    @staticmethod
+    def get_trtllm_version() -> str:
+        return os.getenv("TRT_LLM_VERSION", "default")
+
+    @staticmethod
+    def get_commit_hash() -> str:
+        return os.getenv("COMMIT_HASH", "default")
+
+    @staticmethod
+    def get_commit_time() -> str:
+        return os.getenv("COMMIT_TIME", "default")
+
+    @staticmethod
+    def get_docker_image() -> str:
+        return os.getenv("DOCKER_IMAGE", "default")
+
+    @staticmethod
+    def get_wheel_url() -> str:
+        return os.getenv("WHEEL_URL", "")
+
+    @staticmethod
+    def get_cluster_llm_data() -> str:
+        return os.getenv("CLUSTER_LLM_DATA", "")
+
+    @staticmethod
+    def get_artifacts_user() -> str:
+        return os.getenv("ARTIFACTORY_USER", "")
+
+    @staticmethod
+    def get_artifacts_token() -> str:
+        return os.getenv("ARTIFACTORY_TOKEN", "")
+
+    @staticmethod
+    def get_pipeline_id() -> str:
+        return os.getenv("PIPELINE_ID", "")
+
+    @staticmethod
+    def get_artifactory_repo_name() -> str:
+        return os.getenv("ARTIFACTORY_REPO_NAME", "sw-tensorrt-llm-qa-generic-local")
+
+
+class InfoPrinter:
+    """Print environment information for CI/CD and debugging."""
+
+    @staticmethod
+    def print(test_config=None):
+        """Print environment information and optional reproduce command.
+
+        Args:
+            test_config: TestConfig object containing test configuration information
+        """
+        from utils.logger import logger
+
+        logger.info(f"TRT_LLM_REPO:      {EnvManager.get_trtllm_repo()}")
+        logger.info(f"TRT_LLM_BRANCH:    {EnvManager.get_trtllm_branch()}")
+        logger.info(f"TRT_LLM_VERSION:   {EnvManager.get_trtllm_version()}")
+        logger.info(f"COMMIT_HASH:       {EnvManager.get_commit_hash()}")
+        logger.info(f"COMMIT_TIME:       {EnvManager.get_commit_time()}")
+        logger.info(f"DOCKER_IMAGE:      {EnvManager.get_docker_image()}")
+        logger.info(f"INSTALL_MODE:      {EnvManager.get_install_mode()}")
+        logger.info(f"WHEEL_URL:         {EnvManager.get_wheel_url()}")
+        logger.info(f"GPU_TYPE:          {EnvManager.get_gpu_type()}")
+        logger.info(f"SLURM_PARTITION:   {EnvManager.get_slurm_partition()}")
+        logger.info(f"SLURM_ACCOUNT:     {EnvManager.get_slurm_account()}")
+        logger.info(f"CLUSTER_LLM_DATA:  {EnvManager.get_cluster_llm_data()}")
+        logger.info(f"PIPELINE_ID:       {EnvManager.get_pipeline_id()}")
+
+        if test_config:
+            config_path = test_config.config_path
+            relative_config_path = config_path[
+                config_path.find("tests/integration/defs/perf/disagg/test_configs/") :
+            ]
+            reproduce_cmd = (
+                f"Reproduce Steps: cd [TensorRT-LLM] && "
+                f"python3 examples/disaggregated/slurm/benchmark/submit.py "
+                f"-c {relative_config_path} --log-dir [YOUR_OUTPUT_DIR]"
+            )
+            logger.info(reproduce_cmd)
 
 
 CONFIG_BASE_DIR = os.path.join(EnvManager.get_work_dir(), "test_configs")

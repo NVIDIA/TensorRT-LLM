@@ -28,6 +28,7 @@ from ..utils._graph import (
     run_shape_prop,
 )
 from ..utils.cuda_mem_tracker import get_mem_info
+from ..utils.graph_writer import graph_writer
 from ..utils.logger import ad_logger
 from .graph_module_visualizer import to_dot
 
@@ -121,9 +122,11 @@ class SharedConfig(BaseModel):
     model_config = {
         # to provide an easy way to do config validation of child config classes with more fields
         "extra": "allow",
+        "arbitrary_types_allowed": True,
     }
     local_rank: int = Field(default=0)
     world_size: int = Field(default=1)
+    mapping: Any = Field(default=None)  # Mapping object from ad_executor
 
 
 class TransformConfig(BaseModel):
@@ -486,6 +489,9 @@ class BaseTransform(ABC):
 
         self._set_autodeploy_meta(mod, autodeploy_meta)
         self._visualize_graph(mod, idx)
+
+        # Dump graph after transform for debugging (controlled by AD_DUMP_GRAPHS_DIR env var)
+        graph_writer.dump_graph(mod, t_name, self.config.stage.value)
 
         # return the graph module
         return mod

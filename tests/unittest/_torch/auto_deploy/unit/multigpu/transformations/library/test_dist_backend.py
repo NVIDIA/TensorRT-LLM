@@ -58,6 +58,7 @@ def _create_and_transform_model(
     config = {
         "detect_sharding": {
             "stage": "sharding",
+            "shard_all_unprocessed": True,
         },
         "sharding_transform_executor": {
             "stage": "sharding",

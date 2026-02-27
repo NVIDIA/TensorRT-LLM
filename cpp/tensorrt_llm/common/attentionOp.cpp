@@ -1271,14 +1271,6 @@ int AttentionOp::mlaGeneration(
                 mXqaDispatcher->run(xqaParams, kv_cache_buffer, kv_scale_cache_buffer);
                 return 0;
             }
-            else if (mIsSpecDecodingEnabled && mUseSpecDecoding)
-            {
-                TLLM_CHECK_WITH_INFO(false, "No available XQA kernels are found for speculative decoding mode.");
-            }
-            else if (mFuseFp4Quant)
-            {
-                TLLM_CHECK_WITH_INFO(false, "No available kernels are found for FP4 output.");
-            }
         }
 
         // Use FMHA otherwise.

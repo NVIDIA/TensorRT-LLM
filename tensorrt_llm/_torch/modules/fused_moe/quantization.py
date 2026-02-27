@@ -1,13 +1,29 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import inspect
 import math
 from abc import ABC, abstractmethod
-from typing import Dict, List, NamedTuple, Optional, Union
+from enum import Enum, auto
+from typing import Dict, List, NamedTuple, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_device_integrated, is_sm_100f
 from tensorrt_llm.logger import logger
 from tensorrt_llm.quantization.functional import \
     preprocess_weights_for_mixed_gemm
@@ -22,6 +38,7 @@ from ...utils import (replace_parameter_and_save_metadata, swizzle_sf,
                       unswizzle_sf)
 from ..linear import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
+from .moe_load_balancer import advise_tensor_pageout
 
 # The declarations aligns with moe_kernels.h
 # pack inputs into int64, e.g. 4 x bf16 input values
@@ -159,6 +176,19 @@ def maybe_pad_for_mxfp4(weight: torch.Tensor,
     return weight
 
 
+def _pad_tensor_to_shape(tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
+    """Pad tensor to match target shape. Used for post-shard alignment."""
+    if tensor.numel() == 0:
+        return tensor
+    if tensor.shape == shape:
+        return tensor
+    if len(tensor.shape) == 1:
+        return F.pad(tensor, (0, shape[0] - tensor.shape[0])).contiguous()
+    row_pad = shape[0] - tensor.shape[0]
+    col_pad = shape[1] - tensor.shape[1]
+    return F.pad(tensor, (0, col_pad, 0, row_pad)).contiguous()
+
+
 def interleave_linear_and_gate(x: torch.Tensor,
                                group_size: int = 64,
                                dim: int = -1) -> torch.Tensor:
@@ -173,11 +203,38 @@ def interleave_linear_and_gate(x: torch.Tensor,
     return x
 
 
+class EplbSupportStatus(Enum):
+    """EPLB support status for FusedMoEMethod classes."""
+    SUPPORTED = auto()
+    NOT_SUPPORTED = auto()
+    NOT_VERIFIED = auto()
+
+
 class FusedMoEMethodBase(ABC):
     """
     Base class for all fused MoE methods.
     """
     weight_alignment: int = 1
+    """int: Required byte alignment for MoE weight tensors."""
+
+    eplb_support_status: EplbSupportStatus = EplbSupportStatus.NOT_SUPPORTED
+    """EplbSupportStatus: Online EPLB support status for this quantization method.
+
+    Defaults to NOT_SUPPORTED for safety so that new subclasses do not
+    silently claim EPLB compatibility.  Subclasses that have been verified
+    to work with online EPLB should override this to SUPPORTED; those that
+    have not yet been tested may set it to NOT_VERIFIED.
+    """
+
+    @classmethod
+    def supports_online_eplb(cls) -> bool:
+        """
+        Check if this FusedMoEMethod supports online EPLB.
+
+        Returns:
+            True if online EPLB is supported, False otherwise.
+        """
+        return cls.eplb_support_status == EplbSupportStatus.SUPPORTED
 
     @classmethod
     def need_load_shared_weights(cls, module):
@@ -263,6 +320,20 @@ class FusedMoEMethodBase(ABC):
             w3_w1_kargs["allow_partial_loading"] = allow_partial_loading
         if "allow_partial_loading" in w2_args:
             w2_kargs["allow_partial_loading"] = allow_partial_loading
+
+        def maybe_pageout_mmapped_cpu_weights(
+                weight_tensors: List[object]) -> None:
+            # Integrated GPU systems share physical memory with CPU. After we
+            # finish copying from mmapped CPU weights, proactively advising the
+            # kernel to drop those pages reduces shared-memory pressure.
+            if not is_device_integrated():
+                return
+            for weight in weight_tensors:
+                if (isinstance(weight, torch.Tensor)
+                        and weight.device.type == "cpu"
+                        and weight.is_contiguous()):
+                    advise_tensor_pageout(weight)
+
         # Multithread weight load is superseded by prefetch_files() in model_engine.py
         # Also, threading adds overhead in order to protect shuffle index cache with critical section.
         for local_slot_id, expert_id in enumerate(load_expert_ids):
@@ -318,6 +389,7 @@ class FusedMoEMethodBase(ABC):
                 if weight is not None
             ]
             module._add_raw_shared_weights_for_unmap(unmap_weights)
+            maybe_pageout_mmapped_cpu_weights(unmap_weights)
 
             if module.bias:
                 self.load_expert_w3_w1_weight(
@@ -332,6 +404,7 @@ class FusedMoEMethodBase(ABC):
                     if weight is not None
                 ]
                 module._add_raw_shared_weights_for_unmap(unmap_weights)
+                maybe_pageout_mmapped_cpu_weights(unmap_weights)
 
     def load_weights(self,
                      module: torch.nn.Module,
@@ -543,16 +616,16 @@ class FusedMoEMethodBase(ABC):
 
     def pre_reload_weights(self, module: torch.nn.Module):
         for param_name, metadata in module.rebuild_tensor_metadata.items():
-            logger.warning(
-                f"Pre-reloading weight '{param_name}' requires tensor re-creation, which will invalidate existing CUDA graphs."
-            )
-            param = torch.nn.Parameter(torch.empty_like(metadata,
+            # Extract meta tensor from metadata dict
+            meta_tensor = metadata['meta']
+            param = torch.nn.Parameter(torch.empty_like(meta_tensor,
                                                         device="cuda"),
                                        requires_grad=False)
             module.register_parameter(param_name, param)
 
 
 class UnquantizedFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = module.dtype
@@ -657,6 +730,7 @@ def requantize_expert_w3_w1_weight_fp8_qdq(module: torch.nn.Module,
 
 
 class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -833,6 +907,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -999,6 +1074,23 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         super().post_load_weights(module)
 
 
+def resmooth_and_transform_fp8_scale(
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Resmooth weight/scale to FP8 E8M0 and transform scale to required layout for MoE."""
+    resmoothed_weight, resmoothed_scale = resmooth_to_fp8_e8m0(
+        weight, weight_scale)
+    transformed_scale = transform_sf_into_required_layout(
+        resmoothed_scale,
+        mn=weight.shape[1],
+        k=weight.shape[2],
+        recipe=(1, 128, 128),
+        num_groups=weight.shape[0],
+        is_sfa=False)
+    return resmoothed_weight, transformed_scale
+
+
 class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         DeepSeekFP8BlockScalesFusedMoEMethod):
 
@@ -1007,57 +1099,75 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
-        if is_sm_100f():
-            expert_ids = set(module.initial_local_expert_ids)
-            if self.need_load_shared_weights(module):
-                expert_ids.update(
-                    module.layer_load_balancer.get_load_expert_ids())
-            for name in list(weights.keys()):
-                if name.endswith("weight_scale_inv"):
-                    if int(name.split(".")[0]) not in expert_ids:
-                        continue
-                    weight_name = name.replace("weight_scale_inv", "weight")
-                    logger.debug(f"Resmoothing {weight_name}")
-                    weight = weights[weight_name][:]
-                    scale = weights[name][:]
-                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
-                        weight, scale)
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
     def post_load_weights(self, module: torch.nn.Module):
-        super().post_load_weights(module)
         if is_sm_100f():
-            transfromed_w3_w1_scale = transform_sf_into_required_layout(
-                module.quant_scales[0],
-                mn=module.w3_w1_weight.shape[1],
-                k=module.w3_w1_weight.shape[2],
-                recipe=(1, 128, 128),
-                num_groups=module.w3_w1_weight.shape[0],
-                is_sfa=False)
-            transformed_w3_w1_weight_scaling_factor = nn.Parameter(
-                transfromed_w3_w1_scale, requires_grad=False)
-            replace_parameter_and_save_metadata(
-                module, "w3_w1_weight_scaling_factor",
-                transformed_w3_w1_weight_scaling_factor,
-                module.rebuild_tensor_metadata)
-            transfromed_w2_scale = transform_sf_into_required_layout(
-                module.quant_scales[1],
-                mn=module.w2_weight.shape[1],
-                k=module.w2_weight.shape[2],
-                recipe=(1, 128, 128),
-                num_groups=module.w3_w1_weight.shape[0],
-                is_sfa=False)
-            transformed_w2_weight_scaling_factor = nn.Parameter(
-                transfromed_w2_scale, requires_grad=False)
-            replace_parameter_and_save_metadata(
-                module, "w2_weight_scaling_factor",
-                transformed_w2_weight_scaling_factor,
-                module.rebuild_tensor_metadata)
+            # Resmooth shared experts before registering shared weights
+            if self.need_load_shared_weights(module):
+                local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
+                )
+                if getattr(module, 'local_shared_w3_w1_tensors',
+                           None) is not None:
+                    num_shared_experts = len(local_shared_load_expert_ids)
+                    logger.debug(
+                        f"Batch resmoothing {num_shared_experts} shared experts"
+                    )
+
+                    local_shared_w3_w1_tensors = getattr(
+                        module, 'local_shared_w3_w1_tensors')
+                    local_shared_w3_w1_scale_tensors = getattr(
+                        module, 'local_shared_w3_w1_scale_tensors')
+                    local_shared_w2_tensors = getattr(
+                        module, 'local_shared_w2_tensors')
+                    local_shared_w2_scale_tensors = getattr(
+                        module, 'local_shared_w2_scale_tensors')
+
+                    resmoothed_shared_w3_w1_weight, transformed_shared_w3_w1_scale = resmooth_and_transform_fp8_scale(
+                        local_shared_w3_w1_tensors,
+                        local_shared_w3_w1_scale_tensors)
+                    setattr(module, 'local_shared_w3_w1_tensors',
+                            resmoothed_shared_w3_w1_weight.cpu())
+                    setattr(module, 'local_shared_w3_w1_scale_tensors',
+                            transformed_shared_w3_w1_scale.cpu())
+
+                    resmoothed_shared_w2_weight, transformed_shared_w2_scale = resmooth_and_transform_fp8_scale(
+                        local_shared_w2_tensors, local_shared_w2_scale_tensors)
+                    setattr(module, 'local_shared_w2_tensors',
+                            resmoothed_shared_w2_weight.cpu())
+                    setattr(module, 'local_shared_w2_scale_tensors',
+                            transformed_shared_w2_scale.cpu())
+
+        # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
+        super().post_load_weights(module)
+
+        if is_sm_100f():
+            logger.debug("Resmoothing FP8 weights in post_load_weights")
+            resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
+                module.w3_w1_weight, module.w3_w1_weight_scaling_factor)
+            replace_parameter_and_save_metadata(module, "w3_w1_weight",
+                                                resmoothed_w3_w1_weight,
+                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module,
+                                                "w3_w1_weight_scaling_factor",
+                                                transformed_w3_w1_scale,
+                                                module.rebuild_tensor_metadata)
+
+            resmoothed_w2_weight, transformed_w2_scale = resmooth_and_transform_fp8_scale(
+                module.w2_weight, module.w2_weight_scaling_factor)
+            replace_parameter_and_save_metadata(module, "w2_weight",
+                                                resmoothed_w2_weight,
+                                                module.rebuild_tensor_metadata)
+            replace_parameter_and_save_metadata(module,
+                                                "w2_weight_scaling_factor",
+                                                transformed_w2_scale,
+                                                module.rebuild_tensor_metadata)
             self.setup_quant_scales(module)
 
 
 class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         module.sm_version = get_sm_version()
@@ -1191,6 +1301,7 @@ class INT8WoqPerChannelFusedMoEMethod(FusedMoEMethodBase):
 
 
 class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         module.sm_version = get_sm_version()
@@ -1624,6 +1735,7 @@ class WInt4AFP8FusedMoEMethod(FusedMoEMethodBase):
 
 
 class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     group_size = 32
 
@@ -1833,6 +1945,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     """
     Base class for NVFP4 fused MoE methods for all backends.
     """
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
@@ -2815,6 +2928,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
                 w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
 
+    def _round_up(self, x, alignment):
+        return (x + alignment - 1) // alignment * alignment
+
     def create_weights(self, module: torch.nn.Module):
         # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
         if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
@@ -2822,6 +2938,15 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
             # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
             self.input_hidden_alignment = 256
+
+        else:
+            # Weight scales require M % 128 in get_shuffle_matrix_sf_a_row_indices.
+            # Check if intermediate_size after padding satisfies this requirement.
+            # If not, set weight_alignment to 128.
+            intermediate_size_padded = self._round_up(
+                module.intermediate_size_per_partition, self.weight_alignment)
+            if intermediate_size_padded % 128 != 0:
+                self.weight_alignment = 128
 
         super().create_weights(module, bias_dtype=torch.float32)
 
@@ -2881,6 +3006,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
             dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
         else:
+            w1_weight_shard = _pad_tensor_to_shape(w1_weight_shard,
+                                                   dst_w3_w1_weight_gpu.shape)
             dst_w3_w1_weight_gpu.copy_(
                 w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
 
@@ -2938,6 +3065,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         epilogue_tile_m = 128
 
         # Keep weights in device buffer
+        w2_weight_shard = _pad_tensor_to_shape(w2_weight_shard,
+                                               dst_w2_weight_gpu.shape)
         dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
                                 non_blocking=dst_on_gpu)
         # Get permuted indices
@@ -2971,7 +3100,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
                                           module.tp_size,
-                                          w3_weight_scale.shape[0])
+                                          w1_weight_scale.shape[0])
         w1_weight_scale = maybe_pad_for_mxfp4(
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
@@ -3013,6 +3142,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                     w1_weight_scale.view(dst_w1_weight_scale.dtype))
         else:
             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+            w1_weight_scale = _pad_tensor_to_shape(
+                w1_weight_scale, dst_w3_w1_weight_scale_gpu.shape)
             dst_w3_w1_weight_scale_gpu.copy_(
                 w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
 
@@ -3070,6 +3201,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                             TensorParallelMode.ROW,
                                             device=device)
         # Keep weights in device buffer
+        w2_weight_scale = _pad_tensor_to_shape(w2_weight_scale,
+                                               dst_w2_weight_scale_gpu.shape)
         dst_w2_weight_scale_gpu.copy_(
             w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
 
@@ -3124,6 +3257,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
 
 
 class W4A8NVFP4FP8TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def create_weights(self, module: torch.nn.Module):
         weight_vec_size = torch.iinfo(self.weight_dtype).bits // 4
@@ -3182,6 +3316,7 @@ def _get_weight_alignment(weight_alignment, scaling_vector_size, tp_size,
 
 
 class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
+    eplb_support_status = EplbSupportStatus.SUPPORTED
 
     def create_weights(self,
                        module: torch.nn.Module,
@@ -3329,6 +3464,7 @@ class MXFP4WeightFusedMoEMethod(FusedMoEMethodBase):
 
 
 class MXFP4WeightCutlassFusedMoEMethod(MXFP4WeightFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
     weight_dtype = FUSED_MOE_MXFP4_WEIGHT_DTYPE
     block_scales_dtype = FUSED_MOE_MXFP4_WEIGHT_BLOCK_SCALE_DTYPE
     # Cutlass MoE backend requires weight elements to be 128 aligned.
@@ -3501,6 +3637,7 @@ class W4A16MXFP4CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
 
 class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_VERIFIED
 
     def create_weights(self, module: torch.nn.Module):
         fake_input_scale = nn.Parameter(torch.empty(
@@ -3531,6 +3668,7 @@ class W4A8MXFP4MXFP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
 
 
 class W4A8MXFP4FP8CutlassFusedMoEMethod(MXFP4WeightCutlassFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         fc31_input_scale = nn.Parameter(torch.tensor(1., dtype=torch.float32),
@@ -3937,6 +4075,7 @@ class W4A16MXFP4TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
 
 
 class W4A8MXFP4FP8TRTLLMGenFusedMoEMethod(MXFP4WeightTRTLLMGenFusedMoEMethod):
+    eplb_support_status = EplbSupportStatus.NOT_SUPPORTED
 
     def create_weights(self, module: torch.nn.Module):
         fc31_input_dequant = nn.Parameter(torch.empty(

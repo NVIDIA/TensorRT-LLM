@@ -6,7 +6,8 @@ import torch
 
 from tensorrt_llm._torch.modules.fused_moe.routing import (
     ROUTING_METHOD_TYPE_TO_CLASS, RoutingMethodType)
-from tensorrt_llm._torch.utils import (Fp4QuantizedTensor, fp4_utils,
+from tensorrt_llm._torch.utils import (ActType_TrtllmGen, Fp4QuantizedTensor,
+                                       fp4_utils,
                                        get_last_power_of_2_num_tokens_buckets,
                                        last_positive_power_of_2,
                                        next_positive_power_of_2)
@@ -393,7 +394,7 @@ def fp4_block_scale_moe_runner(
         routed_scaling_factor: Optional[float],
         routing_method_type: int,
         do_finalize: bool,
-        act_type: int = 0,
+        act_type: int = ActType_TrtllmGen.SwiGlu.value,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 

@@ -28,6 +28,7 @@ import math
 from abc import ABC, abstractmethod
 from typing import Dict, List, Literal, Optional, Protocol, Sequence, Set, Tuple, Type, Union
 
+import numpy as np
 import torch
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
@@ -35,10 +36,33 @@ from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-from ...._utils import nvtx_range, str_dtype_to_torch
+from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
+
+# Torch dtype → numpy dtype for fast list-to-tensor conversion.
+# numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
+_TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {
+    torch.int: np.int32,
+    torch.int32: np.int32,
+    torch.int64: np.int64,
+    torch.long: np.int64,
+    torch.float: np.float32,
+    torch.float32: np.float32,
+    torch.float64: np.float64,
+    torch.double: np.float64,
+    torch.float16: np.float16,
+    torch.bool: np.bool_,
+}
+
+
+def _list_to_tensor(data: list, dtype: torch.dtype) -> torch.Tensor:
+    """Convert a Python list to a tensor, using numpy for speed."""
+    np_dtype = _TORCH_TO_NUMPY_DTYPE.get(dtype)
+    if np_dtype is not None:
+        return torch.from_numpy(np.array(data, dtype=np_dtype))
+    return torch.tensor(data, dtype=dtype)
 
 
 class PrepareMetadataHostCallable(Protocol):
@@ -46,39 +70,59 @@ class PrepareMetadataHostCallable(Protocol):
 
 
 class InputBuffer:
-    """Manages contiguous memory buffers for efficient host-to-device transfers.
+    """Manages memory buffers for efficient host-to-device transfers.
 
-    This class consolidates multiple tensors into a single contiguous buffer on both
-    host (pinned memory) and device. This enables efficient bulk transfers with a
-    single async H2D copy instead of multiple small copies.
+    Supports two categories of tensors:
 
-    The buffer layout places the truncatable tensor (typically cache_loc) last,
-    allowing partial copies when the full buffer isn't needed.
+    - **Contiguous tensors** (default): packed into a single contiguous buffer on both
+      host (pinned) and device. Copied in one bulk async H2D transfer.
+    - **Truncatable tensors** (``truncatable=True`` in spec): each gets its own separate
+      host+device buffer pair, copied independently with truncation to actual length.
+      Use this for large, variable-length tensors (e.g., ``cache_loc``) to avoid
+      copying unused capacity.
 
     Usage:
-        1. Create InputBuffer with tensor specifications (name, max_numel, dtype)
+        1. Create InputBuffer with tensor specifications
         2. Use store() to write data to the pinned host buffer
-        3. Call copy_to_device() to perform a single async H2D transfer
+        3. Call copy_to_device() to perform async H2D transfers
         4. Access device tensors via get_view()
     """
 
-    def __init__(self, tensor_specs: List[Tuple[str, int, torch.dtype]]):
+    def __init__(self, tensor_specs: List[Tuple]):
         """Initialize the InputBuffer.
 
         Args:
-            tensor_specs: Ordered list of (name, max_numel, dtype) tuples.
-                         The last tensor is treated as truncatable during copy.
+            tensor_specs: Ordered list of tensor specs. Each element is either:
+                - ``(name, max_numel, dtype)`` for contiguous tensors (default)
+                - ``(name, max_numel, dtype, True)`` for truncatable tensors
         """
-        self._tensor_specs = {name: (numel, dtype) for name, numel, dtype in tensor_specs}
-        self._tensor_order = [name for name, _, _ in tensor_specs]
+        # Parse specs into canonical form: (name, numel, dtype, truncatable)
+        parsed = []
+        for spec in tensor_specs:
+            if len(spec) == 4:
+                name, numel, dtype, truncatable = spec
+            else:
+                name, numel, dtype = spec
+                truncatable = False
+            parsed.append((name, numel, dtype, truncatable))
 
-        # Calculate offsets for each tensor (aligned to dtype's element size)
+        self._tensor_specs: Dict[str, Tuple[int, torch.dtype]] = {
+            name: (numel, dtype) for name, numel, dtype, _ in parsed
+        }
+        self._tensor_order = [name for name, _, _, _ in parsed]
+        self._truncatable_names: Set[str] = {name for name, _, _, t in parsed if t}
+        self._contiguous_names = [name for name, _, _, t in parsed if not t]
+
+        # Track current lengths for each tensor (for truncation optimization)
+        self._current_lengths: Dict[str, int] = {name: 0 for name in self._tensor_order}
+
+        # === CONTIGUOUS BUFFER (small, fixed-size tensors) ===
         self._offsets: Dict[str, int] = {}
         self._byte_sizes: Dict[str, int] = {}
 
         current_offset = 0
-        for name, numel, dtype in tensor_specs:
-            # Align to the tensor's element size for proper memory access
+        for name in self._contiguous_names:
+            numel, dtype = self._tensor_specs[name]
             alignment = dtype.itemsize
             aligned_offset = (current_offset + alignment - 1) // alignment * alignment
             byte_size = numel * dtype.itemsize
@@ -86,46 +130,53 @@ class InputBuffer:
             self._byte_sizes[name] = byte_size
             current_offset = aligned_offset + byte_size
 
-        # Total buffer size
         self._total_bytes = current_offset
 
-        # Allocate contiguous buffers (device buffer starts on default device, use to() to move)
-        self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
-        self._host_buffer = torch.empty(
-            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
-        )
+        if self._total_bytes > 0:
+            self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
+            self._host_buffer = torch.empty(
+                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
+            )
+        else:
+            self._device_buffer = torch.empty(0, dtype=torch.uint8)
+            self._host_buffer = torch.empty(0, dtype=torch.uint8, device="cpu")
 
-        # Create persistent views into device and host buffers
-        # Persistent views help us identify the arguments as static during graph capture.
-        self._device_views = self._create_views(self._device_buffer)
-        self._host_views = self._create_views(self._host_buffer)
+        # Create persistent views into contiguous buffers
+        self._device_views: Dict[str, torch.Tensor] = {}
+        self._host_views: Dict[str, torch.Tensor] = {}
+        self._create_contiguous_views()
 
-        # Track current lengths for each tensor (for truncation optimization)
-        self._current_lengths: Dict[str, int] = {name: 0 for name in self._tensor_order}
+        # === TRUNCATABLE BUFFERS (large, variable-length tensors) ===
+        self._trunc_device_bufs: Dict[str, torch.Tensor] = {}
+        self._trunc_host_bufs: Dict[str, torch.Tensor] = {}
+        for name in self._truncatable_names:
+            numel, dtype = self._tensor_specs[name]
+            byte_size = numel * dtype.itemsize
+            self._trunc_device_bufs[name] = torch.empty(byte_size, dtype=torch.uint8)
+            self._trunc_host_bufs[name] = torch.empty(
+                byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
+            )
+            # Create typed views
+            self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
+            self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
 
-    def _create_views(self, buffer: torch.Tensor) -> Dict[str, torch.Tensor]:
-        """Create views into the given buffer for each tensor."""
-        views = {}
-        for name in self._tensor_order:
+    def _create_contiguous_views(self) -> None:
+        """Create typed views into the contiguous host and device buffers."""
+        for name in self._contiguous_names:
             offset = self._offsets[name]
             byte_size = self._byte_sizes[name]
             _, dtype = self._tensor_specs[name]
-            views[name] = buffer[offset : offset + byte_size].view(dtype)
-        return views
+            self._device_views[name] = self._device_buffer[offset : offset + byte_size].view(dtype)
+            self._host_views[name] = self._host_buffer[offset : offset + byte_size].view(dtype)
 
     @property
     def tensor_names(self) -> List[str]:
-        """Return the list of tensor names in buffer order."""
+        """Return the list of tensor names in spec order."""
         return self._tensor_order.copy()
 
     @property
-    def _truncatable_name(self) -> str:
-        """Return the name of the truncatable tensor."""
-        return self._tensor_order[-1]
-
-    @property
     def total_bytes(self) -> int:
-        """Total size of the buffer in bytes."""
+        """Total size of the contiguous buffer in bytes."""
         return self._total_bytes
 
     @property
@@ -134,74 +185,38 @@ class InputBuffer:
         return self._device_buffer.device
 
     def get_view(self, name: str) -> torch.Tensor:
-        """Get the device tensor view for the specified name.
-
-        Args:
-            name: Name of the tensor.
-
-        Returns:
-            A view into the device buffer for the specified tensor.
-        """
+        """Get the device tensor view for the specified name."""
         return self._device_views[name]
 
     def get_view_at_current_length(self, name: str) -> torch.Tensor:
-        """Get the device tensor view for the specified name at the current length.
-
-        Args:
-            name: Name of the tensor.
-
-        Returns:
-            A view into the device buffer for the specified tensor at the current length.
-        """
+        """Get the device tensor view truncated to the current stored length."""
         return self._device_views[name][: self._current_lengths[name]]
 
     def get_host_view(self, name: str) -> torch.Tensor:
-        """Get the host tensor view for the specified name.
-
-        Args:
-            name: Name of the tensor.
-
-        Returns:
-            A view into the pinned host buffer for the specified tensor.
-        """
+        """Get the host tensor view for the specified name."""
         return self._host_views[name]
 
     def get_capacity(self, name: str) -> int:
-        """Get the maximum number of elements for the specified tensor.
-
-        Args:
-            name: Name of the tensor.
-
-        Returns:
-            Maximum number of elements that can be stored.
-        """
+        """Get the maximum number of elements for the specified tensor."""
         numel, _ = self._tensor_specs[name]
         return numel
 
     def get_current_length(self, name: str) -> int:
-        """Get the current stored length for the specified tensor.
-
-        Args:
-            name: Name of the tensor.
-
-        Returns:
-            Number of elements currently stored in the tensor.
-        """
+        """Get the current stored length for the specified tensor."""
         return self._current_lengths[name]
 
     def store(
         self,
         name: str,
-        data: List[Number],
+        data: torch.Tensor,
         fill_value: Optional[Number] = None,
     ) -> int:
-        """Store data into the host buffer.
+        """Store a tensor into the pinned host buffer.
 
         Args:
             name: Name of the tensor to store to.
-            data: List of values to store.
-            fill_value: Optional value to fill the entire tensor with before storing.
-                       If None, only the provided data is written.
+            data: 1-D torch.Tensor to store.
+            fill_value: Optional value to fill the entire buffer with before storing.
 
         Returns:
             Number of elements stored.
@@ -209,95 +224,99 @@ class InputBuffer:
         numel, dtype = self._tensor_specs[name]
         host_view = self.get_host_view(name)
 
-        # Fill with default value if specified
         if fill_value is not None:
             host_view.fill_(fill_value)
 
-        # Convert list to tensor and copy to host buffer
-        length = len(data)
+        length = data.numel()
         assert length <= numel, f"Data too large for buffer '{name}': {length} > {numel}"
-
-        temp_tensor = torch.tensor(data, dtype=dtype)
-        host_view[:length].copy_(temp_tensor)
+        # Use numpy for the memcpy into pinned memory — avoids torch dispatcher overhead
+        dst = host_view[:length].numpy()
+        src = (data if data.dtype == dtype else data.to(dtype)).numpy()
+        np.copyto(dst, src)
 
         self._current_lengths[name] = length
         return length
 
     def copy_to_device(self) -> None:
-        """Copy from host buffer to device buffer.
+        """Copy from host buffers to device buffers.
 
-        Uses the current length of the truncatable tensor (last in spec) to minimize
-        transfer size. All tensors before the truncatable one are fully copied.
+        Contiguous tensors are copied in a single bulk transfer.
+        Truncatable tensors are each copied independently, truncated to actual length.
         """
-        # Calculate bytes to copy based on truncatable tensor's current length
-        truncatable_len = self._current_lengths[self._truncatable_name]
-        truncatable_offset = self._offsets[self._truncatable_name]
-        truncatable_dtype = self._tensor_specs[self._truncatable_name][1]
-        copy_bytes = truncatable_offset + truncatable_len * truncatable_dtype.itemsize
-
-        # Single async copy
         with nvtx_range("ad_input_buffer_h2d_copy"):
-            self._device_buffer[:copy_bytes].copy_(
-                self._host_buffer[:copy_bytes], non_blocking=True
-            )
+            # Copy contiguous buffer in one shot
+            if self._total_bytes > 0:
+                self._device_buffer[: self._total_bytes].copy_(
+                    self._host_buffer[: self._total_bytes], non_blocking=True
+                )
+
+            # Copy each truncatable tensor independently, truncated to current length
+            for name in self._truncatable_names:
+                length = self._current_lengths[name]
+                if length > 0:
+                    _, dtype = self._tensor_specs[name]
+                    copy_bytes = length * dtype.itemsize
+                    self._trunc_device_bufs[name][:copy_bytes].copy_(
+                        self._trunc_host_bufs[name][:copy_bytes], non_blocking=True
+                    )
 
     def resize(self, name: str, new_capacity: int) -> None:
-        """Resize a tensor's capacity.
+        """Resize a truncatable tensor's capacity.
 
-        This operation is only supported for the last tensor in the buffer to avoid
-        complex offset recalculations.
+        Only truncatable tensors can be resized (they have independent buffers).
 
         Args:
             name: Name of the tensor to resize.
             new_capacity: New maximum number of elements for the tensor.
         """
-        assert name == self._truncatable_name, (
-            f"Can only resize the last tensor in the buffer ('{self._truncatable_name}'). "
-            f"Attempted to resize '{name}'."
+        assert name in self._truncatable_names, (
+            f"Can only resize truncatable tensors. '{name}' is not truncatable. "
+            f"Truncatable tensors: {self._truncatable_names}"
         )
 
         old_numel, dtype = self._tensor_specs[name]
         if new_capacity <= old_numel:
-            return  # No need to resize if new capacity is smaller or equal
+            return
 
-        # Update tensor specs
         self._tensor_specs[name] = (new_capacity, dtype)
-
-        # Calculate new byte size for this tensor
         new_byte_size = new_capacity * dtype.itemsize
-        self._byte_sizes[name] = new_byte_size
-
-        # Update total bytes (offset stays the same since it's the last tensor)
-        self._total_bytes = self._offsets[name] + new_byte_size
 
         # Resize device buffer in-place
-        self._device_buffer.resize_(self._total_bytes)
+        self._trunc_device_bufs[name].resize_(new_byte_size)
 
-        # Host buffer must be re-allocated to ensure we have pinned memory
-        old_host_buffer = self._host_buffer
-        self._host_buffer = torch.empty(
-            self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+        # Host buffer must be re-allocated for pinned memory
+        old_host = self._trunc_host_bufs[name]
+        self._trunc_host_bufs[name] = torch.empty(
+            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
         )
-        self._host_buffer[: old_host_buffer.numel()].copy_(old_host_buffer)
-        del old_host_buffer
+        self._trunc_host_bufs[name][: old_host.numel()].copy_(old_host)
+        del old_host
 
-        # Recreate views after the update
-        self._device_views = self._create_views(self._device_buffer)
-        self._host_views = self._create_views(self._host_buffer)
+        # Recreate typed views
+        self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
+        self._host_views[name] = self._trunc_host_bufs[name].view(dtype)
 
     def to(self, *args, **kwargs) -> None:
-        """Move the device buffer to a new device/dtype.
-
-        Note: This recreates the device views after moving.
-        """
+        """Move all device buffers to a new device/dtype."""
         old_device = self._device_buffer.device
+
+        # Move contiguous buffer
         self._device_buffer = self._device_buffer.to(*args, **kwargs)
+
+        # Move truncatable buffers
+        for name in self._truncatable_names:
+            self._trunc_device_bufs[name] = self._trunc_device_bufs[name].to(*args, **kwargs)
 
         # Recreate views if device changed
         if old_device != self._device_buffer.device:
-            self._device_views = self._create_views(self._device_buffer)
+            self._create_contiguous_views()
+            for name in self._truncatable_names:
+                _, dtype = self._tensor_specs[name]
+                self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
 
 
+# TODO (lucaslie): as this list is growing we may want to "upstream" the active arguments to
+# nest_sequences and _prepare_inputs to skip on unnecessary computations.
 class SequenceInfo:
     """An interface to hold information about how the sequence is laid out and stored in cache.
 
@@ -348,6 +367,16 @@ class SequenceInfo:
     - batch_info: [num_prefill, num_prefill_tokens, num_decode]
       Batch metadata containing the number of prefill sequences, total prefill tokens, and number
       of decode sequences.
+    - max_seq_info: [max_context_length, max_blocks_per_seq, block_offset_multiplier, max_batch_size]
+      Model-level constants for the attention kernel: maximum context length (equal to max_seq_len),
+      maximum number of KV cache blocks per sequence (ceil(max_seq_len / tokens_per_block)),
+      block offset multiplier derived from kv_cache strides, and maximum batch size. These are
+      set once via update_cache_information() after cache initialization and remain constant.
+    - page_seq_indices: [si_0, si_1, ..., si_{np-1}] where si_j is the sequence index that page j
+      belongs to. For example, if seq 0 has 2 pages and seq 1 has 3, then
+      page_seq_indices = [0, 0, 1, 1, 1].
+    - page_in_seq: [pi_0, pi_1, ..., pi_{np-1}] where pi_j is the page index within its sequence.
+      For example, if seq 0 has 2 pages and seq 1 has 3, then page_in_seq = [0, 1, 0, 1, 2].
     - cache_loc: [c_0, c_1, ..., c_{np-1}] where np is total number of pages allocated to describe
       all sequences in the batch. Each value is a page index in the cache.
     - logits_gather_indices: [g_0, g_1, ..., g_{s_total-1}]
@@ -405,6 +434,7 @@ class SequenceInfo:
         self.max_seq_len = max_seq_len
         self.max_batch_size = max_batch_size
         self.tokens_per_block = tokens_per_block or max_seq_len
+        self.max_blocks_per_seq = math.ceil(max_seq_len / self.tokens_per_block)
         # NOTE (lucaslie): +1 is a WAR to address issue when using flashinfer attention with
         # (max_batch_size, max_seq_len) input in trtllm runtime.
         # see https://github.com/NVIDIA/TensorRT-LLM/issues/4504
@@ -427,7 +457,8 @@ class SequenceInfo:
 
         # log parameters
         ad_logger.info(
-            f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.max_num_tokens=}"
+            f"[SequenceInfo:] {self.max_seq_len=}, {self.max_batch_size=}, {self.max_num_tokens=}, "
+            f"{self.max_blocks_per_seq=}, {self.tokens_per_block=}"
         )
 
         # indicator if extra args are activated that are needed for cached attention backends
@@ -452,15 +483,20 @@ class SequenceInfo:
             ("slot_idx", self.max_batch_size, torch.long),
             ("use_initial_states", self.max_batch_size, torch.bool),
             ("batch_info", 3, torch.int),
+            # [max_context_length, max_blocks_per_seq, block_offset_multiplier, max_batch_size]
+            ("max_seq_info", 4, torch.int),
             ("logits_gather_indices", self.max_num_tokens, torch.long),
             ("logits_gather_info", 2, torch.int),
             # OTHER FIELDS WHERE WE NEED EFFICIENT HOST<>DEVICE TRANSFER
             ("_gather_idx", self.max_num_tokens, torch.int),
             ("_mask_scatter_indices", self.max_num_tokens, torch.int),
-            # cache_loc is LAST for truncation optimization (it can be the largest tensor)
+            # TRUNCATABLE TENSORS: large, variable-length, each independently truncated during
+            # H2D copy to avoid copying unused capacity.
             # NOTE: sufficient for max_num_tokens forward pass. will be resized when KVCacheManager
             # is created.
-            ("cache_loc", self.max_num_tokens, torch.int),
+            ("cache_loc", self.max_num_tokens, torch.int, True),
+            ("page_seq_indices", self.max_num_tokens, torch.int, True),
+            ("page_in_seq", self.max_num_tokens, torch.int, True),
         ]
 
         # Create the InputBuffer that manages contiguous host and device memory
@@ -470,13 +506,25 @@ class SequenceInfo:
             f"{name}_host" for name in self._input_buffer.tensor_names
         }
 
-        # Initialize args_list from tensor specs
-        self._args_list: Dict[str, List[int]] = {
-            name: [0] * numel for name, numel, _ in tensor_specs
+        # Initialize args_list from tensor specs (all entries are tensors)
+        self._args_list: Dict[str, torch.Tensor] = {
+            spec[0]: torch.zeros(spec[1], dtype=spec[2]) for spec in tensor_specs
         }
 
         self._active_args = ("input_ids", "position_ids")
         self._shapeable_args = ("input_ids", "position_ids", "input_ids_host", "position_ids_host")
+
+        # Args that require copy to InputBuffer but are NOT included in named_args / graph inputs.
+        # Pre-populated with args that are always needed regardless of graph inclusion.
+        self._requires_copy: Set[str] = {
+            "max_seq_info",  # written once at cache init (update_cache_information)
+            "page_seq_indices",  # used by host-prepare (not a graph input)
+            "page_in_seq",  # used by host-prepare (not a graph input)
+            "logits_gather_indices",  # always needed for logits gathering
+            "logits_gather_info",  # always needed for logits gathering
+            "_gather_idx",  # overlap scheduler metadata
+            "_mask_scatter_indices",  # overlap scheduler metadata
+        }
         ############################################################################################
 
         # EXTRA TENSOR FIELDS ######################################################################
@@ -556,19 +604,19 @@ class SequenceInfo:
 
     @property
     def seq_len(self) -> List[int]:
-        return self._args_list["seq_len"].copy()
+        return self._args_list["seq_len"].tolist()
 
     @property
     def input_pos(self) -> List[int]:
-        return self._args_list["input_pos"].copy()
+        return self._args_list["input_pos"].tolist()
 
     @property
     def cache_loc(self) -> List[int]:
-        return self._args_list["cache_loc"].copy()
+        return self._args_list["cache_loc"].tolist()
 
     @property
     def pages_per_seq(self) -> List[int]:
-        return self._args_list["pages_per_seq"].copy()
+        return self._args_list["pages_per_seq"].tolist()
 
     @property
     def num_sequences(self) -> int:
@@ -602,10 +650,23 @@ class SequenceInfo:
         num_blocks_estimate = num_blocks_estimate_per_seq * self.max_batch_size
         return num_blocks_estimate * self.tokens_per_block
 
-    def estimate_cache_loc_capacity(self, num_blocks: int) -> None:
-        """Estimate needed capacity of cache_loc based on available blocks and resize."""
-        # set num_blocks
+    def update_cache_information(self, num_blocks: int, block_offset_multiplier: int = 0) -> None:
+        """Update cache information after cache manager creation.
+
+        Sets num_blocks and block_offset_multiplier, writes max_seq_info to the host buffer
+        (constant after this call), and resizes cache_loc if needed.
+        """
+        # set num_blocks and block_offset_multiplier
         self._num_blocks = num_blocks
+
+        # write max_seq_info once (constant after this call)
+        max_seq_info = [
+            self.max_seq_len,
+            self.max_blocks_per_seq,
+            block_offset_multiplier,
+            self.max_batch_size,
+        ]
+        self._store_arg("max_seq_info", max_seq_info)
 
         # get current capacity
         cache_loc_capacity = self._input_buffer.get_capacity("cache_loc")
@@ -624,10 +685,10 @@ class SequenceInfo:
         estimated_capacity = estimated_capacity + 1
 
         if estimated_capacity > cache_loc_capacity:
-            self._input_buffer.resize("cache_loc", estimated_capacity)
-            # Also resize the args_list to match
-            old_size = len(self._args_list["cache_loc"])
-            self._args_list["cache_loc"].extend([0] * (estimated_capacity - old_size))
+            # Resize all truncatable page tensors together (they share the same max size)
+            for tensor_name in ("cache_loc", "page_seq_indices", "page_in_seq"):
+                self._input_buffer.resize(tensor_name, estimated_capacity)
+                self._args_list[tensor_name] = torch.zeros(estimated_capacity, dtype=torch.int)
 
     @staticmethod
     def _get_page_assignments(
@@ -688,6 +749,25 @@ class SequenceInfo:
             return True
         return False
 
+    def require_copy(self, arg_name: str) -> bool:
+        """Mark an argument as requiring copy to InputBuffer.
+
+        Unlike activate_arg, this does NOT add the arg to _named_args / graph inputs.
+        It only ensures _store_arg writes to InputBuffer so _get_arg returns updated values.
+
+        Use cases:
+        - Host-prepare functions that need args outside the CUDA graph
+        - Args that are always needed in InputBuffer regardless of graph inclusion
+
+        Returns:
+            True if the argument was newly marked, False if already marked.
+        """
+        assert arg_name in self.available_args, f"{arg_name=} not found in {self.available_args}"
+        if arg_name not in self._requires_copy:
+            self._requires_copy.add(arg_name)
+            return True
+        return False
+
     def to(self, *args, **kwargs) -> None:
         # Move the InputBuffer (which recreates views automatically)
         self._input_buffer.to(*args, **kwargs)
@@ -733,9 +813,13 @@ class SequenceInfo:
         )
 
     def set_max_num_tokens_sample(self) -> None:
-        """Set an example sequence with max_num_tokens."""
-        # TODO (lucaslie): understand what this implies for extra arguments
-        seq_len = self.max_num_tokens // self.max_batch_size
+        """Set an example sequence with max_num_tokens.
+
+        The per-sequence length is capped to the maximum that fits in the paged KV cache
+        (max_blocks_per_seq * tokens_per_block) to avoid exceeding block_offsets capacity.
+        """
+        max_cache_tokens_per_seq = self.max_blocks_per_seq * self.tokens_per_block
+        seq_len = min(self.max_num_tokens // self.max_batch_size, max_cache_tokens_per_seq)
         input_ids = torch.ones(self.max_batch_size, seq_len, dtype=torch.int).tolist()
         self.set_example_sequence(input_ids)
 
@@ -766,31 +850,39 @@ class SequenceInfo:
     def _store_arg(
         self,
         name: str,
-        tnsr_like: List[Number],
+        data: "Union[List[Number], torch.Tensor]",
         reset_val: Optional[Number] = None,
-        force_copy: bool = False,
     ) -> None:
         """Store the argument into the pinned host buffer for later batch transfer to device.
 
         The data is stored in the host-side pinned memory buffer managed by InputBuffer.
         The actual H2D transfer happens in a single batch at the end of nest_sequences().
 
+        Lists are converted to tensors at the boundary so the rest of the pipeline is
+        tensor-only.
+
         Args:
             name: Name of the argument to store.
-            tnsr_like: List of values to store.
+            data: List of values or a 1-D torch.Tensor to store.
             reset_val: Value to reset/fill the tensor with before writing data.
-            force_copy: Whether to force immediate copy to device (for use outside nest_sequences).
         """
         with nvtx_range(f"ad_store_on_host_seq_info_arg_{name}"):
-            # Always store list object for Python access
-            self._args_list[name] = tnsr_like.copy()
+            # Convert to tensor at the boundary (numpy is ~2-3x faster than torch.tensor for large lists)
+            # TODO: move this to self._input_buffer.store() when _args_list get deprecated
+            if not isinstance(data, torch.Tensor):
+                _, dtype = self._input_buffer._tensor_specs[name]
+                data = _list_to_tensor(data, dtype)
 
-            # Only store to buffer when the argument is active or force_copy is True
-            if not (name in self._active_args or f"{name}_host" in self._active_args or force_copy):
+            self._args_list[name] = data
+
+            # Only store to buffer when the argument is active or requires copy
+            is_active = name in self._active_args or f"{name}_host" in self._active_args
+            is_required = name in self._requires_copy or f"{name}_host" in self._requires_copy
+            if not (is_active or is_required):
                 return
 
             # Store to the InputBuffer's pinned host memory
-            self._input_buffer.store(name, tnsr_like, fill_value=reset_val)
+            self._input_buffer.store(name, data, fill_value=reset_val)
 
     def _store_extra_arg(
         self, name: str, tnsr_like: Optional[Union[torch.Tensor, Sequence[torch.Tensor]]]
@@ -835,6 +927,7 @@ class SequenceInfo:
         logits_gather_info: Optional[Sequence[int]] = None,
         _gather_idx: Optional[Sequence[int]] = None,
         _mask_scatter_indices: Optional[Sequence[int]] = None,
+        _ungathered_input_ids: Optional[torch.Tensor] = None,
         **extra_args: Dict[str, Union[torch.Tensor, Sequence[torch.Tensor]]],
     ) -> None:
         """Create and store sequence information for the next forward pass.
@@ -867,6 +960,8 @@ class SequenceInfo:
             logits_gather_info: Info list containing [num_tokens_to_gather, gather_required].
             _gather_idx: Gather indices for the overlap scheduler to reorder input tokens.
             _mask_scatter_indices: Mask scatter indices for the overlap scheduler.
+            _ungathered_input_ids: Optional tensor of ungathered input ids from the overlap
+                scheduler. If provided, triggers rescatter_input_ids after H2D copy.
             extra_args: Extra arguments to be stored in the interface.
 
         This i/f will ensure that all sequence info args are updated accordingly. Reset values are
@@ -920,13 +1015,27 @@ class SequenceInfo:
             self._store_arg("cache_loc", cache_loc)
             self._store_arg("pages_per_seq", pages_per_seq)
 
-        # update cumulative number of pages
-        if cu_num_pages is None:
-            pages_per_seq = self.pages_per_seq
-            cu_num_pages = torch.zeros(len(pages_per_seq) + 1, dtype=torch.int)
-            cu_num_pages[1:] = torch.cumsum(torch.tensor(pages_per_seq), dim=0)
-            cu_num_pages = cu_num_pages.tolist()
-        self._store_arg("cu_num_pages", cu_num_pages)
+            # Resolve cu_num_pages: use caller-provided value or derive from pages_per_seq
+            if cu_num_pages is None:
+                pps_t = self._args_list["pages_per_seq"]
+                cu_num_pages = torch.zeros(len(pps_t) + 1, dtype=torch.int)
+                cu_num_pages[1:] = pps_t.cumsum(0)
+            self._store_arg("cu_num_pages", cu_num_pages)
+
+            # Compute page_seq_indices and page_in_seq using vectorized torch ops,
+            # reusing the stored cu_num_pages tensor instead of recomputing the cumsum.
+            # page_seq_indices[j] = which sequence page j belongs to
+            # page_in_seq[j] = which page within that sequence (0-indexed)
+            pages_per_seq_t = self._args_list["pages_per_seq"]
+            cu_pages_t = self._args_list["cu_num_pages"]
+            seq_indices = torch.arange(len(pages_per_seq), dtype=torch.int)
+            page_seq_indices_t = torch.repeat_interleave(seq_indices, pages_per_seq_t)
+            total_pages = cu_pages_t[-1].item()
+            page_in_seq_t = torch.arange(total_pages, dtype=torch.int) - torch.repeat_interleave(
+                cu_pages_t[:-1], pages_per_seq_t
+            )
+            self._store_arg("page_seq_indices", page_seq_indices_t)
+            self._store_arg("page_in_seq", page_in_seq_t)
 
         # update sequence length with cache
         if seq_len_with_cache is None:
@@ -951,21 +1060,21 @@ class SequenceInfo:
         if logits_gather_indices is None:
             # default is to gather all logits
             logits_gather_indices = list(range(self.total_num_tokens))
-        self._store_arg("logits_gather_indices", logits_gather_indices, force_copy=True)
+        self._store_arg("logits_gather_indices", logits_gather_indices)
 
         # check for updated logits_gather_info
         if logits_gather_info is None:
             logits_gather_info = [len(logits_gather_indices), 1]
-        self._store_arg("logits_gather_info", logits_gather_info, force_copy=True)
+        self._store_arg("logits_gather_info", logits_gather_info)
 
         ### UPDATE OVERLAP SCHEDULER METADATA ######################################################
         # check for updated _gather_idx
         if _gather_idx is not None:
-            self._store_arg("_gather_idx", _gather_idx, force_copy=True)
+            self._store_arg("_gather_idx", _gather_idx)
 
         # check for updated _mask_scatter_indices
         if _mask_scatter_indices is not None:
-            self._store_arg("_mask_scatter_indices", _mask_scatter_indices, force_copy=True)
+            self._store_arg("_mask_scatter_indices", _mask_scatter_indices)
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
@@ -976,6 +1085,14 @@ class SequenceInfo:
         # Perform a single async H2D copy for all device tensors
         # The copy is truncated at the end of cache_loc to minimize transfer size
         self._input_buffer.copy_to_device()
+
+        ### RESCATTER + HOST PREPARE ###############################################################
+        # Rescatter input_ids if ungathered tokens are provided (overlap scheduler)
+        if _ungathered_input_ids is not None:
+            self.rescatter_input_ids(_ungathered_input_ids)
+
+        # Run host-prepare functions for attention forward (e.g. trtllm block_offsets computation)
+        self.run_host_prepare_for_attention_forward()
 
     @nvtx_range("ad_rescatter_input_ids")
     def rescatter_input_ids(self, ungathered_input_ids: torch.Tensor):
@@ -1025,6 +1142,9 @@ class SequenceInfo:
         self, host_function: PrepareMetadataHostCallable, args: List[str]
     ):
         self._host_prepare_functions.append((host_function, args))
+        # Ensure all host-prepare args are stored to InputBuffer via _requires_copy
+        for arg in args:
+            self.require_copy(arg)
 
     def run_host_prepare_for_attention_forward(self) -> None:
         for host_function, args in self._host_prepare_functions:

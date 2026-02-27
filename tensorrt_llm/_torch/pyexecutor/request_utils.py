@@ -1,9 +1,10 @@
 """Utility functions for request processing."""
 
-import heapq
 import os
-from collections import deque, namedtuple
-from typing import Any, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+
+if TYPE_CHECKING:
+    from .scheduler import WaitingQueue
 
 import torch
 
@@ -69,154 +70,6 @@ def attach_py_objects_to_requests(requests: List, py_request_objects: Tuple) -> 
                     setattr(item.request, attr_name, py_obj)
 
 
-def schedule_attention_dp_requests(
-    new_requests: List[Any],
-    all_ranks_num_active_requests: List[int],
-    all_ranks_num_active_tokens: List[int],
-    tp_size: int,
-    max_num_active_requests: int,
-) -> Tuple[Dict[int, List[Any]], int]:
-    """Schedule attention DP requests across ranks.
-
-    This function distributes requests across tensor parallel ranks for attention DP.
-    It first tries to assign requests to their target dp_rank (if specified and has capacity),
-    then balances the remaining requests across all ranks.
-
-    Args:
-        new_requests: List of RequestQueueItem to schedule.
-        all_ranks_num_active_requests: Number of active requests per rank (will be modified).
-        all_ranks_num_active_tokens: Number of active tokens per rank.
-        tp_size: Number of tensor parallel ranks.
-        max_num_active_requests: Maximum number of active requests per rank.
-
-    Returns:
-        Tuple of:
-            - all_ranks_new_requests: Dict mapping rank to list of assigned requests.
-            - expected_num_active_requests: Expected number of active requests per rank.
-    """
-    # Map from ranks to new requests
-    all_ranks_new_requests = {tp_rank: [] for tp_rank in range(tp_size)}
-
-    # Prioritize the requests that are not in relax mode
-    def get_relax_value(req_item):
-        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-        if scheduling_params is None:
-            return True
-        return scheduling_params.attention_dp_relax
-
-    new_requests = sorted(new_requests, key=get_relax_value)
-
-    # Try to put the requests to the target dp rank until the max_num_active_requests is reached
-    remaining_unscheduled = []
-    for req_item in new_requests:
-        scheduled = False
-        scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
-        if scheduling_params is not None:
-            target_dp_rank = scheduling_params.attention_dp_rank
-            if (
-                target_dp_rank is not None
-                and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
-            ):
-                all_ranks_num_active_requests[target_dp_rank] += 1
-                scheduled = True
-                all_ranks_new_requests[target_dp_rank].append(req_item)
-
-        if not scheduled:
-            remaining_unscheduled.append(req_item)
-
-    # Balance the remaining unscheduled requests across ranks
-    num_new_requests_all_ranks = len(remaining_unscheduled)
-    total_num_active_requests = sum(all_ranks_num_active_requests)
-    expected_num_active_requests = max(
-        (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
-        max(all_ranks_num_active_requests),
-    )
-
-    all_ranks_new_requests = balance_requests_across_ranks(
-        remaining_unscheduled,
-        all_ranks_new_requests,
-        all_ranks_num_active_requests,
-        all_ranks_num_active_tokens,
-        expected_num_active_requests,
-    )
-
-    return all_ranks_new_requests, expected_num_active_requests
-
-
-def balance_requests_across_ranks(
-    new_requests: List,
-    all_ranks_new_requests: Dict[int, List],
-    all_ranks_num_active_requests: List[int],
-    all_ranks_num_active_tokens: List[int],
-    expected_num_active_requests: int,
-) -> Dict[int, List]:
-    """Balance requests across ranks for attention DP.
-
-    Uses a heap-based algorithm to distribute requests evenly across ranks,
-    prioritizing ranks with fewer tokens for better load balancing.
-
-    Args:
-        new_requests: List of new requests to distribute.
-        all_ranks_new_requests: Dict mapping rank to list of already assigned requests.
-        all_ranks_num_active_requests: Number of active requests per rank.
-        all_ranks_num_active_tokens: Number of active tokens per rank.
-        expected_num_active_requests: Target number of active requests per rank.
-
-    Returns:
-        Updated all_ranks_new_requests dict with new requests distributed.
-    """
-    if new_requests:
-        # Balance context tokens across ranks using heap
-        HeapVal = namedtuple("HeapVal", ["num_tokens", "num_requests", "rank", "request_list"])
-
-        all_ranks_new_requests_heap = [
-            HeapVal(all_ranks_num_active_tokens[tp_rank], val, tp_rank, [])
-            for tp_rank, val in enumerate(all_ranks_num_active_requests)
-        ]
-
-        all_ranks_new_requests_heap = [
-            val
-            for val in all_ranks_new_requests_heap
-            if val.num_requests < expected_num_active_requests
-        ]
-
-        all_ranks_new_scheduled_requests = {
-            val.rank: val.request_list for val in all_ranks_new_requests_heap
-        }
-
-        heapq.heapify(all_ranks_new_requests_heap)
-
-        # Sort by token count (descending) for better load balancing
-        new_requests = sorted(
-            new_requests,
-            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
-            reverse=True,
-        )
-
-        # Distribute requests across ranks
-        for req_item in new_requests:
-            val = heapq.heappop(all_ranks_new_requests_heap)
-            token_count = (
-                len(getattr(req_item.request, "input_token_ids", [])) if req_item.request else 0
-            )
-            # Update the heap value with the new request
-            val = val._replace(
-                num_tokens=val.num_tokens + token_count,
-                num_requests=val.num_requests + 1,
-            )
-
-            val.request_list.append(req_item)
-            # If rank still has room for new requests, push back into heap
-            if val.num_requests < expected_num_active_requests:
-                heapq.heappush(all_ranks_new_requests_heap, val)
-
-        # Extend all_ranks_new_requests with the new requests that have been scheduled
-        for rank, reqs in all_ranks_new_scheduled_requests.items():
-            all_ranks_new_requests[rank].extend(reqs)
-
-    return all_ranks_new_requests
-
-
 def can_process_attention_dp_request(
     req_item, all_ranks_num_active_requests: List[int], max_num_active_requests: int
 ) -> bool:
@@ -246,7 +99,7 @@ def can_process_attention_dp_request(
 
 
 def get_from_waiting_queue(
-    waiting_queue: deque,
+    waiting_queue: "WaitingQueue",
     max_req_count: int,
     enable_attention_dp: bool,
     max_num_active_requests: int,
@@ -277,11 +130,11 @@ def get_from_waiting_queue(
     )
 
     while req_count < max_req_count and waiting_queue:
-        req_item = waiting_queue[0]
+        req_item = waiting_queue.peek_request()
         num_children = len(req_item.child_req_ids) if req_item.child_req_ids else 0
         if (req_count + 1 + num_children) > max_req_count:
             break
-        req_item = waiting_queue.popleft()
+        req_item = waiting_queue.pop_request()
 
         can_process = (
             can_process_attention_dp_request(
@@ -299,7 +152,7 @@ def get_from_waiting_queue(
 
     # Put the pending requests back to the waiting queue
     # All ranks should have the same waiting queue
-    waiting_queue.extendleft(reversed(pending_requests))
+    waiting_queue.prepend_requests(reversed(pending_requests))
 
     return items
 
@@ -673,7 +526,8 @@ class RequestBroadcaster:
         # Broadcast within first PP stage before send/recv chain to other PP stages.
         # This needs to cover both TP and CP ranks within the first PP stage.
         if self.dist.is_first_pp_rank:
-            payloads = self.dist.tp_cp_broadcast(payloads, root=0)
+            with nvtx_range("tp_broadcast_requests"):
+                payloads = self.dist.tp_cp_broadcast(payloads, root=0)
 
         # Tag for communication
         tag = self.dist.pp_size  # Use pp_size as tag to avoid conflicts

@@ -19,7 +19,7 @@ import yaml
 from pydantic import BaseModel
 
 import tensorrt_llm
-from tensorrt_llm import LLM
+from tensorrt_llm import LLM, DisaggregatedParams
 # Import BaseCheckpointLoader for YAML processing
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import \
     BaseCheckpointLoader
@@ -265,7 +265,8 @@ class ClassSnapshot:
                         continue
                     parameters[field_name] = ParamSnapshot(
                         annotation=field.annotation,
-                        default=field.default or inspect._empty)
+                        default=inspect._empty
+                        if field.is_required() else field.default)
                 methods[method_name] = MethodSnapshot(parameters=parameters,
                                                       return_annotation=None)
             else:
@@ -300,7 +301,8 @@ class ClassSnapshot:
                             continue
                         parameters[field_name] = ParamSnapshot(
                             annotation=field.annotation,
-                            default=field.default or inspect._empty)
+                            default=inspect._empty
+                            if field.is_required() else field.default)
                     methods["__init__"] = MethodSnapshot(parameters=parameters,
                                                          return_annotation=None)
                 else:

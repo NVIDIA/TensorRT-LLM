@@ -27,7 +27,7 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm.functional import PositionEmbeddingType
 from tensorrt_llm.inputs.multimodal import MultimodalParams
 
-from ..._utils import nvtx_range
+from ..._utils import nvtx_range, prefer_pinned
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
@@ -775,7 +775,9 @@ class Qwen2_5_VisionModel(torch.nn.Module):
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         batch_size = 1  # NOTE: Qwen2/2.5-VL concats all the pixel_values into a single tensor, so batch_size is 1
         prompt_lens = seq_lens
-        seq_lens = torch.tensor(seq_lens, dtype=torch.int, pin_memory=True)
+        seq_lens = torch.tensor(seq_lens,
+                                dtype=torch.int,
+                                pin_memory=prefer_pinned())
         request_ids = list(range(1, batch_size + 1))
 
         attn_metadata.num_contexts = len(seq_lens)
@@ -1061,7 +1063,7 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
 
         Args:
             inputs: Text prompt input container. Must contain a non-empty prompt string.
-            mm_handles: List of multimodal embedding handles. Currently only a single handle is supported.
+            mm_handles: List of multimodal embedding handles.
 
         Returns:
             Tuple[List[int], List[int], List[int]]:
@@ -1077,12 +1079,13 @@ class Qwen2_5VLInputProcessorBase(Qwen2VLInputProcessorBase):
         if not isinstance(mm_handles, list):
             raise TypeError("mm_handles must be a list")
 
-        if len(mm_handles) != 1:
-            # TODO: only support single multimodal item within a request for now
-            raise NotImplementedError(
-                "Only one mm_handle is supported for Qwen2.5 VL for now")
-        hidden_size = mm_handles[0]['tensor_size'][1]
-        assert hidden_size == self.config.text_config.hidden_size, "Multimodal embedding hidden size must match model hidden size"
+        expected_hidden_size = self.config.text_config.hidden_size
+        for i, mm_handle in enumerate(mm_handles):
+            hidden_size = mm_handle['tensor_size'][1]
+            if hidden_size != expected_hidden_size:
+                raise RuntimeError(
+                    f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
+                )
         input_ids = self.tokenizer(text_prompt,
                                    return_tensors="pt").input_ids[0]
 

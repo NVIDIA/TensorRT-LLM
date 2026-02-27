@@ -2,7 +2,6 @@ import asyncio
 import os
 import shutil
 import subprocess
-import sys
 import tempfile
 import traceback
 import uuid
@@ -147,14 +146,14 @@ def _run_worker(model_name,
         env = os.environ.copy()
         log_file = None
         log_path = None
+        stdout = None
+        stderr = None
         if save_log:
             log_path = os.path.join(work_dir, f"worker_{role}_{port}.log")
             log_file = open(log_path, "w+")
             stdout = log_file
             stderr = log_file
-        else:
-            stdout = sys.stdout
-            stderr = sys.stderr
+
         if device != -1:
             env["CUDA_VISIBLE_DEVICES"] = str(device)
         print(f"Running {role} on port {port}")
@@ -187,14 +186,13 @@ def run_disagg_server(disagg_cluster_config, work_dir, port=0, save_log=False):
     cmds = ["trtllm-serve", "disaggregated", "-c", disagg_server_config_path]
     log_file = None
     log_path = None
+    stdout = None
+    stderr = None
     if save_log:
         log_path = os.path.join(work_dir, "disagg_server.log")
         log_file = open(log_path, "w+")
         stdout = log_file
         stderr = log_file
-    else:
-        stdout = sys.stdout
-        stderr = sys.stderr
     p = subprocess.Popen(cmds, stdout=stdout, stderr=stderr)
     return ProcessWrapper(p, log_file=log_file, log_path=log_path, port=port)
 

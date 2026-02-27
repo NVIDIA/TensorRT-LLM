@@ -6,6 +6,8 @@ import torch
 from pydantic import Field, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from tensorrt_llm.mapping import Mapping
+
 from ...llmapi.llm_args import (
     BuildConfig,
     EagleDecodingConfig,
@@ -185,7 +187,12 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         " no processes are spawned and the model is run on a single GPU (only for ``demollm``).",
     )
 
-    runtime: Literal["demollm", "trtllm"] = Field(default="trtllm")
+    runtime: Literal["demollm", "trtllm"] = Field(
+        default="trtllm",
+        description="The runtime backend to use. 'trtllm' is a production-grade runtime optimized for "
+        "high-performance inference. 'demollm' is a lightweight runtime for development and testing "
+        "with a simplified scheduler and KV-cache manager for easier debugging.",
+    )
 
     device: str = Field(default="cuda", description="The device to use for the model.", frozen=True)
 
@@ -327,6 +334,44 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
 
     def is_cuda_graph_enabled(self) -> bool:
         return self.compile_backend in ["torch-cudagraph", "torch-opt"]
+
+    def init_mapping_from_config(self, rank: int, world_size: int) -> Mapping:
+        sharding_config = self.transforms.get("detect_sharding", {})
+        dist_mapping_config = sharding_config.get("dist_mapping", {})
+        enable_attention_dp = sharding_config.get("enable_attention_dp", False)
+
+        # Determine MoE parallelism dimensions
+        if enable_attention_dp:
+            # EP + TP 2D parallelism is currently NOT supported with attention-DP.
+            # EP-only: experts sharded across GPUs, use all-to-all dispatch/combine
+            moe_ep_size = self.world_size
+            moe_tp_size = 1
+            ad_logger.info(
+                f"Attention-DP with EP-only MoE: moe_ep_size={moe_ep_size}, moe_tp_size={moe_tp_size}"
+            )
+        else:
+            # No attention-DP: use dist_mapping config or defaults
+            moe_tp_size = dist_mapping_config.get("moe_tp", 1)
+            moe_ep_size = dist_mapping_config.get("moe_ep", self.world_size)
+
+        # Create Mapping with proper distributed configuration
+        try:
+            mapping = Mapping(
+                world_size=world_size,
+                rank=rank,
+                tp_size=dist_mapping_config.get("tp", self.world_size),
+                moe_tp_size=moe_tp_size,
+                moe_ep_size=moe_ep_size,
+                moe_cluster_size=dist_mapping_config.get("moe_cluster", 1),
+                enable_attention_dp=enable_attention_dp,
+            )
+        except ValueError as e:
+            raise ValueError(
+                f"Invalid parallel grid config: {e}. "
+                f"Please check your dist_mapping configuration: {dist_mapping_config}"
+            ) from e
+
+        return mapping
 
     ### PRIVATE METHODS ############################################################################
     @classmethod

@@ -4,7 +4,7 @@ This document shows how to build and run a [Arctic](https://huggingface.co/Snowf
 
 The TensorRT LLM Arctic implementation is based on the LLaMA model, with Mixture of Experts (MoE) enabled. The implementation can
 be found in [llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
-See the LLaMA example [`examples/models/core/llama`](../../../llama) for details.
+See the LLaMA example [`examples/models/core/llama`](../../core/llama) for details.
 
 - [Arctic](#arctic)
   - [Download model checkpoints](#download-model-checkpoints)
@@ -46,7 +46,7 @@ mkdir -p tmp/trt_engines
 ### Apply FP8 PTQ
 
 Notes:
-- currently quantize.py does not support for Expert Parallelism (EP) mode yet. User should use `../llama/convert_checkpoint.py` and specify `--moe_ep_size 1` instead, if needed.
+- currently quantize.py does not support for Expert Parallelism (EP) mode yet. User should use `../../core/llama/convert_checkpoint.py` and specify `--moe_ep_size 1` instead, if needed.
 - TensorRT LLM uses static quantization methods, which is expected to be faster at runtime as compared to dynamic quantization methods. This comes at a cost of an offline calibration step during quantization. `batch_size` and `calib_size` can be adjusted to shorten the calibration time. Please refer to ../quantization/README.md for explanation.
 - **due to the large model size and the calibration step (which has to load the HuggingFace model and run forward passes), it is likely that you will need more number of GPUs during quantization step than the number of GPUs for engine building and final deployment. For example, using 16xH100 or 8xH200 for quantization & 8xH100 for deployment.**
 
@@ -74,13 +74,13 @@ trtllm-build --checkpoint_dir ./tmp/tllm_checkpoints/${ENGINE} \
 ```
 
 ### Run Engine
-Test your engine with the [run.py](../run.py) script:
+Test your engine with the [run.py](../../../run.py) script:
 
 ```bash
 mpirun -n ${TP} --allow-run-as-root python ../../../run.py --engine_dir ./tmp/trt_engines/${ENGINE} --tokenizer_dir tmp/hf_checkpoints/${HF_MODEL} --max_output_len 20 --input_text "The future of AI is" |& tee tmp/trt_engines/${ENGINE}_run.log
 ```
 
-For more examples see [`examples/models/core/llama/README.md`](../../../llama/README.md)
+For more examples see [`examples/models/core/llama/README.md`](../../core/llama/README.md)
 
 
 ### OOTB

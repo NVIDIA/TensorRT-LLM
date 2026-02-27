@@ -17,8 +17,9 @@ from ...custom_ops.quantization.quant import (
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 from ...utils.node_utils import (
+    WeightBiasInfoCache,
+    extract_weight_nodes,
     get_quantization_params_from_linear_node,
-    get_weight_info,
     is_bmm_op,
     is_linear_op,
 )
@@ -109,27 +110,28 @@ class Quantization(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
-        qcfg = factory.get_quant_config()
-        if not qcfg or (
-            qcfg.get("quant_algo", "").upper() != self.algo_name
-            and qcfg.get("quant_method", "").upper() != self.algo_name
-        ):
-            return gm, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-        excluded = qcfg.get("exclude_modules", [])
-        cnt = 0
-        for n in gm.graph.nodes:
-            if not is_linear_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            self._insert_quantized_linear(gm, n, is_quantized_graph=False)
-            cnt += 1
+        with WeightBiasInfoCache():
+            qcfg = factory.get_quant_config()
+            if not qcfg or (
+                qcfg.get("quant_algo", "").upper() != self.algo_name
+                and qcfg.get("quant_method", "").upper() != self.algo_name
+            ):
+                return gm, TransformInfo(
+                    skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+                )
+            excluded = qcfg.get("exclude_modules", [])
+            cnt = 0
+            for n in gm.graph.nodes:
+                if not is_linear_op(n):
+                    continue
+                if should_skip_quantization(n, excluded):
+                    continue
+                self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+                cnt += 1
 
-        return gm, TransformInfo(
-            skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
-        )
+            return gm, TransformInfo(
+                skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)
+            )
 
     def _insert_quantized_linear(
         self,
@@ -141,9 +143,10 @@ class Quantization(BaseTransform):
 
         The state_dict is also updated to contain the sharded weights.
         """
-        lin_weight = get_weight_info(node)
-        if lin_weight is None:
+        weight_nodes = extract_weight_nodes(node)
+        if len(weight_nodes.weights) == 0:
             raise ValueError(f"Linear node {node.name} has no weight")
+        lin_weight = weight_nodes.weights[0]
 
         new_param = nn.Parameter(self.quantize_weight(lin_weight.tensor), requires_grad=False)
         modname, _, attrname = lin_weight.node_key.rpartition(".")
@@ -377,7 +380,9 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                 state_dict[weight_name] = weight_fp4
                 state_dict[weight_name + "_scale"] = weight_scale
                 state_dict[weight_name + "_scale_2"] = weight_scale_2
-                state_dict[alpha_name] = 1 / (weight_scale_2 * state_dict[input_scale_name])
+                state_dict[alpha_name] = 1 / torch.clamp(
+                    weight_scale_2 * state_dict[input_scale_name], min=1e-30
+                )
             # Unified HF ckpt path
             else:
                 if (
@@ -386,10 +391,11 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     and input_scale_name in state_dict
                     and float4_sf_dtype
                 ):
-                    state_dict[alpha_name] = (
-                        state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
-                    )
-                    state_dict[input_scale_name] = 1 / state_dict[input_scale_name]
+                    alpha = state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
+                    alpha = torch.clamp(alpha, min=1e-30)
+                    state_dict[alpha_name] = alpha
+                    input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
+                    state_dict[input_scale_name] = 1 / input_scale
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
                     # Round the weight block scale factors to 128x4 and then swizzle.
                     weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
@@ -564,13 +570,15 @@ class FP8BMMQuantizationFromConfig(Quantization):
 
         excluded = qcfg.get("exclude_modules", [])
         cnt = 0
-        for n in gm.graph.nodes:
-            if not is_bmm_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            if self._insert_quantized_bmm(gm, n, is_quantized_graph=False):
-                cnt += 1
+
+        with WeightBiasInfoCache():
+            for n in gm.graph.nodes:
+                if not is_bmm_op(n):
+                    continue
+                if should_skip_quantization(n, excluded):
+                    continue
+                if self._insert_quantized_bmm(gm, n, is_quantized_graph=False):
+                    cnt += 1
 
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=True

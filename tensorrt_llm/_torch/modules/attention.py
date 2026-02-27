@@ -21,7 +21,8 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
+from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
+                           cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -336,13 +337,14 @@ class Attention(nn.Module):
                              key="sparse_attention_config")
 
             if config.sparse_attention_config.algorithm == "rocket":
-                logger.warning("disable rope_fusion for RocketKV.")
+                logger.warning_once("disable rope_fusion for RocketKV.",
+                                    key="disable_rope_fusion_for_rocketkv")
                 self.rope_fusion = False
 
         if self.rope_fusion and not attn_cls.support_fused_rope():
-            logger.warning(
-                "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion."
-            )
+            logger.warning_once(
+                "rope_fusion is true but the attention backend does not support it. Will disable rope_fusion.",
+                key="disable_rope_fusion_for_non_supported_backend")
             self.rope_fusion = False
         # If rope_fusion is not specified, enable if the attention backend supports it.
         if self.rope_fusion is None:
@@ -824,8 +826,9 @@ class MLA(nn.Module):
         # tensor parallel
         config = config or ModelConfig()
         if mapping_with_cp is not None:
-            logger.warning(
-                "[MLA::__init__] Overriding mapping with CP detected.")
+            logger.warning_once(
+                "[MLA::__init__] Overriding mapping with CP detected.",
+                key="mla_init_mapping_with_cp")
             self.mapping = mapping_with_cp
         else:
             self.mapping = config.mapping
@@ -960,6 +963,7 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        self.mapping_o = mapping_o
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,
@@ -1193,29 +1197,63 @@ class MLA(nn.Module):
                 num_tokens = partial_o.shape[0]
                 cp_size = self.mapping.cp_size
 
-                # Reshape for FIFO-based all-to-all.
-                # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
-                # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+                # Check which FIFO version to use (default: version 2 for better performance).
+                fifo_version = self.mapping.cp_config.get("fifo_version", 2)
 
-                partial_o = partial_o.view(
-                    num_tokens, cp_size, self.num_heads_tp_cp,
-                    kv_lora_rank).transpose(1, 2).contiguous()
-                softmax_stats = softmax_stats.view(num_tokens, cp_size,
-                                                   self.num_heads_tp_cp,
-                                                   2).transpose(1,
-                                                                2).contiguous()
+                if fifo_version == 1:
+                    # Version 1: Uses transpose+contiguous before alltoall, cp_dim=2.
+                    # Reshape for FIFO-based all-to-all. Overlap the two .contiguous() calls on separate streams.
+                    # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
+                    # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+                    partial_o, softmax_stats = maybe_execute_in_parallel(
+                        lambda: partial_o.view(num_tokens, cp_size, self.
+                                               num_heads_tp_cp, kv_lora_rank).
+                        transpose(1, 2).contiguous(),
+                        lambda: softmax_stats.view(num_tokens, cp_size, self.
+                                                   num_heads_tp_cp, 2).
+                        transpose(1, 2).contiguous(),
+                        self.ln_events[0],
+                        self.ln_events[1],
+                        self.aux_stream,
+                    )
 
-                # Call FIFO-based helixAllToAll.
-                partial_o_out, softmax_stats_out = helix.alltoall_native(
-                    partial_o, softmax_stats)
+                    # Call FIFO-based helixAllToAll.
+                    partial_o_out, softmax_stats_out = helix.alltoall_native(
+                        partial_o, softmax_stats)
 
-                # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
-                # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
-                # cp_dim = 2 (the dimension where cp_size is located)
+                    # partial_o_out: [num_tokens, num_heads_tp_cp, cp_size, kv_lora_rank]
+                    # softmax_stats_out: [num_tokens, num_heads_tp_cp, cp_size, 2]
+                    # cp_dim = 2 (the dimension where cp_size is located)
 
-                # Call helix_post_process_native with cp_dim=2.
-                return torch.ops.trtllm.helix_post_process_native(
-                    partial_o_out, softmax_stats_out, 1.0, 2)
+                    # Call helix_post_process_native V1 (cp_dim=2).
+                    return torch.ops.trtllm.helix_post_process_native(
+                        partial_o_out, softmax_stats_out, 1.0, 2)
+                else:
+                    # Version 2: Uses simple view (no transpose+contiguous) for better performance.
+                    # partial_o: [num_tokens, num_heads * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp * kv_lora_rank]
+                    # softmax_stats: [num_tokens, num_heads, 2] -> [num_tokens, cp_size, num_heads_tp_cp * 2]
+                    partial_o = partial_o.view(
+                        num_tokens, cp_size,
+                        self.num_heads_tp_cp * kv_lora_rank)
+                    softmax_stats = softmax_stats.view(num_tokens, cp_size,
+                                                       self.num_heads_tp_cp * 2)
+
+                    # Call FIFO-based helixAllToAll.
+                    partial_o_out, softmax_stats_out = helix.alltoall_native(
+                        partial_o, softmax_stats)
+
+                    # Reshape after alltoall for post-processing.
+                    # partial_o_out: [num_tokens, cp_size, num_heads_tp_cp * kv_lora_rank] -> [num_tokens, cp_size, num_heads_tp_cp, kv_lora_rank]
+                    # softmax_stats_out: [num_tokens, cp_size, num_heads_tp_cp * 2] -> [num_tokens, cp_size, num_heads_tp_cp, 2]
+                    gathered_o = partial_o_out.view(num_tokens, cp_size,
+                                                    self.num_heads_tp_cp,
+                                                    kv_lora_rank)
+                    gathered_stats = softmax_stats_out.view(
+                        num_tokens, cp_size, self.num_heads_tp_cp, 2)
+
+                    # Call helix_post_process_native V2 (cp_dim=1).
+                    return torch.ops.trtllm.helix_post_process_native(
+                        gathered_o, gathered_stats, 1.0, 1)
         else:
             attn_output = attn_backend.forward(q, k, v, attn_metadata, **kwargs)
             return attn_output
@@ -2242,6 +2280,98 @@ class MLA(nn.Module):
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
         return output
 
+    def _needs_cp_reduce_scatter(self) -> bool:
+        """Check if we should use CP reduce-scatter instead of AllReduce."""
+        return (self.mapping.has_cp_helix()
+                and self.mapping.enable_attention_dp)
+
+    def _maybe_allgather_input(
+            self, hidden_states: torch.Tensor,
+            attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """AllGather input hidden states from CP group if needed.
+
+        For the first layer (Embed -> Attn), all CP ranks already have the
+        full input, so this is a no-op. For subsequent layers, the previous
+        layer's reduce-scatter left each rank with a portion that must be
+        reconstructed before attention.
+        """
+        if self._needs_cp_reduce_scatter() and self.layer_idx > 0:
+            hidden_states = cp_allgather(hidden_states, self.mapping, dim=0)
+            # Remove padding introduced by reduce-scatter alignment.
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+        return hidden_states
+
+    def _pad_for_cp(self, tensor: torch.Tensor,
+                    num_tokens: int) -> tuple[torch.Tensor, int]:
+        """Pad tensor along dim-0 so its length is divisible by cp_size.
+
+        Returns the (possibly padded) tensor and the per-rank chunk size.
+        """
+        cp_size = self.mapping.cp_size
+        chunk_size = math.ceil(num_tokens / cp_size)
+        padded_size = chunk_size * cp_size
+
+        if num_tokens < padded_size:
+            tensor = torch.nn.functional.pad(
+                tensor, (0, 0, 0, padded_size - num_tokens),
+                mode="constant",
+                value=0)
+
+        return tensor, chunk_size
+
+    def _slice_for_cp(self, tensor: torch.Tensor,
+                      attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """Slice a tensor to this CP rank's chunk, matching post-RS size.
+
+        Used for the first layer's residual: since there is no prior RS to
+        divide it, we manually extract this rank's portion so it aligns with
+        the reduce-scattered attention output.
+        """
+        tensor, chunk_size = self._pad_for_cp(tensor, attn_metadata.num_tokens)
+        start = self.mapping.cp_rank * chunk_size
+        return tensor[start:start + chunk_size]
+
+    def _output_projection(
+        self,
+        attn_output: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+        residual: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply output projection (o_proj) and reduce across parallel ranks.
+
+        With CP reduce-scatter, o_proj produces partial sums (each CP rank
+        contributes from its head partition). Reduce-scatter sums these
+        and divides the result among CP ranks for subsequent MoE processing.
+        Otherwise, o_proj uses the standard AllReduce path.
+
+        The residual is passed through unchanged unless this is the first
+        layer with CP reduce-scatter, in which case it is sliced to match
+        the post-RS token count.
+        """
+        if self._needs_cp_reduce_scatter():
+            # Skip AllReduce in o_proj; use reduce-scatter instead.
+            attn_output = self.o_proj(
+                attn_output,
+                all_reduce_params=AllReduceParams(enable_allreduce=False))
+
+            # Pad to make token count divisible by cp_size for reduce-scatter.
+            attn_output, _ = self._pad_for_cp(attn_output,
+                                              attn_metadata.num_tokens)
+
+            # Reduce-scatter using mapping_o where tp_group = cp_group.
+            attn_output = reducescatter(attn_output, self.mapping_o, dim=0)
+
+            # For the first layer, the residual comes from the embedding and
+            # has not been through a prior RS. Slice it to match.
+            if self.layer_idx == 0 and residual is not ...:
+                residual = self._slice_for_cp(residual, attn_metadata)
+        else:
+            attn_output = self.o_proj(attn_output,
+                                      all_reduce_params=all_reduce_params)
+
+        return attn_output, residual
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2249,7 +2379,11 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+
+        hidden_states = self._maybe_allgather_input(hidden_states,
+                                                    attn_metadata)
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
@@ -2277,9 +2411,13 @@ class MLA(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
 
-        attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
-        return attn_output
+        attn_output, residual = self._output_projection(attn_output,
+                                                        attn_metadata,
+                                                        all_reduce_params,
+                                                        residual)
+        if residual is ...:
+            return attn_output
+        return attn_output, residual
 
     def resmooth_parameters(self,
                             module_weight,

@@ -26,6 +26,7 @@ from typing import Generic, Literal, Optional, Type, TypeAlias, TypeVar, cast
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
 
@@ -63,7 +64,6 @@ class BeamSearchMetadata(StrategyMetadata):
     seq_lens: torch.Tensor
     finished_beams: torch.Tensor
     predecessor_beams: torch.Tensor
-    end_ids: torch.Tensor
 
 
 @dataclass(frozen=True, kw_only=True)
@@ -439,9 +439,9 @@ def get_rejected_indices(
     # NB: torch.arange is needed to enable "advanced indexing",
     #   cf. https://numpy.org/devdocs/user/basics.indexing.html#integer-array-indexing
     token_idx = torch.arange(num_draft_tokens, dtype=torch.int32, device=generator.device)
-    draft_tokens_cuda = torch.tensor(draft_tokens, dtype=torch.int32, pin_memory=True).to(
-        device=generator.device, non_blocking=True
-    )
+    draft_tokens_cuda = torch.tensor(
+        draft_tokens, dtype=torch.int32, pin_memory=prefer_pinned()
+    ).to(device=generator.device, non_blocking=True)
     p = draft_probs[token_idx, draft_tokens_cuda]
     q = target_probs.squeeze(0)[token_idx, draft_tokens_cuda]
     accept_probs = torch.minimum(torch.ones((), device=generator.device, dtype=q.dtype), q / p)
@@ -596,10 +596,10 @@ class SimpleGroupedStrategySampler(GroupedStrategySampler[Strategy]):
             beam_width_in = group_key[1]
         else:
             beam_width_in = 1
-        if group_logit_indices is None:
-            assert logits.size(0) == beam_width_in * len(strategies)
-        else:
+
+        if group_logit_indices is not None:
             logits = logits[group_logit_indices]
+        assert logits.size(0) == beam_width_in * len(strategies)
 
         assert all(strategy == group_key for strategy in strategies), "group must be consistent"
 
