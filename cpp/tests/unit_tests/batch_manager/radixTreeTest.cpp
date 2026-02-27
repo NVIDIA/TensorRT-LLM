@@ -11,9 +11,9 @@ class RadixTreeTest : public ::testing::Test
 
 TEST_F(RadixTreeTest, SimpleTree)
 {
-    RadixTree<int,std::hash<int>,int,std::hash<int>,int,false> radixTree;
+    RadixTree<int, std::hash<int>, int, std::hash<int>, int, false> radixTree;
 
-    std::vector<int> prefix = {1,2,3};
+    std::vector<int> prefix = {1, 2, 3};
     auto nodes1 = radixTree.insertNodes(prefix);
     auto itr1 = nodes1.exactMatches.begin();
     EXPECT_EQ(itr1->key, 1);
@@ -28,11 +28,7 @@ TEST_F(RadixTreeTest, Strings)
     RadixTreeStringSet stringSet;
 
     // Insert some strings
-    std::vector<std::string> strings = {
-        "This is string 1, yeah",
-        "This is string 2, yeah",
-        "This is a loaf of bread"
-    };
+    std::vector<std::string> strings = {"This is string 1, yeah", "This is string 2, yeah", "This is a loaf of bread"};
     for (auto const& str : strings)
     {
         stringSet.insert(str);
@@ -44,9 +40,9 @@ TEST_F(RadixTreeTest, Strings)
     for (auto const& edge : edges)
     {
         std::string str(edge.begin(), edge.end());
-        printf("edge :: %s\n",str.c_str());
+        printf("edge :: %s\n", str.c_str());
     }
-    printf("stringSet has %d nodes\n",stringSet.countNumberOfNodes());
+    printf("stringSet has %d nodes\n", stringSet.countNumberOfNodes());
 
     // Verify state
     EXPECT_TRUE(stringSet.contains("This is string 1, yeah"));
