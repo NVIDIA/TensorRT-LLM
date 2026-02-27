@@ -621,19 +621,19 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_manager,
             )
         else:
-            use_sage_attn_separate_qkv = any(v is not None and v > 0 for v in [
+            use_sage_attn = any(v is not None and v > 0 for v in [
                 sage_attn_num_elts_per_blk_q, sage_attn_num_elts_per_blk_k,
                 sage_attn_num_elts_per_blk_v
             ])
 
-            if use_sage_attn_separate_qkv:
+            if use_sage_attn:
                 if is_fused_qkv:
                     raise ValueError(
-                        "SageAttention SeparateQkv requires separate q/k/v tensors (is_fused_qkv must be false)."
+                        "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false)."
                     )
                 if k is None or v is None:
                     raise ValueError(
-                        "SageAttention SeparateQkv requires both k and v tensors to be provided."
+                        "SageAttention requires both k and v tensors to be provided."
                     )
 
             thop.attention(

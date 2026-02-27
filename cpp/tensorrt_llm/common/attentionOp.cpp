@@ -776,7 +776,8 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     int const total_v_dim_all_heads
         = mNumAttnHeads * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
     bool const useSageAttnSeparateQkv = mEnableContextFMHA && !mIsMLAEnabled && mFmhaDispatcher->isSeparateQAndKvInput()
-        && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0);
+        && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0)
+        && mFP8ContextFMHA;
 
     // Packed fp8 qkv buffer size for normal fp8 context FMHA
     size_t fp8_qkv_buffer_size = mFP8ContextFMHA && mEnableContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
@@ -803,7 +804,7 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
             fp8_v_buf_size = mChunkPrefillBufferBatchSize * max_num_tokens * static_cast<size_t>(total_v_dim_all_heads);
         }
     }
-    else if (useSageAttnSeparateQkv && mFP8ContextFMHA)
+    else if (useSageAttnSeparateQkv)
     {
         fp8_q_buf_size = max_num_tokens * static_cast<size_t>(local_hidden_units_qo);
         fp8_k_buf_size = max_num_tokens * static_cast<size_t>(local_hidden_units_kv);
@@ -1461,7 +1462,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
     int const total_v_dim_all_heads
         = mNumAttnHeads * dim_v_per_head; // Assuming effective num_kv_heads = head_num for layout
     bool const useSageAttnSeparateQkv = mEnableContextFMHA && !mIsMLAEnabled && mFmhaDispatcher->isSeparateQAndKvInput()
-        && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0);
+        && (mSageAttnNumEltsPerBlkQ > 0 || mSageAttnNumEltsPerBlkK > 0 || mSageAttnNumEltsPerBlkV > 0)
+        && mFP8ContextFMHA;
 
     // Packed fp8 qkv buffer size for normal fp8 context FMHA
     size_t fp8_qkv_buffer_size = mEnableContextFMHA && mFP8ContextFMHA && !mFmhaDispatcher->isSeparateQAndKvInput()
@@ -1488,7 +1490,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             fp8_v_buf_size = params.total_kv_len * static_cast<size_t>(total_v_dim_all_heads);
         }
     }
-    else if (useSageAttnSeparateQkv && mFP8ContextFMHA)
+    else if (useSageAttnSeparateQkv)
     {
         fp8_q_buf_size = params.num_tokens * static_cast<size_t>(local_hidden_units_qo);
         fp8_k_buf_size = params.total_kv_len * static_cast<size_t>(local_hidden_units_kv);
@@ -1818,9 +1820,13 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             if (useSageAttnSeparateQkv)
             {
                 TLLM_CHECK_WITH_INFO(
-                    mFP8ContextFMHA, "SageAttention SeparateQkv kernel runs under mFP8ContextFMHA option.");
+                    mFP8ContextFMHA, "SageAttention kernel runs under mFP8ContextFMHA option.");
+                TLLM_CHECK_WITH_INFO(
+                    mFmhaDispatcher->isSupported(), "SageAttention has no unfused fallback implemented.");
                 TLLM_CHECK_WITH_INFO(mSageAttnNumEltsPerBlkV == 1,
-                    "SageAttention SeparateQkv V quantization currently only supports mSageAttnNumEltsPerBlkV == 1.");
+                    "SageAttention V quantization currently only supports mSageAttnNumEltsPerBlkV == 1.");
+                TLLM_CHECK_WITH_INFO(!params.kv_scale_quant_orig,
+                    "SageAttention disregards the configured params.kv_scale_quant_orig, invalidating the result.");
 
                 tc::SageQuantQkParams qkParams{};
                 qkParams.headDim = getHeadSize();
@@ -3205,6 +3211,10 @@ std::string AttentionOp::toString() const
     ss << "mPosShiftEnabled: " << std::boolalpha << mPosShiftEnabled << std::endl;
     ss << "mPagedContextFMHA: " << std::boolalpha << mPagedContextFMHA << std::endl;
     ss << "mFP8ContextFMHA: " << std::boolalpha << mFP8ContextFMHA << std::endl;
+    ss << "mSageAttnNumEltsPerBlkQ: " << mSageAttnNumEltsPerBlkQ << std::endl;
+    ss << "mSageAttnNumEltsPerBlkK: " << mSageAttnNumEltsPerBlkK << std::endl;
+    ss << "mSageAttnNumEltsPerBlkV: " << mSageAttnNumEltsPerBlkV << std::endl;
+    ss << "mSageAttnQkInt8: " << std::boolalpha << mSageAttnQkInt8 << std::endl;
     ss << "mFP8AttenOutput: " << std::boolalpha << mFP8AttenOutput << std::endl;
     ss << "mFP8ContextMLA: " << std::boolalpha << mFP8ContextMLA << std::endl;
     ss << "mDenseContextFMHA: " << std::boolalpha << mDenseContextFMHA << std::endl;
