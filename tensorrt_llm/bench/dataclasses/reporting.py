@@ -393,6 +393,7 @@ class ReportUtility:
         stats_dict["world_info"] = {
             "tp_size": self.rt_cfg.mapping["tp_size"],
             "pp_size": self.rt_cfg.mapping["pp_size"],
+            "cp_size": self.rt_cfg.mapping["cp_size"],
             "ep_size": self.rt_cfg.mapping["moe_ep_size"],
             "world_size": self.rt_cfg.mapping["world_size"],
             "max_batch_size": self.rt_cfg.settings_config.max_batch_size,
@@ -615,6 +616,7 @@ class ReportUtility:
             "===========================================================\n"
             f"TP Size:                {world_info['tp_size']}\n"
             f"PP Size:                {world_info['pp_size']}\n"
+            f"CP Size:                {world_info['cp_size']}\n"
             f"EP Size:                {world_info['ep_size']}\n"
             f"Max Runtime Batch Size: {world_info['max_batch_size']}\n"
             f"Max Runtime Tokens:     {world_info['max_num_tokens']}\n"

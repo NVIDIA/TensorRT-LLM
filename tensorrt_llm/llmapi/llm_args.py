@@ -27,6 +27,7 @@ except ImportError:
 
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
+from tensorrt_llm.mapping import CpType
 
 from .._utils import mpi_rank
 
@@ -3306,6 +3307,10 @@ def update_llm_args_with_extra_dict(
             base_kv_config = base_kv_config.model_dump(exclude_unset=True)
         llm_args_dict['kv_cache_config'] = base_kv_config | llm_args_dict[
             'kv_cache_config']
+
+    if llm_args_dict.get("context_parallel_size", 1) > 1 and llm_args_dict.get(
+            "cp_config", None) is None:
+        llm_args_dict["cp_config"] = {"cp_type": CpType.ULYSSES}
 
     field_mapping = {
         "quant_config": QuantConfig,

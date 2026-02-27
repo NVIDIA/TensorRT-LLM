@@ -530,6 +530,26 @@ class Mapping(MappingBase):
                          enable_attention_dp=enable_attention_dp,
                          enable_lm_head_tp_in_adp=enable_lm_head_tp_in_adp)
 
+    def repurpose_ulysses_cp_to_tp(self):
+        # In ulysses parallelism, CP is relevant only for the FFN layer. These ranks are repurposed to TP
+        # for attention layers.
+        assert self.has_cp_ulysses()
+        return Mapping(
+            world_size=self.world_size,
+            rank=self.rank,
+            gpus_per_node=self.gpus_per_node,
+            cp_size=1,
+            cp_config={},
+            tp_size=self.tp_size * self.cp_size,
+            pp_size=self.pp_size,
+            pp_partition=self.pp_partition,
+            moe_cluster_size=self.moe_cluster_size,
+            moe_tp_size=self.moe_tp_size * self.cp_size,
+            moe_ep_size=self.moe_ep_size,
+            # attn_tp_size, attn_cp_size shall be set in the constructor of Mapping.
+            enable_attention_dp=self.enable_attention_dp,
+            enable_lm_head_tp_in_adp=self.enable_lm_head_tp_in_adp)
+
     def repurpose_helix_cp_to_tp(self):
         # In helix parallelism, CP is relevant only for the attention layer. These ranks are repurposed to TP
         # for FFN layers.
@@ -627,11 +647,13 @@ class MpiTopology(Mapping):
 
     def _init_parallel_groups(self):
         # init pp group
+        self.pp_groups = []
         for i in range(self.tp_size * self.cp_size):
             ranks = range(i, self.world_size, self.tp_size * self.cp_size)
             self.pp_groups.append(list(ranks))
 
         # init cp group (consecutive ranks within each tp slice).
+        self.cp_groups = []
         for i in range(self.pp_size):
             for j in range(self.tp_size):
                 ranks = range(
@@ -640,6 +662,7 @@ class MpiTopology(Mapping):
                 self.cp_groups.append(list(ranks))
 
         # init tp group (interleaved ranks with stride of cp_size).
+        self.tp_groups = []
         for i in range(self.pp_size):
             for j in range(self.cp_size):
                 ranks = range(i * self.tp_size * self.cp_size + j,
@@ -648,6 +671,7 @@ class MpiTopology(Mapping):
                 self.tp_groups.append(list(ranks))
 
         # init moe tp group
+        self.moe_tp_groups = []
         for i in range(self.pp_size):
             for j in range(self.moe_cluster_size * self.moe_ep_size):
                 ranks = range(i * self.moe_tp_cluster_ep_size + j,
@@ -656,6 +680,7 @@ class MpiTopology(Mapping):
                 self.moe_tp_groups.append(list(ranks))
 
         # init moe cluster group
+        self.moe_cluster_groups = []
         for i in range(self.pp_size):
             for j in range(self.moe_tp_size):
                 ranks = range(
@@ -666,6 +691,7 @@ class MpiTopology(Mapping):
                 self.moe_cluster_groups.append(list(ranks))
 
         # init moe ep group
+        self.moe_ep_groups = []
         for i in range(self.pp_size):
             for j in range(self.moe_tp_size):
                 for k in range(self.moe_cluster_size):

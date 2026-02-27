@@ -178,6 +178,9 @@ class BaseLLM:
                 logger.info("Using LLM with TensorRT backend")
                 llm_args_cls = TrtLlmArgs
 
+            if "cp_config" in kwargs and not kwargs["cp_config"]:
+                kwargs.pop("cp_config")
+
             # check the kwargs and raise ValueError directly
             valid_keys = set(
                 list(llm_args_cls.model_fields.keys()) +
