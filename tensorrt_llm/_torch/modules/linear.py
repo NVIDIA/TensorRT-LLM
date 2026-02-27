@@ -2795,69 +2795,28 @@ class Linear(nn.Module):
                             allow_window_output,
                             output_dtype=self.dtype or input.dtype)
                         if window_out is not None:
-                            output = self.quant_method.apply_out(
-                                self, input, bias, window_out)
-                            # apply_out may fall back (e.g. float8) and return a
-                            # new tensor; window path is not used in that case.
-                            if output.data_ptr() != window_out.data_ptr():
-                                logger.warning_once(
-                                    "NCCL window output path not used: apply_out did not write "
-                                    "into the provided buffer (e.g. float8 where torch.matmul(out=) "
-                                    "is unsupported). Proceeding with non-window buffer.",
-                                    key="linear_apply_out_window_fallback",
-                                )
+                            # Pre-check float8: torch.matmul(out=) is unsupported,
+                            # so apply_out would fall back. Avoids data_ptr()
+                            # comparison inside the dynamo-traced region.
+                            if (not self.use_custom_cublas_mm
+                                    and input.dtype in (torch.float8_e4m3fn,
+                                                        torch.float8_e5m2)):
                                 window_out = None
+                                output = self.apply_linear(
+                                    input, bias, lora_params, layer_idx)
+                            else:
+                                output = self.quant_method.apply_out(
+                                    self, input, bias, window_out)
                         else:
                             output = self.apply_linear(input, bias, lora_params,
                                                        layer_idx)
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
-                    window_success = (window_attempted
-                                      and window_out is not None
-                                      and output.data_ptr()
-                                      == window_out.data_ptr())
-                    window_info = ""
-                    if window_attempted:
-                        window_info = f" (path={window_path})"
-                    if window_success:
-                        window_bytes = window_out.numel(
-                        ) * window_out.element_size()
-                        window_info += (
-                            f" (size_bytes={window_bytes}, ptr={hex(window_out.data_ptr())}, "
-                            f"shape={tuple(window_out.shape)})")
-                    else:
-                        try:
-                            output_shape = list(input.shape)
-                            if output_shape:
-                                output_shape[-1] = self.out_features
-                            output_bytes = math.prod(
-                                output_shape) * input.element_size()
-                            capture = torch.cuda.is_current_stream_capturing()
-                            window_info += (
-                                f" (capture={capture}, size_bytes={output_bytes})"
-                            )
-                        except Exception:
-                            pass
-                        if not window_attempted:
-                            window_info += " (attempted=False, reason=no_apply_out)"
+                    window_success = window_attempted and window_out is not None
                     logger.debug(
-                        f"Linear GEMM NCCL window output buffer: "
-                        f"{'success' if window_success else 'failure'}{window_info}"
-                    )
-                    if window_out is not None:
-                        try:
-                            logger.debug(
-                                "Linear GEMM allreduce input (use_window=%s, out_ptr=%s, window_ptr=%s, "
-                                "out_dtype=%s, out_size_bytes=%d)",
-                                output.data_ptr() == window_out.data_ptr(),
-                                hex(output.data_ptr()),
-                                hex(window_out.data_ptr()),
-                                output.dtype,
-                                output.numel() * output.element_size(),
-                            )
-                        except Exception:
-                            pass
+                        "Linear GEMM NCCL window output buffer: %s (path=%s)",
+                        "success" if window_success else "failure", window_path)
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:
