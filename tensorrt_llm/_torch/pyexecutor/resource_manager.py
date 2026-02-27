@@ -15,7 +15,7 @@ import tensorrt_llm.bindings
 from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
-                                 torch_comm)
+                                 prefer_pinned, torch_comm)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -351,7 +351,8 @@ class KVCacheManager(BaseResourceManager):
         self.attention_dp_events_gather_period_ms = kv_cache_config.attention_dp_events_gather_period_ms
         self.max_num_tokens = max_num_tokens
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
-        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+        self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
+                                       1) if spec_config is not None else 0
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -548,14 +549,14 @@ class KVCacheManager(BaseResourceManager):
         self.max_blocks_per_seq = self.impl.max_blocks_per_seq
         self.enable_block_reuse = kv_cache_config.enable_block_reuse
         self.enable_partial_reuse = kv_cache_config.enable_partial_reuse
-        self.host_kv_cache_block_offsets = torch.empty(self.num_pools,
-                                                       max_batch_size *
-                                                       max_beam_width,
-                                                       2,
-                                                       self.max_blocks_per_seq,
-                                                       dtype=torch.int32,
-                                                       pin_memory=True,
-                                                       device='cpu')
+        self.host_kv_cache_block_offsets = torch.empty(
+            self.num_pools,
+            max_batch_size * max_beam_width,
+            2,
+            self.max_blocks_per_seq,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+            device='cpu')
 
     def shutdown(self):
         self.impl.release_pools()
@@ -1702,7 +1703,7 @@ class KVCacheManagerV2(BaseResourceManager):
         ] for pool_id in range(self.num_pools)],
                                                    dtype=torch.int64,
                                                    device="cpu",
-                                                   pin_memory=True)
+                                                   pin_memory=prefer_pinned())
 
         if kv_cache_config.dtype == "nvfp4":
             self.kv_cache_pool_pointers = torch.stack([
@@ -1714,7 +1715,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 ] for pool_id in range(self.num_pools)],
                              dtype=torch.int64,
                              device="cpu",
-                             pin_memory=True)
+                             pin_memory=prefer_pinned())
             ],
                                                       dim=-1)
 
@@ -1750,7 +1751,7 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_cache_pool_mapping = torch.tensor(kv_cache_pool_mapping_list,
                                                   dtype=torch.int32,
                                                   device="cpu",
-                                                  pin_memory=True)
+                                                  pin_memory=prefer_pinned())
 
         # Pad max_blocks_per_seq to next multiple of 4 for copy_block_offsets kernel
         self.max_blocks_per_seq = (max_seq_len + tokens_per_block -
@@ -1776,11 +1777,11 @@ class KVCacheManagerV2(BaseResourceManager):
         self.index_mapper = IndexMapper(max_batch_size + 1, max_beam_width)
         self.index_scales = torch.empty(self.num_pools,
                                         dtype=torch.int32,
-                                        pin_memory=True,
+                                        pin_memory=prefer_pinned(),
                                         device='cpu')
         self.kv_offset = torch.empty(self.num_pools,
                                      dtype=torch.int32,
-                                     pin_memory=True,
+                                     pin_memory=prefer_pinned(),
                                      device='cpu')
         for pool_id in range(self.num_pools):
             layer_id = self.impl.layer_grouping[pool_id][0]
@@ -1800,7 +1801,7 @@ class KVCacheManagerV2(BaseResourceManager):
             2,  # key and value
             self.max_blocks_per_seq,
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
             device='cpu')
 
     @property
