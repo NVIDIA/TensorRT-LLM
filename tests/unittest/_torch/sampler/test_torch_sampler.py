@@ -1128,6 +1128,7 @@ class TestBatchedSampling:
                 # Code paths excluded by this choice are addressed by test_select_generated_logits
                 return []
 
+            @property
             def context_requests(self) -> list[LlmRequest]:
                 return self.context_requests_chunking + self.context_requests_last_chunk
 
@@ -1138,7 +1139,7 @@ class TestBatchedSampling:
 
             def all_requests(self) -> list[LlmRequest]:
                 # The sampling code relies on this ordering assumption
-                return self.context_requests() + self.generation_requests
+                return self.context_requests + self.generation_requests
 
         with torch.inference_mode(True):
             return cast(

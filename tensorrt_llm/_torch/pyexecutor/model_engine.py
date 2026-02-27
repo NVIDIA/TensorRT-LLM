@@ -2103,7 +2103,7 @@ class PyTorchModelEngine(ModelEngine):
         # (start_idx, end_idx, seq_slot) for first_draft requests
         first_draft_input_ids_positions = []
 
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             all_prompt_tokens = request.get_tokens(0)
             draft_lens.append(0)
@@ -2925,7 +2925,7 @@ class PyTorchModelEngine(ModelEngine):
         request_ids = []
         multimodal_params_list = []
 
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             prompt_tokens = request.get_tokens(0)
             input_ids.extend(prompt_tokens)
             request_ids.append(request.py_request_id)
@@ -3080,7 +3080,7 @@ class PyTorchModelEngine(ModelEngine):
         # for star attention, we need customized block ids
         block_ids_per_seq = []
         num_cached_tokens_per_seq = []
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             request_ids.append(request.py_request_id)
             prompt_lengths.append(request.py_prompt_len)
 
@@ -3138,7 +3138,7 @@ class PyTorchModelEngine(ModelEngine):
             num_cached_tokens_per_seq.append(past_seen_token_num)
             request.cached_tokens = num_cached_tokens_per_seq[-1]
         num_contexts = len(sequence_lengths)
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             ctx_iter = request.ctx_iters
             ctx_blocks = request.ctx_blocks
             ctx_position_blocks = request.ctx_position_blocks
@@ -3644,13 +3644,13 @@ class PyTorchModelEngine(ModelEngine):
         if not multimodal_params or len(multimodal_params) == 0:
             # Return empty embeddings if no multimodal data
             return {'mm_embeddings': []}
-        if getattr(scheduled_requests.context_requests()[0],
-                   'multimodal_lengths', None) is None:
+        if getattr(scheduled_requests.context_requests[0], 'multimodal_lengths',
+                   None) is None:
             multimodal_chunks = None
         else:
             multimodal_chunks = [
                 sum(request.multimodal_lengths)
-                for request in scheduled_requests.context_requests()
+                for request in scheduled_requests.context_requests
                 if request.multimodal_lengths is not None
             ]
         # For mm_encoder_only mode, we only run the vision encoder part

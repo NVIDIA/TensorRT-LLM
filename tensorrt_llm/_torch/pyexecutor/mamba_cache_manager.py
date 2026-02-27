@@ -126,7 +126,7 @@ class CppMambaCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
-            i.py_request_id for i in scheduled_batch.context_requests()
+            i.py_request_id for i in scheduled_batch.context_requests
         ]
         generation_ids = [
             i.py_request_id for i in scheduled_batch.generation_requests
@@ -380,7 +380,7 @@ class PythonMambaCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         context_ids = [
-            i.py_request_id for i in scheduled_batch.context_requests()
+            i.py_request_id for i in scheduled_batch.context_requests
         ]
         generation_ids = [
             i.py_request_id for i in scheduled_batch.generation_requests

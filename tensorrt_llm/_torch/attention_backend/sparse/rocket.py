@@ -1004,7 +1004,7 @@ class RocketKVCacheManager(KVCacheManager):
 
     def prepare_resources(self, scheduled_batch):
         super().prepare_resources(scheduled_batch)
-        for req in scheduled_batch.context_requests():
+        for req in scheduled_batch.context_requests:
             request_id = req.py_request_id
             num_tokens = req.prompt_len
             kt_token_num = math.ceil(num_tokens / self.page_size)
@@ -1020,7 +1020,7 @@ class RocketKVCacheManager(KVCacheManager):
                          scheduled_batch,
                          attn_metadata: AttentionMetadata = None,
                          kv_cache_dtype_byte_size: float = None):
-        for request in scheduled_batch.context_requests():
+        for request in scheduled_batch.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 seq_len = request.get_num_tokens(0)
                 rewind_len = max(seq_len - 1 - self.prompt_budget, 0)

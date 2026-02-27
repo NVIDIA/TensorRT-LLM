@@ -72,7 +72,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests()
+        context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:

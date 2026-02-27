@@ -577,7 +577,7 @@ class ADEngine(ModelEngine):
         )
 
         # requests in order of context, generate
-        context_requests = scheduled_requests.context_requests()
+        context_requests = scheduled_requests.context_requests
         extend_requests = [
             r for r in scheduled_requests.generation_requests if get_draft_token_length(r) > 0
         ]

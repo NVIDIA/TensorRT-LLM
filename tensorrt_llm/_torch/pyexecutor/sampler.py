@@ -3812,14 +3812,14 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
                 self.model_config,
                 self.world_config,
                 self.decoding_config,
-                scheduled_requests.context_requests(),
+                scheduled_requests.context_requests,
                 self.logits_datatype,
                 self.store["decoder_input_buffers"][self.micro_batch_idx],
                 self.store["decoder_state"],
                 self.store["cuda_stream"],
                 self.algs.decoder.decoder_stream,  # type: ignore
                 self.max_seq_len,
-                self.beam_width(scheduled_requests.context_requests()),
+                self.beam_width(scheduled_requests.context_requests),
             )
         )
 
@@ -3894,7 +3894,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         make_decoding_batch_input(
             decoder_input_buffers,
             decoder_state,
-            scheduled_requests.context_requests(),
+            scheduled_requests.context_requests,
             scheduled_requests.generation_requests,
             model_outputs["logits"],
             beam_width,

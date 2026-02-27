@@ -76,7 +76,7 @@ class Eagle3ResourceManager(BaseResourceManager):
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests()
+        context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors and update slot ids
         self.slot_ids = []
         for req in context_batch:
