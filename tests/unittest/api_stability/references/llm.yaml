@@ -212,7 +212,7 @@ methods:
         default: null
         status: prototype
       ray_worker_nsight_options:
-        annotation: Optional[dict]
+        annotation: Optional[dict[str, str]]
         default: null
         status: prototype
       enable_sleep:
