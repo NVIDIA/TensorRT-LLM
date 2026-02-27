@@ -523,7 +523,8 @@ __global__ void moeA2ADispatchKernel(int32_t const* token_selected_experts, // [
             // Barrier index 0 is reserved for dispatch.
             // Only the last-token warp (one warp across all CTAs) participates as a coop.
             ncclCoopWarp coop = ncclCoopWarp();
-            ncclLsaBarrierSession barrier(coop, dev_comm, ncclTeamTagLsa{}, /*index=*/0, /*multimem=*/true);
+            // TODO: Pass multimem=true when devComm is created with lsaMultimem support.
+            ncclLsaBarrierSession barrier(coop, dev_comm, ncclTeamTagLsa{}, /*index=*/0);
             barrier.sync(coop, cuda::memory_order_relaxed);
 #endif
         }
@@ -1010,6 +1011,7 @@ __global__ void moeA2ACombineKernel(
             if (elected)
             {
                 ncclCoopWarp coop;
+                // TODO: Pass multimem=true when devComm is created with lsaMultimem support.
                 ncclLsaBarrierSession barrier(coop, dev_comm, ncclTeamTagLsa{}, /*index=*/1);
                 barrier.sync(coop, cuda::memory_order_relaxed);
 

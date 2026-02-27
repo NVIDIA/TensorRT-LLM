@@ -117,12 +117,11 @@ public:
         return inst;
     }
 
-    void initialize(int epSize, int epRank, int numLsaBarriers, bool multimem)
+    void initialize(int epSize, int epRank, int numLsaBarriers)
     {
         if (mInitialized)
         {
-            TORCH_CHECK(
-                mEpSize == epSize && mEpRank == epRank && mNumLsaBarriers == numLsaBarriers && mMultimem == multimem,
+            TORCH_CHECK(mEpSize == epSize && mEpRank == epRank && mNumLsaBarriers == numLsaBarriers,
                 "MoeA2AComm already initialized with different parameters");
             return;
         }
@@ -137,15 +136,15 @@ public:
         TLLM_NCCL_CHECK(ncclCommInitRank(&mNcclComm, epSize, ncclId, epRank));
 
         // Create device communicator with LSA barrier support (collective call)
+        // TODO: When NCCL >= 2.29 is available, use ncclCommQueryProperties() to query
+        // multimemSupport and enable lsaMultimem for hardware-accelerated barriers.
         ncclDevCommRequirements reqs = {};
         reqs.lsaBarrierCount = numLsaBarriers;
-        reqs.lsaMultimem = multimem;
         TLLM_NCCL_CHECK(ncclDevCommCreate(mNcclComm, &reqs, &mDevComm));
 
         mEpSize = epSize;
         mEpRank = epRank;
         mNumLsaBarriers = numLsaBarriers;
-        mMultimem = multimem;
         mInitialized = true;
     }
 
@@ -177,7 +176,6 @@ private:
     int mEpSize = 0;
     int mEpRank = 0;
     int mNumLsaBarriers = 0;
-    bool mMultimem = false;
     bool mInitialized = false;
 };
 
@@ -217,8 +215,7 @@ torch::Tensor moeA2AInitializeOp(torch::Tensor const& workspace, int64_t epRank,
     //   - Index 0: dispatch barrier (warp 0 of last-token CTA)
     //   - Index 1: combine barrier (warp 0 of an elected CTA, other CTAs wait via local_token_counter)
     // This is a collective call -- all EP ranks must participate.
-    MoeA2AComm::instance().initialize(
-        static_cast<int>(epSize), static_cast<int>(epRank), /*numLsaBarriers=*/2, /*multimem=*/true);
+    MoeA2AComm::instance().initialize(static_cast<int>(epSize), static_cast<int>(epRank), /*numLsaBarriers=*/2);
 
     return metainfo;
 }
