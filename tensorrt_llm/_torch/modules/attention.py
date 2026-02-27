@@ -1061,7 +1061,8 @@ class MLA(nn.Module):
             raise ValueError(
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
-        if self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb:
+        if (self.is_dsa and self.short_seq_mha_threshold > 0
+                and not self.apply_rotary_emb):
             # Dense MHA attention backend for the short-seq path. Uses plain
             # TrtllmAttention (sparse_attention_config=None) because this path
             # computes dense attention over all tokens. TrtllmAttention has no
@@ -1098,8 +1099,10 @@ class MLA(nn.Module):
             self.create_weights()
 
     def create_weights(self):
-        # self.mha/mqa has no weights but has states that are related to quant_config,
-        # which could be modified after __init__
+        # self.mha/mqa has no weights but has states that are related to
+        # quant_config, which could be modified after __init__.
+        # self.mha is non-None for non-DSA models (standard MHA) and for DSA
+        # models when the short-seq MHA optimization is active.
         if self.mha is not None:
             self.mha.update_quant_config(self.quant_config)
         self.mqa.update_quant_config(self.quant_config)
@@ -1545,6 +1548,10 @@ class MLA(nn.Module):
         output: torch.Tensor,
         latent_cache: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Dense MHA context path: expand KV via kv_b_proj and run attention.
+
+        Used by non-DSA models and as the short-seq MHA fallback for DSA models.
+        """
         kv = self.kv_b_proj(compressed_kv)
         k_nope, v = kv.split(
             [
@@ -1564,6 +1571,9 @@ class MLA(nn.Module):
         maybe_compiled_copy_(
             k[..., :self.qk_nope_head_dim],
             k_nope.view(-1, self.num_heads_tp, self.qk_nope_head_dim))
+        # When rope_fusion=True (apply_rotary_emb=False), the rope portion
+        # of k is left uninitialized here; the fused attention kernel
+        # handles k_pe RoPE via latent_cache instead.
         if self.apply_rotary_emb:
             k[..., self.qk_nope_head_dim:] = k_pe.view(-1, 1,
                                                        self.qk_rope_head_dim)
@@ -1600,6 +1610,23 @@ class MLA(nn.Module):
         topk_indices: Optional[torch.Tensor] = None,
         position_ids: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        """Run context-phase attention for DSA models.
+
+        Dispatches to the short-seq MHA path (forward_context_default) when
+        the total packed context tokens are within the threshold, or falls
+        through to the absorption/sparse MLA path otherwise.
+
+        Args:
+            q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
+            compressed_kv: Latent KV, shape [num_ctx_tokens, kv_lora_rank].
+            k_pe: RoPE key portion, shape [num_ctx_tokens, qk_rope_head_dim].
+            attn_metadata: Attention metadata for the current batch.
+            output: Pre-allocated output tensor, written in-place.
+            latent_cache: Concatenated [compressed_kv, k_pe] for KV cache.
+            topk_indices: Sparse routing indices from the indexer (None when
+                the short-seq MHA path is used).
+            position_ids: Token position IDs (required for short-seq MHA).
+        """
         # Short-sequence MHA: bypass absorption path for short prefills,
         # using kv_b_proj expansion + standard attention instead.
         # See __init__ comment for rationale. topk_indices is not used

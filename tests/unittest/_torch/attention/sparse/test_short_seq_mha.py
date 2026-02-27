@@ -807,9 +807,11 @@ def test_short_mha_agrees_with_absorption_path():
     assert torch.isfinite(output_absorption).all()
 
     abs_error = (output_short - output_absorption).abs()
-    # Use relaxed tolerance because the two paths use different math
-    # (kv_b_proj expansion + SDPA vs absorption BMMs + sparse MLA kernel).
-    torch.testing.assert_close(output_short, output_absorption, rtol=0.15, atol=0.15)
+    # The two paths use different intermediate representations (kv_b_proj
+    # expansion + dense attention vs absorption BMMs + sparse MLA kernel),
+    # so bf16 accumulation differences are expected. The tolerance is set
+    # based on observed max errors (~0.06) with headroom for variance.
+    torch.testing.assert_close(output_short, output_absorption, rtol=0.08, atol=0.08)
     print(f"[a_b_test] PASSED: max_error={abs_error.max():.4f}, mean_error={abs_error.mean():.6f}")
 
     kv_cache_manager_short.shutdown()
