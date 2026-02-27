@@ -1,7 +1,7 @@
 import operator
 from abc import ABC, abstractmethod
 from collections import defaultdict
-from functools import partial
+from functools import lru_cache, partial
 from itertools import chain
 from typing import Callable, Dict, List, Tuple
 
@@ -344,9 +344,6 @@ class FuseGemms(BaseTransform):
         return gm, info
 
 
-_QUANT_FUSERS = {}
-
-
 def _get_op_key(node: Node):
     """Get canonical op key for grouping nodes by quantization scheme.
 
@@ -357,15 +354,13 @@ def _get_op_key(node: Node):
     return target.overloadpacket if hasattr(target, "overloadpacket") else target
 
 
+@lru_cache(maxsize=None)
 def _get_quant_fuser(op_key):
     """Get or create a lightweight QuantizationFusionMixin adapter for quantized GDN fusion.
 
     Reuses fuse_rule and build_custom_args_for_linear from the existing FP8/FP4
     fusion classes without requiring BaseTransform config.
     """
-    if op_key in _QUANT_FUSERS:
-        return _QUANT_FUSERS[op_key]
-
     # Lazily resolved: fusion classes are defined later in this module.
     # Use getattr to avoid AttributeError when an op is not yet registered.
     _OP_TO_CLS = {
@@ -377,10 +372,9 @@ def _get_quant_fuser(op_key):
         _OP_TO_CLS[_fg_fp8_op] = FuseFineGrainedFP8Gemms
     src_cls = _OP_TO_CLS.get(op_key)
     if src_cls is None:
-        _QUANT_FUSERS[op_key] = None
         return None
 
-    adapter = type(
+    return type(
         f"_MixedChildren{src_cls.__name__}",
         (QuantizationFusionMixin,),
         {
@@ -390,8 +384,6 @@ def _get_quant_fuser(op_key):
             "build_custom_args_for_linear": src_cls.build_custom_args_for_linear,
         },
     )()
-    _QUANT_FUSERS[op_key] = adapter
-    return adapter
 
 
 @TransformRegistry.register("fuse_gemms_mixed_children")
