@@ -784,7 +784,8 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
         "torch_compile, fast_mode", [(False, False), (True, False),
                                      (True, True)],
         ids=["eager", "torch_compile", "torch_compile_fast"])
-    def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile):
+    def test_fp4_tp2pp2(self, enable_gemm_allreduce_fusion, torch_compile,
+                        fast_mode):
         model_path = f"{llm_models_root()}/llama-3.3-models/Llama-3.3-70B-Instruct-FP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
