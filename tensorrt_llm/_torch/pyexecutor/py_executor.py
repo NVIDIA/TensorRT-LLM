@@ -3300,20 +3300,15 @@ class PyExecutor:
                 #    is True, which would hide the prepended logits since
                 #    they are the only entry at this point.
                 #
-                # WAR: temporarily disable exclusion, read the logits now,
-                # then set the tensor directly on LlmResult as an instance
-                # attribute.  This shadows __getattr__ so the consumer
-                # always gets the correct, frozen logits.
+                # WAR: read the logits now (bypassing exclusion), then set
+                # the tensor directly on LlmResult as an instance attribute.
+                # This shadows __getattr__ so the consumer always gets the
+                # correct, frozen logits.
                 has_prepended_logits = self._has_prepended_logits(req)
-                logits_snapshot = None
-                if has_prepended_logits:
-                    req.set_exclude_last_generation_logits(False)
-                    try:
-                        logits_snapshot = req.py_result.generation_logits
-                    finally:
-                        req.set_exclude_last_generation_logits(True)
+                logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
+                                   if has_prepended_logits else None)
                 response = req.create_response(False, self.dist.rank)
-                if has_prepended_logits and response is not None:
+                if logits_snapshot is not None and response is not None:
                     response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
 
