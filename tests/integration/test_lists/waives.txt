@@ -348,3 +348,7 @@ accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen
 accuracy/test_cli_flow.py::TestGpt2::test_cuda_graph SKIP (https://nvbugs/5860520)
 unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py::test_flashinfer_fused_moe_matches_torch_moe SKIP (https://nvbugs/5920779)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[dp4-cutlass-auto] SKIP (https://nvbugs/5920771)
+full:GB200/accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/5936273)
+full:GB200/accuracy/test_llm_api_pytorch.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm_eagle] SKIP (https://nvbugs/5936273)
+full:GB200/accuracy/test_llm_api_pytorch_multimodal.py::TestMistralLarge3_675B::test_nvfp4_4gpus[latency_moe_trtllm] SKIP (https://nvbugs/5936273)
+full:DGX_H100/unittest/_torch/auto_deploy/unit/multigpu/transformations/library/test_bmm_sharding.py::test_sharding[1-1] SKIP (https://nvbugs/5936322)
