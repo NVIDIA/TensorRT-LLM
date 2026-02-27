@@ -38,6 +38,12 @@ slurm_launch.sh  (generated)
   |-- srun --> slurm_run.sh       (run pytest)
 ```
 
+Both submit scripts read `AGG_CONFIG_FOLDER` and `DISAGG_CONFIG_FOLDER` environment
+variables (with defaults of `tests/scripts/perf-sanity/aggregated` and
+`tests/scripts/perf-sanity/disaggregated`) and propagate them via `PYTEST_COMMON_VARS`
+into the pytest execution environment where `test_perf_sanity.py` uses them to locate
+config files.
+
 ### `local/submit.py`
 
 Used for **local runs**. Supports both **aggregated** and **disaggregated** modes. It

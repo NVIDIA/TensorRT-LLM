@@ -6,8 +6,8 @@ from datetime import datetime
 
 import yaml
 
-AGGR_CONFIG_FOLDER = "tests/scripts/perf-sanity"
-DISAGG_CONFIG_FOLDER = "tests/integration/defs/perf/disagg/test_configs/disagg/perf-sanity"
+AGGR_CONFIG_FOLDER = os.environ.get("AGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/aggregated")
+DISAGG_CONFIG_FOLDER = os.environ.get("DISAGG_CONFIG_FOLDER", "tests/scripts/perf-sanity/disaggregated")
 
 
 def get_llm_src_default():
@@ -527,6 +527,10 @@ def main():
     nsys_prefix = ""
     tllm_profile_start_stop = ""
     if args.capture_nsys:
+        if runtime_mode == "disaggregated":
+            nsys_output = f"{work_dir}/nsys.%q{{DISAGG_SERVING_TYPE}}.rank%q{{SLURM_PROCID}}"
+        else:
+            nsys_output = f"{work_dir}/nsys.rank%q{{SLURM_PROCID}}"
         nsys_prefix = (
             "nsys profile"
             " -t cuda,nvtx,python-gil"
@@ -539,14 +543,16 @@ def main():
             " -c cudaProfilerApi"
             " --capture-range-end=stop"
             " --export=sqlite"
-            f" -o {work_dir}/nsys.rank%q{{SLURM_PROCID}}"
+            f" -o {nsys_output}"
         )
-        tllm_profile_start_stop = args.nsys_start_stop    
+        tllm_profile_start_stop = args.nsys_start_stop
 
     pytest_common_vars = (
         f"LLM_ROOT='{llm_src}' "
         f"LLM_BACKEND_ROOT='{llm_src}/triton_backend' "
         f"LLM_MODELS_ROOT='{args.llm_models_root}' "
+        f"AGG_CONFIG_FOLDER='{AGGR_CONFIG_FOLDER}' "
+        f"DISAGG_CONFIG_FOLDER='{DISAGG_CONFIG_FOLDER}' "
     )
     llmapi_launch = f"{llm_src}/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 

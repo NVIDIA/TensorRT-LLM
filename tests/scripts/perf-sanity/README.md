@@ -32,6 +32,21 @@ The submit scripts generate `slurm_launch.sh` from draft templates:
 | `jenkins/scripts/perf/local/submit.py` | Aggregated (local) | `jenkins/scripts/perf/aggregated/slurm_launch_draft.sh` |
 | `jenkins/scripts/perf/local/submit.py` | Disaggregated (local) | `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` |
 
+## Environment Variables
+
+The config folder paths can be overridden via environment variables. Both submit scripts (`local/submit.py` and `disaggregated/submit.py`) propagate these into the pytest execution environment.
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `AGG_CONFIG_FOLDER` | `tests/scripts/perf-sanity/aggregated` | Path to aggregated config YAML files |
+| `DISAGG_CONFIG_FOLDER` | `tests/scripts/perf-sanity/disaggregated` | Path to disaggregated config YAML files |
+
+**Example**: Run with custom config folders:
+```bash
+AGG_CONFIG_FOLDER=my/custom/agg DISAGG_CONFIG_FOLDER=my/custom/disagg \
+  python jenkins/scripts/perf/local/submit.py ...
+```
+
 ## Configuration Files
 
 There are two modes for perf sanity tests: aggregated (aggr) and disaggregated (disagg).
