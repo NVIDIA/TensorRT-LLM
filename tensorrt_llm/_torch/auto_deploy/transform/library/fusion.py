@@ -15,6 +15,7 @@ from ...utils._graph import delete_all_unused_submodules, eliminate_dead_code
 from ...utils.cuda_mem_tracker import cuda_memory_tracker
 from ...utils.logger import ad_logger
 from ...utils.node_utils import (
+    WeightBiasInfoCache,
     extract_weight_name,
     is_fake_quantized_linear_op,
     is_linear_op,
@@ -329,8 +330,8 @@ def _insert_fused_gemm_narrow(
         n.replace_all_uses_with(narrow_node)
         offset += size
 
-    eliminate_dead_code(gm)
-    delete_all_unused_submodules(gm)
+    # Graph cleanup (eliminate_dead_code + delete_all_unused_submodules)
+    # is deferred to FuseGdnGemms._apply to avoid repeated O(G) traversals.
     return True
 
 
@@ -464,8 +465,8 @@ def _insert_fused_quant_gemm_narrow(
         n.replace_all_uses_with(narrow_node)
         offset += size
 
-    eliminate_dead_code(gm)
-    delete_all_unused_submodules(gm)
+    # Graph cleanup (eliminate_dead_code + delete_all_unused_submodules)
+    # is deferred to FuseGdnGemms._apply to avoid repeated O(G) traversals.
     return True
 
 
@@ -497,7 +498,7 @@ class FuseGdnGemms(BaseTransform):
 
         idx = -1
         num_matches = 0
-        with cuda_memory_tracker():
+        with WeightBiasInfoCache(), cuda_memory_tracker():
             for (parent_node, op_key), lin_children in grouped_nodes.items():
                 if len(lin_children) < 2:
                     continue
@@ -514,6 +515,11 @@ class FuseGdnGemms(BaseTransform):
                     ):
                         num_matches += 1
 
+        # Run graph cleanup once after all fusions instead of per-fusion.
+        # This eliminates dead nodes first, then removes unreferenced parameters.
+        if num_matches > 0:
+            eliminate_dead_code(gm)
+            delete_all_unused_submodules(gm)
         torch.cuda.empty_cache()
 
         info = TransformInfo(
