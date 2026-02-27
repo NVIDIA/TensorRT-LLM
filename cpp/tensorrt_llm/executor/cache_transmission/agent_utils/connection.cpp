@@ -288,7 +288,7 @@ std::optional<size_t> AgentConnection::getPreAssignedBufferId(uint8_t kind) cons
 {
     for (size_t i = 0; i < mBufferKinds.size(); i++)
     {
-        if (mBufferKinds[i] == kind)
+        if (mBufferKinds[i] == kind && i < mCacheBufferIds.size())
         {
             return mCacheBufferIds[i];
         }
