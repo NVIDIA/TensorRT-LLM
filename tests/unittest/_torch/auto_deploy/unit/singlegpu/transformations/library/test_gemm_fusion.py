@@ -340,6 +340,103 @@ class GdnLikeFusableModel(TestModel):
         return qkv.sum(-1, keepdim=True) + z.sum(-1, keepdim=True) + b + a
 
 
+class Qwen35GdnLikeFusableModel(TestModel):
+    """Mirrors the actual Qwen3.5 GatedDeltaNet graph pattern more closely.
+
+    Uses proportional dimensions from the real graph and includes downstream ops
+    (reshape, sigmoid, element-wise mul) that match the actual model structure.
+    """
+
+    def __init__(
+        self,
+        batch_size=2,
+        seq_len=8,
+        hidden=256,
+        qkv_dim=96,
+        z_dim=64,
+        num_heads=8,
+        head_dim=8,
+    ):
+        super().__init__()
+        self.batch_size = batch_size
+        self.seq_len = seq_len
+        self.hidden = hidden
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+        self.in_proj_qkv = nn.Linear(hidden, qkv_dim, bias=False)
+        self.in_proj_z = nn.Linear(hidden, z_dim, bias=False)
+        self.in_proj_b = nn.Linear(hidden, num_heads, bias=False)
+        self.in_proj_a = nn.Linear(hidden, num_heads, bias=False)
+
+    def get_input(self, **kwargs) -> torch.Tensor:
+        return torch.randn(self.batch_size, self.seq_len, self.hidden, **kwargs)
+
+    @property
+    def keys_to_pop(self):
+        return ("in_proj_qkv.weight", "in_proj_z.weight", "in_proj_b.weight", "in_proj_a.weight")
+
+    @property
+    def num_gemms_after_fusion(self) -> int:
+        return 1
+
+    def forward(self, x):
+        batch_size, seq_len, _ = x.shape  # non-linear shape user
+        qkv = self.in_proj_qkv(x)
+        z = self.in_proj_z(x).reshape(batch_size, seq_len, self.num_heads, self.head_dim)
+        b = torch.sigmoid(self.in_proj_b(x))
+        a = self.in_proj_a(x) * b  # element-wise gating
+        return qkv.sum(-1, keepdim=True) + z.sum(-1).sum(-1, keepdim=True) + a.sum(-1, keepdim=True)
+
+
+@pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
+@torch.inference_mode()
+def test_fuse_gdn_gemms_qwen35_like(dtype: str):
+    torch_dtype = getattr(torch, dtype)
+    model = Qwen35GdnLikeFusableModel().to(device="cuda", dtype=torch_dtype)
+    x = model.get_input(device="cuda", dtype=torch_dtype)
+
+    y_model = model(x)
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Verify 4 linears before fusion
+    num_linears_before = sum(is_linear_op(n) for n in gm.graph.nodes)
+    assert num_linears_before == 4, f"Expected 4 linears before fusion, got {num_linears_before}"
+
+    gm_transformed = InferenceOptimizer(
+        None,
+        {
+            "fuse_gdn_gemms": {
+                "stage": "post_load_fusion",
+            },
+        },
+    )(None, gm)
+
+    run_test_transformed_gm(
+        model,
+        x,
+        gm_transformed,
+        lambda gm: sum(is_linear_op(n) for n in gm.graph.nodes) == model.num_gemms_after_fusion,
+        lambda num_p_og: num_p_og,
+        atol=1e-3,
+        rtol=1e-3,
+        test_load_hook=False,
+    )
+
+    # Verify narrow nodes exist (zero-copy view splitting)
+    narrow_count = sum(
+        1
+        for n in gm_transformed.graph.nodes
+        if n.op == "call_function" and n.target is torch.narrow
+    )
+    assert narrow_count == 4, f"Expected 4 narrow nodes, got {narrow_count}"
+
+    reset_parameters(gm_transformed)
+    y_random = gm_transformed(x)
+    assert not all_close(y_model, y_random)
+
+
 @pytest.mark.parametrize("dtype", ["float16", "bfloat16"])
 @torch.inference_mode()
 def test_fuse_gdn_gemms(dtype: str):
