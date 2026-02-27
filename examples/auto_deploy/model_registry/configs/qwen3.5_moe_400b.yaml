@@ -10,7 +10,7 @@ model_factory: AutoModelForCausalLM
 kv_cache_config:
   enable_block_reuse: true
   free_gpu_memory_fraction: 0.8
-  tokens_per_block: 64
+  tokens_per_block: 32
 model_kwargs:
   torch_dtype: bfloat16
 transforms:
@@ -20,24 +20,6 @@ transforms:
     enabled: true
   detect_sharding:
     allreduce_strategy: SYMM_MEM
-    sharding_dims: ['tp','ep', 'bmm']
-    # use only manual config for TP sharding
-    sharding_source: ['manual']
-    manual_config:
-      tp_plan:
-        # GDN layer
-        "in_proj_qkv": "delta"
-        # attention layer
-        "q_proj": "colwise"
-        "k_proj": "colwise"
-        "v_proj": "colwise"
-        "o_proj": "rowwise"
-        # replicating shared experts (keep them commented out)
-        # "shared_expert_gate_proj": "colwise"
-        # "shared_expert_up_proj": "colwise"
-        # "shared_expert_down_proj": "rowwise"
-        # gating layer should be replicated as well
-        # "gate": "gather"
   multi_stream_moe:
     stage: compile
     enabled: true
