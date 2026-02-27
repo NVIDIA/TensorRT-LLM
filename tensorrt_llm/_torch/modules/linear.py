@@ -2730,12 +2730,12 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
 
     def create_weights(self, module: Linear, in_features: int,
                        out_features: int, bias: bool, dtype: torch.dtype):
-        self.residual_dim = in_features
-        self.in_features_with_residual = in_features + self.residual_dim
-        self.reorder_index = torch.arange(in_features,
-                                          dtype=torch.int16,
-                                          requires_grad=False)
-        super().create_weights(module, self.in_features_with_residual,
+        module.residual_dim = in_features
+        module.in_features_with_residual = in_features + module.residual_dim
+        module.reorder_index = Parameter(torch.arange(in_features,
+                                                      dtype=torch.int16),
+                                         requires_grad=False)
+        super().create_weights(module, module.in_features_with_residual,
                                out_features, bias, dtype)
 
     def _input_prepare(self, module: Linear, input: torch.Tensor):
@@ -2747,10 +2747,10 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize_with_reorder_residual(
                 input,
                 module.input_scale,
-                self.reorder_index,
-                self.residual_dim,
+                module.reorder_index,
+                module.residual_dim,
                 is_act=True)
-        return act_fp4, act_sf
+        return act_fp4, act_sf, module.alpha
 
     def load_weights(self,
                      module: Linear,
@@ -2762,4 +2762,4 @@ class NVFP4ARCLinearMethod(NVFP4LinearMethod):
         """
         super().load_weights(module, weights, weight_mode,
                              allow_partial_loading)
-        self.reorder_index = weights[0]['reorder_index']
+        module.reorder_index.data = weights[0]['reorder_index']
