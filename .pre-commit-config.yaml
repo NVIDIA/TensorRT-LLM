@@ -1366,6 +1366,17 @@ common-files: &common_files |
         triton_backend/tools/whisper/client.py |
     )$
 
+# Files to be subjected to static analysis
+static-analysis-files: &static_analysis_files |
+    (?x)^(
+        tensorrt_llm/_torch/pyexecutor/sampler.py |
+        tensorrt_llm/_torch/pyexecutor/sampling_utils.py |
+        tensorrt_llm/_torch/pyexecutor/sampling_utils_flashinfer.py |
+        tests/unittest/_torch/sampler/test_torch_sampler.py |
+        tests/unittest/_torch/sampler/test_beam_search.py |
+        tests/unittest/_torch/sampler/test_beam_search_util.py |
+    )$
+
 # Global exclude pattern for vendored third-party code
 exclude: '^triton_kernels/'
 
@@ -1478,3 +1489,10 @@ repos:
         entry: ./scripts/check_pinned_memory_usage.py
         language: script
         files: ^(tensorrt_llm|triton_backend)/.*\.py$
+    -   id:  type-check
+        name: Run static analysis of type correctness using mypy (use SKIP='type-check' env. var. to bypass)
+        entry: mypy
+        language: python
+        verbose: true
+        require_serial: true  # because of install_types=true
+        files: *static_analysis_files

@@ -32,7 +32,7 @@ from ctypes import byref
 from enum import EnumMeta
 from functools import lru_cache, partial, wraps
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Sequence, Union
+from typing import Any, Callable, Dict, List, Optional, Sequence, TypeVar, Union
 
 import numpy as np
 import nvtx
@@ -915,10 +915,13 @@ def _null_context_manager():
     yield
 
 
+_T = TypeVar("_T")
+
+
 def nvtx_range(msg: str,
                color: str = "grey",
                domain: str = "TensorRT-LLM",
-               category: Optional[str] = None):
+               category: Optional[str] = None) -> Callable[[_T], _T]:
     """
     Creates an NVTX range annotation for profiling.
 

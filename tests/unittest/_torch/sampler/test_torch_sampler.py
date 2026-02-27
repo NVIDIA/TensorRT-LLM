@@ -15,7 +15,18 @@
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from itertools import product
-from typing import Callable, ContextManager, Final, Generator, Optional, Type, TypeVar, Union, cast
+from typing import (
+    Any,
+    Callable,
+    ContextManager,
+    Final,
+    Generator,
+    Optional,
+    Type,
+    TypeVar,
+    Union,
+    cast,
+)
 
 import flashinfer.sampling
 import numpy as np
@@ -24,23 +35,24 @@ import torch
 from scipy.stats import power_divergence
 from utils.util import UutProvider, assert_no_cuda_sync, force_ampere, run_test_with_warmup
 
-from tensorrt_llm._torch.pyexecutor.llm_request import convert_wordlist
-from tensorrt_llm._torch.pyexecutor.sampler import (
-    GREEDY,
+from tensorrt_llm._torch.pyexecutor.llm_request import (
     LlmRequest,
-    ScheduledRequests,
-    SimpleGroupedStrategySampler,
-    StrategyMetadata,
+    convert_wordlist,
+    get_draft_token_length,
+)
+from tensorrt_llm._torch.pyexecutor.sampler import (
     TorchSampler,
     _BatchedSamplingResult,
     _request_get_sampling_params,
     _request_strategy,
-    get_draft_token_length,
 )
 from tensorrt_llm._torch.pyexecutor.sampling_utils import (
+    GREEDY,
     BeamSearch,
     Greedy,
+    SimpleGroupedStrategySampler,
     Strategy,
+    StrategyMetadata,
     TemperatureOnly,
     TopK,
     TopKTopP,
@@ -50,6 +62,7 @@ from tensorrt_llm._torch.pyexecutor.sampling_utils import (
 from tensorrt_llm._torch.pyexecutor.sampling_utils_flashinfer import (
     FlashInferGroupedStrategySampler,
 )
+from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm.bindings import SamplingConfig
 from tensorrt_llm.bindings.executor import FinishReason
 from tensorrt_llm.sampling_params import SamplingParams
@@ -629,7 +642,7 @@ class TestFinishReasons:
             requests: list["TestFinishReasons.RequestCase"],
             *,
             check_no_cuda_sync: bool = True,
-            extra_context: Callable[[], ContextManager] | None = None,
+            extra_context: Callable[[], ContextManager[Any]] | None = None,
         ) -> UutProvider:
             @contextmanager
             def _uut_provider(is_warmup: bool) -> Generator[Callable[[], None], None, None]:
@@ -877,7 +890,9 @@ class TestBatchedSampling:
             for strategy_type, params in BASE_CASES.items():
                 if strategy_type == Greedy and not allow_greedy:
                     continue
-                strategy_name = _get_strategy_name(strategy_type)
+                strategy_name = _get_strategy_name(
+                    cast(Type[Strategy], strategy_type),
+                )
                 test_cases.append(
                     (
                         [params],
@@ -894,7 +909,9 @@ class TestBatchedSampling:
                 batch_size = rng.integers(low=1, high=max_batch_size)
                 if strategy_type == Greedy and not allow_greedy:
                     continue
-                strategy_name = _get_strategy_name(strategy_type)
+                strategy_name = _get_strategy_name(
+                    cast(Type[Strategy], strategy_type),
+                )
                 test_cases.append(
                     (
                         [params] * batch_size,
@@ -916,7 +933,6 @@ class TestBatchedSampling:
             # Batches containing requests with different sampling params
             max_sub_batch_size: Final = 6
             type_to_constrain = TopK
-            mixed_params_list = None
             for constraint_value in [
                 None,  # all sub-batches have at least two requests
                 0,  # one sub-batch omitted
@@ -925,10 +941,10 @@ class TestBatchedSampling:
                 Shuffle(),  # random ordering
                 VaryParams(),  # random ordering + randomized request parameter values
             ]:
-                mixed_params_list = []
+                mixed_params_list: list[SamplingParams] = []
                 constrained_indices = None
                 for strategy_type, params in BASE_CASES.items():
-                    sub_batch_size = rng.integers(low=2, high=max_sub_batch_size)
+                    sub_batch_size = rng.integers(low=2, high=max_sub_batch_size).item()
                     if strategy_type == Greedy and not allow_greedy:
                         continue
                     if strategy_type == type_to_constrain and constraint_value is not None:
@@ -939,7 +955,7 @@ class TestBatchedSampling:
                                 len(mixed_params_list),
                                 len(mixed_params_list) + sub_batch_size,
                             )
-                    strategy_name = _get_strategy_name(strategy_type)
+                    strategy_name = _get_strategy_name(cast(Type[Strategy], strategy_type))
                     mixed_params_list += [params] * sub_batch_size
                 label = "mixed_batch"
                 if isinstance(constraint_value, OneContinguous):
@@ -964,7 +980,7 @@ class TestBatchedSampling:
                     def _perturb_params(param: SamplingParams):
                         top_k = param.top_k
                         if top_k is not None:
-                            top_k = rng.integers(2, vocab_size // 3)
+                            top_k = int(rng.integers(2, vocab_size // 3))
                         top_p = param.top_p
                         if top_p is not None:
                             top_p *= max(rng.random(), 1e-6)
@@ -1547,10 +1563,13 @@ class TestBatchedSampling:
         # FlashInfer sampling batches requests of the same kind (e.g. top-p)
         # together even if they have different parameter values (e.g. probability thresholds).
         # This variable tracks which request types have been encountered.
-        flashinfer_keys_seen = set()
+        flashinfer_keys_seen: set[Any] = set()
 
         if use_flashinfer:
-            sample_grouped_strategies_orig = sampler._grouped_sampler_cls.sample_grouped_strategies
+            assert sampler._grouped_sampler_cls == FlashInferGroupedStrategySampler
+            sample_grouped_strategies_orig = (
+                FlashInferGroupedStrategySampler.sample_grouped_strategies
+            )
 
             def _sample_grouped_strategies(
                 group_key: FlashInferGroupedStrategySampler.STRATEGY_KEY_TYPE,
@@ -1943,9 +1962,10 @@ class TestBatchedSampling:
             axis=-1,
             lambda_="log-likelihood",  # = KL divergence
         )
+        pvalue: np.ndarray | float
         if hasattr(test_result.pvalue, "mask"):
-            assert test_result.pvalue.mask
-            pvalue = test_result.pvalue.data
+            assert test_result.pvalue.mask  # pyright: ignore
+            pvalue = test_result.pvalue.data  # pyright: ignore
         else:
             pvalue = test_result.pvalue
         if not np.all(pvalue > 0.1):  # This can happen by "chance" (many test instances)
@@ -2203,12 +2223,12 @@ class TestBatchedSampling:
 
         seq_slot_assignments = []
         for include_first, include_last in product([False, True], [False, True]):
-            total_seq_slots = rng.integers(max_seq_slots // 2, max_seq_slots)
-            start = 0 if include_first else rng.integers(margin)
-            end = total_seq_slots - (0 if include_last else rng.integers(margin))
+            total_seq_slots = rng.integers(max_seq_slots // 2, max_seq_slots).item()
+            start = 0 if include_first else rng.integers(margin).item()
+            end = total_seq_slots - (0 if include_last else rng.integers(margin).item())
             for dense in [False, True]:
                 if dense:
-                    seq_slots = range(start, end)
+                    seq_slots = list(range(start, end))
                 else:
                     allowed_slots = np.arange(start, end)
                     num_seq_slots = rng.integers(len(allowed_slots) // 2, len(allowed_slots))
@@ -2307,7 +2327,7 @@ class TestBatchedSampling:
             )
 
             req_num_steps = torch.tensor(draft_lens, dtype=torch.int32) + 1
-            total_steps = cast(int, req_num_steps.sum())
+            total_steps = cast(int, req_num_steps.sum().item())
 
             new_tokens_cuda = torch.testing.make_tensor(
                 (max_draft_len + 1, total_seq_slots, 1),
@@ -2320,7 +2340,7 @@ class TestBatchedSampling:
             if not ordered:
                 batch_req_indices = batch_req_indices[torch.randperm(batch_req_indices.numel())]
 
-            first_token = rng.integers(123456)
+            first_token = rng.integers(123456).item()
             batch_next_tokens_cuda_int = torch.arange(
                 first_token, first_token + total_steps, dtype=torch.int32, device="cuda"
             ).unsqueeze(1)  # Add a dimension for beam width

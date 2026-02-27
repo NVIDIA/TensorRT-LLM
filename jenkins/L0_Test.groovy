@@ -3670,6 +3670,11 @@ def launchTestJobs(pipeline, testFilter)
                             config = LINUX_AARCH64_CONFIG
                         }
                         withEnv(libEnv) {
+                            // run type-check hook (requires dependencies to be present)
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pre-commit mypy")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \$(pwd)/${LLM_ROOT}")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit run type-check -a")
+
                             sh "env | sort"
                             runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null, "-SubJob-RunTest")
                         }
