@@ -550,6 +550,32 @@ class SpecWorkerBase(nn.Module, ABC):
 
         return accepted_tokens, num_accepted_tokens
 
+    def _accept_draft_tokens(self, logits, draft_tokens, num_contexts,
+                             batch_size, spec_metadata):
+        """Unified draft token acceptance with automatic rejection sampling support.
+
+        Subclasses should call this instead of manually branching between
+        _sample_and_accept_draft_tokens_base and _sample_and_accept_draft_tokens_rejection.
+
+        Args:
+            logits: Target model logits
+            draft_tokens: [num_gens, draft_len] - already reshaped by the caller
+            num_contexts: Number of context (prefill) requests
+            batch_size: Total batch size
+            spec_metadata: Speculative decoding metadata
+        """
+        if self._can_use_rejection_sampling(spec_metadata, num_contexts):
+            draft_len = draft_tokens.shape[1]
+            vocab_size = spec_metadata.draft_probs_vocab_size
+            draft_probs = spec_metadata.draft_probs[:batch_size * draft_len *
+                                                    vocab_size].reshape(
+                                                        batch_size, draft_len,
+                                                        vocab_size)
+            return self._sample_and_accept_draft_tokens_rejection(
+                logits, draft_tokens, draft_probs, batch_size, spec_metadata)
+        return self._sample_and_accept_draft_tokens_base(
+            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+
     def _can_use_rejection_sampling(self, spec_metadata: SpecMetadata,
                                     num_contexts: int) -> bool:
         """
@@ -627,16 +653,12 @@ class SpecWorkerBase(nn.Module, ABC):
         else:
             full_draft_probs = draft_probs
 
-        full_draft_tokens = draft_tokens.to(torch.int32)
+        full_draft_tokens = draft_tokens.to(torch.int32).contiguous()
 
         # Lazily initialize seed/offset tensors on correct device
         if self.seed is None:
-            self.seed = torch.tensor([0],
-                                     dtype=torch.int64,
-                                     device=device)
-            self.offset = torch.tensor([0],
-                                       dtype=torch.int64,
-                                       device=device)
+            self.seed = torch.tensor([0], dtype=torch.int64, device=device)
+            self.offset = torch.tensor([0], dtype=torch.int64, device=device)
         # Increment seed for CUDA graph compatibility
         self.seed += 1
         self.seed %= (2**31)

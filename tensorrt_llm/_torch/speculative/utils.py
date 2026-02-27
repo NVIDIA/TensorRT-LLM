@@ -90,6 +90,7 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            use_rejection_sampling=spec_config.use_rejection_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(

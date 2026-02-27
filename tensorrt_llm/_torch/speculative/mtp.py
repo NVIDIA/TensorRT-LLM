@@ -928,29 +928,10 @@ class MTPWorker(SpecWorkerBase):
                 # Apply force override for THOP path
                 num_accepted_tokens = self._apply_force_accepted_tokens(
                     num_accepted_tokens, num_contexts)
-            elif self._can_use_rejection_sampling(spec_metadata, num_contexts):
-                draft_tokens = spec_metadata.draft_tokens.reshape(
-                    num_gens, mtp_num_modules)
-                vocab_size = spec_metadata.draft_probs_vocab_size
-                # Reshape to [batch_size, mtp_num_modules, vocab_size]
-                draft_probs = spec_metadata.draft_probs[:batch_size *
-                                                        mtp_num_modules *
-                                                        vocab_size].reshape(
-                                                            batch_size,
-                                                            mtp_num_modules,
-                                                            vocab_size)
-
-                # Use rejection sampling implementation
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_rejection(
-                    logits, draft_tokens, draft_probs, batch_size,
-                    spec_metadata)
             else:
-                # Reshape draft tokens for base implementation
                 draft_tokens = spec_metadata.draft_tokens.reshape(
                     num_gens, mtp_num_modules)
-
-                # Use base implementation for strict acceptance
-                accepted_tokens, num_accepted_tokens = self._sample_and_accept_draft_tokens_base(
+                accepted_tokens, num_accepted_tokens = self._accept_draft_tokens(
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 

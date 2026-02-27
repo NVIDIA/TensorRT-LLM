@@ -569,27 +569,11 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
 
-        # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(
             num_gens, self.max_draft_len)
 
-        if self._can_use_rejection_sampling(spec_metadata, num_contexts):
-            vocab_size = spec_metadata.draft_probs_vocab_size
-            # Reshape to [batch_size, max_draft_len, vocab_size]
-            draft_probs = spec_metadata.draft_probs[:batch_size *
-                                                    self.max_draft_len *
-                                                    vocab_size].reshape(
-                                                        batch_size,
-                                                        self.max_draft_len,
-                                                        vocab_size)
-
-            # Use rejection sampling implementation
-            return self._sample_and_accept_draft_tokens_rejection(
-                logits, draft_tokens, draft_probs, batch_size, spec_metadata)
-
-        # Use base implementation for strict acceptance
-        return self._sample_and_accept_draft_tokens_base(
-            logits, draft_tokens, num_contexts, batch_size, spec_metadata)
+        return self._accept_draft_tokens(logits, draft_tokens, num_contexts,
+                                         batch_size, spec_metadata)
 
     def draft_decoder(
         self,
