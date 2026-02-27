@@ -1125,5 +1125,67 @@ class TestResizeQuota(TestKVCacheManagerV2):
         self.manager.shutdown()
 
 
+class TestHeteroTokensPerBlock(TestKVCacheManagerV2):
+    def test_hetero_tokens_per_block(self) -> None:
+        layers = [
+            AttentionLayerConfig(
+                layer_id=LayerId(0),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=131072),
+                    BufferConfig(role=Role.VALUE, size=131072),
+                ],
+            ),
+            AttentionLayerConfig(
+                layer_id=LayerId(1),
+                buffers=[
+                    BufferConfig(role=Role.KEY, size=131072, tokens_per_block_override=64),
+                    BufferConfig(role=Role.VALUE, size=131072, tokens_per_block_override=64),
+                ],
+            ),
+        ]
+        self.cfg = KVCacheManagerConfig(
+            tokens_per_block=128,
+            vocab_size=1024,
+            cache_tiers=[
+                GpuCacheTierConfig(quota=256 << 20),
+                HostCacheTierConfig(quota=1 << 30),
+            ],
+            layers=layers,
+        )
+        self.engine = FakeEngine(self.cfg)
+        self.manager = KVCacheManager(self.cfg)
+        kv_cache = self.manager.create_kv_cache()
+        prompt_len = 163
+        prompt = [self.next_token() for _ in range(prompt_len)]
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        kv_cache.capacity = prompt_len
+        history = []
+        input = prompt
+        self.engine.execute([Step(kv_cache, input, history)], stream)
+        kv_cache.commit(input)
+        history.extend(input)
+        decode_len = 97
+        for _ in range(decode_len):
+            kv_cache.capacity = len(history) + 1
+            input = [self.next_token()]
+            self.engine.execute([Step(kv_cache, input, history)], stream)
+            kv_cache.commit(input)
+            history.extend(input)
+        kv_cache.close()
+
+        # test reuse.
+        second_prompt_len = 79
+        prompt = history + [self.next_token() for _ in range(second_prompt_len)]
+        kv_cache = self.manager.create_kv_cache(None, prompt)
+        kv_cache.resume(stream)
+        assert kv_cache.num_committed_tokens == len(history)
+        # empty input just for ref-check.
+        input = []
+        self.engine.execute([Step(kv_cache, input, history)], stream)
+        kv_cache.close()
+
+
 if __name__ == "__main__":
     unittest.main()
