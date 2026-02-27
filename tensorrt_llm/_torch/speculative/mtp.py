@@ -72,7 +72,7 @@ class MTPHiddenStatesManager(BaseResourceManager):
             )
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests()
+        context_batch = scheduled_batch.context_requests
         # allocate hidden state tensors
         for req in context_batch:
             if req.is_first_context_chunk:
@@ -282,7 +282,7 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
-        for req in state.scheduled_requests.context_requests():
+        for req in state.scheduled_requests.context_requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
             new_token = add_token(req, new_tokens, beam_idx=beam_idx)
@@ -352,7 +352,7 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         sampler_event = self._record_sampler_event()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             request.py_draft_tokens = [1] * self.draft_len
         return SampleStateMTP(scheduled_requests=scheduled_requests,
                               device=device,

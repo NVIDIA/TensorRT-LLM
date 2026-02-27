@@ -342,7 +342,7 @@ class KvCacheConnectorSchedulerOutputManager:
                                kv_cache_manager: "KVCacheManager"):
         scheduler_output = SchedulerOutput()
 
-        for req in scheduled_batch.context_requests():
+        for req in scheduled_batch.context_requests:
             if req.request_id in new_async_requests.loading_ids:
                 continue
 

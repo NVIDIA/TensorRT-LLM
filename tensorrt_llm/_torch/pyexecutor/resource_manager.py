@@ -581,7 +581,7 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests()
+            context_batch = scheduled_batch.context_requests
             context_requests_chunking = []
             context_requests_last_chunk = []
             generation_batch = scheduled_batch.generation_requests
@@ -784,7 +784,7 @@ class KVCacheManager(BaseResourceManager):
                 self.rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
-        for request in scheduled_batch.context_requests():
+        for request in scheduled_batch.context_requests:
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
@@ -1918,7 +1918,7 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests()
+            context_batch = scheduled_batch.context_requests
             context_requests_chunking = []
             context_requests_last_chunk = []
             generation_batch = scheduled_batch.generation_requests
@@ -2362,7 +2362,7 @@ class KVCacheManagerV2(BaseResourceManager):
             _update_kv_cache_draft_token_location(self, scheduled_batch,
                                                   attn_metadata,
                                                   kv_cache_dtype_byte_size)
-        for req in scheduled_batch.context_requests():
+        for req in scheduled_batch.context_requests:
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
@@ -2698,7 +2698,7 @@ class PeftCacheManager(BaseResourceManager):
         return 0
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
-        context_batch = scheduled_batch.context_requests()
+        context_batch = scheduled_batch.context_requests
         generation_batch = scheduled_batch.generation_requests
         for req in context_batch:
             self.add_request_peft(req)

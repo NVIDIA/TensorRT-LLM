@@ -459,7 +459,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 )
 
             def all_requests(self) -> list[LlmRequest]:
-                return self.context_requests() + self.generation_requests
+                return self.context_requests + self.generation_requests
 
         expected_num_requests = with_ctx * 3 + with_gen * 2
         expected_req_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
@@ -1113,6 +1113,7 @@ class TestBatchedSampling:
                 # Code paths excluded by this choice are addressed by test_select_generated_logits
                 return []
 
+            @property
             def context_requests(self) -> list[LlmRequest]:
                 return self.context_requests_chunking + self.context_requests_last_chunk
 
@@ -1123,7 +1124,7 @@ class TestBatchedSampling:
 
             def all_requests(self) -> list[LlmRequest]:
                 # The sampling code relies on this ordering assumption
-                return self.context_requests() + self.generation_requests
+                return self.context_requests + self.generation_requests
 
         with torch.inference_mode(True):
             return cast(

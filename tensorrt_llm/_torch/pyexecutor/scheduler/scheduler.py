@@ -54,11 +54,12 @@ class ScheduledRequests:
     def num_context_requests(self) -> int:
         return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
 
+    @property
     def context_requests(self) -> RequestList:
         return self.context_requests_chunking + self.context_requests_last_chunk
 
     def all_requests(self) -> RequestList:
-        return self.context_requests() + self.generation_requests
+        return self.context_requests + self.generation_requests
 
 
 class RequestScheduler(ABC):

@@ -296,7 +296,7 @@ class ModelDrafter(Drafter):
 
             draft_batch = ScheduledRequests()
 
-            for request in scheduled_requests.context_requests():
+            for request in scheduled_requests.context_requests:
                 if request.py_disable_speculative_decoding:
                     continue
                 if request.is_first_context_chunk:
@@ -400,11 +400,11 @@ class ModelDrafter(Drafter):
         try:
             num_context_logits_prefix_sum = [0]
             prefix_sum = 0
-            for request in draft_batch.context_requests():
+            for request in draft_batch.context_requests:
                 prefix_sum += request.context_chunk_size if request.py_return_context_logits else 1
                 num_context_logits_prefix_sum.append(prefix_sum)
 
-            HandleLogits()(draft_batch.context_requests(),
+            HandleLogits()(draft_batch.context_requests,
                            draft_batch.generation_requests, outputs["logits"],
                            self.sampler.beam_width(draft_batch.all_requests()),
                            num_context_logits_prefix_sum,
@@ -420,7 +420,7 @@ class ModelDrafter(Drafter):
     def update_request_states(self,
                               scheduled_requests: ScheduledRequests) -> None:
         """Update request states after processing."""
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:
                 request.move_to_next_context_chunk()
             if request.context_remaining_length == 0:
@@ -506,7 +506,7 @@ class ModelDrafter(Drafter):
                 break
         if all_disable_speculative_decoding:
             return False
-        for request in scheduled_batch.context_requests():
+        for request in scheduled_batch.context_requests:
             if request.is_first_context_chunk:
                 continue
             return True

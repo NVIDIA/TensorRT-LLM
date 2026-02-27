@@ -951,8 +951,7 @@ class PyExecutor:
             req_stat.reused_blocks_per_request = req.reused_blocks
             req_stat.missed_blocks_per_request = req.missed_blocks
             req_stat.kv_cache_hit_rate_per_request = req.kv_cache_hit_rate
-            req_stat.scheduled = req in scheduled_requests.context_requests(
-            ) or req in scheduled_requests.generation_requests
+            req_stat.scheduled = req in scheduled_requests.context_requests or req in scheduled_requests.generation_requests
             if req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_CONTEXT_ONLY or req.llm_request_type == LlmRequestType.LLMREQUEST_TYPE_GENERATION_ONLY:
                 req_stat.dis_serving_stats = DisServingRequestStats()
                 req_stat.dis_serving_stats.kv_cache_transfer_ms = req.kv_cache_transfer_time_ms
@@ -2986,7 +2985,7 @@ class PyExecutor:
         try:
             gather_context_logits = any(
                 a.py_return_context_logits
-                for a in scheduled_requests.context_requests())
+                for a in scheduled_requests.context_requests)
             cache_indirection_buffer = self.sampler.get_cache_indirection()
 
             # Run model forward on the execution stream for proper synchronization
@@ -3023,7 +3022,7 @@ class PyExecutor:
             self._terminate_request(request)
             self.active_requests.remove(request)
 
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.py_last_context_chunk = (
                     request.context_current_position,
@@ -3047,7 +3046,7 @@ class PyExecutor:
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
-        for request in scheduled_requests.context_requests():
+        for request in scheduled_requests.context_requests:
             if request.ctx_iters >= len(request.ctx_blocks) - 2:
                 request.state = LlmRequestState.GENERATION_IN_PROGRESS
             request.ctx_iters += 1
@@ -3078,7 +3077,7 @@ class PyExecutor:
                 num_context_logits_prefix_sum = [0]
                 prefix_sum = 0
                 num_context_tokens = 0
-                for request in scheduled_batch.context_requests():
+                for request in scheduled_batch.context_requests:
                     context_chunk_size = request.context_chunk_size
                     prefix_sum += context_chunk_size if request.py_return_context_logits else 1
                     num_context_logits_prefix_sum.append(prefix_sum)
@@ -3087,13 +3086,13 @@ class PyExecutor:
                 beam_width = self.sampler.beam_width(
                     scheduled_batch.all_requests())
 
-                HandleLogits()(scheduled_batch.context_requests(),
+                HandleLogits()(scheduled_batch.context_requests,
                                scheduled_batch.generation_requests,
                                batch_outputs["logits"], beam_width,
                                num_context_logits_prefix_sum,
                                self.sampler.is_generation_model())
 
-                HandleAdditionalOutputs()(scheduled_batch.context_requests(),
+                HandleAdditionalOutputs()(scheduled_batch.context_requests,
                                           scheduled_batch.generation_requests,
                                           batch_outputs, beam_width,
                                           num_context_tokens)
