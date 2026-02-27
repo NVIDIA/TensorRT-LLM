@@ -5,52 +5,6 @@ from torch import nn
 
 from ..attention_backend.interface import RopeParams
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
-from ..utils import maybe_compile
-
-
-def _rotate(q_or_k: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor,
-            is_neox: bool) -> torch.Tensor:
-    """Core rotation math shared by all RoPE entry points.
-
-    This is intentionally *not* compiled so that callers can wrap it in their
-    own @maybe_compile boundary — torch.compile will inline it into whatever
-    compiled region invokes it, allowing optimal fusion.
-    """
-    rot_dim = cos.shape[-1] * 2
-    # If q_or_k_pass is empty, rotary pos embedding is applied to all tensor
-    q_or_k, q_or_k_pass = q_or_k[..., :rot_dim], q_or_k[..., rot_dim:]
-
-    if is_neox:
-        x1 = q_or_k[..., :q_or_k.shape[-1] // 2]
-        x2 = q_or_k[..., q_or_k.shape[-1] // 2:]
-    else:
-        x1 = q_or_k[..., ::2]
-        x2 = q_or_k[..., 1::2]
-
-    o1 = x1 * cos - x2 * sin
-    o2 = x2 * cos + x1 * sin
-
-    if is_neox:
-        return torch.cat((o1, o2, q_or_k_pass), dim=-1)
-    else:
-        embed = torch.stack((o1, o2), dim=-1).flatten(-2)
-        return torch.cat((embed, q_or_k_pass), dim=-1)
-
-
-@maybe_compile
-def _apply_rope_single_packed(x: torch.Tensor, cos_sin_cache: torch.Tensor,
-                              position_ids: torch.Tensor,
-                              is_neox: bool) -> torch.Tensor:
-    """Fused RoPE for a single packed 2D tensor [N, head_dim].
-
-    Compiles the gather + rotation into a single kernel via @maybe_compile,
-    avoiding the reshape overhead of RotaryEmbedding.forward() which is
-    designed for multi-head 3D/4D tensors.
-    """
-    cos_sin = cos_sin_cache[position_ids]  # [N, 2, head_dim//2]
-    cos = cos_sin[:, 0, :].to(x.dtype)  # [N, head_dim//2]
-    sin = cos_sin[:, 1, :].to(x.dtype)  # [N, head_dim//2]
-    return _rotate(x, cos, sin, is_neox)
 
 
 class RotaryEmbedding(nn.Module):
@@ -126,19 +80,7 @@ class RotaryEmbedding(nn.Module):
 
         return [rope_target(target) for target in targets]
 
-    def apply_rope_single_packed(self, x: torch.Tensor,
-                                 position_ids: torch.Tensor) -> torch.Tensor:
-        """Apply RoPE to a single packed 2D tensor [N, head_dim].
-
-        Optimized path for single-head 2D inputs (e.g., k_pe in the short-seq
-        MHA path).  Compiles gather + rotation into one fused kernel, avoiding
-        the reshape overhead of forward().
-        """
-        return _apply_rope_single_packed(x, self.rotary_cos_sin, position_ids,
-                                         self.is_neox)
-
     @staticmethod
-    @maybe_compile
     def apply_rotary_pos_emb(q_or_k: torch.Tensor,
                              cos: torch.Tensor,
                              sin: torch.Tensor,
@@ -163,7 +105,26 @@ class RotaryEmbedding(nn.Module):
         """
         cos = cos.unsqueeze(unsqueeze_dim)
         sin = sin.unsqueeze(unsqueeze_dim)
-        return _rotate(q_or_k, cos, sin, is_neox)
+
+        rot_dim = cos.shape[-1] * 2
+        # If q_or_k_pass is empty, rotary pos embedding is applied to all tensor
+        q_or_k, q_or_k_pass = q_or_k[..., :rot_dim], q_or_k[..., rot_dim:]
+
+        if is_neox:
+            x1 = q_or_k[..., :q_or_k.shape[-1] // 2]
+            x2 = q_or_k[..., q_or_k.shape[-1] // 2:]
+        else:
+            x1 = q_or_k[..., ::2]
+            x2 = q_or_k[..., 1::2]
+
+        o1 = x1 * cos - x2 * sin
+        o2 = x2 * cos + x1 * sin
+
+        if is_neox:
+            return torch.cat((o1, o2, q_or_k_pass), dim=-1)
+        else:
+            embed = torch.stack((o1, o2), dim=-1).flatten(-2)
+            return torch.cat((embed, q_or_k_pass), dim=-1)
 
 
 class MRotaryEmbedding(RotaryEmbedding):
