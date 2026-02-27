@@ -6,7 +6,6 @@ trust_remote_code: true
 enable_attention_dp: true
 cuda_graph_config:
   enable_padding: true
-  max_batch_size: 128
 kv_cache_config:
   dtype: fp8
   free_gpu_memory_fraction: 0.8

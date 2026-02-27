@@ -448,18 +448,17 @@ def batched_lock_to_gpu(
     assert not tasks or storage is get_uniform_attribute(tasks, lambda p: p.page.manager)
     requirements = filled_list(0, storage.num_pool_groups)
     scheduled_for_eviction = [t.page.scheduled_for_eviction for t in tasks]
+    lc2pg = storage._life_cycle_grouping
     for t, e in zip(tasks, scheduled_for_eviction):
         if e:
             storage.exclude_from_eviction(t.page)
         if t.page.cache_level == GPU_LEVEL:
             continue
-        requirements[storage.get_pool_group_index(t.life_cycle)] += 1
+        requirements[lc2pg[t.life_cycle]] += 1
 
     try:
         storage.prepare_free_slots(GPU_LEVEL, requirements)
-        partitioned = partition(
-            tasks, lambda p: (p.page.cache_level, storage.get_pool_group_index(p.life_cycle))
-        )
+        partitioned = partition(tasks, lambda p: (p.page.cache_level, lc2pg[p.life_cycle]))
         for (lvl, pg_idx), part in partitioned.items():
             if lvl == GPU_LEVEL:
                 continue

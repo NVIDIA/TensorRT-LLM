@@ -8,7 +8,7 @@ Expect breaking API changes.
 ```
 
 TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
-easier for users to reproduce our officially published [performance overiew](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
+easier for users to reproduce our officially published [performance overview](../../developer-guide/perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
 - A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
 - An entirely Python workflow for benchmarking.
@@ -63,7 +63,7 @@ sudo nvidia-smi boost-slider --vboost <max_boost_slider>
 
 While `trtllm-bench` should be able to run any network that TensorRT-LLM supports, the following are the list
 that have been validated extensively and is the same listing as seen on the
-[Performance Overview](./perf-overview.md) page.
+[Performance Overview](../../developer-guide/perf-overview.md) page.
 
 - [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
 - [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b-hf)

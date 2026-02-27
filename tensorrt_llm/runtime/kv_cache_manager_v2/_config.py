@@ -136,7 +136,12 @@ class KVCacheManagerConfig:
 
     # When memory utilization is above this threshold, KV cache resuming will fail. This helps
     # reserving some memory for KVCache growth and avoids frequent suspend/resume for dynamic batch size.
-    max_util_for_resume: float = field(default=0.9)
+    max_util_for_resume: float = field(default=0.97)
+
+    enable_partial_reuse: bool = field(default=True)
+    """
+    If True, we will try to reuse tokens from partially matched blocks.
+    """
 
     # unsupported yet
     helix_config: HelixConfig | None = field(default=None)

@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -42,7 +43,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         from ...llmapi.llm_args import EagleDecodingConfig
 
         if isinstance(config, EagleDecodingConfig):
-            self.max_total_draft_tokens = config.max_total_draft_tokens
+            self.max_total_draft_tokens = config.tokens_per_gen_step - 1
         else:
             self.max_total_draft_tokens = self.max_draft_len
 
@@ -239,9 +240,13 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
         # Prepare hidden states gather ids
         self.hidden_states_read_indices_host = torch.tensor(
-            hidden_states_read_indices, dtype=torch.long, pin_memory=True)
+            hidden_states_read_indices,
+            dtype=torch.long,
+            pin_memory=prefer_pinned())
         self.hidden_states_write_indices_host = torch.tensor(
-            hidden_states_write_indices, dtype=torch.long, pin_memory=True)
+            hidden_states_write_indices,
+            dtype=torch.long,
+            pin_memory=prefer_pinned())
         self.is_first_draft = is_first_draft and self.is_draft_model
         if self.is_draft_model:
             self.eagle3_resource_manager.is_first_draft = False
@@ -267,7 +272,8 @@ class Eagle3SpecMetadata(SpecMetadata):
                 to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
                 eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
                                      self.hidden_size].index_copy_(
-                                         0, token_idx, to_save)
+                                         0, token_idx,
+                                         to_save[:self.num_tokens])
                 break
 
     def get_hidden_states(self):
@@ -334,7 +340,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
                                      device='cpu',
-                                     pin_memory=True)
+                                     pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         self.num_tokens -= (self.num_generations) * self.max_draft_len
@@ -373,6 +379,27 @@ class Eagle3OneModelWorker(SpecWorkerBase):
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
+
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        # Save kv_lens_cuda values separately instead of routing through
+        # prepare_for_spec_dec, which would clone the tensor and break the
+        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
+        batch_size = attn_metadata.num_seqs
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                  batch_size].clone(
+                                                                  )
+        else:
+            self._saved_kv_lens_cuda = None
+
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
 
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})

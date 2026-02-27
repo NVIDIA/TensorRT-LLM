@@ -12,6 +12,7 @@ from zmq.asyncio import Context
 
 from tensorrt_llm import SamplingParams
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm.bench.benchmark.utils.energy_monitor import EnergyMonitor
 from tensorrt_llm.bench.dataclasses.general import InferenceRequest
 from tensorrt_llm.bench.dataclasses.reporting import PerfItemTuple, StatsKeeper
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -275,21 +276,24 @@ async def async_benchmark(
                              post_proc_params, submit_finished))
 
         logger.info("Starting benchmark...")
-        pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
-        finished_requests = 0
+        with EnergyMonitor(llm.args.parallel_config.world_size) as monitor:
+            pbar = tqdm.tqdm(total=len(requests), desc="Benchmarking")
+            finished_requests = 0
 
-        while not submit_finished.is_set() or backend.busy or not outbox.empty(
-        ):
-            try:
-                item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
-                                                             timeout=1.0)
-                statistics.register_request_perf_item(item)
-                pbar.update(1)
-                finished_requests += 1
-            except asyncio.TimeoutError:
-                logger.debug("No items in queue. Continuing.")
+            while not submit_finished.is_set(
+            ) or backend.busy or not outbox.empty():
+                try:
+                    item: PerfItemTuple = await asyncio.wait_for(outbox.get(),
+                                                                 timeout=1.0)
+                    statistics.register_request_perf_item(item)
+                    pbar.update(1)
+                    finished_requests += 1
+                except asyncio.TimeoutError:
+                    logger.debug("No items in queue. Continuing.")
 
-        assert finished_requests == len(requests), "Benchmark failed"
+            assert finished_requests == len(requests), "Benchmark failed"
+
+        statistics.set_energy(monitor.total_energy)
         logger.info("Benchmark complete.")
 
         return statistics
