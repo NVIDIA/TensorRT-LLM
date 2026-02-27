@@ -2852,6 +2852,16 @@ class PyExecutor:
                     req.py_result.append_generation_logits(
                         logits_tensor.to(device))
 
+    def _has_prepended_logits(self, req) -> bool:
+        """Check whether the request has first-gen logits prepended from
+        prefill that need a snapshot before response creation."""
+        if not self.should_exclude_last_generation_logits:
+            return False
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return False
+        return getattr(disagg_params, 'first_gen_logits', None) is not None
+
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
@@ -3278,17 +3288,23 @@ class PyExecutor:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
-                # Snapshot the prepended first_gen_logits before creating
-                # the response.  py_result is shared across all streaming
-                # responses, so the lazy generation_logits property would
-                # read stale state by the time the consumer processes it.
-                # Setting the snapshot as an instance attribute on LlmResult
-                # shadows __getattr__ so the consumer gets the correct logits.
-                has_prepended_logits = (
-                    self.should_exclude_last_generation_logits and getattr(
-                        req, 'py_disaggregated_params', None) is not None
-                    and getattr(req.py_disaggregated_params, 'first_gen_logits',
-                                None) is not None)
+                # Snapshot prepended first_gen_logits for the response:
+                #
+                # 1. generation_logits is not stored on LlmResult; every
+                #    access goes through __getattr__ -> PyResult property
+                #    -> LogitsStorage, re-reading shared mutable state.
+                # 2. All streaming responses reference the same PyResult,
+                #    so later tokens mutate what earlier responses would
+                #    read.
+                # 3. With the overlap scheduler, exclude_last_generation_logits
+                #    is True, which would hide the prepended logits since
+                #    they are the only entry at this point.
+                #
+                # WAR: temporarily disable exclusion, read the logits now,
+                # then set the tensor directly on LlmResult as an instance
+                # attribute.  This shadows __getattr__ so the consumer
+                # always gets the correct, frozen logits.
+                has_prepended_logits = self._has_prepended_logits(req)
                 logits_snapshot = None
                 if has_prepended_logits:
                     req.set_exclude_last_generation_logits(False)
