@@ -31,8 +31,11 @@ def test_kv_cache_config_dtype_validation():
     cfg = KvCacheConfig(dtype="NVFP4")
     assert cfg.dtype == "nvfp4"
 
+    cfg = KvCacheConfig(dtype="float16")
+    assert cfg.dtype == "float16"
+
     with pytest.raises(ValueError, match="kv_cache_config.dtype must be one of"):
-        KvCacheConfig(dtype="float16")
+        KvCacheConfig(dtype="invalid_dtype")
 
 
 def test_torch_llm_args_syncs_nvfp4_kv_cache_dtype(tmp_path):
@@ -46,8 +49,8 @@ def test_update_from_hf_quant_config_keeps_auto_strict(tmp_path):
     llm_args = TorchLlmArgs(
         model=str(tmp_path),
         kv_cache_config=KvCacheConfig(dtype="auto"),
-        quant_config=QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4),
     )
+    llm_args.quant_config = QuantConfig(kv_cache_quant_algo=QuantAlgo.NVFP4)
     model_loader = ModelLoader(llm_args)
 
     with pytest.raises(ValueError, match="conflicting with kv_cache_quant_algo"):
