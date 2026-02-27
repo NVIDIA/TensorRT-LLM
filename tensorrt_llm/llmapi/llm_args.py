@@ -28,7 +28,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank
 
 # yapf: disable
 # isort: off
@@ -1862,11 +1862,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     @classmethod
     def validate_dtype(cls, v: str):
         v = v.lower()
-        if v not in ("auto", "fp8", "nvfp4"):
-            raise ValueError(
-                'kv_cache_config.dtype must be one of "auto", "fp8", or "nvfp4"'
-            )
-        return v
+        if v in ("auto", "fp8",
+                 "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+            return v
+
+        raise ValueError(
+            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
+        )
 
     @field_validator('max_gpu_total_bytes')
     @classmethod
