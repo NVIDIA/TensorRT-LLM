@@ -49,8 +49,11 @@ class DiffusionRequest:
     guidance_skip_step: int = 0
     enhance_prompt: bool = False
 
-    # Wan-specific parameters
+    # Image-to-video parameters
     image: Optional[Union[str, List[str]]] = None
+    image_cond_strength: float = 1.0
+
+    # Wan-specific parameters
     guidance_scale_2: Optional[float] = None
     boundary_ratio: Optional[float] = None
     last_image: Optional[Union[str, List[str]]] = None

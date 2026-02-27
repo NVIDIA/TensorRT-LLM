@@ -441,6 +441,7 @@ class VisualGenParams:
     num_frames: int = 81
     frame_rate: float = 24.0
     input_reference: Optional[str] = None
+    image_cond_strength: float = 1.0
 
     # Image-specific parameters
     num_images_per_prompt: int = 1
@@ -565,6 +566,7 @@ class VisualGen:
             guidance_skip_step=params.guidance_skip_step,
             enhance_prompt=params.enhance_prompt,
             image=params.input_reference,
+            image_cond_strength=params.image_cond_strength,
             guidance_scale_2=params.guidance_scale_2,
             boundary_ratio=params.boundary_ratio,
             last_image=params.last_image,

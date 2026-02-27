@@ -3,6 +3,7 @@
 # Two-stage LTX-2 pipeline: stage 1 at half spatial resolution,
 # 2x latent upsample, optional refinement denoising, then decode.
 # Reference: https://github.com/Lightricks/LTX-2
+# WIP
 
 import copy
 import time
@@ -49,6 +50,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
+        image: Optional[Union[str, torch.Tensor]] = None,
+        image_cond_strength: float = 1.0,
         use_learned_upsampler: bool = False,
         stg_scale: float = 0.0,
         stg_blocks: Optional[List[int]] = None,
@@ -57,7 +60,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         guidance_skip_step: int = 0,
         enhance_prompt: bool = False,
     ):
-        """Generate video and audio via two stages.
+        """Generate video and audio via two stages, optionally conditioned on an image.
 
         Stage 1: Denoise at half spatial resolution (height//2, width//2).
         Stage 2: Upsample video latents 2x, optionally run refinement
@@ -71,7 +74,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             f"LTX2 two-stage: stage1 at {height_s1}x{width_s1}, final {height}x{width}"
         )
 
-        # Stage 1
+        # Stage 1 (i2v image is passed to the base pipeline at half resolution)
         out = super().__call__(
             prompt=prompt,
             negative_prompt=negative_prompt,
@@ -85,6 +88,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
             seed=seed,
             output_type="latent",
             max_sequence_length=max_sequence_length,
+            image=image,
+            image_cond_strength=image_cond_strength,
             stg_scale=stg_scale,
             stg_blocks=stg_blocks,
             modality_scale=modality_scale,

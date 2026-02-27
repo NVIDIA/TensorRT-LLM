@@ -59,7 +59,12 @@ from .ltx2_core.types import (
     VideoLatentShape,
     VideoPixelShape,
 )
-from .ltx2_core.video_vae import VideoDecoder, VideoDecoderConfigurator
+from .ltx2_core.video_vae import (
+    VideoDecoder,
+    VideoDecoderConfigurator,
+    VideoEncoder,
+    VideoEncoderConfigurator,
+)
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 
@@ -405,6 +410,23 @@ class LTX2Pipeline(BasePipeline):
             )
             self.audio_connector = self.audio_connector.to(device=device, dtype=dtype)
 
+        # Video encoder (for image-to-video conditioning)
+        if "video_encoder" not in skip_components:
+            encoder_blocks = config.get("vae", {}).get("encoder_blocks", [])
+            if encoder_blocks:
+                logger.info("Loading native video encoder (for i2v)...")
+                self.video_encoder = VideoEncoderConfigurator.from_config(config)
+                _load_component_weights(
+                    sft_paths, self.video_encoder,
+                    ["vae.encoder.", "vae."],
+                )
+                self.video_encoder = self.video_encoder.to(device=device, dtype=dtype)
+            else:
+                logger.info("No encoder_blocks in config; video encoder not loaded.")
+                self.video_encoder = None
+        else:
+            self.video_encoder = None
+
         # Patchifiers (no weights, purely structural)
         t_cfg = self.transformer._transformer_config
         patch_size = t_cfg.get("patch_size", 1)
@@ -570,6 +592,100 @@ class LTX2Pipeline(BasePipeline):
         return video_embeds, audio_embeds, video_mask
 
     # ------------------------------------------------------------------
+    # Image conditioning helpers (for image-to-video)
+    # ------------------------------------------------------------------
+
+    def _load_and_preprocess_image(
+        self,
+        image: Union[str, torch.Tensor],
+        height: int,
+        width: int,
+    ) -> torch.Tensor:
+        """Load and preprocess an image for VAE encoding.
+
+        Args:
+            image: File path (str) or tensor. Tensor should be ``(3, H, W)``
+                or ``(B, 3, H, W)`` in ``[0, 1]`` range.
+            height: Target height in pixels.
+            width: Target width in pixels.
+
+        Returns:
+            Tensor of shape ``(1, 3, 1, H, W)`` in ``[-1, 1]``.
+        """
+        if isinstance(image, str):
+            from PIL import Image
+            pil_img = Image.open(image).convert("RGB")
+            pil_img = pil_img.resize((width, height), Image.LANCZOS)
+            import numpy as np
+            img_np = np.array(pil_img).astype(np.float32) / 255.0
+            img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W)
+        else:
+            img_tensor = image
+            if img_tensor.dim() == 4:
+                img_tensor = img_tensor[0]
+            if img_tensor.shape[1] != height or img_tensor.shape[2] != width:
+                img_tensor = torch.nn.functional.interpolate(
+                    img_tensor.unsqueeze(0),
+                    size=(height, width),
+                    mode="bilinear",
+                    align_corners=False,
+                ).squeeze(0)
+
+        img_tensor = img_tensor * 2.0 - 1.0
+        return img_tensor.unsqueeze(0).unsqueeze(2).to(
+            device=self.device, dtype=self.dtype,
+        )
+
+    @torch.no_grad()
+    def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
+        """Encode a preprocessed image tensor through the VAE encoder.
+
+        Args:
+            image_5d: ``(B, 3, 1, H, W)`` tensor in ``[-1, 1]``.
+
+        Returns:
+            Latent tensor ``(B, C, 1, H_lat, W_lat)``.
+        """
+        if self.video_encoder is None:
+            raise RuntimeError(
+                "Image-to-video requires a VAE encoder but video_encoder was "
+                "not loaded. Ensure the checkpoint contains encoder weights "
+                "(vae.encoder.*) and encoder_blocks config."
+            )
+        return self.video_encoder(image_5d)
+
+    def _build_denoise_mask(
+        self,
+        video_shape: "VideoLatentShape",
+        num_cond_latent_frames: int = 1,
+        strength: float = 1.0,
+    ) -> torch.Tensor:
+        """Create a per-token denoise mask for image conditioning.
+
+        Convention follows LTX-2: ``0.0`` = conditioned (don't denoise),
+        ``1.0`` = unconditioned (fully denoise).
+
+        Args:
+            video_shape: Latent shape for the video.
+            num_cond_latent_frames: Number of latent frames to condition on.
+            strength: Conditioning strength (1.0 = fully conditioned).
+
+        Returns:
+            ``(1, T)`` mask in patchified token space.
+        """
+        patch_t, patch_h, patch_w = self.video_patchifier.patch_size
+        grid_f = video_shape.frames // patch_t
+        grid_h = video_shape.height // patch_h
+        grid_w = video_shape.width // patch_w
+        tokens_per_frame = grid_h * grid_w
+        total_tokens = grid_f * tokens_per_frame
+        cond_tokens = num_cond_latent_frames * tokens_per_frame
+
+        mask = torch.ones(1, total_tokens, device=self.device, dtype=torch.float32)
+        mask[:, :cond_tokens] = 1.0 - strength
+        return mask
+
+    # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
 
@@ -588,6 +704,8 @@ class LTX2Pipeline(BasePipeline):
             output_type=req.output_type,
             guidance_rescale=req.guidance_rescale,
             max_sequence_length=req.max_sequence_length,
+            image=getattr(req, "image", None),
+            image_cond_strength=getattr(req, "image_cond_strength", 1.0),
             stg_scale=getattr(req, "stg_scale", 0.0),
             stg_blocks=getattr(req, "stg_blocks", None),
             modality_scale=getattr(req, "modality_scale", 1.0),
@@ -646,6 +764,8 @@ class LTX2Pipeline(BasePipeline):
         seed: int = 42,
         output_type: str = "pt",
         max_sequence_length: int = 1024,
+        image: Optional[Union[str, torch.Tensor]] = None,
+        image_cond_strength: float = 1.0,
         stg_scale: float = 0.0,
         stg_blocks: Optional[List[int]] = None,
         modality_scale: float = 1.0,
@@ -653,7 +773,19 @@ class LTX2Pipeline(BasePipeline):
         guidance_skip_step: int = 0,
         enhance_prompt: bool = False,
     ):
-        """Generate video and audio from text prompt."""
+        """Generate video (and audio) from text, optionally conditioned on an image.
+
+        When *image* is provided, the first frame of the generated video is
+        seeded with the VAE-encoded image latent.  Per-token timesteps ensure
+        conditioned tokens are treated as clean while the remaining tokens are
+        denoised normally (LTX-2 image-to-video conditioning).
+
+        Args:
+            image: Optional conditioning image. Either a file path (str) or a
+                tensor ``(3, H, W)`` / ``(1, 3, H, W)`` in ``[0, 1]``.
+            image_cond_strength: Conditioning strength for the image
+                (``1.0`` = fully conditioned first frame).
+        """
         pipeline_start = time.time()
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -748,11 +880,49 @@ class LTX2Pipeline(BasePipeline):
             hop_length=getattr(self, "audio_hop_length", 160),
         )
 
-        # ---- 4. Generate initial noise ----------------------------------
+        # ---- 4. Generate initial noise / image conditioning ---------------
         latents = torch.randn(
             video_shape.to_torch_shape(),
             generator=generator, device=self.device, dtype=torch.float32,
         )
+
+        denoise_mask: Optional[torch.Tensor] = None
+        clean_latent: Optional[torch.Tensor] = None
+
+        if image is not None:
+            logger.info("Encoding conditioning image for i2v...")
+            image_5d = self._load_and_preprocess_image(image, height, width)
+            encoded_image = self._encode_image(image_5d).float()  # (1, C, 1, H_lat, W_lat)
+
+            latents[:, :, :1, :, :] = encoded_image
+
+            # 5D mask for mixing noise with clean latents (before patchification)
+            cond_strength = image_cond_strength
+            mask_5d = torch.ones(
+                1, 1, video_shape.frames, video_shape.height, video_shape.width,
+                device=self.device, dtype=torch.float32,
+            )
+            mask_5d[:, :, :1, :, :] = 1.0 - cond_strength
+
+            noise = torch.randn_like(latents)
+            latents = noise * mask_5d + latents * (1.0 - mask_5d)
+
+            # Token-space mask for per-token timesteps (after patchification)
+            denoise_mask = self._build_denoise_mask(
+                video_shape, num_cond_latent_frames=1, strength=cond_strength,
+            )
+            # Full-size clean latent in patchified form for post-step blending.
+            # Non-conditioned positions are zero (masked out by denoise_mask).
+            clean_5d = torch.zeros_like(latents)
+            clean_5d[:, :, :1, :, :] = encoded_image
+            clean_latent = self.video_patchifier.patchify(clean_5d)
+
+            num_cond_tokens = int((denoise_mask < 0.5).sum().item())
+            logger.info(
+                f"i2v conditioning: {num_cond_tokens} conditioned tokens "
+                f"of {clean_latent.shape[1]} total, strength={cond_strength}"
+            )
+
         latents = self.video_patchifier.patchify(latents)
 
         audio_latents = torch.randn(
@@ -798,14 +968,24 @@ class LTX2Pipeline(BasePipeline):
 
             Either *v_latents* or *a_latents* (but not both) may be ``None``
             for modality-isolated passes.
+
+            When *denoise_mask* is active (i2v mode), video timesteps are
+            converted to per-token values (conditioned tokens → 0) and the
+            denoised prediction is blended with the clean conditioning latent.
             """
             v_latents_f32 = v_latents.float() if v_latents is not None else None
             v_latents_bf = v_latents.to(self.dtype) if v_latents is not None else None
             a_latents_f32 = a_latents.float() if a_latents is not None else None
             a_latents_bf = a_latents.to(self.dtype) if a_latents is not None else None
 
+            # Per-token timesteps for image conditioning
+            if denoise_mask is not None and v_latents_bf is not None:
+                v_timestep = denoise_mask * timestep_val.unsqueeze(-1)  # (B, T)
+            else:
+                v_timestep = timestep_val
+
             video_mod = Modality(
-                latent=v_latents_bf, timesteps=timestep_val,
+                latent=v_latents_bf, timesteps=v_timestep,
                 positions=video_positions, context=v_context, context_mask=mask,
             ) if v_latents_bf is not None else None
 
@@ -824,6 +1004,10 @@ class LTX2Pipeline(BasePipeline):
                 while sigma.dim() < vel_v.dim():
                     sigma = sigma.unsqueeze(-1)
                 dn_v = v_latents_f32 - vel_v.float() * sigma
+
+                if denoise_mask is not None and clean_latent is not None:
+                    dm = denoise_mask.unsqueeze(-1)  # (B, T, 1)
+                    dn_v = dn_v * dm + clean_latent.float() * (1.0 - dm)
 
             dn_a = None
             if vel_a is not None and a_latents_f32 is not None:

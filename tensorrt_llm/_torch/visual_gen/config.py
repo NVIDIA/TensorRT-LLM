@@ -539,6 +539,9 @@ class DiffusionModelConfig(BaseModel):
     def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
         """Try to read embedded config from a single-safetensors checkpoint.
 
+        Accepts either a directory (globs for ``*.safetensors``) or a direct
+        path to a ``.safetensors`` file.
+
         Returns the full config dict if found, ``None`` otherwise.
         """
         try:
@@ -546,7 +549,11 @@ class DiffusionModelConfig(BaseModel):
         except ImportError:
             return None
 
-        sft_files = sorted(checkpoint_path.glob("*.safetensors"))
+        if checkpoint_path.is_file() and checkpoint_path.suffix == ".safetensors":
+            sft_files = [checkpoint_path]
+        else:
+            sft_files = sorted(checkpoint_path.glob("*.safetensors"))
+
         if not sft_files:
             return None
 
@@ -643,8 +650,9 @@ class DiffusionModelConfig(BaseModel):
                 pretrained_config = SimpleNamespace(**transformer_dict)
                 extra_attrs["ltx2_native_config"] = native_config
             else:
-                # Fallback: look for a bare config.json in the directory
-                config_path = checkpoint_path / "config.json"
+                # Fallback: look for a bare config.json next to the checkpoint
+                config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
+                config_path = config_dir / "config.json"
                 if not config_path.exists():
                     raise ValueError(
                         f"Config not found at {checkpoint_dir}. "

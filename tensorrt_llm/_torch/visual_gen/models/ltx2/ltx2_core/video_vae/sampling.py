@@ -1,6 +1,5 @@
 # Ported from https://github.com/Lightricks/LTX-2
 # packages/ltx-core/src/ltx_core/model/video_vae/sampling.py
-# Decoder-only: SpaceToDepthDownsample removed (encoder-only).
 
 import math
 from typing import Tuple
@@ -11,6 +10,74 @@ from torch import nn
 
 from .convolution import make_conv_nd
 from .enums import PaddingModeType
+
+
+class SpaceToDepthDownsample(nn.Module):
+    """Spatial/temporal downsampling via conv + space-to-depth rearrangement.
+
+    Matches the reference LTX-2 encoder architecture: a stride-1 conv
+    operates at the original spatial resolution, producing
+    ``out_channels // prod(stride)`` channels, followed by a
+    space-to-depth rearrange that folds spatial/temporal dimensions
+    into the channel axis to yield ``out_channels``.
+
+    When ``residual=True`` the skip connection applies the same
+    space-to-depth rearrangement to the input, groups the resulting
+    channels, and mean-pools over each group to match ``out_channels``.
+    """
+
+    def __init__(
+        self,
+        dims: int | Tuple[int, int],
+        in_channels: int,
+        out_channels: int,
+        stride: Tuple[int, int, int],
+        residual: bool = False,
+        spatial_padding_mode: PaddingModeType = PaddingModeType.ZEROS,
+    ):
+        super().__init__()
+        self.stride = stride
+        self.out_channels = out_channels
+        self.residual = residual
+        self.group_size = in_channels * math.prod(stride) // out_channels
+        self.conv = make_conv_nd(
+            dims=dims,
+            in_channels=in_channels,
+            out_channels=out_channels // math.prod(stride),
+            kernel_size=3,
+            stride=1,
+            causal=True,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+
+    def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
+        if self.stride[0] == 2:
+            x = torch.cat([x[:, :, :1, :, :], x], dim=2)
+
+        if self.residual:
+            x_in = rearrange(
+                x,
+                "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w",
+                p1=self.stride[0],
+                p2=self.stride[1],
+                p3=self.stride[2],
+            )
+            x_in = rearrange(x_in, "b (c g) d h w -> b c g d h w", g=self.group_size)
+            x_in = x_in.mean(dim=2)
+
+        x = self.conv(x, causal=causal)
+        x = rearrange(
+            x,
+            "b c (d p1) (h p2) (w p3) -> b (c p1 p2 p3) d h w",
+            p1=self.stride[0],
+            p2=self.stride[1],
+            p3=self.stride[2],
+        )
+
+        if self.residual:
+            x = x + x_in
+
+        return x
 
 
 class DepthToSpaceUpsample(nn.Module):

@@ -1,6 +1,5 @@
 # Ported from https://github.com/Lightricks/LTX-2
 # packages/ltx-core/src/ltx_core/model/video_vae/video_vae.py
-# Decoder-only: encoder removed (not needed for text-to-video generation).
 
 import logging
 from dataclasses import replace
@@ -14,9 +13,9 @@ from ..normalization import PixelNorm
 from ..timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
 from .convolution import make_conv_nd
 from .enums import NormLayerType, PaddingModeType
-from .ops import PerChannelStatistics, unpatchify
+from .ops import PerChannelStatistics, patchify, unpatchify
 from .resnet import ResnetBlock3D, UNetMidBlock3D
-from .sampling import DepthToSpaceUpsample
+from .sampling import DepthToSpaceUpsample, SpaceToDepthDownsample
 from .tiling import (
     DEFAULT_MAPPING_OPERATION,
     DEFAULT_SPLIT_OPERATION,
@@ -31,6 +30,186 @@ from .tiling import (
 from ..types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape
 
 logger: logging.Logger = logging.getLogger(__name__)
+
+
+def _make_encoder_block(
+    block_name: str,
+    block_config: dict[str, Any],
+    in_channels: int,
+    convolution_dimensions: int,
+    norm_layer: NormLayerType,
+    timestep_conditioning: bool,
+    norm_num_groups: int,
+    spatial_padding_mode: PaddingModeType,
+) -> Tuple[nn.Module, int]:
+    """Build a single encoder block and return (block, out_channels)."""
+    out_channels = in_channels
+    if block_name == "res_x":
+        block = UNetMidBlock3D(
+            dims=convolution_dimensions, in_channels=in_channels,
+            num_layers=block_config["num_layers"], resnet_eps=1e-6,
+            resnet_groups=norm_num_groups, norm_layer=norm_layer,
+            inject_noise=block_config.get("inject_noise", False),
+            timestep_conditioning=timestep_conditioning,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "attn_res_x":
+        block = UNetMidBlock3D(
+            dims=convolution_dimensions, in_channels=in_channels,
+            num_layers=block_config["num_layers"], resnet_groups=norm_num_groups,
+            norm_layer=norm_layer, inject_noise=block_config.get("inject_noise", False),
+            timestep_conditioning=timestep_conditioning,
+            attention_head_dim=block_config["attention_head_dim"],
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "res_x_y":
+        out_channels = in_channels * block_config.get("multiplier", 2)
+        block = ResnetBlock3D(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=out_channels, eps=1e-6, groups=norm_num_groups,
+            norm_layer=norm_layer, inject_noise=block_config.get("inject_noise", False),
+            timestep_conditioning=False, spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_time":
+        block = SpaceToDepthDownsample(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=in_channels, stride=(2, 1, 1),
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_space":
+        block = SpaceToDepthDownsample(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=in_channels, stride=(1, 2, 2),
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_all":
+        out_channels = in_channels * block_config.get("multiplier", 1)
+        block = SpaceToDepthDownsample(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=out_channels, stride=(2, 2, 2),
+            residual=block_config.get("residual", False),
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_space_res":
+        out_channels = in_channels * block_config.get("multiplier", 2)
+        block = SpaceToDepthDownsample(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=out_channels, stride=(1, 2, 2),
+            residual=True,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_time_res":
+        out_channels = in_channels * block_config.get("multiplier", 2)
+        block = SpaceToDepthDownsample(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=out_channels, stride=(2, 1, 1),
+            residual=True,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    elif block_name == "compress_all_res":
+        out_channels = in_channels * block_config.get("multiplier", 2)
+        block = SpaceToDepthDownsample(
+            dims=convolution_dimensions, in_channels=in_channels,
+            out_channels=out_channels, stride=(2, 2, 2),
+            residual=True,
+            spatial_padding_mode=spatial_padding_mode,
+        )
+    else:
+        raise ValueError(f"unknown encoder layer: {block_name}")
+    return block, out_channels
+
+
+class VideoEncoder(nn.Module):
+    """Causal 3D video encoder for encoding images/video into the VAE latent space.
+
+    Used for image-to-video conditioning: encodes a reference image into
+    latent tokens that seed the first frame of the denoising process.
+    """
+
+    _DEFAULT_NORM_NUM_GROUPS = 32
+
+    def __init__(
+        self,
+        convolution_dimensions: int = 3,
+        in_channels: int = 3,
+        out_channels: int = 128,
+        encoder_blocks: List[Tuple[str, int | dict]] = [],
+        patch_size: int = 4,
+        norm_layer: NormLayerType = NormLayerType.PIXEL_NORM,
+        causal: bool = True,
+        timestep_conditioning: bool = False,
+        encoder_spatial_padding_mode: PaddingModeType = PaddingModeType.ZEROS,
+    ):
+        super().__init__()
+        self.patch_size = patch_size
+        self.out_channels = out_channels
+        patched_in_channels = in_channels * patch_size ** 2
+        self.causal = causal
+        self.timestep_conditioning = timestep_conditioning
+        self._norm_num_groups = self._DEFAULT_NORM_NUM_GROUPS
+        self.per_channel_statistics = PerChannelStatistics(latent_channels=out_channels)
+
+        feature_channels = out_channels
+        self.conv_in = make_conv_nd(
+            dims=convolution_dimensions, in_channels=patched_in_channels,
+            out_channels=feature_channels, kernel_size=3, stride=1, padding=1,
+            causal=True, spatial_padding_mode=encoder_spatial_padding_mode,
+        )
+
+        self.down_blocks = nn.ModuleList([])
+        for block_name, block_params in encoder_blocks:
+            block_config = (
+                {"num_layers": block_params} if isinstance(block_params, int)
+                else block_params
+            )
+            block, feature_channels = _make_encoder_block(
+                block_name=block_name, block_config=block_config,
+                in_channels=feature_channels,
+                convolution_dimensions=convolution_dimensions,
+                norm_layer=norm_layer,
+                timestep_conditioning=timestep_conditioning,
+                norm_num_groups=self._norm_num_groups,
+                spatial_padding_mode=encoder_spatial_padding_mode,
+            )
+            self.down_blocks.append(block)
+
+        if norm_layer == NormLayerType.GROUP_NORM:
+            self.conv_norm_out = nn.GroupNorm(
+                num_channels=feature_channels,
+                num_groups=self._norm_num_groups, eps=1e-6,
+            )
+        elif norm_layer == NormLayerType.PIXEL_NORM:
+            self.conv_norm_out = PixelNorm()
+
+        self.conv_act = nn.SiLU()
+        self.conv_out = make_conv_nd(
+            dims=convolution_dimensions, in_channels=feature_channels,
+            out_channels=out_channels + 1, kernel_size=3, padding=1,
+            causal=True, spatial_padding_mode=encoder_spatial_padding_mode,
+        )
+
+    def forward(self, sample: torch.Tensor) -> torch.Tensor:
+        """Encode pixel-space input into normalized VAE latents.
+
+        Args:
+            sample: Pixel tensor ``(B, 3, F, H, W)`` in ``[-1, 1]``.
+
+        Returns:
+            Latent tensor ``(B, C_latent, F_latent, H_latent, W_latent)``,
+            per-channel normalized.
+        """
+        sample = patchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
+        sample = self.conv_in(sample, causal=self.causal)
+
+        for down_block in self.down_blocks:
+            sample = down_block(sample, causal=self.causal)
+
+        sample = self.conv_norm_out(sample)
+        sample = self.conv_act(sample)
+        sample = self.conv_out(sample, causal=self.causal)
+
+        mean = sample[:, :self.out_channels, ...]
+        return self.per_channel_statistics.normalize(mean)
 
 
 def _make_decoder_block(

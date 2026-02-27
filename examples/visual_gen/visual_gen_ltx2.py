@@ -36,20 +36,35 @@ def parse_args():
         help="Negative prompt to guide generation away from undesired content",
     )
     parser.add_argument(
-        "--output_path",
+        "--output_path", "--output-path",
         type=str,
         default="output.mp4",
         help="Path to save the output video with audio (supports .mp4, .gif, .png)",
     )
 
+    # Image-to-video conditioning
+    parser.add_argument(
+        "--image",
+        type=str,
+        default=None,
+        help="Path to input image for image-to-video conditioning",
+    )
+    parser.add_argument(
+        "--image_cond_strength", "--image-cond-strength",
+        type=float,
+        default=1.0,
+        help="Conditioning strength for the input image (0.0 to 1.0, default: 1.0)",
+    )
+
     # Generation Params
     parser.add_argument("--height", type=int, default=512, help="Video height (divisible by 32)")
     parser.add_argument("--width", type=int, default=768, help="Video width (divisible by 32)")
-    parser.add_argument("--num_frames", type=int, default=121, help="Number of frames to generate")
+    parser.add_argument("--num_frames", "--num-frames", type=int, default=121, help="Number of frames to generate")
     parser.add_argument(
         "--frame_rate", type=float, default=24.0, help="Frames per second for the video"
     )
-    parser.add_argument("--steps", type=int, default=40, help="Number of denoising steps")
+    parser.add_argument("--steps", "--num-inference-steps", "--num_inference_steps",
+                        type=int, default=40, help="Number of denoising steps")
     parser.add_argument(
         "--guidance_scale",
         type=float,
@@ -207,6 +222,8 @@ def main():
             frame_rate=args.frame_rate,
             guidance_rescale=args.guidance_rescale,
             output_type=args.output_type,
+            input_reference=args.image,
+            image_cond_strength=args.image_cond_strength,
             stg_scale=args.stg_scale,
             stg_blocks=args.stg_blocks,
             modality_scale=args.modality_scale,

@@ -93,6 +93,12 @@ class PipelineLoader:
                 authentication failure, offline with no cache, etc.)
         """
         if os.path.exists(checkpoint_dir):
+            if os.path.isfile(checkpoint_dir):
+                parent = os.path.dirname(checkpoint_dir)
+                logger.info(
+                    f"'{checkpoint_dir}' is a file; using parent directory '{parent}'"
+                )
+                return parent
             return checkpoint_dir
 
         revision = self.args.revision if self.args else None
@@ -240,6 +246,7 @@ class PipelineLoader:
 
         if config.torch_compile.enable_torch_compile:
             torch._dynamo.config.cache_size_limit = 128
+            torch.backends.cuda.enable_cudnn_sdp(False)
             pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")
