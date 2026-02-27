@@ -262,6 +262,16 @@ class VisualGenArgs(StrictBaseModel):
         ),
     )
 
+    # Path to the text encoder model (e.g. Gemma3 directory) used by LTX-2 pipelines.
+    text_encoder_path: str = PydanticField(
+        "",
+        description=(
+            "Path to the text encoder model directory (e.g. Gemma3). "
+            "Required for LTX-2 pipelines. Must contain model weights, "
+            "tokenizer files, and preprocessor config."
+        ),
+    )
+
     # HuggingFace Hub options
     revision: Optional[str] = PydanticField(
         None,
@@ -297,6 +307,19 @@ class VisualGenArgs(StrictBaseModel):
     # Set by model_validator when quant_config is provided as a dict (ModelOpt format)
     dynamic_weight_quant: bool = False
     force_dynamic_quantization: bool = False
+
+    # When True, use pure PyTorch nn.Linear / nn.RMSNorm / SDPA for the
+    # transformer instead of TRT-LLM optimized modules.  Useful for
+    # debugging, numerical comparison with the reference, or environments
+    # where TRT-LLM custom kernels are not available.
+    use_pytorch_layers: bool = PydanticField(
+        False,
+        description=(
+            "Use pure PyTorch layers (nn.Linear, manual RMSNorm, "
+            "F.scaled_dot_product_attention) instead of TRT-LLM optimized "
+            "modules for the transformer. Default False (TRT-LLM)."
+        ),
+    )
 
     @model_validator(mode="before")
     @classmethod
@@ -416,6 +439,7 @@ class DiffusionModelConfig(BaseModel):
     ulysses_process_group: Optional[torch.distributed.ProcessGroup] = None
 
     dynamic_weight_quant: bool = False
+    use_pytorch_layers: bool = False
 
     # Sub-configs from VisualGenArgs (merged during from_pretrained)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
@@ -512,6 +536,30 @@ class DiffusionModelConfig(BaseModel):
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
 
     @classmethod
+    def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
+        """Try to read embedded config from a single-safetensors checkpoint.
+
+        Returns the full config dict if found, ``None`` otherwise.
+        """
+        try:
+            import safetensors.torch
+        except ImportError:
+            return None
+
+        sft_files = sorted(checkpoint_path.glob("*.safetensors"))
+        if not sft_files:
+            return None
+
+        try:
+            with safetensors.torch.safe_open(str(sft_files[0]), framework="pt") as f:
+                meta = f.metadata()
+                if meta and "config" in meta:
+                    return json.loads(meta["config"])
+        except Exception:
+            pass
+        return None
+
+    @classmethod
     def from_pretrained(
         cls,
         checkpoint_dir: str,
@@ -526,6 +574,16 @@ class DiffusionModelConfig(BaseModel):
                 checkpoint_dir=args.checkpoint_path,
                 args=args,
             )
+
+        Supports two checkpoint formats:
+        * **Diffusers directory layout** -- ``model_index.json`` with
+          component sub-directories each containing ``config.json``.
+        * **LTX-2 native single-safetensors** -- no ``model_index.json``;
+          config embedded in the safetensors metadata header under a
+          ``"config"`` key.  The transformer section is extracted as
+          ``pretrained_config`` and the full dict is stored in
+          ``extra_attrs["ltx2_native_config"]`` for use by component
+          configurators.
 
         Args:
             checkpoint_dir: Path to checkpoint
@@ -545,42 +603,60 @@ class DiffusionModelConfig(BaseModel):
 
         component = PipelineComponent.TRANSFORMER
         checkpoint_path = Path(checkpoint_dir)
+        extra_attrs: Dict[str, Any] = {}
 
-        # Discover pipeline components
+        # Discover pipeline components (diffusers layout)
         components = discover_pipeline_components(checkpoint_path)
 
-        # Determine config path
         if components:
+            # ---------- Diffusers directory layout ----------
             if component not in components:
                 raise ValueError(
                     f"Component '{component}' not found. Available: {list(components.keys())}"
                 )
             config_path = components[component]
-        else:
-            config_path = checkpoint_path / "config.json"
+            if not config_path.exists():
+                raise ValueError(f"Config not found at {config_path}")
 
-        if not config_path.exists():
-            raise ValueError(f"Config not found at {config_path}")
-
-        # Load pretrained_config from checkpoint
-        with open(config_path) as f:
-            config_dict = json.load(f)
-        pretrained_config = SimpleNamespace(**config_dict)
+            with open(config_path) as f:
+                config_dict = json.load(f)
+            pretrained_config = SimpleNamespace(**config_dict)
 
         # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
         if not getattr(pretrained_config, "_name_or_path", None):
             pretrained_config._name_or_path = str(checkpoint_path)
 
-        model_index_path = checkpoint_path / "model_index.json"
-        if model_index_path.exists():
-            with open(model_index_path) as f:
-                model_index = json.load(f)
-            if "boundary_ratio" in model_index and "transformer_2" in model_index:
-                transformer_2_spec = model_index.get("transformer_2")
-                if transformer_2_spec and transformer_2_spec[0] is not None:
-                    pretrained_config.boundary_ratio = model_index["boundary_ratio"]
+            model_index_path = checkpoint_path / "model_index.json"
+            if model_index_path.exists():
+                with open(model_index_path) as f:
+                    model_index = json.load(f)
+                if "boundary_ratio" in model_index and "transformer_2" in model_index:
+                    transformer_2_spec = model_index.get("transformer_2")
+                    if transformer_2_spec and transformer_2_spec[0] is not None:
+                        pretrained_config.boundary_ratio = model_index["boundary_ratio"]
+        else:
+            # ---------- Single safetensors (LTX-2 native) ----------
+            native_config = cls._try_load_safetensors_config(checkpoint_path)
 
-        # Resolve quant config: use args if user set quant (QuantConfig from dict), else checkpoint
+            if native_config is not None:
+                transformer_dict = native_config.get("transformer", {})
+                pretrained_config = SimpleNamespace(**transformer_dict)
+                extra_attrs["ltx2_native_config"] = native_config
+            else:
+                # Fallback: look for a bare config.json in the directory
+                config_path = checkpoint_path / "config.json"
+                if not config_path.exists():
+                    raise ValueError(
+                        f"Config not found at {checkpoint_dir}. "
+                        "Expected model_index.json (diffusers), "
+                        "safetensors with embedded config metadata, "
+                        "or a config.json file."
+                    )
+                with open(config_path) as f:
+                    config_dict = json.load(f)
+                pretrained_config = SimpleNamespace(**config_dict)
+
+        # Resolve quant config
         if args and args.quant_config.quant_algo is not None:
             quant_config = args.quant_config
             quant_config_dict = (
@@ -599,6 +675,8 @@ class DiffusionModelConfig(BaseModel):
                     cls.load_diffusion_quant_config(quant_dict)
                 )
 
+        use_pytorch_layers = args.use_pytorch_layers if args else False
+
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -612,7 +690,8 @@ class DiffusionModelConfig(BaseModel):
             attention=attention_cfg,
             parallel=parallel_cfg,
             teacache=teacache_cfg,
-            # Delay weight creation after apply_quant_config_exclude_modules() in __post_init__
             skip_create_weights_in_init=True,
+            extra_attrs=extra_attrs,
+            use_pytorch_layers=use_pytorch_layers,
             **kwargs,
         )

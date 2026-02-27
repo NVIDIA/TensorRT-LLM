@@ -38,13 +38,13 @@ class DynamicLinearWeightLoader:
 
     def __init__(
         self,
-        model_config: DiffusionModelConfig,
+        model_config: Optional[DiffusionModelConfig] = None,
         params_map: Optional[Dict[str, List[str]]] = None,
     ):
         self.model_config = model_config
-        self.quant_config = model_config.quant_config
-        self.quant_config_dict = model_config.quant_config_dict
-        self.dynamic_weight_quant = model_config.dynamic_weight_quant
+        self.quant_config = model_config.quant_config if model_config else None
+        self.quant_config_dict = model_config.quant_config_dict if model_config else None
+        self.dynamic_weight_quant = model_config.dynamic_weight_quant if model_config else False
         self.params_map = params_map or {}
 
     # =========================================================================

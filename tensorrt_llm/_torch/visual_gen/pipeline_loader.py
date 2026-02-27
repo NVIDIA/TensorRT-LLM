@@ -142,6 +142,7 @@ class PipelineLoader:
         skip_components = self.args.skip_components if self.args else []
 
         load_start = time.time()
+        text_encoder_path = self.args.text_encoder_path if self.args else ""
 
         # =====================================================================
         # STEP 1: Load Config (includes quant config parsing)
@@ -175,36 +176,55 @@ class PipelineLoader:
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
+        # Two code paths:
+        #   A) Native single-safetensor (e.g. LTX-2) — the pipeline implements
+        #      ``load_native_transformer_weights`` which reads the checkpoint
+        #      file directly with model-specific prefix stripping.
+        #   B) Diffusers-compatible — uses the generic ``WeightLoader`` which
+        #      expects a ``transformer/`` sub-directory (or ``transformer.``
+        #      prefixed keys).
         # If dynamic_weight_quant=True:
         #   - BF16 checkpoint weights are loaded
         #   - Quantized on-the-fly to FP8/NVFP4 by DynamicLinearWeightLoader
         #   - Copied into model's quantized buffers
         # =====================================================================
-        if pipeline.transformer is None:
-            raise ValueError("Pipeline has no transformer component")
+        if hasattr(pipeline, "load_native_transformer_weights"):
+            # --- Path A: native single-safetensor checkpoint -----------------
+            logger.info("Loading transformer weights via native checkpoint path")
+            pipeline.load_native_transformer_weights(checkpoint_dir)
+        else:
+            # --- Path B: diffusers-compatible (WeightLoader) -----------------
+            if pipeline.transformer is None:
+                raise ValueError("Pipeline has no transformer component")
 
-        transformer_components = pipeline.transformer_components
-        logger.info(f"Transformer components: {transformer_components}")
+            transformer_components = pipeline.transformer_components
+            logger.info(f"Transformer components: {transformer_components}")
 
-        transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
-        if not os.path.exists(transformer_path):
-            raise FileNotFoundError(
-                f"Transformer path does not exist: {transformer_path}. "
-                f"Checkpoint directory must contain a 'transformer' subdirectory."
-            )
+            transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
+            if not os.path.exists(transformer_path):
+                raise FileNotFoundError(
+                    f"Transformer path does not exist: {transformer_path}. "
+                    f"Checkpoint directory must contain a 'transformer' subdirectory."
+                )
 
-        weight_loader = WeightLoader(components=transformer_components)
-        # TODO: accelerate the cpu loading w/ multiprocessing
-        weights = weight_loader.load_weights(checkpoint_dir, self.mapping)
+            weight_loader = WeightLoader(components=transformer_components)
+            # TODO: accelerate the cpu loading w/ multiprocessing
+            weights = weight_loader.load_weights(checkpoint_dir, self.mapping)
 
-        # Load weights into pipeline
-        pipeline.load_weights(weights)
+            # Load weights into pipeline
+            pipeline.load_weights(weights)
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder via diffusers)
         # These are NOT quantized - loaded as-is from checkpoint
+        #
+        # For LTX-2, Text encoder loads from a separate path (e.g. Gemma3 directory).
+        # All other native components load from the checkpoint safetensors.
         # =====================================================================
-        pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
+        pipeline.load_standard_components(
+            checkpoint_dir, self.device, skip_components,
+            text_encoder_path=text_encoder_path,
+        )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================

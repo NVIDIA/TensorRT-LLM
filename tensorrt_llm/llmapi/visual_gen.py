@@ -453,6 +453,14 @@ class VisualGenParams:
     guidance_rescale: float = 0.0
     output_type: str = "pt"
 
+    # LTX-2 multi-modal guidance (STG / modality guidance)
+    stg_scale: float = 0.0
+    stg_blocks: Optional[List[int]] = None
+    modality_scale: float = 1.0
+    rescale_scale: float = 0.0
+    guidance_skip_step: int = 0
+    enhance_prompt: bool = False
+
     # Wan-specific parameters
     guidance_scale_2: Optional[float] = None
     boundary_ratio: Optional[float] = None
@@ -550,6 +558,12 @@ class VisualGen:
             num_images_per_prompt=params.num_images_per_prompt,
             guidance_rescale=params.guidance_rescale,
             output_type=params.output_type,
+            stg_scale=params.stg_scale,
+            stg_blocks=params.stg_blocks,
+            modality_scale=params.modality_scale,
+            rescale_scale=params.rescale_scale,
+            guidance_skip_step=params.guidance_skip_step,
+            enhance_prompt=params.enhance_prompt,
             image=params.input_reference,
             guidance_scale_2=params.guidance_scale_2,
             boundary_ratio=params.boundary_ratio,

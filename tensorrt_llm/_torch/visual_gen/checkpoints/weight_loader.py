@@ -49,6 +49,18 @@ class WeightLoader(BaseWeightLoader):
         """
         Load weights from checkpoint directory.
 
+        Supports three layouts:
+
+        * **Pipeline (diffusers)** -- ``model_index.json`` with component
+          sub-directories, each containing weight files.
+        * **Single safetensors (LTX-2 native)** -- no ``model_index.json``;
+          component sub-directories absent; weight files sit in the root
+          with prefixed keys (e.g. ``transformer.``, ``video_vae.``).
+          Only keys matching the requested component prefix are returned
+          (prefix stripped).
+        * **Standalone** -- no ``model_index.json`` and no component sub-dirs;
+          weight files in the root directory without prefixes.
+
         Args:
             checkpoint_dir: Path to checkpoint (pipeline root or component dir)
             mapping: Distributed mapping (for future TP/PP support)
@@ -60,46 +72,43 @@ class WeightLoader(BaseWeightLoader):
         """
         checkpoint_path = Path(checkpoint_dir)
 
-        # Check if this is a pipeline (has model_index.json)
         model_index = checkpoint_path / "model_index.json"
         is_pipeline = model_index.exists()
 
-        # Load weights for each component
         all_weights = {}
         for component in self.components:
             if is_pipeline:
-                # Pipeline format: load from component subdirectory
                 component_dir = checkpoint_path / component
                 if not component_dir.exists():
                     raise ValueError(f"Component '{component}' not found in {checkpoint_dir}")
                 weight_dir = component_dir
+                prefix_filter = None
+            elif (checkpoint_path / component).exists():
+                weight_dir = checkpoint_path / component
+                prefix_filter = None
             else:
-                # Standalone model (only valid for single component)
-                if len(self.components) > 1:
-                    raise ValueError(
-                        f"Multiple components specified but {checkpoint_dir} is not a pipeline "
-                        "(no model_index.json found)"
-                    )
                 weight_dir = checkpoint_path
+                prefix_filter = f"{component}."
 
-            # Find weight files
             weight_files = self._find_weight_files(weight_dir)
             if not weight_files:
                 raise ValueError(f"No weight files found in {weight_dir}")
 
-            # Load all weights with progress bar
             component_weights = {}
-            desc = f"Loading {component}" if is_pipeline else "Loading checkpoint"
+            desc = f"Loading {component}"
             for wf in tqdm.tqdm(weight_files, desc=desc):
-                component_weights.update(self._load_file(wf))
+                raw = self._load_file(wf)
+                if prefix_filter is not None:
+                    for key, tensor in raw.items():
+                        if key.startswith(prefix_filter):
+                            component_weights[key[len(prefix_filter):]] = tensor
+                else:
+                    component_weights.update(raw)
 
             all_weights[component] = component_weights
 
-        # Return flat dict for single component (backward compatibility)
         if self.single_component:
             return all_weights[self.components[0]]
-
-        # Return nested dict for multiple components
         return all_weights
 
     def _find_weight_files(self, weight_dir) -> List[str]:

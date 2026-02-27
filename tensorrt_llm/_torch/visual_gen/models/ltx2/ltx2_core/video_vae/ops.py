@@ -1,0 +1,43 @@
+# Ported from https://github.com/Lightricks/LTX-2
+# packages/ltx-core/src/ltx_core/model/video_vae/ops.py
+
+import torch
+from einops import rearrange
+from torch import nn
+
+
+def unpatchify(x: torch.Tensor, patch_size_hw: int, patch_size_t: int = 1) -> torch.Tensor:
+    if patch_size_hw == 1 and patch_size_t == 1:
+        return x
+    if x.dim() == 4:
+        x = rearrange(
+            x, "b (c r q) h w -> b c (h q) (w r)", q=patch_size_hw, r=patch_size_hw
+        )
+    elif x.dim() == 5:
+        x = rearrange(
+            x,
+            "b (c p r q) f h w -> b c (f p) (h q) (w r)",
+            p=patch_size_t,
+            q=patch_size_hw,
+            r=patch_size_hw,
+        )
+    return x
+
+
+class PerChannelStatistics(nn.Module):
+    """Per-channel statistics for denormalizing video latents."""
+
+    def __init__(self, latent_channels: int = 128):
+        super().__init__()
+        self.register_buffer("std-of-means", torch.empty(latent_channels))
+        self.register_buffer("mean-of-means", torch.empty(latent_channels))
+        self.register_buffer("mean-of-stds", torch.empty(latent_channels))
+        self.register_buffer(
+            "mean-of-stds_over_std-of-means", torch.empty(latent_channels)
+        )
+        self.register_buffer("channel", torch.empty(latent_channels))
+
+    def un_normalize(self, x: torch.Tensor) -> torch.Tensor:
+        return (
+            x * self.get_buffer("std-of-means").view(1, -1, 1, 1, 1).to(x)
+        ) + self.get_buffer("mean-of-means").view(1, -1, 1, 1, 1).to(x)

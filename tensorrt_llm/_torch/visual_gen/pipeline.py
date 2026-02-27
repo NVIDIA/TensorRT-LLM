@@ -122,6 +122,7 @@ class BasePipeline(nn.Module):
         checkpoint_dir: str,
         device: torch.device,
         skip_components: Optional[list] = None,
+        **kwargs,
     ) -> None:
         raise NotImplementedError
 
