@@ -157,9 +157,9 @@ void RnnCacheFormatter::format(TransferSession& session)
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
 
-    bool isAgentConnection
-        = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN)).has_value();
-    if (isAgentConnection)
+    auto const* agentConnection
+        = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
+    if (agentConnection != nullptr)
     {
         TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent needs all RNN send buffers pre-allocated");
         TLLM_CHECK(onlyUseDynamicBuffer == false);
