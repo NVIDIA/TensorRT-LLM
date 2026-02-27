@@ -2991,7 +2991,7 @@ class TorchLlmArgs(BaseLlmArgs):
         exclude=True,
         status="prototype")
 
-    ray_worker_nsight_options: Optional[dict] = Field(
+    ray_worker_nsight_options: Optional[dict[str, str]] = Field(
         default=None,
         description="Nsight options.",
         status="prototype",
