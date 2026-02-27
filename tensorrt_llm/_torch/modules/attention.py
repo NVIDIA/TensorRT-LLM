@@ -21,7 +21,8 @@ from ..attention_backend.interface import (AttentionBackend, AttentionMask,
 from ..attention_backend.sparse.dsa import (
     DSAtrtllmAttentionMetadata, transform_local_topk_and_prepare_pool_view)
 from ..attention_backend.utils import create_attention, get_attention_backend
-from ..distributed import AllReduceParams, HelixAllToAllNative, alltoall_helix
+from ..distributed import (AllReduceParams, HelixAllToAllNative, alltoall_helix,
+                           cp_allgather, reducescatter)
 from ..model_config import ModelConfig
 from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
@@ -962,6 +963,7 @@ class MLA(nn.Module):
             gpus_per_node=self.mapping.gpus_per_node,
             enable_attention_dp=self.mapping.enable_attention_dp,
         )
+        self.mapping_o = mapping_o
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,
             self.hidden_size,
@@ -2278,6 +2280,98 @@ class MLA(nn.Module):
                 f"Missing bmm impl for dtype: {self.v_b_proj.dtype}.")
         return output
 
+    def _needs_cp_reduce_scatter(self) -> bool:
+        """Check if we should use CP reduce-scatter instead of AllReduce."""
+        return (self.mapping.has_cp_helix()
+                and self.mapping.enable_attention_dp)
+
+    def _maybe_allgather_input(
+            self, hidden_states: torch.Tensor,
+            attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """AllGather input hidden states from CP group if needed.
+
+        For the first layer (Embed -> Attn), all CP ranks already have the
+        full input, so this is a no-op. For subsequent layers, the previous
+        layer's reduce-scatter left each rank with a portion that must be
+        reconstructed before attention.
+        """
+        if self._needs_cp_reduce_scatter() and self.layer_idx > 0:
+            hidden_states = cp_allgather(hidden_states, self.mapping, dim=0)
+            # Remove padding introduced by reduce-scatter alignment.
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+        return hidden_states
+
+    def _pad_for_cp(self, tensor: torch.Tensor,
+                    num_tokens: int) -> tuple[torch.Tensor, int]:
+        """Pad tensor along dim-0 so its length is divisible by cp_size.
+
+        Returns the (possibly padded) tensor and the per-rank chunk size.
+        """
+        cp_size = self.mapping.cp_size
+        chunk_size = math.ceil(num_tokens / cp_size)
+        padded_size = chunk_size * cp_size
+
+        if num_tokens < padded_size:
+            tensor = torch.nn.functional.pad(
+                tensor, (0, 0, 0, padded_size - num_tokens),
+                mode="constant",
+                value=0)
+
+        return tensor, chunk_size
+
+    def _slice_for_cp(self, tensor: torch.Tensor,
+                      attn_metadata: AttentionMetadata) -> torch.Tensor:
+        """Slice a tensor to this CP rank's chunk, matching post-RS size.
+
+        Used for the first layer's residual: since there is no prior RS to
+        divide it, we manually extract this rank's portion so it aligns with
+        the reduce-scattered attention output.
+        """
+        tensor, chunk_size = self._pad_for_cp(tensor, attn_metadata.num_tokens)
+        start = self.mapping.cp_rank * chunk_size
+        return tensor[start:start + chunk_size]
+
+    def _output_projection(
+        self,
+        attn_output: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        all_reduce_params: Optional[AllReduceParams],
+        residual: Optional[torch.Tensor],
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Apply output projection (o_proj) and reduce across parallel ranks.
+
+        With CP reduce-scatter, o_proj produces partial sums (each CP rank
+        contributes from its head partition). Reduce-scatter sums these
+        and divides the result among CP ranks for subsequent MoE processing.
+        Otherwise, o_proj uses the standard AllReduce path.
+
+        The residual is passed through unchanged unless this is the first
+        layer with CP reduce-scatter, in which case it is sliced to match
+        the post-RS token count.
+        """
+        if self._needs_cp_reduce_scatter():
+            # Skip AllReduce in o_proj; use reduce-scatter instead.
+            attn_output = self.o_proj(
+                attn_output,
+                all_reduce_params=AllReduceParams(enable_allreduce=False))
+
+            # Pad to make token count divisible by cp_size for reduce-scatter.
+            attn_output, _ = self._pad_for_cp(attn_output,
+                                              attn_metadata.num_tokens)
+
+            # Reduce-scatter using mapping_o where tp_group = cp_group.
+            attn_output = reducescatter(attn_output, self.mapping_o, dim=0)
+
+            # For the first layer, the residual comes from the embedding and
+            # has not been through a prior RS. Slice it to match.
+            if self.layer_idx == 0 and residual is not ...:
+                residual = self._slice_for_cp(residual, attn_metadata)
+        else:
+            attn_output = self.o_proj(attn_output,
+                                      all_reduce_params=all_reduce_params)
+
+        return attn_output, residual
+
     def forward(
         self,
         position_ids: Optional[torch.Tensor],
@@ -2285,7 +2379,11 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        residual: Optional[torch.Tensor] = ...,
+    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+
+        hidden_states = self._maybe_allgather_input(hidden_states,
+                                                    attn_metadata)
 
         attn_output = self.create_output(hidden_states,
                                          attn_metadata.num_contexts)
@@ -2313,9 +2411,13 @@ class MLA(nn.Module):
             attn_output = attn_output[:, :self.num_heads_tp_cp *
                                       self.v_head_dim].contiguous()
 
-        attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
-        return attn_output
+        attn_output, residual = self._output_projection(attn_output,
+                                                        attn_metadata,
+                                                        all_reduce_params,
+                                                        residual)
+        if residual is ...:
+            return attn_output
+        return attn_output, residual
 
     def resmooth_parameters(self,
                             module_weight,

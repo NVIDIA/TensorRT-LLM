@@ -1471,7 +1471,16 @@ class PyTorchModelEngine(ModelEngine):
 
     def _get_all_rank_num_tokens(self, attn_metadata: AttentionMetadata):
         if self.enable_attention_dp:
-            return list(self.dist.tp_cp_allgather(attn_metadata.num_tokens))
+            num_tokens = attn_metadata.num_tokens
+            if self.mapping.has_cp_helix():
+                # With CP, attention uses reduce-scatter to divide tokens
+                # among CP ranks. Report the post-RS token count.
+                # Use tp_cp_allgather so MoE (which sees the repurposed
+                # mapping where tp_size = original tp * cp) can index
+                # with its tp_rank.
+                num_tokens = math.ceil(num_tokens / self.mapping.cp_size)
+                return list(self.dist.tp_cp_allgather(num_tokens))
+            return list(self.dist.tp_allgather(num_tokens))
         return None
 
     def _get_all_rank_ctx_requests(self, num_ctx_requests: int):

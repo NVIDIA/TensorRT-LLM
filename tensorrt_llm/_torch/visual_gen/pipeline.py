@@ -22,6 +22,8 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    warmup_steps: int = 2
+
     def __init__(self, model_config: "DiffusionModelConfig"):
         super().__init__()
         self.model_config = model_config
@@ -46,11 +48,10 @@ class BasePipeline(nn.Module):
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
-        cfg = self.model_config.pipeline
-        if not cfg.enable_cuda_graph:
+        if not self.model_config.cuda_graph.enable_cuda_graph:
             return
 
-        if cfg.enable_torch_compile:
+        if self.model_config.torch_compile.enable_torch_compile:
             logger.warning(
                 "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
@@ -175,7 +176,7 @@ class BasePipeline(nn.Module):
         self.cache_backend.enable(model)
 
     def torch_compile(self) -> None:
-        """Apply torch.compile to pipeline components based on PipelineConfig.
+        """Apply torch.compile to pipeline components based on TorchCompileConfig.
 
         For transformer models, compiles each block in the ModuleList individually.
         This enables future block-wise offloading and keeps compilation efficient
@@ -183,12 +184,14 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
-        pipeline_config = self.model_config.pipeline
-        compile_mode = pipeline_config.torch_compile_mode
+        tc_config = self.model_config.torch_compile
 
-        targets = pipeline_config.torch_compile_models
-        if not targets:
-            targets = self.transformer_components
+        # Using default as max-autotune mode takes more initialization time and
+        # does not improve performance a lot.
+        compile_mode = "default"
+
+        # Compiling transformer blocks provides max performance value.
+        targets = self.transformer_components
 
         for name in targets:
             model = getattr(self, name, None)
@@ -196,7 +199,6 @@ class BasePipeline(nn.Module):
                 logger.warning(f"torch.compile: component '{name}' not found, skipping")
                 continue
 
-            # For transformer models with ModuleList blocks, compile per-block
             blocks_attr = self._find_transformer_blocks(model)
             if blocks_attr:
                 for block_name in blocks_attr:
@@ -206,14 +208,13 @@ class BasePipeline(nn.Module):
                         f"({len(blocks)} blocks, mode={compile_mode})"
                     )
                     compiled_blocks = []
-                    # dynamic=None works better with multiple warmup shapes
                     for block in blocks:
                         compiled_blocks.append(
                             torch.compile(
                                 block,
                                 mode=compile_mode,
                                 dynamic=None,
-                                fullgraph=pipeline_config.enable_fullgraph,
+                                fullgraph=tc_config.enable_fullgraph,
                             )
                         )
                     setattr(model, block_name, nn.ModuleList(compiled_blocks))
@@ -223,7 +224,7 @@ class BasePipeline(nn.Module):
                     model,
                     mode=compile_mode,
                     dynamic=None,
-                    fullgraph=pipeline_config.enable_fullgraph,
+                    fullgraph=tc_config.enable_fullgraph,
                 )
                 setattr(self, name, compiled)
 
@@ -249,7 +250,7 @@ class BasePipeline(nn.Module):
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         """
-        warmup_steps = self.model_config.pipeline.warmup_steps
+        warmup_steps = self.warmup_steps
         if warmup_steps <= 0:
             logger.info("Warmup disabled (warmup_steps=0)")
             return
