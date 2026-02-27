@@ -14,11 +14,12 @@ Workflow:
 1. Run the ad flow with the user given model-id and yaml using the below command.
 How to run:
 ```bash
-AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR>  python examples/auto_deploy/build_and_run_ad.py --model <MODEL_HF_ID> --args.yaml-
-extra examples/auto_deploy/model_registry/configs/<CONFIG_YAML_FILE>  2>&1 | tee <LOG_FILE>
-5.log
+AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR> python examples/auto_deploy/build_and_run_ad.py \
+  --model <MODEL_HF_ID> \
+  --args.yaml-extra examples/auto_deploy/model_registry/configs/<CONFIG_YAML_FILE> \
+  2>&1 | tee <LOG_FILE>
 ```
-Where `AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR>` is the directory where the graphs will be dumped (will be auto created by the script), `<MODEL_HF_ID>` is the HF model-if of model we want to run (it can also be a local path to a model checkpoint), and `<CONFIG_YAML_FILE>` is the configuration file for the model.
+Where `AD_DUMP_GRAPHS_DIR=<AD_DUMP_GRAPHS_DIR>` is the directory where the graphs will be dumped (will be auto-created by the script), `<MODEL_HF_ID>` is the HF model-id of model we want to run (it can also be a local path to a model checkpoint), and `<CONFIG_YAML_FILE>` is the configuration file for the model.
 
 If there's any error, we check the log file `<LOG_FILE>` and IR files in the `AD_DUMP_GRAPHS_DIR` directory to see what went wrong.
 

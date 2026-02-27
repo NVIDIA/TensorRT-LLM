@@ -63,9 +63,9 @@ Mark as N/A with justification if the model doesn't have the relevant component.
 | # | Check | How to verify |
 |---|-------|---------------|
 | F1 | Uses small config (hidden_size ~64, num_hidden_layers 2-3, vocab_size ~1000) | Read the test config creation |
-| F3 | No smoke tests — every test has meaningful assertions (`assert_close`, shape checks, finiteness checks) | Check each test for substantive assertions |
-| F3 | Non isNan or isInf checks - these are smoke tests. We want functional closeness tests only | 
-| F4 | Make sure that the test imports existing modules from transformers package or has a copy of reference code copied as part of the test it. The test should self contained or use existing imports from existing packages. No random imports from hardcoded local or temp paths. | 
+| F2 | No smoke tests — every test has meaningful assertions (`assert_close`, shape checks, finiteness checks) | Check each test for substantive assertions |
+| F3 | Do not rely on only `isnan`/`isinf` checks; include functional equivalence assertions | Check tests use `assert_close` (or equivalent) against reference outputs |
+| F4 | Test imports must be self-contained (transformers imports or copied reference classes only); no hardcoded local/temp path imports | Inspect imports and helper loaders |
 
 ### G. Test File — Hierarchical Levels
 
@@ -86,7 +86,7 @@ Mark as N/A with justification if the model doesn't have the relevant component.
 
 ## Output Format
 
-```
+```text
 REVIEW RESULT: PASS | FAIL
 
 === A. Structure & Hierarchy ===

@@ -727,8 +727,8 @@ def test_kimi_k2_moe_layer_numerical_equivalence(B, S, dtype):
 def test_kimi_k2_full_model_numerical_equivalence(B, S, dtype):
     """Test full model produces numerically equivalent logits to HF DeepseekV3ForCausalLM.
 
-    Weight conversion: the load_state_dict_pre_hook on KimiK2ForCausalLM
-    automatically de-interleaves RoPE weights. All other weights have matching keys.
+    Weight conversion: no RoPE de-interleaving is needed for this model path.
+    The attention path uses native interleaved q/k channels.
     """
     HFModel = _get_hf_model_class()
     if HFModel is None:
@@ -747,7 +747,7 @@ def test_kimi_k2_full_model_numerical_equivalence(B, S, dtype):
     hf_model.to(device=device, dtype=dtype)
     hf_model.eval()
 
-    # Create custom model — the pre-hook handles RoPE de-interleaving
+    # Create custom model and load matching HF weights directly.
     custom_model = KimiK2ForCausalLM(config)
     custom_model.to(device=device, dtype=dtype)
     hf_state_dict = hf_model.state_dict()
