@@ -55,9 +55,23 @@ VBENCH_WAN_GOLDEN_SCORES = {
 }
 
 
-# TODO: populate after first successful baseline run for each checkpoint.
-VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES = None
-VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES = None
+# TODO: Reference scores from bf16 baseline runs
+VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES = {
+    "subject_consistency": 0.9173,
+    "background_consistency": 0.9717,
+    "motion_smoothness": 0.9865,
+    "dynamic_degree": 1.0000,
+    "aesthetic_quality": 0.5465,
+    "imaging_quality": 0.7142,
+}
+VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES = {
+    "subject_consistency": 0.9173,
+    "background_consistency": 0.9717,
+    "motion_smoothness": 0.9865,
+    "dynamic_degree": 1.0000,
+    "aesthetic_quality": 0.5465,
+    "imaging_quality": 0.7142,
+}
 
 VBENCH_REPO = "https://github.com/Vchitect/VBench.git"
 # Pin to a fixed commit for reproducible shallow-fetch
@@ -68,12 +82,18 @@ DINO_HUB_DIR_NAME = "facebookresearch_dino_main"
 
 
 @pytest.fixture(scope="session")
+def _visual_gen_deps(llm_venv):
+    """Install av + diffusers once per session (shared by all video-gen fixtures)."""
+    llm_venv.run_cmd(["-m", "pip", "install", "av"])
+    llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
+
+
+@pytest.fixture(scope="session")
 def vbench_repo_root(llm_venv):
     """Clone VBench repo into workspace and install; return repo root path."""
     workspace = llm_venv.get_working_directory()
     repo_path = os.path.join(workspace, "VBench_repo")
     _precache_dino_for_torch_hub()
-    _ensure_vbench_runtime_deps(llm_venv)
     if os.path.exists(repo_path):
         return repo_path
     # Shallow-fetch only the pinned commit to avoid downloading full history (~350 MB)
@@ -112,11 +132,6 @@ def vbench_repo_root(llm_venv):
     return repo_path
 
 
-def _ensure_vbench_runtime_deps(llm_venv):
-    """Ensure VBench runtime deps are installed (idempotent, runs every session)."""
-    llm_venv.run_cmd(["-m", "pip", "install", "-q", "imageio"])
-
-
 def _precache_dino_for_torch_hub():
     """Pre-clone facebookresearch/dino into torch.hub cache to avoid GitHub API rate limits.
 
@@ -137,91 +152,9 @@ def _precache_dino_for_torch_hub():
 
 
 @pytest.fixture(scope="session")
-def wan_trtllm_video_path(llm_venv, llm_root):
+def wan_trtllm_video_path(_visual_gen_deps, llm_venv, llm_root):
     """Generate input video via visual_gen_wan_t2v.py and return path to trtllm_output.mp4."""
-    scratch_space = llm_models_root()
-    model_path = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
-    if not os.path.isdir(model_path):
-        pytest.skip(
-            f"Wan T2V model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
-        )
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output")
-    os.makedirs(out_dir, exist_ok=True)
-    output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
-    if os.path.isfile(output_path):
-        return output_path
-    # Install av and diffusers from main branch
-    llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(
-        [
-            "-m",
-            "pip",
-            "install",
-            "git+https://github.com/huggingface/diffusers.git",
-        ]
-    )
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_wan_t2v.py")
-    assert os.path.isfile(script_path), f"Visual gen script not found: {script_path}"
-    cmd = [
-        script_path,
-        "--height",
-        str(WAN_T2V_HEIGHT),
-        "--width",
-        str(WAN_T2V_WIDTH),
-        "--num_frames",
-        str(WAN_T2V_NUM_FRAMES),
-        "--model_path",
-        model_path,
-        "--prompt",
-        WAN_T2V_PROMPT,
-        "--output_path",
-        output_path,
-    ]
-    if torch.cuda.device_count() >= 2:
-        cmd.extend(["--cfg_size", "2"])
-    venv_check_call(llm_venv, cmd)
-    assert os.path.isfile(output_path), f"Visual gen did not produce {output_path}"
-    return output_path
-
-
-@pytest.fixture(scope="session")
-def wan_reference_video_path(llm_venv, llm_root):
-    """Generate reference video via diffusers (hf_wan.py) using the same model checkpoint."""
-    scratch_space = llm_models_root()
-    model_path = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
-    if not os.path.isdir(model_path):
-        pytest.skip(
-            f"Wan T2V model not found: {model_path} "
-            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
-        )
-    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output")
-    os.makedirs(out_dir, exist_ok=True)
-    reference_path = os.path.join(out_dir, DIFFUSERS_REFERENCE_VIDEO)
-    if os.path.isfile(reference_path):
-        return reference_path
-    hf_script = os.path.join(llm_root, "examples", "visual_gen", "hf_wan.py")
-    assert os.path.isfile(hf_script), f"Diffusers script not found: {hf_script}"
-    venv_check_call(
-        llm_venv,
-        [
-            hf_script,
-            "--model_path",
-            model_path,
-            "--prompt",
-            WAN_T2V_PROMPT,
-            "--output_path",
-            reference_path,
-            "--height",
-            str(WAN_T2V_HEIGHT),
-            "--width",
-            str(WAN_T2V_WIDTH),
-            "--num_frames",
-            str(WAN_T2V_NUM_FRAMES),
-        ],
-    )
-    assert os.path.isfile(reference_path), f"Diffusers did not produce {reference_path}"
-    return reference_path
+    return _generate_wan_video(llm_venv, llm_root, WAN_T2V_MODEL_SUBPATH, "wan")
 
 
 def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
@@ -242,8 +175,6 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
     if os.path.isfile(output_path):
         return output_path
-    llm_venv.run_cmd(["-m", "pip", "install", "av"])
-    llm_venv.run_cmd(["-m", "pip", "install", "git+https://github.com/huggingface/diffusers.git"])
     script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_wan_t2v.py")
     assert os.path.isfile(script_path), f"Visual gen script not found: {script_path}"
     cmd = [
@@ -269,21 +200,15 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
 
 
 @pytest.fixture(scope="session")
-def wan22_a14b_fp8_video_path(llm_venv, llm_root):
+def wan22_a14b_fp8_video_path(_visual_gen_deps, llm_venv, llm_root):
     """Generate video with Wan 2.2 A14B FP8 checkpoint."""
     return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_FP8_MODEL_SUBPATH, "wan22_fp8")
 
 
 @pytest.fixture(scope="session")
-def wan22_a14b_nvfp4_video_path(llm_venv, llm_root):
+def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv, llm_root):
     """Generate video with Wan 2.2 A14B NVFP4 checkpoint."""
     return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
-
-
-def _visual_gen_out_dir(llm_venv, subdir=""):
-    """Output directory for generated media; subdir e.g. 'ltx2' for model-specific outputs."""
-    base = os.path.join(llm_venv.get_working_directory(), "visual_gen_output")
-    return os.path.join(base, subdir) if subdir else base
 
 
 def _normalize_score(val):
@@ -317,83 +242,17 @@ def _get_per_video_scores(results, video_path_substr):
     return scores
 
 
-def _run_vbench_and_compare_to_golden(
-    vbench_repo_root,
-    videos_dir,
-    trtllm_filename,
-    golden_scores,
-    llm_venv,
-    title,
-    max_score_diff=0.1,
-):
-    """Run VBench on videos_dir (TRT-LLM output only), compare to golden HF reference scores."""
-    output_path = os.path.join(
-        llm_venv.get_working_directory(), "vbench_eval_output", title.replace(" ", "_").lower()
-    )
-    os.makedirs(output_path, exist_ok=True)
-    evaluate_script = os.path.join(vbench_repo_root, "evaluate.py")
-    cmd = [
-        evaluate_script,
-        "--videos_path",
-        videos_dir,
-        "--output_path",
-        output_path,
-        "--mode",
-        "custom_input",
-    ]
-    cmd.extend(["--dimension"] + VBENCH_DIMENSIONS)
-    venv_check_call(llm_venv, cmd)
-    pattern = os.path.join(output_path, "*_eval_results.json")
-    result_files = glob.glob(pattern)
-    assert result_files, (
-        f"No eval results found matching {pattern}; output dir: {os.listdir(output_path)}"
-    )
-    with open(result_files[0], "r") as f:
-        results = json.load(f)
-    for dim in VBENCH_DIMENSIONS:
-        assert dim in results, (
-            f"Expected dimension '{dim}' in results; keys: {list(results.keys())}"
-        )
-    scores_trtllm = _get_per_video_scores(results, trtllm_filename)
-    scores_ref = golden_scores
-    max_len = max(len(d) for d in VBENCH_DIMENSIONS)
-    header = f"{'Dimension':<{max_len}}  |  {'TRT-LLM':>10}  |  {'HF Ref':>10}  |  {'Diff':>8}"
-    sep = "-" * len(header)
-    print("\n" + "=" * len(header))
-    print(f"VBench dimension scores ({title}): TRT-LLM vs golden HF reference scores")
-    print("=" * len(header))
-    print(header)
-    print(sep)
-    max_diff_val = 0.0
-    for dim in VBENCH_DIMENSIONS:
-        t, r = scores_trtllm[dim], scores_ref[dim]
-        diff = abs(t - r)
-        max_diff_val = max(max_diff_val, diff)
-        print(f"{dim:<{max_len}}  |  {t:>10.4f}  |  {r:>10.4f}  |  {diff:>8.4f}")
-    print(sep)
-    print(
-        f"{' (all dimensions)':<{max_len}}  |  (TRT-LLM)   |  (golden)   |  max_diff={max_diff_val:.4f}"
-    )
-    print("=" * len(header) + "\n")
-    for dim in VBENCH_DIMENSIONS:
-        diff = abs(scores_trtllm[dim] - scores_ref[dim])
-        assert diff < max_score_diff or scores_trtllm[dim] >= scores_ref[dim], (
-            f"Dimension '{dim}' score difference {diff:.4f} >= {max_score_diff} "
-            f"(TRT-LLM={scores_trtllm[dim]:.4f}, golden={scores_ref[dim]:.4f})"
-        )
-
-
 def test_vbench_dimension_score_wan(vbench_repo_root, wan_trtllm_video_path, llm_venv):
     """Run VBench on WAN TRT-LLM video; compare to golden HF reference scores (diff < 0.05 or TRT-LLM >= golden)."""
     videos_dir = os.path.dirname(wan_trtllm_video_path)
     assert os.path.isfile(wan_trtllm_video_path), "TRT-LLM video must exist"
-    _run_vbench_and_compare_to_golden(
+    _run_vbench_and_report(
         vbench_repo_root,
         videos_dir,
         VISUAL_GEN_OUTPUT_VIDEO,
-        VBENCH_WAN_GOLDEN_SCORES,
         llm_venv,
         title="WAN",
+        golden_scores=VBENCH_WAN_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
 
@@ -495,7 +354,7 @@ def test_vbench_dimension_score_wan22_a14b_fp8(
         llm_venv,
         title="WAN 2.2 A14B FP8",
         golden_scores=VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES,
-        max_score_diff=0.10,
+        max_score_diff=0.05,
     )
 
 
@@ -512,46 +371,5 @@ def test_vbench_dimension_score_wan22_a14b_nvfp4(
         llm_venv,
         title="WAN 2.2 A14B NVFP4",
         golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
-        max_score_diff=0.10,
-    )
-
-
-# ---------------------------------------------------------------------------
-# Score-only tests: skip video generation, evaluate pre-existing .mp4 files.
-#
-#   WAN22_FP8_VIDEO_PATH=/path/to/trtllm_fp8.mp4 \
-#   WAN22_NVFP4_VIDEO_PATH=/path/to/trtllm_nvfp4.mp4 \
-#   pytest ... -k "score_only"
-# ---------------------------------------------------------------------------
-
-
-def test_vbench_score_only_wan22_fp8(vbench_repo_root, llm_venv):
-    """Evaluate a pre-existing FP8 video (set WAN22_FP8_VIDEO_PATH)."""
-    video_path = os.environ.get("WAN22_FP8_VIDEO_PATH")
-    if not video_path:
-        pytest.skip("WAN22_FP8_VIDEO_PATH not set")
-    assert os.path.isfile(video_path), f"Video not found: {video_path}"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        os.path.dirname(video_path),
-        os.path.basename(video_path),
-        llm_venv,
-        title="WAN 2.2 A14B FP8 (score-only)",
-        golden_scores=VBENCH_WAN22_A14B_FP8_GOLDEN_SCORES,
-    )
-
-
-def test_vbench_score_only_wan22_nvfp4(vbench_repo_root, llm_venv):
-    """Evaluate a pre-existing NVFP4 video (set WAN22_NVFP4_VIDEO_PATH)."""
-    video_path = os.environ.get("WAN22_NVFP4_VIDEO_PATH")
-    if not video_path:
-        pytest.skip("WAN22_NVFP4_VIDEO_PATH not set")
-    assert os.path.isfile(video_path), f"Video not found: {video_path}"
-    _run_vbench_and_report(
-        vbench_repo_root,
-        os.path.dirname(video_path),
-        os.path.basename(video_path),
-        llm_venv,
-        title="WAN 2.2 A14B NVFP4 (score-only)",
-        golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
+        max_score_diff=0.05,
     )
