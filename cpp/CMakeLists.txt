@@ -335,6 +335,13 @@ endif()
 
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -DBUILD_SYSTEM=cmake_oss ")
 
+# Generate dependency files (.d) to track all header dependencies This creates
+# .d files alongside .o files showing all headers used
+if(NOT WIN32)
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -MD -MP")
+  set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -MD -MP")
+endif()
+
 # note: cmake expr generation $<BOOL:${ENABLE_MULTI_DEVICE}> is a build time
 # evaluation so hard to debug at cmake time
 if(ENABLE_MULTI_DEVICE)
@@ -391,6 +398,20 @@ if(ENABLE_BOLT_COMPATIBLE AND NOT WIN32)
 endif()
 # Note: For nanobind modules, use NOSTRIP option in nanobind_add_module()
 # ==== End BOLT Compatible Flags ====
+
+# Generate linker dependency files (link.d) for dependency scanning. These files
+# contain the resolved paths of all libraries used during linking.
+option(GENERATE_LINKER_DEPFILES
+       "Generate linker dependency files for dependency scanning" ON)
+if(GENERATE_LINKER_DEPFILES)
+  # Modify linker rules to add --dependency-file flag <TARGET> is a CMake
+  # placeholder that gets replaced with the output path
+  string(APPEND CMAKE_CXX_CREATE_SHARED_LIBRARY
+         " -Wl,--dependency-file,<TARGET>.d")
+  string(APPEND CMAKE_CXX_CREATE_SHARED_MODULE
+         " -Wl,--dependency-file,<TARGET>.d")
+  string(APPEND CMAKE_CXX_LINK_EXECUTABLE " -Wl,--dependency-file,<TARGET>.d")
+endif()
 
 # Disable deprecated declarations warnings
 if(NOT WIN32)

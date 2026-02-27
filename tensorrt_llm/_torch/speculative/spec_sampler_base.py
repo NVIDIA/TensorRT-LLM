@@ -28,6 +28,7 @@ from ..pyexecutor.llm_request import LlmRequest, LlmRequestState
 from ..pyexecutor.resource_manager import BaseResourceManager
 from ..pyexecutor.sampler import (
     DEFAULT_BEAM_IDX,
+    AsyncWorkerMixin,
     Sampler,
     SampleState,
     SampleStateTensors,
@@ -54,7 +55,7 @@ class SampleStateSpec(SampleState):
     host: SampleStateTensorsSpec
 
 
-class SpecSamplerBase(Sampler[SampleStateSpec]):
+class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
     """
     Base class for speculative decoding samplers (MTP, NGram, Eagle3, SA).
 
@@ -251,8 +252,12 @@ class SpecSamplerBase(Sampler[SampleStateSpec]):
             next_draft_tokens=self.store.next_draft_tokens.to("cpu", non_blocking=True),
         )
 
-        sampler_event = torch.cuda.Event()
-        sampler_event.record()
+        host_tensors = SampleStateTensorsSpec(
+            new_tokens=self._copy_to_host(self.store.new_tokens),
+            new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
+            next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),
+        )
+        sampler_event = self._record_sampler_event()
 
         # Add dummy draft tokens to context requests for KV cache preparation
         if self._add_dummy_draft_tokens():

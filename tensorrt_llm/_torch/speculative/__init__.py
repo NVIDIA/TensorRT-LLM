@@ -4,6 +4,7 @@ from .interface import (SpecMetadata, SpecWorkerBase,
                         should_use_separate_draft_kv_cache)
 from .mtp import MTPEagleWorker, MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
+from .pard import PARDSpecMetadata, PARDWorker
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
@@ -24,6 +25,8 @@ __all__ = [
     "MTPWorker",
     "NGramDrafter",
     "NGramPoolManager",
+    "PARDSpecMetadata",
+    "PARDWorker",
     "SASampler",
     "SASpecMetadata",
     "SAWorker",

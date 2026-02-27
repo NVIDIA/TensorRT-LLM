@@ -18,7 +18,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
-from tensorrt_llm._utils import get_size_in_bytes, get_sm_version
+from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -339,7 +339,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_indexer_k_cache_block_offsets = torch.zeros_like(
             self.indexer_k_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
         if not self.enable_context_mla_with_cached_kv:
@@ -353,7 +353,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_ctx_cached_token_indptr = torch.zeros_like(
                 self.ctx_cached_token_indptr,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
             self.ctx_kv_indptr = self.get_empty(
                 self.cuda_graph_buffers,
@@ -365,7 +365,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_ctx_kv_indptr = torch.zeros_like(
                 self.ctx_kv_indptr,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
 
         # Only when MLA chunked prefill is enabled, we need to gather the full KV for indexer's logit computation.
@@ -385,7 +385,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_gen_cached_token_indptr = torch.zeros_like(
             self.gen_cached_token_indptr,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.gen_kv_indptr = self.get_empty(
             self.cuda_graph_buffers,
@@ -397,7 +397,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_gen_kv_indptr = torch.zeros_like(
             self.gen_kv_indptr,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         # Indexer metadata
         # Separate slot mappings for non-interleaved layout (flat byte indices)
@@ -411,7 +411,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_slot_mapping_fp8 = torch.zeros_like(
             self.slot_mapping_fp8,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.slot_mapping_scale = self.get_empty(
             self.cuda_graph_buffers,
@@ -423,7 +423,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_slot_mapping_scale = torch.zeros_like(
             self.slot_mapping_scale,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         # Per-token request index buffer for topk_indices conversion
         self.req_idx_per_token = self.get_empty(
@@ -474,7 +474,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.host_topk_indices_buffer = torch.zeros_like(
                 self.topk_indices_buffer,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
             )
         # Create expanded buffers for MTP support
         self.create_expanded_buffers(capture_graph=capture_graph)
@@ -491,7 +491,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.kv_lens_expanded_host = torch.zeros_like(
             self.kv_lens_expanded_cuda,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.block_table_expanded = self.get_empty(
             self.cuda_graph_buffers,
@@ -506,7 +506,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_block_table_expanded = torch.zeros_like(
             self.block_table_expanded,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
         self.scheduler_metadata_buffer_expanded = self.get_empty(
             self.cuda_graph_buffers,
@@ -1171,12 +1171,10 @@ class Indexer(nn.Module):
             total_kv_per_request = seq_lens[:
                                             num_contexts] + start_positions[:
                                                                             num_contexts]
-            host_slot_mapping_fp8_fullkv = torch.empty(total_kv_len,
-                                                       dtype=torch.int64,
-                                                       pin_memory=True)
-            host_slot_mapping_scale_fullkv = torch.empty(total_kv_len,
-                                                         dtype=torch.int64,
-                                                         pin_memory=True)
+            host_slot_mapping_fp8_fullkv = torch.empty(
+                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
+            host_slot_mapping_scale_fullkv = torch.empty(
+                total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
 
             req_indices = torch.repeat_interleave(
                 torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
