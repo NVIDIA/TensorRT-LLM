@@ -410,7 +410,11 @@ def _(input: torch.Tensor,
       tune_max_num_tokens: int = 8192,
       tuner_num_tokens: Optional[int] = None,
       tuner_top_k: Optional[int] = None,
-      activation_type: ActivationType = ActivationType.Swiglu,
+      activation_type: int = int(ActivationType.Swiglu),
+      routing_method_type: int = int(RoutingMethodType.Default),
+      n_group: Optional[int] = None,
+      topk_group: Optional[int] = None,
+      routed_scaling_factor: Optional[float] = None,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
