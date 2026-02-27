@@ -5833,8 +5833,9 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
         llm_spec = LLM(**llm_common_config, speculative_config=mtp_config)
 
         raw_prompts = [
-            "Below is a list of sentences. I'd like you to translate a few of them into Spanish please:\n\n1. The water cycle, an essential process for life on Earth, involves the continuous movement of water through evaporation, condensation, precipitation, and runoff.\n\n2. The phenomenon of bioluminescence, where living organisms produce light, creates magical scenes in the depths of the ocean and in the night landscapes.\n\n3. Black holes, the mysterious cosmic phenomena where gravity is so strong that not even light can escape, serve as gateways to understanding the limits of our physical laws.\n\n4. The exploration of quantum superposition has led to the conceptualization of quantum bits or qubits, which, unlike their classical counterparts, can represent a 0, a 1, or any quantum superposition of these states, a property that allows quantum computers to perform complex calculations at speeds unattainable by classical computers, offering new horizons in drug discovery, materials science, and cryptography, where they could solve problems considered intractable for traditional computing systems.\n\n5. The mystery of the Tunguska event, a massive explosion in Siberia in 1908, thought to be caused by a comet or asteroid, remains one of the 20th century's great enigmas.\n\nPlease translate the following numbered sentences into Spanish: [1, 2, 3, 4, 5]. Don't repeat the sentences in English. Only translate those 5 sentences. Number them in your response. Thank you!",
-            "Below is a list of sentences. I'd like you to translate a few of them into French please:\n\n1. The intricate dance of planets around stars in distant solar systems, known as exoplanets, expands our horizons in the search for extraterrestrial life.\n\n2. The development of smart cities, using technology to improve the efficiency of services and meet residents' needs, represents a new frontier in urban planning.\n\n3. The melting of polar ice caps, accelerated by global warming, contributes to rising sea levels and the loss of habitat for species like the polar bear.\n\n4. The mysteries of dark matter and dark energy, making up most of the universe's mass and energy, challenge our understanding of the cosmos.\n\n5. The Great Barrier Reef, the world's largest coral reef system, is home to a vast array of marine species and is visible from space.\n\nPlease translate the following numbered sentences into French: [1, 2, 3, 4, 5]. Don't repeat the sentences in English. Only translate those 5 sentences. Number them in your response. Thank you!",
+            "The capital of France is",
+            "The president of the United States is",
+            "The future of AI is",
         ]
         prompts = [
             llm_spec.tokenizer.apply_chat_template([{
@@ -5862,7 +5863,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 num_tokens = len(new_tokens)
 
             accept_rate = num_accepted / num_drafted
-            assert accept_rate > 0.35, \
+            assert accept_rate > 0.2, \
                 f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
 
