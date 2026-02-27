@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
 
 from tensorrt_llm.bindings.internal.common import Hasher as CppHasher
@@ -48,7 +47,7 @@ class Hasher:
     __slots__ = "_hasher"
     _hasher: "CppHasher"
 
-    def __init__(self, data: int | None = None) -> None:
+    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
         self._hasher = CppHasher()
         if data is not None:
             self._hasher.update(data)
@@ -65,11 +64,6 @@ class Hasher:
         self._hasher.update(data)
         return self
 
-    def copy(self) -> "Hasher":
-        new = object.__new__(Hasher)
-        new._hasher = copy.copy(self._hasher)
-        return new
-
     @property
     def digest(self) -> bytes:
         return self._hasher.digest
@@ -81,11 +75,11 @@ TokenBlock = list[TokenIdExt]
 def sequence_to_blockchain_keys(
     tokens_per_block: int, lora_task_id: int | None, tokens: Sequence[TokenIdExt]
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    hasher = Hasher(lora_task_id)
-    yield [], hasher.digest
+    digest = Hasher(lora_task_id).digest
+    yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
-        hasher.update(token_block)
-        yield token_block, hasher.digest
+        digest = Hasher(digest).update(token_block).digest
+        yield token_block, digest
 
 
 Child = TypeVar("Child", bound="Block | RootBlock")
@@ -170,6 +164,16 @@ def find_best_partial_match_in_next_nodes(
     return best_block, best_match_len
 
 
+class DuplicateKeyError(Exception):
+    "Another block with the same key already exists"
+
+    key: BlockKey
+
+    def __init__(self, key: BlockKey) -> None:
+        super().__init__(f"Block with key {key.hex()} already exists")
+        self.key = key
+
+
 class UselessBlockError(Exception):
     block: "Block"
 
@@ -185,24 +189,23 @@ def _add_or_get_existing(
 ) -> "Block | None":
     try:
         return Block(tokens, parent)
+    except DuplicateKeyError as e:
+        return parent.next[e.key]
     except UselessBlockError:
         return None
 
 
 class RootBlock:
-    __slots__ = ("_prev", "key", "next", "lora_task_id", "hasher", "__rawref__")
+    __slots__ = ("_prev", "key", "next", "lora_task_id", "__rawref__")
     key: BlockKey
     lora_task_id: int | None
-    hasher: Hasher
     _prev: rawref.ref["BlockRadixTree"]
     next: Children["Block"]
     __rawref__: rawref.ref["RootBlock"]
 
     def __init__(self, lora_task_id: int | None, prev: "BlockRadixTree") -> None:
-        hasher = Hasher(lora_task_id)
-        self.key = hasher.digest
+        self.key = self.make_key(lora_task_id)
         assert self.key not in prev.next, "Root block already exists"
-        self.hasher = hasher
         self.lora_task_id = lora_task_id
         self._prev = rawref.ref(prev)
         self.next = {}
@@ -238,27 +241,24 @@ class Block:
     A block of tokens. Manages data for all layers.
     """
 
-    __slots__ = ("key", "tokens", "ordinal", "_prev", "next", "storage", "hasher", "__rawref__")
+    __slots__ = ("key", "tokens", "ordinal", "_prev", "next", "storage", "__rawref__")
     key: BlockKey
     tokens: Sequence[TokenIdExt]
     ordinal: BlockOrdinal
     _prev: rawref.ref["Block | RootBlock"]
     next: Children["Block"]
-    hasher: Hasher
     __rawref__: rawref.ref["Block"]
 
     # indexed with LifeCycleId
     storage: TypedIndexList[LifeCycleId, rawref.ref["CommittedPage"] | None]
 
     @staticmethod
-    def make_key(prev_hasher: Hasher, tokens: Sequence[TokenIdExt]) -> tuple[BlockKey, Hasher]:
-        hasher = prev_hasher.copy()
-        hasher.update(tokens)
-        return hasher.digest, hasher
+    def make_key(prev_key: BlockKey, tokens: Sequence[TokenIdExt]) -> BlockKey:
+        return Hasher(prev_key).update(tokens).digest
 
     def __init__(self, tokens: Sequence[TokenIdExt], prev: "Block | RootBlock") -> None:
         assert prev.tokens_per_block == prev.prev.tokens_per_block, "prev must be a full block"
-        self.key, self.hasher = self.make_key(prev.hasher, tokens)
+        self.key = self.make_key(prev.key, tokens)
         self.tokens = tokens
         self.ordinal = BlockOrdinal(prev.ordinal + 1)
         self._prev = rawref.ref(prev)
