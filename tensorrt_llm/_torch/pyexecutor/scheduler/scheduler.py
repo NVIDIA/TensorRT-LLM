@@ -287,6 +287,10 @@ class SimpleScheduler(RequestScheduler):
         fitting_requests, fitting_disagg_gen_init_requests, paused_requests = (
             self.capacity_scheduler.schedule_request(active_requests)
         )
+        logger.info(
+            f"Fitting requests: {len(fitting_requests)}, fitting disagg gen init requests:"
+            f"{len(fitting_disagg_gen_init_requests)}"
+        )
 
         context_requests, generation_requests = self.micro_batch_scheduler.schedule(
             fitting_requests, inflight_request_ids

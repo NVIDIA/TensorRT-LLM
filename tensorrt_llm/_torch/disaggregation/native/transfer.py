@@ -720,6 +720,7 @@ class Sender:
             aux_task.future.set_result(sync_status)
             aux_task.status = TaskStatus.AUX_TRANSFERRED
             session.state.status = SessionStatus.AUX_TRANSFERRED
+            logger.info(f"Aux task for request {agent_args.unique_rid} completed")
         elif aux_task._transferred_count > agent_args.expected_transfers:
             aux_task.future.set_exception(
                 RuntimeError(
@@ -801,6 +802,23 @@ class Sender:
                     if task._perf_timer is not None:
                         task._perf_timer.record_push_start(trans_meta.peer_rank)
                     self.submit_task(trans_meta)
+
+            # Aux task may have been created before peer req-info exists.
+            # Dispatch it here so aux transfer is not dropped by timing races.
+            if session._aux_task is not None:
+                aux_task = session._aux_task
+                if aux_task._perf_timer is not None:
+                    aux_task._perf_timer.record_task_start(info.instance_rank)
+                aux_meta = aux_task._create_write_meta(info)
+                if aux_task._perf_timer is not None:
+                    aux_task._perf_timer.record_push_start(aux_meta.peer_rank)
+                logger.info(
+                    f"Dispatching aux for req_id={aux_task._unique_rid} to peer_rank={info.instance_rank}, "
+                    f"src_aux_ptrs_len={len(aux_meta.src_aux_ptrs) if aux_meta.src_aux_ptrs is not None else 0}"
+                )
+                self.submit_task(aux_meta)
+            else:
+                logger.info(f"No aux task for request {info.unique_rid}")
 
     def _get_or_connect_dealer(self, endpoint: str):
         if endpoint is None:
@@ -896,6 +914,7 @@ class TxSession(TxSessionBase):
             params = self._base_args.params
             slot = self.aux_slot
             task = AuxSendTask(params, slot, self._sender._registrar)
+            logger.info(f"Sending aux for request {self.request_id} with slot {slot}")
 
             self._aux_task = task
             self._sender.dispatch_task(task)
@@ -1142,6 +1161,9 @@ class Receiver:
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         session = self._get_rx_session(unique_rid)
+        logger.info(
+            f"Received AUX_SEND_STATUS for req_id={unique_rid} from peer_rank={peer_rank}: status={status}"
+        )
         session.process_aux_state(peer_rank, status)
 
     def _request_sender_data(self, endpoint: str, receiver_info: RecvReqInfo):
@@ -1182,6 +1204,8 @@ class RxSession(RxSessionBase):
         self._kv_tasks = []
         self._last_slice_counts = 0
         self._aux_counts = 0
+        # aux_slot can be 0; treat None as the only "no aux" marker.
+        self._aux_future = concurrent.futures.Future() if aux_slot is not None else None
 
     @property
     def state(self) -> SessionState:
@@ -1230,26 +1254,53 @@ class RxSession(RxSessionBase):
 
     def process_aux_state(self, peer_rank: int, status: str):
         task = self._kv_tasks[0]  # receive task slice only support slice 0
+        logger.info(f"Session {self.request_id} aux status: {status}, counts: {self._aux_counts}")
         if status == "SUCCESS":
             self._aux_counts += 1
 
             if self._aux_counts == task.expected_transfers:
                 task.status = TaskStatus.AUX_TRANSFERRED
                 self.state.status = SessionStatus.AUX_TRANSFERRED
+                if self._aux_future is not None:
+                    self._aux_future.set_result("SUCCESS")
             elif self._aux_counts > task.expected_transfers:
                 logger.error(
                     f"Session {self.request_id} has more than {task.expected_transfers} transfers"
                 )
                 self.state.status = SessionStatus.ERROR
+                if self._aux_future is not None:
+                    self._aux_future.set_exception(
+                        RuntimeError(
+                            f"Task unexpected count: {self._aux_counts} > {task.expected_transfers}"
+                        )
+                    )
         elif status == "FAILED":
             self.state.status = SessionStatus.ERROR
+            if self._aux_future is not None:
+                self._aux_future.set_exception(RuntimeError(f"Task state: {status}"))
         else:
+            if self._aux_future is not None:
+                self._aux_future.set_exception(RuntimeError(f"Task state: {status}"))
             raise ValueError(
                 f"Session {self.request_id} received unknown aux send status: {status}"
             )
 
     def poll_task(self, id: TaskIdType) -> SessionStatus:
         return self._kv_tasks[id].state
+
+    def wait_complete(self, kv_task_id: TaskIdType, wait_aux: bool = True) -> bool:
+        try:
+            kv_result = self._kv_tasks[kv_task_id].future.result() == "SUCCESS"
+            if wait_aux and self._aux_future is not None:
+                aux_result = self._aux_future.result() == "SUCCESS"
+                return kv_result and aux_result
+            else:
+                return kv_result
+        except Exception as e:
+            import traceback
+
+            logger.error(f"Exception in RxSession.wait_complete: {e}, {traceback.format_exc()}")
+            return False
 
     @property
     def exception(self) -> Optional[Exception]:
@@ -1541,10 +1592,16 @@ class TransferWorker:
 
     def unpack_aux(self, rx_session: RxSession, request: LlmRequest):
         first_gen_tokens, draft_tokens = self._aux_buffer.get_slot_tokens(rx_session.aux_slot)
-
+        logger.info(
+            f"Unpacked aux data for request {request.py_request_id}, first_gen_tokens: "
+            f"{first_gen_tokens}, draft_tokens: {draft_tokens}"
+        )
         # TODO: not first gen ,but add_tokens?
         request.py_first_gen_tokens = first_gen_tokens
         request.py_draft_tokens = draft_tokens
+        if request.context_phase_params is not None:
+            request.context_phase_params.first_gen_tokens = first_gen_tokens
+            request.context_phase_params.draft_tokens = draft_tokens
         return request
 
     def shutdown(self):

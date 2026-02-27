@@ -1702,6 +1702,9 @@ class PyExecutor:
                 request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
+            logger.info(
+                f"Preparing disagg gen init requests: {len(fitting_disagg_gen_init_requests)}"
+            )
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
             self._prepare_disagg_gen_init(fitting_disagg_gen_init_requests)
 
@@ -2657,6 +2660,7 @@ class PyExecutor:
         scheduled_requests.context_requests = scheduled_context_requests
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
+        logger.info(f"Scheduler output: {scheduler_output}")
 
         return scheduled_requests, scheduler_output.fitting_disagg_gen_init_requests, scheduler_output.num_fitting_requests
 
@@ -2817,6 +2821,9 @@ class PyExecutor:
                 ctx_draft_tokens = req.context_phase_params.draft_tokens
                 req.py_draft_tokens = [] if ctx_draft_tokens is None else ctx_draft_tokens
                 beam_width = req.sampling_config.beam_width
+                logger.info(
+                    f"Generation request {req.py_request_id} beam width: {beam_width}, first_gen_tokens: {first_gen_tokens}, ctx_draft_tokens: {ctx_draft_tokens}"
+                )
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
@@ -2945,6 +2952,8 @@ class PyExecutor:
 
     @nvtx_range("_check_disagg_gen_cache_transfer_status")
     def _check_disagg_gen_cache_transfer_status(self, atLeastNum: int = 0):
+        logger.info(
+            f"Checking disagg gen cache transfer status for {atLeastNum}")
         self.kv_cache_transceiver.check_gen_transfer_status(atLeastNum)
         self._check_cache_transfer_errors("generation requests")
 

@@ -8,6 +8,7 @@ import torch
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -15,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -54,11 +56,20 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self.device_id} in PyNativeCacheTransceiver")
 
+        # Aux payload carries first-gen and draft tokens in generation-first flow.
+        self.aux_buffer = AuxBuffer(
+            max_slot_num=max(1, int(self.kv_cache_manager.max_batch_size)),
+            beam_width=max(1, int(getattr(self.kv_cache_manager, "max_beam_width", 1))),
+            max_draft_len=max(0, int(getattr(self.kv_cache_manager, "max_draft_len", 0))),
+            device="cpu",
+        )
+
         self.transfer_worker = TransferWorker(
             kv_cache_manager=kv_cache_manager,
             mapping=mapping,
             device_id=self.device_id,
             instance_name=instance_name,
+            aux_buffer=self.aux_buffer,
         )
 
         self.context_info_endpoint = None
@@ -102,12 +113,38 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
         return KVSlice(is_last_slice=True, block_ids=block_ids)
 
+    @staticmethod
+    def _is_generation_first(req: LlmRequest) -> bool:
+        params = req.py_disaggregated_params
+        return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+
+    def _has_peer_req_data(self, req: LlmRequest) -> bool:
+        params = req.py_disaggregated_params
+        if params is None:
+            return False
+        unique_rid = (
+            params.disagg_request_id
+            if params.disagg_request_id is not None
+            else params.ctx_request_id
+        )
+        if unique_rid is None:
+            return False
+
+        req_info_dict = self.transfer_worker._sender._peer_reqs.get_req_info(unique_rid)
+        return req_info_dict is not None and len(req_info_dict) > 0
+
     def respond_and_send_async(self, req: LlmRequest):
+        logger.info(f"Responding and sending async for request {req.request_id}")
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         send_session = self.transfer_worker.create_tx_session(req)
         self.send_sessions[req.request_id] = send_session
         kv_slice = self._create_kv_slice(req)
         send_task_id = send_session.send(kv_slice)
+        if self._is_generation_first(req):
+            self.transfer_worker.pack_aux(send_session, req)
+            send_session.send_aux()
+        else:
+            logger.info(f"No aux task for request {req.request_id}")
         self.send_task_ids[req.request_id] = send_task_id
 
         req.context_phase_params = ContextPhaseParams(
@@ -213,7 +250,14 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
-            if session.state.status == SessionStatus.TRANSFERRED:
+            req = self.recv_req_id_to_request[request_id]
+            if self._is_generation_first(req):
+                if session.state.status == SessionStatus.AUX_TRANSFERRED:
+                    local_completed_request_ids.append(request_id)
+                    self.transfer_worker.unpack_aux(self.recv_sessions[request_id], req)
+                elif session.state.status == SessionStatus.ERROR:
+                    local_failed_request_ids.append(request_id)
+            elif session.state.status == SessionStatus.TRANSFERRED:
                 local_completed_request_ids.append(request_id)
             elif session.state.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
@@ -246,17 +290,15 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         completed_request_ids = []
         failed_request_ids = []
         for request_id in to_complete_request_ids:
-            future = self.recv_sessions[request_id]._kv_tasks[self.recv_task_ids[request_id]].future
-            try:
-                sync_status = future.result()
-                if sync_status == "SUCCESS":
-                    completed_request_ids.append(request_id)
-                else:
-                    failed_request_ids.append(request_id)
-            except Exception:
+            recv_task_id = self.recv_task_ids[request_id]
+            recv_session = self.recv_sessions[request_id]
+            req = self.recv_req_id_to_request[request_id]
+            wait_aux = self._is_generation_first(req)
+            if recv_session.wait_complete(recv_task_id, wait_aux=wait_aux):
+                completed_request_ids.append(request_id)
+            else:
                 failed_request_ids.append(request_id)
         for request_id in completed_request_ids + failed_request_ids:
-            future = self.recv_sessions[request_id]._kv_tasks[self.recv_task_ids[request_id]].future
             if request_id in completed_request_ids:
                 self.recv_req_id_to_request[
                     request_id
@@ -278,10 +320,25 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         # self.transfer_worker.cancel_request(req)
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
-        raise NotImplementedError("get_disaggregated_params is not implemented")
+        # Keep this aligned with fields populated in respond_and_send_async().
+        # These values are server-level metadata used to seed generation-first
+        # requests before context-phase response data arrives.
+        return {
+            "ctx_dp_rank": self.dp_rank,
+            "ctx_info_endpoint": self.context_info_endpoint,
+        }
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        raise NotImplementedError("prepare_context_requests is not implemented")
+        for req in requests:
+            if not self._has_peer_req_data(req):
+                # Keep request non-schedulable until peer req-info arrives.
+                req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+            elif req.state < LlmRequestState.CONTEXT_INIT:
+                req.state = LlmRequestState.CONTEXT_INIT
+        logger.info(
+            f"Prepared context requests: {len(requests)}, waiting req "
+            f"{len([req for req in requests if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS])}"
+        )
 
     def _check_compatible(self):
         if self.mapping.cp_size != 1:
