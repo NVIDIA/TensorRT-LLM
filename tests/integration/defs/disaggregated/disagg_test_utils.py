@@ -229,10 +229,14 @@ async def _wait_for_disagg_server_status(port, ready, min_ctx_workers=-1, min_ge
         return False
 
 
-@periodic_check(timeout=300, interval=3)
-async def wait_for_disagg_server_ready(port):
+async def wait_for_disagg_server_ready(port, timeout=300):
     """Wait for disagg server to be ready."""
-    return await _wait_for_disagg_server_status(port, True)
+
+    @periodic_check(timeout=timeout, interval=3)
+    async def _check():
+        return await _wait_for_disagg_server_status(port, True)
+
+    return await _check()
 
 
 @periodic_check(timeout=300, interval=3)

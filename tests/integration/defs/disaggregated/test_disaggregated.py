@@ -433,6 +433,7 @@ def setup_disagg_cluster(
     model_name: str | None = None,
     env: dict[str, str] | None = None,
     cwd: str | None = None,
+    server_start_timeout: int = 300,
 ) -> tuple[dict[str, Any], list[ProcessWrapper], list[ProcessWrapper],
            ProcessWrapper, int, str]:
     """Load config, launch workers + disagg server, wait for ready.
@@ -441,6 +442,7 @@ def setup_disagg_cluster(
         config_file: Path to disaggregated server config YAML
         model_name: Model path override (defaults to config's 'model' field)
         env: Environment variables to pass to subprocess (workers and disagg server)
+        server_start_timeout: Timeout in seconds for server to become ready
 
     Returns:
         tuple: (config, ctx_workers, gen_workers, disagg_server, server_port, work_dir)
@@ -480,59 +482,71 @@ def setup_disagg_cluster(
     model = model_name or config.get("model")
     ctx_workers = []
     gen_workers = []
+    disagg_server = None
     next_device = 0
 
     import torch
     num_gpus = torch.cuda.device_count()
 
-    for i in range(num_ctx_instances):
-        device_ids = ",".join(
-            str(d) for d in dict.fromkeys((next_device + j) % num_gpus
-                                          for j in range(gpus_per_ctx)))
-        ctx_workers.append(
-            run_ctx_worker(model,
-                           ctx_worker_config,
-                           work_dir,
-                           port=0,
-                           device=device_ids,
-                           env=env))
-        next_device += gpus_per_ctx
+    try:
+        for i in range(num_ctx_instances):
+            device_ids = ",".join(
+                str(d) for d in dict.fromkeys((next_device + j) % num_gpus
+                                              for j in range(gpus_per_ctx)))
+            ctx_workers.append(
+                run_ctx_worker(model,
+                               ctx_worker_config,
+                               work_dir,
+                               port=0,
+                               device=device_ids,
+                               env=env))
+            next_device += gpus_per_ctx
 
-    for i in range(num_gen_instances):
-        device_ids = ",".join(
-            str(d) for d in dict.fromkeys((next_device + j) % num_gpus
-                                          for j in range(gpus_per_gen)))
-        gen_workers.append(
-            run_gen_worker(model,
-                           gen_worker_config,
-                           work_dir,
-                           port=0,
-                           device=device_ids,
-                           env=env))
-        next_device += gpus_per_gen
+        for i in range(num_gen_instances):
+            device_ids = ",".join(
+                str(d) for d in dict.fromkeys((next_device + j) % num_gpus
+                                              for j in range(gpus_per_gen)))
+            gen_workers.append(
+                run_gen_worker(model,
+                               gen_worker_config,
+                               work_dir,
+                               port=0,
+                               device=device_ids,
+                               env=env))
+            next_device += gpus_per_gen
 
-    # Build minimal server config and launch
-    server_config = {
-        "hostname": server_host,
-        "port": server_port,
-        "disagg_cluster": disagg_cluster,
-        "context_servers": {
-            "router": ctx_servers.get("router", {})
-        },
-        "generation_servers": {
-            "router": gen_servers.get("router", {})
-        },
-        "conditional_disagg_config": config.get("conditional_disagg_config",
-                                                None),
-        "perf_metrics_max_requests": config.get("perf_metrics_max_requests", 0),
-    }
-    disagg_server = run_disagg_server(server_config,
-                                      work_dir,
-                                      server_port,
-                                      env=env,
-                                      cwd=cwd)
+        # Build minimal server config and launch
+        server_config = {
+            "hostname":
+            server_host,
+            "port":
+            server_port,
+            "disagg_cluster":
+            disagg_cluster,
+            "context_servers": {
+                "router": ctx_servers.get("router", {})
+            },
+            "generation_servers": {
+                "router": gen_servers.get("router", {})
+            },
+            "conditional_disagg_config":
+            config.get("conditional_disagg_config", None),
+            "perf_metrics_max_requests":
+            config.get("perf_metrics_max_requests", 0),
+        }
+        disagg_server = run_disagg_server(server_config,
+                                          work_dir,
+                                          server_port,
+                                          env=env,
+                                          cwd=cwd)
 
-    asyncio.run(wait_for_disagg_server_ready(server_port))
+        asyncio.run(
+            wait_for_disagg_server_ready(server_port,
+                                         timeout=server_start_timeout))
+    except Exception:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        shutil.rmtree(work_dir, ignore_errors=True)
+        raise
 
     return config, ctx_workers, gen_workers, disagg_server, server_port, work_dir
 
@@ -1535,7 +1549,8 @@ def run_disaggregated_aiperf(config_file,
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd)
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
     artifact_dir = os.path.join(cwd or ".", "benchmark-results")
@@ -2009,7 +2024,8 @@ def run_disaggregated_cancel_test(example_dir,
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
-        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd)
+        setup_disagg_cluster(config_file, model_name=model_path, env=run_env, cwd=cwd,
+                             server_start_timeout=server_start_timeout)
 
     server_host = config.get("hostname", "localhost")
     server_url = f"http://{server_host}:{server_port}"
@@ -2027,12 +2043,21 @@ def run_disaggregated_cancel_test(example_dir,
                                num_bursts=num_bursts,
                                requests_per_burst=requests_per_burst)
 
+        # Create a temporary client config with the correct dynamic port
+        client_config = config.copy()
+        client_config["port"] = server_port
+        client_config["hostname"] = server_host
+        temp_fd, client_config_file = tempfile.mkstemp(suffix='.yaml',
+                                                       dir=work_dir)
+        with os.fdopen(temp_fd, 'w') as f:
+            yaml.dump(client_config, f)
+
         # Verify server is still healthy after stress test by sending a normal request
         client_dir = f"{example_dir}/clients"
         client_cmd = [
-            'python3', f'{client_dir}/disagg_client.py', '-c', config_file,
-            '-p', f'{client_dir}/prompts.json', '--ignore-eos',
-            '--server-start-timeout',
+            'python3', f'{client_dir}/disagg_client.py', '-c',
+            client_config_file, '-p', f'{client_dir}/prompts.json',
+            '--ignore-eos', '--server-start-timeout',
             str(server_start_timeout)
         ]
         all_worker_procs = [w.process for w in ctx_workers + gen_workers]
