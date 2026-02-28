@@ -247,12 +247,6 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         )
 
         host_tensors = SampleStateTensorsSpec(
-            new_tokens=self.store.new_tokens.to("cpu", non_blocking=True),
-            new_tokens_lens=self.store.new_tokens_lens.to("cpu", non_blocking=True),
-            next_draft_tokens=self.store.next_draft_tokens.to("cpu", non_blocking=True),
-        )
-
-        host_tensors = SampleStateTensorsSpec(
             new_tokens=self._copy_to_host(self.store.new_tokens),
             new_tokens_lens=self._copy_to_host(self.store.new_tokens_lens),
             next_draft_tokens=self._copy_to_host(self.store.next_draft_tokens),

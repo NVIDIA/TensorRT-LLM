@@ -23,6 +23,7 @@ from typing import Dict, List, Optional, Set
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings.internal import suffix_automaton as _sa_native
 
 from ..pyexecutor.llm_request import LlmRequest
@@ -247,7 +248,7 @@ class SuffixAutomatonManager(BaseResourceManager):
         batch_indices = torch.tensor(
             [self._request_to_slot[rid] for rid in request_ids],
             dtype=torch.int32,
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
         num_requests = len(request_ids)

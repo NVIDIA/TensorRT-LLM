@@ -29,6 +29,8 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._utils import prefer_pinned
+
 from ..pyexecutor.sampler import TorchSampler
 from .interface import SpecMetadata, SpecWorkerBase
 from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
@@ -74,7 +76,9 @@ class SASpecMetadata(SpecMetadata):
         assert self.request_ids is not None, "request_ids must be set before prepare()"
         num_seqs = len(self.request_ids)
         # Set up batch indices
-        batch_indices = torch.arange(num_seqs, dtype=torch.int32, device="cpu", pin_memory=True)
+        batch_indices = torch.arange(
+            num_seqs, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
+        )
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices, non_blocking=True)
 
         # Prepare SA manager (copies pending states to GPU)
