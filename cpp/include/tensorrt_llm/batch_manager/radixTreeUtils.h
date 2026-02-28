@@ -16,51 +16,55 @@
 
 #pragma once
 
-#include <string>
-#include <cstdio>
 #include "tensorrt_llm/batch_manager/radixTree.h"
+#include <cstdio>
+#include <string>
 
 namespace tensorrt_llm::batch_manager::radix_tree
 {
 
-class RadixTreeStringSet : public RadixTree<char,std::hash<char>,int,std::hash<int>,int,false>
+class RadixTreeStringSet : public RadixTree<char, std::hash<char>, int, std::hash<int>, int, false>
 {
-    public:
-        RadixTreeStringSet() = default;
+public:
+    RadixTreeStringSet() = default;
 
-        void insert(std::string str)
+    void insert(std::string str)
+    {
+        std::vector<char> prefix(str.begin(), str.end());
+        auto matches = insertNodes(prefix);
+        printf("1. prefix.size() = %ld, str.length() = %ld, matches.exactMatches.size() = %ld\n", prefix.size(),
+            str.length(), matches.exactMatches.size());
+        auto last_match = matches.exactMatches.back();
+        [[maybe_unused]] auto wasOverwritten = last_match.node->setValue(1, static_cast<int>(str.size()),
+            /*overwrite*/ true); // store value for last node so nodes don't get deleted.
+    }
+
+    void erase(std::string str)
+    {
+        std::vector<char> prefix(str.begin(), str.end());
+        auto matches = lookupNodes(prefix, /*allowPartialMatch*/ false);
+        if (matches.exactMatches.size() == prefix.size())
         {
-            std::vector<char> prefix(str.begin(), str.end());
-            auto matches = insertNodes(prefix);
-            printf("1. prefix.size() = %ld, str.length() = %ld, matches.exactMatches.size() = %ld\n", prefix.size(), str.length(), matches.exactMatches.size());
             auto last_match = matches.exactMatches.back();
-            [[maybe_unused]] auto wasOverwritten = last_match.node->setValue(1, static_cast<int>(str.size()), /*overwrite*/true); // store value for last node so nodes don't get deleted.
+            [[maybe_unused]] auto wasCleared
+                = last_match.node->clearValue(1); // clearing value should delete all empty nodes.
         }
+    }
 
-        void erase(std::string str)
+    [[nodiscard]] bool contains(std::string str) const
+    {
+        std::vector<char> prefix(str.begin(), str.end());
+        auto matches = lookupNodes(prefix, /*allowPartialMatch*/ false);
+        printf("2. prefix.size() = %ld, str.length() = %ld, matches.exactMatches.size() = %ld\n", prefix.size(),
+            str.length(), matches.exactMatches.size());
+        if (matches.exactMatches.size() == prefix.size())
         {
-            std::vector<char> prefix(str.begin(), str.end());
-            auto matches = lookupNodes(prefix, /*allowPartialMatch*/false);
-            if (matches.exactMatches.size() == prefix.size())
-            {
-                auto last_match = matches.exactMatches.back();
-                [[maybe_unused]] auto wasCleared = last_match.node->clearValue(1); // clearing value should delete all empty nodes.
-            }
+            auto last_match = matches.exactMatches.back();
+            auto last_val = last_match.node->getValue(1);
+            return last_val.has_value();
         }
-
-        [[nodiscard]] bool contains(std::string str) const
-        {
-            std::vector<char> prefix(str.begin(), str.end());
-            auto matches = lookupNodes(prefix, /*allowPartialMatch*/false);
-            printf("2. prefix.size() = %ld, str.length() = %ld, matches.exactMatches.size() = %ld\n", prefix.size(), str.length(), matches.exactMatches.size());
-            if (matches.exactMatches.size() == prefix.size())
-            {
-                auto last_match = matches.exactMatches.back();
-                auto last_val = last_match.node->getValue(1);
-                return last_val.has_value();
-            }
-            return false;
-        }
+        return false;
+    }
 };
 
-}
+} // namespace tensorrt_llm::batch_manager::radix_tree
