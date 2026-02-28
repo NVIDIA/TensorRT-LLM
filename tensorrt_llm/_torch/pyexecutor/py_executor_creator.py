@@ -35,7 +35,7 @@ from ..virtual_memory import ExecutorMemoryType, RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, create_py_executor_instance,
                     instantiate_sampler, validate_feature_combination)
-from .config_utils import is_mla
+from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .model_engine import PyTorchModelEngine
@@ -222,6 +222,14 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
+
+    # Apply model-specific defaults early, before destructuring llm_args fields
+    checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
+                                                     llm_args.checkpoint_loader,
+                                                     llm_args.checkpoint_format)
+    llm_args = ModelLoader.load_config_and_apply_defaults(
+        checkpoint_dir, llm_args, checkpoint_loader)
+
     garbage_collection_gen0_threshold = llm_args.garbage_collection_gen0_threshold
     lora_config = llm_args.lora_config
     kv_connector_config = llm_args.kv_connector_config
@@ -449,6 +457,7 @@ def create_py_executor(
 
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
+    net_max_seq_len = model_engine_max_seq_len
     if not llm_args.disable_overlap_scheduler:
         model_engine_max_seq_len = model_engine.max_seq_len + 1
         if spec_config is not None:

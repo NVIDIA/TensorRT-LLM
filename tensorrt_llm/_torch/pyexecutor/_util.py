@@ -1,5 +1,5 @@
 import os
-from typing import Dict, Optional
+from typing import Dict, List, Optional
 
 import torch
 
@@ -9,13 +9,12 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._utils import (confidential_compute_enabled,
                                  str_dtype_to_binding, torch_dtype_to_str)
 from tensorrt_llm.bindings.executor import DecodingMode
-
-# isort: off
-from tensorrt_llm.llmapi.llm_args import (
-    CacheTransceiverConfig, EagleDecodingConfig, KvCacheConfig,
-    MTPDecodingConfig, PeftCacheConfig, SamplerType, SchedulerConfig,
-    SparseAttentionConfig, SpeculativeConfig, TorchLlmArgs, WaitingQueuePolicy)
-# isort: on
+from tensorrt_llm.llmapi.llm_args import (CacheTransceiverConfig,
+                                          EagleDecodingConfig, KvCacheConfig,
+                                          MTPDecodingConfig, PeftCacheConfig,
+                                          SamplerType, SchedulerConfig,
+                                          SparseAttentionConfig,
+                                          SpeculativeConfig, TorchLlmArgs)
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
@@ -24,7 +23,8 @@ from tensorrt_llm.mapping import CpType, Mapping
 
 from ..attention_backend import get_sparse_attn_kv_cache_manager
 from ..model_config import ModelConfig
-from ..speculative import get_spec_decoder
+from ..speculative import (get_num_spec_layers, get_spec_decoder,
+                           should_use_separate_draft_kv_cache)
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -105,6 +105,19 @@ class KvCacheCreator:
         if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2:
             self._kv_cache_manager_cls = KVCacheManagerV2
         self._draft_config = draft_config
+
+    def _get_kv_size_per_token(self):
+        model_config = self._model_engine.model.model_config
+        mapping = self._mapping
+        kv_size_per_token = self._kv_cache_manager_cls.get_cache_size_per_token(
+            model_config, mapping, tokens_per_block=self._tokens_per_block)
+        if self._draft_model_engine is not None:
+            draft_model_config = self._draft_model_engine.model.model_config
+            kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
+                draft_model_config,
+                mapping,
+                tokens_per_block=self._tokens_per_block)
+        return kv_size_per_token
 
     def _get_kv_size_per_token(self):
         model_config = self._model_engine.model.model_config
@@ -224,10 +237,9 @@ class KvCacheCreator:
         # use layer_mask to include only target layers. The draft layers should
         # only be in the separate draft KV cache manager.
         # We still pass spec_config so that num_extra_kv_tokens is calculated.
-        spec_dec_layer_mask = None
         if self._should_create_separate_draft_kv_cache():
             num_target_layers = model_engine.model.model_config.pretrained_config.num_hidden_layers
-            spec_dec_layer_mask = [True] * num_target_layers
+            [True] * num_target_layers
 
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
@@ -243,7 +255,6 @@ class KvCacheCreator:
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
             execution_stream=self._execution_stream,
-            layer_mask=spec_dec_layer_mask,
         )
 
         # When SWA is enabled, max_seq_len is updated inside kv_cache_manager.
@@ -251,6 +262,93 @@ class KvCacheCreator:
             self._max_seq_len = kv_cache_manager.max_seq_len
 
         return kv_cache_manager
+
+    def _should_create_separate_draft_kv_cache(self) -> bool:
+        """
+        Check if we need a separate draft KV cache manager for one-model mode.
+        Returns True if the speculative config has use_separate_draft_kv_cache=True.
+
+        Note: For MTP, _draft_config may be None since MTP layers are embedded
+        in the target model and don't produce a separate ModelConfig. We fall
+        back to the target model's config via _get_effective_draft_config().
+        """
+        if self._mapping.enable_attention_dp:
+            logger.info(
+                "Attention DP is enabled, separate draft KV cache is not supported."
+            )
+            return False
+        return should_use_separate_draft_kv_cache(self._speculative_config)
+
+    def _get_effective_draft_config(self) -> ModelConfig:
+        """
+        Return the ModelConfig to use for draft KV cache creation.
+
+        For Eagle3 and draft-target one-model modes, a dedicated draft config
+        is provided at construction time.  For MTP one-model mode, no separate
+        draft config exists because the MTP layers share the same architecture
+        as the target model.  In that case we fall back to the target model's
+        config so that the draft KV cache is created with the correct layout.
+        """
+        if self._draft_config is not None:
+            return self._draft_config
+        # MTP: MTP layers reuse the target model architecture, so the target
+        # model's config describes the correct KV cache layout for the draft
+        # layers as well.
+        return self._model_engine.model.model_config
+
+    def _create_one_model_draft_kv_cache_manager(
+            self) -> Optional[KVCacheManager]:
+        """
+        Create a KV cache manager for draft model layers in one-model mode
+        when target and draft have different KV cache layouts.
+        """
+        # Get target model's num_hidden_layers to compute correct layer indices.
+        # Draft model layers in one-model mode start at target_num_layers.
+        target_pretrained_config = self._model_engine.model.model_config.pretrained_config
+        target_num_layers = target_pretrained_config.num_hidden_layers
+        # Use get_num_spec_layers to get the correct number of draft layers
+        # for the speculative decoding mode (e.g., num_eagle_layers for Eagle3)
+        num_draft_layers = get_num_spec_layers(self._speculative_config)
+
+        # Create layer_mask: False for target layers, True for draft layers.
+        # This ensures the draft KV cache manager uses the correct layer indices
+        # (e.g., layers 32, 33, ... instead of 0, 1, ...).
+        spec_dec_layer_mask = [False
+                               ] * target_num_layers + [True] * num_draft_layers
+
+        # Get the effective draft config (explicit draft_config if available,
+        # otherwise fall back to target model config for MTP).
+        effective_draft_config = self._get_effective_draft_config()
+
+        # Get the appropriate KV cache manager class for the draft model
+        draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
+            effective_draft_config)
+
+        # Use V2 if enabled and the base class is KVCacheManager
+        if draft_kv_cache_manager_cls == KVCacheManager and self._kv_cache_config.use_kv_cache_manager_v2:
+            draft_kv_cache_manager_cls = KVCacheManagerV2
+
+        return _create_kv_cache_manager(
+            model_engine=None,
+            kv_cache_manager_cls=draft_kv_cache_manager_cls,
+            mapping=self._mapping,
+            kv_cache_config=self._kv_cache_config,
+            tokens_per_block=self._tokens_per_block,
+            max_seq_len=self._max_seq_len,
+            max_batch_size=self._max_batch_size,
+            spec_config=self._speculative_config,
+            sparse_attn_config=None,  # Not applicable for draft in one-model mode
+            max_num_tokens=self._max_num_tokens,
+            max_beam_width=self._max_beam_width,
+            kv_connector_manager=self._kv_connector_manager,
+            execution_stream=self._execution_stream,
+            # One-model draft specific overrides
+            model_config=effective_draft_config,
+            dtype=effective_draft_config.pretrained_config.torch_dtype,
+            is_draft=True,
+            layer_mask=spec_dec_layer_mask,
+            num_layers=num_draft_layers,
+        )
 
     def build_managers(self, resources: Dict) -> None:
         """Construct KV caches for model and draft model (if applicable)."""
@@ -261,9 +359,16 @@ class KvCacheCreator:
             raise NotImplementedError(
                 "Connector manager is not supported for draft model.")
 
-        draft_kv_cache_manager = self._create_kv_cache_manager(
-            self._draft_model_engine
-        ) if self._draft_model_engine is not None else None
+        draft_kv_cache_manager = None
+
+        # Two-model speculative decoding: draft model has separate engine
+        if self._draft_model_engine is not None:
+            draft_kv_cache_manager = self._create_kv_cache_manager(
+                self._draft_model_engine)
+        # One-model speculative decoding with different KV layouts
+        elif self._should_create_separate_draft_kv_cache():
+            draft_kv_cache_manager = self._create_one_model_draft_kv_cache_manager(
+            )
 
         resources[ResourceManagerType.KV_CACHE_MANAGER] = kv_cache_manager
         resources[
@@ -271,7 +376,7 @@ class KvCacheCreator:
 
 
 def _create_kv_cache_manager(
-        model_engine: Optional[PyTorchModelEngine],
+        model_engine: PyTorchModelEngine,
         kv_cache_manager_cls,
         mapping: Mapping,
         kv_cache_config: KvCacheConfig,
@@ -283,7 +388,13 @@ def _create_kv_cache_manager(
         max_num_tokens: int,
         max_beam_width: int,
         kv_connector_manager: Optional[KvCacheConnectorManager],
-        execution_stream: Optional[torch.cuda.Stream] = None) -> KVCacheManager:
+        execution_stream: Optional[torch.cuda.Stream] = None,
+        # Optional overrides for one-model draft case (when model_engine is None)
+        model_config: Optional[ModelConfig] = None,
+        dtype: Optional[torch.dtype] = None,
+        is_draft: Optional[bool] = None,
+        layer_mask: Optional[List[bool]] = None,
+        num_layers: Optional[int] = None) -> KVCacheManager:
     """
     Returns:
         A KVCacheManager instance for the given model engine or model config
@@ -292,11 +403,10 @@ def _create_kv_cache_manager(
     if model_config is not None:
         config = model_config.pretrained_config
         quant_config = model_config.quant_config
-        _model_config = model_config
     else:
         config = model_engine.model.model_config.pretrained_config
         quant_config = model_engine.model.model_config.quant_config
-        _model_config = model_engine.model.model_config
+        model_engine.model.model_config
 
     if dtype is None:
         dtype = model_engine.dtype
@@ -338,7 +448,7 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             vocab_size=config.vocab_size,
             max_beam_width=max_beam_width,
-            is_draft=model_engine.is_draft_model,
+            is_draft=is_draft,
             kv_connector_manager=kv_connector_manager,
             sparse_attn_config=sparse_attn_config,
             execution_stream=execution_stream,
@@ -390,6 +500,7 @@ def _create_kv_cache_manager(
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -426,6 +537,7 @@ def _create_kv_cache_manager(
             raise NotImplementedError(
                 "Connector manager is not supported for MambaHybridCacheManager."
             )
+        config = model_engine.model.model_config.pretrained_config
         mamba_layer_mask = [
             True if i %
             config.full_attention_interval != config.full_attention_interval -
@@ -467,7 +579,7 @@ def _create_kv_cache_manager(
             execution_stream=execution_stream,
         )
     else:
-        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_from_cpp in KVCahceManager
+        # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCacheManager
         is_vswa = is_vswa_enabled(kv_cache_config)
         binding_model_config = model_engine.model.model_config.get_bindings_model_config(
             tokens_per_block=tokens_per_block) if is_vswa else None
@@ -682,6 +794,7 @@ def create_py_executor_instance(
     waiting_queue_policy = (scheduler_config.waiting_queue_policy
                             if scheduler_config is not None else
                             WaitingQueuePolicy.FCFS)
+
     return PyExecutor(
         resource_manager,
         scheduler,
