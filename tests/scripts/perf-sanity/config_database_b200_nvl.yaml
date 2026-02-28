@@ -251,7 +251,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.7
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -259,7 +259,7 @@ server_configs:
   attention_dp_config:
     batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
+    timeout_iters: 100
   speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 1
@@ -289,7 +289,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.7
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -297,7 +297,7 @@ server_configs:
   attention_dp_config:
     batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
+    timeout_iters: 100
   speculative_config:
     decoding_type: MTP
     num_nextn_predict_layers: 1
@@ -820,9 +820,7 @@ server_configs:
   moe_config:
     backend: CUTLASS
   attention_dp_config:
-    batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
   num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
@@ -982,28 +980,14 @@ server_configs:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
   max_batch_size: 64
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 64
-  enable_attention_dp: true
   print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  stream_interval: 20
-  moe_config:
-    backend: CUTLASS
-  attention_dp_config:
-    batching_wait_iters: 0
-    enable_balance: true
-    timeout_iters: 60
-  num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 9236
+  kv_cache_config:
+    enable_block_reuse: false
   client_configs:
   - name: con512_isl1024_osl8192
     concurrency: 512
@@ -1033,9 +1017,7 @@ server_configs:
   moe_config:
     backend: CUTLASS
   attention_dp_config:
-    batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
   num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
@@ -1195,28 +1177,14 @@ server_configs:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
   max_batch_size: 384
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 384
-  enable_attention_dp: true
   print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  stream_interval: 20
-  moe_config:
-    backend: CUTLASS
-  attention_dp_config:
-    batching_wait_iters: 0
-    enable_balance: true
-    timeout_iters: 60
-  num_postprocess_workers: 4
   tensor_parallel_size: 4
   moe_expert_parallel_size: 4
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 9236
+  kv_cache_config:
+    enable_block_reuse: false
   client_configs:
   - name: con1536_isl1024_osl8192
     concurrency: 1536
@@ -1449,9 +1417,7 @@ server_configs:
   moe_config:
     backend: TRTLLM
   attention_dp_config:
-    batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
   num_postprocess_workers: 4
   tensor_parallel_size: 2
   moe_expert_parallel_size: 2
@@ -1475,28 +1441,14 @@ server_configs:
     TRTLLM_ENABLE_PDL: 1
     NCCL_GRAPH_REGISTER: 0
   max_batch_size: 512
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 512
-  enable_attention_dp: true
   print_iter_log: true
-  kv_cache_config:
-    dtype: fp8
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  stream_interval: 20
-  moe_config:
-    backend: CUTLASS
-  attention_dp_config:
-    batching_wait_iters: 0
-    enable_balance: true
-    timeout_iters: 60
-  num_postprocess_workers: 4
   tensor_parallel_size: 2
   moe_expert_parallel_size: 2
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 9236
+  kv_cache_config:
+    enable_block_reuse: false
   client_configs:
   - name: con1024_isl8192_osl1024
     concurrency: 1024
@@ -1527,9 +1479,7 @@ server_configs:
   moe_config:
     backend: TRTLLM
   attention_dp_config:
-    batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
   num_postprocess_workers: 4
   tensor_parallel_size: 2
   moe_expert_parallel_size: 2
