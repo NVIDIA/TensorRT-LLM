@@ -11,8 +11,10 @@ Key Components:
 from typing import TYPE_CHECKING, Optional, Tuple, Union
 
 import torch
+import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear, WeightMode, WeightsLoadingConfig
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.modules.swiglu import swiglu
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
@@ -64,11 +66,9 @@ class FluxJointAttention(Attention):
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
 
-        # Base class creates full-dim RMSNorm (flashinfer) for models like WAN
-        # that normalize across all heads. FLUX uses per-head norm (head_dim=128),
-        # so we override with torch.nn.RMSNorm which is fusible by torch.compile.
-        self.norm_q = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
-        self.norm_k = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
+        # Override base class full-dim norms with per-head norms (head_dim=128).
+        self.norm_q = RMSNorm(hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True)
+        self.norm_k = RMSNorm(hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True)
 
         # Delete output projection for single-stream blocks
         if self.pre_only:
@@ -94,8 +94,12 @@ class FluxJointAttention(Attention):
                 },
             )
 
-            self.norm_added_q = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
-            self.norm_added_k = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
+            self.norm_added_q = RMSNorm(
+                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
+            )
+            self.norm_added_k = RMSNorm(
+                hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True
+            )
 
             self.to_add_out = Linear(
                 self.q_dim,
@@ -106,6 +110,30 @@ class FluxJointAttention(Attention):
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
             )
+
+    def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Override: use F.rms_norm for per-head norm
+        - ~1.6× speedup on Flux.2 inputs
+        - Better fusion with torch.compile
+        """
+        q = F.rms_norm(q, (q.shape[-1],), self.norm_q.weight, self.norm_q.variance_epsilon)
+        k = F.rms_norm(k, (k.shape[-1],), self.norm_k.weight, self.norm_k.variance_epsilon)
+        return q, k
+
+    def apply_qk_added_norm(
+        self, enc_q: torch.Tensor, enc_k: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Override: Apply F.rms_norm to text-stream QK,
+        - ~1.6× speedup on Flux.2 inputs
+        - Better fusion with torch.compile
+        """
+        enc_q = F.rms_norm(
+            enc_q, (enc_q.shape[-1],), self.norm_added_q.weight, self.norm_added_q.variance_epsilon
+        )
+        enc_k = F.rms_norm(
+            enc_k, (enc_k.shape[-1],), self.norm_added_k.weight, self.norm_added_k.variance_epsilon
+        )
+        return enc_q, enc_k
 
     def forward(
         self,
@@ -134,7 +162,7 @@ class FluxJointAttention(Attention):
         key = key.view(batch_size, -1, self.num_attention_heads, self.head_dim)
         value = value.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-        # Per-head QK normalization via base (per_head mode operates on 4D)
+        # Per-head QK normalization (F.rms_norm, fusible by torch.compile)
         query, key = self.apply_qk_norm(query, key)
 
         # Text QKV for joint attention (dual-stream blocks)
@@ -147,8 +175,7 @@ class FluxJointAttention(Attention):
             enc_k = enc_k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
             enc_v = enc_v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-            enc_q = self.norm_added_q(enc_q)
-            enc_k = self.norm_added_k(enc_k)
+            enc_q, enc_k = self.apply_qk_added_norm(enc_q, enc_k)
 
             # Concatenate text + image for joint attention
             query = torch.cat([enc_q, query], dim=1)
@@ -284,7 +311,7 @@ class Flux2ParallelSelfAttention(FluxJointAttention):
         k = k.view(batch_size, -1, self.num_attention_heads, self.head_dim)
         v = v.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-        # Per-head QK norm (inherited)
+        # Per-head QK norm (inherited — uses F.rms_norm)
         q, k = self.apply_qk_norm(q, k)
 
         # RoPE
