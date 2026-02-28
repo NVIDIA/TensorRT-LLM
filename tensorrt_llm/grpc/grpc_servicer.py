@@ -23,12 +23,12 @@ import asyncio
 import io
 import time
 from collections.abc import AsyncGenerator
-from typing import List, Optional, Union
+from typing import List, Union
 
 import grpc
-from PIL import Image
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
+from tensorrt_llm.inputs.utils import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
@@ -120,10 +120,10 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             )
 
             # Extract multimodal images if present
-            multimodal_images: Optional[List[Image.Image]] = None
+            multimodal_images = None
             if request.HasField("multimodal_input") and request.multimodal_input.image_data:
                 multimodal_images = [
-                    Image.open(io.BytesIO(img_bytes))
+                    _load_and_convert_image(io.BytesIO(img_bytes))
                     for img_bytes in request.multimodal_input.image_data
                 ]
                 logger.info(
