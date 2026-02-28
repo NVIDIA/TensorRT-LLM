@@ -200,7 +200,7 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint. For example, you can send requests to the disaggregated server using curl:
+Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
 ```bash
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \

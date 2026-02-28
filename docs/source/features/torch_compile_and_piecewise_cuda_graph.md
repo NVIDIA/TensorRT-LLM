@@ -135,7 +135,7 @@ For more examples, please refer to `tensorrt_llm/_torch/custom_ops`.
 
 For hot models like deepseek/qwen/llama, we’ve already wrapped some large modules into a custom op to avoid trace failure/graph breaks and exclude output projection & MTP from torch.compile's scope.
 
-This means developing the inside attention custom op part, the MoE routed expert part, and the MTP part don’t need to worry about complex torch.compile constraints since they are treated as a black box for Torch compile. Developers should only make sure the fake kernels of attention custom op, and routed expert are aligned with the actual implementation.
+This means developers working on the attention custom op, the MoE routed expert part, and the MTP part don’t need to worry about complex torch.compile constraints, since they are treated as a black box by torch.compile. Developers should only make sure the fake kernels for the attention custom op and routed experts are aligned with the actual implementation.
 
 
 <div align="center">
@@ -342,7 +342,7 @@ Notes:
 
 3. Some recompiles that are hard to detect:
 
-   1. python native `min(list)`, `max(list)`: it will recompile when the list elements change
+   1. Python-native `min(list)`, `max(list)`: it will recompile when the list elements change
 
    2. Control Flow based on dynamic shape
 

@@ -12,7 +12,7 @@ Mixture of Experts (MoE) architectures have become widespread, with models such 
 
 ## Tensor Parallel vs Expert Parallel
 
-Parallelism on multi-GPUs is necessary if the MoE model can not be accommodated by a single GPU’s memory.  We have supported three kinds of parallel patterns for MoE structure, Tensor Parallel (default pattern), Expert Parallel, and a hybrid of the two.
+Parallelism on multi-GPUs is necessary if the MoE model cannot be accommodated by a single GPU’s memory. We support three kinds of parallel patterns for MoE structure: Tensor Parallel (default pattern), Expert Parallel, and a hybrid of the two.
 
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/tp_ep.png?raw=true" alt="tensor parallel vs expert parallel" width="500" height="auto">
 

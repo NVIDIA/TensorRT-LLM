@@ -22,7 +22,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## MoE Backend Support Matrix
 
-There are multiple MOE backends inside TensorRT LLM, not all of them supporting every precision on every GPU. Here are the support matrix of the MOE backends.
+There are multiple MOE backends inside TensorRT LLM, not all of them supporting every precision on every GPU. Here is the support matrix of the MOE backends.
 
 | device | Checkpoint | Supported moe_backend |
 |----------|----------|----------|

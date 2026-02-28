@@ -21,7 +21,7 @@ By NVIDIA TensorRT LLM team
             - [DeepGEMM MQA Kernel](#deepgemm-mqa-kernel)
             - [Kernel Fusion](#kernel-fusion)
         - [System Optimizations](#system-optimizations)
-            - [Multi-streams](#multi-steams)
+            - [Multi-streams](#multi-streams)
             - [A Fast Path for Short Sequences](#a-fast-path-for-short-sequences)
     - [How to Reproduce](#how-to-reproduce)
         - [Accuracy Evaluation](#accuracy-evaluation)
