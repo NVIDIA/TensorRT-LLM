@@ -511,7 +511,13 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
 
 
 def _shard_fp4_weight_scale(
-    weight_scale, original_uint8_weight_shape, dim, rank, world_size, min_local_shape=1
+    weight_scale,
+    original_uint8_weight_shape,
+    dim,
+    rank,
+    world_size,
+    min_local_shape=1,
+    fused_weight_dims=None,
 ):
     # Convert original uint8 shape to element shape (FP4 packs 2 elements per byte)
     weight_shape_elements = list(original_uint8_weight_shape)
@@ -519,9 +525,20 @@ def _shard_fp4_weight_scale(
     modelopt_weight_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(
         weight_scale, tuple(weight_shape_elements)
     )
-    sharded_scale = _split_tensor_for_tp(
-        modelopt_weight_scale, dim, rank, world_size, min_local_shape
-    )
+    if fused_weight_dims is not None:
+        # Fused weights (e.g. Mamba in_proj) are split per-component then sharded.
+        # The scale must follow the same per-component splitting to stay aligned.
+        sharded_scale = torch.cat(
+            [
+                _split_tensor_for_tp(chunk, dim, rank, world_size, min_local_shape)
+                for chunk in torch.split(modelopt_weight_scale, list(fused_weight_dims), dim=dim)
+            ],
+            dim=dim,
+        )
+    else:
+        sharded_scale = _split_tensor_for_tp(
+            modelopt_weight_scale, dim, rank, world_size, min_local_shape
+        )
     return modelopt_fp4_scale_to_cutlass_fp4_scale(sharded_scale)
 
 
@@ -548,7 +565,13 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
             "alpha": alpha,
             "input_scale": input_scale,
             "weight_scale": _shard_fp4_weight_scale(
-                weight_scale, weight_original_shape, dim, rank, world_size, min_local_shape
+                weight_scale,
+                weight_original_shape,
+                dim,
+                rank,
+                world_size,
+                min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
             ),
         }
 
@@ -567,7 +590,13 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         key = weight_name + "_scale"
         if key in state_dict:
             state_dict[key] = _shard_fp4_weight_scale(
-                state_dict[key], weight_original_shape, dim, rank, world_size, min_local_shape
+                state_dict[key],
+                weight_original_shape,
+                dim,
+                rank,
+                world_size,
+                min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
             )
 
 

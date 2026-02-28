@@ -290,9 +290,9 @@ def _pad_nvfp4_weight(
     weight_fp4 and weight_scale are padded independently because they have
     different alignment requirements:
       - weight_fp4 has shape [n, k/2] (packed uint8) — padded along both dims.
-      - weight_scale is 1D with n*k/16 real entries in row-major order, padded
-        to a multiple of 128*4=512 from the checkpoint. Padding k requires
-        reshaping to [n, k/16] because block-scale entries are per-row.
+      - weight_scale is 1D in cutlass format (swizzled/padded). It is converted
+        to modelopt row-major [n, k/16] for correct padding, then converted
+        back. The cutlass conversion handles 128x4 alignment internally.
       - alpha has shape [n] or is a scalar — padded along dim 0 when 1-D.
 
     Returns (weight_fp4, weight_scale, alpha, n_padded, k_padded).
@@ -309,21 +309,20 @@ def _pad_nvfp4_weight(
     if alpha.ndim >= 1 and pad_n > 0:
         alpha = torch.nn.functional.pad(alpha, (0, pad_n))
 
-    # weight_scale: 1D with row-major layout [row0_blocks, row1_blocks, ...].
-    # Padding k adds zero blocks at the end of each row (requires reshape).
-    # Padding n adds zero rows at the end.
-    bsv = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
-    blocks_per_row = k // bsv
-    blocks_per_row_padded = k_padded // bsv
+    # weight_scale is in cutlass format (swizzled/padded). Convert to
+    # modelopt row-major [n, k/16] so the reshape/pad operates on the correct
+    # logical layout, then convert back. modelopt_fp4_scale_to_cutlass_fp4_scale
+    # handles the 128x4 alignment internally.
+    from ...utils.quantization_utils import (
+        cutlass_fp4_scale_to_modelopt_fp4_scale,
+        modelopt_fp4_scale_to_cutlass_fp4_scale,
+    )
 
-    ws = weight_scale[: n * blocks_per_row].reshape(n, blocks_per_row)
-    ws = torch.nn.functional.pad(ws, (0, blocks_per_row_padded - blocks_per_row, 0, pad_n))
-    ws = ws.flatten()
-    scale_align = 128 * 4
-    remainder = ws.numel() % scale_align
-    if remainder != 0:
-        ws = torch.nn.functional.pad(ws, (0, scale_align - remainder))
-    weight_scale = ws
+    bsv = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
+    blocks_per_row_padded = k_padded // bsv
+    ws = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale, (n, k))
+    ws = torch.nn.functional.pad(ws, (0, blocks_per_row_padded - ws.shape[1], 0, pad_n))
+    weight_scale = modelopt_fp4_scale_to_cutlass_fp4_scale(ws)
 
     return weight_fp4, weight_scale, alpha, n_padded, k_padded
 

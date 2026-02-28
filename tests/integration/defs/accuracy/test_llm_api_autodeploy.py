@@ -334,8 +334,18 @@ class TestNemotronMOE(LlmapiAccuracyTestHarness):
             "transforms": {
                 "detect_sharding": {
                     "sharding_dims": ['tp', 'ep', 'bmm'],
-                    # NOTE: sharding_source applies only to TP sharding
-                    "sharding_source": ['factory', 'heuristic'],
+                    "sharding_source": ['manual'],
+                    "manual_config": {
+                        "head_dim": 128,
+                        "tp_plan": {
+                            "in_proj": "mamba",
+                            "out_proj": "rowwise",
+                            "q_proj": "colwise",
+                            "k_proj": "colwise",
+                            "v_proj": "colwise",
+                            "o_proj": "rowwise",
+                        },
+                    },
                 },
                 "multi_stream_moe": {
                     "stage": "compile",
