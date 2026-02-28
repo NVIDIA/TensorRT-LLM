@@ -560,6 +560,21 @@ def llms(model_dir: Path,
 
     load_kwargs = _get_fake_checkpoint_kwargs(model_dir)
     moe_config = _get_moe_config_for_blackwell()
+
+    # Enable chunked prefill with a low token budget so that multimodal
+    # contexts are split across multiple forward calls. This exercises the
+    # code path in Qwen3VL's `_get_requests_with_mm_data where`.
+    # `multimodal_embedding` is checked on the *second* chunk after
+    # `get_multimodal_embeddings` has already concatenated the list of tensors
+    # into a single tensor.
+    # Only enabled for Qwen models; other models (e.g. LLaVA) do not yet
+    # populate `multimodal_input` in the `attach_multimodal_embeddings` path, so
+    # chunked prefill would cause a token-count mismatch in `fuse_input_embeds`.
+    if (model_dir in [_QWEN_2_5_VL_DIR, _QWEN_3_VL_DIR]
+            or _is_fake_checkpoint(model_dir)):
+        load_kwargs["enable_chunked_prefill"] = True
+        load_kwargs["max_num_tokens"] = 256
+
     llm = LLM(
         model=model_dir,
         backend='pytorch',
@@ -580,6 +595,7 @@ def llms(model_dir: Path,
                 moe_config=moe_config,
                 trust_remote_code=True,
                 cache_transceiver_config=cache_transceiver_cfg,
+                **chunked_prefill_kwargs,
                 **load_kwargs,
             )
             with llm_decode:
