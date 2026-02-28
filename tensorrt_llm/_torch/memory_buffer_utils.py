@@ -83,7 +83,7 @@ class Buffers:
             if reserve_buffer:
                 # A suitable buffer was found, so reuse it.
                 best_fit_block.is_reserved = True
-                return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
+            return self._view_as(best_fit_block.buffer, tensor_shape, dtype)
             # else:
             # TODO: to reuse tensors both in graph pool and normal pool.
             # if best_fit_block.is_reserved:
@@ -93,17 +93,27 @@ class Buffers:
             # del best_fit_block.buffer
             # candidate_blocks.remove(best_fit_block)
 
+        # for block in list(candidate_blocks):
+        #     if not block.is_reserved:
+        #         if best_fit_block is not None:
+        #             if block is not best_fit_block:
+        #                 # Need to call del BufferBlock.buffer, otherwise memory isn't
+        #                 # released and OOM may happen.
+        #                 del block.buffer
+        #                 candidate_blocks.remove(block)
+        #         else:
+        #             del block.buffer
+        #             candidate_blocks.remove(block)
+
         for block in list(candidate_blocks):
             if not block.is_reserved:
-                if best_fit_block is not None:
-                    if block is not best_fit_block:
-                        # Need to call del BufferBlock.buffer, otherwise memory isn't
-                        # released and OOM may happen.
-                        del block.buffer
-                        candidate_blocks.remove(block)
-                else:
-                    del block.buffer
-                    candidate_blocks.remove(block)
+                # Need to call del BufferBlock.buffer, otherwise memory isn't
+                # released and OOM may happen.
+                buffer_size = block.buffer.numel()
+                del block.buffer
+                if buffer_size >= 1024 * 1024 * 1024:
+                    torch.cuda.empty_cache()
+                candidate_blocks.remove(block)
 
         def _create_buffer():
             return torch.empty((required_memory_size, ),
