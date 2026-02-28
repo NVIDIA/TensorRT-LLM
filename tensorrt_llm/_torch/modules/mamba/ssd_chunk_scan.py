@@ -23,7 +23,125 @@ from packaging import version
 
 TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
 
-_BASE_CONFIGS = [
+_BASE_CHUNK_SCAN_CONFIGS = [
+    # =================================================================
+    # Higher warp count configs for better latency hiding
+    # More warps = more instructions in flight = better memory latency hiding
+    # =================================================================
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=2,
+        num_warps=8,  # 8 warps = 256 threads per block
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=2,
+        num_warps=8,  # 8 warps for better latency hiding
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=2,
+        num_warps=8,
+    ),
+    # Smaller tiles with more stages for software pipelining
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=3,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 32,
+            "BLOCK_SIZE_K": 64
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    # =================================================================
+    # Low register pressure configs (num_stages=1) for large dstate
+    # =================================================================
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 128,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=1,
+        num_warps=4,
+    ),
+    # num_stages=2 configs - moderate register pressure
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 64,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    triton.Config(
+        {
+            "BLOCK_SIZE_M": 32,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 32
+        },
+        num_stages=2,
+        num_warps=4,
+    ),
+    # Original configs for smaller dstate values
     triton.Config(
         {
             "BLOCK_SIZE_M": 128,
@@ -126,227 +244,38 @@ _BASE_CONFIGS = [
 ]
 
 
+def _make_chunk_scan_configs():
+    return [
+        triton.Config(
+            {
+                **cfg.kwargs, "BLOCK_SIZE_DSTATE": bsd
+            },
+            num_stages=cfg.num_stages,
+            num_warps=cfg.num_warps,
+        ) for cfg in _BASE_CHUNK_SCAN_CONFIGS for bsd in (16, 32, 64)
+    ]
+
+
+def _prune_chunk_scan_configs(configs, named_args, **_kwargs):
+    next_pow2 = triton.next_power_of_2(named_args["dstate"])
+    if any(c.kwargs["BLOCK_SIZE_DSTATE"] == next_pow2 for c in configs):
+        return configs
+    # next_pow2 is outside the static set — generate configs for it dynamically.
+    return configs + [
+        triton.Config(
+            {
+                **cfg.kwargs, "BLOCK_SIZE_DSTATE": next_pow2
+            },
+            num_stages=cfg.num_stages,
+            num_warps=cfg.num_warps,
+        ) for cfg in _BASE_CHUNK_SCAN_CONFIGS
+    ]
+
+
 @triton.autotune(
-    configs=[
-        # =================================================================
-        # Higher warp count configs for better latency hiding
-        # More warps = more instructions in flight = better memory latency hiding
-        # =================================================================
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=2,
-            num_warps=8,  # 8 warps = 256 threads per block
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=2,
-            num_warps=8,  # 8 warps for better latency hiding
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=2,
-            num_warps=8,
-        ),
-        # Smaller tiles with more stages for software pipelining
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=3,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 64
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        # =================================================================
-        # Low register pressure configs (num_stages=1) for large dstate
-        # =================================================================
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=1,
-            num_warps=4,
-        ),
-        # num_stages=2 configs - moderate register pressure
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=2,
-            num_warps=4,
-        ),
-        # Original configs for smaller dstate values
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 64
-            },
-            num_stages=3,
-            num_warps=8,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 256,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 64
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 128,
-                "BLOCK_SIZE_K": 64
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 128,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=4,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 32,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=5,
-            num_warps=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 32,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=5,
-            num_warps=2,
-        ),
-        triton.Config(
-            {
-                "BLOCK_SIZE_M": 64,
-                "BLOCK_SIZE_N": 64,
-                "BLOCK_SIZE_K": 32
-            },
-            num_stages=4,
-            num_warps=2,
-        ),
-    ],
+    configs=_make_chunk_scan_configs(),
     key=["chunk_size", "hdim", "dstate", "IS_CAUSAL"],
+    prune_configs_by={"early_config_prune": _prune_chunk_scan_configs},
 )
 @triton.jit
 def _chunk_scan_fwd_kernel(
