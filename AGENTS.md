@@ -128,6 +128,85 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+### Triggering CI
+
+CI is triggered by posting comments on the PR. Basic commands:
+- `/bot run` — trigger the standard CI pipeline
+- `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
+- `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
+
+For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
+
+### Retrieving CI Test Failures from a PR
+
+CI tests run on internal NVIDIA Jenkins infrastructure (`blossom-ci`). To retrieve failed test cases from a PR:
+
+**Step 1: Get the Jenkins build number from PR comments**
+
+The CI bot (`tensorrt-cicd`) posts comments with links to the Jenkins build. Extract the `L0_MergeRequest_PR` build number:
+```bash
+PR_NUM=<pr_number>
+BUILD_NUM=$(gh api "repos/NVIDIA/TensorRT-LLM/issues/${PR_NUM}/comments" --jq \
+  '[.[] | select(.user.login == "tensorrt-cicd") | select(.body | test("L0_MergeRequest_PR"))] | last | .body' \
+  | grep -oP 'L0_MergeRequest_PR/\K\d+')
+```
+
+**Step 2: Query the Jenkins testReport API for failures**
+
+```bash
+JENKINS_BASE="https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_MergeRequest_PR"
+curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(f'Summary: {data[\"passCount\"]} passed, {data[\"failCount\"]} failed, {data[\"skipCount\"]} skipped')
+failed = []
+for suite in data.get('suites', []):
+    for case in suite.get('cases', []):
+        if case.get('status') in ('FAILED', 'REGRESSION'):
+            failed.append(case)
+if not failed:
+    print('No test failures!')
+else:
+    print(f'Failed tests ({len(failed)}):')
+    for f in failed:
+        print(f'  - {f[\"className\"]}.{f[\"name\"]}')
+        err = (f.get('errorDetails') or '')[:200]
+        if err:
+            print(f'    Error: {err}')
+"
+```
+
+**Step 3 (if needed): Get full stdout/stderr for a specific failure**
+
+The `errorStackTrace` can be incomplete when errors originate from subprocesses. In that case, fetch `stdout` and `stderr` for the specific test case to find the real error:
+```bash
+curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for suite in data.get('suites', []):
+    for case in suite.get('cases', []):
+        if case.get('status') in ('FAILED', 'REGRESSION'):
+            name = f'{case[\"className\"]}.{case[\"name\"]}'
+            if '<search_term>' in name:
+                print(f'=== {name} ===')
+                print('--- Error ---')
+                print(case.get('errorDetails', ''))
+                print('--- Stack Trace ---')
+                print(case.get('errorStackTrace', ''))
+                print('--- Stdout (last 3000 chars) ---')
+                print((case.get('stdout') or '')[-3000:])
+                print('--- Stderr (last 3000 chars) ---')
+                print((case.get('stderr') or '')[-3000:])
+                break
+"
+```
+
+**Available fields per failed test case** (from Jenkins testReport API):
+- `className`, `name`: test identifier
+- `status`: `FAILED` or `REGRESSION`
+- `errorDetails`: error message
+- `errorStackTrace`: full stack trace (may be incomplete for subprocess errors)
+- `stdout`, `stderr`: full test output (can be large, check these when stack trace is insufficient)
 ## Key Documentation
 
 | Topic | Path |
