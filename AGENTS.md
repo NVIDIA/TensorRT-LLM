@@ -10,7 +10,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 **CRITICAL (YOU MUST):**
 - Read and follow `CODING_GUIDELINES.md` for ALL code changes (C++ and Python)
 - NVIDIA copyright header on ALL new files (update year on modified files)
-- `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line
+- `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Do not add
+  co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Python imports: `from package.subpackage import module` (never `from module import Class`)
@@ -109,9 +110,14 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 1. Set up build environment (see [installation docs](docs/source/installation/))
 2. Make changes following `CODING_GUIDELINES.md`
 3. Test locally with `pytest`
-4. Submit PR:
+
+## Branching policy and PRs
+
+- The main repository (`upstream`) is located at https://github.com/NVIDIA/TensorRT-LLM/
+- Branches should always be pushed to the user-specified fork (usually `origin`)
+- If pushing fails to due pre-push pre-commits hooks getting updated, just re-push immediately
+- PRs should be opened on the main repository
    - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
-   - Sign commits with DCO (`git commit -s`)
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
 
@@ -153,8 +159,12 @@ BUILD_NUM=$(gh api "repos/NVIDIA/TensorRT-LLM/issues/${PR_NUM}/comments" --jq \
 
 **Step 2: Query the Jenkins testReport API for failures**
 
+Resolve the Jenkins base URL dynamically from the internal shortcut (requires corporate network):
 ```bash
-JENKINS_BASE="https://prod.blsm.nvidia.com/sw-tensorrt-top-1/job/LLM/job/main/job/L0_MergeRequest_PR"
+JENKINS_BASE="$(curl -skI 'https://nv/trt-llm-cicd' 2>/dev/null | grep -i '^location:' | sed 's/^[Ll]ocation: *//;s/[[:space:]]*$//')job/main/job/L0_MergeRequest_PR"
+```
+
+```bash
 curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
 import json, sys
 data = json.load(sys.stdin)
