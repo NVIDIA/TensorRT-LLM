@@ -13,9 +13,7 @@ stream_interval: 20
 moe_config:
   backend: CUTLASS
 attention_dp_config:
-  batching_wait_iters: 0
   enable_balance: true
-  timeout_iters: 60
 num_postprocess_workers: 4
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8

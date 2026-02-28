@@ -11,10 +11,6 @@ kv_cache_config:
 stream_interval: 20
 moe_config:
   backend: TRITON
-attention_dp_config:
-  batching_wait_iters: 0
-  enable_balance: true
-  timeout_iters: 60
 num_postprocess_workers: 4
 tensor_parallel_size: 2
 moe_expert_parallel_size: 2

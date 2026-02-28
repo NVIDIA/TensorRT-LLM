@@ -10,7 +10,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -43,7 +43,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -114,7 +114,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -147,7 +147,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -217,7 +217,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -250,7 +250,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -283,7 +283,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.75
+    free_gpu_memory_fraction: 0.8
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -312,22 +312,14 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
   max_batch_size: 1
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 1
   print_iter_log: true
-  kv_cache_config:
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  stream_interval: 20
-  moe_config:
-    backend: TRITON
-  num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 2068
+  kv_cache_config:
+    enable_block_reuse: false
   client_configs:
   - name: con1_isl1024_osl1024
     concurrency: 1
@@ -344,22 +336,14 @@ server_configs:
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
   max_batch_size: 256
-  cuda_graph_config:
-    enable_padding: true
-    max_batch_size: 256
   print_iter_log: true
-  kv_cache_config:
-    free_gpu_memory_fraction: 0.85
-    enable_block_reuse: false
-  stream_interval: 20
-  moe_config:
-    backend: TRITON
-  num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 2068
+  kv_cache_config:
+    enable_block_reuse: false
   client_configs:
   - name: con256_isl1024_osl1024
     concurrency: 256
@@ -388,9 +372,7 @@ server_configs:
   moe_config:
     backend: TRITON
   attention_dp_config:
-    batching_wait_iters: 0
     enable_balance: true
-    timeout_iters: 60
   num_postprocess_workers: 4
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
@@ -839,10 +821,6 @@ server_configs:
   stream_interval: 20
   moe_config:
     backend: TRITON
-  attention_dp_config:
-    batching_wait_iters: 0
-    enable_balance: true
-    timeout_iters: 60
   num_postprocess_workers: 4
   tensor_parallel_size: 2
   moe_expert_parallel_size: 2
