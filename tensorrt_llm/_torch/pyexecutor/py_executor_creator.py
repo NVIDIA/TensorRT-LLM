@@ -33,8 +33,9 @@ from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
 from ..virtual_memory import ExecutorMemoryType, RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
-from ._util import (KvCacheCreator, create_py_executor_instance,
-                    instantiate_sampler, validate_feature_combination)
+from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
+                    create_py_executor_instance, instantiate_sampler, is_mla,
+                    validate_feature_combination)
 from .config_utils import is_mla, is_nemotron_hybrid, is_qwen3_next
 from .guided_decoder import CapturableGuidedDecoder, GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
@@ -223,6 +224,8 @@ def create_py_executor(
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
 
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    torch.cuda.set_per_process_memory_fraction(1.0)
     # Apply model-specific defaults early, before destructuring llm_args fields
     checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
                                                      llm_args.checkpoint_loader,
@@ -458,10 +461,8 @@ def create_py_executor(
     # PyTorchModelEngine modifies these fields, update them
     model_engine_max_seq_len = model_engine.max_seq_len
     net_max_seq_len = model_engine_max_seq_len
-    if not llm_args.disable_overlap_scheduler:
-        model_engine_max_seq_len = model_engine.max_seq_len + 1
-        if spec_config is not None:
-            model_engine_max_seq_len += spec_config.max_total_draft_tokens
+    if not llm_args.disable_overlap_scheduler and spec_config is not None:
+        model_engine_max_seq_len += spec_config.max_total_draft_tokens
 
     if spec_config is not None:
         model_engine_max_seq_len += get_num_extra_kv_tokens(spec_config)
@@ -647,6 +648,7 @@ def create_py_executor(
     logger.info(
         f"[create_py_executor] Created execution_stream: {execution_stream}")
 
+    estimating_kv_cache = False
     if model_engine.model.model_config.is_generation:
         #NOTE: non-generation models do not have kv cache
 
@@ -665,6 +667,7 @@ def create_py_executor(
             model_engine=model_engine,
             draft_model_engine=draft_model_engine,
             mapping=mapping,
+            net_max_seq_len=None if skip_est else net_max_seq_len,
             kv_connector_manager=kv_connector_manager,
             max_num_tokens=max_num_tokens,
             max_beam_width=max_beam_width,
@@ -679,8 +682,14 @@ def create_py_executor(
             execution_stream=execution_stream,
             draft_config=draft_config,
         )
-        with allocation_scope(ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
-            kv_cache_creator.build_managers(resources)
+
+        if skip_est == True:
+            estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+
+        with allocation_scope(
+                ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
+                ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
+            kv_cache_creator.build_managers(resources, estimating_kv_cache)
             # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
             # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
             max_seq_len = kv_cache_creator._max_seq_len
@@ -718,6 +727,7 @@ def create_py_executor(
             llm_args=llm_args,
             ctx_chunk_config=ctx_chunk_config,
             model_engine=model_engine,
+            start_worker=False,
             sampler=sampler,
             drafter=drafter,
             guided_decoder=guided_decoder,
@@ -739,7 +749,68 @@ def create_py_executor(
         # create_py_executor_instance. Restore it here.
         peft_cache_config = py_executor.peft_cache_config
 
+    if estimating_kv_cache:
+        assert kv_cache_creator is not None
+        with allocation_scope(ExecutorMemoryType.MODEL_EXTRA,
+                              RestoreMode.PINNED):
+            kv_cache_creator.configure_kv_cache_capacity(py_executor)
+        kv_cache_creator.teardown_managers(resources)
+        del py_executor  # free before constructing new
+
+        with allocation_scope(ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
+            # Before estimating KV cache size, a minimal KV cache has been allocated using
+            # create_kv_cache_manager above, which caps kv_cache_creator.max_seq_len. Restoring
+            # the original value before creating the final KV cache.
+            kv_cache_creator._max_seq_len = model_engine_max_seq_len
+            kv_cache_creator.build_managers(resources, False)
+            # Originally, max_seq_len might be mutated inside build_managers as field of executor config.
+            # Since now, we are changing kv_cache_creator._max_seq_len instead. Restore max_seq_len here.
+            max_seq_len = kv_cache_creator._max_seq_len
+            update_sampler_max_seq_len(max_seq_len, sampler)
+
+            for eng in [model_engine, draft_model_engine]:
+                if eng is None:
+                    continue
+                if eng.attn_metadata is not None:
+                    if llm_args.cuda_graph_config is not None:
+                        eng._release_cuda_graphs()
+                    eng.attn_metadata = None
+        with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
+                              RestoreMode.PINNED):
+
+            # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+            gc.collect()
+            py_executor = create_py_executor_instance(
+                dist=dist,
+                resources=resources,
+                mapping=mapping,
+                llm_args=llm_args,
+                ctx_chunk_config=ctx_chunk_config,
+                model_engine=model_engine,
+                start_worker=False,
+                sampler=sampler,
+                drafter=drafter,
+                guided_decoder=guided_decoder,
+                lora_config=lora_config,
+                garbage_collection_gen0_threshold=
+                garbage_collection_gen0_threshold,
+                kv_connector_manager=kv_connector_manager,
+                max_seq_len=max_seq_len,
+                max_batch_size=max_batch_size,
+                max_beam_width=max_beam_width,
+                max_num_tokens=max_num_tokens,
+                peft_cache_config=peft_cache_config,
+                scheduler_config=scheduler_config,
+                cache_transceiver_config=cache_transceiver_config,
+                virtual_memory_pools=vm_pools,
+                execution_stream=execution_stream,
+            )
+
+    _adjust_torch_mem_fraction()
+
     if mapping.rank == 0:
         logger.info(f"LLM Args:\n{llm_args}")
+
+    py_executor.start_worker()
 
     return py_executor
