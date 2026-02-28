@@ -275,9 +275,12 @@ def test_self_attention_equivalence(attn_backend: str):
     return is_close
 
 
-@pytest.mark.parametrize("attn_backend", ["VANILLA"])
+@pytest.mark.parametrize("attn_backend", ["VANILLA", "FA4"])
 def test_cross_attention_equivalence(attn_backend: str):
     """Test that integrated cross-attention produces same output as naive."""
+    if attn_backend == "FA4" and not _flash_attn4_available:
+        pytest.skip("FlashAttention 4 not installed")
+
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
     print("=" * 60)
@@ -344,6 +347,57 @@ def test_cross_attention_equivalence(attn_backend: str):
         f"Cross-attention outputs differ: max_diff={max_diff:.2e}, mean_diff={mean_diff:.2e}"
     )
     return is_close
+
+
+@requires_flash_attn4
+@pytest.mark.parametrize(
+    "batch,seq_len_q,seq_len_kv,num_heads,head_dim",
+    [
+        (1, 1024, 512, 12, 128),
+        (1, 2048, 512, 12, 128),
+    ],
+)
+def test_fa4_cross_attention_wan_shapes(
+    batch: int, seq_len_q: int, seq_len_kv: int, num_heads: int, head_dim: int
+):
+    """Test FA4 cross-attention correctness at Wan-realistic shapes."""
+    hidden_size = num_heads * head_dim
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16
+
+    print(
+        f"\nConfig: B={batch}, S_q={seq_len_q}, S_kv={seq_len_kv}, heads={num_heads}, head_dim={head_dim}"
+    )
+
+    naive = NaiveWanCrossAttention(hidden_size, num_heads, head_dim, dtype=dtype).to(device)
+
+    cfg_vanilla = create_model_config(hidden_size, num_heads, head_dim, attn_backend="VANILLA")
+    ref = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg_vanilla).to(
+        device
+    )
+
+    cfg_fa4 = create_model_config(hidden_size, num_heads, head_dim, attn_backend="FA4")
+    fa4_model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=cfg_fa4).to(
+        device
+    )
+
+    copy_weights_cross_attention(naive, ref)
+    copy_weights_cross_attention(naive, fa4_model)
+    ref.eval()
+    fa4_model.eval()
+
+    torch.manual_seed(42)
+    hidden_states = torch.randn(batch, seq_len_q, hidden_size, device=device, dtype=dtype)
+    encoder_hidden_states = torch.randn(batch, seq_len_kv, hidden_size, device=device, dtype=dtype)
+
+    with torch.no_grad():
+        out_ref = ref(hidden_states, encoder_hidden_states)
+        out_fa4 = fa4_model(hidden_states, encoder_hidden_states)
+
+    max_diff = (out_ref - out_fa4).abs().max().item()
+    is_close = torch.allclose(out_ref, out_fa4, rtol=1e-2, atol=1e-2)
+    print(f"  Max diff: {max_diff:.2e}, match: {is_close}")
+    assert is_close, f"FA4 cross-attn mismatch at Wan shapes: max_diff={max_diff:.2e}"
 
 
 def test_trtllm_cached_prepare():
@@ -522,8 +576,10 @@ def run_all_tests():
     for backend in ["VANILLA", "TRTLLM"] + (["FA4"] if _flash_attn4_available else []):
         results[f"self_attention_{backend}"] = test_self_attention_equivalence(backend)
 
-    # Run cross-attention test (VANILLA only)
+    # Run cross-attention tests
     results["cross_attention_VANILLA"] = test_cross_attention_equivalence("VANILLA")
+    if _flash_attn4_available:
+        results["cross_attention_FA4"] = test_cross_attention_equivalence("FA4")
 
     # Run TRTLLM-specific caching tests
     results["trtllm_cached_prepare"] = test_trtllm_cached_prepare()
