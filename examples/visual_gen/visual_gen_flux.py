@@ -140,10 +140,17 @@ def parse_args():
         choices=["VANILLA", "TRTLLM", "FA4"],
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels, "
         "FA4: Flash Attention 4). "
-        "Note: TRTLLM and FA4 automatically fall back to VANILLA for cross-attention.",
+        "Note: TRTLLM falls back to VANILLA for cross-attention.",
     )
 
     # Parallelism
+    parser.add_argument(
+        "--cfg_size",
+        type=int,
+        default=1,
+        choices=[1, 2],
+        help="CFG parallel size (1 or 2). Distributes positive/negative prompts across GPUs.",
+    )
     parser.add_argument(
         "--ulysses_size",
         type=int,
