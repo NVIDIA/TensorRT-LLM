@@ -55,7 +55,6 @@ class FluxJointAttention(Attention):
             head_dim=head_dim,
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
-            qk_norm_mode="per_head",
             eps=eps,
             bias=bias,
             config=config,
@@ -64,6 +63,10 @@ class FluxJointAttention(Attention):
 
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
+
+        # Override base class full-dim RMSNorm with per-head torch.nn.RMSNorm
+        self.norm_q = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
+        self.norm_k = torch.nn.RMSNorm(head_dim, eps=eps, dtype=self.dtype)
 
         # Delete output projection for single-stream blocks
         if self.pre_only:
@@ -129,7 +132,7 @@ class FluxJointAttention(Attention):
         key = key.view(batch_size, -1, self.num_attention_heads, self.head_dim)
         value = value.view(batch_size, -1, self.num_attention_heads, self.head_dim)
 
-        # Per-head QK normalization via base (per_head mode operates on 4D)
+        # Per-head QK normalization via base (torch.nn.RMSNorm operates on last dim)
         query, key = self.apply_qk_norm(query, key)
 
         # Text QKV for joint attention (dual-stream blocks)

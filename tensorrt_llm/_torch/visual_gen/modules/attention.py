@@ -44,7 +44,6 @@ class Attention(nn.Module):
         head_dim: Optional[int] = None,
         qkv_mode: QKVMode = QKVMode.FUSE_QKV,
         qk_norm: bool = True,
-        qk_norm_mode: str = "full",
         eps: float = 1e-6,
         bias: bool = True,
         config: Optional["DiffusionModelConfig"] = None,
@@ -76,7 +75,6 @@ class Attention(nn.Module):
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
-        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -86,16 +84,12 @@ class Attention(nn.Module):
         self._init_qkv_proj()
 
         if self.qk_norm:
-            if qk_norm_mode == "per_head":
-                self.norm_q = nn.RMSNorm(self.head_dim, eps=self.eps, dtype=self.dtype)
-                self.norm_k = nn.RMSNorm(self.head_dim, eps=self.eps, dtype=self.dtype)
-            else:
-                self.norm_q = RMSNorm(
-                    hidden_size=self.q_dim, eps=self.eps, dtype=self.dtype, has_weights=True
-                )
-                self.norm_k = RMSNorm(
-                    hidden_size=self.kv_dim, eps=self.eps, dtype=self.dtype, has_weights=True
-                )
+            self.norm_q = RMSNorm(
+                hidden_size=self.q_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+            )
+            self.norm_k = RMSNorm(
+                hidden_size=self.kv_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+            )
 
         # TODO: Use weight mapper to create just a Linear module
         self.to_out = nn.ModuleList(
