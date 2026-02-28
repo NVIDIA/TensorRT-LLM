@@ -57,6 +57,7 @@ class FluxJointAttention(Attention):
             head_dim=head_dim,
             qkv_mode=QKVMode.FUSE_QKV,
             qk_norm=True,
+            qk_norm_mode="per_head",
             eps=eps,
             bias=bias,
             config=config,
@@ -65,10 +66,6 @@ class FluxJointAttention(Attention):
 
         self.pre_only = pre_only
         self.added_kv_proj_dim = added_kv_proj_dim
-
-        # Override base class full-dim norms with per-head norms (head_dim=128).
-        self.norm_q = RMSNorm(hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True)
-        self.norm_k = RMSNorm(hidden_size=head_dim, eps=eps, dtype=self.dtype, has_weights=True)
 
         # Delete output projection for single-stream blocks
         if self.pre_only:
