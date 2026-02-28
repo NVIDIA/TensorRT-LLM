@@ -123,7 +123,7 @@ class Buffers:
             # if exception happens during allocating memory from default pool, retry
             # to allocate from shared pool. Try best to avoid fragmentation in shared pool.
             mem_pool = get_shared_pool()
-            if mem_pool is not None:
+            if mem_pool is not None and not reserve_buffer:
                 with torch.cuda.memory.use_mem_pool(mem_pool):
                     new_buffer_tensor = _create_buffer()
             else:
