@@ -9,7 +9,6 @@ from output_handler import OutputHandler
 from tensorrt_llm import logger
 from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
 
-# Set logger level to ensure timing logs are printed
 logger.set_level("info")
 
 
@@ -75,7 +74,7 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # TeaCache Arguments
+    # TeaCache
     parser.add_argument(
         "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
     )
@@ -91,8 +90,11 @@ def parse_args():
         "--linear_type",
         type=str,
         default="default",
-        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "svd-nvfp4"],
-        help="Linear layer quantization type",
+        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
+        help=(
+            "Dynamic quantization mode for linear layers. "
+            "Quantizes weights on-the-fly during loading from an unquantized checkpoint."
+        ),
     )
 
     # Attention Backend
@@ -126,12 +128,12 @@ def parse_args():
         "2 CFG groups × 2 Ulysses ranks = 4 GPUs total.",
     )
 
-    # Cuda graph
+    # CUDA graph
     parser.add_argument(
         "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
     )
 
-    # torch compile
+    # torch.compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
     )
@@ -139,31 +141,21 @@ def parse_args():
         "--torch_compile_models",
         type=str,
         nargs="+",
-        default=[],  # empty = auto detect transformer components
-        help="Torch compile models",
-    )
-    parser.add_argument(
-        "--torch_compile_mode",
-        type=str,
-        default="default",
-        help="Torch compile mode",
-        choices=["default", "max-autotune", "reduce-overhead"],
+        default=[],
+        help="Components to torch.compile (empty = auto detect transformer components)",
     )
     parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
     )
 
-    # Warmup
+    # Autotune
     parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=1,
-        help="Warmup steps. Useful for performance benchmarking.",
+        "--disable_autotune", action="store_true", help="Disable autotuning during warmup"
     )
 
-    # Layerwise nvtx marker
+    # Debug / profiling
     parser.add_argument(
-        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise nvtx marker"
+        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
     )
 
     return parser.parse_args()
@@ -172,13 +164,10 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Total workers: cfg_size × ulysses_size
-    # See ParallelConfig in config.py for detailed parallelism strategy and examples
     n_workers = args.cfg_size * args.ulysses_size
 
-    # Log Ulysses configuration (validation happens in setup_sequence_parallelism)
     if args.ulysses_size > 1:
-        num_heads = 12  # WAN has 12 attention heads
+        num_heads = 12
         logger.info(
             f"Using Ulysses sequence parallelism: "
             f"{num_heads} heads / {args.ulysses_size} ranks = "
@@ -191,10 +180,9 @@ def main():
         quant_config = {"quant_algo": "FP8", "dynamic": True}
     elif args.linear_type == "trtllm-fp8-blockwise":
         quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "svd-nvfp4":
+    elif args.linear_type == "trtllm-nvfp4":
         quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
-    # 1. Setup Configuration
     diffusion_config = {
         "model_type": "wan2",
         "revision": args.revision,
@@ -209,22 +197,23 @@ def main():
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "pipeline": {
-            "enable_cuda_graph": args.enable_cudagraph,
+        "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,
             "torch_compile_models": args.torch_compile_models,
-            "torch_compile_mode": args.torch_compile_mode,
             "enable_fullgraph": args.enable_fullgraph,
-            "warmup_steps": args.warmup_steps,
+            "enable_autotune": not args.disable_autotune,
+        },
+        "cuda_graph": {
+            "enable_cuda_graph": args.enable_cudagraph,
+        },
+        "pipeline": {
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     }
 
-    # Add quant_config if specified
     if quant_config is not None:
         diffusion_config["quant_config"] = quant_config
 
-    # 2. Initialize VisualGen
     logger.info(
         f"Initializing VisualGen: world_size={n_workers} "
         f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
@@ -236,7 +225,6 @@ def main():
     )
 
     try:
-        # 2. Run Inference
         logger.info(f"Generating video for prompt: '{args.prompt}'")
         logger.info(f"Negative prompt: '{args.negative_prompt}'")
         logger.info(
@@ -262,14 +250,11 @@ def main():
             ),
         )
 
-        end_time = time.time()
-        logger.info(f"Generation completed in {end_time - start_time:.2f}s")
+        logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        # 3. Save Output
         OutputHandler.save(output, args.output_path, frame_rate=16.0)
 
     finally:
-        # 4. Shutdown
         visual_gen.shutdown()
 
 

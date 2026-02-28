@@ -2,7 +2,7 @@
 # These are baseline settings that apply to all models unless overridden
 
 runtime: trtllm
-attn_backend: flashinfer
+attn_backend: trtllm
 compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false

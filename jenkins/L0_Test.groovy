@@ -104,7 +104,7 @@ ENABLE_NGC_RELEASE_IMAGE_TEST = params.enableNgcReleaseImageTest ?: false
 
 COMMON_SSH_OPTIONS = "-o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o TCPKeepAlive=no -o ServerAliveInterval=30 -o ServerAliveCountMax=20"
 
-def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName){
+def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String stageName, Boolean stageIsInterrupted) {
     withCredentials([usernamePassword(credentialsId: 'svc_tensorrt', usernameVariable: 'USERNAME', passwordVariable: 'PASSWORD')]) {
         def randomLoginNode = SlurmConfig.getRandomLoginNode(cluster.host)
         def remote = [
@@ -128,9 +128,13 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             def timeoutTestFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/unfinished_test.txt"
             def downloadTimeoutTestSucceed = Utils.exec(pipeline, script: "sshpass -p '${remote.passwd}' scp -P ${remote.port} -r -p ${COMMON_SSH_OPTIONS} ${remote.user}@${remote.host}:${timeoutTestFilePath} ${stageName}/", returnStatus: true, numRetries: 3) == 0
             if (downloadTimeoutTestSucceed) {
-                sh "ls -al ${stageName}/"
-                // Generate timeout test result xml if there are terminated unexpectedly tests
-                hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    sh "ls -al ${stageName}/"
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    hasTimeoutTest = generateTimeoutTestResultXml(pipeline, stageName)
+                }
             }
             // Download normal test results
             def resultsFilePath = "/home/svc_tensorrt/bloom/scripts/${nodeName}/results*.xml"
@@ -915,9 +919,12 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
 
+    def stageIsInterrupted = false
+
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
@@ -1174,6 +1181,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
@@ -1386,8 +1394,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             echo "Finished test stage execution."
         }
+    } catch (InterruptedException e) {
+        stageIsInterrupted = true
+        throw e
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName)
+        uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
@@ -1614,8 +1625,12 @@ def cacheErrorAndUploadResult(stageName, taskRunner, finallyRunner, noResultIfSu
             sh "mkdir -p ${stageName}"
             finallyRunner()
             if (stageIsFailed) {
-                // Generate timeout test result xml if there are terminated unexpectedly tests
-                generateTimeoutTestResultXml(pipeline, stageName)
+                if (stageIsInterrupted) {
+                    echo "Stage is interrupted, skip to generate terminated unexpectedly test result."
+                } else {
+                    // Generate timeout test result xml if there are terminated unexpectedly tests
+                    generateTimeoutTestResultXml(pipeline, stageName)
+                }
                 // Generate stage fail test result xml if the stage failed and there is no result*.xml
                 def stageXml = generateStageFailTestResultXml(stageName, "Stage Failed", "Stage run failed without result", "results*.xml")
                 if (stageXml != null) {
@@ -1933,7 +1948,7 @@ def runLLMDocBuild(pipeline, config)
     sh "pwd && ls -alh"
     sh "env | sort"
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
@@ -2120,13 +2135,13 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     return makoOptsJson
 }
 
-def parseMultiNodeTaskConfigFromStageName(String stageName) {
+def parseTaskConfigFromStageName(String stageName) {
     def taskConfig = null
-    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs(?:-(\d+)_Nodes)?/)
+    def matcher = (stageName =~ /([^-]+)(?:-(\d+)_GPUs)?(?:-(\d+)_Nodes)?/)
     if (matcher.find()) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
-            system_gpu_count: "${matcher.group(2)}",
+            system_gpu_count: matcher.group(2) ?: "1", // Default to 1 if _GPUs not present
             node_count: matcher.group(3) ?: "1" // Default to 1 if _Nodes not present
         ]
     }
@@ -2185,7 +2200,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
 
     if (parseSysinfo) {
-        def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
+        def taskConfig = parseTaskConfigFromStageName(stageName)
         if (taskConfig) {
             makoArgs += [
                 "gpu=${taskConfig.gpu}",
@@ -2793,6 +2808,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         containerLD_LIBRARY_PATH = containerLD_LIBRARY_PATH.replaceAll(':+$', '')
         withEnv(["LD_LIBRARY_PATH=${containerLD_LIBRARY_PATH}"]) {
             withCredentials([
+                string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
                 usernamePassword(
                     credentialsId: 'svc_tensorrt_gitlab_read_api_token',
                     usernameVariable: 'GITLAB_API_USER',
@@ -2945,7 +2961,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     sh "env | sort"
     sh "ccache -sv"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", false, true)
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -2996,6 +3012,15 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "#!/bin/bash \n" + "cd tensorrt_llm/ && pip3 install pytest build/tensorrt_llm-*.whl")
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
+    }
+
+    // Upload attribution files when they exist
+    def attrDir = "tensorrt_llm/cpp/build/attribution"
+    def wheelBase = wheelName.replace('.whl', '')
+    for (f in ["missing_files.json", "import_payload.json", "file_mappings.json"]) {
+        if (fileExists("${attrDir}/${f}")) {
+            trtllm_utils.uploadArtifacts("${attrDir}/${f}", "${UPLOAD_PATH}/${cpu_arch}/attribution/${wheel_path}${wheelBase}/")
+        }
     }
 
     return wheelName
@@ -3182,10 +3207,6 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 1],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
-        "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
-        "B200_PCIe-AutoDeploy-1": ["b100-ts2", "l0_b200", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -3226,9 +3247,6 @@ def launchTestJobs(pipeline, testFilter)
         // "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         // "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
-        "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-PyTorch-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         // "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
         // "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
@@ -3280,12 +3298,19 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-Post-Merge-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 3, 1, 1, true],
+        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 3, 1, 1, true],
+        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 3, 1, 1, true],
+        "DGX_B200-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
+        "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
+        "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
+        "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
         "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 4, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
@@ -3598,7 +3623,7 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
-                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")

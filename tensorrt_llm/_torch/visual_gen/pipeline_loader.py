@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
@@ -110,6 +111,7 @@ class PipelineLoader:
     def load(
         self,
         checkpoint_dir: Optional[str] = None,
+        skip_warmup: bool = False,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
@@ -124,6 +126,7 @@ class PipelineLoader:
 
         Args:
             checkpoint_dir: Local path or HF Hub model ID (uses args.checkpoint_path if not provided)
+            skip_warmup: If True, skip warmup inference after loading (useful for testing)
 
         Returns:
             Loaded pipeline (WanPipeline, FluxPipeline, etc.) - type auto-detected
@@ -206,13 +209,18 @@ class PipelineLoader:
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
-        if config.pipeline.enable_torch_compile:
+        if config.torch_compile.enable_torch_compile:
             torch._dynamo.config.cache_size_limit = 128
             pipeline.torch_compile()
         else:
             logger.info("torch.compile disabled by config")
 
-        pipeline.warmup()
+        if not skip_warmup:
+            if config.torch_compile.enable_autotune:
+                with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
+                    pipeline.warmup()
+            else:
+                pipeline.warmup()
 
         if config.pipeline.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker

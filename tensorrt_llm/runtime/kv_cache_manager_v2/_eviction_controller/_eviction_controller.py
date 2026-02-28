@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Callable, Protocol, cast
+from typing import Callable, Iterator, Protocol, cast
 
 from llist import sllist, sllistnode
 
@@ -69,6 +69,8 @@ class EvictionPolicy(Protocol):
 
     def __len__(self) -> int: ...
 
+    def __iter__(self) -> Iterator[EvictablePage]: ...
+
 
 class LRUEvictionPolicy:
     __slots__ = ("_queue",)
@@ -95,6 +97,9 @@ class LRUEvictionPolicy:
 
     def __len__(self) -> int:
         return len(self._queue)
+
+    def __iter__(self) -> Iterator[EvictablePage]:
+        return iter(self._queue)
 
 
 # helper class to help add support for priority-based eviction
@@ -135,6 +140,10 @@ class PrioritizedEvictionPolicy:
         if not policy:
             self._policies.pop(page.priority)
         return page
+
+    def __iter__(self) -> Iterator[EvictablePage]:
+        for p in self._policies.values():
+            yield from p
 
 
 class PrioritizedLRUEvictionPolicy(PrioritizedEvictionPolicy):
@@ -186,7 +195,7 @@ class PerLevelEvictionController:  # for one cache level
         self, min_num_pages: TypedIndexList[PoolGroupIndex, int]
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
         assert NDEBUG or len(min_num_pages) == self.num_pool_groups
-        ret = make_typed(lambda: list[EvictablePage](), self.num_pool_groups)
+        ret = make_typed(lambda _: list[EvictablePage](), self.num_pool_groups)
         try:
             for pg_idx, count in typed_enumerate(min_num_pages):
                 policy = self._policies[pg_idx]
@@ -218,7 +227,7 @@ class PerLevelEvictionController:  # for one cache level
     def _evict_dependencies(
         self, page: EvictablePage
     ) -> TypedIndexList[PoolGroupIndex, list[EvictablePage]]:
-        return make_typed(lambda: list[EvictablePage](), self.num_pool_groups)
+        return make_typed(lambda _: list[EvictablePage](), self.num_pool_groups)
 
     def num_evictable_pages(self, pg_idx: PoolGroupIndex) -> int:
         return len(self._policies[pg_idx])
@@ -226,3 +235,6 @@ class PerLevelEvictionController:  # for one cache level
     @property
     def num_pool_groups(self) -> PoolGroupIndex:
         return typed_len(self._policies)
+
+    def page_iterator(self, pg_idx: PoolGroupIndex) -> Iterator[EvictablePage]:
+        return iter(self._policies[pg_idx])

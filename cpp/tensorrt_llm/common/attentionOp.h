@@ -140,6 +140,10 @@ public:
         T const* k_ptr = nullptr;
         T const* v_ptr = nullptr;
 
+        // Helix parallelism params.
+        int32_t const* helix_position_offsets = nullptr;
+        bool const* helix_is_inactive_rank = nullptr;
+
         std::string enqueueContextParamsToString() const
         {
             // variables from the params coming from the runtime
@@ -231,6 +235,9 @@ public:
         // optional when fuse_fp4_quant is enabled
         int32_t start_token_idx_sf = 0;
         int32_t layer_idx = 0;
+        // Helix parallelism params.
+        int32_t const* helix_position_offsets = nullptr;
+        bool const* helix_is_inactive_rank = nullptr;
     };
 
     template <typename T, typename KVCacheBuffer>

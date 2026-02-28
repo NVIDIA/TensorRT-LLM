@@ -518,7 +518,7 @@ class ADEngine(ModelEngine):
 
         # check for max total draft tokens
         if self.spec_config is not None:
-            self.max_total_draft_tokens = self.spec_config.max_total_draft_tokens
+            self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
         else:
             self.max_total_draft_tokens = 0
 
@@ -1063,7 +1063,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     max_total_draft_tokens = (
         0
         if ad_config.speculative_config is None
-        else ad_config.speculative_config.max_total_draft_tokens
+        else ad_config.speculative_config.tokens_per_gen_step - 1
     )
 
     # initialize model engine

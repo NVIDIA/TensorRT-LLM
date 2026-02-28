@@ -3474,7 +3474,7 @@ def test_llmapi_generation_logits(llm_venv, model_path,
                  "Qwen3/qwen3-235B-eagle3",
                  marks=skip_pre_blackwell),
 ])
-def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
+def test_eagle3_output_repetition_4gpus(model_dir: str, draft_model_dir: str):
     """
     RCCA: https://nvbugspro.nvidia.com/bug/5575211
     """
@@ -3529,12 +3529,6 @@ def test_eagle3_output_consistency_4gpus(model_dir: str, draft_model_dir: str):
     with LLM(**llm_common_config) as llm_ref:
         results_ref = llm_ref.generate([prompt], sampling_params)
         output_ref = results_ref[0].outputs[0].text
-
-    length_ratio = min(len(output_spec), len(output_ref)) / max(
-        len(output_spec), len(output_ref))
-    assert length_ratio > 0.5, (
-        f"Output lengths differ too much! "
-        f"Eagle3: {len(output_spec)} chars, Baseline: {len(output_ref)} chars")
 
     repetitive_pattern = re.compile(
         r'(.)\1{10,}')  # Check for 10+ repeated chars

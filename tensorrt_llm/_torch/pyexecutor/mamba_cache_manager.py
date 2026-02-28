@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -24,11 +24,12 @@ import tensorrt_llm.bindings
 if TYPE_CHECKING:
     from tensorrt_llm._torch.attention_backend.interface import \
         AttentionMetadata
+
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import (
     BaseResourceManager, CacheTypeCpp, DataType, KVCacheManager, get_pp_layers)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
-from tensorrt_llm._utils import torch_dtype_to_binding
+from tensorrt_llm._utils import prefer_pinned, torch_dtype_to_binding
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
@@ -342,7 +343,7 @@ class PythonMambaCacheManager(BaseResourceManager):
         self.state_indices[:len(self.state_indices_list)].copy_(
             torch.tensor(self.state_indices_list,
                          dtype=torch.int32,
-                         pin_memory=True),
+                         pin_memory=prefer_pinned()),
             non_blocking=True)
 
     # When there exists padded requests, the state indices should not be repeated.
@@ -359,7 +360,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                padding_size] = torch.tensor(
                                    self.mamba_cache_free_blocks[:padding_size],
                                    dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
+                                   pin_memory=prefer_pinned()).to(
                                        self.state_indices.device,
                                        non_blocking=True)
         # But just finished requests won't free their used resources immediately
@@ -373,7 +374,7 @@ class PythonMambaCacheManager(BaseResourceManager):
                                padding_size] = torch.tensor(
                                    free_indices[:padding_size],
                                    dtype=self.state_indices.dtype,
-                                   pin_memory=True).to(
+                                   pin_memory=prefer_pinned()).to(
                                        self.state_indices.device,
                                        non_blocking=True)
 
@@ -612,6 +613,7 @@ class MambaCacheManager(BaseResourceManager):
 
     def update_mamba_states(self, attn_metadata: "AttentionMetadata",
                             num_accepted_tokens: torch.Tensor):
+        assert not self._use_cpp, "update_mamba_states is not supported in CppMambaCacheManager"
         self._impl.update_mamba_states(attn_metadata, num_accepted_tokens)
 
 

@@ -85,6 +85,12 @@ class BufferConfig:
     role: DataRole
     size: int
 
+    tokens_per_block_override: int | None = None
+    """
+    If not None, overrides the tokens_per_block in KVCacheManagerConfig. Must be a factor of tokens_per_block in
+    KVCacheManagerConfig and size should be based on tokens_per_block_override.
+    """
+
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -136,7 +142,12 @@ class KVCacheManagerConfig:
 
     # When memory utilization is above this threshold, KV cache resuming will fail. This helps
     # reserving some memory for KVCache growth and avoids frequent suspend/resume for dynamic batch size.
-    max_util_for_resume: float = field(default=0.9)
+    max_util_for_resume: float = field(default=0.97)
+
+    enable_partial_reuse: bool = field(default=True)
+    """
+    If True, we will try to reuse tokens from partially matched blocks.
+    """
 
     # unsupported yet
     helix_config: HelixConfig | None = field(default=None)
@@ -145,4 +156,10 @@ class KVCacheManagerConfig:
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
         assert len(set(layer.layer_id for layer in self.layers)) == len(self.layers), (
             "duplicate layer id"
+        )
+        assert all(
+            buffer.tokens_per_block_override is None
+            or self.tokens_per_block % buffer.tokens_per_block_override == 0
+            for layer in self.layers
+            for buffer in layer.buffers
         )
