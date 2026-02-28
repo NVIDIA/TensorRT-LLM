@@ -41,7 +41,7 @@ class FlashAttn4Attention(nn.Module):
     Uses flash_attn.cute.interface._flash_attn_fwd which:
     - Expects [B, S, H, D] (NHD) format
     - Supports float16 and bfloat16 (auto-casts other dtypes)
-    - Does not support cross-attention
+    - Supports both self-attention and cross-attention (different Q/KV lengths)
     """
 
     def __init__(
@@ -111,7 +111,7 @@ class FlashAttn4Attention(nn.Module):
             v: Value tensor [batch_size, seq_len_kv, num_kv_heads, head_dim]
             batch_size: Batch size
             seq_len: Query sequence length
-            seq_len_kv: KV sequence length (cross-attention not supported)
+            seq_len_kv: KV sequence length (may differ from seq_len for cross-attention)
             attention_mask: Attention mask type (CAUSAL or FULL)
 
         Returns:
@@ -121,12 +121,6 @@ class FlashAttn4Attention(nn.Module):
             raise ImportError(
                 "FlashAttention 4 is not available. "
                 "Clone the source and export PYTHONPATH as described in the prerequisites."
-            )
-
-        if seq_len_kv is not None and seq_len_kv != seq_len:
-            raise NotImplementedError(
-                "FlashAttn4Attention does not support cross-attention "
-                "(different Q and KV sequence lengths)"
             )
 
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL

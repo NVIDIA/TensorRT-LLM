@@ -248,6 +248,17 @@ class WanAttentionPerformanceBenchmark:
         model.eval()
         return model
 
+    def create_cross_attention_model(
+        self, hidden_size: int, num_heads: int, head_dim: int, backend: str
+    ) -> Attention:
+        """Create a WAN cross-attention model with specified backend."""
+        config = create_model_config(hidden_size, num_heads, head_dim, attn_backend=backend)
+        model = Attention(hidden_size, num_heads, qkv_mode=QKVMode.SEPARATE_QKV, config=config).to(
+            self.device
+        )
+        model.eval()
+        return model
+
     def create_test_data(
         self, batch_size: int, seq_len: int, hidden_size: int, head_dim: int
     ) -> Tuple[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
@@ -270,6 +281,78 @@ class WanAttentionPerformanceBenchmark:
         output_bytes = batch_size * seq_len * hidden_size * bytes_per_element
         # Attention matrix can be O(S^2) but flash attention avoids materializing it
         return (input_bytes + qkv_bytes + output_bytes) / (1024**3)
+
+    def benchmark_cross_attn_single(
+        self,
+        batch_size: int,
+        num_heads: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+        head_dim: int,
+        backend: str,
+        verbose: bool = True,
+    ) -> Optional[Dict]:
+        """Benchmark a single cross-attention configuration.
+
+        Returns:
+            Dict with timing statistics or None if test failed/skipped
+        """
+        hidden_size = num_heads * head_dim
+
+        try:
+            model = self.create_cross_attention_model(hidden_size, num_heads, head_dim, backend)
+
+            hidden_states = torch.randn(
+                batch_size, seq_len_q, hidden_size, device=self.device, dtype=self.dtype
+            )
+            encoder_hidden_states = torch.randn(
+                batch_size, seq_len_kv, hidden_size, device=self.device, dtype=self.dtype
+            )
+
+            # Warmup
+            with torch.no_grad():
+                for _ in range(self.warmup_iterations):
+                    _ = model(hidden_states, encoder_hidden_states=encoder_hidden_states)
+
+            if self.device.type == "cuda":
+                torch.cuda.synchronize()
+
+            # Benchmark
+            times = []
+            with torch.no_grad():
+                for i in range(self.benchmark_iterations):
+                    with cuda_timer(self.device) as get_time:
+                        _ = model(hidden_states, encoder_hidden_states=encoder_hidden_states)
+                    times.append(get_time())
+
+            times_tensor = torch.tensor(times)
+            stats = {
+                "avg_ms": times_tensor.mean().item(),
+                "min_ms": times_tensor.min().item(),
+                "max_ms": times_tensor.max().item(),
+                "std_ms": times_tensor.std().item(),
+                "median_ms": times_tensor.median().item(),
+                "p95_ms": torch.quantile(times_tensor, 0.95).item(),
+                "p99_ms": torch.quantile(times_tensor, 0.99).item(),
+            }
+
+            total_ops = batch_size * num_heads * seq_len_q * seq_len_kv * head_dim
+            stats["throughput_tops"] = (total_ops / 1e12) / (stats["avg_ms"] / 1000)
+
+            if verbose:
+                print(
+                    f"  {backend} (cross S_q={seq_len_q}, S_kv={seq_len_kv}): "
+                    f"avg={stats['avg_ms']:.3f}ms, "
+                    f"median={stats['median_ms']:.3f}ms, "
+                    f"throughput={stats['throughput_tops']:.2f} TOPS"
+                )
+
+            return stats
+
+        except Exception as e:
+            if verbose:
+                print(f"  {backend} (cross): ERROR - {e}")
+            return None
 
     def benchmark_single(
         self,
@@ -645,6 +728,92 @@ class TestFlashAttn4Performance:
         )
         print(f"    VANILLA: avg={vanilla['avg_ms']:.3f}ms  p95={vanilla['p95_ms']:.3f}ms")
         print(f"    FA4:     avg={fa4['avg_ms']:.3f}ms  p95={fa4['p95_ms']:.3f}ms")
+
+
+# ============================================================================
+# Main entry point
+# ============================================================================
+
+
+class TestFlashAttn4CrossAttnPerformance:
+    """Performance benchmarks for FA4 cross-attention vs VANILLA."""
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Setup benchmark with FA4 and VANILLA backends."""
+        self.benchmark = WanAttentionPerformanceBenchmark(
+            warmup_iterations=5,
+            benchmark_iterations=20,
+        )
+        self.device = self.benchmark.device
+        self.dtype = self.benchmark.dtype
+
+    @requires_flash_attn4
+    @pytest.mark.parametrize(
+        "model_name,batch,seq_len_q,seq_len_kv,num_heads,head_dim",
+        [
+            # WAN 1.3B cross-attention: visual tokens attend to 512 text tokens
+            ("wan_1.3b_480p_33f_cross", 1, 14040, 512, 12, 128),
+            ("wan_1.3b_480p_81f_cross", 1, 32760, 512, 12, 128),
+            # WAN 14B cross-attention
+            ("wan_14b_480p_33f_cross", 1, 14040, 512, 40, 128),
+            ("wan_14b_720p_81f_cross", 1, 75600, 512, 40, 128),
+        ],
+    )
+    def test_fa4_vs_vanilla_cross_attn_wan_shapes(
+        self,
+        model_name: str,
+        batch: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+        num_heads: int,
+        head_dim: int,
+    ):
+        """Compare FA4 vs VANILLA cross-attention on real WAN model shapes."""
+        results = {}
+        for backend in ["VANILLA", "FA4"]:
+            results[backend] = self.benchmark.benchmark_cross_attn_single(
+                batch, num_heads, seq_len_q, seq_len_kv, head_dim, backend, verbose=True
+            )
+
+        vanilla = results.get("VANILLA")
+        fa4 = results.get("FA4")
+
+        assert vanilla is not None, f"VANILLA cross-attn benchmark failed for {model_name}"
+        assert fa4 is not None, f"FA4 cross-attn benchmark failed for {model_name}"
+
+        speedup = vanilla["avg_ms"] / fa4["avg_ms"]
+        print(
+            f"\n  {model_name}: FA4 cross-attn speedup={speedup:.2f}x "
+            f"({'faster' if speedup > 1 else 'slower'})"
+        )
+        print(f"    VANILLA: avg={vanilla['avg_ms']:.3f}ms  p95={vanilla['p95_ms']:.3f}ms")
+        print(f"    FA4:     avg={fa4['avg_ms']:.3f}ms  p95={fa4['p95_ms']:.3f}ms")
+
+    @requires_flash_attn4
+    @pytest.mark.parametrize(
+        "batch,seq_len_q,seq_len_kv,num_heads,head_dim",
+        [
+            (1, 1024, 512, 12, 128),
+            (1, 2048, 512, 12, 128),
+            (2, 1024, 512, 12, 128),
+        ],
+    )
+    def test_fa4_cross_attn_quick(
+        self,
+        batch: int,
+        seq_len_q: int,
+        seq_len_kv: int,
+        num_heads: int,
+        head_dim: int,
+    ):
+        """Quick FA4 cross-attention correctness and timing check."""
+        for backend in ["VANILLA", "FA4"]:
+            result = self.benchmark.benchmark_cross_attn_single(
+                batch, num_heads, seq_len_q, seq_len_kv, head_dim, backend, verbose=True
+            )
+            assert result is not None, f"{backend} cross-attn failed"
+            assert result["avg_ms"] > 0
 
 
 # ============================================================================
