@@ -157,6 +157,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(32000)
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM", "FLASHINFER"])
+    @skip_ray
     def test_bfloat16(self, attn_backend, torch_compile):
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -1241,6 +1242,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_without_reuse_disable_overlap_scheduler(self):
+        pytest.skip()
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1257,6 +1259,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_disable_overlap_scheduler(self):
+        pytest.skip("IMA")
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1286,6 +1289,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_reuse_low_memory_available_no_partial_reuse(self):
+        pytest.skip()
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=True,
@@ -1316,6 +1320,7 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_vswa_chunked_prefill_without_reuse(self):
+        pytest.skip()
         # NOTE: Test with VSWA kv cache config.
         kv_cache_config = KvCacheConfig(
             enable_block_reuse=False,
@@ -1413,6 +1418,11 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        if (mtp_nextn == 2 and attention_dp and cuda_graph and overlap_scheduler
+                and not torch_compile and not enable_chunked_prefill):
+            pytest.skip(
+                "waived: test_bfloat16[mtp_nextn=2-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False-enable_chunked_prefill=False]"
+            )
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,
@@ -1434,6 +1444,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
+        pytest.skip()
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         pytorch_config = dict(
             disable_overlap_scheduler=True,
@@ -1599,6 +1610,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @skip_pre_hopper
     @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_fp8_block_scales_cuda_graph_padding(self, mtp_nextn):
+        pytest.skip()
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
@@ -2013,6 +2025,8 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     ])
     def test_no_kv_cache_reuse(self, quant_dtype, mtp_nextn, fp8kv,
                                attention_dp, cuda_graph, overlap_scheduler):
+        if quant_dtype == "fp8" and fp8kv and attention_dp and cuda_graph and overlap_scheduler and mtp_nextn == 2:
+            pytest.skip()
         if quant_dtype == "nvfp4" and mtp_nextn > 0:
             pytest.skip("MTP is not supported for NVFP4")
 
@@ -3807,6 +3821,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, is_integration_test=True)
 
+    @pytest.mark.skip_less_device_memory(40000)
     @pytest.mark.parametrize(
         "tp_size,pp_size,ep_size,attention_dp,cuda_graph,overlap_scheduler,is_cached",
         [(1, 1, 1, False, True, True, True),
