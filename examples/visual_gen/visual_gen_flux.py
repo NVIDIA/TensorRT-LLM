@@ -145,13 +145,6 @@ def parse_args():
 
     # Parallelism
     parser.add_argument(
-        "--cfg_size",
-        type=int,
-        default=1,
-        choices=[1, 2],
-        help="CFG parallel size (1 or 2). Distributes positive/negative prompts across GPUs.",
-    )
-    parser.add_argument(
         "--ulysses_size",
         type=int,
         default=1,
