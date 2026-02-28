@@ -409,9 +409,10 @@ class SequenceInfo:
       Corresponds to the slot index of each sequence in the batch.
 
     ### INFO OBJECTS THAT ARE AVAILABLE TO DESCRIBE THE INPUTS IN A MORE COMPACT WAY ###############
-    - batch_info: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
-      Batch metadata containing the number of requests and tokens for each of the three request
-      types: prefill, extend (spec dec), and decode.
+    - batch_info: [num_prefill, num_prefill_tokens, num_decode]
+      Batch metadata containing the number of prefill requests (including extend/draft requests
+      for speculative decoding), the total number of prefill tokens, and the number of decode
+      requests.
     - max_seq_info: [max_context_length, max_blocks_per_seq, block_offset_multiplier, max_batch_size]
       Model-level constants for the attention kernel: maximum context length (equal to max_seq_len),
       maximum number of KV cache blocks per sequence (ceil(max_seq_len / tokens_per_block)),
@@ -673,11 +674,13 @@ class SequenceInfo:
 
     @property
     def num_sequences(self) -> int:
-        return self.get_arg("batch_info_host")[::2].sum().item()
+        bi = self.get_arg("batch_info_host")
+        return (bi[0] + bi[2]).item()
 
     @property
     def total_num_tokens(self) -> int:
-        return self.get_arg("batch_info_host")[1:].sum().item()
+        bi = self.get_arg("batch_info_host")
+        return (bi[1] + bi[2]).item()
 
     @property
     def is_generate_only(self) -> bool:
@@ -937,11 +940,10 @@ class SequenceInfo:
             cu_seqlen: Cumulative sequence lengths for all sequences.
             input_pos: Absolute starting position in the cache for each sequence. Can be a single
                 int (applied to all sequences) or a list of ints.
-            batch_info: Batch metadata as [num_prefill, num_prefill_tokens, num_extend,
-                num_extend_tokens, num_decode, num_decode_tokens]. If None, heuristic is used to
-                compute it from seq_len. NOTE: the heuristic makes potentially incorrect assumptions
-                about the batch composition. batch_info should be provided explicitly to ensure
-                correctness.
+            batch_info: Batch metadata as [num_prefill, num_prefill_tokens, num_decode]. If None,
+                heuristic is used to compute it from seq_len. NOTE: the heuristic makes potentially
+                incorrect assumptions about the batch composition. batch_info should be provided
+                explicitly to ensure correctness.
             cache_loc: Flat list of page indices for all sequences. Must be provided together with
                 cu_num_pages.
             cu_num_pages: Cumulative number of pages for all sequences. Must be provided together with

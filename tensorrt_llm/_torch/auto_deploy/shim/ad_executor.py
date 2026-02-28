@@ -704,10 +704,17 @@ class ADEngine(ModelEngine):
         num_gather_tokens = len(token_gather_indices) if gather_required else 0
         tokens_gather_info = [num_gather_tokens, int(gather_required)]
 
-        # Store batch information based on prefill, extend, and decode requests.
+        # Compute batch_info explicitly based on actual request ordering rather than
+        # relying on the seq_len > 1 heuristic in nest_sequences. With chunked prefill,
+        # a context request may have context_chunk_size=1, giving seq_len=1. The heuristic
+        # would misclassify it as decode, causing host_request_types to be inconsistent
+        # with the actual request ordering (context + extend first, then generation).
+        # This mismatch leads to incorrect token splitting in thop.attention.
+        num_prefill_seqs = num_prefill + len(extend_requests)
+        num_all_prefill_tokens = cu_seqlen[num_prefill_seqs] - cu_seqlen[0]
         num_decode = len(generation_requests)
         num_decode_tokens = num_decode
-        batch_info = [num_prefill, num_prefill_tokens, num_decode]
+        batch_info = [num_prefill_seqs, num_all_prefill_tokens, num_decode]
 
         # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
