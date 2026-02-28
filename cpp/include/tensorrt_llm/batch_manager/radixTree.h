@@ -96,7 +96,7 @@ public:
         }
     }
 
-    //! \brief Insert child node. Will overwrite exisiting node with same nkey.
+    //! \brief Insert child node. Will overwrite existing node with same nkey.
     //! \param nkey Node key of child node.
     //! \param node Child node.
     //! \return true if node was overwritten in child node map, false if it was inserted.
@@ -203,13 +203,13 @@ public:
     {
         if constexpr (supportsPartialMatching)
         {
-            std::vector<std::tuple<int, NodePtr>> matches;
+            std::vector<std::pair<int, NodePtr>> matches;
             for (auto nn : mNextNodes)
             {
-                int numMatched = key.numMatchingTokens(nn->first);
+                int numMatched = key.numMatchingTokens(nn.first);
                 if (numMatched > 0)
                 {
-                    matches.emplace_back(std::make_tuple<int, NodePtr>(numMatched, nn->second));
+                    matches.emplace_back(numMatched, nn.second);
                 }
             }
             auto results = std::vector<Match>();
@@ -217,25 +217,21 @@ public:
             {
                 // Sort in descending order of number of matched tokens (longest match first)
                 std::sort(matches.begin(), matches.end(),
-                    [](std::tuple<int, NodePtr> const& a, std::tuple<int, NodePtr> const& b)
-                    {
-                        [[maybe_unused]] auto [numMatchedA, dummy1] = a;
-                        [[maybe_unused]] auto [numMatchedB, dummy2] = b;
-                        return numMatchedA > numMatchedB;
-                    });
+                    [](std::pair<int, NodePtr> const& a, std::pair<int, NodePtr> const& b)
+                    { return a.first > b.first; });
                 // Include meta-data in output
                 for (auto match : matches)
                 {
-                    auto numMatched = match->first;
+                    auto numMatched = match.first;
                     auto fullMatch = numMatched == key.getNumTokens();
                     if (fullMatch)
                     {
-                        results.emplace_back(key, match->second, true, false);
+                        results.emplace_back(key, match.second, true, false);
                     }
                     else
                     {
                         auto partialKey = key.shorten(numMatched);
-                        results.emplace_back(partialKey, match->second, false, false);
+                        results.emplace_back(partialKey, match.second, false, false);
                     }
                 }
             }
