@@ -129,6 +129,10 @@ class SpeculativeDecodingMode(IntEnum):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
         ) or self.is_pard()
 
+    def support_dynamic_draft_len(self):
+        # TODO: expand to all one-model algorithms
+        return self.is_eagle3_one_model()
+
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
 
@@ -260,6 +264,12 @@ class SpecMetadata:
     # whether the spec-dec mode is a dynamic tree.
     is_spec_dec_dynamic_tree: bool = False
 
+    # The draft length used for the current iteration.
+    # With dynamic draft length enabled, this varies per batch based on
+    # draft_len_schedule.  Otherwise it equals max_draft_len (the static max).
+    # Always set by model_engine.forward() before any downstream code reads it.
+    runtime_draft_len: int = 0
+
     # For non-greedy sampling on 1-model.
     allow_advanced_sampling: bool = False
     # Sampling parameters for non-greedy sampling (per-request)
@@ -341,7 +351,7 @@ class SpecMetadata:
             tp_val = tp[0] if tp is not None and len(tp) > 0 else None
 
             # Context requests have no draft tokens yet.
-            num_tokens = 1 + self.max_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
+            num_tokens = 1 + self.runtime_draft_len if request.state == LlmRequestState.GENERATION_IN_PROGRESS else 1
 
             is_greedy = SamplingParams.params_imply_greedy_decoding(
                 temperature=temp_val,
@@ -415,6 +425,7 @@ class SpecWorkerBase(nn.Module, ABC):
         spec_metadata,
         draft_model,
     ):
+        """Skip spec dec for non-last rank (PP). Returns placeholder outputs."""
         batch_size = attn_metadata.num_seqs
         accepted_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
@@ -428,6 +439,54 @@ class SpecWorkerBase(nn.Module, ABC):
         next_new_tokens = torch.empty((batch_size, (self.max_draft_len + 1)),
                                       dtype=torch.int,
                                       device=logits.device)
+        return {
+            'logits': logits,
+            'new_tokens': accepted_tokens,
+            'new_tokens_lens': num_accepted_tokens,
+            'next_draft_tokens': next_draft_tokens,
+            'next_new_tokens': next_new_tokens
+        }
+
+    def skip_drafting(
+        self,
+        input_ids,
+        position_ids,
+        hidden_states,
+        logits,
+        attn_metadata,
+        spec_metadata,
+        draft_model,
+    ):
+        """
+        Used when speculation is disabled for dynamic draft length (e.g., large batch size).
+        """
+        batch_size = attn_metadata.num_seqs
+        num_contexts = attn_metadata.num_contexts
+
+        if self.guided_decoder is not None:
+            self.guided_decoder.execute(logits)
+
+        target_tokens = self._sample_tokens_for_batch(logits, spec_metadata,
+                                                      num_contexts, batch_size)
+
+        accepted_tokens = torch.zeros((batch_size, 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        accepted_tokens[:, 0] = target_tokens
+
+        num_accepted_tokens = torch.ones(batch_size,
+                                         dtype=torch.int,
+                                         device=logits.device)
+
+        next_draft_tokens = torch.zeros((batch_size, 0),
+                                        dtype=torch.int,
+                                        device=logits.device)
+
+        next_new_tokens = torch.zeros((batch_size, 1),
+                                      dtype=torch.int,
+                                      device=logits.device)
+        next_new_tokens[:, 0] = target_tokens
+
         return {
             'logits': logits,
             'new_tokens': accepted_tokens,
@@ -455,7 +514,8 @@ class SpecWorkerBase(nn.Module, ABC):
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
-    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts):
+    def _apply_force_accepted_tokens(self, num_accepted_tokens, num_contexts,
+                                     runtime_draft_len: int):
         """
         Apply forced number of accepted tokens if environment variable is set.
         This is used for testing and debugging.
@@ -463,18 +523,15 @@ class SpecWorkerBase(nn.Module, ABC):
         Args:
             num_accepted_tokens: Tensor of shape [batch_size] with current accepted counts
             num_contexts: Number of context (prefill) requests
+            runtime_draft_len: The draft length for the current iteration.
 
         Returns:
             Modified num_accepted_tokens tensor
-
-        Note:
-            For MTPWorker, self.max_draft_len equals num_nextn_predict_layers (mtp_num_modules).
-            For Eagle3OneModelWorker, self.max_draft_len equals spec_config.max_draft_len.
         """
         if self.force_num_accepted_tokens != 0:
             # total tokens per iteration = accepted draft tokens + 1 target token
             force_total_tokens = min(self.force_num_accepted_tokens + 1,
-                                     self.max_draft_len + 1)
+                                     runtime_draft_len + 1)
             num_accepted_tokens[num_contexts:] = force_total_tokens
         return num_accepted_tokens
 
@@ -495,22 +552,23 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Args:
             logits: [num_tokens, vocab_size] - Target model logits
-            draft_tokens: [num_gens, max_draft_len] - Previously predicted draft tokens
+            draft_tokens: [num_gens, runtime_draft_len] - Previously predicted draft tokens
             num_contexts: Number of context requests
             batch_size: Total number of requests
             spec_metadata: Speculative decoding metadata
 
         Returns:
-            accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
+            accepted_tokens: [batch_size, runtime_draft_len + 1] - Accepted tokens (padded)
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
+        runtime_draft_len = spec_metadata.runtime_draft_len
         num_gens = batch_size - num_contexts
 
         if logits.dim() == 1:
             logits = logits.unsqueeze(0)
 
         # Allocate return buffers
-        accepted_tokens = torch.empty((batch_size, self.max_draft_len + 1),
+        accepted_tokens = torch.empty((batch_size, runtime_draft_len + 1),
                                       dtype=torch.int,
                                       device=logits.device)
         num_accepted_tokens = torch.ones(batch_size,
@@ -526,17 +584,19 @@ class SpecWorkerBase(nn.Module, ABC):
 
         # Generation requests: verify draft tokens against target tokens
         gen_target_tokens = target_tokens[num_contexts:].reshape(
-            num_gens, self.max_draft_len + 1)
-        accepted_tokens[num_contexts:, :] = gen_target_tokens
+            num_gens, runtime_draft_len + 1)
+        accepted_tokens[num_contexts:, :runtime_draft_len +
+                        1] = gen_target_tokens
+
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
         num_accepted_tokens[num_contexts:] += torch.cumprod(
-            (draft_tokens == gen_target_tokens[:, :self.max_draft_len]).int(),
+            (draft_tokens == gen_target_tokens[:, :runtime_draft_len]).int(),
             dim=-1).sum(1)
 
         # Apply force override if set
         num_accepted_tokens = self._apply_force_accepted_tokens(
-            num_accepted_tokens, num_contexts)
+            num_accepted_tokens, num_contexts, runtime_draft_len)
 
         return accepted_tokens, num_accepted_tokens
 
@@ -572,13 +632,13 @@ class SpecWorkerBase(nn.Module, ABC):
 
         Args:
             accepted_tokens: [batch_size, max_draft_len + 1] - Accepted tokens
-            next_draft_tokens: [batch_size, max_draft_len] - Predicted draft tokens
+            next_draft_tokens: [batch_size, runtime_draft_len] - Predicted draft tokens (NOT padded)
             batch_indices_cuda: Batch indices tensor
             batch_size: Number of requests
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
 
         Returns:
-            next_new_tokens: [batch_size, max_draft_len + 1] - Input tokens for next iteration
+            next_new_tokens: [batch_size, runtime_draft_len + 1] - Input tokens for next iteration
         """
         next_new_tokens = accepted_tokens[batch_indices_cuda[:batch_size],
                                           num_accepted_tokens - 1].unsqueeze(1)
@@ -692,7 +752,8 @@ class SpecWorkerBase(nn.Module, ABC):
             from .one_model_sampler import sampling_batch_spec_dec_one_model
 
             num_gens = batch_size - num_contexts
-            num_tokens = num_contexts + num_gens * (self.max_draft_len + 1)
+            num_tokens = num_contexts + num_gens * (
+                spec_metadata.runtime_draft_len + 1)
 
             temperatures = spec_metadata.temperatures[:num_tokens]
             top_ks = spec_metadata.top_ks[:num_tokens]
