@@ -560,8 +560,8 @@ class SequenceInfo:
         else:
             bs, sl = 1, self.total_num_tokens
 
-        # truncate to total tokens now, reshape, and return
-        return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
+        # truncate to effective tokens now, reshape, and return
+        return tnsr[: bs * sl].view(bs, sl, *tnsr.shape[1:])
 
     def _get_arg(self, name: str) -> torch.Tensor:
         """Get the argument from the input buffer either on device or host."""
@@ -982,7 +982,7 @@ class SequenceInfo:
 
         ### UPDATE MAIN INPUTS #####################################################################
         # set new input_ids and make sure to flatten it
-        self._store_arg("input_ids", self._flatten(input_ids))
+        self._store_arg("input_ids", self._flatten(input_ids), reset_val=0)
 
         # set new position_ids and make sure to flatten it
         if position_ids is None:
@@ -990,7 +990,7 @@ class SequenceInfo:
                 [num for num in range(in_pos, in_pos + seq_len)]
                 for in_pos, seq_len in zip(self.input_pos, self.seq_len)
             ]
-        self._store_arg("position_ids", self._flatten(position_ids))
+        self._store_arg("position_ids", self._flatten(position_ids), reset_val=0)
 
         ### UPDATE OTHER (DERIVATIVE) METADATA #####################################################
         # check for updated batch_info_tensor

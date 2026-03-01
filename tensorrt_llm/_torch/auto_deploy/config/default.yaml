@@ -235,3 +235,5 @@ transforms:
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile
+    piecewise_enabled: false
+    piecewise_num_tokens: null

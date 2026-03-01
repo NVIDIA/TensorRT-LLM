@@ -816,6 +816,7 @@ class ADEngine(ModelEngine):
     def _compute_logits(self) -> List[torch.Tensor]:
         # run the model
         logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
+
         logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.

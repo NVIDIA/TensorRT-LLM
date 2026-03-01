@@ -330,13 +330,14 @@ def trtllm_mha_with_cache(
     else:
         quant_mode = 0
 
-    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse
-    # Input is always [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed),
-    # so b * s == num_tokens always holds.
+    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
+    # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
+    # With piecewise CUDA graphs the tensor may be padded to a bucket size
+    # (b*s > num_tokens), so flatten first and slice to the real token count.
     q_shape_og = q.shape
-    q_flat = q.reshape(num_tokens, num_heads * head_dim)
-    k_flat = k.reshape(num_tokens, num_kv_heads * head_dim)
-    v_flat = v.reshape(num_tokens, num_kv_heads * head_dim)
+    q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
+    k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+    v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
     # Prepare output
@@ -451,6 +452,15 @@ def trtllm_mha_with_cache(
         None,  # quant_q_buffer
     )
 
+    # If input was padded (piecewise CG), embed the real output into a padded
+    # tensor so downstream static segments see the expected bucket-sized shape.
+    total_padded_tokens = q_shape_og[0] * q_shape_og[1]
+    if total_padded_tokens > num_tokens:
+        padded_output = torch.zeros(
+            total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device
+        )
+        padded_output[:num_tokens] = output
+        return padded_output.view(*q_shape_og)
     return output.view(*q_shape_og)
 
 

@@ -137,11 +137,13 @@ def _triton_cached_ssm(
         )
 
     if num_total_tokens > 0:
-        return (
-            preallocated_ssm_out[:num_total_tokens]
-            .view(b, s, num_heads, head_dim)
-            .to(hidden_states.dtype)
-        )
+        # Cast to input dtype if needed (prefill may compute in higher precision)
+        if preallocated_ssm_out.dtype != hidden_states.dtype:
+            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
+        # Zero padding positions so downstream ops don't see garbage (piecewise CG)
+        if num_total_tokens < bs:
+            preallocated_ssm_out[num_total_tokens:].zero_()
+        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
     else:
         return torch.empty_like(hidden_states)
 
