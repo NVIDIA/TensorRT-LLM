@@ -110,8 +110,10 @@ from ..logger import logger, severity_map
               "--extra_llm_api_options",
               "extra_llm_api_options",
               type=str,
-              default=None,
+              multiple=True,
               help="Path to a YAML file that overwrites the parameters. "
+              "Can be specified multiple times; files are deep-merged in order "
+              "(later files take precedence). "
               "Can be specified as either --config or --extra_llm_api_options.")
 @click.option("--disable_kv_cache_reuse",
               is_flag=True,
@@ -124,7 +126,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
          max_seq_len: int, tp_size: int, pp_size: int, ep_size: Optional[int],
          gpus_per_node: Optional[int], kv_cache_free_gpu_memory_fraction: float,
          trust_remote_code: bool, revision: Optional[str],
-         extra_llm_api_options: Optional[str], disable_kv_cache_reuse: bool):
+         extra_llm_api_options: tuple, disable_kv_cache_reuse: bool):
     logger.set_level(log_level)
 
     kv_cache_config = KvCacheConfig(
@@ -162,7 +164,7 @@ def main(ctx, model: str, tokenizer: Optional[str],
             f"{backend} is not a known backend, check help for available options.",
             param_hint="backend")
 
-    if extra_llm_api_options is not None:
+    if extra_llm_api_options:
         llm_args = update_llm_args_with_extra_options(llm_args,
                                                       extra_llm_api_options)
 

@@ -32,7 +32,8 @@ from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               parse_disagg_config_file,
                                               parse_metadata_server_config_file)
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs, TrtLlmArgs
-from tensorrt_llm.llmapi.llm_utils import update_llm_args_with_extra_dict
+from tensorrt_llm.llmapi.llm_utils import (update_llm_args_with_extra_dict,
+                                           update_llm_args_with_extra_options)
 from tensorrt_llm.llmapi.mpi_session import find_free_ipc_addr
 from tensorrt_llm.llmapi.reasoning_parser import ReasoningParserFactory
 from tensorrt_llm.logger import logger, severity_map
@@ -640,9 +641,10 @@ class ChoiceWithAlias(click.Choice):
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
-    default=None,
+    multiple=True,
     help=help_info_with_stability_tag(
         "Path to a YAML file that overwrites the parameters specified by trtllm-serve. "
+        "Can be specified multiple times; files are deep-merged in order (later files take precedence). "
         "Can be specified as either --config or --extra_llm_api_options.",
         "prototype"))
 @click.option(
@@ -727,7 +729,7 @@ def serve(
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
         free_gpu_memory_fraction: float, num_postprocess_workers: int,
         trust_remote_code: bool, revision: Optional[str],
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
+        extra_llm_api_options: tuple, reasoning_parser: Optional[str],
         tool_parser: Optional[str], metadata_server_config_file: Optional[str],
         server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
@@ -776,12 +778,8 @@ def serve(
             otlp_traces_endpoint=otlp_traces_endpoint,
             enable_chunked_prefill=enable_chunked_prefill)
 
-        llm_args_extra_dict = {}
-        if extra_llm_api_options is not None:
-            with open(extra_llm_api_options, 'r') as f:
-                llm_args_extra_dict = yaml.safe_load(f)
-        llm_args = update_llm_args_with_extra_dict(llm_args,
-                                                   llm_args_extra_dict)
+        llm_args = update_llm_args_with_extra_options(
+            llm_args, extra_llm_api_options or None)
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
