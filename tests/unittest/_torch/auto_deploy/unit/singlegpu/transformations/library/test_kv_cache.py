@@ -221,8 +221,19 @@ def test_sdpa_with_kv_cache(dtype, attn_backend, gqa_config):
 
     # Helper function to call the model with proper sequence nesting
     def _call_and_unnest(x, input_pos):
-        # Use nest_sequences to properly set input_ids and automatically update position_ids
-        cm.info.nest_sequences(x, input_pos=input_pos)
+        # x is [batch_size, seq_len] tensor
+        bs, sl = x.shape
+        cu_seqlen = list(range(0, bs * sl + 1, sl))
+        if isinstance(input_pos, int):
+            input_pos = [input_pos] * bs
+        cm.info.nest_sequences(
+            x.flatten().tolist(),
+            cu_seqlen=cu_seqlen,
+            input_pos=input_pos,
+            cache_loc=list(range(bs)),
+            cu_num_pages=list(range(bs + 1)),
+            slot_idx=list(range(bs)),
+        )
 
         # Use the cm.args as is - it already contains the correct position_ids
         y = gm(**cm.named_args)
