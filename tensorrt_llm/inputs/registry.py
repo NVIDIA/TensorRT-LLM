@@ -254,6 +254,41 @@ class BaseMultimodalInputProcessor(ABC):
         """
         return getattr(self.processor, "mm_special_token_ids", None)
 
+    def get_dummy_text(self, mm_counts: Dict[str, int]) -> str:
+        """
+        Return minimal placeholder text for the given multimodal item counts,
+        so that the HF processor can be called with (dummy_text, mm_data) without error.
+        Used when processing tokenized prompt + MM data without detokenizing (token IDs path).
+
+        Default raises NotImplementedError. Override in model-specific processors
+        that support the token_ids + multi_modal_data path.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support token_ids + multi_modal_data "
+            "without detokenization. Implement get_dummy_text(mm_counts) to enable it."
+        )
+
+    def expand_prompt_token_ids_for_mm(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_image: List[int],
+        hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> List[int]:
+        """
+        Expand image placeholder tokens in prompt_token_ids so each single image token
+        is replaced by the corresponding number of MM placeholder tokens.
+        Used when processing tokenized prompt + MM data without calling the full HF processor.
+
+        Subclasses that need the HF processor or feature extractor (e.g. for
+        image-size-dependent token counts) can use hf_processor_mm_kwargs when provided.
+
+        Default raises NotImplementedError. Override in model-specific processors.
+        """
+        raise NotImplementedError(
+            f"{self.__class__.__name__} does not support expand_prompt_token_ids_for_mm. "
+            "Implement it to enable token_ids + multi_modal_data without detokenization."
+        )
+
     @property
     def get_num_multimodal_tokens(self):
         """
@@ -659,11 +694,65 @@ def create_input_processor_with_hash(
         A wrapped processor that modifies prompts before processing.
     """
 
-    def multimodal_hashing_process(
+    def tokenized_multimodal_process(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
         """
-        Process the multinmodal hashing for media tokens if possible.
+        Process token_ids + multi_modal_data without detokenizing, by:
+        1. Processing multi-modal inputs with dummy inputs (for media placeholder tokens to match the number of multi-modal inputs),
+        2. Replacing the placeholder token IDs for the multi-modal inputs with the actual feature token IDs.
+        Delegate to multimodal_hashing_process afterwards.
+        """
+        prompt_token_ids = inputs["prompt_token_ids"]
+        mm_data = inputs["multi_modal_data"]
+        mm_items = {
+            k: (v if isinstance(v, list) else [v])
+            for k, v in mm_data.items()
+        }
+        mm_counts = {k: len(v) for k, v in mm_items.items()}
+
+        dummy_text = input_processor.get_dummy_text(mm_counts)
+        dummy_inputs = TextPrompt(
+            prompt=dummy_text,
+            multi_modal_data=mm_data,
+            mm_processor_kwargs=inputs.get("mm_processor_kwargs"),
+        )
+        _, extra_processed_inputs = input_processor(dummy_inputs,
+                                                    sampling_params)
+        if extra_processed_inputs is None:
+            extra_processed_inputs = {}
+
+        num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
+        num_mm_tokens = next(iter(num_mm_tokens.values()))
+        if len(num_mm_tokens) <= 0:
+            logger.warning(
+                "tokenized_multimodal_process: no mm tokens from find_mm_token_lengths, returning [], None"
+            )
+            return [], None
+
+        expanded_ids = input_processor.expand_prompt_token_ids_for_mm(
+            prompt_token_ids,
+            num_mm_tokens,
+            hf_processor_mm_kwargs=inputs.get("mm_processor_kwargs"))
+        return multimodal_hashing_process(
+            inputs,
+            sampling_params,
+            precomputed_token_ids=expanded_ids,
+            precomputed_extra=extra_processed_inputs,
+        )
+
+    def multimodal_hashing_process(
+        inputs: TextPrompt,
+        sampling_params: SamplingParams,
+        *,
+        precomputed_token_ids: Optional[List[int]] = None,
+        precomputed_extra: Optional[ExtraProcessedInputs] = None,
+    ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        """
+        Process multimodal hashing for media tokens if possible.
+
+        When precomputed_token_ids and precomputed_extra are provided (tokenized+MM path),
+        skips the input_processor call and uses them; otherwise calls input_processor.
 
         Supports optional user-provided UUIDs via 'multi_modal_uuids' in inputs.
         When a UUID is provided for a multimodal item, it will be used as the
@@ -676,8 +765,13 @@ def create_input_processor_with_hash(
         mm_uuids = inputs.get('multi_modal_uuids', None)
 
         mm_hashes, mm_uuid_list = apply_mm_hashes(mm_data, mm_uuids, hash_lib)
-        prompt_token_ids, extra_processed_inputs = input_processor(
-            inputs, sampling_params)
+
+        if precomputed_token_ids is not None and precomputed_extra is not None:
+            prompt_token_ids = precomputed_token_ids
+            extra_processed_inputs = precomputed_extra
+        else:
+            prompt_token_ids, extra_processed_inputs = input_processor(
+                inputs, sampling_params)
 
         num_mm_tokens = find_mm_token_lengths(mm_data, input_processor)
         # TODO: here we assume there is only one modality for now
@@ -720,6 +814,20 @@ def create_input_processor_with_hash(
     def input_processor_wrapper(
         inputs: TextPrompt, sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
+        # Tokenized prompt + multi_modal_data
+        if (inputs.get("prompt_token_ids") is not None
+                and inputs.get("multi_modal_data") is not None
+                and inputs.get("prompt") is None):
+            if hasattr(input_processor, "get_dummy_text") and hasattr(
+                    input_processor, "expand_prompt_token_ids_for_mm"):
+                try:
+                    return tokenized_multimodal_process(inputs, sampling_params)
+                except Exception as e:
+                    logger.warning(
+                        f"Tokenized+MM path failed ({e}), falling back to detokenize path if applicable."
+                    )
+                    raise
+
         try_multimodal_hashing = False  # only used for first time
         use_multimodal_hashing = False  # used for subsequent calls
         modalities = list(set(inputs['multi_modal_data'].keys())
