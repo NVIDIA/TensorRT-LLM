@@ -194,8 +194,8 @@ def add_llm_args(parser):
     parser.add_argument('--return_generation_logits',
                         default=False,
                         action='store_true')
-    parser.add_argument('--prompt_logprobs', default=False, action='store_true')
-    parser.add_argument('--logprobs', default=False, action='store_true')
+    parser.add_argument('--prompt_logprobs', type=int, default=None)
+    parser.add_argument('--logprobs', type=int, default=None)
 
     parser.add_argument('--additional_model_outputs',
                         type=str,
@@ -334,7 +334,8 @@ def setup_llm(args, **kwargs):
         n=args.n,
         best_of=best_of,
         use_beam_search=use_beam_search,
-        additional_model_outputs=args.additional_model_outputs)
+        additional_model_outputs=args.additional_model_outputs,
+    )
     return llm, sampling_params
 
 
@@ -371,11 +372,11 @@ def main():
                 print(
                     f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
                 )
-            if args.prompt_logprobs:
+            if args.prompt_logprobs is not None:
                 print(
                     f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
                 )
-            if args.logprobs:
+            if args.logprobs is not None:
                 print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
 
             if args.additional_model_outputs:
