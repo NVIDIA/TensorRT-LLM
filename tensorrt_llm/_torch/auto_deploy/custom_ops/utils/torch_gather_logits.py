@@ -25,15 +25,34 @@ def gather_logits_before_lm_head(
     """Gather hidden states using logits_gather_indices before LM head.
 
     Args:
-        hidden_states: Hidden states tensor [b, 1, hidden] or [1, s_total, hidden]
+        hidden_states: Hidden states tensor in one of the supported layouts:
+            - [b, 1, hidden]
+            - [1, s_total, hidden]
+            - [tokens, hidden]
         logits_gather_indices: indices for gathering logits.
         logits_gather_info_host: info for gathering logits.
     Returns:
         Gathered and flattened hidden states [num_gathered_tokens, hidden]
     """
-    # final shape is [total_tokens, hidden] from [b, 1, hidden] or [1, total_tokens, hidden]
-    is_decode_only = hidden_states.shape[1] == 1
-    hidden_states = hidden_states.squeeze(int(is_decode_only))
+    # Normalize to [tokens, hidden] for gather.
+    # NOTE: 2D [tokens, hidden] is already canonical and must not be squeezed on dim 0.
+    if hidden_states.dim() == 3:
+        input_was_3d = True
+        is_decode_only = hidden_states.shape[1] == 1
+        if is_decode_only:
+            # [b, 1, hidden] -> [b, hidden]
+            hidden_states = hidden_states.squeeze(1)
+        else:
+            # [1, s_total, hidden] -> [s_total, hidden]
+            hidden_states = hidden_states.squeeze(0)
+    elif hidden_states.dim() == 2:
+        input_was_3d = False
+        is_decode_only = False
+    else:
+        raise AssertionError(
+            "gather_logits_before_lm_head expects 2D/3D hidden states, "
+            f"got shape={tuple(hidden_states.shape)}"
+        )
 
     # info object
     num_tokens_to_gather, gather_required = logits_gather_info_host.tolist()
@@ -42,7 +61,9 @@ def gather_logits_before_lm_head(
         out = hidden_states.index_select(0, logits_gather_indices[:num_tokens_to_gather])
     else:
         out = hidden_states.clone(memory_format=torch.contiguous_format)
-    return out.unsqueeze(int(is_decode_only))
+    if input_was_3d:
+        out = out.unsqueeze(1 if is_decode_only else 0)
+    return out
 
 
 @gather_logits_before_lm_head.register_fake
