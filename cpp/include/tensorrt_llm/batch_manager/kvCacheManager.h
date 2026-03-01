@@ -19,6 +19,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheConnector.h"
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
+#include "tensorrt_llm/batch_manager/blockKey.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
@@ -139,84 +140,6 @@ struct WindowSizeMetadata
             ".windowSize=%d, .isSWA=%d }",
             allottedPrimaryBlocks, allottedSecondaryBlocks, absolutePoolsOffset, numPools, maxTokenNum, maxBlocksPerSeq,
             maxNumBlocks, temporaryAttentionWindow, windowSize, isSWA);
-    }
-};
-
-std::vector<MmKey> generateBlockHashExtraKeys(
-    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx);
-
-struct BlockKey
-{
-    bool usesExtraIds = false;
-    std::optional<LoraTaskIdType> loraTaskId = std::nullopt;
-    VecUniqueTokens uniqueTokens;
-
-    // Extra keys for multimodal data (similar to VLLM's approach)
-    // Each extra key is a pair of (mm_hash, start_offset_in_block)
-    std::vector<MmKey> extraKeys;
-    std::optional<CacheSaltIDType> cacheSaltID = std::nullopt;
-
-    BlockKey() = default;
-
-    explicit BlockKey(VecTokens const& tokens, std::optional<LoraTaskIdType> loraTaskId = std::nullopt)
-        : loraTaskId{loraTaskId}
-    {
-        uniqueTokens.reserve(tokens.size());
-        for (auto const& token : tokens)
-        {
-            uniqueTokens.push_back(UniqueToken{token, 0});
-        }
-    }
-
-    explicit BlockKey(bool usesExtraIds, std::optional<LoraTaskIdType> loraTaskId, VecUniqueTokens uniqueTokens,
-        std::vector<MmKey> extraKeys = {}, std::optional<CacheSaltIDType> cacheSaltID = std::nullopt)
-        : usesExtraIds{usesExtraIds}
-        , loraTaskId{loraTaskId}
-        , uniqueTokens{std::move(uniqueTokens)}
-        , extraKeys{std::move(extraKeys)}
-        , cacheSaltID{cacheSaltID}
-    {
-    }
-
-    bool operator==(BlockKey const& other) const noexcept;
-
-    bool supportsPartialMatching() const noexcept
-    {
-        return true;
-    }
-
-    int numMatchingTokens(BlockKey const& other) const noexcept
-    {
-        SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID)
-        {
-            auto [matchEnd, otherMatchEnd] = std::mismatch(
-                uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
-            numMatched = std::distance(uniqueTokens.begin(), matchEnd);
-        }
-        return numMatched;
-    }
-
-    int getNumTokens() const noexcept
-    {
-        return static_cast<int>(uniqueTokens.size());
-    }
-
-    struct BlockKey shorten(int newNumTokens) const;
-};
-
-std::vector<BlockKey> buildBlockKeys(std::list<VecUniqueTokens>& blockedUniqueTokens, LlmRequest const& llmRequest);
-
-// Implement hash functor for BlockKey.
-// This allows us to use unordered_map with BlockKey as key.
-// Based on https://stackoverflow.com/questions/20511347/a-good-hash-function-for-a-vector/72073933#72073933
-struct BlockKeyHasher
-{
-    [[nodiscard]] static size_t hash(BlockKey const& blockKey, std::size_t parentHash = 0) noexcept;
-
-    std::size_t operator()(BlockKey const& blockKey, std::size_t parentHash = 0) const noexcept
-    {
-        return hash(blockKey, parentHash);
     }
 };
 
