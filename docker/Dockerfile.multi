@@ -4,6 +4,8 @@ ARG TRITON_IMAGE=nvcr.io/nvidia/tritonserver
 ARG BASE_TAG=25.12-py3
 ARG TRITON_BASE_TAG=25.12-py3
 ARG DEVEL_IMAGE=devel
+ARG RUNTIME_BASE_IMAGE=nvcr.io/nvidia/cuda-dl-base
+ARG RUNTIME_BASE_TAG=25.12-cuda13.1-runtime-ubuntu24.04
 
 FROM ${BASE_IMAGE}:${BASE_TAG} AS base
 
@@ -200,6 +202,143 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
 # Generate OSS attribution file for release image
 COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
 RUN bash /tmp/generate_container_oss_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}" && rm /tmp/generate_container_oss_attribution.sh
+
+FROM ${RUNTIME_BASE_IMAGE}:${RUNTIME_BASE_TAG} AS runtime
+
+LABEL com.nvidia.eula="https://www.nvidia.com/en-us/agreements/enterprise-software/nvidia-software-license-agreement/"
+LABEL com.nvidia.ai-terms="https://www.nvidia.com/en-us/agreements/enterprise-software/product-specific-terms-for-ai-products/"
+
+ARG ARCH_ALT=x86_64
+SHELL ["/bin/bash", "-c"]
+
+# Copy CUDA development tools needed for Triton JIT kernel compilation
+COPY --from=base /usr/local/cuda/bin/nvcc /usr/local/cuda/bin/nvcc
+COPY --from=base /usr/local/cuda/bin/cudafe++ /usr/local/cuda/bin/cudafe++
+COPY --from=base /usr/local/cuda/bin/ptxas /usr/local/cuda/bin/ptxas
+COPY --from=base /usr/local/cuda/bin/fatbinary /usr/local/cuda/bin/fatbinary
+COPY --from=base /usr/local/cuda/include/ /usr/local/cuda/include/
+COPY --from=base /usr/local/cuda/nvvm /usr/local/cuda/nvvm
+COPY --from=base /usr/local/cuda/bin/cuobjdump /usr/local/cuda/bin/cuobjdump
+COPY --from=base /usr/local/cuda/bin/nvdisasm /usr/local/cuda/bin/nvdisasm
+COPY --from=base /usr/local/cuda/lib64/libcudart.so* /usr/local/cuda/lib64/
+COPY --from=base /usr/local/cuda/lib64/libcupti* /usr/local/cuda/lib64/
+COPY --from=base /usr/local/cuda/lib64/libcusparseLt* /usr/local/cuda/lib64/
+
+# Copy HPC-X stack (OpenMPI, UCX, UCC) from the PyTorch base image
+COPY --from=base /opt/hpcx /opt/hpcx
+
+# Copy additional system libraries from the PyTorch base image
+COPY --from=base /usr/local/lib/lib* /usr/local/lib/
+COPY --from=base /usr/lib/${ARCH_ALT}-linux-gnu/libnuma.so* /usr/lib/${ARCH_ALT}-linux-gnu/
+
+# Copy TensorRT from the release stage (installed in devel via install_tensorrt.sh)
+COPY --from=release /usr/local/tensorrt /usr/local/tensorrt
+
+# Copy standalone UCX build (installed in devel via install_ucx.sh)
+COPY --from=release /usr/local/ucx /usr/local/ucx
+
+# Copy NIXL (installed in devel via install_nixl.sh)
+COPY --from=release /opt/nvidia/nvda_nixl /opt/nvidia/nvda_nixl
+
+# Copy etcd binaries (installed in devel via install_etcd.sh)
+COPY --from=release /usr/local/bin/etcd /usr/local/bin/etcd
+COPY --from=release /usr/local/bin/etcdctl /usr/local/bin/etcdctl
+COPY --from=release /usr/local/bin/etcdutl /usr/local/bin/etcdutl
+
+# Install runtime system packages
+RUN apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        gnupg2 curl ca-certificates && \
+    if [ "${ARCH_ALT}" = "x86_64" ]; then ARCH_GPG="x86_64"; else ARCH_GPG="sbsa"; fi && \
+    curl -fsSL \
+        "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH_GPG}/cuda-archive-keyring.gpg" \
+        -o /usr/share/keyrings/cuda-archive-keyring.gpg && \
+    echo "deb [signed-by=/usr/share/keyrings/cuda-archive-keyring.gpg] \
+        https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${ARCH_GPG} /" \
+        > /etc/apt/sources.list.d/cuda.repo.list && \
+    apt-get update && \
+    DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+        build-essential \
+        g++ \
+        ninja-build \
+        git \
+        git-lfs \
+        python3-dev \
+        python3-pip \
+        jq \
+        libcudnn9-cuda-13 \
+        libnvshmem3-cuda-13 \
+        libzmq3-dev \
+        ibverbs-providers \
+        ibverbs-utils \
+        libibumad3 \
+        libibverbs1 \
+        libnuma1 \
+        numactl \
+        librdmacm1 \
+        rdma-core \
+        openssh-client \
+        openssh-server && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* && \
+    ln -sf /usr/lib/${ARCH_ALT}-linux-gnu/libnccl.so.2 /usr/lib/${ARCH_ALT}-linux-gnu/libnccl.so || true
+
+# Copy Python packages with TRT-LLM and all dependencies from the release stage
+COPY --from=release /usr/local/lib/python3.12/dist-packages/ /usr/local/lib/python3.12/dist-packages/
+
+# Set up TRT-LLM application directory
+WORKDIR /app/tensorrt_llm
+COPY --from=release /app/tensorrt_llm/ /app/tensorrt_llm/
+
+# Register library paths with the dynamic linker
+RUN echo "/app/tensorrt_llm/lib" > /etc/ld.so.conf.d/tensorrt_llm.conf && \
+    echo "/usr/local/tensorrt/lib" > /etc/ld.so.conf.d/tensorrt.conf && \
+    echo "/usr/local/ucx/lib" > /etc/ld.so.conf.d/ucx.conf && \
+    echo "/usr/local/ucx/lib/ucx" >> /etc/ld.so.conf.d/ucx.conf && \
+    echo "/opt/nvidia/nvda_nixl/lib/${ARCH_ALT}-linux-gnu" > /etc/ld.so.conf.d/nixl.conf && \
+    echo "/opt/nvidia/nvda_nixl/lib64" >> /etc/ld.so.conf.d/nixl.conf && \
+    ldconfig
+
+ENV CUDA_HOME=/usr/local/cuda \
+    NVIDIA_DRIVER_CAPABILITIES=video,compute,utility \
+    OMPI_MCA_coll_ucc_enable=0 \
+    OPAL_PREFIX=/opt/hpcx/ompi
+
+ENV PATH="/usr/local/ucx/bin:/opt/hpcx/ompi/bin:/usr/local/cuda/bin:/usr/local/cuda/nvvm/bin:${PATH}"
+
+ENV LD_LIBRARY_PATH="\
+/app/tensorrt_llm/lib:\
+/usr/local/tensorrt/lib:\
+/usr/local/ucx/lib:\
+/usr/local/ucx/lib/ucx:\
+/opt/hpcx/ompi/lib:\
+/opt/hpcx/ucc/lib:\
+/opt/nvidia/nvda_nixl/lib/${ARCH_ALT}-linux-gnu:\
+/opt/nvidia/nvda_nixl/lib64:\
+/usr/lib/${ARCH_ALT}-linux-gnu/nvshmem/13/:\
+/usr/local/cuda/lib64"
+
+ENV TRITON_CUPTI_PATH=/usr/local/cuda/include \
+    TRITON_CUDACRT_PATH=/usr/local/cuda/include \
+    TRITON_CUOBJDUMP_PATH=/usr/local/cuda/bin/cuobjdump \
+    TRITON_NVDISASM_PATH=/usr/local/cuda/bin/nvdisasm \
+    TRITON_PTXAS_PATH=/usr/local/cuda/bin/ptxas \
+    TRITON_CUDART_PATH=/usr/local/cuda/include
+
+# Validate critical binaries and library linkage
+RUN test -f /app/tensorrt_llm/bin/executorWorker && \
+    ! ( ldd -v /app/tensorrt_llm/bin/executorWorker | grep tensorrt_llm | grep -q "not found" )
+
+ARG GIT_COMMIT
+ARG TRT_LLM_VER
+ARG TARGETARCH
+ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
+    TRT_LLM_VERSION=${TRT_LLM_VER}
+
+COPY scripts/generate_container_oss_attribution.sh /tmp/generate_container_oss_attribution.sh
+RUN bash /tmp/generate_container_oss_attribution.sh "runtime" "${TRT_LLM_VER}" "${TARGETARCH}" && \
+    rm /tmp/generate_container_oss_attribution.sh
+
 
 FROM wheel AS tritonbuild
 
