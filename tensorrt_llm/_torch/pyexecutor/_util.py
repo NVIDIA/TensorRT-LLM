@@ -1,5 +1,5 @@
 import os
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Union
 
 import torch
 
@@ -654,6 +654,39 @@ class KvCacheCreator:
         del resources[ResourceManagerType.DRAFT_KV_CACHE_MANAGER]
 
 
+def _build_per_layer_num_kv_heads(
+    num_key_value_heads: int,
+    num_hidden_layers: int,
+    spec_config: Optional[SpeculativeConfig] = None,
+    draft_config: Optional[ModelConfig] = None,
+) -> Union[int, List[int]]:
+    """
+    Returns:
+        An int when all layers share the same num_kv_heads (common case),
+        or a list of num_kv_heads (one entry per layer) when target and
+        draft models differ.
+    """
+    if spec_config is None or draft_config is None:
+        return num_key_value_heads
+
+    from ..speculative.utils import get_num_spec_layers
+    draft_pretrained = draft_config.pretrained_config
+    draft_num_kv_heads = getattr(
+        draft_pretrained, 'num_key_value_heads',
+        getattr(draft_pretrained, 'num_attention_heads', None))
+
+    if draft_num_kv_heads is None or draft_num_kv_heads == num_key_value_heads:
+        return num_key_value_heads
+
+    num_spec_layers = get_num_spec_layers(spec_config)
+    logger.info(f"Per-layer KV heads for speculative decoding: "
+                f"target={num_key_value_heads} x {num_hidden_layers} layers, "
+                f"draft={draft_num_kv_heads} x {num_spec_layers} layers, "
+                f"total={num_hidden_layers + num_spec_layers} layers")
+    return [num_key_value_heads] * num_hidden_layers + [draft_num_kv_heads
+                                                        ] * num_spec_layers
+
+
 def _create_kv_cache_manager(
         model_engine: Optional[PyTorchModelEngine],
         kv_cache_manager_cls,
@@ -713,6 +746,17 @@ def _create_kv_cache_manager(
 
     # Use provided num_layers if available, otherwise use config
     num_hidden_layers = num_layers if num_layers is not None else config.num_hidden_layers
+    # Only include draft KV heads in the per-layer list when draft layers
+    # are NOT handled by a separate draft KV cache manager.  When layer_mask
+    # is provided from the caller, it means the main KV cache covers only
+    # the masked (target) layers and draft layers live in their own manager.
+    draft_config_for_kv = None
+    if layer_mask is None:
+        draft_config_for_kv = (getattr(model_engine.model, 'draft_config', None)
+                               if model_engine is not None else None)
+    per_layer_num_kv_heads = _build_per_layer_num_kv_heads(
+        num_key_value_heads, num_hidden_layers, spec_config,
+        draft_config_for_kv)
 
     if is_mla(config):
         kv_cache_manager = kv_cache_manager_cls(
@@ -800,7 +844,7 @@ def _create_kv_cache_manager(
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
             layer_mask=hybrid_layer_mask,
-            num_kv_heads=num_key_value_heads,
+            num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
@@ -850,7 +894,7 @@ def _create_kv_cache_manager(
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_layers,
             layer_mask=hybrid_layer_mask,
-            num_kv_heads=num_key_value_heads,
+            num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
@@ -872,7 +916,7 @@ def _create_kv_cache_manager(
             kv_cache_config,
             tensorrt_llm.bindings.internal.batch_manager.CacheType.SELF,
             num_layers=num_hidden_layers,
-            num_kv_heads=num_key_value_heads,
+            num_kv_heads=per_layer_num_kv_heads,
             head_dim=head_dim,
             tokens_per_block=tokens_per_block,
             max_seq_len=max_seq_len,
