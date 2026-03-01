@@ -469,7 +469,7 @@ class Eagle3ForCausalLM(DecoderModelForCausalLM[Eagle3DraftModel,
     ) -> torch.Tensor:
         hidden_states = self.apply_eagle3_fc(spec_metadata.get_hidden_states())
         output, _ = self.model(
-            input_ids=input_ids,
+            input_ids=input_ids if inputs_embeds is None else None,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
@@ -662,7 +662,7 @@ class MistralLarge3EagleForCausalLM(DecoderModelForCausalLM):
     ) -> torch.Tensor:
         hidden_states = spec_metadata.get_hidden_states()
         output, _ = self.model(
-            input_ids=input_ids,
+            input_ids=input_ids if inputs_embeds is None else None,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
@@ -1084,8 +1084,11 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
+        # When inputs_embeds is set (multimodal), don't pass input_ids to the
+        # backbone model (it would trigger XOR validation). Keep input_ids for
+        # the speculative decoding worker which needs token IDs.
         hidden_states = self.model(
-            input_ids=input_ids,
+            input_ids=input_ids if inputs_embeds is None else None,
             attn_metadata=attn_metadata,
             position_ids=position_ids,
             inputs_embeds=inputs_embeds,
