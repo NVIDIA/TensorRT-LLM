@@ -683,6 +683,7 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
@@ -734,4 +735,26 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @staticmethod
+    def _load_small_config():
+        config = _load_ad_config('qwen3.5_moe_35b.yaml')
+        world_size = config.pop('world_size', 1)
+        return config, world_size
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_bf16_small(self):
+        config, world_size = self._load_small_config()
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME_SMALL,
+                           tokenizer=self.MODEL_NAME_SMALL,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **config) as llm:
+            task = MMLU(self.MODEL_NAME_SMALL)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME_SMALL)
             task.evaluate(llm)
