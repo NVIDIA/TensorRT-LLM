@@ -17,7 +17,6 @@ transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
   fuse_gemms_mixed_children:
-    stage: post_load_fusion
     enabled: true
   detect_sharding:
     sharding_dims: ['tp','ep', 'bmm']
