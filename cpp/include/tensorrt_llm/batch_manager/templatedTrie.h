@@ -22,40 +22,56 @@
 #include <optional>
 
 //
-// This file implements a templated radix search tree.
-// It is used to retrieve KV cache blocks with reusable content during context phase.
+// This file implements a templated trie.
+// It is used to implement a constant radix search tree for reusable KV cache blocks.
 //
 // Template arguments:
-// NodeKey - Single node key. An edge key is needed for a search from root. Edge key is a vector of node keys.
-// NodeKeyHashFunctor - Hash functor for node key. If node key is a type supported by std::hash, hash functor can be
-// std::hash<NodeKey>. ValueKey - Value key for single node. Think of this as a channel selector, for instance if you
-// have one set of values for each sliding window size, ValueKey can be an int that is the window size.
-// ValueKeyHashFunctor - Hash functor for value key. If value key is a type supported by std::hash, hash functor can be
-// std::hash<ValueKey>. Value - Value returned for a given edge and value key.
+//
+// The trie is maintained as a set of nodes.
+// Each node has a map with pointers to the next node(s) [the children] and a single pointer to the previous node [the parent].
+// The key is of type 'NodeKey'. A hash functor for 'NodeKey' is provided by 'NodeKeyHashFunctor'. The hash functor can be
+// std::hash for simple types.
+//
+// Each node stores a value of type 'Value' for multiple channels. The channel is selected with an argument of type 'ValueKey'.
+// For example, if we have one value per window size, ValueKey can be of type int. ValueKey can be any custom struct or class
+// that implements == operator and has a hash functor. The hash functor is passed with argument 'ValueKeyHashFunctor'.
+// For simple data types, hash functor can be std::hash.
+//
+// Note that value is stored by value, not by reference. If your value is an object instance, you should use a pointer type
+// as your Value argument, for instance std::shared_ptr<KVCacheBlock> can be used to point to the objects that contain
+// meta-data for KV cache blocks. If used Value = KVCacheBlock instead of std::shared_ptr<KVCacheBlock>, the value that is
+// returned by Node::getValue would be a copy of the meta-data in the KVCacheBlock instance, not a pointer to it. This is
+// fine for reading, but will not work if you plan on modifying anything.
+//
+// NodeKey is a custom data type with a notion of tokens. The NodeKey we use for KV cache block lookups is struct BlockKey,
+// which has a property called uniqueTokens. uniqueTokens is a vector of fixed size, the size is equal to block length,
+// which is sometimes refered to as 'tokens_per_block'. BlockKey supports partial matching. Partial matching means
+// the entire BlockKey did not match, but the first 'N' tokens did. Not all NodeKeys support partial matching,
+// you enable or disable this feature with template argument 'supportsPartialMatching'.
 //
 
-namespace tensorrt_llm::batch_manager::radix_tree
+namespace tensorrt_llm::batch_manager::templated_trie
 {
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
-class RadixTreeNode;
+class Node;
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
-class RadixTree;
+class Trie;
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
-struct RadixTreeMatch
+struct NodeMatch
 {
-    using Node
-        = RadixTreeNode<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
-    using NodePtr = std::shared_ptr<Node>;
+    using _Node
+        = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using NodePtr = std::shared_ptr<_Node>;
 
-    RadixTreeMatch() = default;
+    NodeMatch() = default;
 
-    explicit RadixTreeMatch(NodeKey const& key, NodePtr node, bool exactMatch, bool wasCreated)
+    explicit NodeMatch(NodeKey const& key, NodePtr node, bool exactMatch, bool wasCreated)
         : key(key)
         , node(node)
         , exactMatch(exactMatch)
@@ -71,18 +87,18 @@ struct RadixTreeMatch
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
-class RadixTreeNode
+class Node
 {
 public:
     using PrefixKey = std::vector<NodeKey>;
-    using NodePtr = std::shared_ptr<RadixTreeNode>;
-    using Match
-        = RadixTreeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
-    using MatchPtr = std::shared_ptr<Match>;
+    using NodePtr = std::shared_ptr<Node>;
+    using _NodeMatch
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using NodeMatchPtr = std::shared_ptr<_NodeMatch>;
 
-    RadixTreeNode() = default;
+    Node() = default;
 
-    explicit RadixTreeNode(NodeKey const& key, NodePtr& prevNode)
+    explicit Node(NodeKey const& key, NodePtr& prevNode)
         : mKey{key}
         , mPrevNode{prevNode}
     {
@@ -183,12 +199,12 @@ public:
     //! \brief Find exact match
     //! \param key Key we are looking for.
     //! \return Matching node or null_opt if no match
-    [[nodiscard]] std::optional<Match> findMatchingNode(NodeKey const& key) const
+    [[nodiscard]] std::optional<_NodeMatch> findMatchingNode(NodeKey const& key) const
     {
         auto itr = mNextNodes.find(key);
         if (itr != mNextNodes.end())
         {
-            return RadixTreeMatch(itr->first, itr->second, true, false);
+            return _NodeMatch(itr->first, itr->second, true, false);
         }
         else
         {
@@ -199,7 +215,7 @@ public:
     //! \brief Find all partially matching nodes
     //! \param key The key we're matching.
     //! \return vector of matching nodes, sorted in descending order of number of matched tokens.
-    [[nodiscard]] std::vector<Match> findPartiallyMatchingNodes(NodeKey const& key) const
+    [[nodiscard]] std::vector<_NodeMatch> findPartiallyMatchingNodes(NodeKey const& key) const
     {
         if constexpr (supportsPartialMatching)
         {
@@ -212,7 +228,7 @@ public:
                     matches.emplace_back(numMatched, nn.second);
                 }
             }
-            auto results = std::vector<Match>();
+            auto results = std::vector<_NodeMatch>();
             if (!matches.empty())
             {
                 // Sort in descending order of number of matched tokens (longest match first)
@@ -244,7 +260,7 @@ public:
     }
 
 private:
-    friend RadixTree<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    friend Trie<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
 
     // Private debugging method.
     void _getEdges(std::vector<NodeKey> edge, std::vector<std::vector<NodeKey>>& edges) const
@@ -291,15 +307,15 @@ private:
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
-struct RadixTreeLookupNodesResult
+struct NodeMatches
 {
-    using Match
-        = RadixTreeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _NodeMatch
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
 
     // Nodes matched exactly from beginning of prefix
-    std::vector<Match> exactMatches;
+    std::vector<_NodeMatch> exactMatches;
     // All partial matches for last node key, sorted in descending order of number of matched tokens
-    std::vector<Match> partialMatches;
+    std::vector<_NodeMatch> partialMatches;
 };
 
 //! \brief A radix search tree used to look up values for given prefixes.
@@ -311,32 +327,31 @@ struct RadixTreeLookupNodesResult
 //! true if NodeKey supports partial matching and you know how to extract a subset of matched tokens from Value.
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
-class RadixTree
+class Trie
 {
 public:
     using PrefixKey = std::vector<NodeKey>;
-    using Node
-        = RadixTreeNode<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
-    using NodePtr = std::shared_ptr<Node>;
-    using Match
-        = RadixTreeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
-    using LookupNodesResult = RadixTreeLookupNodesResult<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor,
-        Value, supportsPartialMatching>;
-    using LookupNodesResultPtr = std::shared_ptr<LookupNodesResult>;
+    using _Node
+        = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using NodePtr = std::shared_ptr<_Node>;
+    using _NodeMatch
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _NodeMatches = NodeMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using NodeMatchesPtr = std::shared_ptr<_NodeMatches>;
     using Values = std::vector<std::optional<Value>>;
 
-    explicit RadixTree()
-        : mRoot{std::make_shared<Node>()}
+    explicit Trie()
+        : mRoot{std::make_shared<_Node>()}
     {
     }
 
     //! \brief Insert nodes for new prefix, or return existing nodes.
     //! \param key Key for new prefix.
     //! \return  An object containing results + meta-data about how nodes were matched.
-    LookupNodesResult insertNodes(PrefixKey const& pkey)
+    _NodeMatches insertNodes(PrefixKey const& pkey)
     {
         // Return value
-        LookupNodesResult results;
+        _NodeMatches results;
         // State variables
         bool lookForMatch = true;
         auto prevNode = mRoot;
@@ -347,9 +362,9 @@ public:
             if (!matchedNode.has_value())
             {
                 lookForMatch = false;
-                auto newNode = std::make_shared<Node>(key, prevNode);
+                auto newNode = std::make_shared<_Node>(key, prevNode);
                 [[maybe_unused]] auto const overwritten = prevNode->insertNode(key, newNode);
-                matchedNode = Match(key, newNode, true, true);
+                matchedNode = _NodeMatch(key, newNode, true, true);
             }
             prevNode = matchedNode.value().node;
             results.exactMatches.emplace_back(std::move(matchedNode.value()));
@@ -361,10 +376,10 @@ public:
     //! \param key Key for prefix we are looking for.
     //! \param allowPartialMatch If true, consider partial match for last node.
     //! \return An object containing results of the lookup + meta-data about how nodes were matched.
-    [[nodiscard]] LookupNodesResult lookupNodes(PrefixKey const& pkey, bool allowPartialMatch) const
+    [[nodiscard]] _NodeMatches lookupNodes(PrefixKey const& pkey, bool allowPartialMatch) const
     {
         // Return value
-        LookupNodesResult results;
+        _NodeMatches results;
         // State variables
         auto prevNode = mRoot;
         for (auto const& key : pkey)
@@ -413,4 +428,4 @@ private:
     NodePtr mRoot;
 };
 
-} // namespace tensorrt_llm::batch_manager::radix_tree
+} // namespace tensorrt_llm::batch_manager::templated_trie

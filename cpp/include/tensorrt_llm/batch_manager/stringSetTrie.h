@@ -16,17 +16,17 @@
 
 #pragma once
 
-#include "tensorrt_llm/batch_manager/radixTree.h"
+#include "tensorrt_llm/batch_manager/templatedTrie.h"
 #include <cstdio>
 #include <string>
 
-namespace tensorrt_llm::batch_manager::radix_tree
+namespace tensorrt_llm::batch_manager::templated_trie
 {
 
-class RadixTreeStringSet : public RadixTree<char, std::hash<char>, int, std::hash<int>, int, false>
+class StringSet : public Trie<char, std::hash<char>, int, std::hash<int>, int, false>
 {
 public:
-    RadixTreeStringSet() = default;
+    StringSet() = default;
 
     void insert(std::string str)
     {
@@ -67,4 +67,4 @@ public:
     }
 };
 
-} // namespace tensorrt_llm::batch_manager::radix_tree
+} // namespace tensorrt_llm::batch_manager::templated_trie
