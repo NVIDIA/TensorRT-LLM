@@ -582,6 +582,8 @@ class KVCacheManager(BaseResourceManager):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
+            context_requests_chunking = []
+            context_requests_last_chunk = []
             generation_batch = scheduled_batch.generation_requests
 
             # wait for all pending work to finish before launching offload/onboarding/partial copy
@@ -612,6 +614,14 @@ class KVCacheManager(BaseResourceManager):
                             block_ids = self.get_cache_indices(req)
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
+
+                if req.is_last_context_chunk:
+                    context_requests_last_chunk.append(req)
+                else:
+                    context_requests_chunking.append(req)
+
+            scheduled_batch.context_requests_chunking = context_requests_chunking
+            scheduled_batch.context_requests_last_chunk = context_requests_last_chunk
 
             for req in generation_batch:
                 if self.mapping.has_cp_helix():
@@ -1909,6 +1919,8 @@ class KVCacheManagerV2(BaseResourceManager):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
+            context_requests_chunking = []
+            context_requests_last_chunk = []
             generation_batch = scheduled_batch.generation_requests
             # allocate KV Cache
             for req in context_batch:
@@ -1961,6 +1973,14 @@ class KVCacheManagerV2(BaseResourceManager):
                             block_ids = self.get_cache_indices(req)
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
+
+                if req.is_last_context_chunk:
+                    context_requests_last_chunk.append(req)
+                else:
+                    context_requests_chunking.append(req)
+
+            scheduled_batch.context_requests_chunking = context_requests_chunking
+            scheduled_batch.context_requests_last_chunk = context_requests_last_chunk
 
             for req in generation_batch:
                 kv_cache = self.kv_cache_map[req.py_request_id]

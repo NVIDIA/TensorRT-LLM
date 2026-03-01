@@ -45,13 +45,12 @@ class MakeDecodingBatchInputOutput:
         active_slots = [[]]
         generation_steps = []
         logits_vec = [[]]
-        for i, r in enumerate(scheduled_requests.context_requests):
-            if r.is_last_context_chunk:
-                active_slots[0].append(r.py_seq_slot)
-                generation_steps.append(r.decoding_iter)
-                logits_vec[0].append(
-                    logits[num_context_logits_prefix_sum[i]:
-                           num_context_logits_prefix_sum[i + 1]].unsqueeze(0))
+        for i, r in enumerate(scheduled_requests.context_requests_last_chunk):
+            active_slots[0].append(r.py_seq_slot)
+            generation_steps.append(r.decoding_iter)
+            logits_vec[0].append(
+                logits[num_context_logits_prefix_sum[i]:
+                       num_context_logits_prefix_sum[i + 1]].unsqueeze(0))
 
         logits_index = num_context_logits_prefix_sum[-1]
         for i, r in enumerate(scheduled_requests.generation_requests):

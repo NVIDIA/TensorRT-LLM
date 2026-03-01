@@ -377,7 +377,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ContextRequestMock:
             def __init__(self, is_last_context_chunk: bool, return_context_logits: bool):
-                self.is_context_init_state = True
                 self.is_last_context_chunk = is_last_context_chunk
                 self.py_draft_tokens = torch.tensor([], dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
@@ -394,7 +393,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class GenRequestMock:
             def __init__(self, draft_len: int):
-                self.is_context_init_state = False
                 self.py_draft_tokens = torch.empty(draft_len, dtype=torch.int32, device=device)
                 self.sampling_config = SamplingConfig(beam_width=1)
 
@@ -405,7 +403,23 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         class ScheduledRequestsMock:
             @property
-            def context_requests(self) -> list[LlmRequest]:
+            def context_requests_chunking(self) -> list[LlmRequest]:
+                return (
+                    [
+                        # This request is expected to be skipped
+                        cast(
+                            LlmRequest,
+                            ContextRequestMock(
+                                is_last_context_chunk=False, return_context_logits=False
+                            ),
+                        )
+                    ]
+                    if with_ctx
+                    else []
+                )
+
+            @property
+            def context_requests_last_chunk(self) -> list[LlmRequest]:
                 return (
                     [
                         # NB: One request with py_return_context_logits is enough
@@ -433,6 +447,13 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                     else []
                 )
 
+            def context_requests(self) -> list[LlmRequest]:
+                return self.context_requests_chunking + self.context_requests_last_chunk
+
+            @property
+            def num_context_requests(self) -> int:
+                return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
+
             @property
             def generation_requests(self) -> list[LlmRequest]:
                 # NB: Currently this list is not inspected, UUT only checks that this
@@ -446,9 +467,6 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                     else []
                 )
 
-            def all_requests(self) -> list[LlmRequest]:
-                return self.context_requests + self.generation_requests
-
         expected_num_requests = with_ctx * 3 + with_gen * 2
         expected_req_num_beams = torch.tensor([1] * expected_num_requests, dtype=torch.int32)
 
@@ -456,9 +474,13 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
             0,
             *(
                 [
-                    100 + 1,  # context req. 1 (assume context len. 100)
-                    (100 + 1) + (0 + 1),  # context req. 2 (not returning context)
-                    (100 + 1) + (0 + 1) + (50 + 1),  # context req. 3 (assume context len. 50)
+                    (0 + 1),  # context req. 1 (not returning context)
+                    (0 + 1) + (100 + 1),  # context req. 2 (assume context len. 100)
+                    (0 + 1) + (100 + 1) + (0 + 1),  # context req. 3 (not returning context)
+                    (0 + 1)
+                    + (100 + 1)
+                    + (0 + 1)
+                    + (50 + 1),  # context req. 4 (assume context len. 50)
                 ]
                 if with_ctx
                 else []
@@ -467,9 +489,9 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         expected_req_num_generation_steps = [
             *(
                 [
-                    1,  # context req. 1
                     1,  # context req. 2
                     1,  # context req. 3
+                    1,  # context req. 4
                 ]
                 if with_ctx
                 else []
@@ -508,9 +530,10 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         expected_logit_indices = []
         if with_ctx:
             expected_logit_indices += [
-                100,  # gen logits from context req. 1
+                # 1,  # skipped gen logits from context req. 1
                 101,  # gen logits from context req. 2
-                152,  # gen logits from context req. 3
+                102,  # gen logits from context req. 3
+                153,  # gen logits from context req. 4
             ]
         if with_gen:
             gen_logit_offset = num_context_logits_prefix_sum[-1]
@@ -528,6 +551,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         @dataclass
         class UutResult:
+            selected_requests: list[LlmRequest]
             req_num_generated_tokens: torch.Tensor
             req_num_beams: torch.Tensor
             req_num_steps: torch.Tensor
@@ -542,6 +566,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
 
         def _uut(res=res):
             (
+                selected_requests,
                 sampling_requests_metadata,
                 selected_logits,
             ) = TorchSampler._select_generated_logits(
@@ -550,6 +575,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
                 num_context_logits_prefix_sum=num_context_logits_prefix_sum,
             )
             res.result = UutResult(
+                selected_requests=selected_requests,
                 req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
                 req_num_beams=sampling_requests_metadata.req_num_beams,
                 req_num_steps=sampling_requests_metadata.req_num_steps,
@@ -562,6 +588,7 @@ def test_select_generated_logits(draft_len: int, with_ctx: bool, with_gen: bool)
         # Check results
         assert res.result is not None
 
+        assert len(res.result.selected_requests) == expected_num_requests
         torch.testing.assert_close(
             res.result.req_num_generated_tokens.to("cpu"), expected_req_num_generation_steps_tensor
         )
@@ -1088,9 +1115,22 @@ class TestBatchedSampling:
                 ]
 
             @property
-            def context_requests(self) -> list[LlmRequest]:
+            def num_context_requests(self) -> int:
+                return 0
+
+            @property
+            def context_requests_chunking(self) -> list[LlmRequest]:
                 # Code paths excluded by this choice are addressed by test_select_generated_logits
                 return []
+
+            @property
+            def context_requests_last_chunk(self) -> list[LlmRequest]:
+                # Code paths excluded by this choice are addressed by test_select_generated_logits
+                return []
+
+            @property
+            def context_requests(self) -> list[LlmRequest]:
+                return self.context_requests_chunking + self.context_requests_last_chunk
 
             @property
             def generation_requests(self) -> list[LlmRequest]:
@@ -1180,7 +1220,7 @@ class TestBatchedSampling:
 
         Optionally, run sampling repeatedly, e.g., to gather statistics.
         """
-        assert not scheduled_requests.context_requests
+        assert scheduled_requests.num_context_requests == 0
         num_actual_repeats = num_repeats if num_repeats is not None else 1
 
         T = TypeVar("T")

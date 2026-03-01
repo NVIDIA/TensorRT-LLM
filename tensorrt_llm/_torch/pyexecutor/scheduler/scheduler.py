@@ -31,25 +31,34 @@ SchedulerOutput = namedtuple(
 class ScheduledRequests:
     # to be aligned with ScheduledRequests in cpp/tensorrt_llm/batch_manager/common.h
     def __init__(self):
-        self.context_requests: RequestList = []
+        self.context_requests_chunking: RequestList = []
+        self.context_requests_last_chunk: RequestList = []
         self.generation_requests: RequestList = []
         self.paused_requests: RequestList = []
 
     @property
     def is_generation_only(self) -> bool:
-        return not self.context_requests and all(
+        return self.num_context_requests == 0 and all(
             len(req.draft_tokens) == 0 for req in self.generation_requests
         )
 
     @property
     def can_run_cuda_graph(self) -> bool:
-        return not self.context_requests
+        return self.num_context_requests == 0
 
     @property
     def batch_size(self) -> int:
-        return len(self.context_requests) + len(self.generation_requests)
+        return self.num_context_requests + len(self.generation_requests)
 
-    def all_requests(self) -> list[LlmRequest]:
+    @property
+    def num_context_requests(self) -> int:
+        return len(self.context_requests_chunking) + len(self.context_requests_last_chunk)
+
+    @property
+    def context_requests(self) -> RequestList:
+        return self.context_requests_chunking + self.context_requests_last_chunk
+
+    def all_requests(self) -> RequestList:
         return self.context_requests + self.generation_requests
 
 
@@ -83,7 +92,8 @@ class SerializableSchedulerOutput:
     Need this class because LlmRequest is not serializable by pickle.
     """
 
-    context_requests: list[int]  # request ids of context requests
+    context_requests_chunking: list[int]  # request ids of context requests chunking
+    context_requests_last_chunk: list[int]  # request ids of context requests last chunk
     generation_requests: list[int]  # request ids of generation requests
     paused_requests: list[int]  # request ids of paused requests
     fitting_disagg_gen_init_requests: list[
@@ -99,7 +109,12 @@ class SerializableSchedulerOutput:
         num_fitting_requests: int,
     ) -> "SerializableSchedulerOutput":
         return cls(
-            context_requests=[req.request_id for req in scheduled_requests.context_requests],
+            context_requests_chunking=[
+                req.request_id for req in scheduled_requests.context_requests_chunking
+            ],
+            context_requests_last_chunk=[
+                req.request_id for req in scheduled_requests.context_requests_last_chunk
+            ],
             generation_requests=[req.request_id for req in scheduled_requests.generation_requests],
             paused_requests=[req.request_id for req in scheduled_requests.paused_requests],
             fitting_disagg_gen_init_requests=[
@@ -113,8 +128,11 @@ class SerializableSchedulerOutput:
     ) -> tuple[ScheduledRequests, RequestList, int]:
         id_to_request = {req.request_id: req for req in active_requests}
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests = [
-            id_to_request[req_id] for req_id in self.context_requests
+        scheduled_requests.context_requests_chunking = [
+            id_to_request[req_id] for req_id in self.context_requests_chunking
+        ]
+        scheduled_requests.context_requests_last_chunk = [
+            id_to_request[req_id] for req_id in self.context_requests_last_chunk
         ]
         scheduled_requests.generation_requests = [
             id_to_request[req_id] for req_id in self.generation_requests

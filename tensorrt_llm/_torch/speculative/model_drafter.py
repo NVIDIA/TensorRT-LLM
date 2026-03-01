@@ -266,7 +266,7 @@ class ModelDrafter(Drafter):
         if draft_request.state == LlmRequestState.GENERATION_IN_PROGRESS:
             draft_batch.generation_requests.append(draft_request)
         else:
-            draft_batch.context_requests.append(draft_request)
+            draft_batch.context_requests_last_chunk.append(draft_request)
 
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(
@@ -448,12 +448,12 @@ class ModelDrafter(Drafter):
 
     def process_decoded_tokens(
             self,
-            draft_batch: ScheduledRequests,
+            requests: List[LlmRequest],
             draft_position: int,
             cleanup_resources: bool = True) -> List[LlmRequest]:
         """Process decoded tokens and determine which requests to continue processing."""
         new_requests = []
-        for req in draft_batch.all_requests():
+        for req in requests:
             target_model_req = self.req_id_to_old_request[req.py_request_id]
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
                 # This is a chunked prefill request and we have more prefill chunks
@@ -701,8 +701,8 @@ class ModelDrafter(Drafter):
         self.update_requests(outputs, resource_manager)
 
         # Create accumulator for draft tokens and process them
-        self.process_decoded_tokens(outputs.scheduled_requests,
-                                    self.max_draft_len, cleanup_resources)
+        self.process_decoded_tokens(outputs.requests, self.max_draft_len,
+                                    cleanup_resources)
 
         # Update py_draft_tokens after processing
         for req_id, tokens in self.draft_tokens_accumulator.items():
@@ -808,8 +808,9 @@ class ModelDrafter(Drafter):
         # Convert context requests to generation requests
         for req in draft_batch.generation_requests:
             req.py_is_first_draft = False
-        draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
-        draft_batch.context_requests = []
+        draft_batch.generation_requests = draft_batch.all_requests()
+        draft_batch.context_requests_chunking = []
+        draft_batch.context_requests_last_chunk = []
 
         previous_draft_state = initial_draft_state
         # reset draft tokens accumulator
@@ -834,8 +835,7 @@ class ModelDrafter(Drafter):
 
             if sample_state is not None and previous_draft_state is not None:
                 new_requests = self.process_decoded_tokens(
-                    previous_draft_state.scheduled_requests,
-                    draft_position=i + 1)
+                    previous_draft_state.requests, draft_position=i + 1)
             else:
                 new_requests = []
 
@@ -911,7 +911,7 @@ class ModelDrafter(Drafter):
             sampler_event.record()
 
             sample_state = SampleState(
-                scheduled_requests=draft_batch,
+                requests=draft_batch.all_requests(),
                 device=SampleStateTensors(
                     new_tokens=outputs["new_draft_tokens"]),
                 host=SampleStateTensors(new_tokens=new_tokens_host),
