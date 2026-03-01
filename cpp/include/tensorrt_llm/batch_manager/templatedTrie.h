@@ -86,6 +86,64 @@ struct NodeMatch
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool supportsPartialMatching>
+struct NodeMatches
+{
+    using _NodeMatch
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+
+    // Nodes matched exactly from beginning of prefix
+    std::vector<_NodeMatch> exactMatches;
+    // All partial matches for last node key, sorted in descending order of number of matched tokens
+    std::vector<_NodeMatch> partialMatches;
+};
+
+template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
+    bool supportsPartialMatching>
+struct ValueMatch
+{
+    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using NodePtr = std::shared_ptr<_Node>;
+
+    ValueMatch() = default;
+
+    explicit ValueMatch(NodeKey& nk, NodePtr& n, ValueKey vk)
+        : isValid{false}
+        , key{nk}
+        , node{n}
+        , vkey{vk}
+        , exactMatch{false}
+    {
+    }
+
+    explicit ValueMatch(NodeKey& nk, NodePtr& n, ValueKey vk, Value const& v, bool em)
+        : isValid{true}
+        , key{nk}
+        , node{n}
+        , vkey{vk}
+        , value{v}
+        , exactMatch{em}
+    {
+    }
+
+    bool isValid = false;
+    NodeKey key;
+    NodePtr node = nullptr;
+    ValueKey vkey;
+    Value value;
+    bool exactMatch = false;
+};
+
+template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
+    bool supportsPartialMatching>
+struct ValueMatches
+{
+    using _ValueMatch
+        = ValueMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    std::vector<_ValueMatch> matches;
+};
+
+template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
+    bool supportsPartialMatching>
 class Node
 {
 public:
@@ -304,19 +362,6 @@ private:
     std::unordered_map<NodeKey, NodePtr, NodeKeyHashFunctor> mNextNodes;
 };
 
-template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
-struct NodeMatches
-{
-    using _NodeMatch
-        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
-
-    // Nodes matched exactly from beginning of prefix
-    std::vector<_NodeMatch> exactMatches;
-    // All partial matches for last node key, sorted in descending order of number of matched tokens
-    std::vector<_NodeMatch> partialMatches;
-};
-
 //! \brief A radix search tree used to look up values for given prefixes.
 //! \tparam NodeKey Single node key. A prefix key is required for lookup from root and is a vector of node key.
 //! \tparam NodeKeyHashFunctor Hash functor for node key. Can be std::hash<NodeKey> if std::hash is implemented for
@@ -337,7 +382,11 @@ public:
     using _NodeMatches
         = NodeMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
     using NodeMatchesPtr = std::shared_ptr<_NodeMatches>;
-    using Values = std::vector<std::optional<Value>>;
+    using _ValueMatch
+        = ValueMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _ValueMatches
+        = ValueMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using ValueMatchesPtr = std::shared_ptr<_ValueMatches>;
 
     explicit Trie()
         : mRoot{std::make_shared<_Node>()}
@@ -421,6 +470,51 @@ public:
         int count = 0;
         mRoot->_countNodes(count);
         return count;
+    }
+
+    //! \brief Find reusable blocks for given window size.
+    //! \param nodeMatches Nodes matching a given prefix.
+    //! \param windowSize Window size.
+    //! \return ValueMatches struct containing values matching prefix and window size. Might be nullptr for some or all.
+    [[nodiscard]] _ValueMatches lookupBlocks(_NodeMatches const& nodeMatches, ValueKey const& vkey) const
+    {
+        _ValueMatches valueMatches;
+        for (auto const& nodeMatch : nodeMatches.exactMatches)
+        {
+            auto optValue = nodeMatch.node->getValue();
+            if (optValue.has_value())
+            {
+                valueMatches.matches.emplace_back(
+                        nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);
+            }
+            else
+            {
+                valueMatches.matches.emplace_back(
+                        nodeMatch.key, nodeMatch.node, vkey);
+            }
+        }
+        for (auto const& nodeMatch : nodeMatches.partialMatches)
+        {
+            auto optValue = nodeMatch.node->getValue();
+            if (optValue.has_value() != nullptr)
+            {
+                valueMatches.matches.emplace_back(
+                        nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);
+                break; // Found longest match, we are done searching for partial match
+            }
+        }
+        return valueMatches;
+    }
+
+    //! \brief Find reusable blocks for given prefix and window size.
+    //! \param pkey prefix.
+    //! \param allowPartialMatch If partial matching of tokens is allowed for last matching block.
+    //! \param windowSize Window size.
+    //! \return ValueMatches struct containing values matching prefix and window size. Might be nullptr for some or all.
+    [[nodiscard]] _ValueMatches lookupBlocks(PrefixKey const& pkey, bool allowPartialMatch, ValueKey const& vkey) const
+    {
+        auto nodeMatches = lookupNodes(pkey, allowPartialMatch);
+        return lookupBlocks(nodeMatches, vkey);
     }
 
 private:

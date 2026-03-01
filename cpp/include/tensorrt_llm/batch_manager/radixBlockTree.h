@@ -28,43 +28,18 @@
 
 namespace tensorrt_llm::batch_manager::radix_block_tree
 {
-struct BlockMatch
-{
-    using BlockPtr = std::shared_ptr<kv_cache_manager::KVCacheBlock>;
-    using Node
-        = templated_trie::Node<BlockKey, BlockKeyHasher, int, std::hash<int>, kv_cache_manager::KVCacheBlock, true>;
-    using NodePtr = std::shared_ptr<Node>;
-
-    BlockMatch() = default;
-
-    explicit BlockMatch(NodePtr& n, BlockPtr& b, BlocKey& bk, bool em, int ws)
-        : node{n}
-        , block{b}
-        , key{bk}
-        , exactMatch{em}
-        , windowSize{ws}
-    {
-    }
-
-    //! Claim the matched block. Block is removed from search tree to prevent further reuse.
-    //! \return true if block was removed from search tree.
-    [[nodiscard]] bool claim()
-    {
-        if (node != nullptr && !block->hasRefs() && node != nullptr)
-        {
-            return node->clearValue(windowSize);
-        }
-        return false;
-    }
-
-    NodePtr node = nullptr;
-    BlockPtr block = nullptr;
-    BlocKey key;
-    bool exactMatch = false;
-    int windowSize = -1;
-};
-
+using BlockMatch = ValueMatch<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>, std::shared_ptr<kv_cache_manager::KVCacheBlock>>;
 using BlockMatches = std::vector<BlockMatch>;
+
+// Convenience method to claim a block. May not be used, mostly here to show how to claim blocks.
+bool claimBlock(BlockMatch& match)
+{
+    if (match.node != nullptr && match.value != nullptr && !match.value->hasRefs())
+    {
+        return match.node->clearValue(match.vkey);
+    }
+    return false;
+}
 
 // The following template arguments are used:
 // NodeKey = BlockKey
@@ -73,52 +48,10 @@ using BlockMatches = std::vector<BlockMatch>;
 // ValueKeyHashFunctor = std::hash<int> since that already exists.
 // Value = std::shared_ptr<KVCacheBlock> very important to use a pointer here since we are planning to modify
 // KVCacheBlock state. supportsPartialMatching = true, because BlockKey supports partial matching.
-class UnifiedBlockTree : public templated_trie::Trie<BlockKey, BlockKeyHasher, int, std::hash<int>,
+class UnifiedBlockTree : public templated_trie::Trie<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>,
                              std::shared_ptr<kv_cache_manager::KVCacheBlock>, true>
 {
 public:
-    using PrefixKey = std::vector<BlockKey>;
-    using NodeMatches = templated_trie::NodeMatches<BlockKey, BlockKeyHasher, int, std::hash<int>,
-        kv_cache_manager::KVCacheBlock, true>;
-
     UnifiedBlockTree() = default;
-
-    //! \brief Find reusable blocks for given window size.
-    //! \param nodeMatches Nodes matching a given prefix.
-    //! \param windowSize Window size.
-    //! \return Blocks BlockMatch struct containing blocks matching prefix and window size. For some of these,
-    //! matchedBlock field may be nullptr.
-    BlockMatches lookupBlocks(NodeMatches const& nodeMatches, int windowSize) const
-    {
-        BlockMatches blockMatches;
-        for (auto const& nodeMatch : nodeMatches.exactMatches)
-        {
-            blockMatches.emplace_back(
-                nodeMatch.node, nodeMatch.node->getValue(windowSize), nodeMatch.key, nodeMatch.exactMatch, windowSize);
-        }
-        for (auto const& nodeMatch : nodeMatches.partialMatches)
-        {
-            auto block = nodeMatch.node->getValue();
-            if (block != nullptr)
-            {
-                blockMatches.emplace_back(nodeMatch.node, nodeMatch.node->getValue(windowSize), nodeMatch.key,
-                    nodeMatch.exactMatch, windowSize);
-                break; // Found longest partial match, we are done
-            }
-        }
-        return blockMatches;
-    }
-
-    //! \brief Find reusable blocks for given prefix and window size.
-    //! \param pkey prefix.
-    //! \param allowPartialMatching If partial matching of tokens is allowed for last matching block.
-    //! \param windowSize Window size.
-    //! \return Blocks BlockMatch struct containing blocks matching prefix and window size. For some of these,
-    //! matchedBlock field may be nullptr.
-    BlockMatches lookupBlocks(PrefixKey const& pkey, bool allowPartialMatching, int windowSize) const
-    {
-        auto nodeMatches = lookupNodes(pkey, allowPartialMatching);
-        return lookupBlocks(nodeMatches, windowSize);
-    }
 };
 } // namespace tensorrt_llm::batch_manager::radix_block_tree
