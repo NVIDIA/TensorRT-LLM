@@ -1570,6 +1570,19 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
     try:
         res = []
         if done:
+            # Process any remaining tokens before sending finish_reason.
+            # With Eagle speculative decoding, the final batch can deliver
+            # multiple content tokens alongside done=True.
+            remaining_tokens = output.token_ids_diff
+            if remaining_tokens:
+                final_token_responses, _ = harmony_adapter.create_openai_streaming_response(
+                    request_id=request_id,
+                    tokens=remaining_tokens,
+                    available_tools=tools_for_parser,
+                    model_name=model,
+                    tool_choice=tool_choice)
+                res.extend(final_token_responses)
+
             # Send final message with finish_reason
             final_response = ChatCompletionStreamResponse(
                 model=model,
