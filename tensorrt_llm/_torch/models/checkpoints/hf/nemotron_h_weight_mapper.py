@@ -93,7 +93,11 @@ class NemotronHHfWeightMapper(HfWeightMapper):
                 w = w.to(torch.float32)
                 new_weights[key] = w
             elif "mixer.in_proj" in key:
-                new_weights[key] = _split_mamba2_mixer_in_proj(weights[name])
+                if weights[name].dim() < 1:
+                    new_weights[key] = weights[name]
+                else:
+                    new_weights[key] = _split_mamba2_mixer_in_proj(
+                        weights[name])
             elif "conv1d" in key:
                 w = weights[name]
                 # removing dim(1) because we are using Linear to store conv1d weights
