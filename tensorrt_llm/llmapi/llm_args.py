@@ -899,7 +899,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_choices(cls, v):
         if v is not None:
             logger.warning(
-                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
             )
             if not isinstance(v, list):
                 if isinstance(v, str):
@@ -914,6 +914,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
+        if not self.eagle3_one_model:
+            logger.warning(
+                "Eagle3 2-model is deprecated and will be removed in release 1.4."
+            )
+
         self.num_eagle_layers = self.max_draft_len
         self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
@@ -1232,8 +1237,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
-                "in release 1.3. After that, the flag will be removed entirely."
+                "2-model style MTP is deprecated and will be removed in release 1.4."
             )
         return self
 
