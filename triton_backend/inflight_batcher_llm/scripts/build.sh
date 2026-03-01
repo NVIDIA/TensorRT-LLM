@@ -3,26 +3,22 @@
 Help()
 {
    # Display Help
-   echo "Syntax: build.sh [h|-t <trt_root>|u]"
+   echo "Syntax: build.sh [h|u]"
    echo "options:"
    echo "h     Print this Help."
-   echo "t     Location of tensorrt library"
    echo "u     Option to build unit tests"
    echo "s     Triton short tag, e.g. 'r25.06'"
    echo
 }
 
-TRT_ROOT='/usr/local/tensorrt'
 BUILD_UNIT_TESTS='false'
 
 # Get the options
-while getopts ":ht:us:" option; do
+while getopts ":hus:" option; do
    case $option in
       h) # display Help
          Help
          exit;;
-      t) # Location of tensorrt
-         TRT_ROOT=$OPTARG;;
       u) # Option to build unit tests
          BUILD_UNIT_TESTS='true';;
       s) # Triton short tag
@@ -35,7 +31,6 @@ while getopts ":ht:us:" option; do
    esac
 done
 
-echo "Using TRT_ROOT=${TRT_ROOT}"
 echo "Using BUILD_UNIT_TESTS=${BUILD_UNIT_TESTS}"
 
 DIRNAME="$(dirname "$(realpath "$0")")"
