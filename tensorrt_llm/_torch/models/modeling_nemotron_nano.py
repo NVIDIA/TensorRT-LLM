@@ -345,7 +345,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_num_tokens_per_image(
         self,
         *,
-        image: Image.Image,
+        image: torch.Tensor,
         **kwargs,
     ):
         # The logic is copied and modified from HuggingFace ImageProcessor.
@@ -400,8 +400,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
 
             return blocks
 
-        image_height = image.height
-        image_width = image.width
+        image_height, image_width = image.shape[-2:]
         if "max_num_tiles" in kwargs:
             max_num_tiles = kwargs["max_num_tiles"]
         else:
@@ -418,7 +417,7 @@ class NanoV2VLInputProcessor(BaseMultimodalInputProcessor, BaseMultimodalDummyIn
     def get_num_tokens_per_video(
         self,
         *,
-        video: List[Image.Image],
+        video: List[torch.Tensor],
         video_pruning_ratio: Optional[float] = None,
         **kwargs,
     ):
