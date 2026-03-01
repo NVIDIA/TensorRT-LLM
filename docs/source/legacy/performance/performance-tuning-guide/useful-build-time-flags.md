@@ -89,7 +89,7 @@ TensorRT allows you to add "plugins" or custom kernels that can be used instead 
 
 ### Enabling GEMM Plugin
 
-Add the following line to the multiple profiles example from above to enable paged context attention.
+Add the following line to the multiple profiles example from above to enable the GEMM plugin.
 
 ```python
 build_config.plugin_config.gemm_plugin = 'auto'
@@ -116,7 +116,7 @@ TensorRT-LLM has custom kernels for AllReduce operations that are enabled by def
 
 ### Enabling Reduce Norm Fusion Plugin
 
-Add the following line to the multiple profiles example from above to enable paged context attention.
+Add the following line to the multiple profiles example from above to enable reduce norm fusion.
 
 ```python
 build_config.plugin_config.reduce_fusion = True

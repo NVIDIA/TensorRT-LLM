@@ -230,7 +230,7 @@ Run `bench.sh` to begin a serving benchmark.
 
 ## Troubleshooting
 
-Since Kimi K2 Thinking has larger weight size than other models, it's possible seeing host OOM issues, as the following:
+Since Kimi K2 Thinking has a larger weight size than other models, it is possible to see host OOM issues, such as the following:
 
 ```log
 Loading weights: 100%|█████████████████████| 1408/1408 [03:43<00:00,  6.30it/s]
