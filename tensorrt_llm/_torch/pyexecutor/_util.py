@@ -1015,8 +1015,16 @@ def create_py_executor_instance(
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
 
+    # When max_batch_size == 1 with attention DP, the overlap scheduler may
+    # need to schedule both a GENERATION_TO_COMPLETE request and an attention
+    # DP dummy request simultaneously.  Reserve an extra slot so that the
+    # SlotManager (and the scheduler capacity below) can accommodate both.
+    seq_slot_capacity = max_num_sequences
+    if max_num_sequences == 1 and mapping.enable_attention_dp and kv_cache_manager:
+        seq_slot_capacity += 1
+
     resources[ResourceManagerType.SEQ_SLOT_MANAGER] = SeqSlotManager(
-        max_num_sequences)
+        seq_slot_capacity)
 
     resource_manager = ResourceManager(resources)
 
