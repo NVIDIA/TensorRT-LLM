@@ -28,7 +28,7 @@ Launch (examples):
 python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend DEEPEP --profile deepseek_v3
 
 # Show per-kernel breakdown and stats across iterations
-python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED --kernel_breakdown --iter_stats
+python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 640 --kernel_breakdown --iter_stats
 
 # With batch size sweeping
 python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 640 -e 2048 -f 2
@@ -117,7 +117,18 @@ def _sync():
 def _set_device_from_local_rank():
     if not torch.cuda.is_available():
         raise RuntimeError("CUDA is required for this benchmark")
-    dev = local_mpi_rank() % torch.cuda.device_count()
+    local_rank = local_mpi_rank()
+    device_count = torch.cuda.device_count()
+    if local_rank >= device_count:
+        raise RuntimeError(
+            "Detected GPU oversubscription: "
+            f"local_mpi_rank={local_rank} >= cuda_device_count={device_count}. "
+            "Reduce local MPI ranks to match visible GPU count "
+            "(e.g. srun --ntasks-per-node=<gpus>, "
+            "mpirun --map-by ppr:<gpus>:node, "
+            "or adjust CUDA_VISIBLE_DEVICES)."
+        )
+    dev = local_rank % device_count
     torch.cuda.set_device(dev)
     return dev
 
@@ -127,11 +138,13 @@ def _make_inputs(
     hidden_size: int,
     top_k: int,
     num_experts_total: int,
+    experts_per_rank: int,
     act_dtype: torch.dtype,
     device: torch.device,
     quant_algo: QuantAlgo,
     backend: Communication,
     moe: Optional[MoE] = None,
+    perfect_router: bool = False,
 ) -> Tuple[torch.Tensor, Optional[torch.Tensor], torch.Tensor, torch.Tensor]:
     # Hidden states: payload we want to communicate.
     hidden_states = torch.randn(local_num_tokens, hidden_size, dtype=act_dtype, device=device)
@@ -141,17 +154,39 @@ def _make_inputs(
     # using Cutlass' quantize_input() (outside the timed comm region).
     if quant_algo != QuantAlgo.NO_QUANT and backend.supports_post_quant_dispatch():
         hidden_states, hidden_states_sf = moe.quantize_input(hidden_states, post_quant_comm=True)
-    # Routing IDs: global expert IDs in [0, num_experts_total).
-    token_selected_slots = torch.randint(
-        0,
-        num_experts_total,
-        (local_num_tokens, top_k),
-        dtype=torch.int32,
-        device=device,
-    )
-    # Router weights/scales.
-    # DeepEP expects router weights/topk_weights to be float32.
+    if perfect_router:
+        assert experts_per_rank > 0
+        assert num_experts_total % experts_per_rank == 0
+        ep_size = num_experts_total // experts_per_rank
+        rank = mpi_rank()
+        assert 0 <= rank < ep_size
+
+        # Fair routing across both ranks and experts:
+        # flatten (token, top-k) slots into a sequence and cycle as:
+        #   rank r expert0, rank r+1 expert0, ..., then rank r expert1, ...
+        flat_slots = torch.arange(local_num_tokens * top_k, device=device, dtype=torch.int64)
+        schedule = flat_slots + rank
+        target_rank = schedule % ep_size
+        local_expert = (schedule // ep_size) % experts_per_rank
+        token_selected_slots = (
+            (target_rank * experts_per_rank + local_expert)
+            .view(local_num_tokens, top_k)
+            .to(torch.int32)
+        )
+    else:
+        # Routing IDs: global expert IDs in [0, num_experts_total).
+        token_selected_slots = torch.randint(
+            0,
+            num_experts_total,
+            (local_num_tokens, top_k),
+            dtype=torch.int32,
+            device=device,
+        )
+        # Router weights/scales.
+
+    # The value of token_final_scales doesn't matter for communication.
     token_final_scales = torch.rand(local_num_tokens, top_k, dtype=torch.float32, device=device)
+
     return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 
 
@@ -219,36 +254,38 @@ def _time_dispatch_and_combine(
         l2_flush_size = (l2_size * 2) // 4  # Size in int32 elements
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
-    # Warmup iterations (not profiled)
-    for _ in range(warmup):
-        if l2_buffer is not None:
-            l2_buffer.zero_()
-        recv_hidden_states, _, _, _ = backend.dispatch(
-            hidden_states,
-            hidden_states_sf,
-            token_selected_slots,
-            token_final_scales,
-            all_rank_num_tokens,
-        )
-        shape = list(recv_hidden_states.shape)
-        shape[-1] = hidden_size
-        recv_hidden_states_moe = torch.empty(
-            tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
-        )
-        _ = backend.combine(
-            recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
-        )
-
     # Profile with Kineto
     with torch.profiler.profile(
-        # Include CPU so `record_function("dispatch_iter..."/"combine_iter...")` ranges
-        # appear in key_averages() / events(). Without CPU activity those ranges are
-        # missing, causing dispatch/combine attribution to fail.
+        # Include CPU so `record_function("dispatch"/"combine")` ranges appear in
+        # key_averages() / events(). Without CPU activity those ranges are missing,
+        # causing dispatch/combine attribution to fail.
         activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
         record_shapes=False,
         with_stack=False,
     ) as prof:
         _sync()
+
+        # Warmup iterations (not profiled)
+        for _ in range(warmup):
+            if l2_buffer is not None:
+                l2_buffer.zero_()
+            recv_hidden_states, _, _, _ = backend.dispatch(
+                hidden_states,
+                hidden_states_sf,
+                token_selected_slots,
+                token_final_scales,
+                all_rank_num_tokens,
+            )
+            shape = list(recv_hidden_states.shape)
+            shape[-1] = hidden_size
+            recv_hidden_states_moe = torch.empty(
+                tuple(shape), dtype=torch.bfloat16, device=recv_hidden_states.device
+            )
+            _ = backend.combine(
+                recv_hidden_states_moe, all_rank_max_num_tokens=max(all_rank_num_tokens)
+            )
+
+        # Timed iterations
         for _ in range(iters):
             # L2 cache flushing
             if l2_buffer is not None:
@@ -290,7 +327,7 @@ def _time_dispatch_and_combine(
     #
     # Each record_function marker produces both a CPU event and a CUDA
     # range event.  We collect the GPU-side "dispatch"/"combine" ranges
-    # and check whether each GPU kernel's start timestamp falls inside
+    # and check whether each GPU kernel's start/stop timestamp falls inside
     # one of them (GPU time-range containment).
     # ------------------------------------------------------------------
     events_list = list(prof.events())
@@ -322,17 +359,26 @@ def _time_dispatch_and_combine(
 
     # Step 2: Scope resolver (GPU events only) ---------------------------------
     def _find_scope(evt) -> Optional[str]:
-        """Return 'dispatch', 'combine', or None based on GPU time-range containment."""
+        """Return scope only when kernel range is strictly contained."""
         tr = getattr(evt, "time_range", None)
         if tr is None:
             return None
-        t = tr.start
-        for s, e in gpu_dispatch_intervals:
-            if s <= t <= e:
-                return "dispatch"
-        for s, e in gpu_combine_intervals:
-            if s <= t <= e:
-                return "combine"
+
+        # Be careful: Due to PDL, the end of dispatch and the start of combine may overlap,
+        # so we say a kernel is in dispatch/combine only if its range is strictly contained in a dispatch/combine range.
+        in_dispatch = any(s <= tr.start and tr.end <= e for s, e in gpu_dispatch_intervals)
+        in_combine = any(s <= tr.start and tr.end <= e for s, e in gpu_combine_intervals)
+
+        assert not (in_dispatch and in_combine), (
+            f"Kernel range is simultaneously inside dispatch and combine ranges: {evt.name}"
+        )
+
+        if in_dispatch:
+            return "dispatch"
+        if in_combine:
+            return "combine"
+
+        # Neither in dispatch or combine (like the element-wise kernel for L2 cache flushing) -> uncategorized.
         return None
 
     # Step 3: Iterate events and bucket by scope ----------------------------
@@ -509,9 +555,7 @@ def parse_args() -> argparse.Namespace:
         help="Override quantization algo (defaults to profile.quant_algo).",
     )
     parser.add_argument("--iters", type=int, default=200, help="Timed iterations.")
-    parser.add_argument(
-        "--warmup", type=int, default=20, help="Warmup iterations. (Currently ignored.)"
-    )
+    parser.add_argument("--warmup", type=int, default=20, help="Warmup iterations.")
     parser.add_argument(
         "--max_num_tokens_per_rank",
         type=int,
@@ -533,6 +577,17 @@ def parse_args() -> argparse.Namespace:
         type=str,
         default=None,
         help="Path to write JSON report file (default: None, stdout only).",
+    )
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=1234,
+        help="Base random seed for input generation (effective seed is random_seed + rank).",
+    )
+    parser.add_argument(
+        "--perfect_router",
+        action="store_true",
+        help="Use deterministic balanced router assignments to avoid communication load imbalance.",
     )
     return parser.parse_args()
 
@@ -604,17 +659,25 @@ def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int,
     return hidden_size, local_num_tokens, top_k, num_experts_total, QuantAlgo.NO_QUANT
 
 
-def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
+_WORKER_ENV = {
+    "TRTLLM_CAN_USE_DEEP_EP": "1",
+}
+
+
+def _run_benchmark_worker_under_current_mpi(
+    args: argparse.Namespace, launcher: str = "spawn"
+) -> None:
     # Keep benchmark output clean.
     tllm.logger.set_level("error")
-    # MPI-spawned workers may not inherit the parent's mutated environment reliably.
-    # Opt-in to DeepEP backends by default (does not override an explicit user setting).
-    os.environ.setdefault("TRTLLM_CAN_USE_DEEP_EP", "1")
 
     ep_size = mpi_world_size()
     rank = mpi_rank()
     _ = _set_device_from_local_rank()
     device = torch.device("cuda")
+    # Keep random inputs reproducible while ensuring different ranks do not get identical samples.
+    seed = int(args.random_seed) + rank
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
 
     hidden_size, _, top_k, num_experts_total, profile_quant_algo = _resolve_profile_args(args)
     local_batch_sizes = _iter_local_batch_sizes(args)
@@ -643,29 +706,26 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
     experts_per_rank = num_experts_total // ep_size
     num_slots = num_experts_total
 
+    benchmark_metadata = {
+        "bench": "bench_moe_comm",
+        "launcher": launcher,
+        "profile": args.profile,
+        "backend": args.backend,
+        "ep_size": ep_size,
+        "hidden_size": hidden_size,
+        "local_batch_size": local_batch_sizes,
+        "top_k": top_k,
+        "dtype": str(act_dtype),
+        "quant_algo": quant_algo.name,
+        "perfect_router": bool(args.perfect_router),
+        "experts_per_rank": experts_per_rank,
+        "num_experts_total": num_experts_total,
+        "max_num_tokens_per_rank": max_num_tokens_per_rank,
+        "random_seed": int(args.random_seed),
+        "device_count": torch.cuda.device_count(),
+    }
     if rank == 0:
-        print(
-            json.dumps(
-                {
-                    "bench": "bench_moe_comm",
-                    "launcher": "spawn",
-                    "profile": args.profile,
-                    "backend": args.backend,
-                    "ep_size": ep_size,
-                    "hidden_size": hidden_size,
-                    "local_batch_size": local_batch_sizes,
-                    "top_k": top_k,
-                    "dtype": str(act_dtype),
-                    "quant_algo": quant_algo.name,
-                    "experts_per_rank": experts_per_rank,
-                    "num_experts_total": num_experts_total,
-                    "max_num_tokens_per_rank": max_num_tokens_per_rank,
-                    "device_count": torch.cuda.device_count(),
-                },
-                indent=2,
-            ),
-            flush=True,
-        )
+        print(json.dumps(benchmark_metadata, indent=2), flush=True)
 
     backends = (
         ["ALLGATHER", "NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED", "DEEPEP", "DEEPEPLOWLATENCY"]
@@ -700,11 +760,9 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                 _maybe_warn_rank0(
                     f"[bench_moe_comm] Skipping {backend_name}: factory returned None."
                 )
-                mpi_barrier()
                 continue
         except Exception as e:
             _maybe_warn_rank0(f"[bench_moe_comm] Skipping {backend_name}: {type(e).__name__}: {e}")
-            mpi_barrier()
             continue
 
         # Post-quant communication: Quantize → Dispatch (mirrors ConfigurableMoE ordering),
@@ -728,18 +786,10 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
 
         for local_num_tokens in local_batch_sizes:
             all_rank_num_tokens = mpi_allgather(int(local_num_tokens))
-            try:
-                if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
-                    _maybe_warn_rank0(
-                        f"[bench_moe_comm] Skipping {backend_name} @ local_batch_size={local_num_tokens}: workload not feasible."
-                    )
-                    mpi_barrier()
-                    continue
-            except Exception as e:
+            if not backend.is_workload_feasible(all_rank_num_tokens, num_chunks=1):
                 _maybe_warn_rank0(
-                    f"[bench_moe_comm] Skipping {backend_name} @ local_batch_size={local_num_tokens}: feasibility check failed: {e}"
+                    f"[bench_moe_comm] Skipping {backend_name} @ local_batch_size={local_num_tokens}: workload not feasible."
                 )
-                mpi_barrier()
                 continue
 
             hidden_states, hidden_states_sf, token_selected_slots, token_final_scales = (
@@ -748,11 +798,13 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
                     hidden_size,
                     top_k,
                     num_experts_total,
+                    experts_per_rank,
                     act_dtype,
                     device,
                     quant_algo,
                     backend,
                     moe,
+                    bool(args.perfect_router),
                 )
             )
 
@@ -784,24 +836,71 @@ def _run_benchmark_worker_under_current_mpi(args: argparse.Namespace) -> None:
 
             # Add kernel breakdown if requested and available
             if args.kernel_breakdown and detailed_stats is not None:
-                for category in ("dispatch_kernels", "combine_kernels", "other_kernels"):
-                    kernels = detailed_stats.get(category, [])
-                    for kernel in kernels:
-                        kernel["per_rank"] = _gather_per_rank(
-                            kernel.pop("_times", []), iter_stats=iter_stats
+                categories = ("dispatch_kernels", "combine_kernels", "other_kernels")
+
+                # Collect once per rank to avoid desynchronizing MPI collectives when
+                # kernel lists differ across ranks.
+                local_kernel_payload: Dict[str, Dict[str, List[float]]] = {}
+                for category in categories:
+                    local_kernel_payload[category] = {
+                        kernel["name"]: kernel.get("_times", [])
+                        for kernel in detailed_stats.get(category, [])
+                    }
+                all_kernel_payload = mpi_allgather(local_kernel_payload)
+
+                for category in categories:
+                    # Preserve deterministic order by first appearance across ranks.
+                    seen = set()
+                    kernel_names: List[str] = []
+                    for rank_payload in all_kernel_payload:
+                        for name in rank_payload.get(category, {}):
+                            if name not in seen:
+                                seen.add(name)
+                                kernel_names.append(name)
+
+                    merged_kernels: List[Dict[str, Any]] = []
+                    for name in kernel_names:
+                        per_rank_times: List[List[float]] = []
+                        for rank_payload in all_kernel_payload:
+                            times = rank_payload.get(category, {}).get(name, [])
+                            per_rank_times.append(times if isinstance(times, list) else [])
+
+                        if iter_stats:
+                            per_rank = {
+                                f"rank{i}": _compute_stats(times)
+                                for i, times in enumerate(per_rank_times)
+                            }
+                        else:
+                            per_rank = {
+                                f"rank{i}": (sum(times) / len(times) if times else 0.0)
+                                for i, times in enumerate(per_rank_times)
+                            }
+
+                        merged_kernels.append(
+                            {
+                                "name": name,
+                                "count": max((len(times) for times in per_rank_times), default=0),
+                                "per_rank": per_rank,
+                            }
                         )
-                    output[category] = kernels
+
+                    output[category] = merged_kernels
 
             if rank == 0:
                 print(json.dumps(output, indent=2), flush=True)
                 all_results.append(output)
 
-            mpi_barrier()
-
     # Write JSON report if requested
     if rank == 0 and args.output_file and all_results:
+        output_dir = os.path.dirname(args.output_file)
+        if output_dir:
+            os.makedirs(output_dir, exist_ok=True)
+        report = {
+            "benchmark_metadata": benchmark_metadata,
+            "results": all_results,
+        }
         with open(args.output_file, "w") as f:
-            json.dump(all_results, f, indent=2)
+            json.dump(report, f, indent=2)
         print(f"Report written to {args.output_file}", flush=True)
 
     return
@@ -817,7 +916,7 @@ def _spawn_worker_main(args_blob: bytes) -> List[Dict[str, Any]]:
     args = pickle.loads(args_blob)
     # In spawned workers, we are already inside an MPI world of size == ep_size.
     try:
-        _run_benchmark_worker_under_current_mpi(args)
+        _run_benchmark_worker_under_current_mpi(args, launcher="spawn")
     except Exception as e:
         # Make worker-side stack trace visible at the parent.
         rank = mpi_rank()
@@ -840,7 +939,6 @@ def _spawn_worker_main(args_blob: bytes) -> List[Dict[str, Any]]:
 def main() -> None:
     args = parse_args()
 
-    # Important: parent is NOT part of the worker MPI world; do not call mpi_barrier here.
     # Make functions/classes in this script pickleable to spawned workers.
     # (Same pattern used in our MPI unit tests, but adapted for a script entrypoint.)
     cloudpickle.register_pickle_by_value(sys.modules[__name__])
@@ -854,8 +952,16 @@ def main() -> None:
     if ep_size <= 0:
         raise ValueError("--ep_size must be > 0")
 
-    if mpi_world_size() != 1:
-        raise RuntimeError("bench_moe_comm should be run from a non-MPI parent (world_size==1).")
+    world_size = mpi_world_size()
+    if world_size > 1:
+        if args.ep_size is not None and ep_size != world_size:
+            raise ValueError(
+                f"--ep_size ({ep_size}) must match external MPI world size ({world_size}) "
+                "when running under mpirun."
+            )
+        # Reuse externally launched MPI processes (supports multi-node SPMD).
+        _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
+        return
 
     if mpi_rank() == 0:
         print(
@@ -873,13 +979,16 @@ def main() -> None:
         )
 
     args_blob = cloudpickle.dumps(args)
-    with MPIPoolExecutor(max_workers=ep_size) as executor:
+    executor = MPIPoolExecutor(max_workers=ep_size, env=_WORKER_ENV)
+    try:
         # Map the same args to all workers; each worker uses its own mpi_rank() and participates
         # in collectives within its spawned MPI world.
         _ = list(executor.map(_spawn_worker_main, [args_blob] * ep_size))
+    finally:
+        # In some environments shutdown(wait=True) can hang even when all workers are idle.
+        # We already consumed all map() results, so use non-blocking shutdown.
+        executor.shutdown(wait=False, cancel_futures=True)
 
 
 if __name__ == "__main__":
-    # Opt-in to DeepEP backends by default. This does not override an explicit user setting.
-    os.environ.setdefault("TRTLLM_CAN_USE_DEEP_EP", "1")
     main()
