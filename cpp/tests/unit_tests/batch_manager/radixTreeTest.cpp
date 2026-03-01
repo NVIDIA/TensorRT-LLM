@@ -14,12 +14,12 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/radixTree.h"
-#include "tensorrt_llm/batch_manager/radixTreeUtils.h"
+#include "tensorrt_llm/batch_manager/templatedTrie.h"
+#include "tensorrt_llm/batch_manager/stringSetTrie.h"
 
 #include <gtest/gtest.h>
 
-using namespace tensorrt_llm::batch_manager::radix_tree;
+using namespace tensorrt_llm::batch_manager::templated_trie;
 
 // ---------------------------------------------------------------------------
 // TokensKey: a NodeKey that supports partial matching.
@@ -80,14 +80,14 @@ struct TokensKeyHasher
 // ---------------------------------------------------------------------------
 // Type aliases used throughout the tests.
 // ---------------------------------------------------------------------------
-using IntTree = RadixTree<int, std::hash<int>, int, std::hash<int>, int, /*supportsPartialMatching*/ false>;
-using PartialTree = RadixTree<TokensKey, TokensKeyHasher, int, std::hash<int>, int, /*supportsPartialMatching*/ true>;
+using IntTree = Trie<int, std::hash<int>, int, std::hash<int>, int, /*supportsPartialMatching*/ false>;
+using PartialTree = Trie<TokensKey, TokensKeyHasher, int, std::hash<int>, int, /*supportsPartialMatching*/ true>;
 
 // ---------------------------------------------------------------------------
 // Test fixture with shared helpers.
 //
 // Test groups:
-//   StringSet Tests -- RadixTreeStringSet end-to-end: insert, lookup, erase
+//   StringSet Tests -- StringSet end-to-end: insert, lookup, erase
 //   Group A         -- insertNodes: prefix insertion, wasCreated / exactMatch flags
 //   Group B         -- lookupNodes (exact): key traversal, short queries, cache misses
 //   Group C         -- lookupNodes (partial): supportsPartialMatching=true, result ordering,
@@ -157,7 +157,7 @@ protected:
 
 TEST_F(RadixTreeTest, StringSetInsertAndContains)
 {
-    RadixTreeStringSet stringSet;
+    StringSet stringSet;
 
     std::vector<std::string> strings = {"This is string 1, yeah", "This is string 2, yeah", "This is a loaf of bread"};
     for (auto const& str : strings)
@@ -183,7 +183,7 @@ TEST_F(RadixTreeTest, StringSetInsertAndContains)
 
 TEST_F(RadixTreeTest, StringSetErase)
 {
-    RadixTreeStringSet stringSet;
+    StringSet stringSet;
 
     std::vector<std::string> strings = {"This is string 1, yeah", "This is string 2, yeah", "This is a loaf of bread"};
     for (auto const& str : strings)
