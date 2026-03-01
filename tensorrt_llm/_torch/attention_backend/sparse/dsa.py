@@ -611,6 +611,29 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                     self.host_topk_indices_buffer[gen_range, :],
                     non_blocking=True)
 
+    def _get_pool_block_indices(self) -> torch.Tensor:
+        """Extract memory pool block indices from host_kv_cache_block_offsets.
+
+        The C++ setOffsets() encodes offsets as:
+            encoded = memPoolBlockIndex * numLayers * kvFactor
+        For SELFKONLY (MLA/DSA), kvFactor=1, so:
+            memPoolBlockIndex = encoded // num_local_layers
+
+        Returns a (num_seqs, max_blocks_per_seq) int32 CPU tensor with valid
+        pool indices clamped to [0, blocks_in_primary_pool - 1].
+        """
+        num_local_layers = self.kv_cache_manager.num_local_layers
+        max_pool_idx = self.kv_cache_manager.blocks_in_primary_pool - 1
+        # host_kv_cache_block_offsets shape: (num_pools, max_batch*beam, 2, max_blocks_per_seq)
+        # Pool 0, first num_seqs entries, field 0 (key offsets)
+        encoded = self.kv_cache_manager.host_kv_cache_block_offsets[
+            0, :self.num_seqs, 0, :]
+        pool_indices = encoded // num_local_layers
+        # Clamp for safety: handles garbage padding from torch.empty in uninitialized slots
+        pool_indices = pool_indices.clamp(min=0,
+                                          max=max_pool_idx).to(torch.int32)
+        return pool_indices
+
     def prepare(self):
         super().prepare()
 
@@ -651,16 +674,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.skip_indexer_for_gen_reqs = False
         self.prepare_dense_topk_indices(kv_lens)
 
-        # Build indexer_k_cache_block_offsets
+        # Build indexer_k_cache_block_offsets using pool block indices derived
+        # from host_kv_cache_block_offsets (populated by super().prepare()).
+        # This correctly resolves block IDs to memory pool indices, which is
+        # required when host cache offload is enabled (block IDs != pool indices
+        # for onboarded secondary blocks).
         if self.kv_cache_manager is not None:
-            block_ids = self.kv_cache_manager.get_batch_cache_indices(
-                self.request_ids)
-            for i in range(len(block_ids)):
-                self.host_indexer_k_cache_block_offsets[
-                    i, :len(block_ids[i])].copy_(
-                        torch.tensor(block_ids[i],
-                                     dtype=torch.int32,
-                                     device='cpu'))
+            pool_indices = self._get_pool_block_indices()
+            self.host_indexer_k_cache_block_offsets[:self.num_seqs].copy_(
+                pool_indices)
             self.indexer_k_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
@@ -674,20 +696,20 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                                                        non_blocking=True)
 
         # Build block_table for topk_indices conversion (actual block allocation)
-        block_ids_all = self.kv_cache_manager.get_batch_cache_indices(
-            self.request_ids[:self.num_seqs])
-        max_blocks_used = max(len(b)
-                              for b in block_ids_all) if block_ids_all else 1
-        host_block_table = torch.full((self.num_seqs, max_blocks_used),
-                                      -1,
-                                      dtype=torch.int32)
-        for i, blocks in enumerate(block_ids_all):
-            if len(blocks) > 0:
-                host_block_table[i, :len(blocks)] = torch.tensor(
-                    blocks, dtype=torch.int32)
-        # Copy to GPU
-        self.block_table[:self.num_seqs, :max_blocks_used].copy_(
-            host_block_table, non_blocking=True)
+        if self.kv_cache_manager is not None:
+            tokens_per_block = self.kv_cache_manager.tokens_per_block
+            num_blocks_per_seq = (kv_lens[:self.num_seqs] + tokens_per_block -
+                                  1) // tokens_per_block
+            max_blocks_used = num_blocks_per_seq.max().item(
+            ) if self.num_seqs > 0 else 1
+            # pool_indices already has correct values; set padding to -1
+            host_block_table = pool_indices[:, :max_blocks_used].clone()
+            for i in range(self.num_seqs):
+                if num_blocks_per_seq[i] < max_blocks_used:
+                    host_block_table[i, num_blocks_per_seq[i]:] = -1
+            # Copy to GPU
+            self.block_table[:self.num_seqs, :max_blocks_used].copy_(
+                host_block_table, non_blocking=True)
 
         # For mla_rope_append_paged_kv_assign_q
         if self.num_contexts > 0:
@@ -768,22 +790,19 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.kv_lens_expanded_host[:num_tokens], non_blocking=True)
 
             # Expand indexer_k_cache_block_offsets (only generation)
-            if self.kv_cache_manager is not None:
-                block_ids = self.kv_cache_manager.get_batch_cache_indices(
-                    self.request_ids)
-                gen_block_ids = block_ids[self.num_contexts:]
-                if len(gen_block_ids) > 0:
-                    # Find max length and create padded tensor
-                    max_len = max(len(bid) for bid in gen_block_ids)
-                    gen_block_tensor = self.host_indexer_k_cache_block_offsets[
-                        self.num_contexts:self.num_seqs, :max_len]
-                    expanded_blocks = gen_block_tensor.repeat_interleave(
-                        1 + self.max_draft_tokens, dim=0)
-                    self.host_block_table_expanded[:num_tokens, :max_len].copy_(
-                        expanded_blocks, non_blocking=True)
-                    self.block_table_expanded[:num_tokens].copy_(
-                        self.host_block_table_expanded[:num_tokens],
-                        non_blocking=True)
+            # host_indexer_k_cache_block_offsets already contains correct pool
+            # indices from _get_pool_block_indices() above.
+            if self.kv_cache_manager is not None and self.num_generations > 0:
+                max_len = self.host_indexer_k_cache_block_offsets.shape[1]
+                gen_block_tensor = self.host_indexer_k_cache_block_offsets[
+                    self.num_contexts:self.num_seqs, :max_len]
+                expanded_blocks = gen_block_tensor.repeat_interleave(
+                    1 + self.max_draft_tokens, dim=0)
+                self.host_block_table_expanded[:num_tokens, :max_len].copy_(
+                    expanded_blocks, non_blocking=True)
+                self.block_table_expanded[:num_tokens].copy_(
+                    self.host_block_table_expanded[:num_tokens],
+                    non_blocking=True)
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
@@ -1474,6 +1493,11 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
+            # Safety clamp: prevent OOB from CUDA graph padding entries which
+            # may contain stale negative or out-of-range values after block
+            # eviction/onboarding with host cache offload.
+            block_table = block_table.clamp(min=0)
+
             assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens, ...]
@@ -1482,6 +1506,7 @@ class Indexer(nn.Module):
             # [num_blocks, tokens_per_block, 1, head_dim + scale_size]
             k_cache = metadata.kv_cache_manager.get_indexer_k_cache_buffers(
                 self.layer_idx)
+
             logits_decode = fp8_paged_mqa_logits(q_decode, k_cache,
                                                  weights_decode, context_lens,
                                                  block_table,
