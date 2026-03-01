@@ -294,8 +294,6 @@ class FuseRMSNorm(BaseTransform):
                     graph.erase_node(node)
                     cnt += 1
 
-        gm.recompile()
-
         info = TransformInfo(
             skipped=False, num_matches=cnt, is_clean=cnt == 0, has_valid_shapes=cnt == 0
         )

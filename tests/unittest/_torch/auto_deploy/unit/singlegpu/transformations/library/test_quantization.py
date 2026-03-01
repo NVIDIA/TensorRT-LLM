@@ -168,6 +168,7 @@ def test_bmm_quantization(quant_config, atol, rtol, num_p_og, model_class):
         {
             "quantize_fp8_bmm_from_config": {
                 "stage": "pattern_matcher",
+                "post_recompile_forward": True,
             },
         },
     )(None, gm)
@@ -237,7 +238,12 @@ def test_int4awq_transform_graph_and_load_hook():
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
         DummyFactory(quant_config),
-        {"quantize_int4_linear_from_config": {"stage": "pattern_matcher"}},
+        {
+            "quantize_int4_linear_from_config": {
+                "stage": "pattern_matcher",
+                "post_recompile_forward": True,
+            }
+        },
     )(None, gm).to(device)
 
     run_test_transformed_gm(
@@ -350,7 +356,12 @@ def test_int4gptq_transform_graph_and_load_hook():
     gm = torch_export_to_gm(model, args=(x,), clone=True)
     gm_transformed = InferenceOptimizer(
         DummyFactory(quant_config),
-        {"quantize_int4_gptq_linear_from_config": {"stage": "pattern_matcher"}},
+        {
+            "quantize_int4_gptq_linear_from_config": {
+                "stage": "pattern_matcher",
+                "post_recompile_forward": True,
+            }
+        },
     )(None, gm).to(device)
 
     run_test_transformed_gm(
