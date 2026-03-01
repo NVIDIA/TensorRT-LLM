@@ -47,8 +47,7 @@ def compute_yarn_parameters(
 
     # If config does not contain rope_scaling or rope_type is not yarn, it means the model is not using yarn
     rope_scaling = getattr(config, "rope_scaling", None)
-    if rope_scaling is None or getattr(rope_scaling, "rope_type",
-                                       None) != "yarn":
+    if rope_scaling is None or rope_scaling.get("rope_type", None) != "yarn":
         return 1.0, 0, 0, 1.0
 
     base = config.rope_theta
@@ -57,7 +56,7 @@ def compute_yarn_parameters(
     head_dim = getattr(config, "head_dim",
                        config.hidden_size // config.num_attention_heads)
     dim = int(head_dim * partial_rotary_factor)
-    factor = getattr(rope_scaling, "factor", 1.0)
+    factor = rope_scaling.get("factor", 1.0)
     attention_factor = rope_scaling.get("attention_factor")
     mscale = rope_scaling.get("mscale")
     mscale_all_dim = rope_scaling.get("mscale_all_dim")
