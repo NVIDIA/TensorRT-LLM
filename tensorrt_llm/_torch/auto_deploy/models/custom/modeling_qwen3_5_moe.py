@@ -1499,7 +1499,7 @@ class Qwen3_5MoeModel(nn.Module):
         Steps:
             1. Embed input_ids -> inputs_embeds
             2. Run vision tower on pixel_values -> masked_scatter into embeds
-            3. Compute mRoPE position_ids via get_rope_index
+            3. Compute mRoPE position_ids via get_rope_index (or use external ones)
             4. Compute (cos, sin) from rotary_emb
             5. Call language_model (TextModel) with (inputs_embeds, position_embeddings)
         """
