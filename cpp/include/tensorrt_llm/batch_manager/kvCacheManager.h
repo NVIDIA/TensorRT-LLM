@@ -203,6 +203,11 @@ public:
 
     [[nodiscard]] bool hasRefs() const;
 
+    [[nodiscard]] bool canBeClaimed() const
+    {
+        return !hasRefs();
+    }
+
     [[nodiscard]] bool hasSchedulingRefs() const;
 
     void setBlockKey(BlockKey const& blockKey, bool isFull);
