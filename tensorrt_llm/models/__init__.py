@@ -24,6 +24,7 @@ from .clip.model import CLIPVisionTransformer
 from .cogvlm.config import CogVLMConfig
 from .cogvlm.model import CogVLMForCausalLM
 from .commandr.model import CohereForCausalLM
+from .commanda.model import Cohere2ForCausalLM
 from .dbrx.config import DbrxConfig
 from .dbrx.model import DbrxForCausalLM
 from .deepseek_v1.model import DeepseekForCausalLM
@@ -133,6 +134,7 @@ __all__ = [
     'EagleForCausalLM',
     'SpeculativeDecodingMode',
     'CohereForCausalLM',
+    'Cohere2ForCausalLM',
     'MLLaMAForCausalLM',
 ]
 
@@ -211,6 +213,7 @@ MODEL_MAP = {
     'DeepseekV2ForCausalLM': DeepseekV2ForCausalLM,
     'EagleForCausalLM': EagleForCausalLM,
     'CohereForCausalLM': CohereForCausalLM,
+    'Cohere2ForCausalLM': Cohere2ForCausalLM,
     'MLLaMAModel': MLLaMAForCausalLM,  # For modelopt
     'MllamaForConditionalGeneration':
     MLLaMAForCausalLM,  # For mllama load by Auto
