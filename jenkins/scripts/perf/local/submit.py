@@ -574,31 +574,43 @@ def main():
     server_env_vars = ""
     benchmark_env_var = ""
     if runtime_mode == "disaggregated":
-        # Build worker env vars
-        worker_env_vars = env_config.get("worker_env_var", "")
+        # Build worker env vars (split into ctx and gen for role-specific settings)
+        base_worker_env_vars = f"{worker_env_vars} {env_config.get("worker_env_var", "")}"
+        ctx_worker_env_vars = base_worker_env_vars
+        gen_worker_env_vars = base_worker_env_vars
         server_env_vars = env_config.get("server_env_var", "")
         benchmark_env_var = env_config.get("benchmark_env_var", "")
         # Handle gen only mode
         if "gen_only_no_context" in bm_config.get("mode", ""):
-            worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {worker_env_vars}"
+            gen_worker_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {gen_worker_env_vars}"
             server_env_vars = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {server_env_vars}"
             script_prefix_lines.append("export TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1")
             srun_args_lines.append("--container-env=TRTLLM_DISAGG_BENCHMARK_GEN_ONLY")
         elif "gen_only" in bm_config.get("mode", ""):
             concurrency = bm_config.get("concurrency", 1)
-            worker_env_vars = (
+            ctx_worker_env_vars = (
+                f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 {ctx_worker_env_vars}"
+            )
+            gen_worker_env_vars = (
                 f"TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1 "
-                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {worker_env_vars}"
+                f"TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency} {gen_worker_env_vars}"
             )
 
         script_prefix_lines.extend(
             [
-                f'export WORKER_ENV_VARS="{worker_env_vars}"',
+                f'export CTX_WORKER_ENV_VARS="{ctx_worker_env_vars}"',
+                f'export GEN_WORKER_ENV_VARS="{gen_worker_env_vars}"',
                 f'export SERVER_ENV_VARS="{server_env_vars}"',
                 f'export BENCHMARK_ENV_VARS="{benchmark_env_var}"',
                 (
-                    'export pytestCommandWorker="unset UCX_TLS &&'
-                    " $WORKER_ENV_VARS $PYTEST_COMMON_VARS"
+                    'export pytestCommandCTXWorker="unset UCX_TLS &&'
+                    " $CTX_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
+                    " $NSYS_PREFIX $LLM_API_LAUNCH"
+                    f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
+                ),
+                (
+                    'export pytestCommandGENWorker="unset UCX_TLS &&'
+                    " $GEN_WORKER_ENV_VARS $PYTEST_COMMON_VARS"
                     " $NSYS_PREFIX $LLM_API_LAUNCH"
                     f' $PYTEST_COMMAND --junitxml={work_dir}/report.xml"'
                 ),
