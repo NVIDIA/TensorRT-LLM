@@ -316,7 +316,17 @@ def torch_backend_mha_with_cache(
     b, s = q.shape[:2]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     input_pos = input_pos[:num_seq]

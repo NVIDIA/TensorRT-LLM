@@ -66,14 +66,14 @@ class GatherLogitsBeforeLmHeadTransform(BaseTransform):
             self._log_info("lm_head node is not linear, using it as the node to gather")
 
         # Add logits_gather_mask as input in the graph and the sequence info interface
-        logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "logits_gather_indices")
+        logits_gather_indices_node = self._add_or_retrieve_input(gm, cm, "token_gather_indices")
         logits_gather_info_host_node = self._add_or_retrieve_input(
-            gm, cm, "logits_gather_info_host"
+            gm, cm, "tokens_gather_info_host"
         )
 
         with gm.graph.inserting_after(node_to_gather):
             gathered_node = gm.graph.call_function(
-                torch.ops.auto_deploy.gather_logits_before_lm_head.default,
+                torch.ops.auto_deploy.gather_tokens.default,
                 args=(node_to_gather, logits_gather_indices_node, logits_gather_info_host_node),
             )
         node_to_gather.replace_all_uses_with(gathered_node)

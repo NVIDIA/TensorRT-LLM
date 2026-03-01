@@ -71,7 +71,7 @@ class DemoEngine(ADEngine):
         currently available token slots in the assigned pages and assign a new, previously
         unassigned page if needed.
         """
-        page_assignments = self.cache_seq_interface.info.page_assignments
+        page_assignments = self.cache_seq_interface.info.get_nested_page_assignments()
         num_pages = self.cache_seq_interface.kv_cache_manager.blocks_in_primary_pool
         tokens_per_block = self.cache_seq_interface.kv_cache_manager.tokens_per_block
 

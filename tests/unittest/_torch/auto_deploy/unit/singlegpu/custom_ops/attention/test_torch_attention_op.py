@@ -245,18 +245,22 @@ class TestTorchBackendAttention:
         cache_loc = torch.arange(batch_size, device=self.device, dtype=torch.int32)
 
         if seq_len == 1:
-            # Generate phase: [num_prefill, num_prefill_tokens, num_decode]
+            # Generate phase: batch_info_host format is
+            # [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
             batch_info_host = torch.tensor(
-                [0, 0, batch_size], device=self.device, dtype=torch.int32
+                [0, 0, 0, 0, batch_size, batch_size], device=self.device, dtype=torch.int32
             )
             seq_start = torch.arange(batch_size, device=self.device, dtype=torch.int32)
             q_flat = q.view(batch_size, seq_len, -1)
             k_flat = k.view(batch_size, seq_len, -1)
             v_flat = v.view(batch_size, seq_len, -1)
         else:
-            # Context phase: [num_prefill, num_prefill_tokens, num_decode]
+            # Context phase: batch_info_host format is
+            # [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
             batch_info_host = torch.tensor(
-                [batch_size, batch_size * seq_len, 0], device=self.device, dtype=torch.int32
+                [batch_size, batch_size * seq_len, 0, 0, 0, 0],
+                device=self.device,
+                dtype=torch.int32,
             )
             seq_start = torch.arange(
                 0, batch_size * seq_len, seq_len, device=self.device, dtype=torch.int32

@@ -38,8 +38,8 @@ def test_flashinfer_decode_matches_triton(mamba_env):
     )
     ssm_state_cache_flashinfer = ssm_state_cache_triton.clone()
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
+    batch_info_host = torch.tensor([0, 0, 0, 0, batch, batch], device=device, dtype=torch.int32)
     cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
 

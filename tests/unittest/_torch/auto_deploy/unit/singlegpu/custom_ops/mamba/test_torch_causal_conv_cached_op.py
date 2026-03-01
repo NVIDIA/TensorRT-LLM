@@ -59,9 +59,9 @@ def test_generate_only_with_slot_mapping(conv_env):
     # Snapshot caches for reference before running op (op mutates caches)
     gathered_before = conv_state_cache.clone().index_select(0, slot_idx)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor([0, 0, 0, 0, batch, batch], device=device, dtype=torch.int32)
     # Run cached op
     y = torch.ops.auto_deploy.torch_cached_causal_conv1d(
         # INPUTS
@@ -124,12 +124,12 @@ def test_context_flattened_and_state_writeback(conv_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     cu_seqlen = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
     # For context/prefill phase: num_prefill = len(lens), num_decode = 0
     num_seqs = len(lens)
     num_prefill_tokens = sum(lens)
     batch_info_host = torch.tensor(
-        [num_seqs, num_prefill_tokens, 0], device=device, dtype=torch.int32
+        [num_seqs, num_prefill_tokens, 0, 0, 0, 0], device=device, dtype=torch.int32
     )
     y = torch.ops.auto_deploy.torch_cached_causal_conv1d(
         # INPUTS

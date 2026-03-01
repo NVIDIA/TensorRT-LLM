@@ -42,6 +42,9 @@ from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig,
 prompts = [
     "What is the capital of France?",
     "Please explain the concept of gravity in simple words and a single sentence.",
+    "Write a short poem about the ocean.",
+    "What are the main differences between Python and C++?",
+    "Summarize the plot of Romeo and Juliet in three sentences.",
 ]
 
 EAGLE_MODEL_SUBPATH = "EAGLE3-LLaMA3.1-Instruct-8B"
@@ -233,7 +236,7 @@ def test_autodeploy_spec_dec_output(spec_dec_mode):
 
 
 def test_autodeploy_eagle3_acceptance_rate():
-    """Test Eagle3 acceptance rate with AutoDeploy engine.
+    """Test Eagle3 (two-model) acceptance rate with AutoDeploy engine.
 
     Runs Eagle3 speculative decoding with streaming and verifies
     that the acceptance rate is above a minimum threshold.
@@ -277,42 +280,103 @@ def test_autodeploy_eagle3_acceptance_rate():
         disable_overlap_scheduler=True,
         max_num_tokens=64,
     ) as llm:
-        # Tokenize 2 prompts to test multiple sequential requests
-        batch_tok_ids = [llm.tokenizer.encode(p) for p in prompts[:2]]
+        _run_acceptance_rate_check(llm, max_draft_len)
 
-        sampling_params = SamplingParams(max_tokens=128, temperature=0, seed=42)
 
-        print("\nRunning Eagle3 speculative decoding with streaming...")
+@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
+def test_autodeploy_eagle3_one_model_acceptance_rate(disable_overlap_scheduler: bool):
+    """Test Eagle3 one-model acceptance rate with AutoDeploy engine.
 
-        # Process each request sequentially and verify acceptance rate
-        for i in range(len(batch_tok_ids)):
-            num_tokens = 0
-            num_drafted = 0
-            num_accepted = 0
+    Runs Eagle3 one-model speculative decoding with streaming and verifies
+    that the acceptance rate is above a minimum threshold.
+    Parameterized over overlap scheduler enabled/disabled.
+    """
+    print("\n" + "=" * 80)
+    print(
+        f"Testing AutoDeploy Eagle3 One-Model Acceptance Rate "
+        f"(overlap={'disabled' if disable_overlap_scheduler else 'enabled'})"
+    )
+    print("=" * 80)
 
-            for output in llm.generate_async(batch_tok_ids[i], sampling_params, streaming=True):
-                new_tokens = output.outputs[0].token_ids
-                num_drafted += max_draft_len
-                num_accepted += len(new_tokens) - num_tokens - 1
-                num_tokens = len(new_tokens)
+    base_model, _, eagle_model = get_model_paths()
 
-            accept_rate = num_accepted / num_drafted
+    print(f"\nBase Model: {base_model}")
+    print(f"Eagle3 Model: {eagle_model}")
 
-            print(f"\nRequest {i + 1} Acceptance Rate Statistics:")
-            print(f"  Total tokens drafted: {num_drafted}")
-            print(f"  Total tokens accepted: {num_accepted}")
-            print(f"  Acceptance rate: {accept_rate:.2%}")
+    max_draft_len = EAGLE_MAX_DRAFT_LEN
 
-            # Verify acceptance rate is above minimum threshold (10%)
-            min_acceptance_rate = 0.10
-            assert accept_rate > min_acceptance_rate, (
-                f"Request {i + 1}: Acceptance rate {accept_rate:.2%} is below minimum threshold "
-                f"{min_acceptance_rate:.0%}"
-            )
+    speculative_config = Eagle3DecodingConfig(
+        max_draft_len=max_draft_len,
+        speculative_model=eagle_model,
+        eagle3_one_model=True,
+        eagle3_layers_to_capture={1, 15, 28},
+    )
+    # TODO: fix resize IMA later...
+    kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.0)
 
-        print("\n" + "=" * 80)
-        print("SUCCESS! All requests passed acceptance rate threshold")
-        print("=" * 80)
+    with LLM(
+        model=base_model,
+        skip_loading_weights=False,
+        runtime="trtllm",
+        world_size=1,
+        kv_cache_config=kv_cache_config,
+        speculative_config=speculative_config,
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        compile_backend="torch-simple",
+        max_num_tokens=512,
+    ) as llm:
+        _run_acceptance_rate_check(llm, max_draft_len)
+
+
+def _run_acceptance_rate_check(llm, max_draft_len: int, min_acceptance_rate: float = 0.10):
+    """Common helper for acceptance rate tests.
+
+    Submits all requests simultaneously so the executor processes them concurrently
+    (batch size > 1), then consumes streaming results to compute acceptance rates.
+    """
+    batch_tok_ids = [llm.tokenizer.encode(p) for p in prompts]
+    sampling_params = SamplingParams(max_tokens=128, temperature=0, seed=42)
+
+    print("\nRunning Eagle3 speculative decoding with streaming...")
+    print(f"Submitting all {len(batch_tok_ids)} requests simultaneously...")
+
+    # Submit all requests before consuming any results so they are in-flight concurrently.
+    generators = [
+        llm.generate_async(tok_ids, sampling_params, streaming=True) for tok_ids in batch_tok_ids
+    ]
+
+    for i, gen in enumerate(generators):
+        num_tokens = 0
+        num_drafted = 0
+        num_accepted = 0
+
+        for output in gen:
+            new_tokens = output.outputs[0].token_ids
+            num_drafted += max_draft_len
+            num_accepted += len(new_tokens) - num_tokens - 1
+            num_tokens = len(new_tokens)
+
+        accept_rate = num_accepted / num_drafted
+
+        generated_text = output.outputs[0].text
+        if not generated_text:
+            generated_text = llm.tokenizer.decode(output.outputs[0].token_ids)
+        print(f"\n[PROMPT {i}] {prompts[i]}")
+        print(f"[OUTPUT {i}] {generated_text}")
+
+        print(f"\nRequest {i + 1} Acceptance Rate Statistics:")
+        print(f"  Total tokens drafted: {num_drafted}")
+        print(f"  Total tokens accepted: {num_accepted}")
+        print(f"  Acceptance rate: {accept_rate:.2%}")
+
+        assert accept_rate > min_acceptance_rate, (
+            f"Request {i + 1}: Acceptance rate {accept_rate:.2%} is below minimum threshold "
+            f"{min_acceptance_rate:.0%}"
+        )
+
+    print("\n" + "=" * 80)
+    print("SUCCESS! All requests passed acceptance rate threshold")
+    print("=" * 80)
 
 
 def load_weights(model_path: Path, model: torch.nn.Module):

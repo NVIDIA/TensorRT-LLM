@@ -188,7 +188,17 @@ def _torch_cached_causal_conv1d(
     num_seq = seq_len.shape[0]
 
     # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     seq_start = cu_seqlen[:num_seq]

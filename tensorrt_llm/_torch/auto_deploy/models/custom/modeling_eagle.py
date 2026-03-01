@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,7 +22,7 @@ This file contains model definitions used for executing Eagle3 speculative decod
 """
 
 from dataclasses import dataclass
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -30,6 +30,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 from transformers.activations import ACT2FN
 from transformers.utils import ModelOutput
 
+from ...shim.interface import CachedSequenceInterface
 from ...utils._config import deep_merge_dicts
 from ...utils.logger import ad_logger
 
@@ -545,28 +546,49 @@ class EagleWrapperConfig:
 
 
 class EagleWrapper(nn.Module):
-    def __init__(self, config, target_model, draft_model, resource_manager):
+    """Combined target + draft model for one-model Eagle speculative decoding.
+
+    Dual-purpose:
+    1. Prefill-only mode (export time): runs both models without KV cache for graph capture.
+    2. KV-cache mode (inference): runs graph-captured models with cached attention and
+       in-place metadata updates. Hidden states flow through hidden_states_cache_* kwargs.
+    """
+
+    def __init__(self, config: EagleWrapperConfig, target_model: nn.Module, draft_model: nn.Module):
         super().__init__()
         self.target_model = target_model
         self.draft_model = draft_model
-        self.resource_manager = resource_manager
         self.max_draft_len = config.max_draft_len
         self.load_embedding_from_target = config.load_embedding_from_target
         self.load_lm_head_from_target = config.load_lm_head_from_target
 
+    @property
+    def _draft_inner_model(self):
+        """Get the inner model submodule of the draft model.
+
+        Before export: self.draft_model.model (Eagle3Model inside Eagle3DrafterForCausalLM).
+        After export: self.draft_model.model (preserved by DraftModelExportInfo.post_process).
+        """
+        return self.draft_model.model
+
+    @property
+    def _draft_dtype(self):
+        """Get the dtype of the draft model (works before and after export)."""
+        return getattr(self._draft_inner_model, "dtype", None) or torch.bfloat16
+
     def apply_eagle3_fc(self, hidden_states: torch.Tensor) -> torch.Tensor:
         """Apply the fc layer that fuses hidden states from multiple target layers."""
-        draft_model = self.draft_model.model
-        hidden_states = hidden_states.to(draft_model.dtype)
+        hidden_states = hidden_states.to(self._draft_dtype)
 
-        fc = getattr(draft_model, "fc", None)
+        fc = getattr(self._draft_inner_model, "fc", None)
         if fc is not None:
             hidden_states = fc(hidden_states)
         return hidden_states
 
+    # TODO: go through this logic, not sure if it is correct at the moment
     def apply_d2t(self, draft_output_ids: torch.Tensor) -> torch.Tensor:
         """Apply draft-to-target token mapping if available."""
-        d2t = getattr(self.draft_model.model, "d2t", None)
+        d2t = getattr(self._draft_inner_model, "d2t", None)
         if d2t is not None:
             draft_output_ids = d2t[draft_output_ids] + draft_output_ids
         return draft_output_ids
@@ -575,7 +597,7 @@ class EagleWrapper(nn.Module):
         """Apply embedding to input_ids for the draft model."""
         if self.load_embedding_from_target:
             embeds = self.target_model.get_input_embeddings()(input_ids)
-            return embeds.to(self.draft_model.dtype)
+            return embeds.to(self._draft_dtype)
         else:
             return self.draft_model.get_input_embeddings()(input_ids)
 
@@ -583,7 +605,7 @@ class EagleWrapper(nn.Module):
         """Apply lm_head to get logits from hidden states."""
         if self.load_lm_head_from_target:
             lm_head_weights = self.target_model.get_output_embeddings()(hidden_states)
-            return lm_head_weights.to(self.draft_model.dtype)
+            return lm_head_weights.to(self._draft_dtype)
         else:
             return self.draft_model.get_output_embeddings()(hidden_states)
 
@@ -591,307 +613,285 @@ class EagleWrapper(nn.Module):
         ret = torch.argmax(logits, dim=-1)
         return ret
 
-    def sample_and_verify(
-        self, input_ids, target_logits: torch.Tensor, num_previously_accepted: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    def forward(self, cache_seq_interface: Optional[CachedSequenceInterface] = None, **kwargs):
+        """Dispatch to appropriate forward implementation.
+
+        - If seq_info is provided: inference mode (after graph transforms + cache init).
+        - Otherwise: prefill-only mode (export time, before caches are inserted).
         """
-        Args:
-            input_ids: [batch_size, seq_len]
-            target_logits: [batch_size, seq_len, vocab_size]
-            num_previously_accepted: [batch_size]. Number of input tokens accepted so far for each batch.
-
-        Returns:
-            output_ids: [batch_size, seq_len] (result of greedy sampling on input ids)
-            num_newly_accepted_tokens: [batch_size]. Number of newly accepted tokens in each batch.
-            num_accepted_tokens: [batch_size]. Number of tokens accepted in each batch, including previously accepted.
-                So num_accepted_tokens[i] = num_previously_accepted + num_newly_accepted_tokens.
-            last_logits_3d: [batch_size, 1, vocab_size]. The logit used to sample the bonus token.
-
-        How it works:
-        - Get input ids that were not previously accepted.
-        - Get the corresponding target logits to these input ids (target_logit[j-1] corresponds to input_ids[j])
-        - Sample a token from the logits for each batch and compare to input_ids to get the newly accepted tokens.
-        - The output_ids consist of the previously accepted tokens, the newly accepted tokens,
-        and a newly sampled token after the last accepted token.
-        """
-
-        batch_size, seq_len = input_ids.shape
-
-        # First, check that num_previously_accepted is <= seq_len for each batch
-        # Additionally, num_previously_accepted should be >= 1 for each batch,
-        # which corresponds to having some context tokens (context tokens are always accepted).
-        assert (num_previously_accepted >= 1).all(), (
-            "num_previously_accepted must be >= 1. Please provide non-empty context in each batch."
-        )
-        assert (num_previously_accepted <= seq_len).all(), (
-            "num_previously_accepted must be <= seq_len for each batch"
-        )
-
-        # We get input tokens that were not yet accepted.
-        unchecked_input_ids = [
-            input_ids[i, num_previously_accepted[i] : seq_len].unsqueeze(0)
-            for i in range(batch_size)
-        ]
-
-        # We get the corresponding target logits for the unchecked input tokens.
-        # logit j-1 corresponds to input j.
-        # Note that because of our check that num_previously_accepted is >= 1
-        # We also get the last output token for each batch, because we may need to append it
-        # at the end.
-        unchecked_target_logits = [
-            target_logits[i, (num_previously_accepted[i] - 1) : seq_len, :].unsqueeze(0)
-            for i in range(batch_size)
-        ]
-
-        unchecked_output_ids = [self.sample_greedy(x) for x in unchecked_target_logits]
-
-        # corresponding_output_ids: [batch_size, seq_len - 1]. The output ids that correspond to the unchecked input ids
-        # Omits the last index because that corresponds to a freshly sampled output model.
-        corresponding_output_ids = [output_id[:, :-1] for output_id in unchecked_output_ids]
-
-        # After sample_greedy, corresponding_output_ids should have same shape as unchecked_input_ids
-        assert [x.shape for x in unchecked_input_ids] == [
-            x.shape for x in corresponding_output_ids
-        ], "unchecked_input_ids and corresponding_output_ids must have the same shape"
-
-        matches = [
-            (corresponding_output_ids[i] == unchecked_input_ids[i]).int() for i in range(batch_size)
-        ]
-
-        # Compute num_newly_accepted_tokens per batch (handles different sizes across batches)
-        num_newly_accepted_tokens = []
-        for i in range(batch_size):
-            if matches[i].numel() == 0:
-                # No unchecked tokens for this batch (num_previously_accepted == seq_len)
-                num_newly_accepted_tokens.append(
-                    torch.tensor(0, dtype=torch.long, device=input_ids.device)
-                )
-            else:
-                # prefix_matches[j] is 1 if first j+1 tokens all matched
-                prefix_matches = matches[i].cumprod(dim=-1)
-                num_newly_accepted_tokens.append(prefix_matches.sum().long())
-        num_newly_accepted_tokens = torch.stack(num_newly_accepted_tokens)
-
-        # num_accepted_tokens: [batch_size]. The total number of accepted tokens in each batch,
-        # including previously accepted tokens.
-        num_accepted_tokens = num_previously_accepted + num_newly_accepted_tokens
-
-        assert (num_accepted_tokens <= seq_len).all(), (
-            "num_accepted_tokens must be <= seq_len for each batch"
-        )
-
-        # Construct draft_input_ids for the draft model
-        # For each sequence:
-        # 1. Take previously accepted tokens (skipping the first one)
-        # 2. Append newly accepted tokens directly from input_ids.
-        # 3. Append the sampled token for last accepted position: unchecked_output_ids[0][num_newly_accepted]
-        # 4. Fill the rest with zeros (padding)
-        # Total real tokens: (num_previously_accepted - 1) + num_newly_accepted + 1 = num_accepted_tokens
-
-        draft_input_ids = torch.zeros(
-            (batch_size, seq_len), dtype=input_ids.dtype, device=input_ids.device
-        )
-
-        for i in range(batch_size):
-            # 1. Previously accepted tokens (skip the first one in keeping with Eagle convention)
-            # Note that this potentially includes context tokens, but is structured this way because we
-            # want the output to contain the entire prefix of accepted tokens because the drafters have no KV cache.
-            prev_accepted = input_ids[i, 1 : num_previously_accepted[i]]
-
-            # 2. Newly accepted input tokens
-            newly_accepted = input_ids[
-                i,
-                num_previously_accepted[i] : num_previously_accepted[i]
-                + num_newly_accepted_tokens[i],
-            ]
-
-            # 3. The sampled output token for the last accepted position
-            # unchecked_output_ids[i][j] is the sampled token for position (num_previously_accepted + j)
-            # We want the token for position num_accepted_tokens, which is index num_newly_accepted_tokens
-            next_token = unchecked_output_ids[i][0][num_newly_accepted_tokens[i]].unsqueeze(0)
-
-            # Concatenate all parts
-            draft_prefix = torch.cat([prev_accepted, newly_accepted, next_token])
-
-            # Sanity check: draft_prefix length should equal num_accepted_tokens
-            assert draft_prefix.shape[0] == num_accepted_tokens[i], (
-                f"draft_prefix length {draft_prefix.shape[0]} != num_accepted_tokens {num_accepted_tokens[i]}"
-            )
-
-            # Fill into draft_input_ids (rest remains zeros as padding)
-            draft_input_ids[i, : num_accepted_tokens[i]] = draft_prefix
-
-        # Construct last_logits_3d: [batch_size, 1, vocab_size]
-        # This is the logit used to sample the bonus token for each sequence.
-        # The bonus token is sampled from unchecked_target_logits[i][0][num_newly_accepted_tokens[i]]
-        last_logits_list = []
-        for i in range(batch_size):
-            # unchecked_target_logits[i] has shape [1, num_unchecked + 1, vocab_size]
-            # Index num_newly_accepted_tokens[i] gives the logit for the bonus token
-            bonus_logit = unchecked_target_logits[i][0, num_newly_accepted_tokens[i], :].unsqueeze(
-                0
-            )
-            last_logits_list.append(bonus_logit)
-        last_logits_3d = torch.stack(last_logits_list, dim=0)  # [batch_size, 1, vocab_size]
-
-        return draft_input_ids, num_newly_accepted_tokens, num_accepted_tokens, last_logits_3d
-
-    def forward(self, input_ids, position_ids, **kwargs):
-        """Dispatch to appropriate forward implementation based on kwargs.
-
-        If num_previously_accepted is provided, use the prefill-only (no KV cache) implementation.
-        Otherwise, this is the KV cache case which is not yet implemented.
-        """
-        num_previously_accepted = kwargs.get("num_previously_accepted", None)
-
-        if num_previously_accepted is not None:
-            return self._forward_prefill_only(input_ids, position_ids, **kwargs)
+        if cache_seq_interface is not None:
+            return self._forward_with_kv_cache(cache_seq_interface)
         else:
-            # KV cached case - not implemented yet
-            raise NotImplementedError(
-                "EagleWrapper forward with KV cache is not implemented. "
-                "This code path is reached when num_previously_accepted is not provided in kwargs."
-            )
+            return self._forward_prefill_only(**kwargs)
 
-    def _forward_prefill_only(self, input_ids, position_ids, **kwargs):
-        """Forward pass without KV cache (prefill-only mode).
+    def _forward_prefill_only(self, input_ids: torch.Tensor, position_ids: torch.Tensor, **kwargs):
+        """Forward pass without KV cache (prefill-only mode, used at export time).
 
-        This is the original implementation that recomputes all attention
-        from scratch on every forward call.
+        Runs each submodule once so that export capture hooks see the correct kwargs.
+        Mirrors the simplest real inference case: a pure context batch where all input
+        tokens are accepted, the target model samples a bonus token, and the draft model
+        produces one draft token.
         """
         batch_size, seq_len = input_ids.shape
         device = input_ids.device
 
-        num_previously_accepted = kwargs.get("num_previously_accepted", None)
-        if num_previously_accepted is None:
-            raise ValueError("num_previously_accepted must be provided for prefill-only mode.")
-
-        # Compute embeddings using the target embedding layer
+        # --- Phase 1: Target model forward ---
         input_embeds = self.target_model.get_input_embeddings()(input_ids)
-
-        # target_logits: [batch_size, seq_len, vocab_size]
-        # Pass embeddings to target model instead of input_ids
         target_logits = self.target_model(
             inputs_embeds=input_embeds, position_ids=position_ids
         ).logits
 
-        # output_ids: [batch_size, seq_len]. Contains a prefix of accepted tokens from the target model,
-        # a generated token from the target model, and some padding to fill out the tensor.
-        # num_accepted_tokens: [batch_size]. The number of accepted tokens in each batch.
-        # num_newly_accepted_tokens: [batch_size]. The number of newly accepted tokens in each batch.
+        # Context case: sample bonus token from last position logits per batch
+        bonus_token = self.sample_greedy(target_logits[:, -1, :])  # [batch_size]
 
-        output_ids, num_newly_accepted_tokens, num_accepted_tokens, _ = self.sample_and_verify(
-            input_ids, target_logits, num_previously_accepted
-        )
+        # --- Phase 2: Draft model forward (single iteration) ---
+        # Construct draft input: input_ids shifted left by 1 with bonus token at end,
+        draft_input_ids = input_ids.roll(-1, dims=1)
+        draft_input_ids[:, -1] = bonus_token
 
-        # Get hidden states from the resource manager
-        # resource_manager.hidden_states is [max_tokens, hidden_size * num_capture_layers] (flattened)
-        # We slice to get [batch_size * seq_len, hidden_size * num_capture_layers]
-        hidden_states = self.resource_manager.hidden_states[: (batch_size * seq_len), :]
-
-        # Apply eagle3 fc to reduce hidden size.
-        # Note: Since we are in prefill-only mode, this is extremely wasteful - we will apply the eagle3 fc layer
-        # to hidden states that we have applied it to previously. But, this is generally the case in prefill-only mode.
-        # Input: [batch_size * seq_len, hidden_size * num_capture_layers]
-        # Output: [batch_size * seq_len, hidden_size]
-        hidden_states = self.apply_eagle3_fc(hidden_states)
-
-        # Reshape from [batch_size * seq_len, hidden_size] to [batch_size, seq_len, hidden_size]
-        hidden_size = hidden_states.shape[-1]
-        hidden_states = hidden_states.view(batch_size, seq_len, hidden_size)
-
-        # Create a working buffer for the drafting loop in [batch, seq + draft_len, hidden] format.
-        # This is separate from resource_manager.hidden_states which remains in flattened format.
-        all_hidden_states = torch.zeros(
-            (batch_size, seq_len + self.max_draft_len, hidden_size),
+        draft_config = self.draft_model.config
+        hidden_size = draft_config.hidden_size
+        num_capture_layers = getattr(draft_config, "num_capture_layers", 1)
+        hidden_states = torch.zeros(
+            batch_size * seq_len,
+            hidden_size * num_capture_layers,
             device=device,
-            dtype=hidden_states.dtype,
+            dtype=input_embeds.dtype,
         )
-        # Copy the initial hidden states from target model
-        all_hidden_states[:, :seq_len, :] = hidden_states
+        hidden_states = self.apply_eagle3_fc(hidden_states)
+        hidden_states = hidden_states.view(batch_size, seq_len, -1)
 
-        # Construct our inputs for the drafting loop.
-        # We want tensors that will be able to hold all the tokens we draft.
-
-        dummy_input_ids = torch.zeros(
-            (batch_size, self.max_draft_len), device=device, dtype=output_ids.dtype
-        )
-
-        # draft_input_ids: [batch_size, seq_len + self.max_draft_len]
-        draft_input_ids = torch.cat((output_ids, dummy_input_ids), dim=1)
-
-        draft_position_ids = 1 + torch.arange(
-            self.max_draft_len, device=device, dtype=torch.long
-        ).unsqueeze(0).expand(batch_size, -1)
-
-        draft_position_ids = draft_position_ids + position_ids[:, -1:].expand(
-            -1, self.max_draft_len
+        draft_embeds = self.apply_draft_embedding(draft_input_ids)
+        draft_output = self.draft_model(
+            inputs_embeds=draft_embeds,
+            position_ids=position_ids,
+            hidden_states=hidden_states,
         )
 
-        # draft_position_ids: [batch_size, seq_len + self.max_draft_len]
-        # These position ids will work throughout the drafting loop.
-        draft_position_ids = torch.cat((position_ids, draft_position_ids), dim=1)
+        # Sample one draft token from last position
+        draft_logits = self.apply_lm_head(draft_output.norm_hidden_state)
+        draft_token = self.sample_greedy(draft_logits[:, -1, :])  # [batch_size]
+        draft_token = self.apply_d2t(draft_token)
 
-        # The number of tokens currently in the draft input ids. Possibly includes padding.
-        curr_num_tokens = seq_len
-
-        # [batch_size]
-        # The number of valid tokens currently in the draft input ids (does not include padding).
-        curr_valid_tokens = num_accepted_tokens.clone()
-
-        batch_indices = torch.arange(batch_size, device=device)
-
-        for _ in range(self.max_draft_len):
-            # Get the input ids, position ids, and hidden states for the current tokens.
-            # size of tensor is constant for the current iteration and constant across dimensions (curr_num_tokens)
-            # These tensors may correspond to padding tokens, but due to the causality of the draft model,
-            # we can extract the draft tokens and hidden states corresponding to the valid tokens.
-
-            input_ids = draft_input_ids[:, :curr_num_tokens]
-            position_ids = draft_position_ids[:, :curr_num_tokens]
-            hidden_states = all_hidden_states[:, :curr_num_tokens, :]
-
-            inputs_embeds = self.apply_draft_embedding(input_ids)
-            draft_output = self.draft_model(
-                inputs_embeds=inputs_embeds,
-                position_ids=position_ids,
-                hidden_states=hidden_states,
-            )
-
-            draft_output_logits = self.apply_lm_head(draft_output.norm_hidden_state)
-
-            # get the output logits for the latest valid token in each batch
-            # It is at curr_valid_tokens-1 due to 0-indexing.
-            latest_draft_logits = draft_output_logits[batch_indices, curr_valid_tokens - 1, :]
-
-            # draft_output_tokens: [batch_size, 1]
-            draft_output_tokens = self.sample_greedy(latest_draft_logits)
-
-            # if the lm_head outputs tokens from the draft vocab, we need to convert them to tokens
-            # from the target vocab before the next iteration.
-            draft_output_tokens = self.apply_d2t(draft_output_tokens)
-
-            # insert the draft output tokens into the draft input ids.
-            draft_input_ids[batch_indices, curr_valid_tokens] = draft_output_tokens
-
-            # Similarly, we want the hidden state for the latest drafted token in each batch.
-            # This is a draft hidden state for the token that was just created from the latest valid token.
-
-            # [batch_size, seq_len + self.max_draft_len, hidden_size]
-            all_hidden_states[batch_indices, curr_valid_tokens, :] = draft_output.last_hidden_state[
-                batch_indices, curr_valid_tokens - 1, :
-            ]
-
-            curr_valid_tokens = curr_valid_tokens + 1
-            curr_num_tokens = curr_num_tokens + 1
-
-        # Return the full draft_input_ids tensor for each batch element.
-        # The valid prefix within each tensor has length:
-        # num_previously_accepted[i] + num_newly_accepted_tokens[i] + max_draft_len
-        # Callers should use this to slice out the valid tokens if needed.
-        new_tokens = [draft_input_ids[i] for i in range(batch_size)]
+        # --- Package output: [bonus_token, draft_token] per batch ---
+        new_tokens = torch.stack([bonus_token, draft_token], dim=1)  # [batch_size, 2]
 
         return EagleWrapperOutput(
             new_tokens=new_tokens,
-            new_tokens_lens=num_newly_accepted_tokens,
+            new_tokens_lens=torch.ones(batch_size, dtype=torch.long, device=device),
+        )
+
+    # ================================================================== #
+    #  KV-cache forward (inference after graph transforms)               #
+    # ================================================================== #
+
+    @staticmethod
+    def _filter_kwargs_for_submodule(kwargs: dict, submodule: nn.Module) -> dict:
+        """Filter kwargs to only include those accepted by submodule's forward (GraphModule)."""
+        expected_names = {node.name for node in submodule.graph.nodes if node.op == "placeholder"}
+        return {k: v for k, v in kwargs.items() if k in expected_names}
+
+    @staticmethod
+    def _collect_hidden_states(kwargs: dict, num_tokens: int) -> torch.Tensor:
+        """Read hidden_states_cache_* buffers from kwargs, concatenate, and slice.
+
+        Returns:
+            Tensor of shape [num_tokens, hidden_size * num_capture_layers].
+        """
+        # TODO: we should eventually use the resource manager to have them be concatenated before
+        # and we just write into a view and hence can just take the whole tensor here.
+        buffers = sorted(
+            [
+                (name, tensor)
+                for name, tensor in kwargs.items()
+                if name.startswith("hidden_states_cache")
+            ],
+            key=lambda x: x[0],
+        )
+        if not buffers:
+            raise ValueError("No hidden_states_cache_* buffers found in kwargs.")
+        hidden_states = torch.cat([buf[:num_tokens] for _, buf in buffers], dim=1)
+        return hidden_states
+
+    @property
+    def required_kwargs(self) -> List[str]:
+        return [
+            "input_ids",
+            "position_ids",
+            "cu_seqlen",
+            "batch_info_host",
+            "tokens_gather_info_host",
+            "token_gather_indices",
+            # NOTE: below kwargs accessed in offset_pos_and_cache_
+            # TODO: see if there is a better way to handle this... this property here should only
+            # return kwargs explicit requested by the forward pass i/f.
+            "seq_len",
+            "extra_page_per_seq",
+        ]
+
+    def _forward_with_kv_cache(self, csi: CachedSequenceInterface):
+        """Forward pass with KV cache (inference after graph transforms).
+
+        Phases: target forward -> collect hidden states -> gather + sample + verify ->
+                draft loop with in-place metadata updates -> package output.
+
+        Expected kwargs that are accessed directly are described in the required_kwargs property.
+        Additional kwargs are forwarded to target/draft submodules (kv caches, etc.).
+        """
+        # ---- Phase 0: Check batch information ----
+        # determine batch information from batch_info_host
+        batch_info_list = csi.get_arg("batch_info_host").tolist()
+        num_prefill, num_extend, num_decode = batch_info_list[::2]
+        num_prefill_tokens, num_extend_tokens, num_decode_tokens = batch_info_list[1::2]
+        num_sequences = num_prefill + num_extend + num_decode
+        num_total_tokens = num_prefill_tokens + num_extend_tokens + num_decode_tokens
+
+        # some sanity checks on the batch
+        assert num_decode == 0, "decode without drafting is not supported inside the eagle wrapper"
+        if num_extend > 0:
+            assert num_extend_tokens // num_extend == 1 + self.max_draft_len, "Unexpected draft len"
+
+        # ---- Phase 1: Target model forward ----
+        out = self.target_model(
+            inputs_embeds=self.target_model.get_input_embeddings()(csi.get_arg("input_ids")),
+            **self._filter_kwargs_for_submodule(csi.named_args, self.target_model),
+        )
+        # NOTE: we assume gather_context_logits is False so that gathering here works!
+        target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
+
+        # ---- Phase 2: Collect hidden states from cache buffers ----
+        hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
+        hidden_states = self.apply_eagle3_fc(hidden_states)
+
+        # ---- Phase 3: Sample ----
+        # check dtype/device
+        device = csi.info.device
+        ids_dtype = csi.get_arg("input_ids").dtype
+
+        # sample tokens from gathered logits
+        sampled_tokens = self.sample_greedy(target_logits).to(ids_dtype)
+
+        # store the new tokens sampled with the target model in 2d grid as expected by runtime. This
+        # includes:
+        # 1. idx=0: golden/bonus token for prefill+extend sequences --> guaranteed new token
+        # 2. idx>1: target-sampled+accepted/declined tokens from previous draft iteration
+        new_tokens_2d_extend = sampled_tokens[num_prefill:].view(num_extend, 1 + self.max_draft_len)
+        if num_prefill > 0:
+            new_tokens_2d = torch.zeros(
+                num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
+            )
+            new_tokens_2d[:num_prefill, 0] = sampled_tokens[:num_prefill]
+            new_tokens_2d[num_prefill:] = new_tokens_2d_extend
+        else:
+            new_tokens_2d = new_tokens_2d_extend
+
+        # ---- Phase 4: Verify ----
+        # get original input ids
+        input_ids_flat = csi.get_arg("input_ids", unflatten=False, truncate=True)
+
+        # build output ids (and input ids for initial draft iteration). Those consist of
+        # - prefill input ids rolled left by 1 with the bonus token at the end
+        # - all sampled tokens from the extend requests
+        # Either way the total number of tokens is the same as in the target model call just before!
+        if num_prefill > 0:
+            output_ids_target = input_ids_flat.roll(-1, dims=0)  # [total_tokens]
+            lgi_prefill = csi.get_arg("token_gather_indices")[:num_prefill]
+            output_ids_target[lgi_prefill] = new_tokens_2d[:num_prefill, 0]
+            output_ids_target[num_prefill_tokens:] = new_tokens_2d[num_prefill:].flatten()
+        else:
+            output_ids_target = new_tokens_2d.flatten()  # [total_tokens]
+
+        # build new_tokens_lens
+        if num_extend > 0:
+            input_ids_extend = input_ids_flat[num_prefill_tokens:].view(num_extend, -1)
+            mask_same = new_tokens_2d_extend[:, :-1] == input_ids_extend[:, 1:]
+            # + 1 since it's the bonus token this is not counted in the cumprod. Note that
+            # 1 <= new_tokens_lens_extend <= max_draft_len + 1
+            new_tokens_lens_extend = mask_same.cumprod(dim=1).sum(dim=1, dtype=torch.int32) + 1
+
+        if num_prefill == 0:
+            new_tokens_lens = new_tokens_lens_extend
+        else:
+            new_tokens_lens = torch.ones(num_sequences, dtype=torch.int32, device=device)
+            if num_extend > 0:
+                new_tokens_lens[num_prefill:] = new_tokens_lens_extend
+
+        # compute the cache and position offset based on the number of new tokens compared to the
+        # maximum draft length. NOTE: cache is currently at the position corresponding to the last
+        # draft token. Hence the following constraint is true:
+        # c_offset[:num_prefill] == 1
+        # -(max_draft_len-1) <= c_offset <= 1
+        c_offset = new_tokens_lens - self.max_draft_len
+        if num_prefill > 0:
+            c_offset[:num_prefill].fill_(1)
+
+        # updated token_gather_indices and info based on c_offset for retrieval of
+        # last accepted tokens for both output and first draft iteration. It's computed as follows:
+        # last_token_index = cu_seqlen[1:] - 1
+        # num_draft_tokens_rejected = 1 - c_offset
+        # last_accepted_tokens = last_token_index - num_draft_tokens_rejected
+        # last_accepted_tokens = cu_seqlen[1:] + c_offset - 2
+        tokens_gather_info_host = csi.get_arg("tokens_gather_info_host")
+        tokens_gather_info_host[0] = num_sequences
+        tokens_gather_info_host[1] = True
+        last_accepted_tokens = csi.get_arg("cu_seqlen", truncate=True)[1:] + c_offset - 2
+        csi.info.copy_("token_gather_indices", last_accepted_tokens, strict=False)
+
+        # ---- Phase 4: Prepare for draft loop and next_new_tokens tensor ----
+        device = csi.info.device
+        ids_dtype = output_ids_target.dtype
+
+        # store current collected output ids asinput ids for the first iteration of the draft loop
+        csi.info.copy_("input_ids", output_ids_target)
+
+        # a 2D grid of latest verified + new draft tokens for each sequence. This includes:
+        # 1. idx=0: latest verified token or bonus token for prefill+extend sequences
+        # 2. idx>1: new draft tokens that will be drafted below
+        next_new_tokens = torch.empty(
+            num_sequences, self.max_draft_len + 1, dtype=ids_dtype, device=device
+        )
+
+        # we can already fill in next_new_tokens for idx=0 which corresponds to last accepted tokens
+        # which we already stored in the input_ids for the first draft iteration.
+        next_new_tokens[:, 0] = csi.info.maybe_gather_and_squeeze(csi.get_arg("input_ids"))
+
+        # ---- Phase 5: Draft loop ----
+        for draft_idx in range(self.max_draft_len):
+            # run forward pass on the draft model in shape [num_sequences, 1]
+            draft_output = self.draft_model(
+                inputs_embeds=self.apply_draft_embedding(csi.get_arg("input_ids")),
+                hidden_states=csi.info.unflatten(hidden_states),
+                **self._filter_kwargs_for_submodule(csi.named_args, self.draft_model),
+            )
+            draft_output_logits = self.apply_lm_head(draft_output.norm_hidden_state)
+
+            # extract gathered logits and hidden state if not yet done as part of draft forward pass
+            latest_logits = csi.info.maybe_gather_and_squeeze(draft_output_logits)
+            hidden_states = csi.info.maybe_gather_and_squeeze(draft_output.last_hidden_state)
+
+            # sample from logits which is output from this draft iteration and input for the next
+            draft_tokens = next_new_tokens[:, draft_idx + 1]
+            draft_tokens[:] = self.sample_greedy(latest_logits)
+            draft_tokens[:] = self.apply_d2t(draft_tokens)
+
+            # update cache offset for the next draft iteration
+            # for idx=0 --> we use pre-computed c_offset from the verification step
+            # for idx>1 --> we offset uniformly by 1
+            if draft_idx == 1:
+                c_offset = torch.ones(num_sequences, dtype=torch.int32, device=device)
+
+            # switch to generate (if not done already), store new tokens, and offset cache
+            # can be skipped for last iteration since after we return metadata will be reset
+            if draft_idx < self.max_draft_len - 1:
+                csi.info.switch_to_generate_()
+                csi.info.copy_("input_ids", draft_tokens)
+                csi.info.offset_pos_and_cache_(c_offset)
+
+        # ---- Phase 6: Package output ----
+        return EagleWrapperOutput(
+            logits=target_logits,
+            new_tokens=new_tokens_2d,
+            new_tokens_lens=new_tokens_lens,
+            next_draft_tokens=next_new_tokens[:, 1:],
+            next_new_tokens=next_new_tokens,
         )

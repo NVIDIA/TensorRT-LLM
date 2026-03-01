@@ -50,9 +50,9 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
     )
     ssm_state_cache_triton = ssm_state_cache_torch.clone()
 
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
     # For generate-only: num_decode = batch, num_prefill = 0
-    batch_info_host = torch.tensor([0, 0, batch], device=device, dtype=torch.int32)
+    batch_info_host = torch.tensor([0, 0, 0, 0, batch, batch], device=device, dtype=torch.int32)
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
@@ -152,8 +152,10 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         torch.arange(len(lens), device=device, dtype=torch.int32),
         seq_len,
     ).view(1, -1)
-    # batch_info_host: [num_prefill, num_prefill_tokens, num_decode]
-    batch_info_host = torch.tensor([len(lens), sum(lens), 0], dtype=torch.int32, device=device)
+    # batch_info_host: [num_prefill, num_prefill_tokens, num_extend, num_extend_tokens, num_decode, num_decode_tokens]
+    batch_info_host = torch.tensor(
+        [len(lens), sum(lens), 0, 0, 0, 0], dtype=torch.int32, device=device
+    )
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
         hidden_states,

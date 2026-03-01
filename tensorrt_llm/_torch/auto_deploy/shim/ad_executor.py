@@ -22,7 +22,6 @@ from strenum import StrEnum
 from torch._prims_common import DeviceLikeType
 
 from tensorrt_llm._torch.attention_backend.interface import AttentionRuntimeFeatures
-from tensorrt_llm._torch.auto_deploy.utils._graph import get_input_embeddings, get_lm_head_weights
 from tensorrt_llm._torch.autotuner import AutoTuner
 from tensorrt_llm._torch.models.modeling_speculative import Eagle3ForCausalLM
 from tensorrt_llm._torch.pyexecutor._util import (
@@ -35,8 +34,8 @@ from tensorrt_llm._torch.pyexecutor.guided_decoder import GuidedDecoder
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, get_draft_token_length
 from tensorrt_llm._torch.pyexecutor.py_executor_creator import get_guided_decoding_config
 from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
-from tensorrt_llm._torch.speculative import get_spec_drafter
-from tensorrt_llm._torch.speculative.eagle3 import Eagle3ResourceManager
+from tensorrt_llm._torch.speculative import get_num_extra_kv_tokens, get_spec_drafter
+from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
@@ -71,6 +70,7 @@ from ...pyexecutor.scheduler import (
 from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
+from ..utils._graph import get_input_embeddings, get_lm_head_weights
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
@@ -80,6 +80,27 @@ class ReportingInfo:
     print_log: bool = False
     enable_iter_perf_stats: bool = False
     enable_iter_req_stats: bool = False
+
+
+def get_extra_seq_len_for_kv_cache(ad_config: LlmArgs) -> int:
+    """Compute extra sequence length needed for KV cache sizing.
+
+    Accounts for overlap scheduler bookkeeping (+1 token), speculative decoding
+    draft tokens, and one-model spec dec extra tokens.
+    """
+    extra_seq_len = 0
+    spec_config = ad_config.speculative_config
+
+    if not ad_config.disable_overlap_scheduler:
+        extra_seq_len += 1
+        if spec_config is not None:
+            extra_seq_len += spec_config.max_total_draft_tokens
+
+    if spec_config is not None:
+        extra_seq_len += spec_config.max_total_draft_tokens
+        extra_seq_len += get_num_extra_kv_tokens(spec_config)
+
+    return extra_seq_len
 
 
 class ADHiddenStateManager(Eagle3ResourceManager):
@@ -119,8 +140,8 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         self, ordered_requests: RequestList, cache_seq_interface: CachedSequenceInterface
     ) -> None:
         """Prepare the hidden states for capture by establishing indices that the hidden states will be written to."""
-        seq_lens = cache_seq_interface.info.seq_len
-        num_tokens = sum(seq_lens)
+        seq_lens = cache_seq_interface.info.get_arg("seq_len", truncate=True).tolist()
+        num_tokens = cache_seq_interface.info.total_num_tokens
 
         start_idx = 0
         hidden_states_write_indices = []
@@ -156,7 +177,7 @@ class ADHiddenStateManager(Eagle3ResourceManager):
         if not full_hidden_states:
             return
 
-        num_tokens = sum(cache_seq_interface.info.seq_len)
+        num_tokens = cache_seq_interface.info.total_num_tokens
 
         hidden_states = [hidden_state[:num_tokens] for hidden_state in full_hidden_states]
         hidden_states = torch.cat(hidden_states, dim=1)
@@ -442,6 +463,8 @@ class ADEngine(ModelEngine):
             kv_cache_config=ad_config.kv_cache_config,
             max_num_tokens=ad_config.max_num_tokens,
             vocab_size_padded=factory.vocab_size_padded,
+            extra_seq_len_for_kv_cache=get_extra_seq_len_for_kv_cache(ad_config),
+            spec_config=ad_config.speculative_config,
         )
 
         reporting_info = ReportingInfo(
@@ -522,12 +545,6 @@ class ADEngine(ModelEngine):
         else:
             self.max_total_draft_tokens = 0
 
-        # TODO(govind): Enable overlap scheduler for speculation.
-        assert self.spec_config is None or self._disable_overlap_scheduler, (
-            "Overlap scheduler is not supported \
-            for speculative decoding in AutoDeploy."
-        )
-
         # For compatibility with PyTorchModelEngine utilities
         self.batch_size = cache_seq_interface.info.max_batch_size
 
@@ -564,6 +581,7 @@ class ADEngine(ModelEngine):
         scheduled_requests: ScheduledRequests,
         resource_manager: ResourceManager,
         new_tokens: Optional[torch.Tensor] = None,
+        new_tokens_lens: Optional[torch.Tensor] = None,
         gather_context_logits: bool = False,
     ) -> None:
         """Prepare inputs for AD Model from scheduled requests."""
@@ -586,19 +604,11 @@ class ADEngine(ModelEngine):
         ]
         gen_requests = extend_requests + generation_requests
         ordered_requests = context_requests + gen_requests
-        # info to be extracted
-        input_ids: List[List[int]] = []
-        position_ids: List[List[int]] = []
-        input_pos: List[int] = []
-        seq_len: List[int] = []
+
+        # sequence information
+        input_ids: List[int] = []
         cu_seqlen: List[int] = [0]
-        cache_loc: List[int] = []
-        pages_per_seq: List[int] = []
-        cu_num_pages: List[int] = [0]
-        seq_len_with_cache: List[int] = []
-        last_page_len: List[int] = []
-        slot_idx: List[int] = []
-        use_initial_states: List[bool] = []
+        input_pos: List[int] = []
 
         # gather indices are used to gather tokens in new_tokens into input_ids
         flat_gather_indices: List[int] = []
@@ -606,199 +616,175 @@ class ADEngine(ModelEngine):
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
 
         # gather indices for logits
-        logits_gather_indices: List[int] = []
-
-        page_size = kv_cache_manager.tokens_per_block
+        token_gather_indices = None if gather_context_logits else []
         dummy_token = -1
-        num_ctx_requests = len(context_requests)
-        num_ctx_tokens = 0
-        num_generation_tokens = 0
-
-        # Helper to get slot index - use mamba_cache_index if available (MambaHybridCacheManager)
-        def _get_slot_idx(request) -> int:
-            if hasattr(kv_cache_manager, "mamba_cache_index"):
-                return kv_cache_manager.mamba_cache_index[request.py_request_id]
-            return request.seq_slot
 
         # look at context requests first
         for request in context_requests:
             # store input ids and pos of first token in sequence
             # NOTE: begin_compute > 0 indicates block reuse
-            # NOTE: end_compute will be used in the future for chunked prefill
+            # NOTE: end_compute is used for chunked prefill
             all_prompt_tokens = request.get_tokens(0)
             begin_compute = request.context_current_position
             end_compute = begin_compute + request.context_chunk_size
             prompt_tokens = all_prompt_tokens[begin_compute:end_compute]
-            num_ctx_tokens += len(prompt_tokens)
 
-            input_ids.append(prompt_tokens)
+            input_ids.extend(prompt_tokens)
+            cu_seqlen.append(len(input_ids))
             input_pos.append(begin_compute)
 
-            seq_len.append(len(input_ids[-1]))
-            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
-
-            request.py_batch_idx = request.seq_slot
-
-            if gather_context_logits:
-                logits_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
-            else:
-                logits_gather_indices.append(cu_seqlen[-1] - 1)
-
-            # get cache indices and truncate the number of blocks according to end_compute
-            cache_indices = kv_cache_manager.get_cache_indices(request)
-            num_active_blocks = kv_cache_manager.get_num_kv_blocks(end_compute)
-            cache_loc.extend(cache_indices[:num_active_blocks])
-            pages_per_seq.append(num_active_blocks)
-            cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
-            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
-            last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
-
-            position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
-
-            # store seq slot idx (use mamba_cache_index if available)
-            slot_idx.append(_get_slot_idx(request))
-            use_initial_states.append(input_pos[-1] > 0)
+            if token_gather_indices is not None:
+                token_gather_indices.append(len(input_ids) - 1)
 
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
                     extra_args[k].append(v)
 
-        def _use_overlap_scheduler(request) -> bool:
-            """Check if we should use overlap scheduler behavior."""
-            return (
+        # store num_prefill and num_prefill_tokens
+        num_prefill = len(context_requests)
+        num_prefill_tokens = len(input_ids)
+
+        for request in gen_requests:
+            # check if need overlap and draft length
+            is_overlap = (
                 not self._disable_overlap_scheduler
                 and new_tokens is not None
                 and not request.is_dummy
                 and request.py_batch_idx is not None
             )
 
-        def _compute_num_tokens_seen(request) -> int:
-            """Compute num_tokens_seen based on request. Note that we treat extend requests
-            (corresponding to running target model in speculative decoding) differently from
-            normal generation requests.
-            """
-            is_extend = get_draft_token_length(request) > 0
+            # check draft length
+            draft_len = get_draft_token_length(request)
 
-            if is_extend:
-                return request.max_beam_num_tokens - 1
+            # there are cases:
+            # 1. No overlap: we are preparing for the current iteration --> use previous token count
+            # 2. Overlap: we are preparing for the next iteration --> use max_beam_num_tokens
+            # 3. Draft request (overlap or not) --> use previous token counts, overlap scheduler is
+            #    accounted for by incrementing position/cache in-place based on new_tokens_lens.
+            num_tokens_seen = request.max_beam_num_tokens
+            if draft_len > 0 or not is_overlap:
+                num_tokens_seen -= 1
+
+            # build input ids
+            if is_overlap:
+                input_ids.extend([dummy_token] * (1 + draft_len))
+                flat_gather_indices.extend(
+                    [request.py_batch_idx + i * new_tokens.shape[1] for i in range(draft_len + 1)]
+                )
             else:
-                # When overlap scheduler is disabled, or when new_tokens is not available,
-                # we use the previous token count
-                use_overlap = _use_overlap_scheduler(request)
-                if use_overlap:
-                    return request.max_beam_num_tokens
-                else:
-                    return request.max_beam_num_tokens - 1
+                input_ids.append(request.get_token(0, request.get_num_tokens(0) - 1))
+                input_ids.extend([] if draft_len == 0 else request.py_draft_tokens)
 
-        def _build_input_ids(request) -> Tuple[List[int], List[int], bool]:
-            """Build input_ids and gather indices for a request.
-            Gather indices are used to gather tokens from new_tokens into input_ids when we run the overlap scheduler.
-            """
-            is_extend = get_draft_token_length(request) > 0
-
-            # Check if we should use overlap scheduler behavior
-            use_overlap = _use_overlap_scheduler(request)
-
-            if not use_overlap:
-                # No overlap scheduler or dummy request
-                if is_extend:
-                    input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)] + [
-                        token for token in request.py_draft_tokens
-                    ]
-                else:
-                    input_ids = [request.get_token(0, request.get_num_tokens(0) - 1)]
-                gather_indices = []
-            else:
-                # Overlap scheduler enabled
-                if is_extend:
-                    gather_indices = [
-                        x * new_tokens.shape[1] + request.py_batch_idx
-                        for x in range(len(request.py_draft_tokens) + 1)
-                    ]
-
-                    dummy_draft_tokens = [dummy_token for _ in range(len(request.py_draft_tokens))]
-                    input_ids = [dummy_token] + dummy_draft_tokens
-                else:
-                    gather_indices = [request.py_batch_idx]
-                    input_ids = [dummy_token]
-
-            return input_ids, gather_indices, use_overlap
-
-        for request in gen_requests:
-            num_tokens_seen = _compute_num_tokens_seen(request)
-            input_ids_for_request, gather_indices_to_append, use_overlap = _build_input_ids(request)
-
-            input_ids.append(input_ids_for_request)
+            cu_seqlen.append(len(input_ids))
             input_pos.append(num_tokens_seen)
-            flat_gather_indices.extend(gather_indices_to_append)
-
-            num_generation_tokens += 1 + get_draft_token_length(request)
-            request.py_batch_idx = request.seq_slot
-            # store seq slot idx (use mamba_cache_index if available)
-            slot_idx.append(_get_slot_idx(request))
-            use_initial_states.append(input_pos[-1] > 0)
-
-            seq_len.append(len(input_ids[-1]))
-            cu_seqlen.append(cu_seqlen[-1] + seq_len[-1])
 
             # for generate requests, we always keep all logits (target logits + draft logits)
-            logits_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
+            if token_gather_indices is not None:
+                token_gather_indices.extend(range(cu_seqlen[-2], cu_seqlen[-1]))
 
-            if use_overlap:
+            if is_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-            # get cache indices and truncate the number of blocks according to total tokens
+        # store cache information for all requests now
+        cache_loc: List[int] = []
+        cu_num_pages: List[int] = [0]
+        extra_page_per_seq: List[int] = []
+        slot_idx: List[int] = []
+        for i, request in enumerate(ordered_requests):
+            # store seq slot idx (use mamba_cache_index if available)
+            request.py_batch_idx = request.seq_slot
+            if hasattr(kv_cache_manager, "mamba_cache_index"):
+                slot_idx_i = kv_cache_manager.mamba_cache_index[request.py_request_id]
+            else:
+                slot_idx_i = request.seq_slot
+            slot_idx.append(slot_idx_i)
+
+            # get some info on the current request
+            seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
+            end_compute_i = input_pos[i] + seq_len_i
+            num_active_blocks_i = kv_cache_manager.get_num_kv_blocks(end_compute_i)
+
+            # construct cache information for the current request
             cache_indices = kv_cache_manager.get_cache_indices(request)
-            cache_loc.extend(cache_indices)
-            pages_per_seq.append(len(cache_indices))
-            cu_num_pages.append(cu_num_pages[-1] + pages_per_seq[-1])
-            seq_len_with_cache.append(input_pos[-1] + seq_len[-1])
-            last_page_len.append((seq_len_with_cache[-1] - 1) % page_size + 1)
+            cache_loc.extend(cache_indices[:num_active_blocks_i])
+            cu_num_pages.append(cu_num_pages[i] + num_active_blocks_i)
+            if len(cache_indices) > num_active_blocks_i:
+                extra_page_per_seq.append(cache_indices[num_active_blocks_i])
+            else:
+                extra_page_per_seq.append(-1)
 
-            position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
-
-        # check for logits_gather_info
+        # check for tokens_gather_info
         # we only need to gather in the following situation:
         # 1. there are context requests and
-        # 2. we are not gathering context logits
         # In other cases (decode-only) or when we keep all logits, we do not need to gather.
-        gather_required = len(context_requests) > 0 and not gather_context_logits
-        logits_gather_info = [len(logits_gather_indices), int(gather_required)]
+        gather_required = num_prefill > 0 and not gather_context_logits
+        num_gather_tokens = len(token_gather_indices) if gather_required else 0
+        tokens_gather_info = [num_gather_tokens, int(gather_required)]
 
-        # Compute batch_info explicitly based on actual request ordering rather than
-        # relying on the seq_len > 1 heuristic in nest_sequences. With chunked prefill,
-        # a context request may have context_chunk_size=1, giving seq_len=1. The heuristic
-        # would misclassify it as decode, causing host_request_types to be inconsistent
-        # with the actual request ordering (context + extend first, then generation).
-        # This mismatch leads to incorrect token splitting in thop.attention.
-        num_prefill_seqs = num_ctx_requests + len(extend_requests)
-        num_prefill_tokens = sum(seq_len[:num_prefill_seqs])
-        num_decode_seqs = len(generation_requests)
-        batch_info = [num_prefill_seqs, num_prefill_tokens, num_decode_seqs]
+        # Store batch information based on prefill, decode, and extend requests.
+        num_decode = len(generation_requests)
+        num_decode_tokens = num_decode
+        num_extend = len(extend_requests)
+        num_extend_tokens = len(input_ids) - num_prefill_tokens - num_decode_tokens
+        batch_info = [
+            num_prefill,
+            num_prefill_tokens,
+            num_extend,
+            num_extend_tokens,
+            num_decode,
+            num_decode_tokens,
+        ]
 
-        # update the sequence info object now (also triggers rescatter + host_prepare internally)
+        # update the sequence info object now
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
-            position_ids=position_ids,
-            seq_len=seq_len,
+            cu_seqlen=cu_seqlen,
             input_pos=input_pos,
             batch_info=batch_info,
-            cu_seqlen=cu_seqlen,
             cache_loc=cache_loc,
-            pages_per_seq=pages_per_seq,
             cu_num_pages=cu_num_pages,
-            seq_len_with_cache=seq_len_with_cache,
-            last_page_len=last_page_len,
+            extra_page_per_seq=extra_page_per_seq,
             slot_idx=slot_idx,
-            use_initial_states=use_initial_states,
-            logits_gather_indices=logits_gather_indices,
-            logits_gather_info=logits_gather_info,
+            token_gather_indices=token_gather_indices,
+            tokens_gather_info=tokens_gather_info,
             _gather_idx=None if new_tokens is None else flat_gather_indices,
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
             _ungathered_input_ids=new_tokens.flatten() if new_tokens is not None else None,
             **extra_args,
         )
+
+        # TODO: this should be after rescatter and before host-side prepare function. This all
+        # inside nest_sequence now, so let's do this correctly...
+        # Overlap scheduler + spec dec: increment position_ids based on accepted tokens.
+        # new_tokens_lens is indexed by seq_slot (MTPSampler scatters via index_copy_ to slots).
+        if (
+            new_tokens_lens is not None
+            and not self._disable_overlap_scheduler
+            and len(gen_requests) > 0
+        ):
+            num_sequences = len(ordered_requests)
+            device = new_tokens_lens.device
+
+            increment = torch.zeros(num_sequences, dtype=torch.int32, device=device)
+            # Use seq_slot to index into new_tokens_lens (py_batch_idx == seq_slot at this point)
+            gen_slots = torch.tensor(
+                [r.seq_slot for r in gen_requests],
+                dtype=torch.long,
+                device=device,
+            )
+            gen_increments = new_tokens_lens[gen_slots] - 1
+            assert (new_tokens_lens[gen_slots] >= 1).all(), (
+                f"Invalid new_tokens_lens for gen requests: {new_tokens_lens[gen_slots].tolist()}"
+            )
+            increment[num_prefill:] = gen_increments.to(torch.int32)
+
+            # TODO: let's think about the format here. Maybe we want to go to the cache_table format
+            # from trtllm-gen here since it seems more natural to then derive cache_loc from that.
+            self.cache_seq_interface.info.offset_pos_and_cache_(increment)
+
+        # TODO: remove again, just here for now to keep order correct during rebase
+        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
@@ -807,16 +793,39 @@ class ADEngine(ModelEngine):
                 ordered_requests, self.cache_seq_interface
             )
 
-        self.iter_states["num_ctx_requests"] = num_ctx_requests
-        self.iter_states["num_ctx_tokens"] = num_ctx_tokens
+        self.iter_states["num_ctx_requests"] = num_prefill
+        self.iter_states["num_ctx_tokens"] = num_prefill_tokens
         # TODO: handle extend requests and draft requests for specdec
-        self.iter_states["num_generation_tokens"] = num_generation_tokens
+        self.iter_states["num_generation_tokens"] = num_decode_tokens + num_extend_tokens
 
     @nvtx_range("ad_compute_logits")
-    def _compute_logits(self) -> List[torch.Tensor]:
-        # run the model
-        logits: torch.Tensor = self.model(**self.cache_seq_interface.named_args)[0]
-        logits = self.cache_seq_interface.info.maybe_gather_and_squeeze_logits(logits)
+    def _compute_logits(self):
+        """Run model forward and return outputs.
+
+        For regular models, returns raw logits tensor.
+        For one-model spec dec (EagleWrapper), returns a dict with logits,
+        new_tokens, new_tokens_lens, next_draft_tokens, next_new_tokens.
+        """
+        # TODO: we don't modeling dependencies in our executor logic...
+        from ..models.custom.modeling_eagle import EagleWrapper, EagleWrapperOutput
+
+        if isinstance(self.model, EagleWrapper):
+            model_output = self.model(cache_seq_interface=self.cache_seq_interface)
+        else:
+            model_output = self.model(**self.cache_seq_interface.named_args)
+
+        # Handle EagleWrapperOutput (one-model spec dec)
+        if isinstance(model_output, EagleWrapperOutput):
+            return {
+                "logits": model_output.logits,
+                "new_tokens": model_output.new_tokens,
+                "new_tokens_lens": model_output.new_tokens_lens,
+                "next_draft_tokens": model_output.next_draft_tokens,
+                "next_new_tokens": model_output.next_new_tokens,
+            }
+
+        logits = model_output[0]
+        logits = self.cache_seq_interface.info.maybe_gather_and_squeeze(logits)
 
         # TRTLLMSampler expects float32 logits. PyTorchModelEngine always casts to float32 regardless.
         return logits.float()
@@ -837,18 +846,34 @@ class ADEngine(ModelEngine):
         num_accepted_tokens_device: Optional[torch.Tensor] = None,
     ):
         """Run forward from scheduled requests; main entrypoint that gets called by the executor."""
+        # TODO: we don't modeling dependencies in our executor logic...
+        from ..models.custom.modeling_eagle import EagleWrapper
+
+        # we don't support gather_context_logits in spec dec yet
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
+            assert not gather_context_logits, "gather_context_logits not supported in spec dec"
+
+        # activate extra arguments for eagle wrapper
+        # TODO: improve this...
+        if isinstance(self.model, EagleWrapper):
+            for key in self.model.required_kwargs:
+                self.cache_seq_interface.info.activate_arg(key)
+
         # convert requests and store in sequence info object
         new_tokens = getattr(new_tensors_device, "new_tokens", None)
+        new_tokens_lens = getattr(new_tensors_device, "new_tokens_lens", None)
         self._prepare_inputs(
-            scheduled_requests, resource_manager, new_tokens, gather_context_logits
+            scheduled_requests, resource_manager, new_tokens, new_tokens_lens, gather_context_logits
         )
         self.iter_counter += 1
 
-        outputs = {
-            "logits": self._compute_logits(),
-        }
+        outputs = self._compute_logits()
 
-        # save hidden states after running model.forward() in _compute_logits()
+        # For one-model spec dec (without_logits=True), pass through all outputs directly
+        if self.spec_config is not None and self.spec_config.spec_dec_mode.without_logits():
+            return outputs
+
+        # For two-model spec dec: save hidden states after target model forward
         spec_resource_manager = resource_manager.get_resource_manager(
             ResourceManagerType.SPEC_RESOURCE_MANAGER
         )
@@ -856,6 +881,10 @@ class ADEngine(ModelEngine):
             spec_resource_manager, ADHiddenStateManager
         ):
             spec_resource_manager.capture_hidden_states(self.cache_seq_interface)
+
+        # Wrap logits for standard path
+        if not isinstance(outputs, dict):
+            outputs = {"logits": outputs}
 
         if self.mapping is not None:
             self._execute_logit_post_processors(scheduled_requests, outputs)
@@ -994,8 +1023,22 @@ def instantiate_sampler(
     dist_mapping: Mapping,
     engine: ADEngine,
 ):
+    spec_config = ad_config.speculative_config
+
+    # One-model spec dec: model performs sampling internally, returns pre-computed tokens
+    if spec_config is not None and spec_config.spec_dec_mode.is_eagle3_one_model():
+        sampler_args = TorchSampler.Args(
+            max_seq_len=ad_config.max_seq_len,
+            max_draft_len=max_draft_len,
+            max_total_draft_tokens=max_total_draft_tokens,
+            max_num_sequences=max_num_sequences,
+            max_beam_width=ad_config.max_beam_width,
+            disable_overlap_scheduler=ad_config.disable_overlap_scheduler,
+        )
+        return Eagle3OneModelSampler(sampler_args)
+
     if ad_config.sampler_type == SamplerType.TorchSampler:
-        # search sampler with speculative decoding
+        # Regular TorchSampler for non-spec-dec or two-model spec-dec
         sampler_args = TorchSampler.Args(
             max_seq_len=ad_config.max_seq_len,
             max_draft_len=max_draft_len,
@@ -1070,11 +1113,15 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     engine = ADEngine.build_from_config(ad_config=ad_config, mapping=dist_mapping, dist=dist)
 
     spec_config = ad_config.speculative_config
+
     if spec_config is not None and not (
-        spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3()
+        spec_config.spec_dec_mode.is_draft_target()
+        or spec_config.spec_dec_mode.is_eagle3()
+        or spec_config.spec_dec_mode.is_eagle3_one_model()
     ):
         raise ValueError(
-            "Currently, AutoDeploy only supports speculative decoding in draft target or eagle3 mode."
+            "Currently, AutoDeploy only supports speculative decoding in "
+            "draft_target, eagle3, or eagle3_one_model mode."
         )
 
     if spec_config is not None and ad_config.guided_decoding_backend is not None:
@@ -1082,21 +1129,31 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
             "Guided decoding is not currently supported for speculative decoding in AutoDeploy."
         )
 
-    draft_model_engine = create_draft_model_engine_maybe(
-        ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, dist=dist
-    )
-
-    spec_resource_manager = (
-        ADHiddenStateManager(
-            cache_seq_interface=engine.cache_seq_interface,
-            config=spec_config,
-            max_num_requests=ad_config.max_batch_size,
-            max_seq_len=engine.llm_args.max_seq_len,
-            max_num_tokens=engine.llm_args.max_num_tokens,
+    # One-model spec dec: no separate draft engine or spec resource manager.
+    # Hidden states flow through hidden_states_cache_* kwargs (managed by CachedSequenceInterface).
+    if spec_config is not None and spec_config.spec_dec_mode.is_eagle3_one_model():
+        draft_model_engine = None
+        spec_resource_manager = None
+    elif spec_config is not None and (
+        spec_config.spec_dec_mode.is_draft_target() or spec_config.spec_dec_mode.is_eagle3()
+    ):
+        draft_model_engine = create_draft_model_engine_maybe(
+            ad_config=ad_config, target_engine=engine, dist_mapping=dist_mapping, dist=dist
         )
-        if isinstance(spec_config, EagleDecodingConfig)
-        else None
-    )
+        spec_resource_manager = (
+            ADHiddenStateManager(
+                cache_seq_interface=engine.cache_seq_interface,
+                config=spec_config,
+                max_num_requests=ad_config.max_batch_size,
+                max_seq_len=engine.llm_args.max_seq_len,
+                max_num_tokens=engine.llm_args.max_num_tokens,
+            )
+            if spec_config.spec_dec_mode.is_eagle3()
+            else None
+        )
+    else:
+        draft_model_engine = None
+        spec_resource_manager = None
 
     # resource managers
     # KVCacheManager is now created and managed by CachedSequenceInterface during the

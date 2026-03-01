@@ -64,9 +64,19 @@ def _triton_cached_ssm(
         dtype=hidden_states.dtype,
         device=hidden_states.device,
     )
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
     preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
     preallocated_ssm_out_d = preallocated_ssm_out[num_prefill_tokens:num_total_tokens]
 

@@ -77,33 +77,26 @@ def _prepare_and_run(
         dtype=torch.int32,
     ).pin_memory()
 
-    # --- paging metadata for host prepare -------------------------------------
+    # --- paging metadata -------------------------------------------------------
     cache_loc_d = torch.tensor(cache_locs, dtype=torch.int32, device=device)
 
     cu_num_pages = [0]
     for pps in pages_per_seq:
         cu_num_pages.append(cu_num_pages[-1] + pps)
-    cu_num_pages_h = torch.tensor(cu_num_pages, dtype=torch.int32).pin_memory()
+    cu_num_pages_d = torch.tensor(cu_num_pages, dtype=torch.int32, device=device)
 
-    page_seq_indices_list = []
-    page_in_seq_list = []
-    for i, np_ in enumerate(pages_per_seq):
-        page_seq_indices_list.extend([i] * np_)
-        page_in_seq_list.extend(range(np_))
-    page_seq_indices_d = torch.tensor(page_seq_indices_list, dtype=torch.int32, device=device)
-    page_in_seq_d = torch.tensor(page_in_seq_list, dtype=torch.int32, device=device)
-
-    # --- host prepare ---------------------------------------------------------
+    # --- host prepare (pinned host tensors) ------------------------------------
     prepare_trtllm_metadata_host(
         batch_info_host=batch_info_host.cpu(),
         max_seq_info_host=max_seq_info_h,
         seq_len_with_cache_host=slwc_h,
-        cu_num_pages_host=cu_num_pages_h,
-        cache_loc=cache_loc_d,
-        page_seq_indices=page_seq_indices_d,
-        page_in_seq=page_in_seq_d,
         input_pos_host=input_pos_h,
         seq_len_host=seq_len_h,
+    )
+
+    # --- device prepare (block_offsets via Triton kernel) ---------------------
+    block_offsets = torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
+        batch_info_host, max_seq_info_h, cu_num_pages_d, cache_loc_d
     )
 
     # --- call op --------------------------------------------------------------
@@ -113,10 +106,9 @@ def _prepare_and_run(
         v,
         batch_info_host,
         seq_len_d,
-        seq_len_h,
-        input_pos_h,
         slwc_d,
         max_seq_info_h,
+        block_offsets,
         kv_cache,
         scale,
     )
@@ -599,3 +591,85 @@ def test_trtllm_attention_with_paged_kvcache(seq_lengths, n_heads, dtype, device
         atol=1e-2,
         rtol=1e-2,
     )
+
+
+# ---------------------------------------------------------------------------
+# Block offsets computation test
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "num_sequences, pages_per_seq_list, block_offset_multiplier",
+    [
+        (1, [1], 2),
+        (3, [2, 3, 1], 2),
+        (4, [1, 4, 2, 3], 2),
+        (2, [5, 5], 4),
+    ],
+)
+def test_block_offsets_computation(num_sequences, pages_per_seq_list, block_offset_multiplier):
+    """Verify block_offsets produced by prepare_trtllm_metadata device-side op."""
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required")
+
+    device = "cuda"
+    _reset_trtllm_planner()
+
+    max_batch_size = max(num_sequences, 4)
+    total_pages = sum(pages_per_seq_list)
+    max_blocks_per_seq = max(pages_per_seq_list)
+    max_seq_len = max_blocks_per_seq * 64
+
+    cache_locs = list(range(100, 100 + total_pages))
+    cache_loc_d = torch.tensor(cache_locs, dtype=torch.int32, device=device)
+
+    cu_num_pages = [0]
+    for pps in pages_per_seq_list:
+        cu_num_pages.append(cu_num_pages[-1] + pps)
+    cu_num_pages_d = torch.tensor(cu_num_pages, dtype=torch.int32, device=device)
+
+    batch_info_host = torch.tensor(
+        [num_sequences, num_sequences, 0], dtype=torch.int32
+    ).pin_memory()
+    max_seq_info_h = torch.tensor(
+        [max_seq_len, max_blocks_per_seq, block_offset_multiplier, max_batch_size],
+        dtype=torch.int32,
+    ).pin_memory()
+
+    prepare_trtllm_metadata_host(
+        batch_info_host=batch_info_host,
+        max_seq_info_host=max_seq_info_h,
+        seq_len_with_cache_host=torch.ones(num_sequences, dtype=torch.int32).pin_memory(),
+        input_pos_host=torch.zeros(num_sequences, dtype=torch.int32).pin_memory(),
+        seq_len_host=torch.ones(num_sequences, dtype=torch.int32).pin_memory(),
+    )
+
+    torch.ops.auto_deploy.trtllm_attention_prepare_metadata(
+        batch_info_host, max_seq_info_h, cu_num_pages_d, cache_loc_d
+    )
+
+    block_offsets = _GlobalTrtllmPlanner.block_offsets
+    bo = block_offsets[0].cpu()
+
+    # Python reference: for each sequence and page, verify K and V offsets
+    offset = 0
+    for seq_id, n_pages in enumerate(pages_per_seq_list):
+        for pg in range(n_pages):
+            raw = cache_locs[offset]
+            expected_k = raw * block_offset_multiplier
+            expected_v = expected_k + 1
+            assert bo[seq_id, 0, pg].item() == expected_k, (
+                f"K mismatch at seq={seq_id} pg={pg}: "
+                f"got {bo[seq_id, 0, pg].item()}, expected {expected_k}"
+            )
+            assert bo[seq_id, 1, pg].item() == expected_v, (
+                f"V mismatch at seq={seq_id} pg={pg}: "
+                f"got {bo[seq_id, 1, pg].item()}, expected {expected_v}"
+            )
+            offset += 1
+
+    # Verify zero-padding in unused slots
+    for seq_id, n_pages in enumerate(pages_per_seq_list):
+        for pg in range(n_pages, max_blocks_per_seq):
+            assert bo[seq_id, 0, pg].item() == 0, f"K padding non-zero at seq={seq_id} pg={pg}"
+            assert bo[seq_id, 1, pg].item() == 1, f"V padding not 1 at seq={seq_id} pg={pg}"

@@ -392,9 +392,19 @@ def prepare_flashinfer_mla_metadata(
     the standard FlashInfer attention preparation.
     """
     # retrieve host-side metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_tokens = num_prefill_tokens + num_decode
+    num_tokens = num_prefill_tokens + num_decode_tokens
 
     _GlobalFlashInferMLAPlanner.reset(position_ids.device)
 
@@ -433,7 +443,17 @@ def prepare_flashinfer_mla_metadata_host(
     For decode-only batches, this function pre-plans the cached CUDA graph
     wrappers to avoid planning during graph capture/replay.
     """
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
 
     if num_prefill == 0:
         _GlobalFlashInferMLAPlanner.plan_generate_only(
@@ -509,9 +529,19 @@ def flashinfer_mla_with_cache(
     v_head_dim = kv_head_dim - qk_nope_head_dim
 
     # Get batch info
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_extend,
+        num_extend_tokens,
+        num_decode,
+        num_decode_tokens,
+    ) = batch_info_host.tolist()
+    # Extend requests are treated like prefill for this backend
+    num_prefill += num_extend
+    num_prefill_tokens += num_extend_tokens
     num_seq = num_prefill + num_decode
-    num_total_tokens = num_prefill_tokens + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode_tokens
 
     # Set scale
     if scale is None:
