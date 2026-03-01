@@ -588,12 +588,14 @@ def main():
         common_worker_env_var = env_config.get("worker_env_var", "")
         ctx_worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{ctx_tllm_profile_start_stop}' "
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"HF_HOME=/tmp/hf_home "
             f"{common_worker_env_var}"
         )
         gen_worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{gen_tllm_profile_start_stop}' "
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"HF_HOME=/tmp/hf_home "
             f"{common_worker_env_var}"
         )
         server_env_vars = env_config.get("server_env_var", "")
@@ -658,7 +660,8 @@ def main():
     else:
         worker_env_vars = (
             f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "
-            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+            f"HF_HOME=/tmp/hf_home "
         )
         # Aggregated mode (including ctx_only)
         script_prefix_lines.extend(

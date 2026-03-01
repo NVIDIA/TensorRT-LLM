@@ -344,7 +344,9 @@ def main():
 
     # Build worker env vars (split into ctx and gen for role-specific settings)
     base_worker_env_vars = (
-        f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache {env_config['worker_env_var']}"
+        f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache_\\${{SLURM_LOCALID}} "
+        f"HF_HOME=/tmp/hf_home "
+        f"{env_config['worker_env_var']}"
     )
     ctx_worker_env_vars = base_worker_env_vars
     gen_worker_env_vars = base_worker_env_vars

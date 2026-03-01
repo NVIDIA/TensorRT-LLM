@@ -40,10 +40,16 @@ slurm_launch.sh  (generated)
 - `--build-wheel`: Add this flag to build the wheel before running tests.
 - `--capture-nsys`: Add this flag to capture an nsys profile during the test run.
 - `--nsys-start-stop`: Nsys start-stop range (default: `1-100`).
+- `--ctx-nsys-start-stop`: CTX Worker Nsys start-stop range (default: `1-100`).
+- `--gen-nsys-start-stop`: GEN Worker Nsys start-stop range (default: `1-100`).
 
 `--image` can be obtained by:
 
 ```bash
+# B200
+image=$(grep LLM_DOCKER_IMAGE  $trtllm/jenkins/current_image_tags.properties | head -1 | awk -F "=" '{print $2}' )
+image=$(echo $image | sed 's|urm.nvidia.com/|urm.nvidia.com#|g')
+# GB200
 image=$(grep LLM_SBSA_DOCKER_IMAGE  $trtllm/jenkins/current_image_tags.properties | head -1 | awk -F "=" '{print $2}' )
 image=$(echo $image | sed 's|urm.nvidia.com/|urm.nvidia.com#|g')
 ```
