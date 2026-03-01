@@ -29,25 +29,25 @@ def _insert_fused_gemm(
     idx: int,
     parent_node: Node,
     linear_nodes: List[Node],
-    use_narrow: bool = True,
+    allow_not_contigous: bool = True,
 ) -> bool:
     """Fuse GEMMs sharing the same input activation.
 
     Args:
-        use_narrow: If True, split output via torch.narrow (zero-copy view).
+        allow_not_contigous: If True, split output via torch.narrow (zero-copy view).
             If False, split via torch.split + .contiguous() (independent copies).
 
     # before fusion:
     w1 = out1 x in,  w2 = out2 x in
     y1 = x @ w1.T,   y2 = x @ w2.T
 
-    # after fusion (use_narrow=True):
+    # after fusion (allow_not_contigous=True):
     w = (out1+out2) x in
     y = x @ w.T
     y1 = y.narrow(-1, 0, out1)          # view, no copy
     y2 = y.narrow(-1, out1, out2)        # view, no copy
 
-    # after fusion (use_narrow=False):
+    # after fusion (allow_not_contigous=False):
     w = (out1+out2) x in
     y = x @ w.T
     y1, y2 = split(y)                   # contiguous copies
@@ -83,7 +83,7 @@ def _insert_fused_gemm(
             kwargs=fused_kwargs,
         )
 
-    if use_narrow:
+    if allow_not_contigous:
         offset = 0
         for i, n in enumerate(linear_nodes):
             size = sizes_unfused[i]
@@ -164,12 +164,12 @@ class QuantizationFusionMixin(ABC):
         idx: int,
         parent_node: Node,
         linear_nodes: List[Node],
-        use_narrow: bool = True,
+        allow_not_contigous: bool = True,
     ) -> bool:
         """Fuse quantized GEMMs sharing the same input activation.
 
         Args:
-            use_narrow: If True, split output via torch.narrow (zero-copy view).
+            allow_not_contigous: If True, split output via torch.narrow (zero-copy view).
                 If False, split via torch.split + .contiguous() (independent copies).
         """
         keys_unfused = [extract_weight_name(n) for n in linear_nodes]
@@ -233,7 +233,7 @@ class QuantizationFusionMixin(ABC):
                     fused_out_shape, dtype=ref_val.dtype, device="meta"
                 )
 
-        if use_narrow:
+        if allow_not_contigous:
             offset = 0
             for i, n in enumerate(linear_nodes):
                 size = sizes_unfused[i]
@@ -250,6 +250,7 @@ class QuantizationFusionMixin(ABC):
         else:
 
             def split_output(tensor: torch.Tensor) -> Tuple[torch.Tensor, ...]:
+                """Split the output tensor of the fused linear node to obtain the original outputs."""
                 return tuple(t.contiguous() for t in torch.split(tensor, sizes_unfused, dim=-1))
 
             with gm.graph.inserting_before(linear_nodes[0]):
@@ -288,7 +289,7 @@ class QuantizationFusionMixin(ABC):
                     # Mixed children (e.g., quantized or non-linear) — skip fusion
                     continue
                 if self._insert_fused_quant_gemm(
-                    gm, idx := idx + 1, parent_node, lin_children, use_narrow=False
+                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
                 ):
                     num_matches += 1
 
@@ -329,7 +330,7 @@ class FuseGemms(BaseTransform):
                     continue
                 # linear nodes to fuse (split+copy for contiguous outputs)
                 if _insert_fused_gemm(
-                    gm, idx := idx + 1, parent_node, lin_children, use_narrow=False
+                    gm, idx := idx + 1, parent_node, lin_children, allow_not_contigous=False
                 ):
                     num_matches += 1
 
@@ -367,6 +368,8 @@ def _get_quant_fuser(op_key):
         torch.ops.auto_deploy.torch_fake_quant_fp8_linear: FuseFP8Gemms,
         torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear: FuseFP4Gemms,
     }
+    # TODO: once the finegrained FP8 custom op is always registered,
+    # move this into _OP_TO_CLS above and remove the getattr guard.
     _fg_fp8_op = getattr(torch.ops.auto_deploy, "torch_fake_quant_finegrained_fp8_linear", None)
     if _fg_fp8_op is not None:
         _OP_TO_CLS[_fg_fp8_op] = FuseFineGrainedFP8Gemms
