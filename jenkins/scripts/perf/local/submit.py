@@ -402,7 +402,17 @@ def main():
     parser.add_argument(
         "--nsys-start-stop",
         default="1-100",
-        help="Nsys start-stop range (default: 1-100)",
+        help="Nsys start-stop range for aggregated mode (default: 1-100)",
+    )
+    parser.add_argument(
+        "--ctx-nsys-start-stop",
+        default="1-100",
+        help="Nsys start-stop range for context workers in disaggregated mode (default: 1-100)",
+    )
+    parser.add_argument(
+        "--gen-nsys-start-stop",
+        default="1-100",
+        help="Nsys start-stop range for generation workers in disaggregated mode (default: 1-100)",
     )
 
     args = parser.parse_args()
@@ -526,6 +536,8 @@ def main():
 
     nsys_prefix = ""
     tllm_profile_start_stop = ""
+    ctx_tllm_profile_start_stop = ""
+    gen_tllm_profile_start_stop = ""
     if args.capture_nsys:
         if runtime_mode == "disaggregated":
             nsys_output = f"{work_dir}/nsys.%q{{DISAGG_SERVING_TYPE}}.rank%q{{SLURM_PROCID}}"
@@ -546,6 +558,8 @@ def main():
             f" -o {nsys_output}"
         )
         tllm_profile_start_stop = args.nsys_start_stop
+        ctx_tllm_profile_start_stop = args.ctx_nsys_start_stop
+        gen_tllm_profile_start_stop = args.gen_nsys_start_stop
 
     pytest_common_vars = (
         f"LLM_ROOT='{llm_src}' "
@@ -567,17 +581,21 @@ def main():
         ]
     )
 
-    worker_env_vars = (
-        f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "
-        f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
-    )
     server_env_vars = ""
     benchmark_env_var = ""
     if runtime_mode == "disaggregated":
         # Build worker env vars (split into ctx and gen for role-specific settings)
-        base_worker_env_vars = f"{worker_env_vars} {env_config.get("worker_env_var", "")}"
-        ctx_worker_env_vars = base_worker_env_vars
-        gen_worker_env_vars = base_worker_env_vars
+        common_worker_env_var = env_config.get("worker_env_var", "")
+        ctx_worker_env_vars = (
+            f"TLLM_PROFILE_START_STOP='{ctx_tllm_profile_start_stop}' "
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+            f"{common_worker_env_var}"
+        )
+        gen_worker_env_vars = (
+            f"TLLM_PROFILE_START_STOP='{gen_tllm_profile_start_stop}' "
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+            f"{common_worker_env_var}"
+        )
         server_env_vars = env_config.get("server_env_var", "")
         benchmark_env_var = env_config.get("benchmark_env_var", "")
         # Handle gen only mode
@@ -638,6 +656,10 @@ def main():
             ]
         )
     else:
+        worker_env_vars = (
+            f"TLLM_PROFILE_START_STOP='{tllm_profile_start_stop}' "
+            f"FLASHINFER_JIT_DIR=/tmp/flashinfer_jit_cache "
+        )
         # Aggregated mode (including ctx_only)
         script_prefix_lines.extend(
             [
