@@ -813,7 +813,7 @@ class PyExecutor:
                 f"iteration 10-20: export {PROFILE_START_STOP_ENV_VAR_NAME}=10-20"
             )
 
-        if enable_torch_trace:
+        if enable_torch_trace and self.dist.rank == 0:
             activities = [
                 torch.profiler.ProfilerActivity.CPU,
                 torch.profiler.ProfilerActivity.CUDA,
@@ -830,7 +830,7 @@ class PyExecutor:
             calibrator.post_step(it)
             if it in self.profile_stop_iters and not self.is_warmup:
                 assert enabled, "Inconsistent CUDA profiling state"
-                if enable_torch_trace:
+                if enable_torch_trace and self.dist.rank == 0:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
@@ -879,7 +879,7 @@ class PyExecutor:
                 assert not enabled, "Inconsistent CUDA profiling state"
                 calibrator.start()
                 torch.cuda.cudart().cudaProfilerStart()
-                if enable_torch_trace:
+                if enable_torch_trace and self.dist.rank == 0:
                     torch_profiler.start()
                 logger.info(f"Profiling started at iteration {it}.")
                 enabled = True
@@ -899,7 +899,7 @@ class PyExecutor:
         finally:
             if enabled:
                 # Stop on early exit / exception
-                if enable_torch_trace:
+                if enable_torch_trace and self.dist.rank == 0:
                     torch_profiler.stop()
                     torch_profiler.export_chrome_trace(torch_trace_path)
                     logger.info(f"Profiling stopped at iteration {it}, "
