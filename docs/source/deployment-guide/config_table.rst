@@ -1074,3 +1074,138 @@
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc64.yaml``
 
 .. end-openai/gpt-oss-120b
+
+.. start-warnold-nv/glm-4.7-modelopt-fp8
+
+.. _warnold-nv/glm-4.7-modelopt-fp8:
+
+`GLM-4.7 (FP8) <https://huggingface.co/warnold-nv/glm-4.7-modelopt-fp8>`_
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+.. list-table::
+   :width: 100%
+   :header-rows: 1
+   :widths: 12 15 15 13 20 25
+
+   * - GPU
+     - Performance Profile
+     - ISL / OSL
+     - Concurrency
+     - Config
+     - Command
+   * - 8xH100_SXM
+     - Min Latency
+     - 1024 / 1024
+     - 4
+     - `1k1k_tp8_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc4.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc4.yaml``
+   * - 8xH100_SXM
+     - Low Latency
+     - 1024 / 1024
+     - 8
+     - `1k1k_tp8_conc8.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc8.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc8.yaml``
+   * - 8xH100_SXM
+     - Low Latency
+     - 1024 / 1024
+     - 16
+     - `1k1k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc16.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc16.yaml``
+   * - 8xH100_SXM
+     - Balanced
+     - 1024 / 1024
+     - 32
+     - `1k1k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc32.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc32.yaml``
+   * - 8xH100_SXM
+     - High Throughput
+     - 1024 / 1024
+     - 64
+     - `1k1k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc64.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc64.yaml``
+   * - 8xH100_SXM
+     - High Throughput
+     - 1024 / 1024
+     - 128
+     - `1k1k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc128.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc128.yaml``
+   * - 8xH100_SXM
+     - Max Throughput
+     - 1024 / 1024
+     - 256
+     - `1k1k_tp8_conc256.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc256.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k1k_tp8_conc256.yaml``
+   * - 8xH100_SXM
+     - Min Latency
+     - 1024 / 8192
+     - 4
+     - `1k8k_tp8_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc4.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc4.yaml``
+   * - 8xH100_SXM
+     - Low Latency
+     - 1024 / 8192
+     - 8
+     - `1k8k_tp8_conc8.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc8.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc8.yaml``
+   * - 8xH100_SXM
+     - Balanced
+     - 1024 / 8192
+     - 16
+     - `1k8k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc16.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc16.yaml``
+   * - 8xH100_SXM
+     - Balanced
+     - 1024 / 8192
+     - 32
+     - `1k8k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc32.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc32.yaml``
+   * - 8xH100_SXM
+     - High Throughput
+     - 1024 / 8192
+     - 64
+     - `1k8k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc64.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc64.yaml``
+   * - 8xH100_SXM
+     - Max Throughput
+     - 1024 / 8192
+     - 128
+     - `1k8k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc128.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/1k8k_tp8_conc128.yaml``
+   * - 8xH100_SXM
+     - Min Latency
+     - 8192 / 1024
+     - 4
+     - `8k1k_tp8_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc4.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc4.yaml``
+   * - 8xH100_SXM
+     - Low Latency
+     - 8192 / 1024
+     - 8
+     - `8k1k_tp8_conc8.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc8.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc8.yaml``
+   * - 8xH100_SXM
+     - Balanced
+     - 8192 / 1024
+     - 16
+     - `8k1k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc16.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc16.yaml``
+   * - 8xH100_SXM
+     - Balanced
+     - 8192 / 1024
+     - 32
+     - `8k1k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc32.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc32.yaml``
+   * - 8xH100_SXM
+     - High Throughput
+     - 8192 / 1024
+     - 64
+     - `8k1k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc64.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc64.yaml``
+   * - 8xH100_SXM
+     - Max Throughput
+     - 8192 / 1024
+     - 128
+     - `8k1k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc128.yaml>`_
+     - ``trtllm-serve warnold-nv/glm-4.7-modelopt-fp8 --config ${TRTLLM_DIR}/examples/configs/database/glm-4.7-fp8/H100/8k1k_tp8_conc128.yaml``
+
+.. end-warnold-nv/glm-4.7-modelopt-fp8
