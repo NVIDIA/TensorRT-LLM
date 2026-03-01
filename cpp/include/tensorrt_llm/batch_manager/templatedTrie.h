@@ -472,11 +472,11 @@ public:
         return count;
     }
 
-    //! \brief Find reusable blocks for given window size.
+    //! \brief Get values for given prefix and value key.
     //! \param nodeMatches Nodes matching a given prefix.
-    //! \param windowSize Window size.
+    //! \param vkey Value key.
     //! \return ValueMatches struct containing values matching prefix and window size. Might be nullptr for some or all.
-    [[nodiscard]] _ValueMatches lookupBlocks(_NodeMatches const& nodeMatches, ValueKey const& vkey) const
+    [[nodiscard]] _ValueMatches lookupValues(_NodeMatches const& nodeMatches, ValueKey const& vkey) const
     {
         _ValueMatches valueMatches;
         for (auto const& nodeMatch : nodeMatches.exactMatches)
@@ -506,15 +506,15 @@ public:
         return valueMatches;
     }
 
-    //! \brief Find reusable blocks for given prefix and window size.
+    //! \brief Get values for given prefix and value key.
     //! \param pkey prefix.
     //! \param allowPartialMatch If partial matching of tokens is allowed for last matching block.
-    //! \param windowSize Window size.
+    //! \param vkey Value key.
     //! \return ValueMatches struct containing values matching prefix and window size. Might be nullptr for some or all.
-    [[nodiscard]] _ValueMatches lookupBlocks(PrefixKey const& pkey, bool allowPartialMatch, ValueKey const& vkey) const
+    [[nodiscard]] _ValueMatches lookupValues(PrefixKey const& pkey, bool allowPartialMatch, ValueKey const& vkey) const
     {
         auto nodeMatches = lookupNodes(pkey, allowPartialMatch);
-        return lookupBlocks(nodeMatches, vkey);
+        return lookupValues(nodeMatches, vkey);
     }
 
 private:
