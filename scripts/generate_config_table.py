@@ -48,6 +48,10 @@ MODEL_INFO = {
         "display_name": "gpt-oss-120b",
         "url": "https://huggingface.co/openai/gpt-oss-120b",
     },
+    "warnold-nv/glm-4.7-modelopt-fp8": {
+        "display_name": "GLM-4.7 (FP8)",
+        "url": "https://huggingface.co/warnold-nv/glm-4.7-modelopt-fp8",
+    },
 }
 
 
