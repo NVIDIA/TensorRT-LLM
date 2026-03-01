@@ -15,7 +15,11 @@ import requests
 import soundfile
 import torch
 from PIL import Image
-from torchvision.transforms import ToTensor
+try:
+    from torchvision.transforms import ToTensor
+except (ImportError, RuntimeError, AttributeError, Exception):
+    ToTensor = None
+
 from transformers import AutoProcessor, ProcessorMixin
 from transformers.utils import logging
 

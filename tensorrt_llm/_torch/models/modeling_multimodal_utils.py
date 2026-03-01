@@ -24,7 +24,11 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange
 from PIL import Image
-from torchvision.transforms import Normalize, Resize, ToTensor
+try:
+    from torchvision.transforms import Normalize, Resize, ToTensor
+except (ImportError, RuntimeError, AttributeError, Exception):
+    Normalize = Resize = ToTensor = None
+
 
 from tensorrt_llm._torch.modules.embedding import Embedding
 from tensorrt_llm.inputs.multimodal import MultimodalParams

@@ -3,7 +3,11 @@ import dataclasses
 from typing import Any, Dict, List, Tuple
 
 import torch
-import torchvision
+try:
+    import torchvision
+except (ImportError, RuntimeError, AttributeError, Exception):
+    torchvision = None
+
 from mistral_common.tokens.tokenizers.multimodal import ImageEncoder
 from PIL import Image
 from torch import nn
