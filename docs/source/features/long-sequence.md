@@ -11,14 +11,18 @@ With the chunked context feature, there are two benefits:
 - This can prevent the context phase from becoming a bottleneck, enable more parallelization with tokens in the decode phase, and increase GPU utilization.
 - Chunked context allows TensorRT LLM to handle requests with longer contexts while achieving higher concurrency. Since memory usage depends on the number of tokens processed per iteration, chunked context decouples memory consumption from the input request's context length, changing it to the smaller chunk size. This enables TensorRT LLM to process longer contexts without increasing memory requirements, which can also help increase the concurrency under the same memory consumption.
 
-To enable chunked context, please set the `enable_chunked_prefill` in `LLM` API to `True`.
+Chunked context is enabled by default. To disable it, set `enable_chunked_prefill` to `False` in the `LLM` API, or pass `--disable_chunked_prefill` when using `trtllm-serve`.
+
 ```bash
+    # To explicitly disable chunked prefill:
     llm = LLM(
         ...
-        enable_chunked_prefill=True,
+        enable_chunked_prefill=False,
         ...
     )
 ```
+
+Note: Some model architectures (e.g., Mamba/SSM hybrids like NemotronH and Qwen3Next, and Gemma3) automatically disable chunked prefill via model-specific defaults.
 
 Note that if chunked context is enabled, please set the `max_num_tokens` to be an integer multiple of the kv-cache block size `tokens_per_block`, which defaults to 64.
 
