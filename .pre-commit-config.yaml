@@ -1367,7 +1367,7 @@ common-files: &common_files |
     )$
 
 # Global exclude pattern for vendored third-party code
-exclude: '^triton_kernels/'
+exclude: '(^triton_kernels/|trtllmGenKernels/fmha/cubin/kernelMetaInfo\.h$|cubin\.cpp$|cubin\.h$)'
 
 default_install_hook_types: [pre-commit, commit-msg]
 repos:
@@ -1389,14 +1389,10 @@ repos:
     rev: v6.0.0
     hooks:
     -   id: check-added-large-files
-        exclude: |
-            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-merge-conflict
     -   id: check-symlinks
     -   id: detect-private-key
     -   id: end-of-file-fixer
-        exclude: |
-            (?x)^(.*cubin.cpp | .*cubin.h)$
     -   id: check-yaml
         args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
@@ -1428,8 +1424,6 @@ repos:
     hooks:
     -   id: clang-format
         types_or: [c++, c, cuda]
-        exclude: |
-            (?x)^(.*cubin.cpp$ | .*_cubin.h)$
 -   repo: https://github.com/cheshirekow/cmake-format-precommit
     rev: v0.6.10
     hooks:
