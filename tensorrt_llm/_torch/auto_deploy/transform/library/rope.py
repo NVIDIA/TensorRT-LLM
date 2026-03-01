@@ -771,20 +771,13 @@ def _optimize_explicit(
                     )
             cache[cache_key] = fused_cos_sin_to
 
-        # Flatten real position_ids from [B, S] to [B*S] and ensure int32
-        # (FlashInfer requires int; converting once here avoids a per-layer
-        # dtype cast inside the opaque custom op).
-        if "full_table_position_ids" in pos_cache:
-            position_ids = pos_cache["full_table_position_ids"]
-        else:
-            with graph.inserting_before(node):
-                flat_pos_ids = graph.call_function(
-                    torch.ops.aten.reshape, args=(cos_pos_ids, (-1,))
-                )
-                position_ids = graph.call_function(
-                    torch.ops.aten.to, args=(flat_pos_ids, torch.int32)
-                )
-            pos_cache["full_table_position_ids"] = position_ids
+        # Flatten real position_ids from [B, S] to [B*S] and ensure int32.
+        # Each layer gets its own copy to guard against memory corruption
+        # on some GPU architectures (e.g. SM100/B200) where intermediate
+        # kernel launches can overwrite shared buffers.
+        with graph.inserting_before(node):
+            flat_pos_ids = graph.call_function(torch.ops.aten.reshape, args=(cos_pos_ids, (-1,)))
+            position_ids = graph.call_function(torch.ops.aten.to, args=(flat_pos_ids, torch.int32))
     else:
         # Fallback: build fused cache from already-indexed cos/sin values.
         cache_key = (cos_node, sin_node)
@@ -1083,21 +1076,16 @@ def _get_position_ids(
     seq_dim: int = 1,
     rope_position_ids_cache: Dict[str, Node] = None,
 ) -> Node:
-    """
-    Retrieves the cached position_ids from the graph if available, or computes and caches them.
-    It uses the symbolic batch and sequence sizes from q_node with the provided dimension indices.
-    """
-    if rope_position_ids_cache is None:
-        rope_position_ids_cache = {}
+    """Create per-layer position_ids via arange.
 
-    if "position_ids" in rope_position_ids_cache:
-        return rope_position_ids_cache["position_ids"]
-
+    Each layer gets its own arange node to guard against memory corruption
+    on some GPU architectures (e.g. SM100/B200) where intermediate kernel
+    launches can overwrite shared buffers.
+    """
     sym_batch = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, batch_dim))
     sym_seq = graph.call_function(torch.ops.aten.sym_size.int, args=(q_node, seq_dim))
     bs_seq = graph.call_function(operator.mul, args=(sym_batch, sym_seq))
 
-    # Retrieve device information, ensuring it is a torch.device.
     device = q_node.meta.get("device", "cpu")
     if isinstance(device, str):
         device = torch.device(device)
@@ -1107,5 +1095,4 @@ def _get_position_ids(
         args=(bs_seq,),
         kwargs={"dtype": torch.int32, "device": device, "pin_memory": False},
     )
-    rope_position_ids_cache["position_ids"] = position_ids
     return position_ids

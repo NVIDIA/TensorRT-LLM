@@ -18,6 +18,49 @@ from typing import Tuple
 import flashinfer
 import torch
 
+from tensorrt_llm._utils import get_sm_version
+
+
+def _apply_rope_pytorch(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    position_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Pure PyTorch RoPE fallback for platforms where FlashInfer kernels crash."""
+    q_shape = q.shape
+    k_shape = k.shape
+    head_dim = cos_sin_cache.shape[-1]
+    half_dim = head_dim // 2
+
+    pos = position_ids.view(-1).long()
+    num_nnz = pos.shape[0]
+
+    cos_vals = cos_sin_cache[pos, :half_dim].to(q.dtype)
+    sin_vals = cos_sin_cache[pos, half_dim:].to(q.dtype)
+
+    def _rotate(x_flat: torch.Tensor) -> torch.Tensor:
+        n_heads = x_flat.shape[-1] // head_dim
+        x_3d = x_flat.view(num_nnz, n_heads, head_dim)
+        c = cos_vals.unsqueeze(1)
+        s = sin_vals.unsqueeze(1)
+        if is_neox:
+            x1, x2 = x_3d[..., :half_dim], x_3d[..., half_dim:]
+            out = torch.cat([x1 * c - x2 * s, x2 * c + x1 * s], dim=-1)
+        else:
+            x_pairs = x_3d.unflatten(-1, (-1, 2))
+            x_even, x_odd = x_pairs[..., 0], x_pairs[..., 1]
+            o_even = x_even * c - x_odd * s
+            o_odd = x_odd * c + x_even * s
+            out = torch.stack([o_even, o_odd], dim=-1).flatten(-2)
+        return out.view(num_nnz, -1)
+
+    q_flat = q.reshape(num_nnz, -1)
+    k_flat = k.reshape(num_nnz, -1)
+
+    return _rotate(q_flat).view(q_shape), _rotate(k_flat).view(k_shape)
+
 
 @torch.library.custom_op("auto_deploy::flashinfer_rope", mutates_args=())
 def apply_rope_with_input_pos_flashinfer(
@@ -49,6 +92,9 @@ def apply_rope_with_input_pos_flashinfer(
       - Rotated query tensor of the same shape and half precision as input.
       - Rotated key tensor of the same shape and half precision as input.
     """
+    if get_sm_version() >= 100:
+        return _apply_rope_pytorch(q, k, position_ids, cos_sin_cache, is_neox)
+
     q_shape = q.shape
     k_shape = k.shape
     head_dim = cos_sin_cache.shape[-1]
@@ -57,17 +103,13 @@ def apply_rope_with_input_pos_flashinfer(
     num_nnz = position_ids.shape[0]
 
     if q.is_contiguous() and k.is_contiguous():
-        # Standard path: flatten to 2D and use the public FlashInfer API.
         q_flat = q.view(num_nnz, -1)
         k_flat = k.view(num_nnz, -1)
         q_rope, k_rope = flashinfer.rope.apply_rope_with_cos_sin_cache(
             position_ids, q_flat, k_flat, head_dim, cos_sin_cache, is_neox=is_neox
         )
     else:
-        # Strided path (e.g. MLA split_with_sizes outputs where the head dim
-        # is non-contiguous): flatten batch+seq dims only, keep (H, D) as-is
-        # so we never need to materialise a contiguous copy.
-        q_3d = q.flatten(0, -3)  # [B, S, H, D] -> [nnz, H, D]
+        q_3d = q.flatten(0, -3)
         k_3d = k.flatten(0, -3)
         q_rope = torch.empty_like(q_3d)
         k_rope = torch.empty_like(k_3d)

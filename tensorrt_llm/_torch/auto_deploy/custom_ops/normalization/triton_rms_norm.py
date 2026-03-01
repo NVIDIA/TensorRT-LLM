@@ -51,8 +51,10 @@ def rms_norm_kernel(
 
 def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
     """Rms norm."""
+    orig_shape = hidden_states.shape
     feat_size = weight.shape[0]
-    seq_len = hidden_states.numel() // hidden_states.size(-1)
+    hidden_states = hidden_states.reshape(-1, feat_size).contiguous()
+    seq_len = hidden_states.shape[0]
     input_stride = hidden_states.stride(-2)
 
     BLOCK_N = triton.next_power_of_2(feat_size)
@@ -71,4 +73,4 @@ def rms_norm(hidden_states: Tensor, weight: Tensor, eps: float = 1e-5):
         num_stages=3,
     )
 
-    return out
+    return out.view(orig_shape)

@@ -28,6 +28,8 @@ from torch._ops import OpOverloadPacket
 from torch._subclasses import FakeTensor
 from torch.fx import Node
 
+from tensorrt_llm._utils import get_sm_version
+
 from .....llmapi.llm_args import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
@@ -573,7 +575,13 @@ def flashinfer_mla_with_cache(
         kv_lens = seq_len_with_cache_host[:num_prefill]
         is_chunked_prefill = (kv_lens > q_lens).any().item()
 
-        if is_chunked_prefill:
+        # On SM100+ (e.g. B200), BatchPrefillWithRaggedKVCache crashes with
+        # MLA's non-standard head_dim_qk (e.g. 192).  Since cache is already
+        # populated (append_paged_mla_kv_cache ran above), route all prefill
+        # through the paged MLA path which works in compressed space.
+        use_paged_prefill = is_chunked_prefill or get_sm_version() >= 100
+
+        if use_paged_prefill:
             # =================================================================
             # CHUNKED PREFILL: Use BatchMLAPagedAttentionWrapper with absorption
             # Same approach as decode, but with variable-length Q sequences
