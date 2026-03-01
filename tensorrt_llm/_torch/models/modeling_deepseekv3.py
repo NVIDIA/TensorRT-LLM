@@ -1875,6 +1875,9 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
     Extracts the DeepSeek-V3 text backbone from the composite config
     and strips the ``language_model.`` weight prefix so that the
     standard DeepseekV3ForCausalLM loading path works unchanged.
+
+    NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
+    so MTP-based speculative decoding is not applicable to this model.
     """
 
     _LANG_PREFIX = "language_model."

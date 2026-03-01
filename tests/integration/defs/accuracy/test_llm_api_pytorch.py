@@ -3405,6 +3405,39 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                 assert not all(tid == 0 for tid in token_ids)
 
 
+@pytest.mark.threadleak(enabled=False)
+@pytest.mark.timeout(10800)
+@pytest.mark.skip_less_device_memory(100000)
+class TestKimiK25(LlmapiAccuracyTestHarness):
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.parametrize("ep_size,attention_dp", [(1, False), (1, True),
+                                                      (8, False), (8, True)],
+                             ids=["ep1", "ep1_dp", "ep8", "ep8_dp"])
+    def test_nvfp4(self, ep_size, attention_dp):
+        model_name = "moonshotai/Kimi-K2.5"
+        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        with LLM(model_path,
+                 tensor_parallel_size=8,
+                 max_batch_size=16,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=attention_dp,
+                 trust_remote_code=True,
+                 speculative_config=None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
+
+
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/Nemotron-Mini-4B-Instruct"
     MODEL_PATH = f"{llm_models_root()}/nemotron/nemotron-mini-4b-instruct_vfp8-fp8-bf16-export"
