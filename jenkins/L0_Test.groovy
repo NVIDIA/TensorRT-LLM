@@ -121,6 +121,7 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
         def hasTimeoutTest = false
         def downloadResultSucceed = false
         def downloadPerfResultSucceed = false
+        def hasMockResult = false
 
         pipeline.stage('Submit Test Result') {
             sh "mkdir -p ${stageName}"
@@ -173,11 +174,41 @@ def uploadResults(def pipeline, SlurmCluster cluster, String nodeName, String st
             } else {
                 println("No results xml to submit")
             }
+
+            echo "hasTimeoutTest: ${hasTimeoutTest}, downloadResultSucceed: ${downloadResultSucceed}"
+
+            // Generate Stage Failed mock result if no results exist locally
+            // This could mean either: 1) Slurm job failed to generate results, or 2) Results exist but download failed
+            // generateStageFailTestResultXml will return null if any results*.xml already exists
+            if (stageIsInterrupted) {
+                echo "Stage is interrupted, skip to generate Stage Failed mock test result."
+            } else {
+                def stageXml = generateStageFailTestResultXml(
+                    stageName,
+                    "Stage Failed or Results Download Failed",
+                    "Slurm job may have failed, or results exist on ${nodeName} but could not be retrieved. Check Slurm job logs for details.",
+                    "results*.xml"
+                )
+                if (stageXml != null) {
+                    sh "echo '${stageXml}' > ${stageName}/results-stage.xml"
+                    hasMockResult = true
+                    echo "WARNING: No result files were retrieved. This could indicate either a test failure or a download failure."
+                }
+            }
+
+            // Upload results (at least one type of result should always exist)
+            sh "ls ${stageName}"
+            echo "Upload test results."
+            sh "tar -czvf results-${stageName}.tar.gz ${stageName}/"
+            ensureStageResultNotUploaded(stageName)
+            trtllm_utils.uploadArtifacts(
+                "results-${stageName}.tar.gz",
+                "${UPLOAD_PATH}/test-results/"
+            )
         }
 
-        if (hasTimeoutTest || downloadResultSucceed) {
-            junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
-        }
+        // Always call junit since we guarantee at least one result exists
+        junit(allowEmptyResults: true, testResults: "${stageName}/results*.xml")
     }
 }
 
