@@ -16,6 +16,14 @@ class BenchmarkEnvironment(BaseModel):
     workspace: Path
     revision: Optional[str] = None
 
+    @model_validator(mode="after")
+    def verify_model_name(self) -> BenchmarkEnvironment:
+        model = Path(self.model)
+        if model.is_dir() or model.is_file():
+            raise ValueError(
+                f"Model is a file or directory, please provide a model name.")
+        return self
+
 
 class InferenceRequest(BaseModel):
     task_id: int
