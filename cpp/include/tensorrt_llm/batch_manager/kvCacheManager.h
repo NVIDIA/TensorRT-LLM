@@ -307,6 +307,10 @@ public:
 
     [[nodiscard]] bool isLeaf() const;
 
+    //! \brief Test if block is detached from radix search tree.
+    //! \return True if block is detached from search tree.
+    [[nodiscard]] bool isDetached() const;
+
     void setPriority(executor::RetentionPriority priority);
 
     [[nodiscard]] executor::RetentionPriority getPriority() const;
