@@ -195,7 +195,11 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
-
+    
+    // Add missing static constexpr members for shared utilities
+    static constexpr int MaxNumExperts = MaxNumExperts_;
+    static constexpr bool isPow2 = isPow2_;
+    static constexpr bool UsePdl = UsePdl_;
     static constexpr bool UseGroups = UseGroups_;
     static constexpr int MaxNumTopExperts = MaxNumTopExperts_;
 
@@ -255,6 +259,11 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
+    
+    // Add missing static constexpr members for shared utilities
+    static constexpr int MaxNumExperts = MaxNumExperts_;
+    static constexpr bool isPow2 = isPow2_;
+    static constexpr bool UsePdl = UsePdl_;
 
     PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
 
@@ -302,7 +311,11 @@ struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_,
 {
     using InputT = InputT_;
     using OutputT = OutputT_;
-
+    
+    // Add missing static constexpr members for shared utilities
+    static constexpr int MaxNumExperts = MaxNumExperts_;
+    static constexpr bool isPow2 = isPow2_;
+    static constexpr bool UsePdl = UsePdl_;
     static constexpr bool DoSoftmaxBeforeTopK = DoSoftmaxBeforeTopK_;
 
     PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
@@ -329,6 +342,63 @@ void run(Data const& data, void* stream);
 
 } // namespace routingRenormalize
 
-////////////////////////////////////////////////////////////////////////////////////////////////////
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+namespace routingMiniMax
+{
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+struct Data : public DataBase
+{
+    tg::Dtype mDtypeExpW{tg::Dtype::Fp32};
+
+    // Used by KernelParams::setKernelParams
+    void const* mPtrRoutingBias{nullptr};
+
+    // Used by KernelParams::setKernelParams
+    bool mNormTopkProb{true};
+};
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
+
+template <typename InputT_, typename OutputT_, int MaxNumExperts_, bool DoSoftmaxBeforeTopK_, bool isPow2_, bool UsePdl_>
+struct KernelParams : public KernelParamsBase<InputT_, OutputT_, MaxNumExperts_, isPow2_, UsePdl_>
+{
+    using InputT = InputT_;
+    using OutputT = OutputT_;
+    
+    // Add missing static constexpr members for shared utilities
+    static constexpr int MaxNumExperts = MaxNumExperts_;
+    static constexpr bool isPow2 = isPow2_;
+    static constexpr bool UsePdl = UsePdl_;
+    static constexpr bool DoSoftmaxBeforeTopK = DoSoftmaxBeforeTopK_;
+
+    PackedScoreIdx<OutputT>* mPtrTopKPacked = nullptr;
+
+    OutputT const* mPtrRoutingBias = nullptr;
+
+    int32_t mTopK = 0;
+
+    bool mNormTopkProb = true;
+
+    static KernelParams setKernelParams(Data const& data)
+    {
+        KernelParams params;
+        params.setBaseParams(data);
+
+        params.mPtrTopKPacked = (PackedScoreIdx<OutputT>*) data.mPtrTopKPacked;
+        params.mPtrRoutingBias = static_cast<OutputT const*>(data.mPtrRoutingBias);
+        params.mNormTopkProb = data.mNormTopkProb;
+        params.mTopK = data.mTopK;
+        return params;
+    }
+};
+
+void run(Data const& data, void* stream);
+
+} // namespace routingMiniMax
+
+//////////////////////////////////////////////////////////////////////////////////////////////////
 } // namespace routing
 } // namespace moe::dev

@@ -123,9 +123,10 @@ def should_skip_trtllm(
         return None
 
     # Routing method compatibility check (used by test_moe_module.py)
-    # TRTLLMGen C++ routing kernel (runner.cu) only implements:
+    # TRTLLMGen C++ routing kernel (runner.cu) implements:
     # - DeepSeekV3 (requires float32 routing_logits)
     # - Llama4 (requires top_k=1)
+    # - MiniMaxM2 (sigmoid activation, bias-added selection)
     # - Renormalize
     # - RenormalizeNaive
     # See: cpp/tensorrt_llm/kernels/trtllmGenKernels/blockScaleMoe/runner.cu:77-212
@@ -140,7 +141,6 @@ def should_skip_trtllm(
         # Routing methods NOT implemented in C++ kernel
         trtllm_unimplemented_routing = (
             DefaultMoeRoutingMethod,  # runner.cu:210 - "Unimplemented routing method"
-            MiniMaxM2MoeRoutingMethod,  # runner.cu:210 - "Unimplemented routing method"
         )
         if routing_method_cls in trtllm_unimplemented_routing:
             routing_name = routing_method_cls.__name__
