@@ -49,6 +49,8 @@ using namespace tensorrt_llm::batch_manager::eviction_policy;
 
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
+// TODO: Replace search structure with radix tree
+
 namespace
 {
 
@@ -184,6 +186,15 @@ bool BlockKey::operator==(BlockKey const& other) const noexcept
         && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
 }
 
+BlockKey BlockKey::shorten(int newNumTokens) const
+{
+    TLLM_CHECK_WITH_INFO(
+        newNumTokens >= 0 && newNumTokens <= getNumTokens(), "newNumTokens must be >= 0 and <= getNumTokens()");
+    BlockKey result(*this);
+    result.uniqueTokens.resize(newNumTokens);
+    return result;
+}
+
 size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
 {
     // Hashing algorithm adapted from StackOverflow:
@@ -194,37 +205,21 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     if (parentHash == 0 && blockKey.cacheSaltID)
     {
         // Only hashing the cache salt ID for the first block in the sequence
-        uint64_t c = blockKey.cacheSaltID.value();
-        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
-        c = c ^ (c >> 31);
-        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed = __hash64(blockKey.cacheSaltID.value(), seed);
     }
 
     for (auto const& uniqueToken : blockKey.uniqueTokens)
     {
-        uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
-        a = ((a >> 16) ^ a) * 0x45d9f3b;
-        a = ((a >> 16) ^ a) * 0x45d9f3b;
-        a = (a >> 16) ^ a;
-        seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed = __hash32(static_cast<uint32_t>(uniqueToken.tokenId), seed);
         if (blockKey.usesExtraIds)
         {
-            uint64_t b = uniqueToken.tokenExtraId;
-            b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-            b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
-            b = b ^ (b >> 31);
-            seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed = __hash64(uniqueToken.tokenExtraId, seed);
         }
     }
 
     if (blockKey.loraTaskId)
     {
-        uint64_t c = blockKey.loraTaskId.value();
-        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
-        c = c ^ (c >> 31);
-        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+        seed = __hash64(blockKey.loraTaskId.value(), seed);
     }
 
     // Add extra keys for multimodal data mixing in external multimodal item hash and token offset within this sequence
@@ -243,18 +238,11 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
                     | (static_cast<uint32_t>(mmHash[i + 2]) << 16) | (static_cast<uint32_t>(mmHash[i + 3]) << 24);
 
                 // Mix the word into the seed
-                word = ((word >> 16) ^ word) * 0x45d9f3b;
-                word = ((word >> 16) ^ word) * 0x45d9f3b;
-                word = (word >> 16) ^ word;
-                seed ^= word + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+                seed = __hash32(word, seed);
             }
 
             // Hash the start offset
-            uint64_t e = static_cast<uint64_t>(startOffset);
-            e = (e ^ (e >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-            e = (e ^ (e >> 27)) * UINT64_C(0x94d049bb133111eb);
-            e = e ^ (e >> 31);
-            seed ^= e + 0x9e3779b9 + (seed << 6) + (seed >> 2);
+            seed = __hash64(static_cast<uint64_t>(startOffset), seed);
         }
     }
 
@@ -455,7 +443,7 @@ std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
             {
                 if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
                 {
-                    SizeType32 numMatched = key.partialMatch(blockKey);
+                    SizeType32 numMatched = key.numMatchingTokens(blockKey);
                     if (numMatched > bestNumMatched)
                     {
                         bestNumMatched = numMatched;
