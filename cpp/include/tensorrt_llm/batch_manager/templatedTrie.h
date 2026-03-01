@@ -28,26 +28,26 @@
 // Template arguments:
 //
 // The trie is maintained as a set of nodes.
-// Each node has a map with pointers to the next node(s) [the children] and a single pointer to the previous node [the parent].
-// The key is of type 'NodeKey'. A hash functor for 'NodeKey' is provided by 'NodeKeyHashFunctor'. The hash functor can be
-// std::hash for simple types.
+// Each node has a map with pointers to the next node(s) [the children] and a single pointer to the previous node [the
+// parent]. The key is of type 'NodeKey'. A hash functor for 'NodeKey' is provided by 'NodeKeyHashFunctor'. The hash
+// functor can be std::hash for simple types.
 //
-// Each node stores a value of type 'Value' for multiple channels. The channel is selected with an argument of type 'ValueKey'.
-// For example, if we have one value per window size, ValueKey can be of type int. ValueKey can be any custom struct or class
-// that implements == operator and has a hash functor. The hash functor is passed with argument 'ValueKeyHashFunctor'.
-// For simple data types, hash functor can be std::hash.
+// Each node stores a value of type 'Value' for multiple channels. The channel is selected with an argument of type
+// 'ValueKey'. For example, if we have one value per window size, ValueKey can be of type int. ValueKey can be any
+// custom struct or class that implements == operator and has a hash functor. The hash functor is passed with argument
+// 'ValueKeyHashFunctor'. For simple data types, hash functor can be std::hash.
 //
-// Note that value is stored by value, not by reference. If your value is an object instance, you should use a pointer type
-// as your Value argument, for instance std::shared_ptr<KVCacheBlock> can be used to point to the objects that contain
-// meta-data for KV cache blocks. If used Value = KVCacheBlock instead of std::shared_ptr<KVCacheBlock>, the value that is
-// returned by Node::getValue would be a copy of the meta-data in the KVCacheBlock instance, not a pointer to it. This is
-// fine for reading, but will not work if you plan on modifying anything.
+// Note that value is stored by value, not by reference. If your value is an object instance, you should use a pointer
+// type as your Value argument, for instance std::shared_ptr<KVCacheBlock> can be used to point to the objects that
+// contain meta-data for KV cache blocks. If used Value = KVCacheBlock instead of std::shared_ptr<KVCacheBlock>, the
+// value that is returned by Node::getValue would be a copy of the meta-data in the KVCacheBlock instance, not a pointer
+// to it. This is fine for reading, but will not work if you plan on modifying anything.
 //
-// NodeKey is a custom data type with a notion of tokens. The NodeKey we use for KV cache block lookups is struct BlockKey,
-// which has a property called uniqueTokens. uniqueTokens is a vector of fixed size, the size is equal to block length,
-// which is sometimes refered to as 'tokens_per_block'. BlockKey supports partial matching. Partial matching means
-// the entire BlockKey did not match, but the first 'N' tokens did. Not all NodeKeys support partial matching,
-// you enable or disable this feature with template argument 'supportsPartialMatching'.
+// NodeKey is a custom data type with a notion of tokens. The NodeKey we use for KV cache block lookups is struct
+// BlockKey, which has a property called uniqueTokens. uniqueTokens is a vector of fixed size, the size is equal to
+// block length, which is sometimes refered to as 'tokens_per_block'. BlockKey supports partial matching. Partial
+// matching means the entire BlockKey did not match, but the first 'N' tokens did. Not all NodeKeys support partial
+// matching, you enable or disable this feature with template argument 'supportsPartialMatching'.
 //
 
 namespace tensorrt_llm::batch_manager::templated_trie
@@ -65,8 +65,7 @@ template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKe
     bool supportsPartialMatching>
 struct NodeMatch
 {
-    using _Node
-        = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
     using NodePtr = std::shared_ptr<_Node>;
 
     NodeMatch() = default;
@@ -331,12 +330,12 @@ class Trie
 {
 public:
     using PrefixKey = std::vector<NodeKey>;
-    using _Node
-        = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
     using NodePtr = std::shared_ptr<_Node>;
     using _NodeMatch
         = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
-    using _NodeMatches = NodeMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _NodeMatches
+        = NodeMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
     using NodeMatchesPtr = std::shared_ptr<_NodeMatches>;
     using Values = std::vector<std::optional<Value>>;
 

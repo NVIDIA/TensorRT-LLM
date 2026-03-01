@@ -14,8 +14,8 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/batch_manager/templatedTrie.h"
 #include "tensorrt_llm/batch_manager/stringSetTrie.h"
+#include "tensorrt_llm/batch_manager/templatedTrie.h"
 
 #include <gtest/gtest.h>
 
