@@ -108,6 +108,10 @@ class ParallelConfig(BaseModel):
 
     t5_fsdp_size: int = 1
 
+    @property
+    def n_workers(self) -> int:
+        return self.dit_cfg_size * self.dit_ulysses_size
+
     def to_mapping(self) -> Mapping:
         """Convert to TRT-LLM Mapping."""
         world_size = self.dit_tp_size * self.dit_cp_size

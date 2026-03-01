@@ -20,7 +20,8 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import (get_is_diffusion_model,
-                                         get_visual_gen_model_type)
+                                         get_visual_gen_model_type,
+                                         get_visual_gen_num_gpus)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -459,11 +460,9 @@ def launch_visual_gen_server(
     model = visual_gen_config["model"]
     logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = 1
+    n_workers = get_visual_gen_num_gpus(visual_gen_config)
     parallel_config = visual_gen_config.get("parallel", {})
     if parallel_config:
-        n_workers = parallel_config.get(
-            "dit_cfg_size", 1) * parallel_config.get("dit_ulysses_size", 1)
         logger.info(f"World size: {n_workers}")
         logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
         logger.info(

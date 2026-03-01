@@ -1,6 +1,6 @@
 # Visual Generation Examples
 
-Quick reference for running visual generation models (WAN).
+Quick reference for running visual generation models (FLUX, WAN).
 
 ## Prerequisites
 
@@ -31,6 +31,86 @@ cd examples/visual_gen
 | `PROJECT_ROOT` | Auto-detected | Path to repository root (set when running from `examples/visual_gen`) |
 | `MODEL_ROOT` | `/llm-models` | Path to model directory |
 | `TLLM_LOG_LEVEL` | `INFO` | Logging level |
+
+---
+
+## FLUX (Text-to-Image)
+
+Supports both FLUX.1-dev and FLUX.2-dev. The pipeline type is auto-detected from the model checkpoint (`model_index.json`).
+
+### Basic Usage
+
+**FLUX.1-dev:**
+```bash
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev \
+    --prompt "A cat sitting on a windowsill" \
+    --guidance_scale 3.5 \
+    --output_path output.png
+```
+
+**FLUX.2-dev:**
+```bash
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev \
+    --prompt "A cat sitting on a windowsill" \
+    --guidance_scale 4.0 \
+    --output_path output.png
+```
+
+**With FP8 Quantization:**
+```bash
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev \
+    --prompt "A cat sitting on a windowsill" \
+    --linear_type trtllm-fp8-per-tensor \
+    --output_path output.png
+```
+
+**With TeaCache:**
+```bash
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev \
+    --prompt "A cat sitting on a windowsill" \
+    --enable_teacache \
+    --output_path output.png
+```
+
+### Batch Mode
+
+Generate multiple images from a prompts file (one prompt per line):
+
+```bash
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev \
+    --prompts_file prompts.txt \
+    --output_dir results/bf16/ \
+    --seed 42
+```
+
+```bash
+# With FP8 quantization
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.2-dev \
+    --prompts_file prompts.txt \
+    --output_dir results/fp8/ \
+    --linear_type trtllm-fp8-per-tensor
+```
+
+Images are saved as `00.png`, `01.png`, etc. with a `timing.json` summary.
+
+### Multi-GPU Parallelism
+
+FLUX supports CFG and Ulysses parallelism, same as WAN.
+
+**CFG + Ulysses (4 GPUs):**
+```bash
+python visual_gen_flux.py \
+    --model_path ${MODEL_ROOT}/FLUX.1-dev \
+    --prompts_file prompts.txt \
+    --output_dir results/ \
+    --cfg_size 2 --ulysses_size 2
+```
 
 ---
 
@@ -116,25 +196,28 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 
 ## Common Arguments
 
-| Argument | WAN | Default | Description |
-|----------|-----|---------|-------------|
-| `--height` | ✓ | 720 | Output height |
-| `--width` | ✓ | 1280 | Output width |
-| `--num_frames` | ✓ | 81 | Number of frames |
-| `--steps` | ✓ | 50 | Denoising steps |
-| `--guidance_scale` | ✓ | 5.0 | CFG guidance strength |
-| `--seed` | ✓ | 42 | Random seed |
-| `--enable_teacache` | ✓ | False | Cache optimization |
-| `--teacache_thresh` | ✓ | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | VANILLA | VANILLA or TRTLLM |
-| `--cfg_size` | ✓ | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | 1 | Sequence parallelism |
-| `--linear_type` | ✓ | default | Quantization type |
+| Argument | FLUX | WAN | Default | Description |
+|----------|------|-----|---------|-------------|
+| `--height` | ✓ | ✓ | 1024 / 720 | Output height |
+| `--width` | ✓ | ✓ | 1024 / 1280 | Output width |
+| `--num_frames` | | ✓ | 81 | Number of frames |
+| `--steps` | ✓ | ✓ | 50 | Denoising steps |
+| `--guidance_scale` | ✓ | ✓ | 3.5 / 5.0 | CFG guidance strength |
+| `--seed` | ✓ | ✓ | 42 | Random seed |
+| `--enable_teacache` | ✓ | ✓ | False | Cache optimization |
+| `--teacache_thresh` | ✓ | ✓ | 0.2 | TeaCache similarity threshold |
+| `--attention_backend` | ✓ | ✓ | VANILLA | VANILLA or TRTLLM |
+| `--cfg_size` | ✓ | ✓ | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | ✓ | 1 | Sequence parallelism |
+| `--linear_type` | ✓ | ✓ | default | Quantization type |
+| `--prompts_file` | ✓ | | — | Batch mode prompts file |
+| `--output_dir` | ✓ | | — | Batch mode output directory |
+| `--disable_torch_compile` | ✓ | ✓ | False | Disable torch.compile |
 
 ## Troubleshooting
 
 **Out of Memory:**
-- Use quantization: `--linear_type trtllm-fp8-blockwise`
+- Use quantization: `--linear_type trtllm-fp8-blockwise` (WAN) or `--linear_type trtllm-fp8-per-tensor` (FLUX)
 - Reduce resolution or frames
 - Enable TeaCache: `--enable_teacache`
 - Use Ulysses parallelism with more GPUs
@@ -149,12 +232,13 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 - Install necessary dependencies, e.g., `pip install -r requirements-dev.txt`
 
 **Ulysses Errors:**
-- `ulysses_size` must divide 12 (WAN heads)
+- `ulysses_size` must divide the model's head count (12 for WAN)
 - Total GPUs = `cfg_size × ulysses_size`
 - Sequence length must be divisible by `ulysses_size`
 
 ## Output Formats
 
+- **FLUX**: `.png` (image)
 - **WAN**: `.mp4` (video), `.gif` (animated), `.png` (single frame)
 
 ## Baseline Validation

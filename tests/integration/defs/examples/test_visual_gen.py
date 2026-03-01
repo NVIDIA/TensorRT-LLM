@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -19,8 +19,8 @@ import json
 import os
 
 import pytest
+from defs import conftest
 from defs.common import venv_check_call
-from defs.conftest import llm_models_root
 from defs.trt_test_alternative import check_call
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
@@ -85,7 +85,7 @@ def vbench_repo_root(llm_venv):
 @pytest.fixture(scope="session")
 def wan_trtllm_video_path(llm_venv, llm_root):
     """Generate input video via visual_gen_wan_t2v.py and return path to trtllm_output.mp4."""
-    scratch_space = llm_models_root()
+    scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -134,7 +134,7 @@ def wan_trtllm_video_path(llm_venv, llm_root):
 @pytest.fixture(scope="session")
 def wan_reference_video_path(llm_venv, llm_root):
     """Generate reference video via diffusers (hf_wan.py) using the same model checkpoint."""
-    scratch_space = llm_models_root()
+    scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -285,4 +285,20 @@ def test_vbench_dimension_score_wan(vbench_repo_root, wan_trtllm_video_path, llm
         llm_venv,
         title="WAN",
         max_score_diff=0.05,
+    )
+
+
+def test_visual_gen_benchmark_serving(llm_venv):
+    """Run benchmark_visual_gen.py against a live trtllm-serve visual-gen server."""
+    test_root = conftest.unittest_path() / "_torch" / "visual_gen"
+    llm_venv.run_cmd(
+        [
+            "-m",
+            "pytest",
+            "-v",
+            str(
+                test_root / "_test_trtllm_serve_visual_gen_benchmark.py"
+                "::test_visual_gen_benchmark_video[openai-videos]"
+            ),
+        ]
     )
