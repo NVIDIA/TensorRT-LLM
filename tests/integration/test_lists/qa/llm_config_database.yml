@@ -21,36 +21,13 @@ llm_config_database:
       linux_distribution_name: ubuntu*
     ranges:
       system_gpu_count:
-        gte: 1
-  tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc4_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc16_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc64_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc4_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc16_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc64_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc4_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc16_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc64_gpu1]
-- condition:
-    wildcards:
-      gpu:
-      - '*b200*'
-      cpu: x86_64
-      linux_distribution_name: ubuntu*
-    ranges:
-      system_gpu_count:
         gte: 2
   tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc4_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc16_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc64_gpu2]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc4_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc16_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc64_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc4_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc16_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc64_gpu2]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc256_gpu2]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc768_gpu2]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc1024_gpu2]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc1280_gpu2]
 - condition:
     wildcards:
       gpu:
@@ -61,21 +38,18 @@ llm_config_database:
       system_gpu_count:
         gte: 4
   tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc32_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc256_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc32_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc256_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc16_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc64_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc16_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc64_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc16_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc64_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc2048_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc1024_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc2048_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc8_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc256_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc1536_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc10_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc384_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc1536_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc1_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc32_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc1792_gpu4]
 - condition:
     wildcards:
       gpu:
@@ -86,46 +60,33 @@ llm_config_database:
       system_gpu_count:
         gte: 8
   tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc4_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_8192_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_8192_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_8192_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc1_gpu8]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc32_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc256_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc32_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc256_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc64_gpu8]
-- condition:
-    wildcards:
-      gpu:
-      - '*h200*'
-      cpu: x86_64
-      linux_distribution_name: ubuntu*
-    ranges:
-      system_gpu_count:
-        gte: 1
-  tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc4_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc16_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc64_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc4_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc16_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc64_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc4_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc16_gpu1]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc64_gpu1]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_1024_8192_conc1024_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc16_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-nvidia_DeepSeek_R1_0528_FP4_v2_8192_1024_conc512_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc384_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc512_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_1024_8192_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc8_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc384_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_b200_nvl-openai_gpt_oss_120b_8192_1024_conc2048_gpu8]
 - condition:
     wildcards:
       gpu:
@@ -136,15 +97,9 @@ llm_config_database:
       system_gpu_count:
         gte: 2
   tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc4_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc16_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc64_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc4_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc16_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc64_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc4_gpu2]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc16_gpu2]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc64_gpu2]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc256_gpu2]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc384_gpu2]
 - condition:
     wildcards:
       gpu:
@@ -155,15 +110,13 @@ llm_config_database:
       system_gpu_count:
         gte: 4
   tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc16_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc64_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc16_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc64_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc128_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc384_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc1024_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc512_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc2_gpu4]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc4_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc16_gpu4]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc64_gpu4]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc768_gpu4]
 - condition:
     wildcards:
       gpu:
@@ -174,18 +127,21 @@ llm_config_database:
       system_gpu_count:
         gte: 8
   tests:
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc4_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc32_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_8192_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_8192_conc16_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_1024_8192_conc512_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc1_gpu8]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc16_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc16_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-deepseek_ai_DeepSeek_R1_0528_8192_1024_conc256_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc1_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc256_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_1024_conc2048_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc1_gpu8]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc64_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc4_gpu8]
-  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc16_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_1024_8192_conc1280_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc1_gpu8]
   - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc64_gpu8]
+  - perf/test_perf_sanity.py::test_e2e[aggr_upload-config_database_h200_sxm-openai_gpt_oss_120b_8192_1024_conc1536_gpu8]

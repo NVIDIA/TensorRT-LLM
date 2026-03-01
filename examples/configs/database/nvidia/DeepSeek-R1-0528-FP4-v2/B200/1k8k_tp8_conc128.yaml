@@ -1,0 +1,22 @@
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 32
+enable_attention_dp: true
+print_iter_log: true
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.8
+stream_interval: 10
+moe_config:
+  backend: TRTLLM
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
+speculative_config:
+  decoding_type: MTP
+  num_nextn_predict_layers: 1
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+trust_remote_code: true
+max_seq_len: 9416

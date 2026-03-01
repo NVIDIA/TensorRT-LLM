@@ -1,0 +1,9 @@
+env_overrides:
+  TRTLLM_ENABLE_PDL: 1
+max_batch_size: 1280
+print_iter_log: true
+tensor_parallel_size: 8
+moe_expert_parallel_size: 8
+trust_remote_code: true
+max_num_tokens: 20000
+max_seq_len: 2068

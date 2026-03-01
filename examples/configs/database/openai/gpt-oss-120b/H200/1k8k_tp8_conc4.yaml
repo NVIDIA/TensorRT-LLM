@@ -1,15 +1,16 @@
 env_overrides:
   TRTLLM_ENABLE_PDL: 1
+max_batch_size: 4
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 4
+print_iter_log: true
 kv_cache_config:
   free_gpu_memory_fraction: 0.85
+stream_interval: 20
 moe_config:
   backend: TRITON
 num_postprocess_workers: 4
-print_iter_log: true
-stream_interval: 20
 tensor_parallel_size: 8
 moe_expert_parallel_size: 8
 trust_remote_code: true
