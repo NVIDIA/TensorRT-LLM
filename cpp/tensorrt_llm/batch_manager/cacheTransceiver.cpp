@@ -554,9 +554,27 @@ RequestStatuses CacheTransceiver::checkContextTransferStatus(
                 }
                 else if (status == std::future_status::timeout)
                 {
-                    TLLM_LOG_WARNING("Timed out waiting for context KV cache transfer after %d milliseconds.",
-                        senderFutureTimeoutMs.value());
-                    ++it;
+                    // If this request has been cancelled, don't wait forever — force-remove it.
+                    // This prevents cancelled sender futures from blocking new requests indefinitely
+                    // when the decode side has already cleaned up and won't acknowledge the transfer.
+                    if (request->isFinishedDueToCancellation())
+                    {
+                        TLLM_LOG_WARNING(
+                            "Force-removing cancelled request %ld from sender futures "
+                            "after transfer timeout of %d ms.",
+                            request->mRequestId, senderFutureTimeoutMs.value());
+                        request->setState(LlmRequestState::kDISAGG_TRANS_ERROR);
+                        requestsStatus.errorRequestIds.insert(request->mRequestId);
+                        it = mSenderFutures.erase(it);
+                    }
+                    else
+                    {
+                        TLLM_LOG_WARNING(
+                            "Timed out waiting for context KV cache transfer "
+                            "after %d milliseconds for request %ld.",
+                            senderFutureTimeoutMs.value(), request->mRequestId);
+                        ++it;
+                    }
                 }
                 else
                 {

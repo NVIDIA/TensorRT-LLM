@@ -425,7 +425,7 @@ public:
         bool isCancelled = false;
         std::scoped_lock lkResp(mSenderMutex);
         auto it = mReadyResponses.find(llmRequest.mRequestId);
-        // If the request is not the current request and already in the ready queue, we can cancel it.
+        // If the request is not the current request and already in the ready queue, we can cancel it immediately.
         if (it != mReadyResponses.end()
             && (!mCurrentRequest.has_value() || getCurrentRequestId() != llmRequest.mRequestId))
         {
@@ -434,7 +434,13 @@ public:
         }
         else
         {
-            TLLM_LOG_WARNING("Cannot cancel request %zu", llmRequest.mRequestId);
+            // Request is either in-flight (mCurrentRequest) or already dispatched for async send.
+            // Still mark as cancelled so the sender future timeout handler can clean it up
+            // after the Python layer sets the request's finish reason to CANCELLED.
+            TLLM_LOG_WARNING("Cannot cancel in-flight request %zu, marking for deferred cleanup",
+                llmRequest.mRequestId);
+            mCancelledRequests.insert(llmRequest.mRequestId);
+            isCancelled = true;
         }
         return isCancelled;
     }
