@@ -1015,6 +1015,27 @@ class AutoTuner:
                 custom_op, 0) + tuning_end_time - tuning_start_time
         return (runners[runner_id], tactic)
 
+    def get_cached_tactic(
+        self,
+        custom_op: str,
+        runners: List[TunableRunner],
+        tuning_config: TuningConfig,
+        input_shapes: Tuple[torch.Size, ...],
+    ) -> Optional[Tuple[TunableRunner, Any]]:
+        """Return (runner, tactic) from cache if present, else None. Uses the
+        same cache and key as choose_one. Use when you have input_shapes but
+        not tensors (e.g. to resolve AUTO strategy before the op runs)."""
+        is_cache_hit, best_runner_id, best_tactic, _ = self.profiling_cache.search_cache(
+            custom_op,
+            runners,
+            input_shapes,
+            tuning_config,
+            apply_map_to_tuning_buckets=True,
+        )
+        if not is_cache_hit:
+            return None
+        return (runners[best_runner_id], best_tactic)
+
     def _profile_runners(
         self,
         custom_op: str,

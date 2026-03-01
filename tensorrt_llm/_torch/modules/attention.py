@@ -712,6 +712,7 @@ class Attention(nn.Module):
         attention_mask: AttentionMask = PredefinedAttentionMask.CAUSAL,
         mrope_config: Optional[dict] = None,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
@@ -734,7 +735,11 @@ class Attention(nn.Module):
         Returns:
             torch.Tensor: The output tensor.
         """
-        qkv = self.qkv_proj(hidden_states)
+        qkv = self.qkv_proj(hidden_states,
+                            all_reduce_params=all_reduce_params,
+                            allow_window_output=allow_window_output,
+                            lora_params=lora_params,
+                            layer_idx=self.layer_idx)
 
         if bool(lora_params):
             qkv_lora = self.splitted_qkv_lora(hidden_states, lora_params,
@@ -782,6 +787,7 @@ class Attention(nn.Module):
 
         attn_output = self.o_proj(attn_output,
                                   all_reduce_params=all_reduce_params,
+                                  allow_window_output=allow_window_output,
                                   lora_params=lora_params,
                                   layer_idx=self.layer_idx)
         return attn_output

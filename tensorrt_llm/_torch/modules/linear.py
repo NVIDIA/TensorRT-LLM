@@ -13,8 +13,9 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import OutputBufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
-from tensorrt_llm._utils import is_device_integrated, mpi_disabled
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
 from tensorrt_llm.functional import (AllReduceFusionOp, AllReduceParams,
                                      AllReduceStrategy)
@@ -31,6 +32,7 @@ from ..._utils import get_sm_version, is_sm_100f
 from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
+from .linear_common import TensorParallelMode, load_weight_shard
 
 
 class WeightMode(str, enum.Enum):
@@ -80,80 +82,6 @@ class WeightMode(str, enum.Enum):
 class WeightsLoadingConfig:
     weight_mode: WeightMode = WeightMode.VANILLA
     ignore_tensor_parallel: bool = False
-
-
-class TensorParallelMode(str, enum.Enum):
-    COLUMN = 'column'
-    ROW = 'row'
-
-    @classmethod
-    def split_dim(cls, mode):
-        return 1 if mode == cls.ROW else 0
-
-    # Helper to shard the corresponding per-channel activation scales
-    # Which shard along the dimension orthogonal to the weights
-    @classmethod
-    def flip(cls, mode):
-        return cls.ROW if mode == cls.COLUMN else cls.COLUMN
-
-
-def load_weight_shard(
-    weight,
-    tensor_parallel_size: int = 1,
-    tensor_parallel_rank: int = 0,
-    tensor_parallel_mode: Optional[TensorParallelMode] = None,
-    device: torch.device = torch.device('cpu'),
-    return_slice_indices: bool = False,
-) -> torch.Tensor:
-    # Skip device transfers on integrated GPUs to conserve shared memory
-    if weight.device.type != device.type and is_device_integrated():
-        # For integrated GPU systems (e.g., DGX Spark), CPU and GPU share limited physical memory.
-        # Avoiding device transfers reduces memory consumption and unnecessary data copies,
-        # enabling support for larger models on memory-constrained systems.
-        logger.warning_once(
-            f"[load_weight_shard] Skipping device transfer from {weight.device} to {device} on integrated GPU to conserve shared memory.",
-            key="load_weight_shard_skip_device_transfer_with_integrated_gpu")
-        device = weight.device
-    if isinstance(weight, torch.Tensor):
-        tensor_shape = weight.shape
-
-        def maybe_convert_to_torch_tensor(tensor: torch.Tensor,
-                                          indices: list[slice] | None = None):
-            if indices is None:
-                # Avoid unnecessary copy
-                result = (tensor.to(device), [slice(d) for d in tensor.shape])
-            else:
-                result = (tensor[indices].to(device), indices)
-            return result if return_slice_indices else result[0]
-
-    # WAR to check whether it is a safetensor slice since safetensor didn't register the type to the module
-    # safetensors slice, supports lazy loading, type(weight) is `builtin.PySafeSlice`
-    elif hasattr(weight, "get_shape"):
-        tensor_shape = weight.get_shape()
-
-        def maybe_convert_to_torch_tensor(
-            tensor, indices: Union[slice, tuple[slice]] = slice(None)):
-            return tensor[indices].to(device)
-    else:
-        raise ValueError(f'unsupported weight type: {type(weight)}')
-    if tensor_parallel_mode is None or tensor_parallel_size <= 1:
-        return maybe_convert_to_torch_tensor(weight)
-
-    split_dim = TensorParallelMode.split_dim(tensor_parallel_mode)
-
-    if len(tensor_shape) == 1 and split_dim == 1:
-        return maybe_convert_to_torch_tensor(weight)
-
-    width = tensor_shape[split_dim]
-    if width == 1:
-        return maybe_convert_to_torch_tensor(weight)
-
-    slice_width = math.ceil(width / tensor_parallel_size)
-    slice_start = tensor_parallel_rank * slice_width
-    slice_end = min((tensor_parallel_rank + 1) * slice_width, width)
-    slice_obj = [slice(d) for d in tensor_shape]
-    slice_obj[split_dim] = slice(slice_start, slice_end)
-    return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
 
 
 def copy_weight(dst: Parameter, src: torch.Tensor):
@@ -458,8 +386,12 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         if module.use_custom_cublas_mm:
             output = torch.ops.trtllm.cublas_mm(input,
                                                 module.weight.t(),
@@ -467,6 +399,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
                                                 out_dtype=None)
         else:
             output = F.linear(input, module.weight, bias)
+        return output
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], out: torch.Tensor):
+        if module.use_custom_cublas_mm:
+            output = torch.ops.trtllm.cublas_mm_out(input, module.weight.t(),
+                                                    bias, out)
+        else:
+            if input.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                # torch.matmul(out=) does not support float8; fall back to non-out path.
+                return self.apply(module, input, bias)
+            torch.matmul(input, module.weight.t(), out=out)
+            if bias is not None:
+                out += bias
+            output = out
         return output
 
     def load_weights_vanilla(self,
@@ -554,9 +501,12 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
-
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
         original_shape = input.shape
@@ -578,6 +528,10 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             qinput = input
 
+        if output_buffer_kind == int(
+                OutputBufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
+
         # This op does not support bias now.
         if module.enable_cuda_core and qinput.shape[0] <= 8:
             # use cuda core for small m dimension
@@ -588,6 +542,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 scale_b=module.weight_scale,
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
             )
         else:
             output = torch.ops.trtllm.cublas_scaled_mm(
@@ -597,6 +553,8 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
                 scale_b=module.weight_scale,
                 bias=None,
                 out_dtype=module.dtype or input.dtype,
+                output_buffer_kind=output_buffer_kind,
+                group=group,
             )
 
         # Reshape output back to original shape (with out_features as last dim)
@@ -606,6 +564,15 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          group=group)
 
     def load_kv_scales(self, weights: List[Dict]):
         k_scale, v_scale = [], []
@@ -865,8 +832,12 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
 
         module.rebuild_tensor_metadata = {}
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
             qinput = input
@@ -879,16 +850,35 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 input)
 
         # This op does not support bias now.
+        if output_buffer_kind == int(
+                OutputBufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
+
         output = torch.ops.trtllm.fp8_rowwise_gemm(
             qinput,
             module.weight,
             cur_input_scale.float(),
             module.weight_scale,
             module.dtype or input.dtype,
+            output_buffer_kind=output_buffer_kind,
+            group=group,
         )
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_out(self, module: Linear, input: torch.Tensor,
+                  bias: Optional[torch.Tensor], out: torch.Tensor):
+        return self.apply(module, input, bias)
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          group=group)
 
     def _get_scale_name(self, weights: List[Dict]):
         # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
@@ -1265,8 +1255,12 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
-    def apply(self, module: Linear, input: torch.Tensor,
-              bias: Optional[torch.Tensor]):
+    def apply(self,
+              module: Linear,
+              input: torch.Tensor,
+              bias: Optional[torch.Tensor],
+              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # GEMM requires 2D. Only plain tensors support for now, skip for
         # tuple and Fp4QuantizedTensor.
@@ -1281,6 +1275,9 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
+        if output_buffer_kind == int(
+                OutputBufferKind.NCCL_WINDOW) and group is None:
+            group = module.mapping.tp_group if module.mapping is not None else None
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
             module.weight,
@@ -1288,8 +1285,9 @@ class NVFP4LinearMethod(LinearMethodBase):
             module.weight_scale,
             alpha,
             module.dtype,
-            to_userbuffers=False,
-            allowed_backends=allowed_backends_str)
+            output_buffer_kind=output_buffer_kind,
+            allowed_backends=allowed_backends_str,
+            group=group)
         # Take the dim of out_features if padded. Make sure the output is contiguous
         if output.shape[-1] > module.out_features:
             output = output[..., :module.out_features].contiguous()
@@ -1300,6 +1298,15 @@ class NVFP4LinearMethod(LinearMethodBase):
         if bias is not None:
             output = output + bias
         return output
+
+    def apply_window_output(self, module: Linear, input: torch.Tensor,
+                            bias: Optional[torch.Tensor]):
+        group = module.mapping.tp_group if module.mapping is not None else None
+        return self.apply(module,
+                          input,
+                          bias,
+                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          group=group)
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
                                bias: Optional[torch.Tensor], tp_rank: int,
@@ -2633,6 +2640,91 @@ class Linear(nn.Module):
                 output = output + lora_result
         return output
 
+    def _should_use_nccl_window_output(
+            self,
+            input: torch.Tensor,
+            all_reduce_params: Optional[AllReduceParams],
+            lora_params: Optional[dict],
+            allow_window_output: Optional[bool] = None) -> bool:
+        if mpi_disabled():
+            return False
+        if self.all_reduce is None:
+            return False
+        if not self.all_reduce.uses_nccl_window():
+            return False
+        if (all_reduce_params is not None
+                and not all_reduce_params.enable_allreduce
+                and not allow_window_output):
+            return False
+        if self.lora is not None and bool(lora_params):
+            return False
+        if not isinstance(input, torch.Tensor) or input.numel() == 0:
+            return False
+        return True
+
+    def _maybe_create_nccl_window_output(
+        self,
+        input: torch.Tensor,
+        all_reduce_params: Optional[AllReduceParams],
+        lora_params: Optional[dict],
+        allow_window_output: Optional[bool] = None,
+        output_dtype: Optional[torch.dtype] = None,
+    ) -> Optional[torch.Tensor]:
+        if not self._should_use_nccl_window_output(
+                input, all_reduce_params, lora_params, allow_window_output):
+            mpi_off = mpi_disabled()
+            has_all_reduce = self.all_reduce is not None
+            strategy = None if self.all_reduce is None else self.all_reduce.strategy
+            enable_allreduce = None if all_reduce_params is None else all_reduce_params.enable_allreduce
+            has_lora = self.lora is not None and bool(lora_params)
+            valid_input = isinstance(input, torch.Tensor) and input.numel() > 0
+            strategy_ok = strategy in (AllReduceStrategy.AUTO,
+                                       AllReduceStrategy.NCCL_SYMMETRIC)
+            reasons = []
+            if mpi_off:
+                reasons.append("mpi_disabled")
+            if not has_all_reduce:
+                reasons.append("no_all_reduce")
+            if has_all_reduce and not strategy_ok:
+                reasons.append("strategy_not_auto_or_nccl_symmetric")
+            if enable_allreduce is False and not allow_window_output:
+                reasons.append("enable_allreduce_false")
+            if has_lora:
+                reasons.append("lora_active")
+            if not valid_input:
+                reasons.append("invalid_input")
+            logger.debug(
+                "create_nccl_window_tensor skipped "
+                f"(reasons={reasons}, "
+                f"mpi_disabled={mpi_off}, has_all_reduce={has_all_reduce}, "
+                f"strategy={strategy}, enable_allreduce={enable_allreduce}, "
+                f"allow_window_output={allow_window_output}, "
+                f"has_lora={has_lora}, valid_input={valid_input})")
+            return None
+        output_shape = list(input.shape)
+        if not output_shape:
+            return None
+        output_shape[-1] = self.out_features
+        output_dtype = output_dtype or input.dtype
+        like_tensor = input
+        if output_dtype != input.dtype:
+            like_tensor = torch.empty((),
+                                      device=input.device,
+                                      dtype=output_dtype)
+        window = self.all_reduce.get_nccl_window_for_shape(
+            tuple(output_shape),
+            all_reduce_params=all_reduce_params,
+            like_tensor=like_tensor,
+        )
+        if window is None:
+            logger.debug(
+                "create_nccl_window_tensor skipped (get_nccl_window_for_shape "
+                "returned None; shape=%s, group=%s)",
+                tuple(output_shape),
+                tuple(self.mapping.tp_group),
+            )
+        return window
+
     def apply_linear_allreduce(self,
                                input,
                                bias,
@@ -2663,6 +2755,7 @@ class Linear(nn.Module):
         input: Union[torch.Tensor, Fp4QuantizedTensor],
         *,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         layer_idx: Optional[int] = None,
     ) -> torch.Tensor:
@@ -2680,8 +2773,50 @@ class Linear(nn.Module):
                     fuse_bias = self._maybe_fuse_bias_into_allreduce(
                         bias, all_reduce_params)
                     bias = None if fuse_bias else bias
-                    output = self.apply_linear(input, bias, lora_params,
-                                               layer_idx)
+                    window_out = None
+                    window_attempted = False
+                    window_path = "none"
+                    if hasattr(self.quant_method, "apply_window_output"
+                               ) and self._should_use_nccl_window_output(
+                                   input, all_reduce_params, lora_params,
+                                   allow_window_output):
+                        window_attempted = True
+                        window_path = "apply_window_output"
+                        output = self.quant_method.apply_window_output(
+                            self, input, bias)
+                        window_out = output
+                    elif hasattr(self.quant_method, "apply_out"):
+                        window_attempted = True
+                        window_path = "apply_out"
+                        window_out = self._maybe_create_nccl_window_output(
+                            input,
+                            all_reduce_params,
+                            lora_params,
+                            allow_window_output,
+                            output_dtype=self.dtype or input.dtype)
+                        if window_out is not None:
+                            # Pre-check float8: torch.matmul(out=) is unsupported,
+                            # so apply_out would fall back. Avoids data_ptr()
+                            # comparison inside the dynamo-traced region.
+                            if (not self.use_custom_cublas_mm
+                                    and input.dtype in (torch.float8_e4m3fn,
+                                                        torch.float8_e5m2)):
+                                window_out = None
+                                output = self.apply_linear(
+                                    input, bias, lora_params, layer_idx)
+                            else:
+                                output = self.quant_method.apply_out(
+                                    self, input, bias, window_out)
+                        else:
+                            output = self.apply_linear(input, bias, lora_params,
+                                                       layer_idx)
+                    else:
+                        output = self.apply_linear(input, bias, lora_params,
+                                                   layer_idx)
+                    window_success = window_attempted and window_out is not None
+                    logger.debug(
+                        "Linear GEMM NCCL window output buffer: %s (path=%s)",
+                        "success" if window_success else "failure", window_path)
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:

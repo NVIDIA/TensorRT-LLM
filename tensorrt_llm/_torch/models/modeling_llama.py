@@ -166,6 +166,7 @@ class Llama4Attention(Attention):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         skip_attn_scaling: bool = False,
     ):
 
@@ -191,7 +192,8 @@ class Llama4Attention(Attention):
             attn_output = Fp4QuantizedTensor(attn_output[0], attn_output[1])
 
         attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params)
+                                  all_reduce_params=all_reduce_params,
+                                  allow_window_output=allow_window_output)
 
         return attn_output
 
@@ -203,6 +205,7 @@ class Llama4Attention(Attention):
         attention_mask: PredefinedAttentionMask = PredefinedAttentionMask.
         CAUSAL,
         all_reduce_params: Optional[AllReduceParams] = None,
+        allow_window_output: Optional[bool] = None,
         lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
@@ -214,6 +217,7 @@ class Llama4Attention(Attention):
                 attn_metadata=attn_metadata,
                 attention_mask=attention_mask,
                 all_reduce_params=all_reduce_params,
+                allow_window_output=allow_window_output,
                 lora_params=lora_params,
                 **kwargs,
             )
@@ -222,7 +226,8 @@ class Llama4Attention(Attention):
                                       hidden_states=hidden_states,
                                       attn_metadata=attn_metadata,
                                       attention_mask=attention_mask,
-                                      all_reduce_params=all_reduce_params)
+                                      all_reduce_params=all_reduce_params,
+                                      allow_window_output=allow_window_output)
 
 
 class LlamaAttention(Attention):
@@ -344,11 +349,22 @@ class Llama4MoE(nn.Module):
 
         assert shared_output.size() == routed_output.size(
         ), f'unmatched tensor shape'
-        final_hidden_states = shared_output + routed_output
         if not self.enable_attention_dp and self.mapping.has_tp():
+            if isinstance(shared_output, torch.Tensor):
+                window = self.all_reduce.get_nccl_window_for_shape(
+                    shared_output.shape,
+                    all_reduce_params=final_all_reduce_params,
+                    like_tensor=shared_output,
+                )
+                final_hidden_states = torch.add(shared_output,
+                                                routed_output,
+                                                out=window)
+            else:
+                final_hidden_states = shared_output + routed_output
             final_hidden_states = self.all_reduce(
                 final_hidden_states, all_reduce_params=final_all_reduce_params)
-
+        else:
+            final_hidden_states = shared_output + routed_output
         return final_hidden_states
 
 
@@ -502,6 +518,9 @@ class Llama4DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            allow_window_output=(self.disable_attn_allreduce
+                                 and (self.fusion_config.PRE_MLP_FUSION
+                                      or self.fusion_config.PRE_MOE_FUSION)),
             **kwargs,
         )
 
@@ -541,6 +560,9 @@ class Llama4DecoderLayer(DecoderLayer):
             all_rank_num_tokens=attn_metadata.all_rank_num_tokens,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_feed_forward_allreduce),
+            allow_window_output=(self.disable_feed_forward_allreduce
+                                 and (self.fusion_config.POST_MLP_FUSION
+                                      or self.fusion_config.POST_MOE_FUSION)),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
         )
 
@@ -774,6 +796,8 @@ class LlamaDecoderLayer(DecoderLayer):
             attention_mask=self.attention_mask,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            allow_window_output=(self.disable_attn_allreduce
+                                 and self.PRE_MLP_FUSION),
             **kwargs,
         )
         # Fully Connected
@@ -827,6 +851,8 @@ class LlamaDecoderLayer(DecoderLayer):
             hidden_states,
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_mlp_allreduce),
+            allow_window_output=(self.disable_mlp_allreduce
+                                 and self.POST_MLP_FUSION),
             **kwargs,
         )
 

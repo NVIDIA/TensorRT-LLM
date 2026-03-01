@@ -17,6 +17,7 @@
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/cutlass_kernels/fp8_rowwise_gemm/fp8_rowwise_gemm.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 
@@ -27,7 +28,6 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
-#include <functional>
 #include <type_traits>
 #include <vector>
 
@@ -52,8 +52,8 @@ void check_input_dtypes(torch::Tensor const& mat, torch::Tensor const& matScale)
 
 template <typename OutputType>
 torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, bool to_userbuffers = false,
-    tkc::CutlassGemmConfig const* maybe_config = nullptr)
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     check_input_dtypes(mat1, mat1Scale);
     check_input_dtypes(mat2, mat2Scale);
@@ -71,20 +71,13 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
     auto const m = mat1.sizes()[0];
     auto const n = mat2.sizes()[0];
     auto const k = mat1.sizes()[1];
+    static constexpr auto outType
+        = std::is_same<OutputType, half>::value ? at::ScalarType::Half : at::ScalarType::BFloat16;
+    at::Tensor out = torch_ext::allocate_output(
+        {m, n}, outType, mat1.device(), static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
 
     static_assert(std::is_same<OutputType, half>::value || std::is_same<OutputType, __nv_bfloat16>::value,
         "Output type must be half or bfloat16");
-    static constexpr auto outType
-        = std::is_same<OutputType, half>::value ? at::ScalarType::Half : at::ScalarType::BFloat16;
-    at::Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor({m, n}, outType).first;
-    }
-    else
-    {
-        out = at::detail::empty_cuda({m, n}, outType, mat1.device(), std::nullopt);
-    }
 
     auto stream = at::cuda::getCurrentCUDAStream(mat1.get_device());
 
@@ -108,15 +101,16 @@ torch::Tensor fp8_rowwise_gemm_launch(torch::Tensor const& mat1, torch::Tensor c
 }
 
 template torch::Tensor fp8_rowwise_gemm_launch<half>(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, bool to_userbuffers = false,
-    tkc::CutlassGemmConfig const* maybe_config = nullptr);
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt);
 template torch::Tensor fp8_rowwise_gemm_launch<__nv_bfloat16>(torch::Tensor const& mat1, torch::Tensor const& mat2,
-    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, bool to_userbuffers = false,
-    tkc::CutlassGemmConfig const* maybe_config = nullptr);
+    torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, int64_t output_buffer_kind = 0,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt);
 
 torch::Tensor fp8_rowwise_gemm_dispatch(torch::Tensor const& mat1, torch::Tensor const& mat2,
     torch::Tensor const& mat1Scale, torch::Tensor const& mat2Scale, at::ScalarType outDataType,
-    bool to_userbuffers = false, tkc::CutlassGemmConfig const* maybe_config = nullptr)
+    int64_t output_buffer_kind = 0, tkc::CutlassGemmConfig const* maybe_config = nullptr,
+    c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     // The functional version of this op does not do any profiling; use the profiler class below instead for
     // better performance.
@@ -124,10 +118,11 @@ torch::Tensor fp8_rowwise_gemm_dispatch(torch::Tensor const& mat1, torch::Tensor
     switch (outDataType)
     {
     case at::ScalarType::Half:
-        return fp8_rowwise_gemm_launch<half>(mat1, mat2, mat1Scale, mat2Scale, to_userbuffers, maybe_config);
+        return fp8_rowwise_gemm_launch<half>(mat1, mat2, mat1Scale, mat2Scale, output_buffer_kind, maybe_config, group);
 #ifdef ENABLE_BF16
     case at::ScalarType::BFloat16:
-        return fp8_rowwise_gemm_launch<__nv_bfloat16>(mat1, mat2, mat1Scale, mat2Scale, to_userbuffers, maybe_config);
+        return fp8_rowwise_gemm_launch<__nv_bfloat16>(
+            mat1, mat2, mat1Scale, mat2Scale, output_buffer_kind, maybe_config, group);
 #endif
     default: TORCH_CHECK(false, "Unsupported output dtype for FP8 block scaling GEMM");
     }
@@ -157,7 +152,8 @@ public:
     }
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-        at::Tensor const& mat2Scale, bool to_userbuffers, int64_t configIdx) const
+        at::Tensor const& mat2Scale, int64_t output_buffer_kind, int64_t configIdx,
+        c10::optional<torch::List<int64_t>> group = c10::nullopt) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;
         if (configIdx != -1)
@@ -165,7 +161,8 @@ public:
             TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs());
             config = &mConfigs.at(configIdx);
         }
-        return fp8_rowwise_gemm_dispatch(mat1, mat2, mat1Scale, mat2Scale, mOutputDtype, to_userbuffers, config);
+        return fp8_rowwise_gemm_dispatch(
+            mat1, mat2, mat1Scale, mat2Scale, mOutputDtype, output_buffer_kind, config, group);
     }
 
     at::ScalarType getOutputDtype() const
