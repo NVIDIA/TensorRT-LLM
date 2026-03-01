@@ -10,7 +10,8 @@ import uuid
 from abc import ABC, abstractmethod
 from collections.abc import AsyncGenerator
 from copy import copy
-from typing import Any, List, Literal, Optional, OrderedDict, Tuple, Union
+from typing import (Any, List, Literal, Optional, OrderedDict, Tuple, TypeAlias,
+                    Union)
 
 from openai.types.responses import (ResponseCompletedEvent,
                                     ResponseContentPartAddedEvent,
@@ -55,6 +56,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionMessageParam,
                                                 FunctionDefinition,
                                                 OpenAIBaseModel,
                                                 ReasoningAssistantMessage,
+                                                ResponseInputItemParam,
                                                 ResponseInputOutputItem,
                                                 ResponsesRequest,
                                                 ResponsesResponse,
@@ -173,6 +175,10 @@ def _parse_response_input(
     return msg
 
 
+ResponseStoreItem: TypeAlias = tuple[ResponsesResponse,
+                                     Union[str, list[ResponseInputOutputItem]]]
+
+
 class ConversationHistoryStore:
 
     def __init__(self, resp_capacity: int = 16, max_conversations=32):
@@ -185,7 +191,7 @@ class ConversationHistoryStore:
 
         self.responses_lock = asyncio.Lock()
         # Responses store, responses stored more than response_capacity will be removed in LRU policy.
-        self.responses: OrderedDict[str, ResponsesResponse] = OrderedDict()
+        self.responses: OrderedDict[str, ResponseStoreItem] = OrderedDict()
 
         self.conversations_lock = asyncio.Lock()
         # Conversations store, conversations stored more than conversation_capacity will be removed in LRU policy.
@@ -206,14 +212,24 @@ class ConversationHistoryStore:
                 return None
 
             self.responses.move_to_end(resp_id)
-            return self.responses.get(resp_id)
+            return self.responses.get(resp_id, (None, None))[0]
 
-    async def store_response(self,
-                             resp: ResponsesResponse,
-                             resp_msgs: Optional[
-                                 Union[list[Message],
-                                       list[ChatCompletionMessageParam]]] = [],
-                             prev_resp_id: Optional[str] = None) -> None:
+    async def load_request_inputs(
+            self, resp_id: str) -> Union[str, list[ResponseInputOutputItem]]:
+        _responses_debug_log(
+            f"ConversationHistoryStore loading request inputs: {resp_id}")
+        async with self.responses_lock:
+            return self.responses.get(resp_id, (None, None))[1]
+
+    async def store_response(
+        self,
+        resp: ResponsesResponse,
+        resp_msgs: Optional[Union[list[Message],
+                                  list[ChatCompletionMessageParam]]] = [],
+        prev_resp_id: Optional[str] = None,
+        request_inputs: Optional[Union[str,
+                                       list[ResponseInputItemParam]]] = None
+    ) -> None:
         """
         Store the response and its messages(model output messages) in the conversation store. If the previous response id is provided,
         the messages will be appended to the conversation. Otherwise, a new conversation will be created.
@@ -235,7 +251,7 @@ class ConversationHistoryStore:
                 _responses_debug_log(f" -> {msg}")
 
         async with self.responses_lock:
-            self.responses[resp_id] = resp
+            self.responses[resp_id] = (resp, request_inputs)
             if len(self.responses) > self.response_capacity:
                 self._pop_response()
 
@@ -683,6 +699,43 @@ def _response_output_item_to_chat_completion_message(
         case _:
             raise ValueError(
                 f"Unsupported input item type: {item_type}, item: {item}")
+
+
+async def create_list_input_response(
+        response_id: str, store: ConversationHistoryStore) -> dict[str, Any]:
+    resp = {
+        "object": "list",
+        "data": [],
+        "first_id": "",
+        "last_id": "",
+        "has_more": False
+    }
+
+    input_list = await store.load_request_inputs(response_id)
+    if input_list is None:
+        return resp
+
+    _responses_debug_log(f"GET: input_list: {input_list}")
+
+    if isinstance(input_list, str):
+        input_list = [{
+            "id": f"msg_{_random_uuid()}",
+            "type": "message",
+            "role": "user",
+            "content": [{
+                "type": "input_text",
+                "text": input_list,
+            }],
+        }]
+    else:
+        input_list = [item.model_dump() for item in input_list]
+
+    resp["data"] = input_list
+    if len(input_list) > 0:
+        resp["first_id"] = input_list[0].get("id", "")
+        resp["last_id"] = input_list[-1].get("id", "")
+
+    return resp
 
 
 async def _create_input_messages(
@@ -1164,7 +1217,8 @@ async def create_response(
     if enable_store and request.store:
         await conversation_store.store_response(resp=response,
                                                 resp_msgs=output_messages,
-                                                prev_resp_id=prev_response_id)
+                                                prev_resp_id=prev_response_id,
+                                                request_inputs=request.input)
 
     return response
 
