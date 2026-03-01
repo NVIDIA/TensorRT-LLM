@@ -6,6 +6,7 @@ from utils import add_common_args, compute_str_match_rate
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.runtime import MultimodalModelRunner
 
 
@@ -98,6 +99,7 @@ def print_result(model, input_text, output_text, args):
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("run.py")
     os.environ["TOKENIZERS_PARALLELISM"] = "false"
     parser = argparse.ArgumentParser()
     parser = add_common_args(parser)

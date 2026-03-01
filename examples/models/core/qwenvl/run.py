@@ -25,6 +25,7 @@ from vit_onnx_trt import Preprocss
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (ModelConfig, SamplingConfig, Session,
@@ -524,6 +525,7 @@ def vit_process(image_path, vit_engine_path, stream):
 
 
 if __name__ == "__main__":
+    emit_engine_arch_deprecation("run.py")
     args = parse_arguments()
     stream = torch.cuda.current_stream().cuda_stream
     tensorrt_llm.logger.set_level(args.log_level)

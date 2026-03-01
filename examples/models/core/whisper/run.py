@@ -31,6 +31,7 @@ from whisper_utils import (log_mel_spectrogram, store_transcripts,
 
 import tensorrt_llm
 import tensorrt_llm.logger as logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import (str_dtype_to_torch, str_dtype_to_trt,
                                  trt_dtype_to_torch)
 from tensorrt_llm.bindings import GptJsonConfig
@@ -558,6 +559,7 @@ def decode_dataset(
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("run.py")
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
     model = WhisperTRTLLM(args.engine_dir, args.debug, args.assets_dir,

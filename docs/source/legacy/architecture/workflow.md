@@ -1,5 +1,10 @@
 # TensorRT-LLM Build Workflow
 
+> [!WARNING]
+> This page describes the **legacy** TensorRT engine-build workflow.
+> For new projects, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 ## Overview
 
 

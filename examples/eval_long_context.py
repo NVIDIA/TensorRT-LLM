@@ -44,6 +44,7 @@ from utils import (DEFAULT_HF_MODEL_DIRS, DEFAULT_PROMPT_TEMPLATES,
 
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.logger import logger
 from tensorrt_llm.runtime import PYTHON_BINDINGS, ModelRunner
 
@@ -147,6 +148,7 @@ def parse_input(tokenizer,
 
 
 def main(args):
+    emit_engine_arch_deprecation("eval_long_context.py")
     # model_name = "yarn-mistral"
     runtime_rank = tensorrt_llm.mpi_rank()
     logger.set_level(args.log_level)
