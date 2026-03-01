@@ -1,0 +1,18 @@
+name: Auto Assign PR to Author
+
+on:
+  pull_request_target:
+    types: [opened]
+
+jobs:
+  assign-author:
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # Required to modify the PR
+    steps:
+      - name: Assign PR to Author
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          AUTHOR: ${{ github.actor }}
+        run: gh pr edit $PR_URL --add-assignee $AUTHOR
