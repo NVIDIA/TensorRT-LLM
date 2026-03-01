@@ -17,8 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager

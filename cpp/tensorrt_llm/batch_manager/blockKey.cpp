@@ -23,7 +23,7 @@ inline uint8_t getNthByte(tensorrt_llm::runtime::SizeType32 hashPart, uint8_t by
 {
     return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
 }
-}
+} // namespace
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
