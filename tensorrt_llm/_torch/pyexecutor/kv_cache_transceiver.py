@@ -9,7 +9,6 @@ from tensorrt_llm.bindings import WorldConfig
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
-from .context_progress import ContextProgress
 from .llm_request import LlmRequest
 from .mamba_cache_manager import MambaCacheManager
 from .resource_manager import KVCacheManager
@@ -110,22 +109,6 @@ class KvCacheTransceiver(ABC):
     @abstractmethod
     def respond_and_send_async(self, req: LlmRequest):
         raise NotImplementedError
-
-    def respond_and_send_layer_wise(self, requests: List[LlmRequest],
-                                    context_progress: ContextProgress):
-        """Start layer-wise async KV cache send for context requests.
-
-        Unlike respond_and_send_async (which sends after the full forward),
-        this starts a background transfer that waits on each layer's
-        ContextProgress event before sending that layer's KV cache.
-        This overlaps compute with KV transfer for CPP.
-
-        Default implementation falls back to per-request async send
-        after all layers complete.
-        """
-        for req in requests:
-            context_progress.wait(context_progress.num_layers - 1)
-            self.respond_and_send_async(req)
 
     @abstractmethod
     def request_and_receive_sync(self, req: LlmRequest):

@@ -919,7 +919,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
-    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(60000)
     @skip_pre_hopper
     @pytest.mark.parametrize("ctx_pp_size", [2, 4], ids=["ctx_pp2", "ctx_pp4"])

@@ -1734,7 +1734,6 @@ class DeepseekV3Model(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
-        context_progress=None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1757,8 +1756,6 @@ class DeepseekV3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
-            if context_progress is not None:
-                context_progress.record_event(idx)
 
         # With CP helix, the last layer's reduce-scatter leaves each rank
         # with only its chunk of tokens.  AllGather restores the full token

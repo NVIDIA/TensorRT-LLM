@@ -3469,8 +3469,7 @@ class PyTorchModelEngine(ModelEngine):
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
                 spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
-                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None,
-                context_progress=None):
+                req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         draft_kv_cache_manager = self._get_draft_kv_cache_manager(
@@ -3521,8 +3520,7 @@ class PyTorchModelEngine(ModelEngine):
                         inputs, scheduled_requests)
                 else:
                     return self._forward_step(
-                        inputs, gather_ids, gather_context_logits,
-                        context_progress=context_progress)
+                        inputs, gather_ids, gather_context_logits)
         with self.cuda_graph_runner.pad_batch(
                 scheduled_requests, resource_manager,
                 self.runtime_draft_len) as padded_requests:
@@ -3558,8 +3556,7 @@ class PyTorchModelEngine(ModelEngine):
                     # Fallback to eager execution if graph was not used
                     with MoeLoadBalancerIterContext(moe_load_balancer):
                         outputs = self._forward_step(
-                            inputs, gather_ids, gather_context_logits,
-                            context_progress=context_progress)
+                            inputs, gather_ids, gather_context_logits)
                 else:
                     if self.cuda_graph_runner.needs_capture(key):
 
@@ -3616,14 +3613,10 @@ class PyTorchModelEngine(ModelEngine):
     def _forward_step(self,
                       inputs: Dict[str, Any],
                       gather_ids: Optional[torch.Tensor],
-                      gather_context_logits: bool = False,
-                      context_progress=None) -> Dict[str, Any]:
+                      gather_context_logits: bool = False) -> Dict[str, Any]:
         inputs = self._preprocess_inputs(inputs)
         if inputs.get('spec_metadata', None):
             gather_ids = inputs['spec_metadata'].gather_ids
-
-        if context_progress is not None:
-            inputs['context_progress'] = context_progress
 
         # For simplicity, just return all the the logits if we have special gather_ids
         # from speculative decoding.
