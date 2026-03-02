@@ -373,6 +373,47 @@ def _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, devi
     return kv_cache_manager
 
 
+def _build_kv_cache_manager_with_cached(
+    mapping, sparse_config, model_config, cached_per_seq, new_per_seq, device
+):
+    """Build a DSACacheManager with blocks allocated for cached + new tokens.
+
+    The cache manager allocates enough blocks for the full sequence
+    (cached + new tokens per request), which is needed so that
+    DSAMetadata.prepare() can compute correct kv_lens and
+    num_ctx_cached_tokens.
+    """
+    total_per_seq = [c + n for c, n in zip(cached_per_seq, new_per_seq)]
+    max_seqlen = max(total_per_seq)
+    max_tokens = 16384
+
+    cache_dtype = torch.bfloat16
+    kv_cache_manager = DSACacheManager(
+        KvCacheConfig(max_tokens=max_tokens, enable_block_reuse=False),
+        tensorrt_llm.bindings.internal.batch_manager.CacheType.SELFKONLY,
+        num_layers=NUM_LAYERS,
+        num_kv_heads=1,
+        head_dim=KV_LORA_RANK + QK_ROPE_HEAD_DIM,
+        tokens_per_block=TOKENS_PER_BLOCK,
+        max_seq_len=max_seqlen,
+        max_batch_size=len(cached_per_seq),
+        mapping=mapping,
+        dtype=str_dtype_to_binding(torch_dtype_to_str(cache_dtype)),
+        sparse_attn_config=sparse_config,
+        model_config=model_config,
+    )
+
+    for req_idx, total in enumerate(total_per_seq):
+        kv_cache_manager.add_dummy_requests(
+            request_ids=[req_idx],
+            token_nums=[total],
+            is_gen=False,
+            prepare_resource=True,
+        )
+
+    return kv_cache_manager
+
+
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
 @pytest.mark.parametrize("batch_name,seq_lens", BATCH_SPECS, ids=[b[0] for b in BATCH_SPECS])
 def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
@@ -818,6 +859,201 @@ def test_short_mha_agrees_with_absorption_path():
     kv_cache_manager_absorption.shutdown()
 
 
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
+def test_short_mha_disabled_with_cached_tokens():
+    """Verify short MHA path is NOT used when cached tokens exist.
+
+    When a sequence has cached tokens from previous chunks/turns,
+    forward_context_default cannot attend over them, so the short MHA
+    path must be bypassed regardless of the new-token count vs threshold.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    rope_config = _make_rope_config()
+
+    cached_per_seq = [200]
+    new_per_seq = [100]
+    seq_lens = new_per_seq
+    # Threshold exceeds new tokens alone — would trigger short MHA
+    # without the cached-token guard.
+    threshold = 512
+
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
+    _init_mla_weights(mla)
+
+    kv_cache_manager = _build_kv_cache_manager_with_cached(
+        mapping,
+        sparse_config,
+        model_config,
+        cached_per_seq,
+        new_per_seq,
+        device,
+    )
+    AttentionCls = get_attention_backend("TRTLLM", sparse_config)
+
+    total_new = sum(new_per_seq)
+    num_contexts = len(seq_lens)
+    q = torch.randn(total_new, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv = torch.randn(total_new, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe = torch.randn(total_new, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
+    hidden_states = torch.randn(total_new, HIDDEN_SIZE, dtype=dtype, device=device)
+    qr = torch.randn(total_new, Q_LORA_RANK, dtype=dtype, device=device)
+    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+    # Position IDs offset by cached length.
+    position_ids = torch.cat(
+        [
+            torch.arange(c, c + n, device=device, dtype=torch.int32)
+            for c, n in zip(cached_per_seq, new_per_seq)
+        ]
+    )
+    output = torch.empty(total_new, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
+
+    attn_metadata = AttentionCls.Metadata(
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+        request_ids=list(range(num_contexts)),
+        max_num_requests=num_contexts,
+        num_contexts=num_contexts,
+        prompt_lens=seq_lens,
+        max_num_tokens=total_new,
+        kv_cache_manager=kv_cache_manager,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=cached_per_seq,
+        ),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    attn_metadata.prepare()
+
+    # Key assertions: cached tokens present and new tokens alone < threshold.
+    assert attn_metadata.num_ctx_cached_tokens == sum(cached_per_seq)
+    assert total_new <= threshold
+
+    # Absorption fallback needs topk_indices from the indexer.
+    topk_indices = mla.mqa.indexer(
+        qr,
+        hidden_states,
+        attn_metadata,
+        position_ids,
+        indexer_k=mla.mqa.indexer.wk(hidden_states),
+    )
+
+    mla.forward_context_dsa(
+        q=q,
+        compressed_kv=compressed_kv,
+        k_pe=k_pe,
+        attn_metadata=attn_metadata,
+        output=output,
+        latent_cache=latent_cache,
+        topk_indices=topk_indices,
+        position_ids=position_ids,
+    )
+
+    assert torch.isfinite(output).all(), "Output contains non-finite values"
+    print(f"[cached_tokens] PASSED: absorption path ran, output mean={output.abs().mean():.4f}")
+
+    kv_cache_manager.shutdown()
+
+
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
+def test_short_mha_disabled_with_cached_tokens_multi_seq():
+    """Multi-sequence variant: short MHA disabled when any request has cache.
+
+    Two sequences with different cached/new counts; total new tokens
+    are below the threshold but cached tokens exist, so the absorption
+    path must be used.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    rope_config = _make_rope_config()
+
+    cached_per_seq = [128, 64]
+    new_per_seq = [32, 16]
+    seq_lens = new_per_seq
+    threshold = 512
+
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
+    _init_mla_weights(mla)
+
+    kv_cache_manager = _build_kv_cache_manager_with_cached(
+        mapping,
+        sparse_config,
+        model_config,
+        cached_per_seq,
+        new_per_seq,
+        device,
+    )
+    AttentionCls = get_attention_backend("TRTLLM", sparse_config)
+
+    total_new = sum(new_per_seq)
+    num_contexts = len(seq_lens)
+    q = torch.randn(total_new, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv = torch.randn(total_new, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe = torch.randn(total_new, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
+    hidden_states = torch.randn(total_new, HIDDEN_SIZE, dtype=dtype, device=device)
+    qr = torch.randn(total_new, Q_LORA_RANK, dtype=dtype, device=device)
+    latent_cache = torch.cat([compressed_kv, k_pe], dim=-1)
+    position_ids = torch.cat(
+        [
+            torch.arange(c, c + n, device=device, dtype=torch.int32)
+            for c, n in zip(cached_per_seq, new_per_seq)
+        ]
+    )
+    output = torch.empty(total_new, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
+
+    attn_metadata = AttentionCls.Metadata(
+        seq_lens=torch.tensor(seq_lens, dtype=torch.int),
+        request_ids=list(range(num_contexts)),
+        max_num_requests=num_contexts,
+        num_contexts=num_contexts,
+        prompt_lens=seq_lens,
+        max_num_tokens=total_new,
+        kv_cache_manager=kv_cache_manager,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=cached_per_seq,
+        ),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    attn_metadata.prepare()
+
+    assert attn_metadata.num_ctx_cached_tokens == sum(cached_per_seq)
+    assert total_new <= threshold
+
+    topk_indices = mla.mqa.indexer(
+        qr,
+        hidden_states,
+        attn_metadata,
+        position_ids,
+        indexer_k=mla.mqa.indexer.wk(hidden_states),
+    )
+
+    mla.forward_context_dsa(
+        q=q,
+        compressed_kv=compressed_kv,
+        k_pe=k_pe,
+        attn_metadata=attn_metadata,
+        output=output,
+        latent_cache=latent_cache,
+        topk_indices=topk_indices,
+        position_ids=position_ids,
+    )
+
+    assert torch.isfinite(output).all(), "Output contains non-finite values"
+    print(
+        f"[cached_tokens_multi] PASSED: absorption path ran, output mean={output.abs().mean():.4f}"
+    )
+
+    kv_cache_manager.shutdown()
+
+
 if __name__ == "__main__":
     for batch_name, seq_lens in BATCH_SPECS:
         test_forward_context_short_mha(batch_name, seq_lens)
@@ -825,4 +1061,6 @@ if __name__ == "__main__":
     test_short_mha_boundary_threshold_equals_max_seq()
     test_short_mha_not_triggered_when_seq_exceeds_threshold()
     test_short_mha_agrees_with_absorption_path()
+    test_short_mha_disabled_with_cached_tokens()
+    test_short_mha_disabled_with_cached_tokens_multi_seq()
     print("All tests passed!")
