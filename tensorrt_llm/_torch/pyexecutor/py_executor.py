@@ -1533,7 +1533,7 @@ class PyExecutor:
         tag = PPCommTag.SAMPLE_STATE
         microbatch_id = executed_batch.microbatch_id
         sample_state = executed_batch.sample_state
-        requests = sample_state.scheduled_requests.all_requests()
+        requests = sample_state.requests
 
         if not self.dist.is_last_pp_rank:
             # Receive tokens from previous pp rank (w.r.t model forward direction)
@@ -1568,13 +1568,9 @@ class PyExecutor:
         finished_requests = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
-                scheduled_requests = executed_batch.scheduled_requests
-                sampling_requests = ScheduledRequests()
-                sampling_requests.context_requests_last_chunk = scheduled_requests.context_requests_last_chunk
-                sampling_requests.generation_requests = scheduled_requests.generation_requests
-                executed_batch.sample_state.scheduled_requests = sampling_requests
                 self._update_requests(executed_batch.sample_state)
 
+                scheduled_requests = executed_batch.scheduled_requests
                 if self.kv_cache_transceiver:
                     finished_ctx_reqs = scheduled_requests.context_requests_last_chunk
                     self._send_kv_async(finished_ctx_reqs)
@@ -2329,8 +2325,9 @@ class PyExecutor:
         sampler_event = torch.cuda.Event()
         sampler_event.record()
         self._update_request_states(scheduled_batch)
+        sampling_requests = scheduled_batch.context_requests_last_chunk + scheduled_batch.generation_requests
         return self.sampler.SampleState(
-            scheduled_requests=scheduled_batch,
+            requests=sampling_requests,
             sampler_event=SamplerEvent(cuda_event=sampler_event),
         )
 

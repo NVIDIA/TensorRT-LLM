@@ -174,22 +174,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
 
-        # Handle context requests (prefill phase)
-        for req in state.scheduled_requests.context_requests:
-            if (
-                req.state == LlmRequestState.GENERATION_COMPLETE
-                or req.context_remaining_length != 0
-            ):
-                continue
-            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
-            TorchSampler._handle_stop_criteria(
-                req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
-            )
-            self._request_common_handling(req, next_draft_tokens_list)
-
-        # Handle generation requests (decode phase)
-        for req in state.scheduled_requests.generation_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE:
+        for req in state.requests:
+            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
@@ -259,7 +245,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 request.py_draft_tokens = [1] * self.draft_len
 
         return SampleStateSpec(
-            scheduled_requests=scheduled_requests,
+            requests=scheduled_requests.all_requests(),
             device=device_tensors,
             host=host_tensors,
             sampler_event=sampler_event,
