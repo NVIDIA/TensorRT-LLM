@@ -38,23 +38,27 @@ def _load_ad_config(config_name):
         return yaml.safe_load(f)
 
 
-# Mapping from model_id to (quant_algo, kv_cache_quant_algo) for accuracy
-# threshold lookups. AutoDeploy infers quantization from the checkpoint, but
-# quant_config must still be set explicitly so that the accuracy harness can
-# look up the correct per-quantization thresholds.
-_QUANT_ALGO_BY_MODEL_ID = {
-    "fp8": (QuantAlgo.FP8, QuantAlgo.FP8),
-    "nvfp4": (QuantAlgo.NVFP4, QuantAlgo.FP8),
-}
-
-
 def _set_quant_config(llm, model_id: str) -> None:
     """Set quant_config on *llm* based on *model_id* so the accuracy harness
     can resolve the correct thresholds."""
-    if model_id in _QUANT_ALGO_BY_MODEL_ID:
-        quant_algo, kv_cache_quant_algo = _QUANT_ALGO_BY_MODEL_ID[model_id]
-        llm.args.quant_config.quant_algo = quant_algo
-        llm.args.quant_config.kv_cache_quant_algo = kv_cache_quant_algo
+    QUANT_ALGO_BY_MODEL_ID = {
+        "fp8": {
+            "weights": QuantAlgo.FP8,
+            "kv_cache": QuantAlgo.FP8
+        },
+        "nvfp4": {
+            "weights": QuantAlgo.NVFP4,
+            "kv_cache": QuantAlgo.FP8
+        },
+    }
+
+    if model_id in QUANT_ALGO_BY_MODEL_ID:
+        llm.args.quant_config.quant_algo = QUANT_ALGO_BY_MODEL_ID[model_id][
+            "weights"]
+        llm.args.quant_config.kv_cache_quant_algo = QUANT_ALGO_BY_MODEL_ID[
+            model_id]["kv_cache"]
+    else:
+        print("Could not match quantization scheme, using default values")
 
 
 def print_memory_usage(label: str):
