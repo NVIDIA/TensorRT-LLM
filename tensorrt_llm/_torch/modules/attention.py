@@ -1455,10 +1455,10 @@ class MLA(nn.Module):
 
         # Check if the short-seq MHA path will handle context, in which case
         # the indexer (topk_indices) is not needed for context tokens.
-        # Disable when cached tokens exist: forward_context_default does not
-        # attend over cached KV from previous chunks/turns.
-        has_cached_ctx = getattr(attn_metadata, 'num_ctx_cached_tokens', 0) > 0
-        use_short_mha_for_ctx = (num_contexts > 0 and not has_cached_ctx
+        # The MHA path handles cached tokens via forward_context(), which
+        # dispatches to forward_context_with_cached_kv or
+        # forward_context_with_chunked_prefill as needed.
+        use_short_mha_for_ctx = (num_contexts > 0
                                  and self._should_use_short_mha(
                                      num_ctx_tokens, position_ids))
 
@@ -1579,9 +1579,10 @@ class MLA(nn.Module):
                               position_ids: Optional[torch.Tensor]) -> bool:
         """Check if the short-seq MHA optimization should be used for context.
 
-        This checks only token count vs threshold. Callers MUST separately
-        verify that there are no cached tokens (num_ctx_cached_tokens == 0),
-        because forward_context_default does not attend over cached KV.
+        This checks only new token count vs threshold.  When cached tokens
+        exist, the caller should route through forward_context() which
+        dispatches to the appropriate cached-KV handler
+        (forward_context_with_cached_kv or forward_context_with_chunked_prefill).
         """
         return (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
                 and self.mapping.cp_size == 1 and position_ids is not None
@@ -1619,13 +1620,12 @@ class MLA(nn.Module):
         # using kv_b_proj expansion + standard attention instead.
         # See __init__ comment for rationale. topk_indices is not used
         # because dense attention is faster than sparse routing at this scale.
+        # forward_context() handles cached tokens by dispatching to
+        # forward_context_with_cached_kv or forward_context_with_chunked_prefill.
         num_ctx_tokens = q.shape[0]
-        has_cached = getattr(attn_metadata, 'num_ctx_cached_tokens', 0) > 0
-        if not has_cached and self._should_use_short_mha(
-                num_ctx_tokens, position_ids):
-            return self.forward_context_default(q, compressed_kv, k_pe,
-                                                position_ids, attn_metadata,
-                                                output, latent_cache)
+        if self._should_use_short_mha(num_ctx_tokens, position_ids):
+            return self.forward_context(q, compressed_kv, k_pe, position_ids,
+                                        attn_metadata, output, latent_cache)
 
         if get_sm_version() >= 100:
             return self.forward_absorption_context(q,
