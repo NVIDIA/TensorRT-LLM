@@ -533,8 +533,8 @@ class SequenceInfo:
         else:
             bs, sl = 1, self.total_num_tokens
 
-        # truncate to effective tokens now, reshape, and return
-        return tnsr[: bs * sl].view(bs, sl, *tnsr.shape[1:])
+        # truncate to total tokens now, reshape, and return
+        return tnsr[: self.total_num_tokens].view(bs, sl, *tnsr.shape[1:])
 
     def _get_arg(self, name: str) -> torch.Tensor:
         """Get the argument from the input buffer either on device or host."""

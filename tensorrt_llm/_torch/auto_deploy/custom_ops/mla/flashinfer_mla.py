@@ -545,11 +545,8 @@ def flashinfer_mla_with_cache(
         last_page_len[:num_seq],
     )
 
-    # Pre-allocate output
-    if num_prefill > 0 and num_decode > 0:
-        y = torch.empty(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
-    else:
-        y = None
+    # Pre-allocate output as zeros so padding positions are clean
+    y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
 
     # =========================================================================
     # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
@@ -681,10 +678,7 @@ def flashinfer_mla_with_cache(
                 v_prefill,
             )
 
-        if y is not None:
-            y[:num_prefill_tokens] = y_prefill
-        else:
-            y = y_prefill
+        y[:num_prefill_tokens] = y_prefill
 
     # =========================================================================
     # DECODE phase: Use BatchMLAPagedAttentionWrapper with paged compressed KV
@@ -752,19 +746,7 @@ def flashinfer_mla_with_cache(
         # y_decode: [num_decode, N, v_head_dim]
         y_decode = torch.einsum("bnk,nvk->bnv", y_decode_compressed, w_v)
 
-        if y is not None:
-            y[num_prefill_tokens:num_total_tokens] = y_decode
-        else:
-            y = y_decode
-
-    # piecewise bucket padding can make b*s > num_total_tokens.
-    # pad/truncate output to [b*s, ...] before view so padded slots are deterministic.
-    if y.shape[0] < bs:
-        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
-        y_padded[: y.shape[0]] = y
-        y = y_padded
-    elif num_total_tokens < bs:
-        y[num_total_tokens:].zero_()
+        y[num_prefill_tokens:num_total_tokens] = y_decode
 
     return y.view(b, s, num_heads, v_head_dim)
 

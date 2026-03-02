@@ -377,11 +377,8 @@ def flashinfer_mha_with_cache(
         kv_layout=_GlobalFlashInferPlanner.kv_layout,
     )
 
-    # check if we need to re-combine outputs
-    if num_prefill > 0 and num_decode > 0:
-        y = torch.empty_like(q)
-    else:
-        y = None
+    # Pre-allocate output as zeros so padding positions are clean
+    y = torch.zeros_like(q)
 
     # now run split prefill, decode
     if num_prefill > 0:
@@ -414,10 +411,7 @@ def flashinfer_mha_with_cache(
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
         )
-        if y is not None:
-            y[:num_prefill_tokens] = y_prefill
-        else:
-            y = y_prefill
+        y[:num_prefill_tokens] = y_prefill
 
     if num_decode > 0:
         q_decode = q[num_prefill_tokens:num_total_tokens]
@@ -448,24 +442,7 @@ def flashinfer_mha_with_cache(
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
         )
-        if y is not None:
-            y[num_prefill_tokens:num_total_tokens] = y_decode
-        else:
-            y = y_decode
-
-    # Reshape to match input shape [b, s, ...]
-    # y has shape [num_total_tokens, n_heads, head_dim] (pure) or [b*s, n_heads, head_dim] (mixed).
-    # q_shape_og is [b, s, ...] which may be padded (bucketed) for piecewise CG.
-    # Pad with zeros if y is smaller than the padded shape, so downstream ops
-    # (o_proj, residual add, LayerNorm) don't see garbage in padding positions.
-    bs = b * s
-    if y.shape[0] < bs:
-        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
-        y_padded[: y.shape[0]] = y
-        y = y_padded
-    elif num_total_tokens < bs:
-        # Mixed batch: y is already [b*s, ...] but positions [num_total_tokens:] are uninitialized
-        y[num_total_tokens:].zero_()
+        y[num_prefill_tokens:num_total_tokens] = y_decode
 
     return y.view(q_shape_og)
 

@@ -341,8 +341,8 @@ def torch_backend_mha_with_cache(
 
     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
 
-    # Preallocate output tensor
-    y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
+    # Preallocate output tensor (zeros so padding positions are clean)
+    y = q.new_zeros(*bs_view, num_heads, v_head_dim).contiguous()
 
     # Compute attention
     if s == 1:
@@ -379,12 +379,6 @@ def torch_backend_mha_with_cache(
             sliding_window_size,
             sinks,
         )
-
-    # Zero padding positions so downstream ops don't see garbage (piecewise CG)
-    num_total_tokens = num_prefill_tokens + num_decode
-    bs = b * s
-    if num_total_tokens < bs:
-        y[num_total_tokens:].zero_()
 
     return y.view(*output_shape)
 

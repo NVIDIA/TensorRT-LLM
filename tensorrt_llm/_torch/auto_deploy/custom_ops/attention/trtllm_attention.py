@@ -336,8 +336,9 @@ def trtllm_mha_with_cache(
     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
-    # Prepare output
-    output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
+    # Prepare output (pre-allocate at full padded size so padding positions are clean zeros)
+    total_padded_tokens = q_shape_og[0] * q_shape_og[1]
+    output = torch.zeros(total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
@@ -371,7 +372,7 @@ def trtllm_mha_with_cache(
         qkv_fused,  # q (actually fused QKV)
         None,  # k (None when using fused QKV)
         None,  # v (None when using fused QKV)
-        output,  # output
+        output[:num_tokens],  # output
         None,  # output_sf (NVFP4)
         _GlobalTrtllmPlanner.workspace,  # workspace (module-level, like flashinfer)
         sequence_length,  # sequence_length
@@ -448,15 +449,6 @@ def trtllm_mha_with_cache(
         None,  # quant_q_buffer
     )
 
-    # If input was padded (piecewise CG), embed the real output into a padded
-    # tensor so downstream static segments see the expected bucket-sized shape.
-    total_padded_tokens = q_shape_og[0] * q_shape_og[1]
-    if total_padded_tokens > num_tokens:
-        padded_output = torch.zeros(
-            total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device
-        )
-        padded_output[:num_tokens] = output
-        return padded_output.view(*q_shape_og)
     return output.view(*q_shape_og)
 
 
