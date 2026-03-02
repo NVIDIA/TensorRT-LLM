@@ -84,6 +84,11 @@ class _TrtllmPlanner:
         # Persistent block_offsets buffer for CUDA graph compatibility.
         # Pre-allocated to max size so the tensor address is stable across replays.
         self.block_offsets: Optional[torch.Tensor] = None
+        # Per-layer cache for tensors that must survive CUDA graph replay.
+        # Keyed by kv_cache.data_ptr() (stable and unique per layer).
+        self._layer_cache: dict[
+            int, Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]
+        ] = {}
 
     def reset(self, device: torch.device, max_batch: int, max_blocks_per_seq: int) -> None:
         """One-time allocation of ALL persistent buffers.
@@ -115,6 +120,39 @@ class _TrtllmPlanner:
         self.host_context_lengths = torch.zeros(
             max_batch, dtype=torch.int32, device="cpu", pin_memory=prefer_pinned()
         )
+
+    def get_layer_tensors(
+        self,
+        kv_cache: torch.Tensor,
+        kv_scale_orig_quant: float,
+        kv_scale_quant_orig: float,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], int]:
+        """Return (pool_pointers, kv_scale_oq, kv_scale_qo, quant_mode) for a layer.
+
+        Lazily creates and caches the tensors on first call per layer to avoid
+        dynamic allocations during CUDA graph capture.
+        """
+        key = kv_cache.data_ptr()
+        if key not in self._layer_cache:
+            pool_ptrs = torch.zeros(
+                1, 2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+            )
+            pool_ptrs[0, 0] = key
+            if kv_cache.dtype == torch.float8_e4m3fn:
+                scale_oq = torch.tensor(
+                    [kv_scale_orig_quant], dtype=torch.float32, device=kv_cache.device
+                )
+                scale_qo = torch.tensor(
+                    [kv_scale_quant_orig], dtype=torch.float32, device=kv_cache.device
+                )
+            else:
+                scale_oq = None
+                scale_qo = None
+            self._layer_cache[key] = (pool_ptrs, scale_oq, scale_qo)
+
+        pool_ptrs, scale_oq, scale_qo = self._layer_cache[key]
+        quant_mode = int(QuantMode.FP8_KV_CACHE) if scale_oq is not None else 0
+        return pool_ptrs, scale_oq, scale_qo, quant_mode
 
     def plan_host(
         self,
@@ -313,21 +351,11 @@ def trtllm_mha_with_cache(
         else max_context_length
     )
 
-    # Per-layer pool pointer tensor (created per invocation from kv_cache.data_ptr())
-    host_kv_cache_pool_pointers = torch.zeros(
-        1, 2, dtype=torch.int64, device="cpu", pin_memory=prefer_pinned()
+    # Per-layer tensors (pool pointers + optional FP8 scale tensors).
+    # Cached on first call to avoid allocations during CUDA graph capture.
+    host_kv_cache_pool_pointers, kv_scale_oq, kv_scale_qo, quant_mode = (
+        _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
-    host_kv_cache_pool_pointers[0, 0] = kv_cache.data_ptr()
-
-    # FP8 KV cache scale tensors
-    if kv_cache.dtype == torch.float8_e4m3fn:
-        kv_scale_oq = torch.tensor([kv_scale_orig_quant], dtype=torch.float32, device=q.device)
-        kv_scale_qo = torch.tensor([kv_scale_quant_orig], dtype=torch.float32, device=q.device)
-        quant_mode = int(QuantMode.FP8_KV_CACHE)
-    else:
-        kv_scale_oq = None
-        kv_scale_qo = None
-        quant_mode = 0
 
     # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse
     # Input is always [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed),
