@@ -28,27 +28,24 @@ namespace common
 
 void Hasher::initCtx()
 {
-    mCtx = EVP_MD_CTX_new();
+    mCtx.reset(EVP_MD_CTX_new());
     if (!mCtx)
     {
         throw std::runtime_error("Failed to create EVP_MD_CTX");
     }
-    if (EVP_DigestInit_ex(mCtx, EVP_sha256(), nullptr) != 1)
+    if (EVP_DigestInit_ex(mCtx.get(), EVP_sha256(), nullptr) != 1)
     {
-        EVP_MD_CTX_free(mCtx);
-        mCtx = nullptr;
+        mCtx.reset();
         throw std::runtime_error("Failed to initialize SHA-256 digest");
     }
 }
 
 Hasher::Hasher()
-    : mCtx(nullptr)
 {
     initCtx();
 }
 
 Hasher::Hasher(uint64_t seed)
-    : mCtx(nullptr)
 {
     initCtx();
     // Feed the seed as initial data (little-endian)
@@ -62,7 +59,6 @@ Hasher::Hasher(uint64_t seed)
 }
 
 Hasher::Hasher(std::optional<uint64_t> seed)
-    : mCtx(nullptr)
 {
     initCtx();
     if (seed.has_value())
@@ -78,27 +74,16 @@ Hasher::Hasher(std::optional<uint64_t> seed)
     }
 }
 
-Hasher::~Hasher()
-{
-    if (mCtx)
-    {
-        EVP_MD_CTX_free(mCtx);
-    }
-}
+Hasher::~Hasher() = default;
 
 Hasher::Hasher(Hasher const& other)
-    : mCtx(nullptr)
 {
     if (other.mCtx)
     {
-        mCtx = EVP_MD_CTX_new();
-        if (!mCtx || EVP_MD_CTX_copy_ex(mCtx, other.mCtx) != 1)
+        mCtx.reset(EVP_MD_CTX_new());
+        if (!mCtx || EVP_MD_CTX_copy_ex(mCtx.get(), other.mCtx.get()) != 1)
         {
-            if (mCtx)
-            {
-                EVP_MD_CTX_free(mCtx);
-                mCtx = nullptr;
-            }
+            mCtx.reset();
             throw std::runtime_error("Failed to copy EVP_MD_CTX");
         }
     }
@@ -114,25 +99,9 @@ Hasher& Hasher::operator=(Hasher const& other)
     return *this;
 }
 
-Hasher::Hasher(Hasher&& other) noexcept
-    : mCtx(other.mCtx)
-{
-    other.mCtx = nullptr;
-}
+Hasher::Hasher(Hasher&& other) noexcept = default;
 
-Hasher& Hasher::operator=(Hasher&& other) noexcept
-{
-    if (this != &other)
-    {
-        if (mCtx)
-        {
-            EVP_MD_CTX_free(mCtx);
-        }
-        mCtx = other.mCtx;
-        other.mCtx = nullptr;
-    }
-    return *this;
-}
+Hasher& Hasher::operator=(Hasher&& other) noexcept = default;
 
 Hasher& Hasher::update(uint64_t value)
 {
@@ -152,7 +121,7 @@ Hasher& Hasher::update(void const* data, size_t size)
     {
         return *this;
     }
-    if (EVP_DigestUpdate(mCtx, data, size) != 1)
+    if (EVP_DigestUpdate(mCtx.get(), data, size) != 1)
     {
         throw std::runtime_error("Failed to update SHA-256 digest");
     }
@@ -174,24 +143,18 @@ uint64_t Hasher::digest() const
 std::array<uint8_t, Hasher::kDigestSize> Hasher::digestBytes() const
 {
     // Finalize on a copy so the hasher remains usable
-    EVP_MD_CTX* copyCtx = EVP_MD_CTX_new();
-    if (!copyCtx || EVP_MD_CTX_copy_ex(copyCtx, mCtx) != 1)
+    EvpMdCtxPtr copyCtx(EVP_MD_CTX_new());
+    if (!copyCtx || EVP_MD_CTX_copy_ex(copyCtx.get(), mCtx.get()) != 1)
     {
-        if (copyCtx)
-        {
-            EVP_MD_CTX_free(copyCtx);
-        }
         throw std::runtime_error("Failed to copy EVP_MD_CTX for digest");
     }
 
     std::array<uint8_t, kDigestSize> result;
     unsigned int len = 0;
-    if (EVP_DigestFinal_ex(copyCtx, result.data(), &len) != 1)
+    if (EVP_DigestFinal_ex(copyCtx.get(), result.data(), &len) != 1)
     {
-        EVP_MD_CTX_free(copyCtx);
         throw std::runtime_error("Failed to finalize SHA-256 digest");
     }
-    EVP_MD_CTX_free(copyCtx);
     return result;
 }
 

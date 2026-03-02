@@ -22,6 +22,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 #include <openssl/evp.h>
@@ -99,7 +100,17 @@ public:
     [[nodiscard]] std::array<uint8_t, kDigestSize> digestBytes() const;
 
 private:
-    EVP_MD_CTX* mCtx;
+    struct EvpMdCtxDeleter
+    {
+        void operator()(EVP_MD_CTX* ctx) const noexcept
+        {
+            EVP_MD_CTX_free(ctx);
+        }
+    };
+
+    using EvpMdCtxPtr = std::unique_ptr<EVP_MD_CTX, EvpMdCtxDeleter>;
+
+    EvpMdCtxPtr mCtx;
 
     void initCtx();
 };
