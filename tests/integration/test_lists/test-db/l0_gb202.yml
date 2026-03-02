@@ -17,8 +17,8 @@ l0_gb202:
   # ------------- PyTorch tests ---------------
   - unittest/_torch/modeling -k "modeling_mllama"
   - unittest/_torch/modeling -k "modeling_out_of_tree"
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[enable_finalize_fusion-CUTLASS-dtype0]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_nvfp4[enable_finalize_fusion-CUTLASS-dtype1]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=8-dtype=torch.float16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_single_gpu[e8_k1_h512_i512-seq=8-dtype=torch.bfloat16-backend=CUTLASS-quant=NVFP4-routing=Renormalize]
   # - unittest/_torch/modeling -k "modeling_qwen" # https://nvbugs/5234573
   - unittest/_torch/attention/test_attention_mla.py
   - test_e2e.py::test_ptp_quickstart_bert[VANILLA-BertForSequenceClassification-bert/bert-base-uncased-yelp-polarity]
