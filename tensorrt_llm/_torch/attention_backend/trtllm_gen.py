@@ -1005,7 +1005,6 @@ class EnqueueParams:
     block_ids_per_seq: Optional[torch.Tensor] = None
     pool_index: int = 0
     seq_offset: int = 0
-    request_ids: Optional[List] = None
     tokens_per_block: int = 64
     mask_type: int = 1
     kv_cache_quant_mode: int = 0
@@ -1550,7 +1549,6 @@ def trtllm_gen_attention(
     quant_q_buffer: Optional[torch.Tensor],
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
-    request_ids: Optional[List[int]] = None,
 ) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
@@ -1645,7 +1643,6 @@ def trtllm_gen_attention(
         quant_q_buffer: Buffer for quantized query tensor.
         quant_config: Quantization configuration (QuantConfig).
         kv_cache_manager: KV cache manager (KVCacheManager).
-        request_ids: Request IDs for beam search.
 
     Returns:
         None. Results are written to the output tensor in-place.
@@ -1698,8 +1695,11 @@ def trtllm_gen_attention(
             f"Attention workspace size is not enough, increase the size from "
             f"{current_workspace_size} bytes to {required_workspace_size} bytes"
         )
-        workspace.resize_(required_workspace_size)
-        workspace.zero_()
+        if workspace is None:
+            workspace = torch.zeros(required_workspace_size, device=q.device, dtype=torch.uint8)
+        else:
+            workspace.resize_(required_workspace_size)
+            workspace.zero_()
 
     # Reshape Tensors
     # Input q shape: [num_tokens, (num_heads + 2*num_kv_heads) * head_size] for fused QKV
@@ -1779,7 +1779,6 @@ def trtllm_gen_attention(
         max_context_q_len = int(host_context_lengths[seq_offset : seq_offset + num_seqs].max())
         max_past_kv_len = int(host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max())
 
-        ctx_request_ids = request_ids[:num_seqs] if request_ids is not None else None
         ctx_params = EnqueueContextParams(
             **common_params,
             attention_input=query[token_offset : token_offset + num_ctx_tokens],
@@ -1792,7 +1791,6 @@ def trtllm_gen_attention(
             num_tokens=num_ctx_tokens,
             total_kv_len=ctx_total_kv_len,
             seq_offset=seq_offset,
-            request_ids=ctx_request_ids,
             input_seq_length=max_context_q_len,
             batch_size=num_seqs,
             max_context_length=max_context_length,
@@ -1809,9 +1807,6 @@ def trtllm_gen_attention(
         max_past_kv_len = int(host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max())
         input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
 
-        gen_request_ids = (
-            request_ids[seq_offset : seq_offset + num_seqs] if request_ids is not None else None
-        )
         gen_params = EnqueueGenerationParams(
             **common_params,
             attention_input=query[token_offset : token_offset + num_gen_tokens],
@@ -1824,7 +1819,6 @@ def trtllm_gen_attention(
             num_tokens=num_gen_tokens,
             total_kv_len=gen_total_kv_len,
             seq_offset=seq_offset,
-            request_ids=gen_request_ids,
             input_seq_length=input_seq_length,
             beam_width=beam_width,
             num_requests=num_seqs // beam_width,
