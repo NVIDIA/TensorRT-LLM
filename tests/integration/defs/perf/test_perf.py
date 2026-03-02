@@ -22,6 +22,7 @@ import sys
 from typing import Dict, List, NamedTuple
 
 import pytest
+import yaml
 from defs.common import get_cpp_benchmark
 from defs.trt_test_alternative import (is_linux, is_windows, print_info,
                                        print_warning)
