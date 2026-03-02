@@ -88,15 +88,18 @@ roles = (Role.KEY, Role.VALUE, Role.KEY_BLOCK_QUANT, Role.VALUE_BLOCK_QUANT)
 class FakeEngine:
     cfg: KVCacheManagerConfig
     num_heads: int
+    tokens_per_block_map: dict[LayerId, list[int]]
 
     def __init__(self, config: KVCacheManagerConfig, num_heads: int = 1) -> None:
         super().__init__()
         self.cfg = config
         self.num_heads = num_heads
-
-    @property
-    def tokens_per_block(self) -> int:
-        return self.cfg.tokens_per_block
+        self.tokens_per_block_map = {
+            layer.layer_id: [
+                buf.tokens_per_block_override or config.tokens_per_block for buf in layer.buffers
+            ]
+            for layer in config.layers
+        }
 
     @cached_property
     def layers(self) -> dict[LayerId, AttentionLayerConfig]:
@@ -132,7 +135,7 @@ class FakeEngine:
         stream: CudaStream,
     ):
         manager = kv_cache.manager
-        tokens_per_block = self.tokens_per_block
+        tokens_per_block = self.tokens_per_block_map[layer_id][buf_id]
         layer_cfg = self.layers[layer_id]
         buf = layer_cfg.buffers[buf_id]
         role = buf.role
@@ -141,11 +144,10 @@ class FakeEngine:
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         base_pages = kv_cache.get_base_page_indices(lc_id, beam)
-        page_scale = manager.get_page_index_scale(layer_id, role)
-        pages = [
-            BAD_PAGE_INDEX if base_page is BAD_PAGE_INDEX else base_page * page_scale
-            for base_page in base_pages
-        ]
+        page_converter = manager.get_page_index_converter(layer_id, role).__call__
+        pages = list(
+            itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
+        )
         capacity = kv_cache.capacity
         history_len = len(history)
         assert len(history) == history_len
@@ -157,7 +159,7 @@ class FakeEngine:
         sink = value_or(layer_cfg.num_sink_tokens, 0)
         # check history
         for ordinal, page in enumerate(pages):
-            if page == BAD_PAGE_INDEX:
+            if page == BAD_PAGE_INDEX or tokens_per_block * ordinal >= capacity:
                 continue
             page_range = (tokens_per_block * ordinal, tokens_per_block * (ordinal + 1))
             need_page = overlap(page_range, (0, sink)) or overlap(page_range, window)
@@ -191,27 +193,26 @@ class FakeEngine:
         stream: CudaStream,
     ):
         manager = kv_cache.manager
-        tokens_per_block = self.tokens_per_block
+        tokens_per_block = self.tokens_per_block_map[layer_id][buf_id]
         layer_cfg = self.layers[layer_id]
         buf = layer_cfg.buffers[buf_id]
         role = buf.role
-        token_bytes = exact_div(buf.size, self.tokens_per_block)
+        token_bytes = exact_div(buf.size, tokens_per_block)
         pool = manager.get_mem_pool_base_address(layer_id, role)
         stride = manager.get_page_stride(layer_id, role)
         lc_id = manager._storage._layer_to_life_cycle_ids[layer_id]
         base_pages = kv_cache.get_base_page_indices(lc_id, beam)[
             : div_up(history_len + len(input), tokens_per_block)
         ]
-        page_scale = manager.get_page_index_scale(layer_id, role)
-        pages = [
-            BAD_PAGE_INDEX if base_page is BAD_PAGE_INDEX else base_page * page_scale
-            for base_page in base_pages
-        ]
+        page_converter = manager.get_page_index_converter(layer_id, role).__call__
+        pages = list(
+            itertools.chain.from_iterable(page_converter(base_page) for base_page in base_pages)
+        )
         capacity = kv_cache.capacity
         input_range = (history_len, history_len + len(input))
         assert input_range[1] <= capacity
         ordinal_beg = input_range[0] // tokens_per_block
-        pages = itertools.islice(pages, ordinal_beg, None)
+        pages = itertools.islice(pages, ordinal_beg, div_up(capacity, tokens_per_block))
         ordinal = None
         for i, page in enumerate(pages):
             ordinal = ordinal_beg + i

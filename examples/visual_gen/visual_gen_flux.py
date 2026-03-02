@@ -43,7 +43,6 @@ from output_handler import OutputHandler
 from tensorrt_llm import logger
 from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
 
-# Set logger level to ensure timing logs are printed
 logger.set_level("info")
 
 
@@ -110,7 +109,7 @@ def parse_args():
     )
     parser.add_argument("--seed", type=int, default=42, help="Random seed")
 
-    # TeaCache Arguments
+    # TeaCache
     parser.add_argument(
         "--enable_teacache", action="store_true", help="Enable TeaCache acceleration"
     )
@@ -143,34 +142,7 @@ def parse_args():
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
 
-    # torch.compile
-    parser.add_argument(
-        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
-    )
-    parser.add_argument(
-        "--torch_compile_mode",
-        type=str,
-        default="default",
-        help="Torch compile mode",
-        choices=["default", "max-autotune", "reduce-overhead"],
-    )
-
-    # Warmup
-    parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=1,
-        help="Number of warmup steps (0 to disable)",
-    )
-
     # Parallelism
-    parser.add_argument(
-        "--cfg_size",
-        type=int,
-        default=1,
-        choices=[1, 2],
-        help="CFG parallel size (1 or 2). Set to 2 for CFG Parallelism.",
-    )
     parser.add_argument(
         "--ulysses_size",
         type=int,
@@ -178,9 +150,38 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
+    # torch.compile
+    parser.add_argument(
+        "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
+    )
+    parser.add_argument(
+        "--torch_compile_models",
+        type=str,
+        nargs="+",
+        default=[],
+        help="Components to torch.compile (empty = auto detect transformer components)",
+    )
+    parser.add_argument(
+        "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
+    )
+
+    # Autotune
+    parser.add_argument(
+        "--disable_autotune", action="store_true", help="Disable autotuning during warmup"
+    )
+
+    # Debug / profiling
+    parser.add_argument(
+        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
+    )
+
     args = parser.parse_args()
 
-    # Validate: either --prompt or --prompts_file is required
     if args.prompt is None and args.prompts_file is None:
         parser.error("Either --prompt or --prompts_file is required")
     if args.prompt is not None and args.prompts_file is not None:
@@ -202,7 +203,6 @@ def load_prompts(prompts_file, num_prompts=None):
 
 def build_diffusion_config(args):
     """Build diffusion_config dict from parsed args."""
-    # Convert linear_type to quant_config
     quant_config = None
     if args.linear_type == "trtllm-fp8-per-tensor":
         quant_config = {"quant_algo": "FP8", "dynamic": True}
@@ -211,7 +211,6 @@ def build_diffusion_config(args):
     elif args.linear_type == "trtllm-nvfp4":
         quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
-    # Note: pipeline type (FLUX.1 vs FLUX.2) is auto-detected from model_index.json
     diffusion_config = {
         "revision": args.revision,
         "attention": {
@@ -225,10 +224,17 @@ def build_diffusion_config(args):
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "pipeline": {
+        "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,
-            "torch_compile_mode": args.torch_compile_mode,
-            "warmup_steps": args.warmup_steps,
+            "torch_compile_models": args.torch_compile_models,
+            "enable_fullgraph": args.enable_fullgraph,
+            "enable_autotune": not args.disable_autotune,
+        },
+        "cuda_graph": {
+            "enable_cuda_graph": args.enable_cudagraph,
+        },
+        "pipeline": {
+            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     }
 
@@ -241,12 +247,9 @@ def build_diffusion_config(args):
 def main():
     args = parse_args()
 
-    # world_size = cfg_size * ulysses_size
     n_workers = args.cfg_size * args.ulysses_size
-
     diffusion_config = build_diffusion_config(args)
 
-    # Initialize VisualGen
     logger.info(
         f"Initializing VisualGen: world_size={n_workers} "
         f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
@@ -259,11 +262,10 @@ def main():
 
     try:
         if args.prompts_file:
-            # Batch mode
             prompts = load_prompts(args.prompts_file, args.num_prompts)
             os.makedirs(args.output_dir, exist_ok=True)
 
-            logger.info(f"Batch mode: {len(prompts)} prompts → {args.output_dir}")
+            logger.info(f"Batch mode: {len(prompts)} prompts -> {args.output_dir}")
             logger.info(f"Resolution: {args.height}x{args.width}, Steps: {args.steps}")
 
             timing_records = []
@@ -301,7 +303,6 @@ def main():
             total_elapsed = time.time() - total_start
             times = [r["time"] for r in timing_records]
 
-            # Write timing metadata
             timing_data = {
                 "images": timing_records,
                 "total_time": round(total_elapsed, 2),
@@ -327,7 +328,6 @@ def main():
             logger.info(f"Timing saved to {timing_path}")
 
         else:
-            # Single image mode
             logger.info(f"Generating image for prompt: '{args.prompt}'")
             logger.info(f"Resolution: {args.height}x{args.width}, Steps: {args.steps}")
 
@@ -344,8 +344,7 @@ def main():
                 ),
             )
 
-            end_time = time.time()
-            logger.info(f"Generation completed in {end_time - start_time:.2f}s")
+            logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
             OutputHandler.save(output, args.output_path)
 

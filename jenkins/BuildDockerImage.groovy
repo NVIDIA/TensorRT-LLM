@@ -272,7 +272,7 @@ def buildImage(config, imageKeyToTag)
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
         // If using a forked repo, svc_tensorrt needs to have the access to the forked repo.
-        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, true, true)
+        trtllm_utils.checkoutSource(LLM_REPO, LLM_COMMIT_OR_BRANCH, LLM_ROOT, false, true)
     }
 
     // Step 2: Build the images

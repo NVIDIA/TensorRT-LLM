@@ -75,7 +75,8 @@ class AsyncLLM(LLM):
         method: str,
         args: tuple[Any, ...] = (),
         kwargs: Optional[dict] = None,
-        unique_reply_rank: Optional[int] = None,
+        unique_reply_rank: Optional[int] = None,  # TODO: deprecate this in the future
+        target_ranks: int | list[int] | None = None,
     ) -> list[Any]:
         """Execute an asynchronous RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
@@ -84,12 +85,13 @@ class AsyncLLM(LLM):
             args (tuple[Any, ...]): Positional arguments to pass to the worker method. Defaults to ().
             kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
             unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply.
+            target_ranks (int | list[int] | None): The ranks of the workers that will be used to send the reply.
 
         Returns:
             list[Any]: A list of results from each worker.
         """
         return await self._executor.collective_rpc_async(
-            method, args, kwargs, unique_reply_rank=unique_reply_rank
+            method, args, kwargs, unique_reply_rank=unique_reply_rank, target_ranks=target_ranks
         )
 
     def __await__(self):
