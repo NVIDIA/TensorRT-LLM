@@ -1823,7 +1823,7 @@ class MLA(nn.Module):
             v_head_dim, dtype, device):
         """Warmup torch.compile for cat operations with different tensor layouts.
 
-        Tensors are marked with torch._dynamo.mark_dynamic(..., 0) on the
+        Tensors are marked with torch._dynamo.maybe_mark_dynamic(..., 0) on the
         num_tokens dimension, so for num_tokens != 1 a single warmup run is
         enough and the compiled kernel generalizes across varying num_tokens at
         runtime. num_tokens=1 still triggers recompile (torch.compile specializes
