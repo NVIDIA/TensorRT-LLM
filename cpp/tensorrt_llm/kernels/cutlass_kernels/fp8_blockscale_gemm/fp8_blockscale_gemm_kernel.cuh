@@ -724,7 +724,7 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -737,12 +737,12 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
     auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
 
-    int32_t ld_a = shape_k;
-    int32_t stride_a = shape_m * shape_k;
-    int32_t ld_b = shape_k;
-    int32_t stride_b = shape_n * shape_k;
-    int32_t ld_d = shape_n;
-    int32_t stride_d = shape_m * shape_n;
+    int64_t ld_a = shape_k;
+    int64_t stride_a = static_cast<int64_t>(shape_m) * static_cast<int64_t>(shape_k);
+    int64_t ld_b = shape_k;
+    int64_t stride_b = static_cast<int64_t>(shape_n) * static_cast<int64_t>(shape_k);
+    int64_t ld_d = shape_n;
+    int64_t stride_d = static_cast<int64_t>(shape_m) * static_cast<int64_t>(shape_n);
 
     typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
     typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
@@ -764,7 +764,7 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;
@@ -998,7 +998,7 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -1011,11 +1011,11 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
     auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
 
-    typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
-    typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
+    typename KT::StrideA dA = make_stride(static_cast<int64_t>(ld_a), Int<1>{}, static_cast<int64_t>(stride_a));
+    typename KT::StrideB dB = make_stride(static_cast<int64_t>(ld_b), Int<1>{}, static_cast<int64_t>(stride_b));
     typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(problem_shape).stride();
     typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(problem_shape).stride();
-    typename KT::StrideD dD = make_stride(ld_d, Int<1>{}, stride_d);
+    typename KT::StrideD dD = make_stride(static_cast<int64_t>(ld_d), Int<1>{}, static_cast<int64_t>(stride_d));
 
     Arguments args = {ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD};
 
@@ -1031,7 +1031,7 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
     attrs[0].val.programmaticStreamSerializationAllowed = 1;
 
-    launch_config.gridDim = GemmKernel::get_grid_shape(kernel_params);
+    launch_config.gridDim = dim3(num_device_sms, 1, 1);
     launch_config.blockDim = GemmKernel::get_block_shape();
     launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
     launch_config.stream = stream;

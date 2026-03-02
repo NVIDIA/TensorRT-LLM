@@ -89,7 +89,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 
     if getSMVersion() == 120:
         act_a_fp8, act_a_sf = fp8_utils.per_token_quant_and_transform(a)
-        act_b_fp8, act_b_sf = fp8_utils.per_block_cast_to_fp8_e8m0(b)
+        act_b_fp8, act_b_sf = per_block_cast_to_fp8_e8m0(b)
         act_b_sf = fp8_utils.transform_sf_into_required_layout(
             act_b_sf,
             mn=act_b_fp8.shape[0],
@@ -187,7 +187,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     if getSMVersion() == 120:
         a_fp8, a_scales = fp8_utils.per_token_quant_and_transform(
             a, need_permute102=True)
-        b_fp8, b_scales = fp8_utils.per_block_cast_to_fp8_e8m0(b)
+        b_fp8, b_scales = per_block_cast_to_fp8_e8m0(b)
         b_scales = fp8_utils.transform_sf_into_required_layout(
             b_scales,
             mn=n,
