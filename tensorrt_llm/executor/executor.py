@@ -328,7 +328,7 @@ class GenerationExecutor(ABC):
         """
         if self._iter_stats_result is None:
             print_colored(
-                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats_async() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
+                "Iteration statistics are not available yet. To collect runtime statistics, please call aget_stats() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
                 "yellow")
             return empty_async_iterable()
 
@@ -538,8 +538,8 @@ class GenerationExecutor(ABC):
                 use_worker=True)
 
         # For single-gpu case:
-        # Partition the workload to multiple process for streaming performance.
-        # While this requires uses to protect their entrypoint to
+        # Partition the workload to multiple processes for streaming performance.
+        # While this requires users to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
             if orchestrator_is_rpc:
