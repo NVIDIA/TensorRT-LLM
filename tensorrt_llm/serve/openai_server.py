@@ -730,9 +730,6 @@ class OpenAIServer:
                 timing_metrics.last_token_time.total_seconds() +
                 self.disagg_server_steady_clock_offset,
             }
-            utilization = None
-            if kv_cache_metrics.max_num_blocks and kv_cache_metrics.max_num_blocks > 0:
-                utilization = kv_cache_metrics.used_num_blocks / kv_cache_metrics.max_num_blocks
             metrics_json["kv_cache_metrics"] = {
                 "num_total_allocated_blocks":
                 kv_cache_metrics.num_total_allocated_blocks,
@@ -740,10 +737,6 @@ class OpenAIServer:
                 kv_cache_metrics.num_new_allocated_blocks,
                 "num_reused_blocks": kv_cache_metrics.num_reused_blocks,
                 "num_missed_blocks": kv_cache_metrics.num_missed_blocks,
-                "max_num_blocks": kv_cache_metrics.max_num_blocks,
-                "used_num_blocks": kv_cache_metrics.used_num_blocks,
-                "free_num_blocks": kv_cache_metrics.free_num_blocks,
-                "utilization": utilization,
             }
             if timing_metrics.kv_cache_size > 0:
                 metrics_json["timing_metrics"].update({
