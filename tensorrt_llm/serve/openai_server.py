@@ -45,7 +45,7 @@ from tensorrt_llm.serve.chat_utils import (load_chat_template,
                                            parse_chat_messages_coroutines)
 from tensorrt_llm.serve.cluster_storage import create_cluster_storage_client
 from tensorrt_llm.serve.disagg_auto_scaling import DisaggClusterWorker
-from tensorrt_llm.serve.media_storage import MediaStorage
+from tensorrt_llm.serve.media_storage import MediaStorage, resolve_video_format
 from tensorrt_llm.serve.metadata_server import create_metadata_server
 from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ChatCompletionResponse,
@@ -1471,11 +1471,16 @@ class OpenAIServer:
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
 
+            # Resolve the video encode format (mp4/avi/auto)
+            resolved_fmt, resolved_ext = resolve_video_format(
+                request.output_format)
+
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}.mp4",
+                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
+                format=resolved_fmt,
             )
 
             # Determine media type based on actual output file extension
@@ -1526,7 +1531,7 @@ class OpenAIServer:
                 raise ValueError("'prompt' is required")
 
             # Optional string fields
-            for field in ["model", "size", "negative_prompt"]:
+            for field in ["model", "size", "negative_prompt", "output_format"]:
                 if field in form and form[field]:
                     data[field] = form[field]
 
@@ -1635,11 +1640,16 @@ class OpenAIServer:
                     await VIDEO_STORE.upsert(video_id, job)
                 return
 
+            # Resolve the video encode format (mp4/avi/auto)
+            resolved_fmt, resolved_ext = resolve_video_format(
+                request.output_format)
+
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}.mp4",
+                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
+                format=resolved_fmt,
             )
             job = await VIDEO_STORE.get(video_id)
             if job:

@@ -13,7 +13,7 @@ import tempfile
 from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Tuple
 
 import torch
 from PIL import Image
@@ -455,6 +455,35 @@ class PurePythonEncoder(VideoEncoder):
             f.write(riff_data)
 
 
+def resolve_video_format(output_format: str) -> Tuple[str, str]:
+    """Resolve the requested output format to a concrete format and extension.
+
+    Args:
+        output_format: One of 'mp4', 'avi', or 'auto'.
+
+    Returns:
+        Tuple of (format, extension), e.g. ('mp4', '.mp4') or ('avi', '.avi').
+
+    Raises:
+        RuntimeError: If 'mp4' is requested but ffmpeg is not available.
+    """
+    if output_format == "mp4":
+        if _check_ffmpeg_available():
+            return "mp4", ".mp4"
+        raise RuntimeError(
+            "MP4 (H.264) format requires ffmpeg to be installed. "
+            "Install ffmpeg (e.g., 'apt-get install ffmpeg' on Ubuntu/Debian) "
+            "or use output_format='avi' for MJPEG encoding (no ffmpeg required). "
+            "See https://ffmpeg.org/download.html for installation instructions."
+        )
+    elif output_format == "avi":
+        return "avi", ".avi"
+    else:  # auto
+        if _check_ffmpeg_available():
+            return "mp4", ".mp4"
+        return "avi", ".avi"
+
+
 def get_video_encoder() -> Optional["VideoEncoder"]:
     """Get the best available video encoder (cached singleton).
 
@@ -631,9 +660,8 @@ class MediaStorage:
         format = format.lower()
 
         # Save based on format
-        if format == "mp4":
-            # _save_mp4 may return a different path (e.g., .avi when using PurePythonEncoder)
-            output_path = MediaStorage._save_mp4(video, audio, output_path, frame_rate)
+        if format in ("mp4", "avi"):
+            output_path = MediaStorage._save_encoded_video(video, audio, output_path, frame_rate)
         elif format == "gif":
             output_path = MediaStorage._save_gif(video, output_path, frame_rate)
         elif format == "png":
@@ -641,7 +669,7 @@ class MediaStorage:
         else:
             logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
             output_path = output_path.rsplit(".", 1)[0] + ".mp4"
-            output_path = MediaStorage._save_mp4(video, audio, output_path, frame_rate)
+            output_path = MediaStorage._save_encoded_video(video, audio, output_path, frame_rate)
 
         return output_path
 
@@ -682,18 +710,19 @@ class MediaStorage:
                     os.unlink(path)
 
     @staticmethod
-    def _save_mp4(
+    def _save_encoded_video(
         video: torch.Tensor, audio: Optional[torch.Tensor], output_path: str, frame_rate: float
     ) -> str:
-        """Save video with optional audio as MP4.
+        """Save video with optional audio using the best available encoder.
 
-        Uses ffmpeg CLI if available (supports audio), otherwise raises an error
-        to prompt ffmpeg installation.
+        For MP4 output, ffmpeg CLI is required. For AVI output, the pure Python
+        MJPEG encoder is used directly. Falls back to saving the middle frame
+        as PNG if no encoder is available.
 
         Args:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
             audio: Optional audio as torch.Tensor
-            output_path: Output path for MP4
+            output_path: Output path (MP4 or AVI)
             frame_rate: Frames per second
 
         Returns:

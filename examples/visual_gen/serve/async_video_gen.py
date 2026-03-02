@@ -33,6 +33,7 @@ def test_async_video_generation(
     fps: int = 24,
     size: str = "256x256",
     output_file: str = "output_async.mp4",
+    output_format: str = "auto",
 ):
     """Test asynchronous video generation with OpenAI SDK.
 
@@ -76,6 +77,7 @@ def test_async_video_generation(
             "seconds": duration,
             "extra_body": {
                 "fps": fps,
+                "output_format": output_format,
             },
         }
 
@@ -230,6 +232,14 @@ Examples:
         help="Output video file path (extension may change based on server encoder: .mp4 or .avi)",
     )
 
+    parser.add_argument(
+        "--output-format",
+        type=str,
+        default="auto",
+        choices=["mp4", "avi", "auto"],
+        help="Output video format: mp4 or avi or auto",
+    )
+
     args = parser.parse_args()
 
     # Validate ti2v mode requirements
@@ -254,6 +264,7 @@ Examples:
         fps=args.fps,
         size=args.size,
         output_file=args.output,
+        output_format=args.output_format,
     )
 
     sys.exit(0 if success else 1)
