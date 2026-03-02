@@ -223,8 +223,26 @@ def create_py_executor(
     tokenizer: Optional[TokenizerBase] = None,
     profiling_stage_data: Optional[dict] = None,
 ) -> PyExecutor:
-    torch.cuda.set_per_process_memory_fraction(1.0)
+    """Create and initialize a PyExecutor instance from the given LLM arguments.
 
+    Loads model configuration, applies model-specific defaults, constructs the
+    resource manager, model engine, scheduler, and decoder, then returns a fully
+    initialized PyExecutor ready for inference.
+
+    Args:
+        llm_args: Configuration arguments for the PyTorch-based LLM executor.
+        checkpoint_dir: Path to the model checkpoint directory. If None, uses
+            the path specified in llm_args.
+        tokenizer: Optional tokenizer instance. If None, loaded from checkpoint.
+        profiling_stage_data: Optional dict for collecting per-stage memory
+            profiling data during executor construction.
+
+    Returns:
+        A fully initialized PyExecutor instance.
+    """
+
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    torch.cuda.set_per_process_memory_fraction(1.0)
     # Apply model-specific defaults early, before destructuring llm_args fields
     checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
                                                      llm_args.checkpoint_loader,
@@ -345,7 +363,8 @@ def create_py_executor(
 
         # WAR for https://nvbugs/5807902
         # Disable separate draft KV cache in disaggregated mode
-        if cache_transceiver_config is not None or kv_connector_config is not None:
+        # Enable separate pool for None DI + Non-KVBM and Aggregated + KVBM
+        if cache_transceiver_config is not None:
             spec_config._allow_separate_draft_kv_cache = False
 
     # chunk_unit_size may be changed to 64 when using flash mla
@@ -687,8 +706,11 @@ def create_py_executor(
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
             draft_config=draft_config,
+            skip_est=skip_est,
         )
+
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
                 ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
@@ -721,6 +743,8 @@ def create_py_executor(
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
             ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):
+        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -746,6 +770,7 @@ def create_py_executor(
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
         )
+
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
         peft_cache_config = py_executor.peft_cache_config
@@ -776,7 +801,6 @@ def create_py_executor(
                     if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
-
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
 
@@ -814,4 +838,5 @@ def create_py_executor(
         logger.info(f"LLM Args:\n{llm_args}")
 
     py_executor.start_worker()
+
     return py_executor

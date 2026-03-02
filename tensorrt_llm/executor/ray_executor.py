@@ -111,6 +111,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         llm_args = worker_kwargs.get("llm_args")
         placement_config = getattr(llm_args, 'ray_placement_config',
                                    None) if llm_args else None
+        ray_worker_nsight_options = getattr(
+            llm_args, 'ray_worker_nsight_options', None) if llm_args else None
 
         # When set to be a fraction, it allows Ray to schedule
         # multiple actors on a single GPU for colocate use cases.
@@ -126,6 +128,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             "TLLM_DISABLE_MPI": "1",
             "MASTER_ADDR": self.master_address,  # head-IP for NCCL/Gloo
         })
+        if ray_worker_nsight_options:
+            runtime_env["nsight"] = ray_worker_nsight_options
 
         placement_groups, self.bundle_indices = self._get_placement_group(
             tp_size=self.tp_size, worker_kwargs=worker_kwargs)
@@ -192,14 +196,19 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             ])
 
     @unwrap_ray_errors()
-    def collective_rpc(self,
-                       method: str,
-                       args: tuple = (),
-                       kwargs: Optional[dict] = None,
-                       non_block: bool = False,
-                       unique_reply_rank: Optional[int] = None) -> list[Any]:
-        workers = (self.workers[unique_reply_rank],
-                   ) if unique_reply_rank is not None else self.workers
+    def collective_rpc(
+            self,
+            method: str,
+            args: tuple = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
+        if target_ranks is None:
+            target_ranks = unique_reply_rank
+        workers = (self.workers if target_ranks is None else
+                   [self.workers[rank] for rank in target_ranks] if isinstance(
+                       target_ranks, list) else [self.workers[target_ranks]])
         kwargs = kwargs or {}
 
         refs = []
@@ -220,12 +229,14 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
             method: str,
             args: tuple = (),
             kwargs: Optional[dict] = None,
-            unique_reply_rank: Optional[int] = None) -> list[Any]:
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
         refs = self.collective_rpc(method,
                                    args,
                                    kwargs,
                                    non_block=True,
-                                   unique_reply_rank=unique_reply_rank)
+                                   unique_reply_rank=unique_reply_rank,
+                                   target_ranks=target_ranks)
         return await asyncio.gather(*refs)
 
     def submit(self, request: "GenerationRequest") -> "GenerationResult":
