@@ -214,7 +214,7 @@ HF_MODEL_PATH = {
 LORA_MODEL_PATH = {
     "llama_v2_13b":
     "llama-models-v2/chinese-llama-2-lora-13b",
-    "mixtral_8x7b_0.1":
+    "mixtral_8x7b_v0.1":
     "chinese-mixtral-lora",
     "llama_v3.1_8b_instruct_fp8":
     "lora/llama-3-chinese-8b-instruct-v2-lora/",
