@@ -121,6 +121,6 @@ class VanillaAttention(nn.Module):
         """Return the preferred tensor layout for this backend."""
         return self._preferred_layout
 
-    @classmethod
-    def support_fused_qkv(cls) -> bool:
+    @property
+    def support_fused_qkv(self) -> bool:
         return False

@@ -105,6 +105,36 @@ def parse_args():
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block FP8/INT8 quantised Q/K/V). Requires TRTLLM backend.",
+    )
+    parser.add_argument(
+        "--sage_num_elts_per_blk_q",
+        type=int,
+        default=1,
+        help="SageAttention: elements per quantization block for Q (0 disables)",
+    )
+    parser.add_argument(
+        "--sage_num_elts_per_blk_k",
+        type=int,
+        default=4,
+        help="SageAttention: elements per quantization block for K (0 disables)",
+    )
+    parser.add_argument(
+        "--sage_num_elts_per_blk_v",
+        type=int,
+        default=1,
+        help="SageAttention: elements per quantization block for V (0 disables)",
+    )
+    parser.add_argument(
+        "--sage_qk_int8",
+        action="store_true",
+        help="SageAttention: use INT8 (vs E4M3) for Q/K quantization",
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -155,12 +185,21 @@ def main():
         quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
     # 1. Setup Configuration
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        attention_cfg["sage_attention_config"] = {
+            "num_elts_per_blk_q": args.sage_num_elts_per_blk_q,
+            "num_elts_per_blk_k": args.sage_num_elts_per_blk_k,
+            "num_elts_per_blk_v": args.sage_num_elts_per_blk_v,
+            "qk_int8": args.sage_qk_int8,
+        }
+
     diffusion_config = {
         "model_type": "wan2",
         "revision": args.revision,
-        "attention": {
-            "backend": args.attention_backend,
-        },
+        "attention": attention_cfg,
         "teacache": {
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,

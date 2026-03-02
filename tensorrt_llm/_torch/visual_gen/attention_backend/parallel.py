@@ -156,7 +156,7 @@ class UlyssesAttention(nn.Module):
         """Preferred tensor layout: [B, S, H, D]"""
         return self._preferred_layout
 
-    @classmethod
-    def support_fused_qkv(cls) -> bool:
+    @property
+    def support_fused_qkv(self) -> bool:
         """This backend does not support fused QKV."""
         return False

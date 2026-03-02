@@ -122,6 +122,7 @@ class Attention(nn.Module):
             num_kv_heads=backend_num_kv_heads,
             quant_config=self.quant_config,
             dtype=self.dtype,
+            attention_config=config.attention,
         )
 
         # Wrap with parallelism strategy (orthogonal to backend choice)

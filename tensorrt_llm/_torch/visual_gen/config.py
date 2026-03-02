@@ -40,12 +40,53 @@ class PipelineComponent(str, Enum):
 # =============================================================================
 
 
+class SageAttentionConfig(BaseModel):
+    """Configuration for SageAttention quantization (TRTLLM backend only).
+
+    SageAttention quantizes Q/K/V into FP8 (or INT8 for Q/K) with per-block
+    scaling factors, enabling faster attention kernels. Providing this config
+    to AttentionConfig enables SageAttention; omitting it (None) disables it.
+
+    Similar to ``sparse_attention_config`` for the base TRTLLM attention
+    backend — the presence of the config object signals enablement.
+    """
+
+    num_elts_per_blk_q: int = PydanticField(
+        1, ge=0, description="Elements per quantization block for Q (0 disables)"
+    )
+    num_elts_per_blk_k: int = PydanticField(
+        4, ge=0, description="Elements per quantization block for K (0 disables)"
+    )
+    num_elts_per_blk_v: int = PydanticField(
+        1, ge=0, description="Elements per quantization block for V (0 disables)"
+    )
+    qk_int8: bool = PydanticField(False, description="Use INT8 (vs E4M3) for Q/K quantization")
+
+
 class AttentionConfig(BaseModel):
     """Configuration for Attention layers."""
 
     backend: Literal["VANILLA", "TRTLLM"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM"
     )
+    sage_attention_config: Optional[SageAttentionConfig] = PydanticField(
+        None,
+        description=(
+            "SageAttention config (TRTLLM backend only). "
+            "Set to a SageAttentionConfig instance to enable SageAttention; "
+            "leave as None to disable."
+        ),
+    )
+
+    @model_validator(mode="after")
+    def _validate_sage_requires_trtllm(self) -> "AttentionConfig":
+        if self.sage_attention_config is not None and self.backend != "TRTLLM":
+            raise ValueError(
+                f"sage_attention_config requires backend='TRTLLM', "
+                f"got backend='{self.backend}'. Either set backend='TRTLLM' "
+                f"or remove sage_attention_config."
+            )
+        return self
 
 
 class ParallelConfig(BaseModel):
