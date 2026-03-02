@@ -50,6 +50,7 @@ from ..attention_interface import (
     ResourceHandlerDict,
     StateResourceHandler,
 )
+from .fla_gated_delta import _l2norm
 
 # ---------------------------------------------------------------------------
 # Core recurrence helpers
@@ -178,8 +179,8 @@ def _preprocess_raw_inputs(
     H_k = q.shape[-2]
     interleave = HV // H_k
 
-    q_out = F.normalize(q.float(), dim=-1).to(q.dtype)
-    k_out = F.normalize(k.float(), dim=-1).to(k.dtype)
+    q_out = _l2norm(q.float()).to(q.dtype)
+    k_out = _l2norm(k.float()).to(k.dtype)
 
     if interleave > 1:
         q_out = q_out.repeat_interleave(interleave, dim=-2)

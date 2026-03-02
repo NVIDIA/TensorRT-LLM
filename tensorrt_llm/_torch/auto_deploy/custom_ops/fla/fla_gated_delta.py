@@ -35,6 +35,16 @@ import torch
 import torch.nn.functional as F
 
 
+def _l2norm(x: torch.Tensor, dim: int = -1, eps: float = 1e-6) -> torch.Tensor:
+    """L2 normalization matching the HF/FLA convention.
+
+    Uses ``rsqrt(sum(x^2) + eps)`` rather than ``x / max(||x||, eps)``
+    (the ``F.normalize`` convention). The difference matters for small-norm
+    vectors because eps is added *inside* the square root here.
+    """
+    return x * torch.rsqrt((x * x).sum(dim=dim, keepdim=True) + eps)
+
+
 def _torch_chunk_gated_delta_rule_impl(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -161,9 +171,9 @@ def torch_gated_delta_rule(
     H_k = q.shape[2]
     HV = v.shape[2]
 
-    # L2 normalize q and k
-    q_norm = F.normalize(q.float(), dim=-1).to(q.dtype)
-    k_norm = F.normalize(k.float(), dim=-1).to(k.dtype)
+    # L2 normalize q and k (must match HF/FLA l2norm convention)
+    q_norm = _l2norm(q.float()).to(q.dtype)
+    k_norm = _l2norm(k.float()).to(k.dtype)
 
     # GQA expand if num_v_heads > num_k_heads
     if HV > H_k:

@@ -21,6 +21,7 @@ from transformers.models.qwen3_next.modeling_qwen3_next import (
 
 # Register all auto_deploy custom ops (torch_gated_delta_rule, torch_causal_conv1d, etc.)
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.fla.fla_gated_delta import _l2norm
 from tensorrt_llm._torch.auto_deploy.models.patches.qwen3_next import _patched_gdn_forward
 
 
@@ -50,9 +51,9 @@ def test_torch_gated_delta_rule_op():
     A_log = torch.randn(num_heads, dtype=torch.float32)
     dt_bias = torch.randn(num_heads, dtype=torch.float32)
 
-    # Preprocess for HF reference: l2 norm + gating
-    q_norm = torch.nn.functional.normalize(q_raw.float(), dim=-1)
-    k_norm = torch.nn.functional.normalize(k_raw.float(), dim=-1)
+    # Preprocess for HF reference: l2 norm + gating (must match _l2norm convention)
+    q_norm = _l2norm(q_raw.float())
+    k_norm = _l2norm(k_raw.float())
     g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
     beta = b.float().sigmoid()
 
@@ -95,8 +96,8 @@ def test_torch_gated_delta_rule_op_bfloat16():
     A_log = torch.randn(num_heads, dtype=torch.bfloat16)
     dt_bias = torch.randn(num_heads, dtype=torch.bfloat16)
 
-    q_norm = torch.nn.functional.normalize(q_raw.float(), dim=-1).to(torch.bfloat16)
-    k_norm = torch.nn.functional.normalize(k_raw.float(), dim=-1).to(torch.bfloat16)
+    q_norm = _l2norm(q_raw.float()).to(torch.bfloat16)
+    k_norm = _l2norm(k_raw.float()).to(torch.bfloat16)
     g = -A_log.float().exp() * torch.nn.functional.softplus(a.float() + dt_bias)
     g = g.to(torch.bfloat16)
     beta = b.float().sigmoid().to(torch.bfloat16)
