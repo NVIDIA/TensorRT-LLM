@@ -28,7 +28,7 @@ Reference:
   - Gated Delta Networks paper: https://arxiv.org/abs/2412.06464
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -154,7 +154,7 @@ def _torch_gated_delta_prefill(
 
 
 @torch.library.custom_op(
-    "auto_deploy::torch_cached_gated_delta_rule", mutates_args=("delta_cache",)
+    "auto_deploy::torch_cached_gated_delta_rule", mutates_args=("delta_cache", "out")
 )
 def torch_cached_gated_delta_rule(
     # INPUTS (dense but may be flattened across sequences)
@@ -172,6 +172,7 @@ def torch_cached_gated_delta_rule(
     delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
     # CONSTANTS
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Cached gated delta rule using pure-torch recurrence.
 
@@ -200,6 +201,7 @@ def torch_cached_gated_delta_rule(
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
 
     # Clean up metadata
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
@@ -293,6 +295,13 @@ def torch_cached_gated_delta_rule(
             # Write state back to cache
             delta_cache[slot] = new_state.squeeze(0).to(delta_cache.dtype)
 
+    if out is not None:
+        out_flat = out.reshape(b * s, num_heads, -1)
+        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
+        if num_total_tokens < b * s:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y
 
 
@@ -309,7 +318,10 @@ def torch_cached_gated_delta_rule_fake(
     use_initial_states: torch.Tensor,
     delta_cache: torch.Tensor,
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     return torch.empty_like(v)
 
 
