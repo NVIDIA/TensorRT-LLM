@@ -243,6 +243,21 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
     echo "Preprocessing testDBList to extract ISOLATION markers..."
 
     def originalTestLines = readFile(file: testDBList).readLines()
+
+    // Transform verl:: prefixed test paths to actual paths using VERL_ROOT
+    def verlRoot = env.VERL_ROOT
+    if (verlRoot) {
+        echo "Transforming verl:: test paths using VERL_ROOT=${verlRoot}"
+        originalTestLines = originalTestLines.collect { line ->
+            if (line.trim().startsWith('verl::')) {
+                def transformedLine = line.replace('verl::', "${verlRoot}/")
+                echo "Transformed: ${line} -> ${transformedLine}"
+                return transformedLine
+            }
+            return line
+        }
+    }
+
     def cleanedTestLines = []
     def isolationTestLines = []
 
@@ -2177,8 +2192,12 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
         // If stageName contains "-AutoDeploy-", add "backend=autodeploy" to makoArgs
         // At this point, only tests with backend=autodeploy or unspecified backend will be run
         makoArgs += ["backend=autodeploy"]
+    } else if (stageName.contains("-Verl-")) {
+        // If stageName contains "-Verl-", add "backend=verl" to makoArgs
+        // At this point, only tests with backend=verl or unspecified backend will be run
+        makoArgs += ["backend=verl"]
     } else {
-        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", "-FMHA-", or "-AutoDeploy-", do not add any backend
+        // If stageName does not contain "-PyTorch-", "-TensorRT-", "-CPP-", "-Triton-", "-FMHA-", "-AutoDeploy-", or "-Verl-", do not add any backend
         // At this point, all tests will be run
         // For cases where backend is not specified in makoArgs, we will match all types of backends and tests without specified backend
     }
@@ -2650,6 +2669,52 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmSrc} && pip3 install -r requirements-dev.txt")
         if (stageName.contains("-Ray-")) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
+        }
+        // Verl environment setup
+        if (stageName.contains("-Verl-")) {
+            def verlConfigPath = "${llmSrc}/tests/integration/defs/verl/verl_config.yml"
+            def verlConfig = readYaml(file: verlConfigPath)
+            def verlPath = "${llmPath}/verl"
+
+            // Build environment variable export prefix from config for shell commands
+            def envPrefix = ""
+            if (verlConfig.verl_config.env_vars) {
+                envPrefix = verlConfig.verl_config.env_vars.collect { "export ${it}" }.join(" && ") + " && "
+            }
+
+            // Run install commands with env vars exported
+            verlConfig.verl_config.install_commands.each { cmd ->
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "${envPrefix}${cmd}")
+            }
+
+            // Clone verl repo at specific commit/tag
+            trtllm_utils.llmExecStepWithRetry(pipeline, script: """
+                git clone ${verlConfig.verl_config.repo_url} ${verlPath} && cd ${verlPath} && git checkout ${verlConfig.verl_config.repo_tag}
+            """)
+
+            // Set VERL_ROOT environment variable for test execution
+            env.VERL_ROOT = verlPath
+
+            // Persist env vars in Jenkins environment for test execution
+            if (verlConfig.verl_config.env_vars) {
+                def resolvedVars = [:]
+                verlConfig.verl_config.env_vars.each { envVar ->
+                    def eqIdx = envVar.indexOf('=')
+                    if (eqIdx > 0) {
+                        def key = envVar.substring(0, eqIdx)
+                        def value = envVar.substring(eqIdx + 1).replaceAll('^"|"$', '')
+                        // Resolve references to previously resolved vars
+                        resolvedVars.each { k, v ->
+                            value = value.replace('${' + k + '}', v)
+                        }
+                        // Resolve references to existing env vars
+                        value = value.replace('$LD_LIBRARY_PATH', env.LD_LIBRARY_PATH ?: '')
+                        value = value.replace('$PATH', env.PATH ?: '')
+                        resolvedVars[key] = value
+                        env."${key}" = value
+                    }
+                }
+            }
         }
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
@@ -3310,6 +3375,7 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 4, 1, true],
         "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
+        "DGX_B200-4_GPUs-Verl-Post-Merge-1": ["auto:dgx-b200-flex", "l0_verl", 1, 1, 4, 1, true],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
