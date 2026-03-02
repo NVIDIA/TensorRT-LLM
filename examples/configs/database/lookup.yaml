@@ -939,14 +939,6 @@
   gpu: B200_NVL
   isl: 1024
   osl: 1024
-  concurrency: 1024
-  config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1024.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: B200_NVL
-  isl: 1024
-  osl: 1024
   concurrency: 1280
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc1280.yaml
   num_gpus: 4
@@ -1067,14 +1059,6 @@
   gpu: B200_NVL
   isl: 1024
   osl: 8192
-  concurrency: 512
-  config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc512.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: B200_NVL
-  isl: 1024
-  osl: 8192
   concurrency: 640
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc640.yaml
   num_gpus: 4
@@ -1110,14 +1094,6 @@
   concurrency: 1280
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc1280.yaml
   num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: B200_NVL
-  isl: 1024
-  osl: 8192
-  concurrency: 1536
-  config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc1536.yaml
-  num_gpus: 4
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
   gpu: B200_NVL
@@ -1227,14 +1203,6 @@
   gpu: B200_NVL
   isl: 8192
   osl: 1024
-  concurrency: 512
-  config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc512.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: B200_NVL
-  isl: 8192
-  osl: 1024
   concurrency: 640
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc640.yaml
   num_gpus: 8
@@ -1245,22 +1213,6 @@
   osl: 1024
   concurrency: 768
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc768.yaml
-  num_gpus: 2
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: B200_NVL
-  isl: 8192
-  osl: 1024
-  concurrency: 896
-  config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc896.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: B200_NVL
-  isl: 8192
-  osl: 1024
-  concurrency: 1024
-  config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc1024.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
@@ -1293,22 +1245,6 @@
   osl: 1024
   concurrency: 2048
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc2048.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
-  concurrency: 1
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
-  concurrency: 2
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc2.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
@@ -1363,14 +1299,6 @@
   gpu: H200_SXM
   isl: 1024
   osl: 1024
-  concurrency: 256
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc256.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
   concurrency: 384
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc384.yaml
   num_gpus: 4
@@ -1381,14 +1309,6 @@
   osl: 1024
   concurrency: 512
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc512.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
-  concurrency: 640
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc640.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
@@ -1414,30 +1334,6 @@
   concurrency: 1024
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc1024.yaml
   num_gpus: 4
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
-  concurrency: 1280
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1280.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
-  concurrency: 1536
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1536.yaml
-  num_gpus: 8
-- model: openai/gpt-oss-120b
-  arch: GptOssForCausalLM
-  gpu: H200_SXM
-  isl: 1024
-  osl: 1024
-  concurrency: 1792
-  config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1792.yaml
-  num_gpus: 8
 - model: openai/gpt-oss-120b
   arch: GptOssForCausalLM
   gpu: H200_SXM

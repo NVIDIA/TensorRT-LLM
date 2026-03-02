@@ -701,12 +701,6 @@
      - `8k1k_tp2_conc768.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc768.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc768.yaml``
    * - 2xB200_NVL
-     - Balanced
-     - 8192 / 1024
-     - 1024
-     - `8k1k_tp2_conc1024.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc1024.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc1024.yaml``
-   * - 2xB200_NVL
      - Max Throughput
      - 8192 / 1024
      - 1280
@@ -755,7 +749,7 @@
      - `1k8k_tp4_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc64.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc64.yaml``
    * - 4xB200_NVL
-     - Low Latency
+     - Balanced
      - 1024 / 8192
      - 128
      - `1k8k_tp4_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc128.yaml>`_
@@ -773,17 +767,11 @@
      - `1k8k_tp4_conc640.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc640.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc640.yaml``
    * - 4xB200_NVL
-     - High Throughput
+     - Max Throughput
      - 1024 / 8192
      - 896
      - `1k8k_tp4_conc896.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc896.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc896.yaml``
-   * - 4xB200_NVL
-     - Max Throughput
-     - 1024 / 8192
-     - 1536
-     - `1k8k_tp4_conc1536.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc1536.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc1536.yaml``
    * - 4xB200_NVL
      - Min Latency
      - 8192 / 1024
@@ -881,7 +869,7 @@
      - `1k1k_tp8_conc384.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc384.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc384.yaml``
    * - 8xB200_NVL
-     - Balanced
+     - High Throughput
      - 1024 / 1024
      - 512
      - `1k1k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc512.yaml>`_
@@ -904,12 +892,6 @@
      - 896
      - `1k1k_tp8_conc896.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc896.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc896.yaml``
-   * - 8xB200_NVL
-     - High Throughput
-     - 1024 / 1024
-     - 1024
-     - `1k1k_tp8_conc1024.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1024.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc1024.yaml``
    * - 8xB200_NVL
      - High Throughput
      - 1024 / 1024
@@ -947,19 +929,13 @@
      - `1k8k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc16.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc16.yaml``
    * - 8xB200_NVL
-     - Low Latency
+     - Balanced
      - 1024 / 8192
      - 32
      - `1k8k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc32.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc32.yaml``
    * - 8xB200_NVL
      - Balanced
-     - 1024 / 8192
-     - 512
-     - `1k8k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc512.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc512.yaml``
-   * - 8xB200_NVL
-     - High Throughput
      - 1024 / 8192
      - 768
      - `1k8k_tp8_conc768.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc768.yaml>`_
@@ -1001,7 +977,7 @@
      - `8k1k_tp8_conc16.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc16.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc16.yaml``
    * - 8xB200_NVL
-     - Low Latency
+     - Balanced
      - 8192 / 1024
      - 128
      - `8k1k_tp8_conc128.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc128.yaml>`_
@@ -1013,23 +989,11 @@
      - `8k1k_tp8_conc384.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc384.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc384.yaml``
    * - 8xB200_NVL
-     - Balanced
-     - 8192 / 1024
-     - 512
-     - `8k1k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc512.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc512.yaml``
-   * - 8xB200_NVL
      - High Throughput
      - 8192 / 1024
      - 640
      - `8k1k_tp8_conc640.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc640.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc640.yaml``
-   * - 8xB200_NVL
-     - High Throughput
-     - 8192 / 1024
-     - 896
-     - `8k1k_tp8_conc896.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc896.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc896.yaml``
    * - 8xB200_NVL
      - Max Throughput
      - 8192 / 1024
@@ -1099,18 +1063,6 @@
    * - 8xH200_SXM
      - Min Latency
      - 1024 / 1024
-     - 1
-     - `1k1k_tp8_conc1.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1.yaml``
-   * - 8xH200_SXM
-     - Low Latency
-     - 1024 / 1024
-     - 2
-     - `1k1k_tp8_conc2.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc2.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc2.yaml``
-   * - 8xH200_SXM
-     - Low Latency
-     - 1024 / 1024
      - 4
      - `1k1k_tp8_conc4.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc4.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc4.yaml``
@@ -1133,29 +1085,17 @@
      - `1k1k_tp8_conc32.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc32.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc32.yaml``
    * - 8xH200_SXM
-     - Low Latency
+     - Balanced
      - 1024 / 1024
      - 64
      - `1k1k_tp8_conc64.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc64.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc64.yaml``
    * - 8xH200_SXM
-     - Balanced
-     - 1024 / 1024
-     - 256
-     - `1k1k_tp8_conc256.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc256.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc256.yaml``
-   * - 8xH200_SXM
-     - Balanced
+     - High Throughput
      - 1024 / 1024
      - 512
      - `1k1k_tp8_conc512.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc512.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc512.yaml``
-   * - 8xH200_SXM
-     - High Throughput
-     - 1024 / 1024
-     - 640
-     - `1k1k_tp8_conc640.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc640.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc640.yaml``
    * - 8xH200_SXM
      - High Throughput
      - 1024 / 1024
@@ -1168,24 +1108,6 @@
      - 896
      - `1k1k_tp8_conc896.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc896.yaml>`_
      - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc896.yaml``
-   * - 8xH200_SXM
-     - High Throughput
-     - 1024 / 1024
-     - 1280
-     - `1k1k_tp8_conc1280.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1280.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1280.yaml``
-   * - 8xH200_SXM
-     - High Throughput
-     - 1024 / 1024
-     - 1536
-     - `1k1k_tp8_conc1536.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1536.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1536.yaml``
-   * - 8xH200_SXM
-     - High Throughput
-     - 1024 / 1024
-     - 1792
-     - `1k1k_tp8_conc1792.yaml <https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1792.yaml>`_
-     - ``trtllm-serve openai/gpt-oss-120b --config ${TRTLLM_DIR}/examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc1792.yaml``
    * - 8xH200_SXM
      - Max Throughput
      - 1024 / 1024

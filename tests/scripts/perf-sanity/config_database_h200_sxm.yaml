@@ -305,48 +305,62 @@ server_configs:
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc1_gpu8
+- name: openai_gpt_oss_120b_1024_1024_conc4_gpu8
   model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
-  max_batch_size: 1
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 4
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  moe_config:
+    backend: TRITON
+  num_postprocess_workers: 4
   print_iter_log: true
+  stream_interval: 20
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 2068
-  kv_cache_config:
-    enable_block_reuse: false
   client_configs:
-  - name: con1_isl1024_osl1024
-    concurrency: 1
+  - name: con4_isl1024_osl1024
+    concurrency: 4
     iterations: 10
     isl: 1024
     osl: 1024
     random_range_ratio: 0.0
     backend: openai
     streaming: true
-- name: openai_gpt_oss_120b_1024_1024_conc256_gpu8
+- name: openai_gpt_oss_120b_1024_1024_conc64_gpu8
   model_name: gpt_oss_120b_fp4
   gpus: 8
   match_mode: scenario
   env_overrides:
     TRTLLM_ENABLE_PDL: 1
-  max_batch_size: 256
+  cuda_graph_config:
+    enable_padding: true
+    max_batch_size: 64
+  kv_cache_config:
+    free_gpu_memory_fraction: 0.85
+    enable_block_reuse: false
+  moe_config:
+    backend: TRITON
+  num_postprocess_workers: 4
   print_iter_log: true
+  stream_interval: 20
   tensor_parallel_size: 8
   moe_expert_parallel_size: 8
   trust_remote_code: true
   max_num_tokens: 20000
   max_seq_len: 2068
-  kv_cache_config:
-    enable_block_reuse: false
   client_configs:
-  - name: con256_isl1024_osl1024
-    concurrency: 256
+  - name: con64_isl1024_osl1024
+    concurrency: 64
     iterations: 10
     isl: 1024
     osl: 1024
