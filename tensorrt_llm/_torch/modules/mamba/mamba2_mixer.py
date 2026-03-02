@@ -13,6 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
+
 import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
@@ -359,10 +361,9 @@ class Mamba2Mixer(nn.Module):
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes,
-                    dtype=torch.int32,
-                    device=state_indices_d.device)
+                intermediate_state_indices = _cached_arange(
+                    attn_metadata.kv_cache_manager.get_max_resource_count(),
+                    state_indices_d.device)[:num_decodes]
 
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
@@ -376,7 +377,7 @@ class Mamba2Mixer(nn.Module):
                     activation="silu",
                     conv_state_indices=state_indices_d[:num_decodes],
                     intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
 
                 xbc_d = xbc_d_processed.transpose(1, 2).view(
@@ -442,7 +443,7 @@ class Mamba2Mixer(nn.Module):
                     disable_state_update=True,
                     intermediate_states_buffer=intermediate_ssm_states,
                     cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
             else:
                 self.selective_state_update_func_no_mtp(
@@ -468,3 +469,11 @@ class Mamba2Mixer(nn.Module):
         out = self.out_proj(hidden_states)
 
         return out[:num_actual_tokens]
+
+
+# We want to cache the largest indexing vector we'd ever need and mask it, vs
+# recreating it.  But we don't know the size at __init__, and it could even
+# change later if the mamba cache manager changes.
+@functools.cache
+def _cached_arange(n: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(n, dtype=torch.int32, device=device)
