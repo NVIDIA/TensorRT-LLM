@@ -26,6 +26,8 @@ MPI_TAG = 9999
 MPI_READY = MPI_TAG + 2
 MPI_REQUEST = MPI_TAG
 MPI_RESULT = MPI_TAG + 1
+MPI_CANCEL = MPI_TAG + 3
+MPI_STARTED = MPI_TAG + 4
 
 MODEL_PATHS = {
     "DeepSeek-V3-Lite-fp8": "DeepSeek-V3-Lite/fp8",
@@ -80,8 +82,12 @@ def model_path(model_name):
     raise ValueError(f"Unknown model: {model_name}")
 
 
-async def run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
-                     model_name, rank):
+async def run_worker(kv_cache_config,
+                     cache_transceiver_config,
+                     pytorch_config,
+                     model_name,
+                     rank,
+                     support_cancel=False):
     assert isinstance(pytorch_config, dict)
     print(f"Running worker {rank}")
     try:
@@ -124,18 +130,57 @@ async def run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
                 break
 
             futures = []
-            for request in requests:
+            for i, request in enumerate(requests):
+                print(f"Worker {rank}: submitting request {i}/{len(requests)}",
+                      flush=True)
                 futures.append(
                     llm.generate_async(request[0],
                                        sampling_params=request[1],
                                        disaggregated_params=request[2]))
+            print(f"Worker {rank}: all {len(futures)} requests submitted",
+                  flush=True)
 
-            for future in futures:
-                result = await future
-                intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
+            if support_cancel:
+                intercomm.send(len(futures), dest=0, tag=MPI_STARTED)
+                cancel_indices = intercomm.recv(source=MPI.ANY_SOURCE,
+                                                tag=MPI_CANCEL)
+                if cancel_indices:
+                    print(
+                        f"Worker {rank}: cancelling {len(cancel_indices)} requests: {cancel_indices}",
+                        flush=True)
+                    for idx in cancel_indices:
+                        futures[idx].abort()
+
+                for i, future in enumerate(futures):
+                    try:
+                        print(
+                            f"Worker {rank}: awaiting future {i}/{len(futures)}",
+                            flush=True)
+                        result = await future
+                        print(f"Worker {rank}: got result {i}, sending",
+                              flush=True)
+                        intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
+                    except Exception as e:
+                        print(f"Worker {rank}: error on future {i}: {e}",
+                              flush=True)
+                        intercomm.send(str(e), dest=0, tag=MPI_RESULT)
+            else:
+                for i, future in enumerate(futures):
+                    try:
+                        print(
+                            f"Worker {rank}: awaiting future {i}/{len(futures)}",
+                            flush=True)
+                        result = await future
+                        print(f"Worker {rank}: got result {i}, sending",
+                              flush=True)
+                        intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
+                    except Exception as e:
+                        print(f"Worker {rank}: error on future {i}: {e}",
+                              flush=True)
+                        intercomm.send(str(e), dest=0, tag=MPI_RESULT)
         except Exception as e:
-            print(f"Worker {rank} error: {e}")
-    llm.shutdown()
+            print(f"Unexpected error: {e}", flush=True)
+            raise e
 
 
 def send_requests_to_worker(requests, worker_rank, intercomm):
@@ -149,11 +194,19 @@ def send_requests_to_worker(requests, worker_rank, intercomm):
     return responses
 
 
-def worker_entry_point(kv_cache_config, cache_transceiver_config,
-                       pytorch_config, model_name, rank):
+def worker_entry_point(kv_cache_config,
+                       cache_transceiver_config,
+                       pytorch_config,
+                       model_name,
+                       rank,
+                       support_cancel=False):
     return asyncio.run(
-        run_worker(kv_cache_config, cache_transceiver_config, pytorch_config,
-                   model_name, rank))
+        run_worker(kv_cache_config,
+                   cache_transceiver_config,
+                   pytorch_config,
+                   model_name,
+                   rank,
+                   support_cancel=support_cancel))
 
 
 def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
@@ -236,7 +289,6 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             assert output[0].token_ids == expected_output_ids
         except Exception as e:
             print(f"Exception encountered: {e}", flush=True)
-            raise e
         finally:
             print("Sending termination request", flush=True)
             mpi_send_termination_request(intercomm)
@@ -614,6 +666,113 @@ def test_disaggregated_logprobs(model, generation_overlap):
             mpi_send_termination_request(intercomm)
             for future in futures:
                 future.result()
+
+
+@pytest.mark.parametrize("model", ["TinyLlama-1.1B-Chat-v1.0"])
+def test_disaggregated_cancel_gen_requests(model):
+    # Test that cancelling generation requests on a saturated generation
+    # worker completes without hangs or resource leaks.
+    worker_pytorch_configs = []
+
+    # Context worker
+    worker_pytorch_configs.append(
+        dict(disable_overlap_scheduler=True, cuda_graph_config=None))
+
+    # Generation worker
+    worker_pytorch_configs.append(dict(cuda_graph_config=None))
+
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=2048, enable_block_reuse=False)
+        for _ in range(2)
+    ]
+    cache_transceiver_configs = [
+        CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
+    ]
+    model_names = [model_path(model) for _ in range(2)]
+
+    port_name = mpi_publish_name()
+
+    prompt = "What is the capital of Germany?"
+    num_requests = 16
+    num_cancel = 8
+    max_tokens = 50
+
+    with MPIPoolExecutor(max_workers=2,
+                         env={
+                             "UCX_TLS": "^ib,gdr_copy",
+                             "UCX_MM_ERROR_HANDLING": "y",
+                         }) as executor:
+        futures = []
+        try:
+            futures.append(
+                executor.submit(worker_entry_point, kv_cache_configs[0],
+                                cache_transceiver_configs[0],
+                                worker_pytorch_configs[0], model_names[0], 0))
+            futures.append(
+                executor.submit(worker_entry_point, kv_cache_configs[1],
+                                cache_transceiver_configs[1],
+                                worker_pytorch_configs[1], model_names[1], 1,
+                                True))
+        except Exception as e:
+            print(f"Error submitting workers: {e}")
+            raise e
+
+        intercomm = None
+        try:
+            print("Launched all workers.", flush=True)
+            intercomm = mpi_initialize_intercomm(port_name)
+
+            for _ in range(2):
+                intercomm.recv(tag=MPI_READY)
+                print("Received ready signal.")
+
+            context_requests = []
+            for _ in range(num_requests):
+                context_requests.append(
+                    (prompt, SamplingParams(max_tokens=1, ignore_eos=True),
+                     DisaggregatedParams(request_type="context_only")))
+
+            intercomm.send(context_requests, dest=0, tag=MPI_REQUEST)
+
+            gen_requests = []
+            for _ in range(num_requests):
+                output = intercomm.recv(source=0, tag=MPI_RESULT)
+                assert output[0].disaggregated_params is not None
+                assert output[
+                    0].disaggregated_params.request_type == "context_only"
+                assert len(output[0].token_ids) == 1
+
+                disagg_params = output[0].disaggregated_params
+                disagg_params.request_type = "generation_only"
+                gen_requests.append(
+                    (prompt,
+                     SamplingParams(max_tokens=max_tokens,
+                                    ignore_eos=True), disagg_params))
+
+            intercomm.send(gen_requests, dest=1, tag=MPI_REQUEST)
+
+            num_started = intercomm.recv(source=1, tag=MPI_STARTED)
+            assert num_started == num_requests
+            print(f"Generation worker started {num_started} requests.")
+
+            cancel_indices = list(range(num_cancel))
+            intercomm.send(cancel_indices, dest=1, tag=MPI_CANCEL)
+            print(f"Sent cancel for indices {cancel_indices}.")
+
+            for i in range(num_requests):
+                output = intercomm.recv(source=1, tag=MPI_RESULT)
+                print(f"Received result {i}/{num_requests}.")
+
+        except Exception as e:
+            print(f"Exception encountered: {e}", flush=True)
+        finally:
+            print("Sending termination request", flush=True)
+            mpi_send_termination_request(intercomm)
+
+            print("Waiting for all workers to terminate.", flush=True)
+            for future in futures:
+                future.result()
+            print("All workers terminated.")
 
 
 if __name__ == "__main__":
