@@ -23,7 +23,7 @@ from _torch.helpers import (calc_diff, per_block_cast_to_fp8,
 from utils.util import getSMVersion, isSM100Family
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
-from tensorrt_llm._torch.autotuner import autotune
+from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 
 
 @pytest.mark.skipif(
@@ -110,8 +110,8 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
 
 
 @pytest.mark.skipif(
-    not isSM100Family(),
-    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "k, n",
@@ -126,11 +126,7 @@ def test_fp8_block_scale_gemm(dtype, m, k, n):
     "dtype",
     [torch.bfloat16],
 )
-@pytest.mark.parametrize(
-    "use_tvm_ffi",
-    [True, False],
-)
-def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
+def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, k), device='cuda', dtype=dtype) / k
@@ -141,20 +137,30 @@ def test_cute_dsl_fp8_block_scale_gemm(dtype, m, k, n, use_tvm_ffi):
 
     output_expected = a @ b.t()
 
-    with autotune():
-        cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf, use_tvm_ffi=use_tvm_ffi)
+    with AutoTuner.get().capture() as tactics_capture:
+        output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+            act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
 
-    # test Cute DSL kernel
-    cute_dsl_output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
-        act_a_fp8, act_b_fp8, act_a_sf, act_b_sf, use_tvm_ffi=use_tvm_ffi)
+    tactics_list = list(tactics_capture)
+    print(f"  Found {len(tactics_list)} tactics")
+    assert len(tactics_list) > 0, "No valid tactics found"
 
-    diff = calc_diff(cute_dsl_output, output_expected)
-    assert diff < 1e-3
-    torch.testing.assert_close(cute_dsl_output,
-                               output_expected,
-                               atol=1e-3,
-                               rtol=1e-3)
+    for tactic_idx, tactic_config in enumerate(tactics_list):
+        runner, tactic_value = tactic_config[0]
+        runner_name = runner.__class__.__name__
+
+        with AutoTuner.get().replay(tactic_config):
+            output = torch.ops.trtllm.cute_dsl_fp8_gemm_blackwell(
+                act_a_fp8, act_b_fp8, act_a_sf, act_b_sf)
+
+        diff = calc_diff(output, output_expected)
+        assert diff < 1e-3, (
+            f"Tactic {tactic_idx} ({runner_name}, tactic={tactic_value}) "
+            f"failed: diff={diff}")
+        torch.testing.assert_close(output,
+                                   output_expected,
+                                   atol=1e-3,
+                                   rtol=1e-3)
 
 
 @pytest.mark.skipif(
@@ -220,8 +226,8 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
 
 @pytest.mark.skipif(
-    not isSM100Family(),
-    reason="The test is for Blackwell. Current SM is %d." % getSMVersion(),
+    getSMVersion() not in (100, 103),
+    reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
 )
 @pytest.mark.parametrize(
     "k, n",
@@ -239,11 +245,7 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
     "dtype",
     [torch.bfloat16],
 )
-@pytest.mark.parametrize(
-    "use_tvm_ffi",
-    [True, False],
-)
-def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups, use_tvm_ffi):
+def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
     torch.random.manual_seed(0)
     a = torch.randn((m, num_groups, k), device='cuda', dtype=dtype) / k
@@ -262,24 +264,32 @@ def test_cute_dsl_fp8_block_scale_bmm(dtype, m, k, n, num_groups, use_tvm_ffi):
     output = torch.empty((num_groups, m, n),
                          device='cuda',
                          dtype=torch.bfloat16)
-    # tune
-    with autotune():
-        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8,
-                                                    b_fp8,
-                                                    a_scales,
-                                                    b_scales,
-                                                    output,
-                                                    use_tvm_ffi=use_tvm_ffi)
-    # run the tuned kernel
-    torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8,
-                                                b_fp8,
-                                                a_scales,
-                                                b_scales,
-                                                output,
-                                                use_tvm_ffi=use_tvm_ffi)
-    diff = calc_diff(output, output_expected)
-    assert diff < 1e-3
-    torch.testing.assert_close(output, output_expected, atol=1e-3, rtol=1e-3)
+
+    with AutoTuner.get().capture() as tactics_capture:
+        torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                    b_scales, output)
+
+    tactics_list = list(tactics_capture)
+    print(f"  Found {len(tactics_list)} tactics")
+    assert len(tactics_list) > 0, "No valid tactics found"
+
+    for tactic_idx, tactic_config in enumerate(tactics_list):
+        runner, tactic_value = tactic_config[0]
+        runner_name = runner.__class__.__name__
+
+        output.zero_()
+        with AutoTuner.get().replay(tactic_config):
+            torch.ops.trtllm.cute_dsl_fp8_bmm_blackwell(a_fp8, b_fp8, a_scales,
+                                                        b_scales, output)
+
+        diff = calc_diff(output, output_expected)
+        assert diff < 1e-3, (
+            f"Tactic {tactic_idx} ({runner_name}, tactic={tactic_value}) "
+            f"failed: diff={diff}")
+        torch.testing.assert_close(output,
+                                   output_expected,
+                                   atol=1e-3,
+                                   rtol=1e-3)
 
 
 def deepSeekFp8ComputeGemmReference(mM, mN, mK, valsC, dqSfsC, valsA, dqSfsA,

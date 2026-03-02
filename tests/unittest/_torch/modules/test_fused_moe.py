@@ -18,7 +18,8 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
+from utils.util import (check_accuracy, getSMVersion, isSM100Family,
+                        skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
                         skip_pre_blackwell, skip_pre_hopper)
 
@@ -1038,7 +1039,10 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
-@skip_pre_blackwell
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1157,7 +1161,8 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
         # Note: use deepgemm mm will cause accuracy error, so we use trtllmgen mm here
-        use_cute_dsl_blockscaling_mm=True,
+        use_cute_dsl_blockscaling_mm=False,
+        disable_deep_gemm=True,
     )
     ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
@@ -1337,7 +1342,10 @@ def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
-@skip_pre_blackwell
+@pytest.mark.skipif(
+    not isSM100Family(),
+    reason="The test is for Blackwell only. Current SM is %d." % getSMVersion(),
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("ep_size", [1, 2, 4])
@@ -2743,6 +2751,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                  dtype: Optional[torch.dtype] = None,
                  model_config: ModelConfig = ModelConfig(),
                  use_cute_dsl_blockscaling_mm: bool = False,
+                 disable_deep_gemm: bool = False,
                  bias=False,
                  swiglu_alpha: Optional[float] = None,
                  swiglu_beta: Optional[float] = None,
@@ -2778,6 +2787,7 @@ class RefGatedMLPFusedMoE(nn.Module):
                 dtype=self.dtype,
                 config=model_config,
                 use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                disable_deep_gemm=disable_deep_gemm,
                 activation=custom_swiglu
                 if swiglu_alpha is not None else F.silu,
             ) for _ in range(self.num_experts)
