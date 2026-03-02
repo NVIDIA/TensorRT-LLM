@@ -21,7 +21,7 @@
 
 //
 // Implementation of constant radix search tree for KV cache blocks.
-// It is a unified tree, a single instane of search tree services
+// It is a unified tree, a single instance of search tree services
 // all WindowBlockManager instances. This is achieved by using
 // window size as value key.
 //
