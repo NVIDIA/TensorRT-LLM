@@ -3467,7 +3467,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         # NB: Unfortunately, Torch provides no combination of torch.index_select (similar to
         #     torch.Tensor.gather -- allows one-to-many mapping) and addition, analogous to how
-        #     torch.Tensor.scatter_add_ (and it's variant torch.Tensor.index_add_ -- allows
+        #     torch.Tensor.scatter_add_ (and its variant torch.Tensor.index_add_ -- allows
         #     many-to-one mapping) combine addition with torch.Tensor.scatter_.
         #
         #     Notwithstanding the previous point, there are two options:
