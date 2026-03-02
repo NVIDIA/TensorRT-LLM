@@ -21,8 +21,7 @@ set(TensorRT_WELL_KNOWN_ROOT /usr/local/tensorrt)
 find_path(
   TensorRT_INCLUDE_DIR
   NAMES NvInfer.h
-  PATHS ${TensorRT_ROOT}/include
-        ${TensorRT_ROOT}/include/tensorrt
+  PATHS ${TensorRT_ROOT}/include ${TensorRT_ROOT}/include/tensorrt
         ${TensorRT_WELL_KNOWN_ROOT}/include)
 
 function(_tensorrt_get_version)
@@ -95,8 +94,7 @@ if(TensorRT_FIND_COMPONENTS)
 
     find_library(
       TensorRT_OnnxParser_LIBRARY
-      NAMES nvonnxparser
-            "nvonnxparser_${TensorRT_VERSION_MAJOR}"
+      NAMES nvonnxparser "nvonnxparser_${TensorRT_VERSION_MAJOR}"
             "libnvonnxparser.so.${TensorRT_VERSION_MAJOR}"
       PATHS ${TensorRT_ROOT} ${TensorRT_WELL_KNOWN_ROOT}/lib)
     if(TensorRT_OnnxParser_LIBRARY AND TensorRT_LIBRARIES)
