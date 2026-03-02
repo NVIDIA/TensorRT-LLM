@@ -452,6 +452,8 @@ class SpecWorkerBase(nn.Module, ABC):
         """
         Restore attention metadata after speculative decoding draft token generation.
         """
+        if hasattr(attn_metadata, 'use_spec_decoding'):
+            attn_metadata.use_spec_decoding = attn_metadata.is_spec_decoding_enabled
         attn_metadata.restore_from_spec_dec()
         attn_metadata.on_update()
 
