@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+from typing import List, Optional
 
 import torch
 
@@ -28,7 +28,7 @@ from .mamba_backend_common import (
 )
 
 
-@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args={})
+@torch.library.custom_op("auto_deploy::triton_cached_ssm", mutates_args=("out",))
 def _triton_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
@@ -52,6 +52,7 @@ def _triton_cached_ssm(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     b, s, num_heads, head_dim, bs, hs_flat, B_flat, C_flat, dt_flat = _flatten_ssm_inputs(
         hidden_states, B, C, dt
@@ -135,6 +136,13 @@ def _triton_cached_ssm(
             out=preallocated_ssm_out_d,
         )
 
+    if out is not None:
+        flat_out = out.view(b * s, num_heads, head_dim)
+        flat_out[:num_total_tokens].copy_(preallocated_ssm_out[:num_total_tokens])
+        if num_total_tokens < b * s:
+            flat_out[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     if num_total_tokens > 0:
         # Cast to input dtype if needed (prefill may compute in higher precision)
         if preallocated_ssm_out.dtype != hidden_states.dtype:
@@ -168,7 +176,10 @@ def _triton_cached_ssm_fake(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ):
+    if out is not None:
+        return out
     # Return a correctly-shaped tensor for tracing with fake tensors
     return torch.empty_like(
         hidden_states,

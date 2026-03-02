@@ -59,7 +59,7 @@ _METADATA_PREP_OPS = [
 
 # Logits gather ops (CPU branching on host tensor + shape-dependent logic)
 _LOGITS_GATHER_OPS = [
-    "auto_deploy::gather_logits_before_lm_head",
+    "auto_deploy::gather_tokens",
 ]
 
 

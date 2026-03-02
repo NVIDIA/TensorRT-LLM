@@ -89,12 +89,42 @@ class CompileModel(BaseTransform):
             cm.info.set_generate_only_batch(bs)
             return (), cm.named_args
 
+        def _get_mixed_args_kwargs(num_tokens: int) -> ArgsKwargs:
+            """Generate synthetic mixed-batch args for piecewise CG capture."""
+            assert num_tokens >= 3, (
+                f"Piecewise bucket {num_tokens} too small for mixed batch. "
+                f"Minimum is 3 (1 prefill seq with len>=2 + 1 decode seq)."
+            )
+            max_seq = cm.info.max_seq_len
+            max_batch = cm.info.max_batch_size
+
+            input_ids = []
+            remaining = num_tokens - 1
+            while remaining > 0 and len(input_ids) < max_batch - 1:
+                seq_len = min(remaining, max_seq)
+                input_ids.append([1] * seq_len)
+                remaining -= seq_len
+            input_ids.append([1])
+
+            if remaining > 0:
+                raise ValueError(
+                    f"Piecewise bucket {num_tokens} exceeds batch capacity "
+                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode). "
+                    f"Increase max_seq_len or max_batch_size."
+                )
+
+            cm.info.set_example_sequence(input_ids=input_ids)
+            return (), cm.named_args
+
         extra_kwargs = {}
         config_overrides = {}
 
         if self.config.piecewise_enabled:
-            extra_kwargs["piecewise_seq_info"] = cm.info
-            extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
+            extra_kwargs["get_mixed_args_kwargs_for_compile"] = _get_mixed_args_kwargs
+
+            max_seq = cm.info.max_seq_len
+            max_batch = cm.info.max_batch_size
+            batch_capacity = (max_batch - 1) * max_seq + 1
 
             # Auto-generate piecewise_num_tokens if not explicitly specified
             if self.config.piecewise_num_tokens is None:
@@ -115,6 +145,20 @@ class CompileModel(BaseTransform):
                         f"minimum is 3). Remaining: {valid_buckets}"
                     )
                 config_overrides["piecewise_num_tokens"] = valid_buckets
+
+            # Filter out buckets that exceed the mixed-batch capacity
+            buckets = config_overrides.get(
+                "piecewise_num_tokens", self.config.piecewise_num_tokens or []
+            )
+            over = [nt for nt in buckets if nt > batch_capacity]
+            if over:
+                buckets = [nt for nt in buckets if nt <= batch_capacity]
+                ad_logger.warning(
+                    f"Dropping piecewise buckets {over} that exceed mixed-batch capacity "
+                    f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode = {batch_capacity}). "
+                    f"Remaining: {buckets}"
+                )
+                config_overrides["piecewise_num_tokens"] = buckets
 
         # Merge config with any overrides
         config_dict = self.config.model_dump()
