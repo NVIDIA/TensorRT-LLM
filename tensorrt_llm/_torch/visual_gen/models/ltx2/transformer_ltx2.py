@@ -22,85 +22,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
+from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.modules.rms_norm import RMSNorm
+from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
-
-# ---------------------------------------------------------------------------
-# Pure-PyTorch fallback layers (used when DiffusionModelConfig.use_pytorch_layers=True)
-# ---------------------------------------------------------------------------
-
-
-class _PyTorchRMSNorm(nn.Module):
-    """Pure-PyTorch RMSNorm matching the TRT-LLM RMSNorm interface."""
-
-    def __init__(self, hidden_size: int, eps: float = 1e-6, dtype=None):
-        super().__init__()
-        self.weight = nn.Parameter(torch.ones(hidden_size, dtype=dtype))
-        self.eps = eps
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        orig_dtype = x.dtype
-        x_fp32 = x.to(torch.float32)
-        variance = x_fp32.pow(2).mean(-1, keepdim=True)
-        x_normed = x_fp32 * torch.rsqrt(variance + self.eps)
-        return (self.weight * x_normed).to(orig_dtype)
-
-
-class _PyTorchMLP(nn.Module):
-    """Pure-PyTorch gated MLP matching the TRT-LLM MLP interface.
-
-    Attribute names (`up_proj`, `down_proj`) intentionally match the TRT-LLM
-    MLP so that checkpoint key remapping works identically for both backends.
-    """
-
-    def __init__(
-        self,
-        hidden_size: int,
-        intermediate_size: int,
-        bias: bool = True,
-        dtype=None,
-        **_kwargs,
-    ):
-        super().__init__()
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=bias, dtype=dtype)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=bias, dtype=dtype)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.down_proj(F.gelu(self.up_proj(x), approximate="tanh"))
-
-
-class _PyTorchAttention(nn.Module):
-    """Thin wrapper around ``F.scaled_dot_product_attention``."""
-
-    def forward(self, *, q, k, v, batch_size, seq_len, seq_len_kv=None):
-        # q/k/v: [B, S, H, D] → transpose to [B, H, S, D] for SDPA
-        q = q.transpose(1, 2)
-        k = k.transpose(1, 2)
-        v = v.transpose(1, 2)
-        out = F.scaled_dot_product_attention(q, k, v)
-        return out.transpose(1, 2)  # [B, H, S, D] → [B, S, H, D]
-
-
-# ---------------------------------------------------------------------------
-# Lazy-import helpers so we do not hard-depend on TRT-LLM modules at import
-# time when only the PyTorch path is used.
-# ---------------------------------------------------------------------------
-
-
-def _trtllm_imports():
-    """Return (Linear, MLP, RMSNorm, create_attention, DynamicLinearWeightLoader)."""
-    from tensorrt_llm._torch.modules.linear import Linear
-    from tensorrt_llm._torch.modules.mlp import MLP
-    from tensorrt_llm._torch.modules.rms_norm import RMSNorm
-    from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
-    from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-    return Linear, MLP, RMSNorm, create_attention, DynamicLinearWeightLoader
-
-
-def _is_pytorch_mode(config) -> bool:
-    """Check whether the model config requests pure-PyTorch layers."""
-    if config is None:
-        return False
-    return getattr(config, "use_pytorch_layers", False)
 
 
 from .ltx2_core.adaln import AdaLayerNormSingle
@@ -124,12 +51,7 @@ if TYPE_CHECKING:
 
 
 class LTX2Attention(nn.Module):
-    """LTX-2 attention with selectable backend.
-
-    When ``config.use_pytorch_layers`` is *False* (default), uses TRT-LLM
-    Linear, RMSNorm, and attention backend.  When *True*, falls back to
-    ``nn.Linear``, ``_PyTorchRMSNorm``, and ``F.scaled_dot_product_attention``.
-    """
+    """LTX-2 attention using TRT-LLM Linear, RMSNorm, and attention backend."""
 
     def __init__(
         self,
@@ -148,7 +70,6 @@ class LTX2Attention(nn.Module):
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
         config = config or DiffusionModelConfig()
-        pytorch_mode = _is_pytorch_mode(config)
 
         self.rope_type = rope_type
         self.heads = heads
@@ -157,84 +78,63 @@ class LTX2Attention(nn.Module):
         context_dim = query_dim if context_dim is None else context_dim
         dtype = config.torch_dtype
 
-        if pytorch_mode:
-            self.to_q = nn.Linear(query_dim, inner_dim, bias=True, dtype=dtype)
-            self.to_k = nn.Linear(context_dim, inner_dim, bias=True, dtype=dtype)
-            self.to_v = nn.Linear(context_dim, inner_dim, bias=True, dtype=dtype)
+        quant_config = config.quant_config
+        skip_create = config.skip_create_weights_in_init
+        force_dq = config.force_dynamic_quantization
+        mapping = getattr(config, "mapping", None)
 
-            self.q_norm = _PyTorchRMSNorm(inner_dim, eps=norm_eps, dtype=dtype)
-            self.k_norm = _PyTorchRMSNorm(inner_dim, eps=norm_eps, dtype=dtype)
+        self.to_q = Linear(
+            query_dim, inner_dim, bias=True, dtype=dtype,
+            mapping=mapping, quant_config=quant_config,
+            skip_create_weights_in_init=skip_create,
+            force_dynamic_quantization=force_dq,
+        )
+        self.to_k = Linear(
+            context_dim, inner_dim, bias=True, dtype=dtype,
+            mapping=mapping, quant_config=quant_config,
+            skip_create_weights_in_init=skip_create,
+            force_dynamic_quantization=force_dq,
+        )
+        self.to_v = Linear(
+            context_dim, inner_dim, bias=True, dtype=dtype,
+            mapping=mapping, quant_config=quant_config,
+            skip_create_weights_in_init=skip_create,
+            force_dynamic_quantization=force_dq,
+        )
 
-            if apply_gated_attention:
-                self.to_gate_logits = nn.Linear(query_dim, heads, bias=True, dtype=dtype)
-            else:
-                self.to_gate_logits = None
+        self.q_norm = RMSNorm(hidden_size=inner_dim, eps=norm_eps, dtype=dtype)
+        self.k_norm = RMSNorm(hidden_size=inner_dim, eps=norm_eps, dtype=dtype)
 
-            self.to_out = nn.ModuleList([
-                nn.Linear(inner_dim, query_dim, bias=True, dtype=dtype)
-            ])
-
-            self.attn = _PyTorchAttention()
+        if apply_gated_attention:
+            self.to_gate_logits = Linear(
+                query_dim, heads, bias=True, dtype=dtype,
+                mapping=mapping, quant_config=quant_config,
+                skip_create_weights_in_init=skip_create,
+                force_dynamic_quantization=force_dq,
+            )
         else:
-            Linear, _MLP, RMSNorm, create_attention, _ = _trtllm_imports()
+            self.to_gate_logits = None
 
-            quant_config = config.quant_config
-            skip_create = config.skip_create_weights_in_init
-            force_dq = config.force_dynamic_quantization
-            mapping = getattr(config, "mapping", None)
-
-            self.to_q = Linear(
-                query_dim, inner_dim, bias=True, dtype=dtype,
+        self.to_out = nn.ModuleList([
+            Linear(
+                inner_dim, query_dim, bias=True, dtype=dtype,
                 mapping=mapping, quant_config=quant_config,
                 skip_create_weights_in_init=skip_create,
                 force_dynamic_quantization=force_dq,
             )
-            self.to_k = Linear(
-                context_dim, inner_dim, bias=True, dtype=dtype,
-                mapping=mapping, quant_config=quant_config,
-                skip_create_weights_in_init=skip_create,
-                force_dynamic_quantization=force_dq,
-            )
-            self.to_v = Linear(
-                context_dim, inner_dim, bias=True, dtype=dtype,
-                mapping=mapping, quant_config=quant_config,
-                skip_create_weights_in_init=skip_create,
-                force_dynamic_quantization=force_dq,
-            )
+        ])
 
-            self.q_norm = RMSNorm(hidden_size=inner_dim, eps=norm_eps, dtype=dtype)
-            self.k_norm = RMSNorm(hidden_size=inner_dim, eps=norm_eps, dtype=dtype)
-
-            if apply_gated_attention:
-                self.to_gate_logits = Linear(
-                    query_dim, heads, bias=True, dtype=dtype,
-                    mapping=mapping, quant_config=quant_config,
-                    skip_create_weights_in_init=skip_create,
-                    force_dynamic_quantization=force_dq,
-                )
-            else:
-                self.to_gate_logits = None
-
-            self.to_out = nn.ModuleList([
-                Linear(
-                    inner_dim, query_dim, bias=True, dtype=dtype,
-                    mapping=mapping, quant_config=quant_config,
-                    skip_create_weights_in_init=skip_create,
-                    force_dynamic_quantization=force_dq,
-                )
-            ])
-
-            is_cross_attn = (context_dim != query_dim)
-            backend_name = "VANILLA" if is_cross_attn else config.attention.backend
-            self.attn = create_attention(
-                backend=backend_name,
-                layer_idx=layer_idx,
-                num_heads=heads,
-                head_dim=dim_head,
-                num_kv_heads=heads,
-                quant_config=quant_config,
-                dtype=dtype,
-            )
+        is_cross_attn = (context_dim != query_dim)
+        backend_name = "VANILLA" if is_cross_attn else config.attention.backend
+        self.attn = create_attention(
+            backend=backend_name,
+            layer_idx=layer_idx,
+            num_heads=heads,
+            head_dim=dim_head,
+            num_kv_heads=heads,
+            quant_config=quant_config,
+            dtype=dtype,
+        )
 
     def forward(
         self,
@@ -269,46 +169,33 @@ class LTX2Attention(nn.Module):
         seq_len = q.shape[1]
         kv_seq_len = k.shape[1]
 
-        if isinstance(self.attn, _PyTorchAttention):
+        from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
+            AttentionTensorLayout,
+        )
+
+        backend_layout = getattr(
+            self.attn, "preferred_layout", AttentionTensorLayout.NHD
+        )
+        if backend_layout == AttentionTensorLayout.HND:
+            q = q.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
+            k = k.view(batch_size, kv_seq_len, self.heads, self.dim_head).transpose(1, 2)
+            v = v.view(batch_size, kv_seq_len, self.heads, self.dim_head).transpose(1, 2)
+        else:
             q = q.view(batch_size, seq_len, self.heads, self.dim_head)
             k = k.view(batch_size, kv_seq_len, self.heads, self.dim_head)
             v = v.view(batch_size, kv_seq_len, self.heads, self.dim_head)
 
-            out = self.attn(
-                q=q, k=k, v=v,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                seq_len_kv=kv_seq_len if kv_seq_len != seq_len else None,
-            )
-            out = out.flatten(2)
+        out = self.attn.forward(
+            q=q, k=k, v=v,
+            batch_size=batch_size,
+            seq_len=seq_len,
+            seq_len_kv=kv_seq_len if kv_seq_len != seq_len else None,
+        )
+
+        if backend_layout == AttentionTensorLayout.HND:
+            out = out.transpose(1, 2).flatten(2)
         else:
-            from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
-                AttentionTensorLayout,
-            )
-
-            backend_layout = getattr(
-                self.attn, "preferred_layout", AttentionTensorLayout.NHD
-            )
-            if backend_layout == AttentionTensorLayout.HND:
-                q = q.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
-                k = k.view(batch_size, kv_seq_len, self.heads, self.dim_head).transpose(1, 2)
-                v = v.view(batch_size, kv_seq_len, self.heads, self.dim_head).transpose(1, 2)
-            else:
-                q = q.view(batch_size, seq_len, self.heads, self.dim_head)
-                k = k.view(batch_size, kv_seq_len, self.heads, self.dim_head)
-                v = v.view(batch_size, kv_seq_len, self.heads, self.dim_head)
-
-            out = self.attn.forward(
-                q=q, k=k, v=v,
-                batch_size=batch_size,
-                seq_len=seq_len,
-                seq_len_kv=kv_seq_len if kv_seq_len != seq_len else None,
-            )
-
-            if backend_layout == AttentionTensorLayout.HND:
-                out = out.transpose(1, 2).flatten(2)
-            else:
-                out = out.flatten(2)
+            out = out.flatten(2)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
@@ -369,12 +256,6 @@ class BasicAVTransformerBlock(nn.Module):
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
         dtype = model_config.torch_dtype if model_config else None
-        if _is_pytorch_mode(model_config):
-            return _PyTorchMLP(
-                hidden_size=cfg.dim, intermediate_size=cfg.dim * 4,
-                bias=True, dtype=dtype,
-            )
-        _, MLP, *_ = _trtllm_imports()
         return MLP(
             hidden_size=cfg.dim, intermediate_size=cfg.dim * 4, bias=True,
             activation=lambda x: F.gelu(x, approximate="tanh"),
@@ -782,11 +663,10 @@ class LTXModel(nn.Module):
 
     def __post_init__(self):
         """Apply quant exclusions then materialize deferred Linear weights."""
-        if not _is_pytorch_mode(self.model_config):
-            self._apply_quant_config_exclude_modules()
-            for _, module in self.named_modules():
-                if callable(getattr(module, "create_weights", None)):
-                    module.create_weights()
+        self._apply_quant_config_exclude_modules()
+        for _, module in self.named_modules():
+            if callable(getattr(module, "create_weights", None)):
+                module.create_weights()
 
     def _apply_quant_config_exclude_modules(self):
         if self.model_config is None:
@@ -794,8 +674,6 @@ class LTXModel(nn.Module):
         quant_config = self.model_config.quant_config
         if quant_config is None or quant_config.exclude_modules is None:
             return
-
-        Linear, *_ = _trtllm_imports()
 
         from tensorrt_llm.models.modeling_utils import QuantConfig
 
@@ -811,12 +689,8 @@ class LTXModel(nn.Module):
     # -- Initialization helpers ----------------------------------------------
 
     def _make_linear(self, in_features: int, out_features: int, bias: bool = True) -> nn.Module:
-        """Create a Linear layer using the configured backend."""
+        """Create a Linear layer using the TRT-LLM backend."""
         dtype = self.model_config.torch_dtype if self.model_config else None
-        if _is_pytorch_mode(self.model_config):
-            return nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
-
-        Linear, *_ = _trtllm_imports()
         quant_config = self.model_config.quant_config if self.model_config else None
         skip_create = (
             self.model_config.skip_create_weights_in_init if self.model_config else False
@@ -1113,27 +987,10 @@ class LTXModel(nn.Module):
             if param is not None and param_name in weights:
                 param.data.copy_(weights[param_name].to(target_dtype))
 
-        if _is_pytorch_mode(self.model_config):
-            self._load_weights_pytorch(weights, target_dtype)
-        else:
-            self._load_weights_trtllm(weights, target_dtype)
-
-    def _load_weights_pytorch(self, weights: dict, target_dtype: torch.dtype) -> None:
-        """Simple state-dict-style loading for pure-PyTorch modules."""
-        for name, module in tqdm(self.named_modules(), desc="Loading LTXModel weights (PyTorch)"):
-            if len(module._parameters) == 0:
-                continue
-            prefix = name + "." if name else ""
-            for param_name, param in module._parameters.items():
-                full_key = prefix + param_name
-                if param is not None and full_key in weights:
-                    param.data.copy_(weights[full_key].to(target_dtype))
+        self._load_weights_trtllm(weights, target_dtype)
 
     def _load_weights_trtllm(self, weights: dict, target_dtype: torch.dtype) -> None:
         """TRT-LLM weight loading with dynamic quantization support."""
-        Linear, *_ = _trtllm_imports()
-        from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
-
         loader = DynamicLinearWeightLoader(self.model_config)
 
         for name, module in tqdm(self.named_modules(), desc="Loading LTXModel weights"):
@@ -1153,29 +1010,7 @@ class LTXModel(nn.Module):
                         )
 
     def post_load_weights(self) -> None:
-        """Post-load hooks: convert embedding modules to target dtype."""
-        target_dtype = self.model_config.torch_dtype if self.model_config else torch.bfloat16
-
-        # In TRT-LLM mode these modules now contain quantized Linear layers
-        # that manage their own dtypes; a blanket .to() would corrupt float32
-        # scale parameters (input_scale, alpha, weight_scale_2) required by
-        # NVFP4 kernels.  Only convert in pure-PyTorch mode.
-        if _is_pytorch_mode(self.model_config):
-            for mod in [
-                getattr(self, "adaln_single", None),
-                getattr(self, "caption_projection", None),
-                getattr(self, "audio_adaln_single", None),
-                getattr(self, "audio_caption_projection", None),
-                getattr(self, "av_ca_video_scale_shift_adaln_single", None),
-                getattr(self, "av_ca_audio_scale_shift_adaln_single", None),
-                getattr(self, "av_ca_a2v_gate_adaln_single", None),
-                getattr(self, "av_ca_v2a_gate_adaln_single", None),
-            ]:
-                if mod is not None:
-                    mod.to(target_dtype)
-
-        if not _is_pytorch_mode(self.model_config):
-            Linear, *_ = _trtllm_imports()
-            for _, module in self.named_modules():
-                if isinstance(module, Linear) and hasattr(module, "post_load_weights"):
-                    module.post_load_weights()
+        """Post-load hooks: finalize quantized Linear layers."""
+        for _, module in self.named_modules():
+            if isinstance(module, Linear) and hasattr(module, "post_load_weights"):
+                module.post_load_weights()

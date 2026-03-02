@@ -124,17 +124,6 @@ def parse_args():
         help="Use Gemma3 to enhance the text prompt before encoding",
     )
 
-    # Layer backend
-    parser.add_argument(
-        "--use_pytorch_layers",
-        action="store_true",
-        help=(
-            "Use pure PyTorch layers (nn.Linear, RMSNorm, SDPA) for the "
-            "transformer instead of TRT-LLM optimized modules. "
-            "Useful for debugging or numerical comparison with the reference."
-        ),
-    )
-
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -172,7 +161,6 @@ def main():
     diffusion_config = {
         "model_type": "ltx2",
         "text_encoder_path": args.text_encoder_path,
-        "use_pytorch_layers": args.use_pytorch_layers,
         "teacache": {
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,

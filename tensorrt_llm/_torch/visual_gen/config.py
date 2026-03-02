@@ -308,18 +308,6 @@ class VisualGenArgs(StrictBaseModel):
     dynamic_weight_quant: bool = False
     force_dynamic_quantization: bool = False
 
-    # When True, use pure PyTorch nn.Linear / nn.RMSNorm / SDPA for the
-    # transformer instead of TRT-LLM optimized modules.  Useful for
-    # debugging, numerical comparison with the reference, or environments
-    # where TRT-LLM custom kernels are not available.
-    use_pytorch_layers: bool = PydanticField(
-        False,
-        description=(
-            "Use pure PyTorch layers (nn.Linear, manual RMSNorm, "
-            "F.scaled_dot_product_attention) instead of TRT-LLM optimized "
-            "modules for the transformer. Default False (TRT-LLM)."
-        ),
-    )
 
     @model_validator(mode="before")
     @classmethod
@@ -439,7 +427,6 @@ class DiffusionModelConfig(BaseModel):
     ulysses_process_group: Optional[torch.distributed.ProcessGroup] = None
 
     dynamic_weight_quant: bool = False
-    use_pytorch_layers: bool = False
 
     # Sub-configs from VisualGenArgs (merged during from_pretrained)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
@@ -709,8 +696,6 @@ class DiffusionModelConfig(BaseModel):
                     cls.load_diffusion_quant_config(quant_dict)
                 )
 
-        use_pytorch_layers = args.use_pytorch_layers if args else False
-
         return cls(
             pretrained_config=pretrained_config,
             quant_config=quant_config,
@@ -726,6 +711,5 @@ class DiffusionModelConfig(BaseModel):
             teacache=teacache_cfg,
             skip_create_weights_in_init=True,
             extra_attrs=extra_attrs,
-            use_pytorch_layers=use_pytorch_layers,
             **kwargs,
         )
