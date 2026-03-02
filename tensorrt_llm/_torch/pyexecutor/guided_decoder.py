@@ -103,7 +103,7 @@ class GuidedRequests:
             for req in scheduled_requests.all_requests()
         ]
         return cls(requests,
-                   num_contexts=len(scheduled_requests.context_requests),
+                   num_contexts=scheduled_requests.num_context_requests,
                    num_generations=len(scheduled_requests.generation_requests),
                    max_num_draft_tokens=max_num_draft_tokens)
 

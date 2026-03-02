@@ -140,7 +140,6 @@ def test_scheduler_output_num_scheduled_tokens_with_mtp():
     req.py_draft_tokens = [100, 101, 102]  # 3 MTP draft tokens
 
     scheduled_batch = ScheduledRequests()
-    scheduled_batch.context_requests = []
     scheduled_batch.generation_requests = [req]
 
     manager = KvCacheConnectorSchedulerOutputManager()

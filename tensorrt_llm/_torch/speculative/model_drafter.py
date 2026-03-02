@@ -266,7 +266,7 @@ class ModelDrafter(Drafter):
         if draft_request.state == LlmRequestState.GENERATION_IN_PROGRESS:
             draft_batch.generation_requests.append(draft_request)
         else:
-            draft_batch.context_requests.append(draft_request)
+            draft_batch.context_requests_last_chunk.append(draft_request)
 
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(
@@ -808,8 +808,9 @@ class ModelDrafter(Drafter):
         # Convert context requests to generation requests
         for req in draft_batch.generation_requests:
             req.py_is_first_draft = False
-        draft_batch.generation_requests = draft_batch.context_requests + draft_batch.generation_requests
-        draft_batch.context_requests = []
+        draft_batch.generation_requests = draft_batch.all_requests()
+        draft_batch.context_requests_chunking = []
+        draft_batch.context_requests_last_chunk = []
 
         previous_draft_state = initial_draft_state
         # reset draft tokens accumulator
