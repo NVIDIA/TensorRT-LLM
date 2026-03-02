@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -56,8 +56,9 @@ FmhaDispatcher::FmhaDispatcher(MHARunnerFixedParams fixedParams)
 {
     if (mUseTllmGen)
     {
-        mTllmGenFMHARunner.reset(
-            new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv, mFixedParams.dataTypeOut));
+        mTllmGenFMHARunner.reset(new TllmGenFmhaRunner(mFixedParams.dataType, mFixedParams.dataTypeKv,
+            mFixedParams.dataTypeOut, 1, mFixedParams.sageBlockSizeQ, mFixedParams.sageBlockSizeK, 0,
+            mFixedParams.sageBlockSizeV, mFixedParams.dataTypeQkReinterpret));
         if (!isSupported())
         {
             TLLM_LOG_WARNING("TRTLLM-GEN does not support the requested kernels.");
@@ -226,10 +227,29 @@ void FmhaDispatcher::run(MHARunnerParams runnerParams)
         // Set it to INT_MAX as the kv cache pageOffsets will ensure that there is no out-of-bounds access.
         tllmRunnerParams.mNumPagesInMemPool = INT_MAX;
         tllmRunnerParams.mSfStartTokenIdx = 0;
+        // SageAttention scaling factors.
+        tllmRunnerParams.sageAttnSfsQPtr = runnerParams.qScalePtr;
+        tllmRunnerParams.sageAttnSfsKPtr = runnerParams.kScalePtr;
+        tllmRunnerParams.sageAttnSfsPPtr = nullptr;
+        tllmRunnerParams.sageAttnSfsVPtr = runnerParams.vScalePtr;
         // For mla chunked prefill
         tllmRunnerParams.softmaxStatsPtr = reinterpret_cast<float2*>(runnerParams.softmaxStatsPtr);
         // For skip softmax
         tllmRunnerParams.mSkipSoftmaxThresholdScaleFactor = runnerParams.skipSoftmaxThresholdScaleFactor;
+
+        auto const computeLog2BlockSize = [](int blockSize) -> int {
+            if (blockSize <= 0)
+            {
+                return 0;
+            }
+            TLLM_CHECK_WITH_INFO((blockSize & (blockSize - 1)) == 0, "SageAttn block size must be a power of 2.");
+            return __builtin_ctz(static_cast<unsigned int>(blockSize));
+        };
+        tllmRunnerParams.mLogNumEltsPerSageAttnBlkQ = computeLog2BlockSize(mFixedParams.sageBlockSizeQ);
+        tllmRunnerParams.mLogNumEltsPerSageAttnBlkK = computeLog2BlockSize(mFixedParams.sageBlockSizeK);
+        tllmRunnerParams.mLogNumEltsPerSageAttnBlkP = 0;
+        tllmRunnerParams.mLogNumEltsPerSageAttnBlkV = computeLog2BlockSize(mFixedParams.sageBlockSizeV);
+
         tllmRunnerParams.stream = runnerParams.stream;
         // Set the sparse attention parameters if sparseMLA is used.
         if (mFixedParams.useSparseMLA)

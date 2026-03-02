@@ -32,7 +32,9 @@ class TllmGenFmhaRunner
 {
 public:
     // Constructor.
-    explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut);
+    explicit TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut, int maxNumHeadsQPerKvInCta = 1,
+        int numEltsPerSageAttnBlkQ = 0, int numEltsPerSageAttnBlkK = 0, int numEltsPerSageAttnBlkP = 0,
+        int numEltsPerSageAttnBlkV = 0, Data_type dataTypeQkReinterpret = DATA_TYPE_E4M3);
 
     TllmGenFmhaRunner() = default;
 
@@ -57,6 +59,13 @@ private:
     size_t mTotalDeviceMemory;
     // The class that stores all the kernels.
     TllmGenFmhaKernel const* mKernel;
+    // VisualGen extensions.
+    int mMaxNumHeadsQPerKvInCta;
+    int mNumEltsPerSageAttnBlkQ;
+    int mNumEltsPerSageAttnBlkK;
+    int mNumEltsPerSageAttnBlkP;
+    int mNumEltsPerSageAttnBlkV;
+    Data_type mDataTypeQkReinterpret;
 };
 
 } // namespace kernels
