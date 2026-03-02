@@ -284,6 +284,9 @@ bool AttentionOp::convertMMHAParamsToXQAParams(tensorrt_llm::kernels::XQAParams&
     xqaParams.spec_decoding_bl_tree_mask = generationsParams.spec_decoding_bl_tree_mask;
     xqaParams.spec_bl_tree_first_sparse_mask_offset_kv = generationsParams.spec_bl_tree_first_sparse_mask_offset_kv;
     xqaParams.mrope_position_deltas = generationsParams.mrope_position_deltas;
+    xqaParams.helix_position_offsets = generationsParams.helix_position_offsets;
+    xqaParams.helix_is_inactive_rank = generationsParams.helix_is_inactive_rank;
+    xqaParams.softmax_stats = generationsParams.softmax_stats;
 
     xqaParams.logn_scaling_ptr = generationsParams.logn_scaling_ptr;
     xqaParams.total_num_input_tokens = mCpSize > 1 ? generationsParams.num_requests : generationsParams.num_tokens;
@@ -1687,6 +1690,8 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         preprocessingParams.mrope_rotary_cos_sin = params.mrope_rotary_cos_sin;
         preprocessingParams.qkv_scale_orig_quant = params.kv_scale_orig_quant;
         preprocessingParams.spec_decoding_position_offsets = nullptr;
+        preprocessingParams.helix_position_offsets = params.helix_position_offsets;
+        preprocessingParams.helix_is_inactive_rank = params.helix_is_inactive_rank;
         preprocessingParams.logn_scaling = params.logn_scaling_ptr;
 
         // Sparse KV write

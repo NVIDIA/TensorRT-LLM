@@ -44,7 +44,11 @@ def test_async_video_generation(
         duration: Video duration in seconds
         fps: Frames per second
         size: Video resolution (WxH format)
-        output_file: Output video file path
+        output_file: Output video file path (extension may change based on server encoder)
+
+    Note:
+        The server may return either MP4 (H.264) or AVI (MJPEG) format depending on
+        the available encoder. The output filename extension will be adjusted to match.
     """
     mode = "TI2V" if input_reference else "T2V"
     print("=" * 80)
@@ -124,6 +128,20 @@ def test_async_video_generation(
         print("\n3. Downloading video...")
         # For binary content, use the underlying HTTP client
         content = client.videos.download_content(video_id, variant="video")
+
+        # Check content type to determine actual file extension
+        content_type = getattr(content.response, "headers", {}).get("content-type", "video/mp4")
+        if "x-msvideo" in content_type or "avi" in content_type:
+            actual_ext = ".avi"
+        else:
+            actual_ext = ".mp4"
+
+        # Adjust output filename if extension doesn't match
+        output_path = Path(output_file)
+        if output_path.suffix.lower() != actual_ext:
+            output_file = str(output_path.with_suffix(actual_ext))
+            print(f"   Note: Server returned {actual_ext} format")
+
         content.write_to_file(output_file)
         print(f"   ✓ Saved to: {output_file}")
 
@@ -206,7 +224,10 @@ Examples:
         help="Video resolution in WxH format (e.g., 1280x720)",
     )
     parser.add_argument(
-        "--output", type=str, default="output_async.mp4", help="Output video file path"
+        "--output",
+        type=str,
+        default="output_async.mp4",
+        help="Output video file path (extension may change based on server encoder: .mp4 or .avi)",
     )
 
     args = parser.parse_args()
