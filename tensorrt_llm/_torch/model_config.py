@@ -122,6 +122,10 @@ class ModelConfig(Generic[TConfig]):
 
     extra_attrs: Dict = field(default_factory=dict, repr=False, init=False)
 
+    # cute dsl op configs
+    use_cute_dsl_blockscaling_mm: bool = False
+    use_cute_dsl_blockscaling_bmm: bool = False
+
     _frozen: bool = field(default=False, init=False, repr=False)
 
     # If true, ONLY the vision encoder part of the full model is loaded/executed.

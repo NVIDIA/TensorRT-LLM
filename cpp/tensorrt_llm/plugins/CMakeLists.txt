@@ -170,7 +170,6 @@ target_link_libraries(
   ${CUBLASLT_LIB}
   ${TRT_LIB}
   ${CUDA_DRV_LIB}
-  ${CUDA_NVML_LIB}
   ${CUDA_RT_LIB}
   ${CMAKE_DL_LIBS}
   ${SHARED_TARGET})

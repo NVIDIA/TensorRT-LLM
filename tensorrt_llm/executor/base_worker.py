@@ -427,7 +427,9 @@ class BaseWorker(GenerationExecutor):
                     multimodal_positions=request.multimodal_params.
                     multimodal_input.multimodal_positions,
                     multimodal_lengths=request.multimodal_params.
-                    multimodal_input.multimodal_lengths)
+                    multimodal_input.multimodal_lengths,
+                    multimodal_uuids=request.multimodal_params.multimodal_input.
+                    multimodal_uuids)
             # NOTE: Setting to None here to avoid sending multimodal_input again through the 'py_multimodal_data' field
             request.multimodal_params.multimodal_input = None
 
@@ -653,6 +655,12 @@ class BaseWorker(GenerationExecutor):
         if self.engine is not None and self.engine.can_enqueue_requests():
             self.engine.shutdown()
             self.engine = None
+
+    def get_disaggregated_params(self) -> dict:
+        if self.engine is None or self.engine.kv_cache_transceiver is None:
+            logger.warning("Engine or kv cache transceiver is not initialized")
+            return {}
+        return self.engine.kv_cache_transceiver.get_disaggregated_params()
 
     # Define a Callable to join iteration and request stats
     @staticmethod

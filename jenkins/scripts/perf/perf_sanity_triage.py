@@ -5,6 +5,7 @@ import json
 import re
 import sys
 import time
+from datetime import datetime, timezone
 
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
@@ -13,9 +14,68 @@ sys.path.insert(0, sys.path[0] + "/..")
 from open_search_db import OpenSearchDB
 
 QUERY_LOOKBACK_DAYS = 90
+LOOKBACK_JOBS = 30
 MAX_QUERY_SIZE = 3000
-MAX_TEST_CASES_PER_MSG = 5
+MAX_TEST_CASES_PER_MSG = 4
 POST_SLACK_MSG_RETRY_TIMES = 5
+
+# Comparison operators (order matters: >= before >, <= before <, != before =)
+COMPARISON_OPERATORS = [">=", "<=", "!=", ">", "<", "="]
+COMPARISON_ALLOWED_PREFIXES = ("d_", "l_")
+COMPARISON_ALLOWED_FIELDS = ("ts_created",)
+
+
+def _timestamp_to_date(ts):
+    """Convert millisecond timestamp to YYYY/MM/DD format."""
+    if ts == "N/A" or ts is None:
+        return "N/A"
+    try:
+        ts_int = int(ts)
+        # Convert milliseconds to seconds
+        dt = datetime.fromtimestamp(ts_int / 1000)
+        return dt.strftime("%Y/%m/%d")
+    except (ValueError, TypeError, OSError):
+        return str(ts)
+
+
+def _parse_date_string(date_str):
+    """Convert date string like 'Feb 18, 2026 @ 22:32:02.960' to millisecond timestamp.
+
+    All date strings are interpreted as UTC to ensure consistent timestamps
+    across different environments/timezones.
+    """
+    date_str = date_str.strip()
+    # Try format: "Feb 18, 2026 @ 22:32:02.960"
+    try:
+        dt = datetime.strptime(date_str, "%b %d, %Y @ %H:%M:%S.%f")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        pass
+    # Try format: "Feb 18, 2026 @ 22:32:02"
+    try:
+        dt = datetime.strptime(date_str, "%b %d, %Y @ %H:%M:%S")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        pass
+    # Try format: "2026/02/18"
+    try:
+        dt = datetime.strptime(date_str, "%Y/%m/%d")
+        dt = dt.replace(tzinfo=timezone.utc)
+        return int(dt.timestamp() * 1000)
+    except ValueError:
+        pass
+    raise ValueError(f"Unable to parse date string: {date_str}")
+
+
+def _can_use_comparison_operator(field_name):
+    """Check if a field can use comparison operators (>, <, >=, <=)."""
+    if field_name in COMPARISON_ALLOWED_FIELDS:
+        return True
+    if field_name.startswith(COMPARISON_ALLOWED_PREFIXES):
+        return True
+    return False
 
 
 def _parse_value(value):
@@ -56,6 +116,71 @@ def _parse_assignments(text):
     return result, None
 
 
+def _parse_where_clauses(text):
+    """Parse WHERE clauses supporting =, >, <, >=, <= operators.
+
+    Returns a list of tuples: (field_name, operator, value)
+    Only d_*, l_*, and ts_created fields can use comparison operators.
+    """
+    clauses = _split_and_clauses(text)
+    if not clauses:
+        return None, "No fields provided"
+
+    result = []
+    for clause in clauses:
+        # Match: field_name <operator> value
+        # Using regex to find operator right after field name, avoiding false matches in values
+        m = re.match(r"^\s*(\w+)\s*(>=|<=|!=|>|<|=)\s*(.*)", clause)
+        if not m:
+            return None, f"Invalid clause (missing operator): {clause}"
+
+        key = m.group(1).strip()
+        found_op = m.group(2)
+        value = _parse_value(m.group(3))
+
+        if not key:
+            return None, f"Invalid clause (empty field name): {clause}"
+
+        # Check if comparison operator is allowed for this field
+        # != is allowed for all fields, but >, <, >=, <= are restricted
+        if found_op not in ("=", "!=") and not _can_use_comparison_operator(key):
+            return None, (
+                f"Comparison operator '{found_op}' not allowed for field '{key}'. "
+                f"Only fields starting with 'd_', 'l_', or field 'ts_created' can use >, <, >=, <= operators."
+            )
+
+        # Convert date string to timestamp for ts_created
+        if key == "ts_created" and isinstance(value, str):
+            try:
+                value = _parse_date_string(value)
+            except ValueError as e:
+                return None, str(e)
+
+        result.append((key, found_op, value))
+
+    return result, None
+
+
+def _build_opensearch_clause(field, operator, value):
+    """Build OpenSearch query clause from field, operator, and value.
+
+    Returns a tuple (clause_type, clause) where clause_type is "must" or "must_not".
+    """
+    if operator == "=":
+        return ("must", {"term": {field: value}})
+
+    if operator == "!=":
+        return ("must_not", {"term": {field: value}})
+
+    op_map = {
+        ">": "gt",
+        "<": "lt",
+        ">=": "gte",
+        "<=": "lte",
+    }
+    return ("must", {"range": {field: {op_map[operator]: value}}})
+
+
 def parse_update_operation(operation):
     match = re.match(
         r"^\s*UPDATE\s+SET\s+(.+?)(?:\s+WHERE\s+(.+))?\s*$", operation, flags=re.IGNORECASE
@@ -67,14 +192,14 @@ def parse_update_operation(operation):
     set_values, error = _parse_assignments(set_text)
     if error:
         return None, None, f"Invalid SET clause: {error}"
-    where_values = {}
+    where_clauses = []
     if match.group(2) is not None:
         if not where_text:
             return None, None, "Invalid WHERE clause: empty scope"
-        where_values, error = _parse_assignments(where_text)
+        where_clauses, error = _parse_where_clauses(where_text)
         if error:
             return None, None, f"Invalid WHERE clause: {error}"
-    return set_values, where_values, None
+    return set_values, where_clauses, None
 
 
 def update_perf_data_fields(data_list, set_values):
@@ -99,42 +224,74 @@ def post_perf_data(data_list, project_name):
         return False
 
 
-def get_regression_data_by_job_id(data_list, query_job_number):
-    """Returns a dict with job_id as key and list of regression data as value.
+def get_regression_dict(data_list, query_job_number, lookback_job_number=LOOKBACK_JOBS):
+    """Returns a dict with job_id as key and list of regression tuples as value.
 
+    Each tuple is (test_case_name, gpu_type, runtime, history_regression_job_ids, data).
     Only returns the latest query_job_number jobs.
     """
     if data_list is None or len(data_list) == 0:
         return {}
 
     # Group data by job_id
-    job_data_dict = {}
+    job_test_dict = {}
     for data in data_list:
-        job_id = data.get("s_job_id", "")
-        if job_id == "":
+        raw_job_id = data.get("s_job_id", "")
+        if raw_job_id == "":
             continue
-        if job_id not in job_data_dict:
-            job_data_dict[job_id] = []
-        job_data_dict[job_id].append(data)
+        try:
+            job_id = int(raw_job_id)
+        except (TypeError, ValueError):
+            continue
+        job_test_dict.setdefault(job_id, []).append(data)
 
-    # Sort job_ids by the latest ts_created in each group (descending)
-    def get_latest_timestamp(job_id):
-        timestamps = [d.get("ts_created", 0) for d in job_data_dict[job_id]]
-        return max(timestamps) if timestamps else 0
+    if not job_test_dict:
+        return {}
 
-    sorted_job_ids = sorted(job_data_dict.keys(), key=get_latest_timestamp, reverse=True)
+    # Sort job_ids (descending: latest -> oldest)
+    sorted_job_id_list = sorted(job_test_dict.keys(), reverse=True)
 
-    # Only keep the latest query_job_number jobs
-    latest_job_ids = sorted_job_ids[:query_job_number]
+    # Build (test_case_name, gpu_type, runtime) -> job_ids dict
+    test_job_dict = {}
+    for job_id, data_list in job_test_dict.items():
+        for data in data_list:
+            test_case_name = data.get("s_test_case_name") or ""
+            gpu_type = data.get("s_gpu_type") or ""
+            runtime = data.get("s_runtime") or ""
+            if not test_case_name or not gpu_type or not runtime:
+                continue
+            key = (test_case_name, gpu_type, runtime)
+            test_job_dict.setdefault(key, set()).add(job_id)
 
-    result = {}
+    # Sort job ids for each test case (descending: latest -> oldest)
+    for key, job_id_set in list(test_job_dict.items()):
+        test_job_dict[key] = sorted(job_id_set, reverse=True)
+
+    # Only keep the latest query_job_number jobs in the result
+    latest_job_ids = sorted_job_id_list[:query_job_number]
+
+    regression_dict = {}
     for job_id in latest_job_ids:
-        result[job_id] = job_data_dict[job_id]
+        entries = []
+        for data in job_test_dict.get(job_id, []):
+            test_case_name = data.get("s_test_case_name") or ""
+            gpu_type = data.get("s_gpu_type") or ""
+            runtime = data.get("s_runtime") or ""
+            if not test_case_name or not gpu_type or not runtime:
+                continue
+            key = (test_case_name, gpu_type, runtime)
+            history_ids = test_job_dict.get(key, [])
+            lower_bound = job_id - lookback_job_number + 1
+            history_regression_job_ids = [
+                jid for jid in history_ids if lower_bound <= jid <= job_id
+            ]
+            entries.append((test_case_name, gpu_type, runtime, history_regression_job_ids, data))
+        regression_dict[job_id] = entries
 
-    return result
+    return regression_dict
 
 
-def process_regression_message(regression_dict):
+def split_regression_message(regression_dict):
     """Process regression data into message chunks.
 
     Returns a list of messages, each containing at most MAX_TEST_CASES_PER_MSG test cases.
@@ -142,12 +299,17 @@ def process_regression_message(regression_dict):
     if not regression_dict:
         return []
 
-    # Flatten all test cases into a list with (job_id, idx, data) tuples
+    # Flatten all test cases into a list with
+    # (job_id, idx, test_case_name, gpu_type, runtime, history_regression_job_ids, data) tuples
     all_test_cases = []
     for job_id, data_list in regression_dict.items():
-        sorted_data_list = sorted(data_list, key=lambda x: x.get("s_test_case_name", ""))
-        for idx, data in enumerate(sorted_data_list, start=1):
-            all_test_cases.append((job_id, idx, data))
+        sorted_data_list = sorted(data_list, key=lambda x: x[0])
+        for idx, (test_case_name, gpu_type, runtime, history_regression_job_ids, data) in enumerate(
+            sorted_data_list, start=1
+        ):
+            all_test_cases.append(
+                (job_id, idx, test_case_name, gpu_type, runtime, history_regression_job_ids, data)
+            )
 
     # Split into chunks of MAX_TEST_CASES_PER_MSG
     chunks = []
@@ -159,7 +321,15 @@ def process_regression_message(regression_dict):
     for chunk in chunks:
         msg_parts = []
         current_job_id = None
-        for job_id, idx, data in chunk:
+        for (
+            job_id,
+            idx,
+            test_case_name,
+            gpu_type,
+            runtime,
+            history_regression_job_ids,
+            data,
+        ) in chunk:
             # Add job header when switching to a new job_id
             if job_id != current_job_id:
                 if msg_parts:
@@ -168,12 +338,46 @@ def process_regression_message(regression_dict):
                 msg_parts.append(job_header)
                 current_job_id = job_id
 
-            test_case_name = data.get("s_test_case_name", "N/A")
             regression_info = data.get("s_regression_info", "N/A")
+            history_text = (
+                ", ".join(str(jid) for jid in history_regression_job_ids)
+                if history_regression_job_ids
+                else "N/A"
+            )
             msg_parts.append(f"*REGRESSION TEST CASE {idx}: {test_case_name}*\n")
+            msg_parts.append(f"*GPU: {gpu_type} Mode: {runtime}*\n")
+            msg_parts.append(f"*History Regression Post-Merge Job IDs: {history_text}*\n")
+
+            # Parse regression_info to extract baseline info and metrics
+            baseline_date = "N/A"
+            baseline_branch = "N/A"
+            baseline_commit = "N/A"
             for part in regression_info.split(","):
                 part = part.strip()
-                if part and "baseline_id" not in part:
+                if "baseline_date:" in part:
+                    baseline_date = _timestamp_to_date(part.split(":", 1)[-1].strip())
+                elif "baseline_branch:" in part:
+                    baseline_branch = part.split(":", 1)[-1].strip()
+                elif "baseline_commit:" in part:
+                    baseline_commit = part.split(":", 1)[-1].strip()
+
+            # Get regression branch and commit from data
+            regression_date = _timestamp_to_date(data.get("ts_created", "N/A"))
+            regression_branch = data.get("s_branch", "N/A")
+            regression_commit = data.get("s_commit", "N/A")
+
+            msg_parts.append(
+                f"*Baseline date, branch and commit: "
+                f"{baseline_date} {baseline_branch} {baseline_commit}*\n"
+            )
+            msg_parts.append(
+                f"*Regression date, branch and commit: "
+                f"{regression_date} {regression_branch} {regression_commit}*\n"
+            )
+
+            for part in regression_info.split(","):
+                part = part.strip()
+                if part and "baseline_" not in part:
                     msg_parts.append(f"  {part}\n")
 
         msg = "".join(msg_parts).strip()
@@ -288,21 +492,26 @@ def main():
             print("Failed to query regression data")
             return
 
-        regression_dict = get_regression_data_by_job_id(data_list, args.query_job_number)
-        messages = process_regression_message(regression_dict)
+        regression_dict = get_regression_dict(data_list, args.query_job_number)
+        messages = split_regression_message(regression_dict)
         send_regression_message(messages, args.channel_id, args.bot_token)
     elif args.operation.strip().upper().startswith("UPDATE"):
-        set_values, where_values, error = parse_update_operation(args.operation)
+        set_values, where_clauses, error = parse_update_operation(args.operation)
         if error:
             print(error)
             return
 
         must_clauses = []
-        for key, value in where_values.items():
-            must_clauses.append({"term": {key: value}})
+        must_not_clauses = []
+        for field, operator, value in where_clauses:
+            clause_type, clause = _build_opensearch_clause(field, operator, value)
+            if clause_type == "must":
+                must_clauses.append(clause)
+            else:
+                must_not_clauses.append(clause)
 
         data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
-            args.project_name, must_clauses, size=MAX_QUERY_SIZE
+            args.project_name, must_clauses, size=MAX_QUERY_SIZE, must_not_clauses=must_not_clauses
         )
         if data_list is None:
             print("Failed to query data for update")

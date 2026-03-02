@@ -29,7 +29,12 @@ set(SRCS
 
 include_directories(${PROJECT_SOURCE_DIR}/include)
 
-nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
+# NOSTRIP: Disable stripping for BOLT compatibility (requires --emit-relocs)
+if(ENABLE_BOLT_COMPATIBLE)
+  nanobind_add_module(${TRTLLM_NB_MODULE} NOSTRIP ${SRCS})
+else()
+  nanobind_add_module(${TRTLLM_NB_MODULE} ${SRCS})
+endif()
 
 set_property(TARGET ${TRTLLM_NB_MODULE} PROPERTY POSITION_INDEPENDENT_CODE ON)
 
@@ -48,7 +53,6 @@ target_link_libraries(
          ${TORCH_LIBRARIES}
          torch_python
          ${CUDA_DRV_LIB}
-         ${CUDA_NVML_LIB}
          th_common
          pg_utils)
 target_compile_definitions(

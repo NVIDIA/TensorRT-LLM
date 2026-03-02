@@ -22,7 +22,7 @@ import torch
 import torch.nn as nn
 
 # Ensure custom ops are registered
-from tensorrt_llm._torch.auto_deploy.custom_ops import rms_norm  # noqa: F401
+from tensorrt_llm._torch.auto_deploy.custom_ops.normalization import rms_norm  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -182,7 +182,7 @@ class TestRMSNormShardingTransform:
                     "simple_shard_only": False,
                     "sharding_source": ["manual", "factory", "heuristic"],
                     "support_partial_config": True,
-                    "sharding_dims": ["tp", "ep", "bmm"],
+                    "sharding_scope": ["tp", "ep", "bmm"],
                     "shard_all_unprocessed": True,
                     "allreduce_strategy": "NCCL",
                     "dist_backend": "auto",
@@ -237,7 +237,7 @@ class TestRMSNormShardingTransform:
                     "simple_shard_only": False,
                     "sharding_source": ["manual", "factory", "heuristic"],
                     "support_partial_config": True,
-                    "sharding_dims": ["tp", "ep", "bmm"],
+                    "sharding_scope": ["tp", "ep", "bmm"],
                     "shard_all_unprocessed": True,
                     "allreduce_strategy": "NCCL",
                     "dist_backend": "auto",
@@ -296,7 +296,7 @@ class TestRMSNormShardingTransform:
                     "simple_shard_only": False,
                     "sharding_source": ["manual", "factory", "heuristic"],
                     "support_partial_config": True,
-                    "sharding_dims": ["tp", "ep", "bmm"],
+                    "sharding_scope": ["tp", "ep", "bmm"],
                     "shard_all_unprocessed": True,
                     "allreduce_strategy": "NCCL",
                     "dist_backend": "auto",

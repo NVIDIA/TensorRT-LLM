@@ -67,6 +67,7 @@ add_library(
   dsv3FusedAGemmOp.cpp
   fusedQKNormRopeOp.cpp
   fusedAddRMSNormQuant.cpp
+  fusedActivationQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
@@ -133,8 +134,7 @@ endif()
 
 if(ENABLE_MULTI_DEVICE)
   target_include_directories(th_common PUBLIC ${MPI_C_INCLUDE_DIRS})
-  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB}
-                                          CUDA::nvml)
+  target_link_libraries(th_common PRIVATE ${MPI_C_LIBRARIES} ${NCCL_LIB})
 endif()
 
 if(NOT WIN32)

@@ -24,6 +24,7 @@ set(SRCS
     baseTransBuffer.cpp
     blockKey.cpp
     cacheFormatter.cpp
+    cacheTransferLayer.cpp
     mlaCacheFormatter.cpp
     cacheTransceiver.cpp
     capacityScheduler.cpp
@@ -51,6 +52,8 @@ set(SRCS
     promptTuningBuffers.cpp
     rnnStateBuffers.cpp
     rnnStateManager.cpp
+    rnnCacheFormatter.cpp
+    rnnCacheTransBuffer.cpp
     runtimeBuffers.cpp
     sequenceSlotManager.cpp
     transformerBuffers.cpp

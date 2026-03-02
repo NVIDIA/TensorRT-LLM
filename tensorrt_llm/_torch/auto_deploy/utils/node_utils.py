@@ -3,7 +3,6 @@
 import operator
 from dataclasses import dataclass
 from enum import Enum
-from functools import partial
 from typing import Callable, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -40,16 +39,17 @@ class LayerType(Enum):
     MLP = "mlp"
     MOE = "moe"
     MLA = "mla"
+    DELTA = "delta"
     UNKNOWN = "unknown"
 
 
 class LayerSubgraph(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
-    opening_nodes: List[Node]
-    subgraph_nodes: List[Node]
-    terminating_node: Union[Node, None]
     layer_type: LayerType
+    opening_nodes: List[Node]
+    terminating_node: Union[Node, None]
     min_local_shape: int = 1
+    subgraph_nodes: List[Node]
 
 
 class WeightNode(BaseModel):
@@ -153,27 +153,133 @@ def get_all_weights_in_subgraph(
 
 
 def extract_weight_name(node: Node) -> Union[str, bool]:
-    weight_nodes = extract_weight_nodes(node)
+    try:
+        weight_nodes = extract_weight_nodes(node)
+    except Exception:
+        return False
     if len(weight_nodes.weights) == 0:
         return False
     return weight_nodes.weights[0].node_key
 
 
 def get_param_or_buffer(tensor_name: str, gm: GraphModule) -> torch.Tensor:
-    if tensor_name in dict(gm.named_parameters()):
-        return gm.get_parameter(tensor_name)
-    elif tensor_name in dict(gm.named_buffers()):
-        return gm.get_buffer(tensor_name)
-    else:
-        raise KeyError(f"Tensor {tensor_name} not found in the graph")
+    param_dict = WeightBiasInfoCache.get_param_dict(gm)
+    if tensor_name in param_dict:
+        return param_dict[tensor_name]
+    buffer_dict = WeightBiasInfoCache.get_buffer_dict(gm)
+    if tensor_name in buffer_dict:
+        return buffer_dict[tensor_name]
+    raise KeyError(f"Tensor {tensor_name} not found in the graph")
+
+
+class WeightBiasInfoCache:
+    """Cache for weight and bias information to avoid repeated expensive operations.
+
+    This class manages caches for parameter names and weight shapes that are used
+    during graph transformation operations. Use it as a context manager to scope
+    the cache lifetime.
+
+    Example:
+        with WeightBiasInfoCache() as cache:
+            # All calls to get_weight_shape and extract_weight_nodes
+            # within this block use caching
+            layer_subgraphs, _ = get_all_layer_subgraphs(gm)
+        # Caches are cleared here
+    """
+
+    # Class-level reference to the currently active cache instance
+    _active_instance: "WeightBiasInfoCache" = None
+
+    def __init__(self):
+        # Cache for param/buffer dicts to avoid repeated expensive named_parameters/named_buffers calls
+        self._param_dict_cache = {}
+        self._buffer_dict_cache = {}
+        # Cache for get_weight_shape to avoid repeated expensive extract_weight_nodes calls
+        self._weight_shape_cache = {}
+        # Activate this cache instance
+        WeightBiasInfoCache._active_instance = self
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        self.close()
+        return False
+
+    def close(self):
+        """Explicitly deactivate and clear the cache."""
+        if WeightBiasInfoCache._active_instance is self:
+            WeightBiasInfoCache._active_instance = None
+        self._param_dict_cache.clear()
+        self._buffer_dict_cache.clear()
+        self._weight_shape_cache.clear()
+
+    def __del__(self):
+        """Cleanup when the cache is garbage collected."""
+        self.close()
+
+    @classmethod
+    def is_active(cls) -> bool:
+        """Check if caching is currently enabled."""
+        return cls._active_instance is not None
+
+    @classmethod
+    def get_param_dict(cls, gm: GraphModule) -> dict:
+        """Get cached parameters dict for a GraphModule, or compute and cache it."""
+        if cls._active_instance is None:
+            return dict(gm.named_parameters())
+
+        cache = cls._active_instance._param_dict_cache
+        if gm not in cache:
+            cache[gm] = dict(gm.named_parameters())
+        return cache[gm]
+
+    @classmethod
+    def get_buffer_dict(cls, gm: GraphModule) -> dict:
+        """Get cached buffers dict for a GraphModule, or compute and cache it."""
+        if cls._active_instance is None:
+            return dict(gm.named_buffers())
+
+        cache = cls._active_instance._buffer_dict_cache
+        if gm not in cache:
+            cache[gm] = dict(gm.named_buffers())
+        return cache[gm]
+
+    @classmethod
+    def get_param_names(cls, gm: GraphModule) -> set:
+        """Get cached parameter and buffer names for a GraphModule."""
+        param_dict = cls.get_param_dict(gm)
+        buffer_dict = cls.get_buffer_dict(gm)
+        return set(param_dict.keys()).union(buffer_dict.keys())
+
+    @classmethod
+    def get_weight_shape(cls, node: Node) -> Tuple[bool, Optional[List[int]]]:
+        """Get cached weight shape for a node.
+
+        Returns:
+            Tuple of (found, value). If found is False, value should be ignored.
+        """
+        if cls._active_instance is None:
+            return False, None
+
+        cache = cls._active_instance._weight_shape_cache
+        if node in cache:
+            return True, cache[node]
+        return False, None
+
+    @classmethod
+    def set_weight_shape(cls, node: Node, shape: Optional[List[int]]):
+        """Store weight shape in cache."""
+        if cls._active_instance is not None:
+            cls._active_instance._weight_shape_cache[node] = shape
 
 
 def extract_weight_nodes(node: Node) -> WeightNodes:
     """Extracts the list of weight node and optional bias node from the given parametrized node"""
     gm = node.graph.owning_module
-    param_names = {name for name, _ in gm.named_parameters()}.union(
-        {name for name, _ in gm.named_buffers()}
-    )
+
+    # Use cached param_names to avoid repeated expensive named_parameters/named_buffers calls
+    param_names = WeightBiasInfoCache.get_param_names(gm)
 
     def find_get_attr_node(weight_node: Node) -> Node:
         """Recursively traverse inputs of allowed nodes to find a node with 'get_attr' op."""
@@ -216,6 +322,65 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             ],
             biases=[],
         )
+    elif is_fake_quantized_linear_op(node):
+        # For quantized linear ops (FP8, FP4, etc.), only args[1] is the actual shardable
+        # weight. Scale buffers (input_scale, weight_scale, alpha, ...) are also registered
+        # as get_attr nodes in the graph and would otherwise be picked up by the generic
+        # all_input_nodes scan below -- causing shard_weight_tensor to overwrite them as
+        # nn.Parameters, which then breaks quantization_cb's get_buffer() call.
+        # The quantization_cb (QuantizationShardingMixin) is responsible for sharding scales.
+        weight_node = find_get_attr_node(node.args[1])
+        if weight_node is None:
+            return WeightNodes(weights=[], biases=[])
+        biases = []
+        if len(node.args) > 2 and isinstance(node.args[2], Node):
+            b = find_get_attr_node(node.args[2])
+            if b is not None and b.target.rsplit(".", 1)[-1] == "bias":
+                biases = [
+                    WeightNode(
+                        node=node.args[2],
+                        node_key=b.target,
+                        submod=gm.get_submodule(b.target.rpartition(".")[0]),
+                        tensor=get_param_or_buffer(b.target, gm),
+                    )
+                ]
+        return WeightNodes(
+            weights=[
+                WeightNode(
+                    node=node.args[1],
+                    node_key=weight_node.target,
+                    submod=gm.get_submodule(weight_node.target.rpartition(".")[0]),
+                    tensor=get_param_or_buffer(weight_node.target, gm),
+                )
+            ],
+            biases=biases,
+        )
+    elif is_weight_node(node):
+        weights = []
+        biases = []
+
+        if node.target.rsplit(".", 1)[-1] == "bias":
+            biases = [
+                WeightNode(
+                    node=node,
+                    node_key=node.target,
+                    tensor=get_param_or_buffer(node.target, gm),
+                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                )
+            ]
+        else:
+            weights = [
+                WeightNode(
+                    node=node,
+                    node_key=node.target,
+                    tensor=get_param_or_buffer(node.target, gm),
+                    submod=gm.get_submodule(node.target.rpartition(".")[0]),
+                )
+            ]
+        return WeightNodes(
+            weights=weights,
+            biases=biases,
+        )
     # for other parametrized nodes, we need to find the weight node
     else:
         all_weight_nodes = [
@@ -224,7 +389,7 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
             if (attr_node := find_get_attr_node(n)) is not None
         ]
         # separate weight nodes and bias nodes
-        bias_nodes = [n for n in all_weight_nodes if n.target.endswith("bias")]
+        bias_nodes = [n for n in all_weight_nodes if n.target.rsplit(".", 1)[-1] == "bias"]
         weight_nodes = [n for n in all_weight_nodes if n not in bias_nodes]
         weight_nodes = [
             WeightNode(
@@ -247,10 +412,28 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
     return WeightNodes(weights=weight_nodes, biases=bias_nodes)
 
 
+def get_weight_node(node: Node) -> Node:
+    """Get the primary weight node for a compute node.
+
+    When the node itself is a bias get_attr node (i.e. extract_weight_nodes
+    puts it into .biases rather than .weights), return the bias node so that
+    num_users_of_weight_node gives the correct user count instead of 0.
+    """
+    weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) > 0:
+        return weight_nodes.weights[0].node
+    if len(weight_nodes.biases) > 0:
+        return weight_nodes.biases[0].node
+    raise ValueError(f"Node {node.name} has no weight or bias")
+
+
 def num_users_of_weight_node(node: Node) -> int:
     """Returns the number of users of the weight node of the given parametrized node."""
-    weight_node = extract_weight_nodes(node).weights[0].node
-    return len(weight_node.users) if weight_node is not None else 0
+    try:
+        weight_node = get_weight_node(node)
+    except ValueError:
+        return 0
+    return len(weight_node.users)
 
 
 def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
@@ -373,6 +556,22 @@ def is_any_moe_op(node: Node) -> bool:
     )
 
 
+def is_any_delta_op(node: Node) -> bool:
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_gated_delta_rule,
+        ],
+    )
+
+
+def is_residual_add(node: Node) -> bool:
+    if is_op(node, torch.ops.aten.add):
+        if len(list(filtered_nodes(node.args, is_any_lin_op))) == 1:
+            return True
+    return False
+
+
 def is_any_ssm_op(node: Node) -> bool:
     return is_op(
         node,
@@ -387,6 +586,7 @@ def is_any_conv_op(node: Node) -> bool:
         node,
         ops=[
             torch.ops.auto_deploy.torch_causal_conv1d,
+            torch.ops.aten.conv1d,  # Support regular conv1d for tests
         ],
     )
 
@@ -397,6 +597,16 @@ def is_any_attention_op(node: Node) -> bool:
         ops=[
             torch.ops.auto_deploy.torch_attention_sdpa,
             torch.ops.auto_deploy.torch_attention,
+        ],
+    )
+
+
+def is_any_mla_op(node: Node) -> bool:
+    """Check if the node is a mla op."""
+    return is_op(
+        node,
+        ops=[
+            torch.ops.auto_deploy.torch_mla,
         ],
     )
 
@@ -446,6 +656,89 @@ def is_weight_node(node: Node) -> bool:
     return node.op == "get_attr" and node.target and has_shape(node) and len(shape(node)) > 0
 
 
+# Auxiliary ops that may appear between a weight node and its consumer compute node
+_WEIGHT_AUX_OPS = frozenset(
+    {
+        torch.ops.aten.to.dtype,
+        torch.ops.aten.view.default,
+    }
+)
+
+
+def precompute_weight_node_mapping(gm: GraphModule) -> None:
+    """
+    Pre-compute weight-to-consumer mapping for all weight nodes in the graph.
+
+    For each weight node (get_attr), finds the consumer compute node by traversing
+    through auxiliary ops (to.dtype, view.default). Stores the mapping in consumer
+    node's metadata:
+      - node.meta["weight_nodes"]: list of weight nodes (non-bias)
+      - node.meta["bias_nodes"]: list of bias nodes
+
+    This enables O(1) weight node lookup instead of O(depth) backward traversal.
+    Called automatically on first weight lookup via lazy initialization.
+
+    GUARANTEES (verified by assertions for debugging):
+      - Called exactly once per GraphModule
+      - No duplicate weight/bias nodes in any consumer's lists
+      - Each weight node mapped to exactly one consumer
+    """
+    # Early return if already computed
+    if "_weight_mapping_computed" in gm.meta and gm.meta["_weight_mapping_computed"]:
+        return
+    gm.meta["_weight_mapping_computed"] = True
+
+    for node in gm.graph.nodes:
+        if not is_weight_node(node):
+            continue
+
+        is_bias = node.target.rsplit(".", 1)[-1] == "bias"
+
+        # the weight to user mapping is reflective - the weight node "owns" itself
+        node.meta["weight_nodes"] = [node]
+
+        # Find the consumer compute node by traversing through auxiliary ops
+        current = node
+        visited = {current}
+
+        while True:
+            # Get users of current node
+            users = list(current.users.keys())
+            if not users:
+                break
+
+            aux_node = None
+
+            for user in users:
+                if is_bias:
+                    if "bias_nodes" not in user.meta:
+                        user.meta["bias_nodes"] = []
+                    # ASSERTION: Each weight node should be mapped exactly once
+                    assert node not in user.meta["bias_nodes"], (
+                        f"Duplicate bias node {node.name} found for consumer {user.name}"
+                    )
+                    user.meta["bias_nodes"].append(node)
+                else:
+                    if "weight_nodes" not in user.meta:
+                        user.meta["weight_nodes"] = []
+                    # ASSERTION: Each weight node should be mapped exactly once
+                    assert node not in user.meta["weight_nodes"], (
+                        f"Duplicate weight node {node.name} found for consumer {user.name}"
+                    )
+                    user.meta["weight_nodes"].append(node)
+                if user.target in _WEIGHT_AUX_OPS:
+                    # This is an auxiliary op, continue traversing
+                    aux_node = user
+
+            if aux_node is not None and aux_node not in visited:
+                # Continue through auxiliary op
+                current = aux_node
+                visited.add(current)
+            else:
+                # No more nodes to traverse
+                break
+
+
 def get_user_if_pattern_match(node, ops, numusers, user_idx: int = 0):
     """Get a user from a node if the node matches a given op set and num of users."""
     if node is None:
@@ -464,7 +757,7 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     Right now, we split the regions according to the following structure:
         1. Input node
         2. Embedding node
-        3. Residual nodes from the embedding node onwards (no other nodes in-between0)
+        3. Residual nodes from the embedding node onwards (no other nodes in-between)
         4. Output node
 
     The list will contain the boundary nodes between the regions.
@@ -498,11 +791,14 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     boundary_nodes.append(n_user)
 
     # find residual nodes from here on
-    # NOTE: for now, we assume that the residual nodes do not go through point-wise operations like
-    # activations. We are just looking for a "straight" path to the output.
-    for node in gm.graph.nodes:
-        if is_op(node, torch.ops.aten.add) and any(n == node for n in boundary_nodes[-1].users):
-            boundary_nodes.append(node)
+    while True:
+        next_res_add, _ = bfs(
+            boundary_nodes[-1], lambda n: is_op(n, torch.ops.aten.add), include_root=False
+        )
+        if next_res_add is None:
+            break
+        else:
+            boundary_nodes.append(next_res_add)
 
     # sanity check: we expect at most two users for any residual node
     res_nodes_more_users = [n for n in boundary_nodes[2:] if len(n.users) > 2]
@@ -515,9 +811,12 @@ def identify_regions_between_residuals(gm: GraphModule) -> List[Node]:
     return boundary_nodes
 
 
-def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
+def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[Node]]:
     """
-    Get subgraphs corresponding to all consecutive layers (attention, MLP, SSM, MoE) in the graph.
+    Get subgraphs for all consecutive layers (attention, MLP, SSM, MoE) in the graph.
+
+    Caches weight shapes for all linear nodes using WeightBiasInfoCache.
+    Each layer is contained between opening linear layers and a single closing linear layer.
 
     Assumptions:
         1. each layer (each subgraph) is contained between a list of opening
@@ -546,18 +845,37 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
     assert gm.graph.nodes, "Graph is empty"
     layer_subgraphs = []
     linear_nodes = list(filtered_nodes(gm.graph.nodes, is_any_lin_op))
+
+    # get residual add nodes to correctly identify layer boundaries
+    residuals = identify_regions_between_residuals(gm)
+
+    # Pre-compute weight-to-consumer mapping for O(1) weight node lookup
+    precompute_weight_node_mapping(gm)
+
+    # Cache weight shapes for all linear nodes
+    for lin_node in linear_nodes:
+        if "lin_node_shape" not in lin_node.meta:
+            shape = get_weight_shape(lin_node)
+            if shape is not None:
+                lin_node.meta["lin_node_shape"] = shape
+
+    # Find the embedding size from the first linear node
+    embd = get_weight_shape(linear_nodes[0], dim=-1)
+    if embd is None:
+        raise ValueError("Failed to extract embedding size from first linear node")
+
     unprocessed_linear_nodes = set(linear_nodes)
     assert len(linear_nodes) > 0, "Could not find any linear nodes in the graph"
 
     terminating_indices = [-1]
     last_lin_index = terminating_indices[-1] + 1
 
-    # for each linear node, find its layer subgraph defined as regions between consecutive linear nodes
+    # For each linear node, find its layer subgraph defined as regions between consecutive linear nodes.
     while last_lin_index < len(linear_nodes):
-        # opening is the list of linear nodes
-        # layer_subgraph is the list of nodes between the opening and closing linear nodes
-        # closing is the last linear node in the layer
-        layer_subgraph = get_layer_after_linear_node(linear_nodes, terminating_indices)
+        layer_subgraph = get_layer_after_linear_node(
+            linear_nodes, terminating_indices, embd=embd, residuals=residuals
+        )
+
         if layer_subgraph.opening_nodes is not None and len(layer_subgraph.opening_nodes) > 0:
             unprocessed_linear_nodes -= (
                 set(layer_subgraph.opening_nodes)
@@ -567,7 +885,7 @@ def get_all_layer_subgraphs(gm: GraphModule) -> List[List[Node]]:
             layer_subgraphs.append(layer_subgraph)
         last_lin_index = terminating_indices[-1] + 1
 
-    # unprocessed linear nodes can be "simple sharded".
+    # Unprocessed linear nodes can be "simple sharded".
     return layer_subgraphs, unprocessed_linear_nodes
 
 
@@ -626,6 +944,18 @@ def extract_output_tuple(node: Node, count: int = 2):
     return results
 
 
+def _get_op_schema(node: Node):
+    """Return the op schema for a call_function node."""
+    if node.op != "call_function":
+        raise ValueError(f"_get_op_schema only supports call_function nodes, got {node.op}")
+    op = node.target
+    if hasattr(op, "_schemas"):
+        return next(iter(op._schemas.values()))
+    elif hasattr(op, "_schema"):
+        return op._schema
+    raise RuntimeError(f"No schema found on op {op}")
+
+
 def extract_op_args(node: Node, *arg_names):
     """
     Given a call_function node for torch custom op,
@@ -634,16 +964,7 @@ def extract_op_args(node: Node, *arg_names):
     2. node.args[position_in_schema]
     3. the schema default
     """
-    if node.op != "call_function":
-        raise ValueError(f"extract_op_args only supports call_function nodes, got {node.op}")
-
-    op = node.target
-    if hasattr(op, "_schemas"):
-        schema = next(iter(op._schemas.values()))
-    elif hasattr(op, "_schema"):
-        schema = op._schema
-    else:
-        raise RuntimeError(f"No schema found on op {op}")
+    schema = _get_op_schema(node)
     args_meta = schema.arguments
 
     # name→index in signature, and name→default_value
@@ -661,9 +982,44 @@ def extract_op_args(node: Node, *arg_names):
             return args[i]
         if name in defs:
             return defs[name]
-        raise RuntimeError(f"Could not find a value for '{name}' on op {op}")
+        raise RuntimeError(f"Could not find a value for '{name}' on op {node.target}")
 
     return [_get(n) for n in arg_names]
+
+
+def set_op_args(node: Node, **name_value_pairs) -> None:
+    """Set argument values on a call_function node by name, using the op schema.
+
+    For each name=value pair, the value is placed according to where the argument
+    currently lives (or would naturally live):
+
+    1. If the name is already present in ``node.kwargs``, update it there.
+    2. If the name corresponds to a positional slot that exists in ``node.args``,
+       update that slot.
+    3. Otherwise, add it to ``node.kwargs`` (safest default — downstream
+       consumers using ``extract_op_args`` or ``node.kwargs`` will find it).
+
+    This is the write-side complement to :func:`extract_op_args` and avoids
+    manual index arithmetic when injecting new arguments into a node.
+    """
+    schema = _get_op_schema(node)
+    pos = {a.name: i for i, a in enumerate(schema.arguments)}
+
+    args = list(node.args)
+    kwargs = dict(node.kwargs) if node.kwargs else {}
+
+    for name, value in name_value_pairs.items():
+        if name not in pos:
+            raise RuntimeError(f"'{name}' is not a valid argument for op {node.target}")
+        if name in kwargs:
+            kwargs[name] = value
+        elif pos[name] < len(args):
+            args[pos[name]] = value
+        else:
+            kwargs[name] = value
+
+    node.args = tuple(args)
+    node.kwargs = kwargs
 
 
 def predecessors(
@@ -808,12 +1164,22 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
     """Get the shape of the weight node."""
     if not is_any_lin_op(node):
         return None
-    s = list(shape(extract_weight_nodes(node).weights[0].node))
-    if len(s) == 0:
+
+    # Try to get from cache first
+    found, s = WeightBiasInfoCache.get_weight_shape(node)
+    if not found:
+        # Not in cache or caching not enabled - compute the shape
+        s = list(shape(extract_weight_nodes(node).weights[0].node))
+        if len(s) == 0:
+            s = None
+        elif is_fp4_op(node):
+            # FP4 weights are packed as uint8 type with 2 FP4 values per element
+            s[-1] *= 2
+        # Store in cache if caching is enabled
+        WeightBiasInfoCache.set_weight_shape(node, s)
+
+    if s is None:
         return None
-    if is_fp4_op(node):
-        # FP4 weights are packed as uint8 type with 2 FP4 values per element
-        s[-1] *= 2
     if dim is None:
         return s
     else:
@@ -823,6 +1189,8 @@ def get_weight_shape(node: Node, dim: Optional[int] = None) -> Optional[Union[in
 def get_layer_after_linear_node(
     linear_nodes: List[Node],
     terminating_indices: List[int],
+    embd: int,
+    residuals: List[Node],
     match_on_shapes: bool = True,
     enforce_strict_linear_history: bool = True,
 ) -> LayerSubgraph:
@@ -856,37 +1224,42 @@ def get_layer_after_linear_node(
     Args:
         linear_nodes: List of linear nodes in the graph.
         terminating_indices: List of indices of terminating linear nodes.
-        match_on_shapes: If True, the layer is matched on shapes of the nodes.
-            If False, the layer is matched on the nodes themselves.
+        embd: Embedding size for shape matching.
+        match_on_shapes: If True, match layers on embedding shapes.
+        enforce_strict_linear_history: If True, enforce strict ordering constraints.
+
     Returns:
-        LayerSubgraph: The layer subgraph.
+        LayerSubgraph containing opening nodes, subgraph nodes, and terminating node.
     """
 
-    def boundary_condition(
-        node: Node, embd: Optional[int] = None, dim: Optional[int] = None
-    ) -> bool:
-        if embd is not None and dim is not None:
+    def boundary_condition(node: Node, dim: int) -> bool:
+        if match_on_shapes:
+            if is_any_lin_op(node):
+                return node.meta["lin_node_shape"][dim] == embd
             return (
-                # match on embedding size
-                (is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd)
-                or is_any_moe_op(node)
+                is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+                or node in residuals
             )
         else:
             return (
                 is_any_lin_op(node)
                 or is_any_moe_op(node)
                 or is_op(node, ops=[torch.ops.aten.sym_size, torch.ops.aten.bmm])
+                or node in residuals
             )
 
-    def filter_condition(node: Node, embd: Optional[int] = None, dim: Optional[int] = None) -> bool:
-        if embd is not None and dim is not None:
-            return is_any_lin_op(node) and get_weight_shape(node, dim=dim) == embd
+    def filter_condition(node: Node, dim: int) -> bool:
+        if match_on_shapes:
+            if is_any_lin_op(node):
+                return node.meta["lin_node_shape"][dim] == embd
+            return False
         else:
             return is_any_lin_op(node)
 
     lin_nodes_in_subgraph = []
     start_lin_index = terminating_indices[-1] + 1
+
     while len(lin_nodes_in_subgraph) != 1:
         if start_lin_index >= len(linear_nodes):
             terminating_indices.append(len(linear_nodes))
@@ -896,30 +1269,39 @@ def get_layer_after_linear_node(
                 terminating_node=None,
                 layer_type=LayerType.UNKNOWN,
             )
-        if match_on_shapes:
-            # get embedding size of the opening linear node
-            embd = get_weight_shape(linear_nodes[start_lin_index], dim=-1)
-            # partial init boundary_condition and filter_condition
-            boundary_condition = partial(boundary_condition, embd=embd, dim=0)
-            filter_condition = partial(filter_condition, embd=embd, dim=0)
 
         forward_subgraph = subgraph(
-            sources=[linear_nodes[start_lin_index]], boundary_condition=boundary_condition
+            sources=[linear_nodes[start_lin_index]],
+            boundary_condition=lambda n: boundary_condition(n, dim=0),
         )
-        lin_nodes_in_subgraph = list(filtered_nodes(forward_subgraph, filter_condition))
+        lin_nodes_in_subgraph = list(
+            filtered_nodes(forward_subgraph, lambda n: filter_condition(n, dim=0))
+        )
+        if len(lin_nodes_in_subgraph) > 1:
+            # it means that probably we went over the boundary of the layer.
+            # It may happen e.g., with MoLE (latent MoE), with the closing latent fc2 projection,
+            # when the subgraph spanned over fc2 "spills" over consecutive layers.
+            # Then, wrap this single linear node in  LayerType.UNKNOWN and return.
+            terminating_indices.append(start_lin_index)
+            return LayerSubgraph(
+                opening_nodes=[linear_nodes[start_lin_index]],
+                subgraph_nodes=[],
+                terminating_node=linear_nodes[start_lin_index],
+                layer_type=LayerType.UNKNOWN,
+            )
         start_lin_index += 1
     start_lin_index -= 1
     terminating_linear_node = lin_nodes_in_subgraph[0]
 
-    # for backward pass, match embedding on the dim=0
-    if match_on_shapes:
-        boundary_condition = partial(boundary_condition, embd=embd, dim=-1)
-        filter_condition = partial(filter_condition, embd=embd, dim=-1)
+    # For backward pass, match embedding on dim=-1
     backward_subgraph = subgraph(
-        sinks=[terminating_linear_node], boundary_condition=boundary_condition
+        sinks=[terminating_linear_node], boundary_condition=lambda n: boundary_condition(n, dim=-1)
     )
-    # get all opening linear nodes
-    opening_linear_nodes = list(filtered_nodes(backward_subgraph, filter_condition))
+
+    # Get all opening linear nodes
+    opening_linear_nodes = list(
+        filtered_nodes(backward_subgraph, lambda n: filter_condition(n, dim=-1))
+    )
 
     if enforce_strict_linear_history:
         # opening nodes must succeed last terminating node
@@ -937,34 +1319,90 @@ def get_layer_after_linear_node(
         if n not in set(opening_linear_nodes).union([terminating_linear_node])
     ]
     ssm_nodes = list(filtered_nodes(interior_nodes, is_any_ssm_op))
+    delta_nodes = list(filtered_nodes(interior_nodes, is_any_delta_op))
     attention_nodes = list(filtered_nodes(interior_nodes, is_any_attention_op))
+    mla_nodes = list(filtered_nodes(interior_nodes, is_any_mla_op))
     intermediate_lin_nodes = list(filtered_nodes(interior_nodes, is_any_lin_op))
-
-    layer_type = LayerType.MLP
-    min_local_shape = 1
-    if len(ssm_nodes) > 0:
-        assert len(ssm_nodes) == 1, "SSM layer must have exactly one SSM node"
-        layer_type = LayerType.SSM
-        # determine head size
-        min_local_shape = shape(ssm_nodes[0])[-1]
-    if len(attention_nodes) > 0:
-        assert len(attention_nodes) == 1, "Attention layer must have exactly one attention node"
-        layer_type = LayerType.ATTENTION
-        # determine head size
-        min_local_shape = shape(attention_nodes[0])[-1]
-    if len(intermediate_lin_nodes) > 0:
-        assert len(intermediate_lin_nodes) == 2, (
-            "MLA layer must have exactly two intermediate linear nodes"
+    intermediate_weight_nodes = list(
+        filtered_nodes(
+            interior_nodes, lambda n: is_weight_node(n) and not is_any_lin_op(list(n.users)[0])
         )
-        assert len(attention_nodes) == 1, "MLA layer must have exactly one attention node"
-        layer_type = LayerType.MLA
+    )
+
+    ####################################################
+    ########## LAYER TYPE CLASSIFICATION ###############
+    ####################################################
+
+    def classify_layer_type() -> [LayerType, int]:
+        if len(ssm_nodes) + len(attention_nodes) + len(mla_nodes) + len(delta_nodes) > 1:
+            # ambiguous layer type
+            return LayerType.UNKNOWN, 1
+
+        if len(delta_nodes) == 1:
+            head_size = shape(delta_nodes[0])[-1]
+            # Gated DeltaNet layers should have 2 opening linear nodes (fused qkvz + ba,
+            # e.g. Qwen3Next) or 4 opening linear nodes (unfused qkv + z + b + a,
+            # e.g. Qwen3.5 MoE) and one terminating node.
+            if len(intermediate_lin_nodes) > 0 or len(opening_linear_nodes) not in (2, 4):
+                return LayerType.UNKNOWN, 1
+            # Gated DeltaNet layer should have 4 to 6 intermediate weight nodes:
+            # - conv1d weight
+            # - attn_A (attn_a_log))
+            # - attn_norm_weight
+            # - layernorm_weight
+            # - attn_dt_bias [optional]
+            # - conv1d bias [optional]
+
+            if len(intermediate_weight_nodes) not in list(range(4, 7)):
+                return LayerType.UNKNOWN, 1
+            return LayerType.DELTA, head_size
+
+        if len(attention_nodes) == 1:
+            head_size = shape(attention_nodes[0])[-1]
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            return LayerType.ATTENTION, head_size
+
+        if len(ssm_nodes) == 1:
+            head_size = shape(ssm_nodes[0])[-1]
+            # Mamba layers should not have any intermediate linear nodes.
+            if len(intermediate_lin_nodes) > 0:
+                return LayerType.UNKNOWN, 1
+            # Mamba layer should have 3 to 6 intermediate weight nodes:
+            # - conv1d weight
+            # - A (A_log)
+            # - D
+            # - conv1d bias [optional]
+            # - dt_bias [optional]
+            # - RMS norm [optional]
+            if len(intermediate_weight_nodes) not in list(range(3, 7)):
+                return LayerType.UNKNOWN, 1
+            return LayerType.SSM, head_size
+
+        if len(mla_nodes) == 1:
+            head_size = shape(mla_nodes[0])[-1]
+            # MLA should have two intermediate linear nodes:
+            # kv_b_proj and q_b_proj, but:
+            # - kv_b_proj may be absorbed by the MLA op
+            # - q_b_proj is skipped if q_lora_rank is None
+            if len(intermediate_lin_nodes) > 2:
+                return LayerType.UNKNOWN, 1
+            return LayerType.MLA, head_size
+
+        # if we reach here, it means the layer is a MLP.
+        # MLP should not have any intermediate linear or weight nodes.
+        if len(intermediate_lin_nodes) > 0 or len(intermediate_weight_nodes) > 0:
+            return LayerType.UNKNOWN, 1
+        return LayerType.MLP, 1
+
+    layer_type, head_size = classify_layer_type()
 
     layer_subgraph = LayerSubgraph(
         opening_nodes=opening_linear_nodes,
         subgraph_nodes=interior_nodes,
         terminating_node=terminating_linear_node,
         layer_type=layer_type,
-        min_local_shape=min_local_shape,
+        min_local_shape=head_size,
     )
     assert linear_nodes[start_lin_index] in opening_linear_nodes, (
         f"Linear node not found in opening linear nodes - "
@@ -986,7 +1424,7 @@ def get_layer_after_linear_node(
                 "ill-formed layer subgraph"
             )
         terminating_indices.append(terminating_index)
-    # otherwise, we are done. We processed the last linear node.
+
     return layer_subgraph
 
 
@@ -1003,6 +1441,8 @@ def shape(node: Node) -> Tuple[int, ...]:
 def get_weight_tensor(node: Node) -> torch.Tensor:
     """Extract the weight tensor from a node within a GraphModule."""
     weight_nodes = extract_weight_nodes(node)
+    if len(weight_nodes.weights) == 0:
+        raise ValueError(f"Node {node.name} has no weight")
     return weight_nodes.weights[0].tensor
 
 
@@ -1015,3 +1455,47 @@ def draw_graph(gm: GraphModule, filename: str):
     drawer = FxGraphDrawer(gm, filename)
     with open(f"{filename}.svg", "wb") as f:
         f.write(drawer.get_dot_graph().create_svg())
+
+
+def sync_weight_meta_dtype(gm: GraphModule) -> int:
+    """Sync .meta['val'] dtype with actual state_dict dtype for weight nodes.
+
+    During graph tracing, .meta['val'] is set with the dtype at tracing time.
+    However, quantization transforms may change the actual weight dtype (e.g., FP16 -> FP8)
+    without updating .meta['val']. This causes ONNX export to see incorrect dtypes.
+
+    This function iterates through all get_attr nodes and updates their .meta['val']
+    to match the actual tensor dtype from the GraphModule's state.
+
+    Args:
+        gm: The GraphModule containing weights to sync.
+
+    Returns:
+        Number of weight meta dtypes that were synced.
+    """
+    num_synced = 0
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            try:
+                # Traverse the attribute path to get the actual tensor
+                target_path = str(node.target)
+                obj = gm
+                for attr in target_path.split("."):
+                    obj = getattr(obj, attr)
+
+                # Update .meta["val"] if dtype differs
+                if isinstance(obj, torch.Tensor) and "val" in node.meta:
+                    old_val = node.meta["val"]
+                    if hasattr(old_val, "dtype") and old_val.dtype != obj.dtype:
+                        # Create new meta tensor with correct dtype
+                        node.meta["val"] = torch.empty(
+                            obj.shape, dtype=obj.dtype, device=old_val.device
+                        )
+                        ad_logger.debug(
+                            f"Synced {node.target} meta dtype: {old_val.dtype} -> {obj.dtype}"
+                        )
+                        num_synced += 1
+            except (AttributeError, RuntimeError):
+                pass  # Skip if attribute not found
+
+    return num_synced

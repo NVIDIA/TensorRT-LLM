@@ -116,7 +116,7 @@ Normally, the `trtllm-build` command only requires a single GPU, but you can ena
 ```bash
 # GLM-4-9B: single-gpu engine with dtype float16, GPT Attention plugin, Gemm plugin
 trtllm-build --checkpoint_dir trt_ckpt/glm_4_9b/fp16/1-gpu \
-        --gemm_plugin float16 \
+        --gemm_plugin bfloat16 \
         --output_dir trt_engines/glm_4_9b/fp16/1-gpu
 ```
 

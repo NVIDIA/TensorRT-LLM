@@ -523,6 +523,29 @@ class DecoderModelForCausalLM(nn.Module,
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        """Return model-specific LLM API default overrides.
+
+        Subclasses can override this to provide defaults that are applied
+        when the user hasn't explicitly set the corresponding llm_args
+        fields.
+
+        This will enable model-specific default overrides for better OOTB experience.
+        For example,
+        - to disable some defaults when model doesn't support it, like KV cache block reuse.
+            return {"kv_cache_config": {"enable_block_reuse": False}}
+        - Adaptively setting the moe backend based on the model and hardware.
+        - etc.
+
+        Model authors are encouraged to override this method for tuning default behavior
+        informed by the model's capabilities and hardware.
+
+        The returned dict is deep-merged with the user's llm_args, with
+        user-set values taking priority over these defaults.
+        """
+        return {}
+
     @property
     def config(self):
         return self.model_config.pretrained_config
@@ -748,11 +771,17 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
             pattern_mapping = {
                 r'(.*?)out_proj(.*)': r'\1o_proj\2'
             }
-        weights: A dictionary of weights
+        weights: A dictionary of weights (or ConsumableWeightsDict)
     Returns:
-        A dictionary of weights with renamed keys
+        A dictionary of weights with renamed keys (preserves ConsumableWeightsDict if input was one)
     """
     import re
+
+    from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
+        ConsumableWeightsDict
+
+    # Check if input is a ConsumableWeightsDict to preserve the type
+    is_consumable = isinstance(weights, ConsumableWeightsDict)
 
     # Create a new dictionary to store the renamed weights
     renamed_weights = {}
@@ -776,6 +805,9 @@ def rename_weights_with_regex(pattern_mapping: Dict[str, str], weights: Dict):
         if key not in matched_keys:
             renamed_weights[key] = weights[key]
 
+    # Preserve ConsumableWeightsDict type if that's what was passed in
+    if is_consumable:
+        return ConsumableWeightsDict(renamed_weights)
     return renamed_weights
 
 
@@ -913,6 +945,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                     module_weights.append(fw)
                 module.load_weights(weights=module_weights,
                                     allow_partial_loading=allow_partial_loading)
+                # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
+                if hasattr(weights, 'mark_consumed'):
+                    for src_name in params_map[names[-1]]:
+                        weights.mark_consumed('.'.join(names[:-1] + [src_name]))
 
             else:
                 module_weights = filter_weights(name, weights)
@@ -933,6 +969,10 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                                 assert n in module_weights
                             if n in module_weights:
                                 p.data.copy_(module_weights[n][:])
+
+                    # Mark consumed weights
+                    if hasattr(weights, 'mark_consumed'):
+                        weights.mark_consumed(name)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:
@@ -969,7 +1009,7 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
 
 
 def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
-                          weights: Dict,
+                          weights,
                           weight_mapper: "BaseWeightMapper",
                           skip_modules: List[str] = [],
                           params_map: Optional[Dict[str, str]] = None,
@@ -1008,6 +1048,12 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                     module, module_name, module_names_breakdown, weights)
                 module.load_weights(weights=module_weights,
                                     allow_partial_loading=allow_partial_loading)
+
+                # Mark consumed source weights (e.g., q_proj, k_proj, v_proj for qkv_proj)
+                if hasattr(weights, 'mark_consumed'):
+                    for src_name in weight_mapper._mapping.get(module_name, []):
+                        prefix = '.'.join(module_names_breakdown + [src_name])
+                        weights.mark_consumed(prefix)
             else:
                 module_weights = weight_mapper.filter_weights(name, weights)
                 # Note: module_weights may be empty after filtering (e.g., in streaming weight updates)
@@ -1038,6 +1084,10 @@ def _load_weights_impl_v2(model: Union[nn.Module, DecoderModelForCausalLM],
                                 n,
                                 p,
                                 allow_partial_loading=allow_partial_loading)
+
+                    # Mark consumed weights
+                    if hasattr(weights, 'mark_consumed'):
+                        weights.mark_consumed(name)
 
     if os.environ.get("TRT_LLM_DISABLE_LOAD_WEIGHTS_IN_PARALLEL",
                       "False") in ["True", "true", "1", "yes", "y"]:

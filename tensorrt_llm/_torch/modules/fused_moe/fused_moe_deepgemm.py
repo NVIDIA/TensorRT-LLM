@@ -1,4 +1,19 @@
-from typing import Dict, List, Optional, Union
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+from typing import Dict, List, Optional, Tuple, Union
 
 import torch
 import triton
@@ -6,7 +21,8 @@ import triton.language as tl
 
 import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
-from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm._utils import get_sm_version, nvtx_range
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...distributed import allgather
 from ...memory_buffer_utils import get_memory_buffers
@@ -361,6 +377,67 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        swiglu_gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if DeepGemmFusedMoE can implement the given quantization algorithm.
+
+        DeepGemmFusedMoE supports:
+        - FP8_BLOCK_SCALES: SM in {100, 103}
+
+        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type. Supported types are
+                float32, bfloat16, and float16 (required by moe_permute_op kernel).
+                Note: Output dtype is always bfloat16 regardless of input dtype.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                DeepGemmFusedMoE does NOT support swiglu_gptoss_style.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        if sm_version not in {100, 103}:
+            return _warn_and_return(
+                f"DeepGemmFusedMoE requires SM100 or SM103, got SM{sm_version}")
+
+        # Check dtype_activation: moe_permute_op only supports float32, bfloat16, float16
+        if dtype_activation not in {
+                torch.float32, torch.bfloat16, torch.float16
+        }:
+            return _warn_and_return(
+                f"DeepGemmFusedMoE requires float32, bfloat16, or float16 activation, "
+                f"got {dtype_activation}")
+
+        # DeepGemmFusedMoE does NOT support unquantized mode
+        if quant_algo is None:
+            return _warn_and_return(
+                "DeepGemmFusedMoE does not support unquantized mode")
+
+        # DeepGemmFusedMoE does NOT support swiglu_gptoss_style
+        if swiglu_gptoss_style:
+            return _warn_and_return(
+                "DeepGemmFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
+            )
+
+        # Only FP8_BLOCK_SCALES is supported
+        if quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
+            return True, None
+
+        return _warn_and_return(
+            f"DeepGemmFusedMoE does not support quant_algo={quant_algo}")
+
     # To reuse pytorch memory segments allocated during graph capture.
     buffers = get_memory_buffers()
 
@@ -663,6 +740,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                    expert_first_token_offset_tensor,
                                    token_to_expert_map)
 
+        topk = self.routing_method.top_k
+        if token_selected_experts is not None:
+            # For the deepgemmlowlatency, the topk has been viewed into 1
+            topk = token_selected_experts.shape[-1]
+
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             permuted_data_tensor,
             None,  # biases
@@ -675,7 +757,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             x.shape[0],  # num_rows
             x.shape[1],  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
+            topk,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
             self.tp_rank,

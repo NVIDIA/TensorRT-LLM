@@ -41,7 +41,7 @@ from ..interface import (
     TransformInfo,
     TransformRegistry,
 )
-from .kvcache import InsertCachedAttention
+from .kvcache import _InsertCachedOperator
 
 
 @torch.library.custom_op("auto_deploy::residual_add_for_capture", mutates_args=())
@@ -251,5 +251,5 @@ class CachedResidualAdd(AttentionDescriptor):
 
 
 @TransformRegistry.register("insert_cached_residual_add")
-class InsertCachedResidualAdd(InsertCachedAttention):
+class InsertCachedResidualAdd(_InsertCachedOperator):
     """A transform to handle residual add cache operations."""

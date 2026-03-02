@@ -26,7 +26,7 @@
    ```
 
    ```{tip}
-   Instead of manually installing the preqrequisites as described
+   Instead of manually installing the prerequisites as described
    above, it is also possible to use the pre-built [TensorRT LLM Develop container
    image hosted on NGC](https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/devel)
    (see [here](containers) for information on container tags).
@@ -37,7 +37,7 @@
    Once all prerequisites are in place, TensorRT LLM can be installed as follows:
 
    ```bash
-   pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm
+   pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm
    ```
 
    > **Note:** The TensorRT LLM wheel on PyPI is built with PyTorch 2.9.1. This version may be incompatible with the NVIDIA NGC PyTorch 25.12 container, which uses a more recent PyTorch build from the main branch. If you are using this container or a similar environment, please install the pre-built wheel located at `/app/tensorrt_llm` inside the TensorRT LLM NGC Release container instead.
@@ -58,7 +58,7 @@ There are some known limitations when you pip install pre-built TensorRT LLM whe
 1. MPI in the Slurm environment
 
     If you encounter an error while running TensorRT LLM in a Slurm-managed cluster, you need to reconfigure the MPI installation to work with Slurm.
-    The setup methods depends on your slurm configuration, pls check with your admin. This is not a TensorRT LLM specific, rather a general mpi+slurm issue.
+    The setup method depends on your Slurm configuration, please check with your admin. This is not TensorRT LLM specific, but rather a general MPI+Slurm issue.
     ```
     The application appears to have been direct launched using "srun",
     but OMPI was not built with SLURM support. This usually happens
@@ -75,5 +75,5 @@ There are some known limitations when you pip install pre-built TensorRT LLM whe
    ```bash
    CURRENT_TORCH_VERSION=$(python3 -c "import torch; print(torch.__version__)")
    echo "torch==$CURRENT_TORCH_VERSION" > /tmp/torch-constraint.txt
-   pip3 install --upgrade pip setuptools && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
+   pip3 install --ignore-installed pip setuptools wheel && pip3 install tensorrt_llm -c /tmp/torch-constraint.txt
    ```

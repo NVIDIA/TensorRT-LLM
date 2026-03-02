@@ -6,7 +6,7 @@ import torch
 from pydantic import Field
 from torch.fx import GraphModule, Node
 
-from ...custom_ops.rms_norm import gated_rms_norm_ref
+from ...custom_ops.normalization.rms_norm import gated_rms_norm_ref
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
 

@@ -19,7 +19,7 @@ Toggling the CUDA profiler runtime API on and off:
   * Results in smaller files to post-process (for metric extraction or similar).
 
 (PyTorch workflow only) Toggling the PyTorch profiler on and off:
-  * Help users to analysis the performance breakdown in the model.
+  * Help users to analyze the performance breakdown in the model.
   * Results in smaller files to post-process (for metric extraction or similar).
 
 

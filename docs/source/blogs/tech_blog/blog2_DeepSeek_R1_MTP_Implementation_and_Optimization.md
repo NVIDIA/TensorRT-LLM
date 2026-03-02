@@ -237,7 +237,7 @@ We validated the Relaxed Acceptance on different datasets. In Figure 8, we show 
 </div>
 <p align="center"><sub><em>Figure 9. Comparison between the chain-based and tree-based speculative decoding</em></sub></p>
 
-TensorRT LLM PyTorch backend can only support chain-based speculative decoding now, both MTP Vanilla and MTP Eagle. However, the tree-based speculative decoding technique is widely used in previous advanced methods, such as Ealge2 and Eagle3, to increase the acceptance rate. MTPs in TensorRT LLM can also be extended to support the tree-based technique. Figure 9 compares the chain-based method with the tree-based method. Both full tree and dynamic tree methods can help expand the candidate combinations, so that we can have more choices for the draft tokens.
+TensorRT LLM PyTorch backend can only support chain-based speculative decoding now, both MTP Vanilla and MTP Eagle. However, the tree-based speculative decoding technique is widely used in previous advanced methods, such as Eagle2 and Eagle3, to increase the acceptance rate. MTPs in TensorRT LLM can also be extended to support the tree-based technique. Figure 9 compares the chain-based method with the tree-based method. Both full tree and dynamic tree methods can help expand the candidate combinations, so that we can have more choices for the draft tokens.
 
 ### Eagle3 support
 

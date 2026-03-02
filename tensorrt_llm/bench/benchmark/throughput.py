@@ -320,6 +320,12 @@ def throughput_command(
                 f"Failed to import custom module from {custom_module_dir}: {e}")
             raise e
 
+    # Eagerly import auto_deploy to ensure custom model configs
+    # are registered with transformers.AutoConfig before
+    # options.model_type triggers AutoConfig.from_pretrained().
+    if options.backend == "_autodeploy":
+        import tensorrt_llm._torch.auto_deploy  # noqa: F401
+
     # Runtime kwargs and option tracking.
     kwargs = {}
 
