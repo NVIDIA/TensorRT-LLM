@@ -253,6 +253,8 @@ accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-trtl
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v2_kv_cache-trtllm-two_model-overlap_scheduler] SKIP (https://nvbugs/5820938)
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_vswa_reuse SKIP (https://nvbugs/5820497)
 accuracy/test_llm_api_pytorch.py::TestGemma3_1BInstruct::test_fp8_guided_decoding_vswa_reuse[xgrammar] SKIP (https://nvbugs/5820497)
+full:sm89/accuracy/test_llm_api_pytorch_multimodal.py::TestNemotron_Nano_12B_V2_VL::test_auto_dtype SKIP (https://nvbugs/5814504)
+test_e2e.py::test_eagle3_output_consistency_4gpus[Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf-Qwen3/qwen3-235B-eagle3] SKIP (https://nvbugs/5820335)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp8_tp4[torch_compile=True] SKIP (https://nvbugs/5821415)
 accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_nvfp4_tp4[torch_compile=True] SKIP (https://nvbugs/5821415)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_w4_4gpus[v1_kv_cache-ep4-trtllm-auto] SKIP (https://nvbugs/5651865)
