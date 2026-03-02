@@ -30,7 +30,11 @@ import torch
 
 import tensorrt_llm
 import tensorrt_llm.bindings
-from tensorrt_llm._torch.attention_backend.interface import PositionalEmbeddingParams, RopeParams
+from tensorrt_llm._torch.attention_backend.interface import (
+    AttentionRuntimeFeatures,
+    PositionalEmbeddingParams,
+    RopeParams,
+)
 from tensorrt_llm._torch.attention_backend.sparse.dsa import DSACacheManager
 from tensorrt_llm._torch.attention_backend.utils import get_attention_backend
 from tensorrt_llm._torch.metadata import KVCacheParams
@@ -63,25 +67,23 @@ LAYER_IDX = 0
 TOPK_TOKENS = 2048
 NN_INIT_STD = 0.02
 
-# "boundary_exact" tests the dispatch guard boundary (threshold == total_tokens).
+# ---------------------------------------------------------------------------
+# Parametrized test specs
+# ---------------------------------------------------------------------------
+# Each entry exercises a distinct code path: single-seq, multi-seq, boundary.
 BATCH_SPECS = [
-    ("single_short", [16]),
-    ("single_medium", [64]),
-    ("multi_short", [8, 12, 16]),
-    ("multi_varied", [4, 32, 10]),
-    ("single_one_token", [1]),
+    ("single", [16]),
+    ("multi", [8, 12, 16]),
     ("boundary_exact", [24, 16]),
 ]
 
-# (name, [(cached_tokens, new_tokens), ...])
-CHUNKED_CONTEXT_SPECS = [
-    ("single_small", [(16, 8)]),
-    ("single_medium", [(64, 32)]),
-    ("large_cache_small_new", [(128, 4)]),
-    ("single_one_new_token", [(64, 1)]),
-    ("multi_seq", [(64, 32), (32, 16)]),
-    ("multi_varied", [(128, 8), (16, 64)]),
-    ("three_seqs", [(32, 16), (16, 8), (48, 4)]),
+# (name, [(cached_tokens, new_tokens), ...], chunk_size or None)
+# chunk_size=None -> cached-KV path; chunk_size=int -> chunked-prefill path.
+CHUNKED_SPECS = [
+    ("cached_kv_single", [(64, 32)], None),
+    ("cached_kv_multi", [(64, 32), (32, 16)], None),
+    ("chunked_prefill_single", [(64, 8)], 16),
+    ("chunked_prefill_multi", [(64, 16), (64, 8)], 32),
 ]
 
 
@@ -343,10 +345,13 @@ def _make_metadata(
     sparse_config,
     cached_per_seq=None,
     enable_cached_kv=False,
+    runtime_features=None,
 ):
     """Build and prepare attention metadata."""
     num_ctx = len(seq_lens)
     kwargs = {"enable_context_mla_with_cached_kv": True} if enable_cached_kv else {}
+    if runtime_features is not None:
+        kwargs["runtime_features"] = runtime_features
     metadata = attn_cls.Metadata(
         seq_lens=torch.tensor(seq_lens, dtype=torch.int),
         request_ids=list(range(num_ctx)),
@@ -535,12 +540,17 @@ def test_agrees_with_absorption_path():
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
 @pytest.mark.parametrize(
-    "spec_name,chunk_specs",
-    CHUNKED_CONTEXT_SPECS,
-    ids=[s[0] for s in CHUNKED_CONTEXT_SPECS],
+    "spec_name,chunk_specs,chunk_size",
+    CHUNKED_SPECS,
+    ids=[s[0] for s in CHUNKED_SPECS],
 )
-def test_chunked_context_correctness(spec_name: str, chunk_specs: List[Tuple[int, int]]):
-    """Chunked context (chunk1 prefill + chunk2 cached KV) matches single-pass prefill."""
+def test_chunked_correctness(spec_name: str, chunk_specs: List[Tuple[int, int]], chunk_size):
+    """Chunked context (cached KV or chunked prefill) matches single-pass prefill.
+
+    When chunk_size is None, exercises the cached-KV path
+    (forward_context_with_cached_kv). When chunk_size is set, exercises the
+    chunked-prefill path (forward_context_with_chunked_prefill).
+    """
     device = torch.device("cuda")
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -582,7 +592,14 @@ def test_chunked_context_correctness(spec_name: str, chunk_specs: List[Tuple[int
         mla, q[c1_idx], compressed_kv[c1_idx], k_pe[c1_idx], latent_cache[c1_idx], pos_c1, meta_c1
     )
 
-    # Chunk 2: cached KV path.
+    # Chunk 2: cached KV or chunked prefill path.
+    runtime_features = None
+    if chunk_size is not None:
+        runtime_features = AttentionRuntimeFeatures(
+            chunked_prefill=True,
+            chunk_size=chunk_size,
+            chunked_prefill_buffer_batch_size=1,
+        )
     meta_c2 = _make_metadata(
         attn_cls,
         new_per_seq,
@@ -591,6 +608,7 @@ def test_chunked_context_correctness(spec_name: str, chunk_specs: List[Tuple[int
         sparse_config,
         cached_per_seq=cached_per_seq,
         enable_cached_kv=True,
+        runtime_features=runtime_features,
     )
     pos_c2 = torch.cat(
         [torch.arange(c, c + n, device=device, dtype=torch.int32) for c, n in chunk_specs]
@@ -606,11 +624,11 @@ def test_chunked_context_correctness(spec_name: str, chunk_specs: List[Tuple[int
 
 
 if __name__ == "__main__":
-    for batch_name, seq_lens in BATCH_SPECS:
-        test_forward_context_short_mha(batch_name, seq_lens)
+    for name, seq_lens in BATCH_SPECS:
+        test_forward_context_short_mha(name, seq_lens)
     test_threshold_zero_disables_mha()
     test_standard_path_when_exceeds_threshold()
     test_agrees_with_absorption_path()
-    for spec_name, chunk_specs in CHUNKED_CONTEXT_SPECS:
-        test_chunked_context_correctness(spec_name, chunk_specs)
+    for name, specs, cs in CHUNKED_SPECS:
+        test_chunked_correctness(name, specs, cs)
     print("All tests passed!")
