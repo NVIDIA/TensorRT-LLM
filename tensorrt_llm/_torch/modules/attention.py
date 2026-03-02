@@ -1455,7 +1455,10 @@ class MLA(nn.Module):
 
         # Check if the short-seq MHA path will handle context, in which case
         # the indexer (topk_indices) is not needed for context tokens.
-        use_short_mha_for_ctx = (num_contexts > 0
+        # Disable when cached tokens exist: forward_context_default does not
+        # attend over cached KV from previous chunks/turns.
+        has_cached_ctx = getattr(attn_metadata, 'num_ctx_cached_tokens', 0) > 0
+        use_short_mha_for_ctx = (num_contexts > 0 and not has_cached_ctx
                                  and self._should_use_short_mha(
                                      num_ctx_tokens, position_ids))
 
@@ -1574,7 +1577,12 @@ class MLA(nn.Module):
 
     def _should_use_short_mha(self, num_ctx_tokens: int,
                               position_ids: Optional[torch.Tensor]) -> bool:
-        """Check if the short-seq MHA optimization should be used for context."""
+        """Check if the short-seq MHA optimization should be used for context.
+
+        This checks only token count vs threshold. Callers MUST separately
+        verify that there are no cached tokens (num_ctx_cached_tokens == 0),
+        because forward_context_default does not attend over cached KV.
+        """
         return (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
                 and self.mapping.cp_size == 1 and position_ids is not None
                 and num_ctx_tokens <= self.short_seq_mha_threshold)
@@ -1612,7 +1620,9 @@ class MLA(nn.Module):
         # See __init__ comment for rationale. topk_indices is not used
         # because dense attention is faster than sparse routing at this scale.
         num_ctx_tokens = q.shape[0]
-        if self._should_use_short_mha(num_ctx_tokens, position_ids):
+        has_cached = getattr(attn_metadata, 'num_ctx_cached_tokens', 0) > 0
+        if not has_cached and self._should_use_short_mha(
+                num_ctx_tokens, position_ids):
             return self.forward_context_default(q, compressed_kv, k_pe,
                                                 position_ids, attn_metadata,
                                                 output, latent_cache)
