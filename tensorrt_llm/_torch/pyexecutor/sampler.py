@@ -178,7 +178,7 @@ class Sampler(ABC, Generic[GenericSampleState]):
         scheduled_requests: ScheduledRequests,
         model_outputs,
         num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> GenericSampleState:
         raise NotImplementedError
 
@@ -186,7 +186,7 @@ class Sampler(ABC, Generic[GenericSampleState]):
     def update_requests(
         self,
         state: GenericSampleState,
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> None:
         raise NotImplementedError
 
@@ -235,7 +235,7 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
         scheduled_requests: ScheduledRequests,
         model_outputs,
         num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> SampleState:
         host = SampleStateTensors(new_tokens=torch.empty(0))
         return self.SampleState(scheduled_requests=scheduled_requests, host=host)
@@ -244,7 +244,7 @@ class EarlyStopSampler(Sampler[SampleState[SampleStateTensors, SampleStateTensor
     def update_requests(
         self,
         state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> None:
         assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
@@ -313,7 +313,7 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
         scheduled_requests: ScheduledRequests,
         model_outputs,
         num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> SampleState:
         # from model_outputs to MultimodalResult
         data = MultimodalResult(
@@ -326,9 +326,8 @@ class EarlyStopWithMMResult(Sampler[SampleStateWithMMResult]):
     def update_requests(
         self,
         state: SampleState,
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> None:
-        # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleState)
         scheduled_requests = state.scheduled_requests
         assert not scheduled_requests.generation_requests
@@ -2362,6 +2361,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def update_requests(
         self,
         state: SampleStateTorch,
+        *,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
         if state.sampler_event:
@@ -2469,7 +2469,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         scheduled_requests: ScheduledRequests,
         model_outputs: dict[str, torch.Tensor],
         num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
+        *,
+        d2t: Optional[torch.Tensor] = None,
+        **kwargs,
     ) -> SampleStateTorch:
         # NB: The sampler is either called directly by PyExecutor, for the target model,
         #     or by ModelDrafter.prepare_draft_tokens(), for the draft model. In the former
@@ -2492,11 +2494,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
         new_tokens_host = self._process_requests(
             scheduled_requests,
-            model_outputs,
+            model_outputs["logits"],
             new_tokens,
             num_context_logits_prefix_sum,
             seq_slots=seq_slots_host,
             seq_lens=seq_lens_host,
+            d2t=d2t,
         )
 
         finish_reasons = self.store.finish_reasons
@@ -2572,14 +2575,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
     @staticmethod
-    def _apply_d2t(tokens: torch.Tensor, model_outputs) -> None:
+    def _apply_d2t(tokens: torch.Tensor, d2t: Optional[torch.Tensor] = None) -> None:
         """Applies draft-to-target token translation table.
 
         Modifies tokens in-place.
         """
-        if "d2t" in model_outputs:
-            d2t = model_outputs["d2t"][tokens]
-            tokens += d2t
+        if d2t is not None:
+            tokens += d2t[tokens]
 
     @staticmethod
     @nvtx_range("fast_greedy_sample_kernel")
@@ -2700,7 +2702,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         self,
         logits_cuda: torch.Tensor,
         requests: list[LlmRequest],
-        model_outputs: dict[str, torch.Tensor],
         *,
         cuda_device: torch.device,
         logits_cuda_indexer: _PackedStepIndexer,
@@ -2711,6 +2712,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         seq_lens: Optional[torch.Tensor] = None,
         token_dtype: torch.dtype,
         return_log_probs: bool,
+        d2t: Optional[torch.Tensor] = None,
     ) -> _BatchedSamplingResult:
         grouped_requests = self._request_grouper.group_requests_by_strategy_key(
             requests,
@@ -2730,7 +2732,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # NB: Currently, "d2t" is applied to draft tokens, but not to draft logits,
         #     breaking _process_draft_tokens_rejection_sampling.
-        needs_d2t = "d2t" in model_outputs
+        needs_d2t = d2t is not None
         if needs_d2t and (
             len(grouped_requests_with_metadata) > 1
             or (
@@ -2927,7 +2929,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         #     vocab. Since the inputs/outputs are linked by TorchSampler.update_requests,
         #     they currently need to be handled within TorchSampler.
         if needs_d2t:
-            self._apply_d2t(batch_next_tokens_cuda_int, model_outputs)
+            self._apply_d2t(batch_next_tokens_cuda_int, d2t)
 
         return _BatchedSamplingResult(
             batch_req_indices=batch_req_indices,
@@ -3524,20 +3526,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     def _process_requests(
         self,
         scheduled_requests: ScheduledRequests,
-        model_outputs: dict[str, torch.Tensor],
+        raw_logits_cuda: torch.Tensor,
         new_tokens_cuda: torch.Tensor,
         num_context_logits_prefix_sum: list[int],
         *,
         seq_slots: torch.Tensor,
         seq_lens: torch.Tensor | None = None,
+        d2t: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         seq_slots_int64 = seq_slots
         seq_slots = torch.empty_like(
             seq_slots_int64, dtype=torch.int32, pin_memory=prefer_pinned()
         )  # int32 suffices here
         seq_slots[:] = seq_slots_int64
-
-        raw_logits_cuda = model_outputs["logits"]
 
         requests = scheduled_requests.all_requests()
         cuda_device = raw_logits_cuda.device
@@ -3576,9 +3577,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 new_tokens_cuda.device, non_blocking=True
             )
 
-            # Get d2t tensor if present
-            d2t = model_outputs.get("d2t", None)
-
             # Run compiled kernel for argmax, d2t application, and scatter
             self._fast_greedy_sample_kernel(
                 logits_cuda,
@@ -3604,7 +3602,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
             requests,
-            model_outputs,
             cuda_device=cuda_device,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=sampling_requests_metadata.req_offsets,
@@ -3614,6 +3611,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             req_num_steps=sampling_requests_metadata.req_num_steps,
             token_dtype=new_tokens_cuda.dtype,
             return_log_probs=return_log_probs,
+            d2t=d2t,
         )
 
         if return_log_probs:
@@ -3870,7 +3868,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         scheduled_requests: ScheduledRequests,
         model_outputs,
         num_context_logits_prefix_sum: list[int],
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ) -> SampleStateTRTLLM:
         batch_size = scheduled_requests.batch_size
         beam_width = self.beam_width(scheduled_requests.all_requests())
@@ -3955,7 +3953,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
     def update_requests(
         self,
         state: SampleStateTRTLLM,
-        resource_manager: Optional[ResourceManager] = None,
+        **kwargs,
     ):
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)

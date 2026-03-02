@@ -3121,7 +3121,8 @@ class PyExecutor:
                          sample_state: SampleState,
                          resource_manager: Optional[ResourceManager] = None):
         try:
-            self.sampler.update_requests(sample_state, resource_manager)
+            self.sampler.update_requests(sample_state,
+                                         resource_manager=resource_manager)
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)

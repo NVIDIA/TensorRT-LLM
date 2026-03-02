@@ -1214,7 +1214,6 @@ class TestBatchedSampling:
                         scheduled_requests,
                         model_outputs=model_outputs,
                         num_context_logits_prefix_sum=[0],
-                        resource_manager=None,  #  only used for tree sampling, which is not tested here
                     )
                 )
                 for _ in range(num_actual_repeats)
@@ -1591,7 +1590,6 @@ class TestBatchedSampling:
                 scheduled_requests: ScheduledRequests,
                 model_outputs: dict[str, torch.Tensor],
                 num_context_logits_prefix_sum: list[int],
-                resource_manager=None,
             ):
                 nonlocal flashinfer_keys_seen
                 flashinfer_keys_seen.clear()
@@ -1599,7 +1597,6 @@ class TestBatchedSampling:
                     scheduled_requests,
                     model_outputs,
                     num_context_logits_prefix_sum,
-                    resource_manager,
                 )
 
                 # Fast greedy path bypasses flashinfer sampling, so flashinfer_keys_seen
