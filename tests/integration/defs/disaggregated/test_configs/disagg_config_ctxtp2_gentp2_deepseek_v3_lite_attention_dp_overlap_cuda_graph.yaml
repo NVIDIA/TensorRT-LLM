@@ -19,7 +19,7 @@ generation_servers:
   pipeline_parallel_size: 1
   enable_attention_dp: true
   cuda_graph_config:
-    enable_padding: False
+    enable_padding: True
   disable_overlap_scheduler: False
   cache_transceiver_config:
     backend: DEFAULT

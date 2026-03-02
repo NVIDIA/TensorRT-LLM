@@ -108,7 +108,7 @@ class CudaGraphConfig(StrictBaseModel):
         default=0, description="Maximum batch size for CUDA graphs.")
 
     enable_padding: bool = Field(
-        default=False,
+        default=True,
         description=
         "If true, batches are rounded up to the nearest cuda_graph_batch_size. This is usually a net win for performance."
     )
@@ -163,10 +163,16 @@ class CudaGraphConfig(StrictBaseModel):
         else:
             batch_sizes = list(range(1, 32)) + [32, 64, 128]
 
-        # Add powers of 2 up to max_batch_size
-        batch_sizes += [
-            2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
-        ]
+        if enable_padding:
+            # Use tile size of 64 when padding is enabled (more finer granularity)
+            batch_sizes += [
+                i * 64 for i in range(3, (max_batch_size // 64) + 1)
+            ]
+        else:
+            # Add powers of 2 up to max_batch_size
+            batch_sizes += [
+                2**i for i in range(8, math.ceil(math.log(max_batch_size, 2)))
+            ]
 
         # Filter and sort batch sizes
         batch_sizes = sorted(
