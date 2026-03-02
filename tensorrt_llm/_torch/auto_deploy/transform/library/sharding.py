@@ -1746,9 +1746,10 @@ def _insert_sharded_moe(
             # Standard TP with all_reduce:
             # No attention-DP, so tokens are NOT distributed across ranks.
             # Just add all_reduce after MoE to sum TP partial results.
+            _, all_reduce_op = _get_dist_ops(config.dist_backend)
             with gm.graph.inserting_after(node):
                 dist_node = gm.graph.call_function(
-                    torch.ops.auto_deploy.torch_dist_all_reduce.default,
+                    all_reduce_op,
                     args=(node, allreduce_strategy),
                 )
                 node.replace_all_uses_with(dist_node)
@@ -1836,10 +1837,9 @@ def _insert_sharded_mxfp4_mlp_ep(
     node.args = args_ep
 
     # Add a dist all-reduce after the op (sum partial results across EP ranks)
+    _, all_reduce_op = _get_dist_ops(config.dist_backend)
     with gm.graph.inserting_after(node):
-        red = gm.graph.call_function(
-            torch.ops.auto_deploy.torch_dist_all_reduce, args=(node, config.allreduce_strategy.name)
-        )
+        red = gm.graph.call_function(all_reduce_op, args=(node, config.allreduce_strategy.name))
         node.replace_all_uses_with(red)
         # keep dataflow: red(input=node)
         red.replace_input_with(red, node)
