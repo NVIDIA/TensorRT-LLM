@@ -235,6 +235,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -252,7 +253,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type,
-            self.do_finalize, tactic, args.topk_weights, args.topk_ids)
+            self.do_finalize, tactic, args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -396,7 +397,8 @@ def fp4_block_scale_moe_runner(
         do_finalize: bool,
         act_type: int = ActType_TrtllmGen.SwiGlu.value,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP4BlockScaleMoERunner(
@@ -464,8 +466,17 @@ def fp4_block_scale_moe_runner(
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided and do_finalize=True, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None and do_finalize:
+        return [torch.empty(0, device=output.device, dtype=output.dtype)]
+    return result
 
 
 def fp4_block_scale_fake_output_without_finalize(
@@ -523,7 +534,8 @@ def _(routing_logits,
       do_finalize,
       act_type,
       topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+      topk_ids: Optional[torch.Tensor] = None,
+      output: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
     if do_finalize:
         num_tokens = hidden_states.shape[0]
         hidden_size = hidden_states.shape[1] * 2
@@ -605,6 +617,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
 
         args = FP8BlockScaleMoEInputs(*inputs)
@@ -619,7 +632,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
             self.n_group, self.topk_group, self.intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids)
+            args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -713,26 +726,28 @@ class FP8BlockScaleMoERunner(TunableRunner):
 
 
 @torch.library.custom_op("trtllm::fp8_block_scale_moe_runner", mutates_args=())
-def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
-                               routing_bias: torch.Tensor,
-                               hidden_states: torch.Tensor,
-                               hidden_states_scale: torch.Tensor,
-                               gemm1_weights: torch.Tensor,
-                               gemm1_weights_scale: torch.Tensor,
-                               gemm2_weights: torch.Tensor,
-                               gemm2_weights_scale: torch.Tensor,
-                               num_experts: int,
-                               top_k: int,
-                               n_group: Optional[int],
-                               topk_group: Optional[int],
-                               intermediate_size: int,
-                               local_expert_offset: int,
-                               local_num_experts: int,
-                               routed_scaling_factor: Optional[float],
-                               routing_method_type: int,
-                               topk_weights: Optional[torch.Tensor] = None,
-                               topk_ids: Optional[torch.Tensor] = None,
-                               act_type: int = 0) -> torch.Tensor:
+def fp8_block_scale_moe_runner(
+        routing_logits: Optional[torch.Tensor],
+        routing_bias: torch.Tensor,
+        hidden_states: torch.Tensor,
+        hidden_states_scale: torch.Tensor,
+        gemm1_weights: torch.Tensor,
+        gemm1_weights_scale: torch.Tensor,
+        gemm2_weights: torch.Tensor,
+        gemm2_weights_scale: torch.Tensor,
+        num_experts: int,
+        top_k: int,
+        n_group: Optional[int],
+        topk_group: Optional[int],
+        intermediate_size: int,
+        local_expert_offset: int,
+        local_num_experts: int,
+        routed_scaling_factor: Optional[float],
+        routing_method_type: int,
+        topk_weights: Optional[torch.Tensor] = None,
+        topk_ids: Optional[torch.Tensor] = None,
+        act_type: int = 0,
+        output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
     kernel_runner = FP8BlockScaleMoERunner(
@@ -790,8 +805,17 @@ def fp8_block_scale_moe_runner(routing_logits: Optional[torch.Tensor],
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None:
+        return torch.empty(0, device=result.device, dtype=result.dtype)
+    return result
 
 
 @fp8_block_scale_moe_runner.register_fake
@@ -813,7 +837,9 @@ def _(routing_logits: torch.Tensor,
       routed_scaling_factor: Optional[float],
       routing_method_type: int,
       topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+      topk_ids: Optional[torch.Tensor] = None,
+      act_type: int = 0,
+      output: Optional[torch.Tensor] = None) -> torch.Tensor:
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1] * 2
 
@@ -1199,6 +1225,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -1216,8 +1243,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
             self.valid_hidden_size, self.valid_intermediate_size,
             self.local_expert_offset, self.local_num_experts,
             self.routed_scaling_factor, self.routing_method_type, tactic,
-            args.topk_weights, args.topk_ids, None
-        )  # TODO: Currently user provided output is only supported in w4a8_mxfp4_mxfp8
+            args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -1334,7 +1360,8 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         routing_method_type: int,
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
     kernel_runner = E4m3MxE2m1BlockScaleMoERunner(
@@ -1402,8 +1429,17 @@ def e4m3_mxe2m1_block_scale_moe_runner(
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None:
+        return torch.empty(0, device=result.device, dtype=result.dtype)
+    return result
 
 
 @dataclass(frozen=True)
@@ -1477,6 +1513,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -1493,7 +1530,8 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
             self.intermediate_size, self.valid_hidden_size,
             self.valid_intermediate_size, self.local_expert_offset,
             self.local_num_experts, self.routed_scaling_factor,
-            self.routing_method_type, tactic, args.topk_weights, args.topk_ids)
+            self.routing_method_type, tactic, args.topk_weights, args.topk_ids,
+            output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -1607,7 +1645,8 @@ def bf16_mxe2m1_block_scale_moe_runner(
         routing_method_type: int,
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> torch.Tensor:
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None) -> torch.Tensor:
 
     tuner = AutoTuner.get()
     kernel_runner = Bf16MxE2m1BlockScaleMoERunner(
@@ -1673,8 +1712,17 @@ def bf16_mxe2m1_block_scale_moe_runner(
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None:
+        return torch.empty(0, device=result.device, dtype=result.dtype)
+    return result
 
 
 @dataclass(frozen=True)
@@ -1740,6 +1788,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: List[int] = [-1, -1],
+        output: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         assert isinstance(tactic, list)
 
@@ -1755,7 +1804,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
             self.intermediate_size, self.local_expert_offset,
             self.local_num_experts, self.routed_scaling_factor,
             self.routing_method_type, self.do_finalize, tactic,
-            args.topk_weights, args.topk_ids)
+            args.topk_weights, args.topk_ids, output)
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
                           profile: OptimizationProfile,
@@ -1867,7 +1916,8 @@ def fp8_fp4_block_scale_moe_runner(
         do_finalize: bool,
         act_type: int,
         topk_weights: Optional[torch.Tensor] = None,
-        topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+        topk_ids: Optional[torch.Tensor] = None,
+        output: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     tuner = AutoTuner.get()
     kernel_runner = FP8FP4BlockScaleMoERunner(
@@ -1929,8 +1979,17 @@ def fp8_fp4_block_scale_moe_runner(
         0] = routing_logits  # replace dummy routing logits with actual routing logits
     input_tensors[-2] = topk_weights  # replace dummy topk_weights with actual
     input_tensors[-1] = topk_ids  # replace dummy topk_ids with actual
-    return kernel_runner(input_tensors,
-                         tactic=[-1, -1] if best_tactic == -1 else best_tactic)
+    result = kernel_runner(
+        input_tensors,
+        tactic=[-1, -1] if best_tactic == -1 else best_tactic,
+        output=output)
+    # When output is provided and do_finalize=True, the result is written in-place to output.
+    # Return empty tensor to avoid aliasing constraint violation in PyTorch 2.9.1+
+    # (custom op output cannot be the same tensor as input).
+    # Callers should use output directly when they provide it.
+    if output is not None and do_finalize:
+        return [torch.empty(0, device=output.device, dtype=output.dtype)]
+    return result
 
 
 @fp8_fp4_block_scale_moe_runner.register_fake
@@ -1956,7 +2015,8 @@ def _(routing_logits,
       do_finalize,
       act_type,
       topk_weights: Optional[torch.Tensor] = None,
-      topk_ids: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
+      topk_ids: Optional[torch.Tensor] = None,
+      output: Optional[torch.Tensor] = None) -> List[torch.Tensor]:
 
     num_tokens = hidden_states.shape[0]
     hidden_size = hidden_states.shape[1]
