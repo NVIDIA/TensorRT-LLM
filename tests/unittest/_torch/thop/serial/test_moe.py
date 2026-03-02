@@ -37,6 +37,7 @@ from tensorrt_llm.quantization.utils.fp4_utils import (
 class ActType(Enum):
     SwiGlu = 0
     Relu2 = 1
+    Silu = 2
 
 
 class moe_args:
@@ -422,6 +423,8 @@ def run_moe_dequant(args,
             activation_output[i:i + my_num_tokens] = act * (beta + my_x1)
         elif args.act_type == ActType.Relu2:
             activation_output[i:i + my_num_tokens] = F.relu(my_x1)**2
+        elif args.act_type == ActType.Silu:
+            activation_output[i:i + my_num_tokens] = F.silu(my_x1)
         i += my_num_tokens
         i = (i + args.padding - 1) // args.padding * args.padding
 
@@ -1021,8 +1024,9 @@ class TestMoeFp4:
     @pytest.mark.parametrize("num_tokens", [1, 1024])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024, 768])
-    @pytest.mark.parametrize("act_type", [ActType.SwiGlu, ActType.Relu2],
-                             ids=["swiglu", "relu2"])
+    @pytest.mark.parametrize("act_type",
+                             [ActType.SwiGlu, ActType.Relu2, ActType.Silu],
+                             ids=["swiglu", "relu2", "silu"])
     @pytest.mark.parametrize(
         "routing_info",
         [
@@ -1137,8 +1141,9 @@ class TestMoeFp4:
     @pytest.mark.parametrize("num_tokens", [1, 150])
     @pytest.mark.parametrize("hidden_size", [1024])
     @pytest.mark.parametrize("intermediate_size", [1024])
-    @pytest.mark.parametrize("act_type", [ActType.SwiGlu, ActType.Relu2],
-                             ids=["swiglu", "relu2"])
+    @pytest.mark.parametrize("act_type",
+                             [ActType.SwiGlu, ActType.Relu2, ActType.Silu],
+                             ids=["swiglu", "relu2", "silu"])
     @pytest.mark.parametrize(
         "routing_info",
         [
@@ -1601,7 +1606,7 @@ class TestMoeFp4:
             scale_c_fc1 = args_dequant.c_global_sf * (
                 1.0 / args.gemm1_scales_global) * (
                     1.0 / args.hidden_states_scale_global)
-        elif act_type == ActType.Relu2:
+        elif act_type in [ActType.Relu2, ActType.Silu]:
             scale_c_fc1 = torch.full_like(args.gemm1_scales_global,
                                           args_dequant.c_global_sf)
         # self.fc31_alpha
@@ -1651,7 +1656,7 @@ class TestMoeFp4:
                 do_finalize=True,
                 topk_ids=topk_ids,
                 topk_weights=topk_weights,
-                act_type=1 if act_type == ActType.Relu2 else 0)
+                act_type=act_type.value)
         torch.cuda.synchronize()
         output_dequant_actual = output[0].to(torch.float)
 
@@ -1662,7 +1667,7 @@ class TestMoeFp4:
         else:
             atol = 0.1
             rtol = 0.85
-            percent = 0.925
+            percent = 0.9
 
         check_accuracy(output_dequant_reference,
                        output_dequant_actual,

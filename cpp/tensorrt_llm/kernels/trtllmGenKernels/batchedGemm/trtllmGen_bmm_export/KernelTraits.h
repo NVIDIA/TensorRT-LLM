@@ -390,77 +390,86 @@ public:
             }
 
             // Per-token Scale Factors
-            {
-                // Number of bytes for per-token scale factors
-                auto const numBytesSmemPerTokenSf
-                    = (usePerTokenSfA ? (tileM) * sizeof(float) : 0) + (usePerTokenSfB ? (tileN) * sizeof(float) : 0);
-                // Number of bytes alignment for per-token scale factors
-                auto const numBytesAlignmentPerTokenSf = 16;
-                // Add info.
-                smemChunkNames.emplace_back("smemPerTokenSf");
-                numBytesAndAlignmentPerSmemChunk.emplace_back(
-                    std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
-                firstChunkReuseSmem.emplace_back(false);
-            }
+            {{// Number of bytes for per-token scale factors
+                auto const numBytesSmemPerTokenSf = (usePerTokenSfA ? (tileM) * sizeof(float) : 0);
+            // Number of bytes alignment for per-token scale factors
+            auto const numBytesAlignmentPerTokenSf = 16;
+            // Add info.
+            smemChunkNames.emplace_back("smemPerTokenSfA");
+            numBytesAndAlignmentPerSmemChunk.emplace_back(
+                std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
+            firstChunkReuseSmem.emplace_back(false);
+        }
+        {
+            // Number of bytes for per-token scale factors
+            auto const numBytesSmemPerTokenSf = (usePerTokenSfB ? (tileN) * sizeof(float) : 0);
+            // Number of bytes alignment for per-token scale factors
+            auto const numBytesAlignmentPerTokenSf = 16;
+            // Add info.
+            smemChunkNames.emplace_back("smemPerTokenSfB");
+            numBytesAndAlignmentPerSmemChunk.emplace_back(
+                std::make_pair(numBytesSmemPerTokenSf, numBytesAlignmentPerTokenSf));
+            firstChunkReuseSmem.emplace_back(false);
+        }
+    }
 
-            // Bias
-            {
-                int32_t numBytesSmemBias = 0;
-                if (isBiasTypeN(biasType))
-                {
-                    numBytesSmemBias = tileN * sizeof(float);
-                }
-                else if (isBiasTypeM(biasType))
-                {
-                    numBytesSmemBias = tileM * sizeof(float);
-                }
-                else if (isBiasTypeMn(biasType))
-                {
-                    numBytesSmemBias = tileM * tileN * sizeof(float);
-                }
-                // Number of bytes alignment for bias
-                auto const numBytesAlignmentBias = 16;
-                // Add info.
-                smemChunkNames.emplace_back("smemBias");
-                numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemBias, numBytesAlignmentBias));
-                firstChunkReuseSmem.emplace_back(false);
-            }
+    // Bias
+    {
+        int32_t numBytesSmemBias = 0;
+        if (isBiasTypeN(biasType))
+        {
+            numBytesSmemBias = tileN * sizeof(float);
+        }
+        else if (isBiasTypeM(biasType))
+        {
+            numBytesSmemBias = tileM * sizeof(float);
+        }
+        else if (isBiasTypeMn(biasType))
+        {
+            numBytesSmemBias = tileM * tileN * sizeof(float);
+        }
+        // Number of bytes alignment for bias
+        auto const numBytesAlignmentBias = 16;
+        // Add info.
+        smemChunkNames.emplace_back("smemBias");
+        numBytesAndAlignmentPerSmemChunk.emplace_back(std::make_pair(numBytesSmemBias, numBytesAlignmentBias));
+        firstChunkReuseSmem.emplace_back(false);
+    }
 
-            // Per-block absolute maximum for multi-warp reduction.
-            {
-                // Number of bytes: number of epilogue warps * number of tile columns.
-                auto const numBytesSmemBlockAmax = transposeMmaOutput ? 4 * tileN * sizeof(float) : 0;
-                // Number of bytes alignment.
-                auto const numBytesAlignmentBlockAmax = 16;
-                // Add info.
-                smemChunkNames.emplace_back("smemBlockAmax");
-                numBytesAndAlignmentPerSmemChunk.emplace_back(
-                    std::make_pair(numBytesSmemBlockAmax, numBytesAlignmentBlockAmax));
-                firstChunkReuseSmem.emplace_back(false);
-            }
+    // Per-block absolute maximum for multi-warp reduction.
+    {
+        // Number of bytes: number of epilogue warps * number of tile columns.
+        auto const numBytesSmemBlockAmax = transposeMmaOutput ? 4 * tileN * sizeof(float) : 0;
+        // Number of bytes alignment.
+        auto const numBytesAlignmentBlockAmax = 16;
+        // Add info.
+        smemChunkNames.emplace_back("smemBlockAmax");
+        numBytesAndAlignmentPerSmemChunk.emplace_back(
+            std::make_pair(numBytesSmemBlockAmax, numBytesAlignmentBlockAmax));
+        firstChunkReuseSmem.emplace_back(false);
+    }
 
-            // SmemConstSfBuf
-            // A buffer used to copy constant values to TMEM.
-            {
-                // Do we need the buffer?
-                bool const useConstSfBuf = dtypeB == tg::Dtype::E4m3 && dtypeMmaB == tg::Dtype::MxE4m3;
-                // Number of bytes for the buffer.
-                auto const numSmemBytesConstSfBuf = useConstSfBuf ? 512 : 0;
-                // Number of bytes for the alignment of the buffer.
-                auto const numBytesAlignmentConstSfBuf = 16;
-                // No need to reuse the first chunk.
-                auto const reuseChunksSmemConstSfBuf = false;
+    // SmemConstSfBuf
+    // A buffer used to copy constant values to TMEM.
+    {
+        // Do we need the buffer?
+        bool const useConstSfBuf = dtypeB == tg::Dtype::E4m3 && dtypeMmaB == tg::Dtype::MxE4m3;
+        // Number of bytes for the buffer.
+        auto const numSmemBytesConstSfBuf = useConstSfBuf ? 512 : 0;
+        // Number of bytes for the alignment of the buffer.
+        auto const numBytesAlignmentConstSfBuf = 16;
+        // No need to reuse the first chunk.
+        auto const reuseChunksSmemConstSfBuf = false;
 
-                // Add info.
-                smemChunkNames.emplace_back("smemConstSfBuf");
-                numBytesAndAlignmentPerSmemChunk.emplace_back(
-                    std::make_pair(numSmemBytesConstSfBuf, numBytesAlignmentConstSfBuf));
-                firstChunkReuseSmem.emplace_back(reuseChunksSmemConstSfBuf);
-            }
+        // Add info.
+        smemChunkNames.emplace_back("smemConstSfBuf");
+        numBytesAndAlignmentPerSmemChunk.emplace_back(
+            std::make_pair(numSmemBytesConstSfBuf, numBytesAlignmentConstSfBuf));
+        firstChunkReuseSmem.emplace_back(reuseChunksSmemConstSfBuf);
+    }
 
-            // Create SMEM helper object.
-            mSmemAllocatorHelper
-                = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem, smemChunkNames);
+    // Create SMEM helper object.
+    mSmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerSmemChunk, firstChunkReuseSmem, smemChunkNames);
 #if 0
       // E.g.,
       // Chunk 0 smemLoadA: 32768 bytes, 1024 alignment, false, offset 0
@@ -470,146 +479,145 @@ public:
       // Chunk 4 smemGmemC1: 65536 bytes, 1024 alignment, false, offset 65536
       // Chunk 5 smemRowMax: 512 bytes, 16 alignment, false, offset 131072
       // Chunk 6 smemSliceK: 0 bytes, 16 alignment, false, offset 131584
-      // Chunk 7 smemPerTokenSf: 0 bytes, 16 alignment, false, offset 131584
+      // Chunk 7 smemPerTokenSfA: 0 bytes, 16 alignment, false, offset 131584
+      // Chunk 8 smemPerTokenSfB: 0 bytes, 16 alignment, false, offset 131584
       mSmemAllocatorHelper.print();
 #endif
-        }
+}
 
-        //
-        // TMEM
-        //
-        // [..D..][..A..][.SfA.][.SfB.]
-        {
-            std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerTmemChunk;
-            std::vector<bool> firstChunkReuseTmem;
-            std::vector<std::string> tmemChunkNames;
-            // Matrix D
-            {
-                // Two set of TMEM resources for D share epilogueTileN columns,
-                //  | set0:epiTileN0 | set0:epiTileN1/set1:epiTileN0 | set1:epiTileN1 |
-                auto const numCols = mUseMaxTmemOverlap ? 2 * tileN - epilogueTileN : tileN;
-                // Number of columns for accumulators.
-                auto const numTmemColsD = numSlicesForSliceK * numCols * numStagesMma * tg::dtypeGetNumBits(dtypeAcc)
-                    / tg::dtypeGetNumBits(tg::Dtype::UInt32);
-                // Number of columns for D alignment.
-                auto const numColsAlignmentD = 2;
-                // No need to reuse TMEM.
-                auto const reuseChunksTmemD = false;
+//
+// TMEM
+//
+// [..D..][..A..][.SfA.][.SfB.]
+{
+    std::vector<std::pair<int32_t, int32_t>> numBytesAndAlignmentPerTmemChunk;
+    std::vector<bool> firstChunkReuseTmem;
+    std::vector<std::string> tmemChunkNames;
+    // Matrix D
+    {
+        // Two set of TMEM resources for D share epilogueTileN columns,
+        //  | set0:epiTileN0 | set0:epiTileN1/set1:epiTileN0 | set1:epiTileN1 |
+        auto const numCols = mUseMaxTmemOverlap ? 2 * tileN - epilogueTileN : tileN;
+        // Number of columns for accumulators.
+        auto const numTmemColsD = numSlicesForSliceK * numCols * numStagesMma * tg::dtypeGetNumBits(dtypeAcc)
+            / tg::dtypeGetNumBits(tg::Dtype::UInt32);
+        // Number of columns for D alignment.
+        auto const numColsAlignmentD = 2;
+        // No need to reuse TMEM.
+        auto const reuseChunksTmemD = false;
 
-                // Add info.
-                tmemChunkNames.emplace_back("tmemD");
-                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsD, numColsAlignmentD));
-                firstChunkReuseTmem.emplace_back(reuseChunksTmemD);
-            }
-
-            // Matrix A
-            {
-                // We use TMEM for A if we use slice-K or if we need to cast A.
-                bool const useTmemA = (numSlicesForSliceK > 1) || (dtypeMmaA != dtypeA);
-                // Number of columns for A.
-                auto const numTmemColsA = useTmemA ? numStages * tileK
-                        / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeMmaA))
-                                                   : 0;
-                // Number of columns for A alignment.
-                auto const numColsAlignmentA = 4;
-                // No need to reuse TMEM.
-                auto const reuseChunksTmemA = false;
-
-                // Add info.
-                tmemChunkNames.emplace_back("tmemA");
-                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsA, numColsAlignmentA));
-                firstChunkReuseTmem.emplace_back(reuseChunksTmemA);
-            }
-
-            // Sf A
-            {
-                // Does the MMA require block scales in TMEM for A?
-                bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeMmaA);
-                // Are the block scales constant?
-                bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
-                // TMEM cols group size in the K dimension.
-                int32_t kGroupSize = 4;
-                // Number of columns per stage.
-                int32_t const numColsPerStage = useBlockScalingA
-                    ? ((tileK / (kGroupSize * numEltsPerSfA)) * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
-                    : 0;
-                // Number of columns for scaling factors of A.
-                auto const numTmemColsSfA = useConstSfA ? tg::roundUp(numColsPerStage, 4)
-                                                        : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
-                // Number of columns for Sf alignment.
-                auto const numColsAlignmentSfA = 4;
-                // No need to reuse TMEM.
-                auto const reuseChunksTmemSfA = false;
-
-                // Add info.
-                tmemChunkNames.emplace_back("tmemSfA");
-                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfA, numColsAlignmentSfA));
-                firstChunkReuseTmem.emplace_back(reuseChunksTmemSfA);
-            }
-
-            // Sf B
-            {
-                // Does the MMA require block scales in TMEM for B?
-                bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeMmaB);
-                // Are the block scales constant?
-                bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
-                // TMEM cols group size in the K dimension.
-                int32_t kGroupSize = 4;
-                // Number of columns per stage.
-                int32_t const numColsPerStage = useBlockScalingB
-                    ? ((tileK / (kGroupSize * numEltsPerSfB)) * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
-                    : 0;
-                // Number of columns for scaling factors of B.
-                auto const numTmemColsSfB = useConstSfB ? tg::roundUp(numColsPerStage, 4)
-                                                        : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
-                // Number of columns for Sf alignment.
-                auto const numColsAlignmentSfB = 4;
-                // No need to reuse TMEM.
-                auto const reuseChunksTmemSfB = false;
-
-                // Add info.
-                tmemChunkNames.emplace_back("tmemSfB");
-                numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfB, numColsAlignmentSfB));
-                firstChunkReuseTmem.emplace_back(reuseChunksTmemSfB);
-            }
-
-            // Sparsity info for A
-            {
-                // Number of columns for the sparsity info for A (note: for Dense, this is 0).
-                auto const numTmemColsSparsityInfoA
-                    = numStages * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
-                // Number of columns for Sf alignment.
-                auto const numColsAlignmentSparsityInfoA = 2;
-                // No need to reuse TMEM.
-                auto const reuseChunksTmemSparsityInfoA = false;
-
-                // Add info.
-                tmemChunkNames.emplace_back("tmemSparsityInfoA");
-                numBytesAndAlignmentPerTmemChunk.emplace_back(
-                    std::make_pair(numTmemColsSparsityInfoA, numColsAlignmentSparsityInfoA));
-                firstChunkReuseTmem.emplace_back(reuseChunksTmemSparsityInfoA);
-            }
-
-            // Create TMEM helper object.
-            mTmemAllocatorHelper
-                = MemAllocatorHelper(numBytesAndAlignmentPerTmemChunk, firstChunkReuseTmem, tmemChunkNames);
-        }
+        // Add info.
+        tmemChunkNames.emplace_back("tmemD");
+        numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsD, numColsAlignmentD));
+        firstChunkReuseTmem.emplace_back(reuseChunksTmemD);
     }
 
+    // Matrix A
+    {
+        // We use TMEM for A if we use slice-K or if we need to cast A.
+        bool const useTmemA = (numSlicesForSliceK > 1) || (dtypeMmaA != dtypeA);
+        // Number of columns for A.
+        auto const numTmemColsA = useTmemA ? numStages * tileK
+                / (numSlicesForSliceK * tg::dtypeGetNumBits(tg::Dtype::UInt32) / tg::dtypeGetNumBits(dtypeMmaA))
+                                           : 0;
+        // Number of columns for A alignment.
+        auto const numColsAlignmentA = 4;
+        // No need to reuse TMEM.
+        auto const reuseChunksTmemA = false;
+
+        // Add info.
+        tmemChunkNames.emplace_back("tmemA");
+        numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsA, numColsAlignmentA));
+        firstChunkReuseTmem.emplace_back(reuseChunksTmemA);
+    }
+
+    // Sf A
+    {
+        // Does the MMA require block scales in TMEM for A?
+        bool const useBlockScalingA = tg::dtypeIsBlockFmt(dtypeMmaA);
+        // Are the block scales constant?
+        bool const useConstSfA = useBlockScalingA && !tg::dtypeIsBlockFmt(dtypeA);
+        // TMEM cols group size in the K dimension.
+        int32_t kGroupSize = 4;
+        // Number of columns per stage.
+        int32_t const numColsPerStage = useBlockScalingA
+            ? ((tileK / (kGroupSize * numEltsPerSfA)) * tg::getTmemColStridePerGroup(tileM, mmaK, kGroupSize))
+            : 0;
+        // Number of columns for scaling factors of A.
+        auto const numTmemColsSfA = useConstSfA ? tg::roundUp(numColsPerStage, 4)
+                                                : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
+        // Number of columns for Sf alignment.
+        auto const numColsAlignmentSfA = 4;
+        // No need to reuse TMEM.
+        auto const reuseChunksTmemSfA = false;
+
+        // Add info.
+        tmemChunkNames.emplace_back("tmemSfA");
+        numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfA, numColsAlignmentSfA));
+        firstChunkReuseTmem.emplace_back(reuseChunksTmemSfA);
+    }
+
+    // Sf B
+    {
+        // Does the MMA require block scales in TMEM for B?
+        bool const useBlockScalingB = tg::dtypeIsBlockFmt(dtypeMmaB);
+        // Are the block scales constant?
+        bool const useConstSfB = useBlockScalingB && !tg::dtypeIsBlockFmt(dtypeB);
+        // TMEM cols group size in the K dimension.
+        int32_t kGroupSize = 4;
+        // Number of columns per stage.
+        int32_t const numColsPerStage = useBlockScalingB
+            ? ((tileK / (kGroupSize * numEltsPerSfB)) * tg::getTmemColStridePerGroup(tileN, mmaK, kGroupSize))
+            : 0;
+        // Number of columns for scaling factors of B.
+        auto const numTmemColsSfB = useConstSfB ? tg::roundUp(numColsPerStage, 4)
+                                                : (numColsPerStage * (mFuseUtccpWithUtcmma ? 1 : numStages));
+        // Number of columns for Sf alignment.
+        auto const numColsAlignmentSfB = 4;
+        // No need to reuse TMEM.
+        auto const reuseChunksTmemSfB = false;
+
+        // Add info.
+        tmemChunkNames.emplace_back("tmemSfB");
+        numBytesAndAlignmentPerTmemChunk.emplace_back(std::make_pair(numTmemColsSfB, numColsAlignmentSfB));
+        firstChunkReuseTmem.emplace_back(reuseChunksTmemSfB);
+    }
+
+    // Sparsity info for A
+    {
+        // Number of columns for the sparsity info for A (note: for Dense, this is 0).
+        auto const numTmemColsSparsityInfoA = numStages * tg::getNumBytesSparsityInfo(sparsityA, tileK) / 4 /* bytes */;
+        // Number of columns for Sf alignment.
+        auto const numColsAlignmentSparsityInfoA = 2;
+        // No need to reuse TMEM.
+        auto const reuseChunksTmemSparsityInfoA = false;
+
+        // Add info.
+        tmemChunkNames.emplace_back("tmemSparsityInfoA");
+        numBytesAndAlignmentPerTmemChunk.emplace_back(
+            std::make_pair(numTmemColsSparsityInfoA, numColsAlignmentSparsityInfoA));
+        firstChunkReuseTmem.emplace_back(reuseChunksTmemSparsityInfoA);
+    }
+
+    // Create TMEM helper object.
+    mTmemAllocatorHelper = MemAllocatorHelper(numBytesAndAlignmentPerTmemChunk, firstChunkReuseTmem, tmemChunkNames);
+}
+} // namespace gemm
+
 public:
-    // The MMA kind.
-    tg::MmaKind mMmaKind{};
-    // Whether fuse Utccp into the MMA task.
-    bool mFuseUtccpWithUtcmma{};
-    // Whether use the max TMEM overlap trick.
-    bool mUseMaxTmemOverlap{};
-    // The number of epilogue warps.
-    int32_t mNumEpilogueWarps{};
-    // Helper for SMEM allocation.
-    MemAllocatorHelper mSmemAllocatorHelper;
-    // Helper for TMEM allocation.
-    MemAllocatorHelper mTmemAllocatorHelper;
-};
+// The MMA kind.
+tg::MmaKind mMmaKind{};
+// Whether fuse Utccp into the MMA task.
+bool mFuseUtccpWithUtcmma{};
+// Whether use the max TMEM overlap trick.
+bool mUseMaxTmemOverlap{};
+// The number of epilogue warps.
+int32_t mNumEpilogueWarps{};
+// Helper for SMEM allocation.
+MemAllocatorHelper mSmemAllocatorHelper;
+// Helper for TMEM allocation.
+MemAllocatorHelper mTmemAllocatorHelper;
+}; // namespace batchedGemm
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -680,9 +688,16 @@ inline int32_t getSmemOffsetSliceK(KernelTraits traits)
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-inline int32_t getSmemOffsetPerTokenSf(KernelTraits traits)
+inline int32_t getSmemOffsetPerTokenSfA(KernelTraits traits)
 {
-    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSf");
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSfA");
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline int32_t getSmemOffsetPerTokenSfB(KernelTraits traits)
+{
+    return traits.mSmemAllocatorHelper.getChunkOffsetByName("smemPerTokenSfB");
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
