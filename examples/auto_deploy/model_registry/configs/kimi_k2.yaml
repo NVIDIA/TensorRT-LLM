@@ -1,0 +1,22 @@
+# Configuration for Kimi-K2.5 VLM (moonshotai/Kimi-K2.5)
+# Uses minimum layers for validation: 1 dense + 2 MoE = 3 total
+runtime: trtllm
+compile_backend: torch-cudagraph
+max_seq_len: 4096
+max_num_tokens: 4096
+max_batch_size: 64
+world_size: 8
+enable_chunked_prefill: true
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64]
+kv_cache_config:
+  dtype: bfloat16
+  enable_block_reuse: false
+  free_gpu_memory_fraction: 0.7
+  tokens_per_block: 64
+model_kwargs:
+  torch_dtype: bfloat16
+transforms:
+  export_to_gm:
+    num_moe_experts_for_export: 2
+  fuse_nvfp4_moe:
+    allow_different_input_scales: true

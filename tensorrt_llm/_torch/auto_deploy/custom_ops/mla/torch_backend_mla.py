@@ -52,6 +52,12 @@ def _update_mla_cache(
     - First kv_lora_rank dims: compressed KV latent (before kv_b_proj)
     - Last qk_rope_head_dim dims: key positional encoding
     """
+    cache_dtype = mla_cache.dtype
+    if compressed_kv.dtype != cache_dtype:
+        compressed_kv = compressed_kv.to(cache_dtype)
+    if kpe.dtype != cache_dtype:
+        kpe = kpe.to(cache_dtype)
+
     for idx in range(seq_len.shape[0]):
         start = seq_start[idx].item()
         length = seq_len[idx].item()
@@ -102,6 +108,13 @@ def _torch_mla_generate_with_absorption(
     compressed_kv_flat = compressed_kv.squeeze(1)  # [B, kv_lora_rank]
     kpe_flat = kpe.squeeze(1).squeeze(1)  # [B, qk_rope_head_dim]
 
+    # Cast to cache dtype if needed (e.g. BF16 -> FP8)
+    cache_dtype = mla_cache.dtype
+    if compressed_kv_flat.dtype != cache_dtype:
+        compressed_kv_flat = compressed_kv_flat.to(cache_dtype)
+    if kpe_flat.dtype != cache_dtype:
+        kpe_flat = kpe_flat.to(cache_dtype)
+
     for i in range(b):
         cache_idx = slot_idx[i].item()
         pos = input_pos[i].item()
@@ -121,6 +134,13 @@ def _torch_mla_generate_with_absorption(
         cached_data = mla_cache[cache_idx, : pos + 1]  # [seq_len, kv_lora_rank + qk_rope_head_dim]
         compressed_kv_cached = cached_data[:, :kv_lora_rank]  # [seq_len, kv_lora_rank]
         kpe_cached = cached_data[:, kv_lora_rank:]  # [seq_len, qk_rope_head_dim]
+
+        # Cast from cache dtype (e.g. FP8) to compute dtype
+        compute_dtype = q_nope.dtype
+        if compressed_kv_cached.dtype != compute_dtype:
+            compressed_kv_cached = compressed_kv_cached.to(compute_dtype)
+        if kpe_cached.dtype != compute_dtype:
+            kpe_cached = kpe_cached.to(compute_dtype)
 
         # =====================================================================
         # Weight absorption for Q_nope part
@@ -229,6 +249,13 @@ def _torch_mla_context_with_expansion(
         ]  # [kv_seq_len, kv_lora_rank + qk_rope_head_dim]
         compressed_kv_cached = cached_data[:, :kv_lora_rank]  # [kv_seq_len, kv_lora_rank]
         kpe_cached = cached_data[:, kv_lora_rank:]  # [kv_seq_len, qk_rope_head_dim]
+
+        # Cast from cache dtype (e.g. FP8) to compute dtype
+        compute_dtype = q_nope.dtype
+        if compressed_kv_cached.dtype != compute_dtype:
+            compressed_kv_cached = compressed_kv_cached.to(compute_dtype)
+        if kpe_cached.dtype != compute_dtype:
+            kpe_cached = kpe_cached.to(compute_dtype)
 
         # =====================================================================
         # Expand compressed_kv using kv_b_proj_weight for this sequence
@@ -496,12 +523,17 @@ class TorchBackendMLAAttention(AttentionDescriptor):
         kv_lora_rank = compressed_kv_fake.shape[-1]
         qk_rope_head_dim = kpe_fake.shape[-1]
 
-        # FlashInfer MLA cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
+        model_dtype = compressed_kv_fake.dtype
+        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, model_dtype)
+
+        # Torch MLA supports configured/model cache dtypes; no dtype override needed.
+
+        # MLA cache: [max_batch, max_seq, kv_lora_rank + qk_rope_head_dim]
         # No num_heads dimension - this is the key MLA optimization
         return {
             "mla_cache": UnpagedResourceHandler(
                 kv_lora_rank + qk_rope_head_dim,
-                dtype=cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype),
+                dtype=cache_dtype,
             ),
         }
 
