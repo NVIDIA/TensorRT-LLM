@@ -12,7 +12,6 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
 
-from tensorrt_llm.llmapi import DisaggScheduleStyle
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 
 try:
@@ -59,7 +58,10 @@ from .llm_request import (ExecutorRequest, LlmRequest, LlmRequestState,
 from .model_engine import ModelEngine
 from .perf_metrics_manager import PerfMetricsManager
 from .request_utils import (RequestBroadcaster, attach_py_objects_to_requests,
-                            get_from_waiting_queue, merge_requests)
+                            balance_adp_requests, check_batch_waiting,
+                            check_disagg_ctx_schedulable,
+                            create_adp_dummy_request, get_from_waiting_queue,
+                            merge_requests, prepare_draft_requests)
 from .resource_manager import (ResourceManager, ResourceManagerType,
                                request_context)
 from .sampler import (AsyncWorkerMixin, Sampler, SamplerEvent, SampleState,
@@ -68,6 +70,7 @@ from .scheduler import (RequestScheduler, ScheduledRequests,
                         SerializableSchedulerOutput, WaitingQueue,
                         create_waiting_queue)
 from .scheduler.adp_router import ADPRouter, DefaultADPRouter
+from .scheduler.unified_scheduler import SimpleUnifiedScheduler
 
 # Environment variable to specify iteration ranges for profiling start/stop.
 # Format: "start1-stop1,start2-stop2,..." or single iterations "iter1,iter2,..."
@@ -1615,92 +1618,171 @@ class PyExecutor:
         return can_queue, can_queue_this_rank
 
     def _prepare_and_schedule_batch(self):
-        new_requests = self._fetch_and_activate_new_requests()
-        if self.should_stop_processing:
-            return None, None
+        if isinstance(self.scheduler, SimpleUnifiedScheduler):
+            # 1. Fill waiting queue from external request queue
+            self._fetch_and_enqueue_requests(self.waiting_queue,
+                                             len(self.active_requests))
+            if self.should_stop_processing:
+                return None, None
 
-        if self.kv_cache_transceiver:
-            self._check_disagg_ctx_schedulable_status(new_requests)
-            self._check_disagg_gen_transfer_status()
-            self._check_kv_transfer_timeout()
+            # 2. Disagg gen/timeout checks (independent of new_requests)
+            if self.kv_cache_transceiver:
+                self._check_disagg_gen_transfer_status()
+                self._check_kv_transfer_timeout()
 
-        # In gen-only benchmark mode with disaggregated serving, keep fetching
-        # until all real requests have arrived before adding ADP dummies.
-        # This ensures the benchmark starts with the exact number of real
-        # requests specified, since dummies only get added after this loop.
-        if not self.is_warmup and self.benchmark_req_queues_size > 0 \
-                and self.kv_cache_transceiver \
-                and self.num_fetch_requests < self.benchmark_req_queues_size:
-            if self.dist.rank == 0:
-                logger.info(f"Starting benchmark fill loop, "
-                            f"num_fetch_requests={self.num_fetch_requests}/"
-                            f"{self.benchmark_req_queues_size}, "
-                            f"len(active_requests)={len(self.active_requests)}")
-            while self.num_fetch_requests < self.benchmark_req_queues_size:
-                iter_requests = self._fetch_and_activate_new_requests()
-                if self.should_stop_processing:
-                    return None, None
-                new_requests += iter_requests
-                self.hang_detector.checkpoint()
-                if self.num_fetch_requests < self.benchmark_req_queues_size:
-                    time.sleep(1)
+            # 3. Benchmark fill: keep filling queue until target reached
+            if (not self.is_warmup and self.benchmark_req_queues_size > 0
+                    and self.kv_cache_transceiver
+                    and len(self.waiting_queue) + len(self.active_requests)
+                    < self.benchmark_req_queues_size):
+                if self.dist.rank == 0:
+                    logger.info(f"Starting benchmark fill loop, "
+                                f"waiting_queue={len(self.waiting_queue)}, "
+                                f"active_requests={len(self.active_requests)}/"
+                                f"{self.benchmark_req_queues_size}")
+                while (len(self.waiting_queue) + len(self.active_requests)
+                       < self.benchmark_req_queues_size):
+                    self._fetch_and_enqueue_requests(self.waiting_queue,
+                                                     len(self.active_requests))
+                    if self.should_stop_processing:
+                        return None, None
+                    self.hang_detector.checkpoint()
+                    if (len(self.waiting_queue) + len(self.active_requests)
+                            < self.benchmark_req_queues_size):
+                        time.sleep(1)
 
-        iter_stats = None
-        if self.enable_iter_perf_stats:
-            iter_stats = self._get_init_iter_stats(
-                len(new_requests),
-                self._get_new_active_requests_queue_latency())
+            # 4. Schedule (handles pop, validate, pad, drafter, schedule)
+            result = self.scheduler.schedule(
+                waiting_queue=self.waiting_queue,
+                active_requests=self.active_requests,
+                inflight_req_ids=self.inflight_req_ids,
+                validate_fn=self._make_validate_fn(),
+                kv_cache_manager=self.kv_cache_manager,
+                kv_cache_transceiver=self.kv_cache_transceiver,
+                kv_connector_manager=self.kv_connector_manager,
+                is_warmup=self.is_warmup,
+                num_fetch_requests=self.num_fetch_requests,
+                exclude_last_generation_logits=self.
+                _should_exclude_last_generation_logits(),
+            )
 
-        self._pad_attention_dp_dummy_request()
+            # 5. Update executor state from result
+            new_requests = result.new_requests
+            self.expected_num_active_requests = result.expected_num_active_requests
+            if self.enable_iter_perf_stats and self.dist.rank == 0:
+                self._update_new_active_requests_queue_latency(
+                    result.all_new_requests)
+            if self.enable_attention_dp:
+                self.num_fetch_requests += len(result.all_new_requests)
+                self.num_fetch_requests_cur_rank += len(result.new_requests)
 
-        if self.drafter is not None:
-            # Honor permanent disable flag based on rolling acceptance first
-            if self.drafter.draft_len_schedule is not None:
-                batch_size_input = len(self.active_requests)
+            # 6. Apply side effects from the unified scheduler
+            if result.dummy_request is not None:
+                spec_rm = self.resource_manager.get_resource_manager(
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                if spec_rm is not None:
+                    spec_rm.add_dummy_requests([0])
+            if self.drafter is not None:
+                self.use_spec_decode = result.use_spec_decode
+                self.max_total_draft_tokens = result.max_total_draft_tokens
+                self.model_engine.enable_spec_decode = result.use_spec_decode
 
-                self.max_total_draft_tokens = self.drafter.get_draft_len_for_batch_size(
-                    batch_size_input)
+            iter_stats = None
+            if self.enable_iter_perf_stats:
+                iter_stats = self._get_init_iter_stats(
+                    len(new_requests),
+                    self._get_new_active_requests_queue_latency())
 
-                self.drafter.update_max_total_draft_tokens(
-                    self.max_total_draft_tokens)
+            scheduled_batch = result.scheduled_requests
+            fitting_disagg_gen_init_requests = result.fitting_disagg_gen_init_requests
+            num_fitting_reqs = result.num_fitting_requests
+        else:
+            new_requests = self._fetch_and_activate_new_requests()
+            if self.should_stop_processing:
+                return None, None
 
-            # Check if draft_len=0 → immediately disable
-            # self.max_total_draft_tokens==0 is only possible when draft_len_schedule is provided
-            # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
-            if self.drafter.draft_len_schedule is not None and self.max_total_draft_tokens == 0:
-                self.use_spec_decode = False
-            elif getattr(self, 'speculation_permanently_disabled', False):
-                self.use_spec_decode = False
-            else:
-                self.use_spec_decode = self.drafter.should_use_spec_decode(
-                    self.active_requests, self.max_batch_size,
-                    self.model_engine.llm_args.max_num_tokens,
-                    self.max_total_draft_tokens)
-            logger.debug(f"Use spec decode: {self.use_spec_decode}")
-            self.model_engine.enable_spec_decode = self.use_spec_decode
+            if self.kv_cache_transceiver:
+                self._check_disagg_ctx_schedulable_status(new_requests)
+                self._check_disagg_gen_transfer_status()
+                self._check_kv_transfer_timeout()
 
-            # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
-            for request in self.active_requests:
-                if request.state not in (
-                        LlmRequestState.GENERATION_IN_PROGRESS,
-                        LlmRequestState.DISAGG_GENERATION_INIT):
-                    continue
-                request.draft_tokens = [
-                    0
-                ] * self.max_total_draft_tokens if self.max_total_draft_tokens > 0 else []
+            # In gen-only benchmark mode with disaggregated serving, keep fetching
+            # until all real requests have arrived before adding ADP dummies.
+            # This ensures the benchmark starts with the exact number of real
+            # requests specified, since dummies only get added after this loop.
+            if not self.is_warmup and self.benchmark_req_queues_size > 0 \
+                    and self.kv_cache_transceiver \
+                    and self.num_fetch_requests < self.benchmark_req_queues_size:
+                if self.dist.rank == 0:
+                    logger.info(
+                        f"Starting benchmark fill loop, "
+                        f"num_fetch_requests={self.num_fetch_requests}/"
+                        f"{self.benchmark_req_queues_size}, "
+                        f"len(active_requests)={len(self.active_requests)}")
+                while self.num_fetch_requests < self.benchmark_req_queues_size:
+                    iter_requests = self._fetch_and_activate_new_requests()
+                    if self.should_stop_processing:
+                        return None, None
+                    new_requests += iter_requests
+                    self.hang_detector.checkpoint()
+                    if self.num_fetch_requests < self.benchmark_req_queues_size:
+                        time.sleep(1)
 
-            # If speculation is off, this function sets py_draft_tokens to []
-            # for all active requests. If it's on, we initialize py_draft_tokens
-            # with dummy draft tokens to make the scheduler aware of the fact
-            # that speculation is about to happen.
-            self._prepare_draft_requests()
+            iter_stats = None
+            if self.enable_iter_perf_stats:
+                iter_stats = self._get_init_iter_stats(
+                    len(new_requests),
+                    self._get_new_active_requests_queue_latency())
+            self._pad_attention_dp_dummy_request()
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-        )
+            if self.drafter is not None:
+                # Honor permanent disable flag based on rolling acceptance first
+                if self.drafter.draft_len_schedule is not None:
+                    batch_size_input = len(self.active_requests)
 
-        if self.drafter is not None and not self.use_spec_decode:
-            for request in scheduled_batch.all_requests():
-                request.py_disable_speculative_decoding = True
+                    self.max_total_draft_tokens = self.drafter.get_draft_len_for_batch_size(
+                        batch_size_input)
+
+                    self.drafter.update_max_total_draft_tokens(
+                        self.max_total_draft_tokens)
+
+                # Check if draft_len=0 → immediately disable
+                # self.max_total_draft_tokens==0 is only possible when draft_len_schedule is provided
+                # for example, draft_len_schedule = {1:4, 4:2, 8:0}, batch_size >= 8 will set self.max_draft_len = 0
+                if self.drafter.draft_len_schedule is not None and self.max_total_draft_tokens == 0:
+                    self.use_spec_decode = False
+                elif getattr(self, 'speculation_permanently_disabled', False):
+                    self.use_spec_decode = False
+                else:
+                    self.use_spec_decode = self.drafter.should_use_spec_decode(
+                        self.active_requests, self.max_batch_size,
+                        self.model_engine.llm_args.max_num_tokens,
+                        self.max_total_draft_tokens)
+                logger.debug(f"Use spec decode: {self.use_spec_decode}")
+                self.model_engine.enable_spec_decode = self.use_spec_decode
+
+                # Set up draft_tokens in active_requests, because they could be used in the scheduling stage.
+                for request in self.active_requests:
+                    if request.state not in (
+                            LlmRequestState.GENERATION_IN_PROGRESS,
+                            LlmRequestState.DISAGG_GENERATION_INIT):
+                        continue
+                    request.draft_tokens = [
+                        0
+                    ] * self.max_total_draft_tokens if self.max_total_draft_tokens > 0 else []
+
+                # If speculation is off, this function sets py_draft_tokens to []
+                # for all active requests. If it's on, we initialize py_draft_tokens
+                # with dummy draft tokens to make the scheduler aware of the fact
+                # that speculation is about to happen.
+                self._prepare_draft_requests()
+
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
+            )
+
+            if self.drafter is not None and not self.use_spec_decode:
+                for request in scheduled_batch.all_requests():
+                    request.py_disable_speculative_decoding = True
 
         if self.kv_cache_transceiver:
             # For requests that are fitting disagg gen init, also prepare resources for KV cache manager
@@ -1913,22 +1995,11 @@ class PyExecutor:
 
     def _prepare_draft_requests(self):
         try:
-            # Set draft tokens here to make the KV cache manager
-            # and scheduler aware of them.
-            for req in self.active_requests:
-                if req.state not in (LlmRequestState.GENERATION_IN_PROGRESS,
-                                     LlmRequestState.DISAGG_GENERATION_INIT):
-                    continue
-
-                req.py_last_draft_tokens = req.py_draft_tokens
-
-                if self.max_total_draft_tokens > 0 and self.use_spec_decode and not req.py_disable_speculative_decoding:
-                    req.py_draft_tokens = [0] * self.max_total_draft_tokens
-                    req.py_draft_pages_allocated = self.max_total_draft_tokens
-                else:
-                    req.py_draft_tokens = []
-                    req.py_draft_pages_allocated = 0
-
+            prepare_draft_requests(
+                self.active_requests,
+                self.max_total_draft_tokens,
+                self.use_spec_decode,
+            )
         except Exception as e:
             traceback.print_exc()
             error_msg = str(e)
@@ -2516,6 +2587,25 @@ class PyExecutor:
     def _should_exclude_last_generation_logits(self) -> bool:
         return self.should_exclude_last_generation_logits
 
+    def _make_validate_fn(self):
+        """Create a validation callback for scheduler.schedule().
+
+        Returns a function that validates requests and filters out invalid
+        ones, immediately responding with errors for those that fail.
+        """
+
+        def _validate_and_filter(requests):
+            validated = []
+            for request in requests:
+                try:
+                    self._validate_request(request)
+                    validated.append(request)
+                except Exception as e:
+                    self._handle_errors(str(e), requests=[request])
+            return validated
+
+        return _validate_and_filter
+
     def _fetch_and_activate_new_requests(self) -> List[LlmRequest]:
 
         def _respond_if_invalid(request: LlmRequest) -> bool:
@@ -2561,55 +2651,20 @@ class PyExecutor:
 
     def _balance_adp_requests(self, context_requests: list[LlmRequest],
                               generation_requests: list[LlmRequest]):
-        balanced_context_requests = context_requests
-        num_scheduled_context_requests = len(context_requests)
-        num_scheduled_generation_requests = len(generation_requests)
-        num_scheduled_tokens = sum(
-            [len(req.get_tokens(0))
-             for req in context_requests]) + num_scheduled_generation_requests
-        # Note: We use tp_allgather instead of tp_cp_allgather because we want to
-        # balance the requests across DP ranks; not CP ranks within those DP ranks.
-        responses_list = self.dist.tp_allgather([
-            num_scheduled_context_requests, num_scheduled_generation_requests,
-            num_scheduled_tokens
-        ])
-        all_ranks_num_scheduled_context_requests = [
-            response[0] for response in responses_list
-        ]
-        all_ranks_num_scheduled_generation_requests = [
-            response[1] for response in responses_list
-        ]
-        all_ranks_have_free_ctx_slots = all([
-            num_gen < self.max_batch_size
-            for num_gen in all_ranks_num_scheduled_generation_requests
-        ])
-        all_ranks_have_ctx_requests = all([
-            num_ctx > 0 for num_ctx in all_ranks_num_scheduled_context_requests
-        ])
-        all_ranks_have_gen_requests = all([
-            num_gen > 0
-            for num_gen in all_ranks_num_scheduled_generation_requests
-        ])
-
-        if self.attention_dp_enable_balance:
-            # wait for all ranks have context requests
-            if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
-                self.adp_ctx_waiting_iters_count = 0
-                # balance number of context requests across ranks
-                if all_ranks_have_gen_requests:
-                    if self.adp_ctx_batching_wait_iters_count < self.attention_dp_batching_wait_iters:
-                        self.adp_ctx_batching_wait_iters_count += 1
-                        balanced_context_requests = []
-                    else:
-                        self.adp_ctx_batching_wait_iters_count = 0
-            else:
-                self.adp_ctx_waiting_iters_count += 1
-                balanced_context_requests = []
-                timeout_reached = self.adp_ctx_waiting_iters_count >= self.attention_dp_time_out_iters
-                if timeout_reached or not all_ranks_have_gen_requests:
-                    self.adp_ctx_waiting_iters_count = 0
-                    balanced_context_requests = context_requests
-        return balanced_context_requests
+        # Note: We use tp_allgather (via dist) instead of tp_cp_allgather because
+        # we want to balance the requests across DP ranks; not CP ranks within those DP ranks.
+        result, self.adp_ctx_waiting_iters_count, self.adp_ctx_batching_wait_iters_count = \
+            balance_adp_requests(
+                context_requests, generation_requests,
+                dist=self.dist,
+                max_batch_size=self.max_batch_size,
+                enable_balance=self.attention_dp_enable_balance,
+                timeout_iters=self.attention_dp_time_out_iters,
+                batching_wait_iters=self.attention_dp_batching_wait_iters,
+                ctx_waiting_count=self.adp_ctx_waiting_iters_count,
+                ctx_batching_count=self.adp_ctx_batching_wait_iters_count,
+            )
+        return result
 
     def _waiting_requests(self, context_requests: list[LlmRequest],
                           generation_requests: list[LlmRequest]):
@@ -2619,23 +2674,25 @@ class PyExecutor:
         - The number of scheduled tokens (both context and generation) is smaller than `self.batch_wait_max_tokens_ratio * self.max_num_tokens`
         - The number of waiting iterations is smaller than `self.batch_wait_timeout_iters`.
         """
-
-        num_scheduled_ctx_tokens = sum(
-            len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
-        num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens
-                                       for gen_req in generation_requests)
-        num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
-
-        should_waiting = self.batch_wait_iters_count < self.batch_wait_timeout_iters and num_scheduled_tokens < self.batch_wait_max_tokens_ratio * self.max_num_tokens
-        if should_waiting:
-            self.batch_wait_iters_count += 1
-            return []
-
-        self.batch_wait_iters_count = 0
-        return context_requests
+        result, self.batch_wait_iters_count = check_batch_waiting(
+            context_requests,
+            generation_requests,
+            batch_wait_iters_count=self.batch_wait_iters_count,
+            batch_wait_timeout_iters=self.batch_wait_timeout_iters,
+            batch_wait_max_tokens_ratio=self.batch_wait_max_tokens_ratio,
+            max_num_tokens=self.max_num_tokens,
+        )
+        return result
 
     @nvtx_range("_schedule")
     def _schedule(self):
+        if isinstance(self.scheduler, SimpleUnifiedScheduler):
+            result = self.scheduler._schedule(self.active_requests,
+                                              self.inflight_req_ids)
+            return (result.scheduled_requests,
+                    result.fitting_disagg_gen_init_requests,
+                    result.num_fitting_requests)
+
         scheduler_output = self.scheduler.schedule_request(
             self.active_requests, self.inflight_req_ids)
 
@@ -2716,57 +2773,49 @@ class PyExecutor:
         """
         if not self.kv_cache_transceiver:
             return
-        ctx_only_requests = [
-            req for req in new_requests
-            if req.is_context_only_request and req.py_disaggregated_params.
-            schedule_style == DisaggScheduleStyle.GENERATION_FIRST
-        ]
-        if ctx_only_requests:
-            self.kv_cache_transceiver.prepare_context_requests(
-                ctx_only_requests)
+        check_disagg_ctx_schedulable(new_requests, self.kv_cache_transceiver)
 
     @nvtx_range("_pad_attention_dp_dummy_request")
     def _pad_attention_dp_dummy_request(self):
         """
         Pad with a generation dummy request, if required, to ensure every attention_dp rank has at least one active request.
         """
+        if isinstance(self.scheduler, SimpleUnifiedScheduler):
+            dummy = self.scheduler.pad_dummy_request(
+                self.active_requests,
+                kv_cache_manager=self.kv_cache_manager,
+                kv_cache_transceiver=self.kv_cache_transceiver,
+                is_warmup=self.is_warmup,
+                max_total_draft_tokens=self.max_total_draft_tokens,
+                num_fetch_requests=self.num_fetch_requests,
+            )
+            if dummy is not None:
+                spec_resource_manager = self.resource_manager.get_resource_manager(
+                    ResourceManagerType.SPEC_RESOURCE_MANAGER)
+                if spec_resource_manager is not None:
+                    spec_resource_manager.add_dummy_requests([0])
+                self.active_requests.append(dummy)
+            return
+
         if not self.enable_attention_dp:
             return
 
-        assert self.expected_num_active_requests >= len(self.active_requests)
-        if self.kv_cache_transceiver is None:
-            num_active_request = len(self.active_requests)
-        else:
-            num_active_request = len([
-                req for req in self.active_requests
-                if not (req.is_disagg_generation_init_state
-                        or req.is_disagg_generation_transmission_in_progress)
-            ])
-
-        # In benchmark disagg mode the fill loop saturates all slots with INIT
-        # requests simultaneously. Skip dummy addition until KV transfers
-        # complete and real requests become active (num_active_request > 0).
-        if (self.benchmark_req_queues_size > 0 and self.kv_cache_transceiver
-                and not self.is_warmup and len(self.active_requests) > 0
-                and num_active_request == 0):
-            logger.info(
-                f"Skipped adding dummy requests: num_fetch_requests={self.num_fetch_requests}, {num_active_request=}"
-            )
-            return
-
-        if self.expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
-            llm_request = self.kv_cache_manager.add_dummy_requests(
-                request_ids=[0],
-                is_gen=True,
-                prepare_resource=True,
-                max_num_draft_tokens=self.max_total_draft_tokens,
-            )[0]
-            llm_request.is_attention_dp_dummy = True
+        dummy = create_adp_dummy_request(
+            self.active_requests,
+            expected_num_active_requests=self.expected_num_active_requests,
+            kv_cache_manager=self.kv_cache_manager,
+            kv_cache_transceiver=self.kv_cache_transceiver,
+            is_warmup=self.is_warmup,
+            max_total_draft_tokens=self.max_total_draft_tokens,
+            num_fetch_requests=self.num_fetch_requests,
+            benchmark_req_queues_size=self.benchmark_req_queues_size,
+        )
+        if dummy is not None:
             spec_resource_manager = self.resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
             if spec_resource_manager is not None:
                 spec_resource_manager.add_dummy_requests([0])
-            self.active_requests.append(llm_request)
+            self.active_requests.append(dummy)
 
     @nvtx_range("_prepare_disagg_gen_init")
     def _prepare_disagg_gen_init(self, fitting_disagg_gen_init_requests):
@@ -3349,6 +3398,9 @@ class PyExecutor:
                                     # disable speculation permanently
                                     # starting from next iteration, _prepare_and_schedule_batch will set self.use_spec_decode to False
                                     self.speculation_permanently_disabled = True
+                                    if isinstance(self.scheduler,
+                                                  SimpleUnifiedScheduler):
+                                        self.scheduler.speculation_permanently_disabled = True
                             else:
                                 logger.debug(
                                     f"Request {request.py_request_id} has no avg_decoded_tokens_per_iter"
