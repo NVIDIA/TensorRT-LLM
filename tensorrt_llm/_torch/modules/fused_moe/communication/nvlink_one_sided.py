@@ -418,6 +418,7 @@ class NVLinkOneSided(Communication):
     def combine(
         self,
         final_hidden_states: torch.Tensor,
+        fp8_combine: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -427,6 +428,8 @@ class NVLinkOneSided(Communication):
             final_hidden_states: Output from MoE computation
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
+            fp8_combine: If True, quantize BF16 payload to FP8 for NVLink transfer
+                         (halves NVLink bandwidth usage, output is always BF16)
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -472,6 +475,7 @@ class NVLinkOneSided(Communication):
             self.top_k,
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
+            bool(fp8_combine),
         )
 
         # Reset state for next round

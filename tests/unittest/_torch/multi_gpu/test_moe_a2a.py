@@ -591,8 +591,6 @@ class TestMoEAlltoAll:
                     gathered_stats,
                     expected_stats), (f"Rank {rank} gathered_stats mismatch")
 
-    @pytest.mark.skipif(torch.cuda.device_count() < 8,
-                        reason='needs at least 8 GPUs to run multi-GPU test')
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
         "mpi_pool_executor,all_num_tokens,top_k",
@@ -619,6 +617,10 @@ class TestMoEAlltoAll:
             pytest.skip("MNNVL not supported on this system")
 
         ep_size = mpi_pool_executor.num_workers
+        if ep_size > torch.cuda.device_count():
+            pytest.skip(
+                f"Need at least {ep_size} GPUs to run this test, but only {torch.cuda.device_count()} are available"
+            )
         assert ep_size == len(
             all_num_tokens), "ep_size does not match all_num_tokens"
 
@@ -657,6 +659,60 @@ class TestMoEAlltoAll:
         # Verify combine results
         print("Starting verification...")
         verify_combine(all_results, ep_size)
+
+    @pytest.mark.threadleak(enabled=False)
+    @pytest.mark.parametrize(
+        "mpi_pool_executor,all_num_tokens,top_k",
+        [
+            # Basic 4-rank uniform
+            (4, [32, 32, 32, 32], 2),
+            # Non-uniform token distribution
+            (4, [16, 32, 64, 48], 2),
+            # Zero-token edge case
+            (4, [32, 0, 16, 0], 2),
+            # Larger top_k
+            (4, [32, 32, 32, 32], 4),
+        ],
+        indirect=["mpi_pool_executor"])
+    def test_combine_fp8(self, mpi_pool_executor, all_num_tokens, top_k):
+        """Test FP8 combine: quantize BF16 MoE output to FP8 over NVLink, accumulate as BF16.
+
+        Runs two back-to-back dispatch+combine rounds on the same MoeAlltoAll instance
+        with identical inputs: the first round uses BF16 combine (reference), the second
+        uses FP8 combine. The outputs are compared within FP8 rounding tolerance.
+        """
+        try:
+            MnnvlMemory.initialize()
+            assert MnnvlMemory.supports_mnnvl()
+        except Exception:
+            pytest.skip("MNNVL not supported on this system")
+
+        ep_size = mpi_pool_executor.num_workers
+        if ep_size > torch.cuda.device_count():
+            pytest.skip(
+                f"Need at least {ep_size} GPUs to run this test, but only {torch.cuda.device_count()} are available"
+            )
+        assert ep_size == len(all_num_tokens)
+        assert torch.cuda.device_count() >= ep_size, (
+            f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}")
+
+        hidden_size = 1024  # smaller than test_combine for faster iteration
+        num_experts = 32
+        workspace_size_per_rank = 512 * 1024 * 1024
+
+        results = mpi_pool_executor.map(
+            run_moe_a2a_dispatch_moe_combine_fp8_single_rank,
+            *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
+                    num_experts, hidden_size)] * ep_size),
+        )
+
+        try:
+            all_results = list(results)
+        except Exception:
+            traceback.print_exc()
+            raise
+
+        verify_combine_fp8(all_results, ep_size)
 
 
 def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
@@ -848,3 +904,124 @@ def verify_combine(all_results, ep_size):
                 error_msg += f"\n{str(e)}"
 
                 raise AssertionError(error_msg)
+
+
+def run_moe_a2a_dispatch_moe_combine_fp8_single_rank(ep_size, all_num_tokens,
+                                                     top_k,
+                                                     workspace_size_per_rank,
+                                                     num_experts, hidden_size):
+    """Worker for FP8 combine test.
+
+    Runs two sequential dispatch+combine rounds on the same MoeAlltoAll instance
+    with identical input data:
+      - Round 1: BF16 combine (reference)
+      - Round 2: FP8 combine (under test)
+
+    Returns (fp8_combined_output, bf16_combined_output) on CPU.
+    """
+    rank = tllm.mpi_rank()
+    torch.cuda.set_device(rank)
+    device = torch.cuda.current_device()
+    max_num_tokens = max(all_num_tokens)
+    rank_local_tokens = all_num_tokens[rank]
+    invalid_token_expert_id = -1
+
+    try:
+        mapping = Mapping(rank=rank,
+                          tp_size=ep_size,
+                          moe_ep_size=ep_size,
+                          world_size=ep_size)
+
+        moe_a2a = MoeAlltoAll(
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            top_k=top_k,
+            num_slots=num_experts,
+            workspace_size_per_rank=workspace_size_per_rank,
+        )
+
+        # Fixed seed per rank so both rounds use the same routing and experts.
+        torch.manual_seed(0x5678 + rank)
+        token_selected_experts = generate_token_selected_experts(
+            rank_local_tokens, num_experts, top_k)
+        payloads, expert_id_payload_index = make_bfloat16_payloads(
+            rank_local_tokens, hidden_size, top_k, rank, token_selected_experts)
+
+        num_experts_per_rank = num_experts // ep_size
+        rank_experts = create_experts_per_rank(num_experts_per_rank,
+                                               hidden_size,
+                                               rank,
+                                               device,
+                                               dtype=torch.bfloat16)
+
+        def dispatch_and_fake_moe():
+            """Run one dispatch round and return fake-MoE output [ep_size, max_tokens, hidden]."""
+            recv_tensors = moe_a2a.dispatch(
+                token_selected_experts,
+                payloads,
+                max_num_tokens,
+                invalid_token_expert_id=invalid_token_expert_id,
+                expert_id_payload_index=expert_id_payload_index)
+            hs = recv_tensors[0]
+            tse = recv_tensors[1]
+            tfs = recv_tensors[2]
+            moe_out = fake_moe(
+                hs.view(ep_size * max_num_tokens, hs.shape[-1]),
+                tse.view(ep_size * max_num_tokens, tse.shape[-1]),
+                tfs.view(ep_size * max_num_tokens, tfs.shape[-1]),
+                rank_experts,
+                is_ep=True,
+                ep_rank=rank,
+                num_experts_per_rank=num_experts_per_rank,
+            )
+            return moe_out.view(ep_size, max_num_tokens, hs.shape[-1])
+
+        # Round 1: BF16 combine (reference)
+        moe_out_r1 = dispatch_and_fake_moe()
+        bf16_output = moe_a2a.combine(moe_out_r1,
+                                      max_num_tokens,
+                                      fp8_combine=False)
+
+        # Round 2: FP8 combine — identical data, identical routing
+        moe_out_r2 = dispatch_and_fake_moe()
+        fp8_output = moe_a2a.combine(moe_out_r2,
+                                     max_num_tokens,
+                                     fp8_combine=True)
+
+        return (fp8_output.cpu(), bf16_output.cpu())
+
+    except Exception:
+        traceback.print_exc()
+        raise
+
+
+def verify_combine_fp8(all_results, ep_size):
+    """Compare FP8 combine output against BF16 combine output within FP8 rounding tolerance.
+
+    FP8 e4m3fn has 3 mantissa bits → relative error per element ≤ 2^-3 = 12.5 %.
+    After accumulating top_k expert outputs the absolute error grows proportionally.
+    We use rtol=0.20 and atol=1.0 which provides comfortable headroom above that bound.
+    """
+    for rank in range(ep_size):
+        fp8_output, bf16_output = all_results[rank]
+
+        assert fp8_output.dtype == torch.bfloat16, (
+            f"Rank {rank}: FP8 combine output dtype should be bfloat16, got {fp8_output.dtype}"
+        )
+        assert fp8_output.shape == bf16_output.shape, (
+            f"Rank {rank}: shape mismatch fp8={fp8_output.shape} bf16={bf16_output.shape}"
+        )
+
+        try:
+            torch.testing.assert_close(fp8_output,
+                                       bf16_output,
+                                       rtol=0.20,
+                                       atol=1.0)
+        except AssertionError as e:
+            abs_diff = (fp8_output - bf16_output).abs()
+            max_diff = abs_diff.max().item()
+            mean_diff = abs_diff.mean().item()
+            raise AssertionError(
+                f"Rank {rank}: FP8 vs BF16 combine mismatch "
+                f"(max_abs_diff={max_diff:.4f}, mean_abs_diff={mean_diff:.4f})\n{e}"
+            ) from e
