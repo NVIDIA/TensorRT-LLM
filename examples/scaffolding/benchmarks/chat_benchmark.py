@@ -6,7 +6,8 @@ from tensorrt_llm.scaffolding import NativeChatController, ScaffoldingLlm, TRTOp
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy,
-    PoissonWarmupStrategy,
+    PoissonRateStrategy,
+    UniformWarmupStrategy,
 )
 from tensorrt_llm.scaffolding.task import ChatTask
 from tensorrt_llm.scaffolding.task_collection import TaskMetricsCollector, with_task_collection
@@ -52,17 +53,21 @@ async def async_chat_benchmark(args):
     task_collection_types = {}
     requests = [ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts]
 
-    # Select strategy based on Poisson arrival flag
-    if getattr(args, "enable_poisson_arrival", False):
-        strategy = PoissonWarmupStrategy(
-            num_requests=len(requests),
-            warmup_window=getattr(args, "poisson_warmup_window", 60.0),
-            max_concurrency=args.chat_concurrency,
-            random_seed=getattr(args, "poisson_arrival_seed", 42),
+    # Select strategy based on load mode
+    if getattr(args, "load_mode", "concurrent") == "rate":
+        strategy = PoissonRateStrategy(
+            rate=getattr(args, "chat_rate", 1.0),
+            random_seed=getattr(args, "rate_seed", 42),
         )
-        print(f"  Using Poisson warmup arrival: {strategy}")
+    elif getattr(args, "warmup_window", None) is not None:
+        strategy = UniformWarmupStrategy(
+            num_requests=len(requests),
+            warmup_window=args.warmup_window,
+            max_concurrency=args.chat_concurrency,
+        )
     else:
         strategy = ConcurrentStrategy(concurrency=args.chat_concurrency)
+    print(f"  Strategy: {strategy}")
 
     (
         results,

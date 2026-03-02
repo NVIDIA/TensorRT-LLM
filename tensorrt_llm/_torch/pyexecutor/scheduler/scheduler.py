@@ -259,8 +259,9 @@ class BindMicroBatchScheduler(MicroBatchScheduler):
                 ctx_chunk_config[0]._to_pybind(), ctx_chunk_config[1]
             )
 
-        self.impl = tb_internal.algorithms.MicroBatchScheduler(ctx_chunk_config=ctx_chunk_config_cpp,
-            max_context_length=max_num_tokens)
+        self.impl = tb_internal.algorithms.MicroBatchScheduler(
+            ctx_chunk_config=ctx_chunk_config_cpp, max_context_length=max_num_tokens
+        )
 
     def schedule(
         self, active_requests: RequestList, inflight_request_ids: set[int]
@@ -289,10 +290,6 @@ class SimpleScheduler(RequestScheduler):
             fitting_requests, inflight_request_ids
         )
 
-        if os.environ.get('DEBUG_AGENT_HIERARCHY') == '1':
-            print(
-                f"has {len(fitting_requests)} reqs, micro batch scheduler only scheduled total {len(context_requests) + len(generation_requests)} requests, which is {len(context_requests)} context reqs and {len(generation_requests)} generation reqs"
-            )
         # Convert from binding type RequestVector to list[LlmRequest],
         # so Python fields on LlmRequest won't be stripped away
         return SchedulerOutput(

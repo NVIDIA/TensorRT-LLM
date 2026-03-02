@@ -1631,6 +1631,7 @@ void BlockManager::truncateBlocks(
 
 void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
 {
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     auto numTokens = static_cast<SizeType32>(targetTokens.size());
     auto blockedTokens = chopVectorIntoBlocks<TokenIdType>(targetTokens, numTokens, mTokensPerBlock, true);
     SizeType32 numMatchedTokens = 0;
@@ -1650,7 +1651,7 @@ void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetToken
         {
             tokenStr += std::to_string(token.tokenId) + " ";
         }
-        TLLM_LOG_WARNING("%s::truncateBlocks - Tokens: %s", mLogPrefix.c_str(), tokenStr.c_str());
+        TLLM_LOG_DEBUG("%s::truncateBlocks - Tokens: %s", mLogPrefix.c_str(), tokenStr.c_str());
 
         auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
             ? searchRoot->findMatchingBlock(blockKey, mEnablePartialReuse, mCopyOnPartialReuse)

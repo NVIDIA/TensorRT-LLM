@@ -12,7 +12,8 @@ from tensorrt_llm.scaffolding.contrib.open_deep_research import (
 )
 from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy,
-    PoissonWarmupStrategy,
+    PoissonRateStrategy,
+    UniformWarmupStrategy,
 )
 
 from .benchmark_utils import (
@@ -41,17 +42,21 @@ async def run_agent_benchmark_core(
     task_collection_types = {}
     requests = [ScaffoldingBenchRequest(prompt=prompt) for prompt in prompts]
 
-    # Select strategy based on Poisson arrival flag
-    if use_poisson_arrival and getattr(args, "enable_poisson_arrival", False):
-        strategy = PoissonWarmupStrategy(
-            num_requests=len(requests),
-            warmup_window=getattr(args, "poisson_warmup_window", 60.0),
-            max_concurrency=concurrency,
-            random_seed=getattr(args, "poisson_arrival_seed", 42),
+    # Select strategy based on load mode
+    if use_poisson_arrival and getattr(args, "load_mode", "concurrent") == "rate":
+        strategy = PoissonRateStrategy(
+            rate=getattr(args, "agent_rate", 1.0),
+            random_seed=getattr(args, "rate_seed", 42),
         )
-        print(f"  Using Poisson warmup arrival: {strategy}")
+    elif getattr(args, "warmup_window", None) is not None:
+        strategy = UniformWarmupStrategy(
+            num_requests=len(requests),
+            warmup_window=args.warmup_window,
+            max_concurrency=concurrency,
+        )
     else:
         strategy = ConcurrentStrategy(concurrency=concurrency)
+    print(f"  Strategy: {strategy}")
 
     (
         results,

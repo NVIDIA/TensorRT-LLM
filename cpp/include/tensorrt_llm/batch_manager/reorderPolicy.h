@@ -25,27 +25,27 @@
 namespace tensorrt_llm::batch_manager
 {
 
-/// @brief Abstract base class for request resort policies.
+/// @brief Abstract base class for request reorder policies.
 /// Derived classes can implement custom logic to reorder requests before scheduling.
-class ResortPolicy
+class ReorderPolicy
 {
 public:
-    virtual ~ResortPolicy() = default;
+    virtual ~ReorderPolicy() = default;
 
     /// @brief Reorders the given requests according to the policy.
     /// @param requests The vector of requests to be reordered.
     /// @return The reordered vector of requests.
-    [[nodiscard]] virtual RequestVector resortRequests(RequestVector const& requests) const = 0;
+    [[nodiscard]] virtual RequestVector reorderRequests(RequestVector const& requests) const = 0;
 
     /// @brief Reorders the given requests (RequestList version).
     /// @param requests The list of requests to be reordered.
     /// @return The reordered list of requests.
     /// @note This is a convenience overload that converts to/from RequestVector internally.
-    [[nodiscard]] RequestList resortRequests(RequestList const& requests) const
+    [[nodiscard]] RequestList reorderRequests(RequestList const& requests) const
     {
         RequestVector requestsVec(requests.begin(), requests.end());
-        RequestVector resortedVec = resortRequests(requestsVec);
-        return RequestList(resortedVec.begin(), resortedVec.end());
+        RequestVector reorderedVec = reorderRequests(requestsVec);
+        return RequestList(reorderedVec.begin(), reorderedVec.end());
     }
 };
 

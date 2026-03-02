@@ -769,14 +769,38 @@ class BaseLLM:
         '''
         return self._executor.aget_kv_events(timeout=timeout)
 
-    @set_api_status("beta")
+    @set_api_status("prototype")
     def set_kv_cache_hints(
             self,
             action: Literal["truncate"],
             messages_to_retain: Union[str, List[int]],
             messages: Union[str, List[int]],
             sampling_params: Optional[SamplingParams] = None) -> None:
-        '''Set KV cache hints.
+        '''Provide hints to the KV cache manager to optimize cache usage.
+
+        Currently supports the "truncate" action, which instructs the engine to
+        retain the KV cache entries for a prefix of the conversation
+        (messages_to_retain) and discard the rest, then associate the retained
+        cache with the full message sequence (messages). This is useful in
+        agent-serving scenarios where the context of sub-agents can be pruned
+        upon exit.
+
+        Both messages_to_retain and messages are tokenized internally when
+        provided as strings.
+
+        Args:
+            action: The cache management action to perform. Currently only
+                "truncate" is supported.
+            messages_to_retain: The prefix of the conversation whose KV cache
+                entries should be kept. Can be a text string or a list of
+                pre-tokenized token IDs.
+            messages: The full message sequence to associate with the retained
+                cache. Can be a text string or a list of pre-tokenized token
+                IDs. If empty (empty string or empty list), this method is a
+                no-op.
+            sampling_params: Optional sampling parameters used during
+                tokenization of string inputs (e.g., for applying chat
+                templates). Not used when inputs are already token IDs.
         '''
         if isinstance(messages, str) and messages == "":
             return
