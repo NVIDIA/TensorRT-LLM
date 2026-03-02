@@ -139,6 +139,7 @@ class ConfigurableMoE(MoE):
         apply_router_weight_on_input: bool = False,
         layer_idx: Optional[int] = None,
         override_quant_config: Optional["QuantConfig"] = None,
+        combine_fp8: bool = False,
         **kwargs,
     ):
         super().__init__(
@@ -157,6 +158,9 @@ class ConfigurableMoE(MoE):
         # Store model_config and aux_stream_dict for later use (e.g., backend setter)
         self.model_config = model_config
         self.aux_stream_dict = aux_stream_dict
+
+        # If True, quantize BF16 combine payload to FP8 for NVLink transfer (halves bandwidth usage)
+        self.combine_fp8 = combine_fp8
 
         # If True, the router weight will be multiplied on the input rather than at the end of FC2
         self.apply_router_weight_on_input = apply_router_weight_on_input
@@ -758,7 +762,9 @@ class ConfigurableMoE(MoE):
             # Use unified combine interface (reads dispatch state from strategy)
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             final_hidden_states = self.comm.combine(
-                final_hidden_states, all_rank_max_num_tokens=all_rank_max_num_tokens
+                final_hidden_states,
+                fp8_combine=self.combine_fp8,
+                all_rank_max_num_tokens=all_rank_max_num_tokens,
             )
         else:
             # For non-comm case, It should be attention TP or single rank.
