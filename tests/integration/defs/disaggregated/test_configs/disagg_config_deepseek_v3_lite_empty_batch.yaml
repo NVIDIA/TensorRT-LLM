@@ -1,7 +1,6 @@
 hostname: localhost
-port: 8000
 model: DeepSeek-V3-Lite/bf16
-backend: "pytorch"
+backend: pytorch
 context_servers:
   num_instances: 1
   max_batch_size: 10
@@ -19,8 +18,6 @@ context_servers:
   cache_transceiver_config:
     max_tokens_in_buffer: 8448
     backend: DEFAULT
-  urls:
-      - "localhost:8001"
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -44,5 +41,3 @@ generation_servers:
     backend: DEFAULT
   stream_interval: 1
   num_postprocess_workers: 1
-  urls:
-      - "localhost:8002"

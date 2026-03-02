@@ -1,8 +1,6 @@
 model: gpt_oss/gpt-oss-120b
 hostname: localhost
-port: 8100
 backend: pytorch
-
 context_servers:
   num_instances: 1
   tensor_parallel_size: 2
@@ -16,7 +14,7 @@ context_servers:
   enable_chunked_prefill: true
   kv_cache_config:
     enable_block_reuse: false
-    free_gpu_memory_fraction: 0.80
+    free_gpu_memory_fraction: 0.8
     dtype: fp8
   disable_overlap_scheduler: true
   moe_config:
@@ -26,9 +24,6 @@ context_servers:
   cache_transceiver_config:
     backend: DEFAULT
     max_tokens_in_buffer: 16384
-  urls:
-    - "localhost:8101"
-
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 2
@@ -42,17 +37,27 @@ generation_servers:
   enable_chunked_prefill: true
   kv_cache_config:
     enable_block_reuse: false
-    free_gpu_memory_fraction: 0.80
+    free_gpu_memory_fraction: 0.8
     dtype: fp8
   disable_overlap_scheduler: true
   moe_config:
     backend: TRTLLM
   cuda_graph_config:
     enable_padding: true
-    batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
+    batch_sizes:
+    - 1
+    - 2
+    - 4
+    - 8
+    - 16
+    - 32
+    - 64
+    - 128
+    - 256
+    - 512
+    - 768
+    - 1024
   print_iter_log: true
   cache_transceiver_config:
     backend: DEFAULT
     max_tokens_in_buffer: 16384
-  urls:
-    - "localhost:8102"

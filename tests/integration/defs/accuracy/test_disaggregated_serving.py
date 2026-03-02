@@ -16,7 +16,7 @@ import openai
 import pytest
 import requests
 import yaml
-from defs.common import revise_disaggregated_server_config_urls_with_free_ports
+from defs.common import get_free_port_in_ci as get_free_port
 
 from tensorrt_llm.executor.result import GenerationResultBase
 from tensorrt_llm.llmapi import CompletionOutput, RequestOutput, SamplingParams
@@ -170,8 +170,38 @@ def launch_disaggregated_llm(
     _apply_perf_flags(ctx_server_config)
     _apply_perf_flags(gen_server_config)
 
-    disaggregated_server_config = revise_disaggregated_server_config_urls_with_free_ports(
-        disaggregated_server_config)
+    # Always assign free port dynamically for service discovery
+    serve_port = get_free_port()
+    disaggregated_server_config["port"] = serve_port
+
+    # Use HTTP service discovery
+    cluster_uri = f"http://localhost:{serve_port}"
+    print(f"Using HTTP service discovery at {cluster_uri}")
+
+    # Create service discovery config
+    disagg_cluster = {
+        "cluster_uri": cluster_uri,
+        "cluster_name": "test_cluster",
+        "heartbeat_interval_sec": 1,
+        "inactive_timeout_sec": 2,
+    }
+
+    # Auto-deduce minimal_instances from num_instances
+    num_ctx_instances = disaggregated_server_config["context_servers"][
+        "num_instances"]
+    num_gen_instances = disaggregated_server_config["generation_servers"][
+        "num_instances"]
+    disagg_cluster["minimal_instances"] = {
+        "context_servers": num_ctx_instances,
+        "generation_servers": num_gen_instances
+    }
+
+    # Inject disagg_cluster into server config (for minimal_instances and is_ready check)
+    disaggregated_server_config["disagg_cluster"] = disagg_cluster
+
+    # Inject into worker configs
+    ctx_server_config = {**ctx_server_config, "disagg_cluster": disagg_cluster}
+    gen_server_config = {**gen_server_config, "disagg_cluster": disagg_cluster}
 
     with open(disaggregated_serving_config_path, "w") as f:
         yaml.dump(disaggregated_server_config, f)
@@ -221,12 +251,9 @@ def launch_disaggregated_llm(
     ctx_total_gpus = ctx_tp * ctx_pp * ctx_cp
     gen_total_gpus = gen_tp * gen_pp * gen_cp
 
-    ctx_urls = disaggregated_server_config["context_servers"]["urls"]
-    gen_urls = disaggregated_server_config["generation_servers"]["urls"]
-
-    serve_port = disaggregated_server_config["port"]
-    ctx_ports = [int(url.split(":")[1]) for url in ctx_urls]
-    gen_ports = [int(url.split(":")[1]) for url in gen_urls]
+    # Auto-assign ports for workers (port=0 means dynamic assignment)
+    ctx_ports = [0] * num_ctx_instances
+    gen_ports = [0] * num_gen_instances
 
     ctx_servers = []
     current_gpu_offset = 0
@@ -256,8 +283,9 @@ def launch_disaggregated_llm(
 
         ctx_server_args = ctx_args + [
             "--port",
-            str(port), "--config", ctx_server_config_path,
-            f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}", f"--cp_size={ctx_cp}"
+            str(port), "--config", ctx_server_config_path, "--server_role",
+            "context", f"--tp_size={ctx_tp}", f"--pp_size={ctx_pp}",
+            f"--cp_size={ctx_cp}"
         ]
         if "max_num_tokens" in ctx_server_config:
             ctx_server_args.append(
@@ -285,8 +313,9 @@ def launch_disaggregated_llm(
 
         gen_server_args = gen_args + [
             "--port",
-            str(port), "--config", gen_server_config_path,
-            f"--tp_size={gen_tp}", f"--pp_size={gen_pp}", f"--cp_size={gen_cp}"
+            str(port), "--config", gen_server_config_path, "--server_role",
+            "generation", f"--tp_size={gen_tp}", f"--pp_size={gen_pp}",
+            f"--cp_size={gen_cp}"
         ]
         if "max_num_tokens" in gen_server_config:
             gen_server_args.append(
@@ -346,11 +375,15 @@ def launch_disaggregated_llm(
                         f"process {process.pid} exited with code {process.returncode}"
                     )
             try:
-                print("Checking health endpoint")
-                response = requests.get(f"http://localhost:{serve_port}/health")
+                print("Checking cluster_info endpoint for worker registration")
+                response = requests.get(
+                    f"http://localhost:{serve_port}/cluster_info")
                 if response.status_code == 200:
-                    server_is_ready = True
-                    break
+                    cluster_info = response.json()
+                    if cluster_info.get("is_ready"):
+                        print(f"Cluster ready: {cluster_info}")
+                        server_is_ready = True
+                        break
             except requests.exceptions.ConnectionError:
                 continue
         if not server_is_ready:
@@ -420,7 +453,7 @@ def launch_disaggregated_llm(
 
         def _get_perf_metrics():
             path = "/perf_metrics"
-            perf_url = f"http://localhost:8000{path}"
+            perf_url = f"http://localhost:{serve_port}{path}"
             try:
                 print(f"Fetching perf metrics from {perf_url}")
                 resp = requests.get(perf_url, timeout=10)
@@ -523,20 +556,15 @@ def run_parallel_test(model_name: str,
         }
     }
 
-    ctx_urls = [f"localhost:{8001 + i * 2}" for i in range(ctx_instances)]
-    gen_urls = [f"localhost:{8002 + i * 2}" for i in range(gen_instances)]
-
+    # No need to generate URLs - workers will register via service discovery
     disaggregated_server_config = {
         "hostname": "localhost",
-        "port": 8000,
         "backend": "pytorch",
         "context_servers": {
             "num_instances": ctx_instances,
-            "urls": ctx_urls
         },
         "generation_servers": {
             "num_instances": gen_instances,
-            "urls": gen_urls
         }
     }
     with launch_disaggregated_llm(disaggregated_server_config,
@@ -582,15 +610,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -629,15 +654,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -688,15 +710,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -724,15 +743,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -780,15 +796,12 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -860,15 +873,12 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
         gen_server_config["max_seq_len"] = 8192
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -903,15 +913,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -939,15 +946,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1040,15 +1044,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1093,15 +1094,12 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1146,15 +1144,12 @@ class TestGemma3_1BInstruct(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1207,15 +1202,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1279,15 +1271,12 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1322,15 +1311,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1365,15 +1351,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1410,15 +1393,12 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
@@ -1598,15 +1578,12 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         }
         disaggregated_server_config = {
             "hostname": "localhost",
-            "port": 8000,
             "backend": "pytorch",
             "context_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8001"]
+                "num_instances": 1
             },
             "generation_servers": {
-                "num_instances": 1,
-                "urls": ["localhost:8002"]
+                "num_instances": 1
             }
         }
         with launch_disaggregated_llm(disaggregated_server_config,
