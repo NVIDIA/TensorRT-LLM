@@ -101,9 +101,11 @@ transforms:
   detect_sharding:
     stage: sharding
     simple_shard_only: false
+    sharding_dims: ['tp', 'ep', 'bmm']
+    # NOTE: sharding_source applies only to TP sharding
     sharding_source: ['manual', 'factory', 'heuristic']
     support_partial_config: true
-    sharding_dims: ['tp', 'ep', 'bmm']
+
     shard_all_unprocessed: false
     enable_attention_dp: false
     allreduce_strategy: 'NCCL'
