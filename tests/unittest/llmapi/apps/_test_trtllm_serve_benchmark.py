@@ -25,8 +25,7 @@ def model_path(model_name: str):
 def server(model_path: str):
     args = ["--kv_cache_free_gpu_memory_fraction", "0.8"]
     # fix port to facilitate concise trtllm-serve examples
-    with RemoteOpenAIServer(model_path, cli_args=args,
-                            port=8000) as remote_server:
+    with RemoteOpenAIServer(model_path, cli_args=args) as remote_server:
         yield remote_server
 
 
@@ -55,6 +54,7 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
     model_name = model_path.split("/")[-1]
     client_script = os.path.join(benchmark_root, "benchmark_serving.py")
     dataset = dataset_path("sharegpt")
+    port = server.port
     benchmark_cmd = [
         "python3",
         client_script,
@@ -66,6 +66,8 @@ def test_trtllm_serve_benchmark(server: RemoteOpenAIServer, benchmark_root: str,
         dataset,
         "--tokenizer",
         model_path,
+        "--port",
+        str(port),
         "--temperature",
         "1.0",
         "--top-p",
