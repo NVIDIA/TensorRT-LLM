@@ -919,6 +919,57 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["MMLU", "GSM8K"])
 
+    @pytest.mark.skip_less_device(4)
+    @pytest.mark.skip_less_device_memory(60000)
+    @skip_pre_hopper
+    @pytest.mark.parametrize("ctx_pp_size", [2, 4], ids=["ctx_pp2", "ctx_pp4"])
+    def test_chunked_pipeline_parallel(self, ctx_pp_size):
+        """Context server uses PP with PIPELINE_AWARE chunking;
+        generation server uses standard TP config."""
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False,
+        }
+        ctx_server_config = {
+            "pipeline_parallel_size": ctx_pp_size,
+            "tensor_parallel_size": 4 // ctx_pp_size,
+            "disable_overlap_scheduler": True,
+            "enable_chunked_prefill": True,
+            "enable_chunked_pipeline_parallelism": True,
+            "kv_cache_config": kv_cache_config,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "NIXL"
+            },
+        }
+        gen_server_config = {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 4,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "NIXL"
+            },
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
     @pytest.mark.skip_less_device(8)
     @parametrize_with_ids("overlap_scheduler", [True, False])
     @parametrize_with_ids("mtp_nextn", [0, 2])

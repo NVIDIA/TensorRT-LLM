@@ -1567,8 +1567,11 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     ''' Context chunking policy. '''
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
+    PIPELINE_AWARE = "PIPELINE_AWARE"
 
     def _to_pybind(self):
+        if self == ContextChunkingPolicy.PIPELINE_AWARE:
+            return None
         return getattr(_ContextChunkingPolicy, self.value)
 
 
@@ -2132,6 +2135,21 @@ class BaseLlmArgs(StrictBaseModel):
     enable_chunked_prefill: bool = Field(default=False,
                                          description="Enable chunked prefill.")
 
+    enable_chunked_pipeline_parallelism: bool = Field(
+        default=False,
+        description=
+        "Enable Chunked Pipeline Parallelism (CPP) for prefill. "
+        "Splits prefill context into chunks pipelined across PP stages "
+        "with layer-wise KV cache transfer. Requires pp_size > 1 and "
+        "is intended for context servers in disaggregated serving.")
+
+    cpp_num_chunks: Optional[int] = Field(
+        default=None,
+        description=
+        "Number of chunks for Chunked Pipeline Parallelism. "
+        "If None, defaults to pp_size for optimal pipeline fill. "
+        "Must be >= pp_size when specified.")
+
     guided_decoding_backend: Optional[Literal["xgrammar", "llguidance"]] = Field(
         default=None,
         description=
@@ -2456,6 +2474,30 @@ class BaseLlmArgs(StrictBaseModel):
             raise ValueError(
                 f"lora_prefetch_dir was set to '{self.peft_cache_config.lora_prefetch_dir}' "
                 "while LoRA prefetch is not supported")
+        return self
+
+    @model_validator(mode="after")
+    def validate_chunked_pipeline_parallelism(self):
+        if not self.enable_chunked_pipeline_parallelism:
+            return self
+
+        pp_size = self.pipeline_parallel_size
+        if pp_size <= 1:
+            raise ValueError(
+                "enable_chunked_pipeline_parallelism requires "
+                "pipeline_parallel_size > 1")
+
+        if not self.enable_chunked_prefill:
+            logger.info(
+                "Enabling chunked prefill automatically for Chunked Pipeline "
+                "Parallelism")
+            self.enable_chunked_prefill = True
+
+        if self.cpp_num_chunks is not None:
+            if self.cpp_num_chunks < pp_size:
+                raise ValueError(
+                    f"cpp_num_chunks ({self.cpp_num_chunks}) must be >= "
+                    f"pipeline_parallel_size ({pp_size})")
         return self
 
     def get_runtime_sizes(self, ) -> Tuple[int, int, int, int]:

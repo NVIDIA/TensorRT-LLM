@@ -252,6 +252,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         lora_params: Optional[dict] = None,
+        context_progress=None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -264,13 +265,15 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
 
         hidden_states = inputs_embeds
 
-        for decoder_layer in self.layers:
+        for layer_idx, decoder_layer in enumerate(self.layers):
             hidden_states = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
                 attn_metadata=attn_metadata,
                 lora_params=lora_params,
             )
+            if context_progress is not None:
+                context_progress.record_event(layer_idx)
 
         hidden_states = self.norm(hidden_states)
 
@@ -563,6 +566,7 @@ class DecoderModelForCausalLM(nn.Module,
         return_context_logits: bool = False,
         spec_metadata: Optional[SpecMetadata] = None,
         lora_params: Optional[dict] = None,
+        context_progress=None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -573,6 +577,7 @@ class DecoderModelForCausalLM(nn.Module,
             inputs_embeds=inputs_embeds,
             spec_metadata=spec_metadata,
             lora_params=lora_params,
+            context_progress=context_progress,
         )
 
         return self.logits_processor.forward(

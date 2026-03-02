@@ -2864,7 +2864,8 @@ class PyExecutor:
         return
 
     @nvtx_range("_send_kv_async")
-    def _send_kv_async(self, scheduled_requests: List[LlmRequest]):
+    def _send_kv_async(self, scheduled_requests: List[LlmRequest],
+                       context_progress=None):
 
         def kv_connector_request_finished(req: LlmRequest):
             try:
@@ -2879,17 +2880,24 @@ class PyExecutor:
                     self.async_transfer_manager.start_transfer(req)
 
         if self.kv_cache_transceiver:
+            layerwise_reqs = []
             for req in scheduled_requests:
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
-                    # Order is important here: we need to start the transfer before responding
-                    # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
-                    self.kv_cache_transceiver.respond_and_send_async(req)
+
+                    if context_progress is not None:
+                        layerwise_reqs.append(req)
+                    else:
+                        self.kv_cache_transceiver.respond_and_send_async(req)
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
+
+            if layerwise_reqs and context_progress is not None:
+                self.kv_cache_transceiver.respond_and_send_layer_wise(
+                    layerwise_reqs, context_progress)
 
         if self.kv_connector_manager:
             if not self.disable_overlap_scheduler:
@@ -2966,7 +2974,8 @@ class PyExecutor:
             self,
             scheduled_requests: ScheduledRequests,
             new_tensors_device: Optional[SampleStateTensors] = None,
-            num_accepted_tokens_device: Optional[torch.Tensor] = None):
+            num_accepted_tokens_device: Optional[torch.Tensor] = None,
+            context_progress=None):
         ExpertStatistic.set_iter(self.iter_counter)
 
         @nvtx_range(
@@ -2974,14 +2983,15 @@ class PyExecutor:
         )
         def forward(scheduled_requests, resource_manager, new_tensors_device,
                     gather_context_logits, cache_indirection_buffer,
-                    num_accepted_tokens_device):
+                    num_accepted_tokens_device, context_progress):
             return self.model_engine.forward(
                 scheduled_requests,
                 resource_manager,
                 new_tensors_device,
                 gather_context_logits=gather_context_logits,
                 cache_indirection_buffer=cache_indirection_buffer,
-                num_accepted_tokens_device=num_accepted_tokens_device)
+                num_accepted_tokens_device=num_accepted_tokens_device,
+                context_progress=context_progress)
 
         try:
             gather_context_logits = any(
@@ -2996,7 +3006,8 @@ class PyExecutor:
                 outputs = forward(scheduled_requests, self.resource_manager,
                                   new_tensors_device, gather_context_logits,
                                   cache_indirection_buffer,
-                                  num_accepted_tokens_device)
+                                  num_accepted_tokens_device,
+                                  context_progress)
 
             # Ensure the default stream waits for execution_stream to complete
             # before downstream operations use the outputs.

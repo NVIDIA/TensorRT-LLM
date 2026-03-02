@@ -543,12 +543,18 @@ def create_py_executor(
             logger.info(
                 f"ChunkUnitSize is set to {chunk_unit_size} as sliding window attention is used."
             )
-        chunking_policy = (scheduler_config.context_chunking_policy if
-                           scheduler_config.context_chunking_policy is not None
-                           else ContextChunkingPolicy.FIRST_COME_FIRST_SERVED)
+        if llm_args.enable_chunked_pipeline_parallelism:
+            chunking_policy = ContextChunkingPolicy.PIPELINE_AWARE
+            logger.info(
+                "Using PIPELINE_AWARE chunking policy for Chunked Pipeline "
+                "Parallelism")
+        elif scheduler_config.context_chunking_policy is not None:
+            chunking_policy = scheduler_config.context_chunking_policy
+        else:
+            chunking_policy = ContextChunkingPolicy.FIRST_COME_FIRST_SERVED
         assert chunk_unit_size is not None, "chunk_unit_size must be set"
-        ctx_chunk_config: Tuple[StrEnum,
-                                int] = (chunking_policy, chunk_unit_size)
+        ctx_chunk_config: tuple = (chunking_policy, chunk_unit_size,
+                                   mapping.pp_size)
     else:
         ctx_chunk_config = None
 
