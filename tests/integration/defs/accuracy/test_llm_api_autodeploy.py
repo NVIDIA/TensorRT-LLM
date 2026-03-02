@@ -850,6 +850,3 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, sampling_params=sampling_params)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
-
-
-class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
