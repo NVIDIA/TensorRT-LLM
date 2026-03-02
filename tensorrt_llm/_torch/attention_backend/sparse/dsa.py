@@ -1326,7 +1326,6 @@ class Indexer(nn.Module):
     def sparse_attn_indexer(
         self,
         metadata: DSAtrtllmAttentionMetadata,
-        hidden_states: torch.Tensor,
         q_fp8: torch.Tensor,
         k_fp8: torch.Tensor,
         k_scale: torch.Tensor,
@@ -1342,12 +1341,11 @@ class Indexer(nn.Module):
         has_prefill = num_contexts > 0
         num_gen_tokens = num_tokens - num_ctx_tokens
 
-        topk_indices_buffer = torch.empty(
-            (hidden_states.shape[0], self.index_topk),
-            dtype=torch.int32,
-            device=hidden_states.device)
+        topk_indices_buffer = torch.empty((num_tokens, self.index_topk),
+                                          dtype=torch.int32,
+                                          device=q_fp8.device)
         if not use_custom_topk:
-            topk_indices_buffer[:hidden_states.shape[0]] = -1
+            topk_indices_buffer[:num_tokens] = -1
 
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
@@ -1523,11 +1521,10 @@ class Indexer(nn.Module):
         weights = _scale(weights, q_scale, self.weight_scale_factor)
         return weights
 
-    def _qk_projection_and_rope(self, qr: torch.Tensor, indexer_k: torch.Tensor,
+    def _qk_projection_and_rope(self, qr: torch.Tensor, k: torch.Tensor,
                                 position_ids: torch.Tensor):
         """Project Q/K and apply RoPE"""
         q = self.wq_b(qr)
-        k = self.k_norm(indexer_k)
         q = q.view(-1, self.n_heads, self.head_dim)
         q_pe, q_nope = q.split([self.rope_dim, self.head_dim - self.rope_dim],
                                dim=-1)
@@ -1535,7 +1532,9 @@ class Indexer(nn.Module):
                                dim=-1)
         q_pe, k_pe = self.rotary_emb(position_ids, [q_pe, k_pe.unsqueeze(1)])
         k_pe = k_pe[:, 0, :]
-        return q_pe, q_nope, k_pe, k_nope
+        q = self._prep_q_or_k(q_pe, q_nope)
+        k = self._prep_q_or_k(k_pe, k_nope)
+        return q, k
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
@@ -1560,14 +1559,7 @@ class Indexer(nn.Module):
             self.ln_events[1],
             self.aux_stream,
         )
-        q_pe, q_nope, k_pe, k_nope = q_and_k
-        q, k = maybe_execute_in_parallel(
-            lambda: self._prep_q_or_k(q_pe, q_nope),
-            lambda: self._prep_q_or_k(k_pe, k_nope),
-            self.ln_events[0],
-            self.ln_events[1],
-            self.aux_stream,
-        )
+        q, k = q_and_k
         q_fp8, q_scale = q
         k_fp8, k_scale = k
         q_fp8 = q_fp8.view(-1, self.n_heads, self.head_dim)
@@ -1583,8 +1575,8 @@ class Indexer(nn.Module):
         )
 
         # Return topk indices buffer for sparse attention [num_tokens, index_topk]
-        return self.sparse_attn_indexer(metadata, hidden_states, q_fp8, k_fp8,
-                                        k_scale, weights)
+        return self.sparse_attn_indexer(metadata, q_fp8, k_fp8, k_scale,
+                                        weights)
 
 
 class DSATrtllmAttention(TrtllmAttention):

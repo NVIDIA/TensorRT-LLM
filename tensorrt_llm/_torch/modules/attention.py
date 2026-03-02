@@ -1470,7 +1470,6 @@ class MLA(nn.Module):
                 self.indexer.head_dim
             ], -1)
 
-        # TODO: possibly overlap/fuse q_a_rmsnorm + kv_a_rmsnorm + indexer.k_layernorm?
         q, compressed_kv = maybe_execute_in_parallel(
             lambda: self.q_a_layernorm(q),
             lambda: self.kv_a_layernorm(compressed_kv),
@@ -1479,9 +1478,14 @@ class MLA(nn.Module):
             self.aux_stream,
         )
         qr = q
-        latent_cache = torch.concat([compressed_kv, k_pe], dim=-1)
+        latent_cache, indexer_k = maybe_execute_in_parallel(
+            lambda: torch.concat([compressed_kv, k_pe], dim=-1),
+            lambda: self.indexer.k_norm(indexer_k),
+            self.ln_events[0],
+            self.ln_events[1],
+            self.aux_stream,
+        )
 
-        # TODO: fuse wq_b + (indexer) wlq here
         q = self.q_b_proj(q)
         # Indexer
         topk_indices = self.indexer(
