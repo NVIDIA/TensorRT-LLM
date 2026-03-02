@@ -16,6 +16,8 @@ model_kwargs:
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
+  fuse_gemms_mixed_children:
+    enabled: true
   detect_sharding:
     sharding_dims: ['tp','ep', 'bmm']
     # use only manual config for TP sharding
