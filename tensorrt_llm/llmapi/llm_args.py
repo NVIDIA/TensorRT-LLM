@@ -1151,6 +1151,34 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class SADecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
+    the target model forward; supports CUDA graph and overlap scheduler.
+    """
+    decoding_type: Literal["SA"] = "SA"
+    max_matching_ngram_size: int = Field(
+        default=-1,
+        description="Positive value (e.g., 3): fixed-size ngram matching. "
+        "-1: longest possible match via suffix automaton. 0 is invalid.")
+
+    @model_validator(mode='after')
+    def validate_sa_config(self):
+        if self.max_matching_ngram_size == 0:
+            raise ValueError(
+                "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
+                "Got 0.")
+        if self.max_draft_len is None or self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for SA")
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
 
@@ -1200,6 +1228,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: int = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -1753,6 +1792,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
+        SADecodingConfig,
         UserProvidedDecodingConfig,
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,

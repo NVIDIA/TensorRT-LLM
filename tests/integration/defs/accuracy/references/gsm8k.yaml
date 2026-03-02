@@ -2,6 +2,8 @@ meta-llama/Llama-3.1-8B-Instruct:
   - accuracy: 74.20
   - spec_dec_algo: NGram
     accuracy: 74.20
+  - spec_dec_algo: SA
+    accuracy: 74.20
   - spec_dec_algo: Eagle
     accuracy: 74.20
   - spec_dec_algo: Eagle3
@@ -67,6 +69,9 @@ deepseek-ai/DeepSeek-V3-Lite:
     kv_cache_quant_algo: FP8
     accuracy: 64.74
   - spec_dec_algo: MTP
+    accuracy: 64.44
+  - spec_dec_algo: MTP
+    extra_acc_spec: use_sa_spec
     accuracy: 64.44
   - spec_dec_algo: MTP
     kv_cache_quant_algo: FP8

@@ -57,7 +57,8 @@ from tensorrt_llm.llmapi import (
     AutoDecodingConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
     NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SamplingParams, SkipSoftmaxAttentionConfig, TorchCompileConfig)
+    SamplingParams, SkipSoftmaxAttentionConfig, SADecodingConfig,
+    TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -359,6 +360,32 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             is_keep_all=True,
             is_use_oldest=True,
             is_public_pool=True,
+        )
+
+        with LLM(model=self.MODEL_PATH,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config,
+                 max_batch_size=max_bs) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_suffix_automaton(self):
+        max_bs = 16
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[i for i in range(1, max_bs + 1)]),
+        )
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.8)
+
+        spec_config = SADecodingConfig(
+            max_draft_len=4,
+            max_matching_ngram_size=-1,  # longest match via suffix automaton
         )
 
         with LLM(model=self.MODEL_PATH,
@@ -1450,6 +1477,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_bfloat16_mtp_sa(self):
+        """Accuracy test for MTP + Suffix Automaton (MTP+SA) speculative decoding."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
+                                       use_sa_spec=True)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("torch_compile", [False, True])

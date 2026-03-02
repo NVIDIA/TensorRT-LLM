@@ -1,7 +1,10 @@
 from dataclasses import dataclass
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
@@ -15,8 +18,10 @@ from .mtp import (MTPEagleWorker, MTPHiddenStatesManager, MTPSampler,
                   MTPSpecMetadata, MTPWorker)
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
+from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
+from .suffix_automaton import SuffixAutomatonManager
 
 
 def get_spec_metadata(spec_config,
@@ -24,8 +29,14 @@ def get_spec_metadata(spec_config,
                       max_num_requests,
                       max_num_tokens,
                       spec_resource_manager=None,
-                      is_draft_model=False):
+                      is_draft_model=False,
+                      max_seq_len=262144):
     if spec_config.spec_dec_mode.is_mtp_one_model():
+        # Get SA manager from spec_resource_manager if MTP+SA mode
+        sa_manager = None
+        if spec_resource_manager is not None and hasattr(
+                spec_resource_manager, 'sa_manager'):
+            sa_manager = spec_resource_manager.sa_manager
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -33,6 +44,7 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
+            sa_manager=sa_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
@@ -102,6 +114,15 @@ def get_spec_metadata(spec_config,
             resource_manager=spec_resource_manager,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
         )
+    if spec_config.spec_dec_mode.is_sa():
+        return SASpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            sa_manager=spec_resource_manager,
+            max_matching_ngram_size=spec_config.max_matching_ngram_size,
+        )
     if  spec_config.spec_dec_mode.is_draft_target() or \
         spec_config.spec_dec_mode.is_ngram() or \
         spec_config.spec_dec_mode.is_user_provided():
@@ -124,21 +145,31 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
     max_num_tokens = model_engine.max_num_tokens
     spec_dec_mode = spec_config.spec_dec_mode
     if spec_dec_mode.is_mtp_eagle_one_model():
-        if spec_config.use_relaxed_acceptance_for_thinking:
+        sa_manager = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
+        if spec_config.use_relaxed_acceptance_for_thinking or sa_manager is not None:
             return MTPHiddenStatesManager(
                 spec_config,
                 model_config.torch_dtype,
                 model_config.hidden_size,
                 max_num_requests,
+                sa_manager=sa_manager,
             )
         else:
             return None
     if spec_dec_mode.is_mtp_one_model():
+        sa_manager = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
         return MTPHiddenStatesManager(
             spec_config,
             model_config.torch_dtype,
             model_config.hidden_size,
             max_num_requests,
+            sa_manager=sa_manager,
         )
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
@@ -160,13 +191,18 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
         )
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
+    if spec_dec_mode.is_sa():
+        return SuffixAutomatonManager(spec_config, max_num_requests,
+                                      max_seq_len)
     if spec_dec_mode.is_user_provided():
         return spec_config.resource_manager
     return None
 
 
-def get_spec_decoder(sampler_args: TorchSampler.Args,
-                     spec_config: "DecodingBaseConfig"):
+def get_spec_decoder(
+    sampler_args: TorchSampler.Args,
+    spec_config: "DecodingBaseConfig",
+):
     if spec_config.spec_dec_mode.is_mtp_one_model():
         return MTPSampler(sampler_args,
                           nextn=spec_config.num_nextn_predict_layers)
@@ -179,6 +215,8 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
     if spec_config.spec_dec_mode.is_pard():
         return MTPSampler(sampler_args,
                           nextn=spec_config.tokens_per_gen_step - 1)
+    if spec_config.spec_dec_mode.is_sa():
+        return SASampler(sampler_args, max_draft_len=spec_config.max_draft_len)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -238,6 +276,8 @@ def get_spec_worker(spec_config,
                                     use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    if spec_dec_mode.is_sa():
+        return SAWorker(spec_config, model_config)
     return None
 
 

@@ -45,7 +45,7 @@ from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
-from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
@@ -718,6 +718,20 @@ class PyExecutor:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
         self.worker_started = False
+        # Release CUDA graphs before resource managers free their GPU memory.
+        # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
+        # that is referenced by raw pointers inside captured CUDA graphs.  If
+        # the workspace is freed first (and returned to the driver via
+        # empty_cache), the subsequent CUDA graph teardown can trigger a
+        # device-wide cudaErrorIllegalAddress when the driver touches metadata
+        # for the now-freed memory regions.
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None and hasattr(engine, '_release_cuda_graphs'):
+                engine._release_cuda_graphs()
+        # Ensure graph destruction has fully completed on device before
+        # resource managers start freeing GPU-backed workspaces.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -2206,7 +2220,7 @@ class PyExecutor:
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
         target_inputs: Optional[SampleStateTensors]
-    ) -> Tuple[SampleStateTensorsMTP, Optional[torch.Tensor]]:
+    ) -> Tuple[SampleStateTensorsSpec, Optional[torch.Tensor]]:
         """
         Prepare target device inputs after computing draft token acceptance.
 
@@ -2222,13 +2236,13 @@ class PyExecutor:
             target_inputs: Contains next_draft_tokens [batch_size, max_draft_len]
         Returns:
             Tuple of:
-            - SampleStateTensorsMTP with new_tokens set to accepted tokens,
+            - SampleStateTensorsSpec with new_tokens set to accepted tokens,
               new_tokens_lens and next_draft_tokens set to None
             - num_accepted_tokens: [batch_size] tensor with acceptance counts per request,
               or None if no draft tokens
         """
         has_draft_tokens = target_inputs is not None and isinstance(
-            target_inputs, SampleStateTensorsMTP
+            target_inputs, SampleStateTensorsSpec
         ) and target_inputs.next_draft_tokens is not None
         target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
         new_tokens = torch.zeros_like(target_tokens)
@@ -2276,9 +2290,9 @@ class PyExecutor:
             batch_indices = torch.arange(batch_size, device=device)
             new_tokens[0, :, 0] = target_tokens[0, batch_indices]
 
-        # Create the updated SampleStateTensorsMTP
+        # Create the updated SampleStateTensorsSpec
         # new_tokens_lens and next_draft_tokens are left as None
-        result_tensors = SampleStateTensorsMTP(
+        result_tensors = SampleStateTensorsSpec(
             new_tokens=new_tokens,
             log_probs=target_outputs.log_probs,
             new_tokens_lens=None,
@@ -3455,7 +3469,7 @@ class PyExecutor:
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
-    ) -> Tuple[Optional[SampleStateTensorsMTP], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[SampleStateTensorsSpec], Optional[torch.Tensor]]:
         with request_context(is_draft=self.draft_model_engine is not None,
                              scheduled_requests=scheduled_batch):
             target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
