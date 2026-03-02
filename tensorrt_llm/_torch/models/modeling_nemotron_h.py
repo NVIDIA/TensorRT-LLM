@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -801,14 +802,14 @@ class NemotronHMTP(nn.Module):
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
                 model_config, self.layer_idx)
 
-            # Create a temporary model_config with the override quant_config
-            sublayer_model_config = ModelConfig(
-                pretrained_config=model_config.pretrained_config,
-                mapping=model_config.mapping,
-                quant_config=sublayer_quant_config,
-                skip_create_weights_in_init=model_config.
-                skip_create_weights_in_init,
-            )
+            # Create a model_config copy with quant_config overridden and
+            # spec_config cleared. All other fields (use_cuda_graph,
+            # moe_backend, moe_max_num_tokens, etc.) must be inherited
+            # so MoE layers are configured correctly for CUDA graph
+            # capture and communication (e.g., DeepEP).
+            sublayer_model_config = replace(model_config,
+                                            quant_config=sublayer_quant_config,
+                                            spec_config=None)
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,
