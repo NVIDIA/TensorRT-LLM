@@ -218,20 +218,18 @@ struct LinearAttentionMetadata
     }
 
     [[nodiscard]] SizeType32 calcMaxMemoryBlocks(
-        WindowSizeType encodedWindowSize, SizeType32 tokensPerBlock, size_t memoryBudget, SizeType32 maxBatchSize) const
+        WindowSizeType encodedWindowSize, SizeType32 tokensPerBlock, size_t memoryBudget, SizeType32 numLayers) const
     {
-        size_t const numLayers = linearLayerIndices.size();
         if (hasRecurrentStatesCache(encodedWindowSize))
         {
             TLLM_CHECK_WITH_INFO(
-                encodedWindowSize == kRecurrentStates, "each pool must only serve on type of linear cache");
+                encodedWindowSize == kRecurrentStates, "each pool must only serve one type of linear cache");
             TLLM_CHECK_WITH_INFO(statesSnapshotInterval % tokensPerBlock == 0,
                 "statesSnapshotInterval must be multiple of tokensPerBlock");
             // take a snapshot every `blockAlignment` blocks.
-            auto fixedBytes = allRecurrentStatesBytes * numLayers * maxBatchSize; // a slot for current recurrent states
             auto perBlockBytes = allRecurrentStatesBytes * numLayers;
-            auto numDynamicBlocks = common::ceilDiv(memoryBudget - fixedBytes, perBlockBytes);
-            return static_cast<SizeType32>(numDynamicBlocks + maxBatchSize);
+            auto numDynamicBlocks = (memoryBudget / perBlockBytes);
+            return static_cast<SizeType32>(numDynamicBlocks);
         }
         if (hasInputFeaturesCache(encodedWindowSize))
         {
@@ -1573,6 +1571,11 @@ public:
         return mWindowBlockManagers.at(windowSize).getPool(relativePoolIndex);
     }
 
+    [[nodiscard]] KVCacheBlockPool const& getRecurrentStatesPool() const
+    {
+        return mWindowBlockManagers.at(LinearAttentionMetadata::LinearCacheType::kRecurrentStates).getPool(0);
+    }
+
     //! \brief Update cache offsets for blocks initiated from sequence
     void updateSequenceCacheBlockOffsets(GenerationRequest& seq, SizeType32 windowSize);
 
@@ -1785,7 +1788,7 @@ public:
 
     //! @return maxBlockCount of all beams
     virtual SizeType32 copyBlockOffsets(
-        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const
+        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const
         = 0;
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
@@ -2159,7 +2162,7 @@ public:
 
     //! @return maxBlockCount of all beams
     SizeType32 copyBlockOffsets(
-        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId) const override;
+        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override;
 
     [[nodiscard]] bool isEnableBlockReuse() const override
     {

@@ -117,6 +117,8 @@ void KVCacheTransferManager::copyBlock(BlockPtr const& src, BlockPtr const& dst,
             TLLM_LOG_DEBUG("src: id %d, addr %p, dst: id %d, addr %p", src->getBlockId(), srcPtr->data(),
                 dst->getBlockId(), dstPtr->data());
 
+            // TLLM_LOG_INFO("copying to dst: id %d, addr %p", dst->getBlockId(), dstPtr->data());
+
             // Does it contain block scales?
             auto containsBlockScales = pools[poolIdx].containsBlockScales;
 

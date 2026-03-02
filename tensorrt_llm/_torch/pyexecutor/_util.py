@@ -33,7 +33,7 @@ from .guided_decoder import GuidedDecoder
 from .kv_cache_connector import KvCacheConnectorManager
 from .kv_cache_transceiver import AttentionTypeCpp, create_kv_cache_transceiver
 from .llm_request import ExecutorResponse
-from .mamba_cache_manager import MambaHybridCacheManager
+from .mamba_cache_manager import LinearHybridCacheManager, MambaHybridCacheManager
 from .model_engine import PyTorchModelEngine
 from .py_executor import PyExecutor
 from .resource_manager import (KVCacheManager, KVCacheManagerV2,
@@ -46,6 +46,9 @@ from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
                         SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
+qwen3_next_kv_cache_manager_cls = LinearHybridCacheManager
+if os.environ.get("AAAA") in ["1", "2"]:
+    qwen3_next_kv_cache_manager_cls = MambaHybridCacheManager
 GB = 1 << 30
 
 
@@ -56,7 +59,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig,
     if sparse_attn_config is not None:
         return get_sparse_attn_kv_cache_manager(sparse_attn_config)
     elif is_nemotron_hybrid(config) or is_qwen3_next(config):
-        return MambaHybridCacheManager
+        return qwen3_next_kv_cache_manager_cls
     else:
         return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
 
@@ -518,6 +521,7 @@ class KvCacheCreator:
             spec_dec_layer_mask = [True] * num_target_layers
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        print(f"creating kv cache manager with actual type = {self._kv_cache_manager_cls.__name__}")
         kv_cache_manager = _create_kv_cache_manager(
             model_engine=model_engine,
             kv_cache_manager_cls=self._kv_cache_manager_cls,
@@ -827,6 +831,8 @@ def _create_kv_cache_manager(
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
             layer_mask=layer_mask,
+            model_config=model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=tokens_per_block),
         )
     elif is_nemotron_hybrid(config):
         if max_beam_width > 1:
@@ -913,6 +919,8 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_config=model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=tokens_per_block),
         )
     elif is_qwen3_next(config):
         if max_beam_width > 1:
@@ -963,6 +971,8 @@ def _create_kv_cache_manager(
             spec_config=spec_config,
             is_estimating_kv_cache=estimating_kv_cache,
             execution_stream=execution_stream,
+            model_config=model_engine.model.model_config.get_bindings_model_config(
+                tokens_per_block=tokens_per_block),
         )
     else:
         # NOTE: this is a workaround for VSWA to switch to calculate_max_num_blocks_for_vswa in KVCahceManager

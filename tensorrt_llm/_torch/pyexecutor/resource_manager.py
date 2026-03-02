@@ -7,6 +7,7 @@ from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
+from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 import torch
 from mpi4py import MPI
 
@@ -20,7 +21,7 @@ from tensorrt_llm.bindings.internal.batch_manager import KvCacheStats
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig
+from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig, PybindMirror
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
@@ -280,6 +281,7 @@ class KVCacheManager(BaseResourceManager):
         indexer_k_cache_index_head_dim: int = 0,
         is_estimating_kv_cache: bool = False,
         execution_stream: Optional[torch.cuda.Stream] = None,
+        linear_attention_metadata: Optional[LinearAttentionMetadata] = None,
         **kwargs,
     ) -> None:
         self.mapping = mapping
@@ -354,6 +356,8 @@ class KVCacheManager(BaseResourceManager):
         self.max_draft_len = spec_config.max_draft_len if spec_config is not None else 0
         self.max_total_draft_tokens = (spec_config.tokens_per_gen_step -
                                        1) if spec_config is not None else 0
+        self.max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
+        self.linear_attention_metadata = linear_attention_metadata
 
         # Determine max_attention_window_vec
         if kv_cache_config.max_attention_window is None:
@@ -374,7 +378,8 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1
+        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(w > 0 for w in self.max_attention_window_vec)
+        self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
         # FIXME: flashinfer.py accesses kv_cache_manager.blocks_in_primary_pool
@@ -403,7 +408,7 @@ class KVCacheManager(BaseResourceManager):
                 f"[kv cache manager] Primary/secondary blocks for window sizes set to {blocks_per_window} for estimation dry run"
             )
         else:
-            if self.is_vswa:
+            if self.is_vswa or self.is_linear_attention:
                 # VSWA case: use C++ implementation for variable window sizes
                 if model_config is None:
                     raise ValueError(
@@ -517,7 +522,8 @@ class KVCacheManager(BaseResourceManager):
             'enable_indexer_k_cache': enable_indexer_k_cache,
             'indexer_k_cache_quant_block_size':
             indexer_k_cache_quant_block_size,
-            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim
+            'indexer_k_cache_index_head_dim': indexer_k_cache_index_head_dim,
+            'linear_attention_metadata': linear_attention_metadata
         }
 
         if self.event_buffer_max_size > 0:
@@ -558,12 +564,18 @@ class KVCacheManager(BaseResourceManager):
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
             device='cpu')
+        self.blocks_per_window = blocks_per_window
 
     def shutdown(self):
         self.impl.release_pools()
 
     def get_max_resource_count(self) -> int:
         return self.impl.max_num_blocks
+
+    def get_num_blocks(self, window_size: int | None = None) -> Tuple[int, int]:
+        if window_size is None:
+            return (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
+        return self.blocks_per_window[window_size]
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: the C++ implementation of this method can be used, but the
@@ -581,6 +593,7 @@ class KVCacheManager(BaseResourceManager):
         return need_blocks
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        # print("KVCacheManager::prepare_resources")
         with request_context(self.is_draft, scheduled_batch):
             context_batch = scheduled_batch.context_requests
             generation_batch = scheduled_batch.generation_requests
@@ -596,6 +609,7 @@ class KVCacheManager(BaseResourceManager):
                     if req.ctx_iters == 0:
                         seq_len = sum(
                             len(ctx_block) for ctx_block in req.ctx_blocks)
+                        # print(f"add_sequence for request {req.py_request_id}")
                         self.impl.add_sequence(
                             req.py_request_id,
                             seq_len + (len(req.query_id) if self.mapping.cp_rank
@@ -994,7 +1008,7 @@ class KVCacheManager(BaseResourceManager):
         return result
 
     def get_num_free_blocks(self) -> int:
-        if self.is_vswa:
+        if self.is_vswa or self.is_linear_attention:
             logger.info(
                 f"For VSWA case, we return the minimum of the number of free blocks for each window size: {self.impl.get_kv_cache_stats().num_free_blocks_per_window_size}"
             )
@@ -1316,19 +1330,37 @@ class KVCacheManager(BaseResourceManager):
             f"secondary_pool_memory_bytes is set to {self._secondary_pool_memory_bytes/1024**3}GB"
         )
 
-        # Adjust the window sizes to fit the memory if even a single sequence
-        # cannot fit in the memory.
-        window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
-            window_size_to_layers=window_size_to_layers,
-            max_attention_window_vec=self.max_attention_window_vec,
-            model_config=model_config,
-            kv_cache_config=kv_cache_config,
-            pool_memory_bytes=self._primary_pool_memory_bytes,
-            kv_factor=self.kv_factor,
-            dtype=self.dtype,
-            is_cross_attention=is_cross_attention,
-        )
-        self.max_attention_window_vec = max_attention_window_vec
+        if self.is_vswa:
+            # Adjust the window sizes to fit the memory if even a single sequence
+            # cannot fit in the memory.
+            window_size_to_layers, max_attention_window_vec = self.adjust_window_sizes_for_vswa(
+                window_size_to_layers=window_size_to_layers,
+                max_attention_window_vec=self.max_attention_window_vec,
+                model_config=model_config,
+                kv_cache_config=kv_cache_config,
+                pool_memory_bytes=self._primary_pool_memory_bytes,
+                kv_factor=self.kv_factor,
+                dtype=self.dtype,
+                is_cross_attention=is_cross_attention,
+            )
+            self.max_attention_window_vec = max_attention_window_vec
+
+        if self.is_linear_attention:
+            blocks_per_window = KVCacheManagerCpp.calculate_max_num_blocks(
+                config=PybindMirror.maybe_to_pybind(kv_cache_config),
+                is_cross_attention=is_cross_attention,
+                dtype=self.dtype,
+                model_config=model_config,
+                world_config=world_config_cpp,
+                window_size_to_layers=window_size_to_layers,
+                allotted_primary_mem_bytes=self._primary_pool_memory_bytes,
+                allotted_secondary_mem_bytes=self._secondary_pool_memory_bytes,
+                extra_cost_memory=extra_cost_memory,
+                kv_factor=self.kv_factor,
+                max_batch_size=self.max_batch_size,
+                linear_attention_metadata=PybindMirror.maybe_to_pybind(self.linear_attention_metadata),
+            )
+            return blocks_per_window
 
         def calculate_cache_size_per_token(layers: Set[int]) -> int:
             # Same as BaseKVCacheManager::calculateCacheSizePerTokenForSingleWindowSize
