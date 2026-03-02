@@ -225,7 +225,10 @@ def verify_disaggregated(model, generation_overlap, enable_cuda_graph, prompt,
             disable_overlap_scheduler=not generation_overlap,
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
-    kv_cache_configs = [KvCacheConfig(max_tokens=2048 * 8) for _ in range(2)]
+    kv_cache_configs = [
+        KvCacheConfig(max_tokens=2048 * 8, use_kv_cache_manager_v2=False)
+        for _ in range(2)
+    ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
     ]
@@ -370,8 +373,10 @@ def test_disaggregated_llama_context_capacity(model, enable_cuda_graph,
             cuda_graph_config=CudaGraphConfig() if enable_cuda_graph else None))
 
     kv_cache_configs = [
-        KvCacheConfig(max_tokens=128, enable_block_reuse=False, dtype="auto")
-        for _ in range(2)
+        KvCacheConfig(max_tokens=128,
+                      enable_block_reuse=False,
+                      dtype="auto",
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
@@ -481,7 +486,8 @@ def test_disaggregated_spec_dec_batch_slot_limit(model, spec_dec_model_path,
     kv_cache_configs = [
         KvCacheConfig(max_tokens=128,
                       enable_block_reuse=False,
-                      free_gpu_memory_fraction=0.4) for _ in range(2)
+                      free_gpu_memory_fraction=0.4,
+                      use_kv_cache_manager_v2=False) for _ in range(2)
     ]
     cache_transceiver_configs = [
         CacheTransceiverConfig(backend="DEFAULT") for _ in range(2)
