@@ -75,7 +75,19 @@ def get_version():
 
 
 def get_license():
+    """Get license files for the wheel package.
+
+    Prefers auto-generated ATTRIBUTIONS.md (copied to project root by build_wheel.py)
+    when available, falling back to hard-coded platform-specific attribution files.
+    """
     import sysconfig
+
+    # Check for auto-generated attributions (copied to project root by build_wheel.py)
+    auto_generated_attributions = Path("ATTRIBUTIONS.md")
+    if auto_generated_attributions.exists():
+        return ["LICENSE", "ATTRIBUTIONS.md"]
+
+    # Fall back to hard-coded platform-specific attribution files
     platform_tag = sysconfig.get_platform()
     if "x86_64" in platform_tag:
         return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]

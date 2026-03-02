@@ -189,7 +189,7 @@ def get_llm_args(
         KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction)
         if free_gpu_memory_fraction != kv_cache_default_fraction else None,
         "cp_config":
-        cp_config if cp_config else {},
+        cp_config,
         "build_config":
         BuildConfig(max_batch_size=max_batch_size,
                     max_num_tokens=max_num_tokens,
@@ -255,10 +255,11 @@ def launch_server(
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-        multimodal_server_config: Optional[MultimodalServerConfig] = None):
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
+        served_model_name: Optional[str] = None):
 
     backend = llm_args["backend"]
-    model = llm_args["model"]
+    model = served_model_name or llm_args["model"]
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -306,7 +307,10 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
-def launch_grpc_server(host: str, port: int, llm_args: dict):
+def launch_grpc_server(host: str,
+                       port: int,
+                       llm_args: dict,
+                       served_model_name: Optional[str] = None):
     """
     Launch a gRPC server for TensorRT-LLM.
 
@@ -317,6 +321,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
         host: Host to bind to
         port: Port to bind to
         llm_args: Arguments for LLM initialization (from get_llm_args)
+        served_model_name: Custom model name for API responses (defaults to model path)
     """
     import grpc
 
@@ -334,7 +339,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
         logger.info("Initializing TensorRT-LLM gRPC server...")
 
         backend = llm_args.get("backend")
-        model_path = llm_args.get("model", "")
+        model_path = served_model_name or llm_args.get("model", "")
 
         if backend == "pytorch":
             llm_args.pop("build_config", None)
@@ -712,6 +717,14 @@ class ChoiceWithAlias(click.Choice):
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
     "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
+@click.option(
+    "--served_model_name",
+    type=str,
+    default=None,
+    help=help_info_with_stability_tag(
+        "The model name used in the API. If not specified, the model path is "
+        "used as the model name. This is useful when the model path is long or "
+        "when you want to expose a custom name to clients.", "prototype"))
 @click.option("--extra_visual_gen_options",
               type=str,
               default=None,
@@ -734,7 +747,8 @@ def serve(
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
         custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool, extra_visual_gen_options: Optional[str]):
+        grpc: bool, served_model_name: Optional[str],
+        extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -832,12 +846,22 @@ def serve(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            launch_grpc_server(host, port, llm_args)
+            launch_grpc_server(host,
+                               port,
+                               llm_args,
+                               served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
-            launch_server(host, port, llm_args, tool_parser, chat_template,
-                          metadata_server_cfg, server_role,
-                          disagg_cluster_config, multimodal_server_config)
+            launch_server(host,
+                          port,
+                          llm_args,
+                          tool_parser,
+                          chat_template,
+                          metadata_server_cfg,
+                          server_role,
+                          disagg_cluster_config,
+                          multimodal_server_config,
+                          served_model_name=served_model_name)
 
     def _serve_visual_gen():
         visual_gen_config = {

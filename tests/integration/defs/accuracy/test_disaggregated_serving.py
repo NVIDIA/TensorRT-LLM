@@ -184,8 +184,8 @@ def launch_disaggregated_llm(
     with open(gen_server_config_path, "w") as f:
         yaml.dump(gen_server_config, f)
 
-    args = LlmArgs.from_kwargs(model=model_name,
-                               tensor_parallel_size=tensor_parallel_size)
+    args = LlmArgs(model=model_name, tensor_parallel_size=tensor_parallel_size)
+
     if "FP4" in model_name:
         args.quant_config.quant_algo = "NVFP4"
 
@@ -1435,6 +1435,105 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     def test_chunked_prefill_ctx_pp2(self):
         self._test_chunked_prefill_helper(ctx_pp=2)
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.parametrize(
+        "gen_pp,gen_tp,gen_cp,enable_attention_dp", [
+            (1, 1, 4, False),
+            (1, 2, 2, False),
+            (1, 2, 2, True),
+            (2, 1, 2, False),
+        ],
+        ids=["pp1tp1cp4", "pp1tp2cp2", "pp1dp2cp2", "pp2tp1cp2"])
+    @pytest.mark.parametrize("cuda_graph_config", [
+        None,
+        {
+            "enable_padding": False,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+        {
+            "enable_padding": True,
+            "batch_sizes": [1, 2, 4, 8, 16, 32, 64]
+        },
+    ],
+                             ids=[
+                                 "cudagraph:none", "cudagraph:without_padding",
+                                 "cudagraph:with_padding"
+                             ])
+    @pytest.mark.parametrize("comms_medium", ["fifo_v1", "fifo_v2", "nccl"])
+    def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
+                                   gen_pp, gen_tp, gen_cp, enable_attention_dp):
+        # Parse comms_medium to get use_nccl_for_alltoall and fifo_version.
+        if comms_medium == "nccl":
+            use_nccl_for_alltoall = True
+            fifo_version = 2  # Not used when NCCL is enabled.
+        elif comms_medium == "fifo_v1":
+            use_nccl_for_alltoall = False
+            fifo_version = 1
+        elif comms_medium == "fifo_v2":
+            use_nccl_for_alltoall = False
+            fifo_version = 2
+        else:
+            raise ValueError(f"Unknown comms_medium: {comms_medium}")
+        gen_ep = gen_tp * gen_cp
+        kv_cache_config = {
+            "free_gpu_memory_fraction": 0.5,
+            "enable_block_reuse": False,
+            "enable_partial_reuse": False,
+            "tokens_per_block": 32,
+        }
+        ctx_server_config = {
+            "pipeline_parallel_size": 1,
+            "tensor_parallel_size": 4,
+            "context_parallel_size": 1,
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": None,
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+        }
+        gen_server_config = {
+            "tensor_parallel_size": gen_tp,
+            "pipeline_parallel_size": gen_pp,
+            "context_parallel_size": gen_cp,
+            "moe_expert_parallel_size": gen_ep,
+            "cp_config": {
+                "cp_type": "HELIX",
+                "tokens_per_block": 32,
+                "use_nccl_for_alltoall": use_nccl_for_alltoall,
+                "fifo_version": fifo_version,
+            },
+            "disable_overlap_scheduler": True,
+            "kv_cache_config": kv_cache_config,
+            "enable_chunked_prefill": False,
+            "cuda_graph_config": cuda_graph_config,
+            "cache_transceiver_config": {
+                "backend": "UCX",
+                "max_tokens_in_buffer": 8192,
+            },
+            "enable_attention_dp": enable_attention_dp,
+        }
+        disaggregated_server_config = {
+            "hostname": "localhost",
+            "port": 8000,
+            "backend": "pytorch",
+            "context_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8001"]
+            },
+            "generation_servers": {
+                "num_instances": 1,
+                "urls": ["localhost:8002"]
+            }
+        }
+        with launch_disaggregated_llm(disaggregated_server_config,
+                                      ctx_server_config, gen_server_config,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
 @skip_pre_blackwell

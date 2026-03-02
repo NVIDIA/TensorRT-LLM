@@ -382,7 +382,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if DeepGemmFusedMoE can implement the given quantization algorithm.
@@ -391,15 +391,15 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
         - FP8_BLOCK_SCALES: SM in {100, 103}
 
         Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
-        Does NOT support gptoss_style (bias/swiglu with custom alpha/beta/limit).
+        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation input data type. Supported types are
                 float32, bfloat16, and float16 (required by moe_permute_op kernel).
                 Note: Output dtype is always bfloat16 regardless of input dtype.
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                DeepGemmFusedMoE does NOT support gptoss_style.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                DeepGemmFusedMoE does NOT support swiglu_gptoss_style.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -425,10 +425,10 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             return _warn_and_return(
                 "DeepGemmFusedMoE does not support unquantized mode")
 
-        # DeepGemmFusedMoE does NOT support gptoss_style
-        if gptoss_style:
+        # DeepGemmFusedMoE does NOT support swiglu_gptoss_style
+        if swiglu_gptoss_style:
             return _warn_and_return(
-                "DeepGemmFusedMoE does not support gptoss_style (bias/swiglu with custom alpha/beta/limit)"
+                "DeepGemmFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
             )
 
         # Only FP8_BLOCK_SCALES is supported
@@ -740,6 +740,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                    expert_first_token_offset_tensor,
                                    token_to_expert_map)
 
+        topk = self.routing_method.top_k
+        if token_selected_experts is not None:
+            # For the deepgemmlowlatency, the topk has been viewed into 1
+            topk = token_selected_experts.shape[-1]
+
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             permuted_data_tensor,
             None,  # biases
@@ -752,7 +757,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             x.shape[0],  # num_rows
             x.shape[1],  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
+            topk,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
             self.tp_rank,

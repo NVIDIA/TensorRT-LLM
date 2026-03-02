@@ -10,7 +10,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 **CRITICAL (YOU MUST):**
 - Read and follow `CODING_GUIDELINES.md` for ALL code changes (C++ and Python)
 - NVIDIA copyright header on ALL new files (update year on modified files)
-- `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line
+- `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Do not add
+  co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Python imports: `from package.subpackage import module` (never `from module import Class`)
@@ -24,9 +25,9 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 | Specific test | `pytest tests/unittest/llmapi/test_llm_args.py` |
 | Pattern match | `pytest tests/unittest -k "test_llm_args"` |
 | Integration tests | `LLM_MODELS_ROOT=/path/to/models pytest tests/integration/defs/...` |
-| Serve model | `trtllm-serve --model <hf_model> --port 8000` |
-| Serve with config | `trtllm-serve --model <hf_model> --config config.yaml` |
-| Benchmark | `trtllm-bench --model <hf_model> --dataset_path <path>` |
+| Serve model | `trtllm-serve <hf_model> --port 8000` |
+| Serve with config | `trtllm-serve <hf_model> --config config.yaml` |
+| Benchmark | `trtllm-bench --model <hf_model> throughput --dataset <path>` |
 | Find CI stage for test | `python scripts/test_to_stage_mapping.py --tests "test_name"` |
 
 ### Installation & Build
@@ -102,15 +103,21 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
 - **Python import style is enforced** — `from package.subpackage import module`, never `from module import Class`. Pre-commit will not catch this.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
+- **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 
 ## Development Workflow
 
 1. Set up build environment (see [installation docs](docs/source/installation/))
 2. Make changes following `CODING_GUIDELINES.md`
 3. Test locally with `pytest`
-4. Submit PR:
+
+## Branching policy and PRs
+
+- The main repository (`upstream`) is located at https://github.com/NVIDIA/TensorRT-LLM/
+- Branches should always be pushed to the user-specified fork (usually `origin`)
+- If pushing fails to due pre-push pre-commits hooks getting updated, just re-push immediately
+- PRs should be opened on the main repository
    - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
-   - Sign commits with DCO (`git commit -s`)
    - Target `main` unless fixing a release branch bug
    - See `CONTRIBUTING.md` for full PR policies
 
@@ -127,6 +134,89 @@ See [CI overview](docs/source/developer-guide/ci-overview.md) for full details.
 | Test waives | `tests/integration/test_lists/waives.txt` | Skip known-failing tests with NVBug links |
 | Performance | See [benchmarking guide](docs/source/developer-guide/perf-benchmarking.md) | `trtllm-bench` and `trtllm-serve` benchmarks |
 
+### Triggering CI
+
+CI is triggered by posting comments on the PR. Basic commands:
+- `/bot run` — trigger the standard CI pipeline
+- `/bot run --disable-fail-fast` — run all stages even if earlier ones fail (only add when explicitly needed)
+- `/bot run --extra-stage "DGX_B200-4_GPUs-AutoDeploy-1, DGX_H100-4_GPUs-AutoDeploy-1"` — include AutoDeploy CI stages (use for AutoDeploy-related PRs)
+
+For a full list of up-to-date bot commands, post `/bot help` as a PR comment and check the bot's reply.
+
+### Retrieving CI Test Failures from a PR
+
+CI tests run on internal NVIDIA Jenkins infrastructure (`blossom-ci`). To retrieve failed test cases from a PR:
+
+**Step 1: Get the Jenkins build number from PR comments**
+
+The CI bot (`tensorrt-cicd`) posts comments with links to the Jenkins build. Extract the `L0_MergeRequest_PR` build number:
+```bash
+PR_NUM=<pr_number>
+BUILD_NUM=$(gh api "repos/NVIDIA/TensorRT-LLM/issues/${PR_NUM}/comments" --jq \
+  '[.[] | select(.user.login == "tensorrt-cicd") | select(.body | test("L0_MergeRequest_PR"))] | last | .body' \
+  | grep -oP 'L0_MergeRequest_PR/\K\d+')
+```
+
+**Step 2: Query the Jenkins testReport API for failures**
+
+Resolve the Jenkins base URL dynamically from the internal shortcut (requires corporate network):
+```bash
+JENKINS_BASE="$(curl -skI 'https://nv/trt-llm-cicd' 2>/dev/null | grep -i '^location:' | sed 's/^[Ll]ocation: *//;s/[[:space:]]*$//')job/main/job/L0_MergeRequest_PR"
+```
+
+```bash
+curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+print(f'Summary: {data[\"passCount\"]} passed, {data[\"failCount\"]} failed, {data[\"skipCount\"]} skipped')
+failed = []
+for suite in data.get('suites', []):
+    for case in suite.get('cases', []):
+        if case.get('status') in ('FAILED', 'REGRESSION'):
+            failed.append(case)
+if not failed:
+    print('No test failures!')
+else:
+    print(f'Failed tests ({len(failed)}):')
+    for f in failed:
+        print(f'  - {f[\"className\"]}.{f[\"name\"]}')
+        err = (f.get('errorDetails') or '')[:200]
+        if err:
+            print(f'    Error: {err}')
+"
+```
+
+**Step 3 (if needed): Get full stdout/stderr for a specific failure**
+
+The `errorStackTrace` can be incomplete when errors originate from subprocesses. In that case, fetch `stdout` and `stderr` for the specific test case to find the real error:
+```bash
+curl -s "${JENKINS_BASE}/${BUILD_NUM}/testReport/api/json" | python3 -c "
+import json, sys
+data = json.load(sys.stdin)
+for suite in data.get('suites', []):
+    for case in suite.get('cases', []):
+        if case.get('status') in ('FAILED', 'REGRESSION'):
+            name = f'{case[\"className\"]}.{case[\"name\"]}'
+            if '<search_term>' in name:
+                print(f'=== {name} ===')
+                print('--- Error ---')
+                print(case.get('errorDetails', ''))
+                print('--- Stack Trace ---')
+                print(case.get('errorStackTrace', ''))
+                print('--- Stdout (last 3000 chars) ---')
+                print((case.get('stdout') or '')[-3000:])
+                print('--- Stderr (last 3000 chars) ---')
+                print((case.get('stderr') or '')[-3000:])
+                break
+"
+```
+
+**Available fields per failed test case** (from Jenkins testReport API):
+- `className`, `name`: test identifier
+- `status`: `FAILED` or `REGRESSION`
+- `errorDetails`: error message
+- `errorStackTrace`: full stack trace (may be incomplete for subprocess errors)
+- `stdout`, `stderr`: full test output (can be large, check these when stack trace is insufficient)
 ## Key Documentation
 
 | Topic | Path |

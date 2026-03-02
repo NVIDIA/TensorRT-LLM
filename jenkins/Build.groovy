@@ -391,7 +391,7 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "ccache -sv"
     sh "rm -rf **/*.xml *.tar.gz"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -457,6 +457,12 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/libtensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
     sh "cp ${LLM_ROOT}/cpp/build/tensorrt_llm/plugins/libnvinfer_plugin_tensorrt_llm.so TensorRT-LLM/benchmarks/cpp"
 
+    // Step 6: packaging attribution files into tarfile when they exist
+    sh "mkdir -p TensorRT-LLM/attribution"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/missing_files.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/import_payload.json TensorRT-LLM/attribution/ || true"
+    sh "cp ${LLM_ROOT}/cpp/build/attribution/file_mappings.json TensorRT-LLM/attribution/ || true"
+
     if (is_linux_x86_64) {
         sh "rm -rf ${tarName}"
         sh "pigz --version || true"
@@ -476,7 +482,7 @@ def buildWheelInContainer(pipeline, libraries=[], triple=X86_64_TRIPLE, clean=fa
     sh "cat ${CCACHE_DIR}/ccache.conf"
 
     // Step 1: cloning tekit source code
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     if (env.alternativeTRT) {
         trtllm_utils.replaceWithAlternativeTRT(env.alternativeTRT, cpver)
         sh "cd ${LLM_ROOT} && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"

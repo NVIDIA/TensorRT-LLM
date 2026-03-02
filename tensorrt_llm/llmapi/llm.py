@@ -188,17 +188,16 @@ class BaseLLM:
                         f"{self.__class__.__name__} got invalid argument: {key}"
                     )
 
-            self.args = llm_args_cls.from_kwargs(
-                model=model,
-                tokenizer=tokenizer,
-                tokenizer_mode=tokenizer_mode,
-                skip_tokenizer_init=skip_tokenizer_init,
-                trust_remote_code=trust_remote_code,
-                tensor_parallel_size=tensor_parallel_size,
-                dtype=dtype,
-                revision=revision,
-                tokenizer_revision=tokenizer_revision,
-                **kwargs)
+            self.args = llm_args_cls(model=model,
+                                     tokenizer=tokenizer,
+                                     tokenizer_mode=tokenizer_mode,
+                                     skip_tokenizer_init=skip_tokenizer_init,
+                                     trust_remote_code=trust_remote_code,
+                                     tensor_parallel_size=tensor_parallel_size,
+                                     dtype=dtype,
+                                     revision=revision,
+                                     tokenizer_revision=tokenizer_revision,
+                                     **kwargs)
 
         except Exception as e:
             logger.error(
@@ -1182,12 +1181,14 @@ class _TorchLLM(BaseLLM):
                          **kwargs)
 
     @set_api_status("prototype")
-    def _collective_rpc(self,
-                        method: str,
-                        args: tuple[Any, ...] = (),
-                        kwargs: Optional[dict] = None,
-                        non_block: bool = False,
-                        unique_reply_rank: Optional[int] = None) -> list[Any]:
+    def _collective_rpc(
+            self,
+            method: str,
+            args: tuple[Any, ...] = (),
+            kwargs: Optional[dict] = None,
+            non_block: bool = False,
+            unique_reply_rank: Optional[int] = None,
+            target_ranks: int | list[int] | None = None) -> list[Any]:
         """
         Execute an RPC call on all GPU workers. Currently, this is only supported for RayExecutor.
 
@@ -1197,13 +1198,15 @@ class _TorchLLM(BaseLLM):
             kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
             non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.
             unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.
+            target_ranks: (int, list[int], optional): The rank(s) of the worker(s) that will be used to send the reply. Defaults to None.
 
         Returns:
             list[Any]: A list of results from each worker.
         """
         if hasattr(self._executor, 'collective_rpc'):
             return self._executor.collective_rpc(method, args, kwargs,
-                                                 non_block, unique_reply_rank)
+                                                 non_block, unique_reply_rank,
+                                                 target_ranks)
         else:
             raise ValueError(
                 f"Executor type {type(self._executor)} does not support collective RPC."

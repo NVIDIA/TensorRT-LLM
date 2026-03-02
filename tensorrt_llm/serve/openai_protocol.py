@@ -118,6 +118,7 @@ class ResponseFormat(OpenAIBaseModel):
 class DisaggregatedParams(OpenAIBaseModel):
     request_type: str
     first_gen_tokens: Optional[List[int]] = None
+    first_gen_log_probs: Optional[List] = None
     ctx_request_id: Optional[int] = None
     encoded_opaque_state: Optional[str] = None
     draft_tokens: Optional[List[int]] = None
@@ -1086,6 +1087,52 @@ def decode_opaque_state(encoded_opaque_state: Optional[str]) -> Optional[bytes]:
     return base64.b64decode(encoded_opaque_state)
 
 
+def _serialize_first_gen_log_probs(
+    first_gen_log_probs: Optional[list], ) -> Optional[List]:
+    """Serialize list[dict[int, Logprob]] to JSON-safe list[list[dict]]."""
+    if first_gen_log_probs is None:
+        return None
+    if not isinstance(first_gen_log_probs, list):
+        raise ValueError("first_gen_log_probs must be a list")
+    result = []
+    for i, pos in enumerate(first_gen_log_probs):
+        if not isinstance(pos, dict):
+            raise ValueError(
+                f"first_gen_log_probs[{i}] must be a dict, got {type(pos)}")
+        result.append([{
+            "token_id": tid,
+            "logprob": lp.logprob,
+            "rank": lp.rank
+        } for tid, lp in pos.items()])
+    return result
+
+
+def _deserialize_first_gen_log_probs(
+    serialized: Optional[List], ) -> Optional[list]:
+    """Deserialize JSON list[list[dict]] back to list[dict[int, Logprob]]."""
+    if serialized is None:
+        return None
+    from tensorrt_llm.executor.result import Logprob
+    result = []
+    for i, pos in enumerate(serialized):
+        if not isinstance(pos, list):
+            raise ValueError(
+                f"first_gen_log_probs[{i}] must be a list, got {type(pos)}")
+        token_map = {}
+        for j, item in enumerate(pos):
+            if not isinstance(item, dict):
+                raise ValueError(
+                    f"first_gen_log_probs[{i}][{j}] must be a dict")
+            if "token_id" not in item or "logprob" not in item:
+                raise ValueError(
+                    f"first_gen_log_probs[{i}][{j}] missing required keys "
+                    "'token_id' and/or 'logprob'")
+            token_map[item["token_id"]] = Logprob(logprob=item["logprob"],
+                                                  rank=item.get("rank"))
+        result.append(token_map)
+    return result
+
+
 def to_disaggregated_params(
         tllm_disagg_params: LlmDisaggregatedParams) -> DisaggregatedParams:
     if tllm_disagg_params is None:
@@ -1093,6 +1140,8 @@ def to_disaggregated_params(
     return DisaggregatedParams(
         request_type=tllm_disagg_params.request_type,
         first_gen_tokens=tllm_disagg_params.first_gen_tokens,
+        first_gen_log_probs=_serialize_first_gen_log_probs(
+            tllm_disagg_params.first_gen_log_probs),
         ctx_request_id=tllm_disagg_params.ctx_request_id,
         encoded_opaque_state=encode_opaque_state(
             tllm_disagg_params.opaque_state),
@@ -1111,6 +1160,8 @@ def to_llm_disaggregated_params(
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,
+        first_gen_log_probs=_deserialize_first_gen_log_probs(
+            disaggregated_params.first_gen_log_probs),
         ctx_request_id=disaggregated_params.ctx_request_id,
         opaque_state=decode_opaque_state(
             disaggregated_params.encoded_opaque_state),
@@ -1327,6 +1378,8 @@ class VideoJob(OpenAIBaseModel):
     fps: Optional[int] = Field(default=None, description="Frames per second")
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    output_path: Optional[str] = Field(
+        default=None, description="Actual path where the video file was saved")
 
 
 class VideoJobList(OpenAIBaseModel):

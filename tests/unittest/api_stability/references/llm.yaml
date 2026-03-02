@@ -15,7 +15,7 @@ methods:
         default: False
         status: beta
       cp_config:
-        annotation: Optional[dict]
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.CpConfig]
         default: null
         status: prototype
       pp_partition:
@@ -76,12 +76,8 @@ methods:
         status: beta
       # Misc
       backend:
-        annotation: Optional[str]
-        default: null
-        status: deprecated
-      build_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.BuildConfig]
-        default: null
+        annotation: Literal["pytorch"]
+        default: pytorch
         status: deprecated
       cuda_graph_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.CudaGraphConfig]
@@ -200,7 +196,7 @@ methods:
         default: null
         status: prototype
       sparse_attention_config:
-        annotation: Optional[tensorrt_llm.llmapi.llm_args.SparseAttentionConfig]
+        annotation: Union[tensorrt_llm.llmapi.llm_args.RocketSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.DeepSeekSparseAttentionConfig, tensorrt_llm.llmapi.llm_args.SkipSoftmaxAttentionConfig, NoneType]
         default: null
         status: prototype
       otlp_traces_endpoint:
@@ -213,6 +209,10 @@ methods:
         status: prototype
       ray_placement_config:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.RayPlacementConfig]
+        default: null
+        status: prototype
+      ray_worker_nsight_options:
+        annotation: Optional[dict[str, str]]
         default: null
         status: prototype
       enable_sleep:

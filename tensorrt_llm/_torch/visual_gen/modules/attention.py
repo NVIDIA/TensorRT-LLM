@@ -44,7 +44,9 @@ class Attention(nn.Module):
         head_dim: Optional[int] = None,
         qkv_mode: QKVMode = QKVMode.FUSE_QKV,
         qk_norm: bool = True,
-        eps: float = 1e-6,  # TODO: remove this, we should add this to the config
+        qk_norm_mode: str = "full",
+        eps: float = 1e-6,
+        bias: bool = True,
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: Optional[int] = None,
     ):
@@ -62,6 +64,7 @@ class Attention(nn.Module):
         self.num_key_value_heads = num_key_value_heads or num_attention_heads
         self.head_dim = head_dim or (hidden_size // num_attention_heads)
         self.qkv_mode = QKVMode(qkv_mode) if isinstance(qkv_mode, str) else qkv_mode
+        self.bias = bias
 
         # Select compute backend (orthogonal to parallelism)
         ulysses_size = config.parallel.dit_ulysses_size
@@ -73,6 +76,7 @@ class Attention(nn.Module):
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
+        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -82,11 +86,15 @@ class Attention(nn.Module):
         self._init_qkv_proj()
 
         if self.qk_norm:
+            # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
+            # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
+            q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
+            k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
             self.norm_q = RMSNorm(
-                hidden_size=self.q_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
             self.norm_k = RMSNorm(
-                hidden_size=self.kv_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=k_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -95,6 +103,7 @@ class Attention(nn.Module):
                 Linear(
                     self.q_dim,
                     self.hidden_size,
+                    bias=self.bias,
                     dtype=self.dtype,
                     mapping=self.mapping,
                     quant_config=self.quant_config,
@@ -140,6 +149,7 @@ class Attention(nn.Module):
             self.qkv_proj = Linear(
                 self.hidden_size,
                 qkv_out_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -158,6 +168,7 @@ class Attention(nn.Module):
             self.to_q = Linear(
                 self.hidden_size,
                 self.q_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -167,6 +178,7 @@ class Attention(nn.Module):
             self.to_k = Linear(
                 self.hidden_size,
                 self.kv_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,
@@ -176,6 +188,7 @@ class Attention(nn.Module):
             self.to_v = Linear(
                 self.hidden_size,
                 self.kv_dim,
+                bias=self.bias,
                 dtype=self.dtype,
                 mapping=self.mapping,
                 quant_config=self.quant_config,

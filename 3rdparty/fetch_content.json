@@ -1,0 +1,101 @@
+{
+  "schema_version": 1,
+  "dependencies": [
+    {
+      "name": "cppzmq",
+      "git_repository": "https://github.com/zeromq/cppzmq",
+      "git_tag": "v4.10.0",
+      "git_shallow": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "cutlass",
+      "git_repository": "https://github.com/NVIDIA/cutlass",
+      "git_tag": "v4.3.0",
+      "git_shallow": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "cxxopts",
+      "git_repository": "https://github.com/jarro2783/cxxopts",
+      "git_tag": "v3.1.1",
+      "git_shallow": true
+    },
+    {
+      "name": "deep_ep_download",
+      "display_name": "deep_ep",
+      "git_repository": "${github_base_url}/deepseek-ai/DeepEP",
+      "git_tag": "5be51b228a7c82dbdb213ea58e77bffd12b38af8",
+      "use_url": true
+    },
+    {
+      "name": "deepgemm",
+      "git_repository": "https://github.com/deepseek-ai/DeepGEMM",
+      "git_tag": "4ff3f54d9b7ed3129e4f36f9871232ea7ecab86b",
+      "git_submodules_recurse": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "eigen",
+      "git_repository": "https://github.com/libeigen/eigen",
+      "git_tag": "3.4.0",
+      "git_shallow": true
+    },
+    {
+      "name": "flashmla",
+      "git_repository": "https://github.com/deepseek-ai/FlashMLA.git",
+      "git_tag": "1408756a88e52a25196b759eaf8db89d2b51b5a1",
+      "git_submodules_recurse": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "googlebenchmark",
+      "git_repository": "https://github.com/google/benchmark",
+      "git_tag": "v1.8.3",
+      "git_shallow": true
+    },
+    {
+      "name": "googletest",
+      "git_repository": "https://github.com/google/googletest",
+      "git_tag": "v1.15.2",
+      "git_shallow": true
+    },
+    {
+      "name": "json",
+      "git_repository": "https://github.com/nlohmann/json",
+      "git_tag": "v3.12.0",
+      "git_shallow": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "nanobind",
+      "git_repository": "https://github.com/wjakob/nanobind",
+      "git_tag": "a0ed2587f1089ef7657e2ed49ad6756b01c74e9f"
+    },
+    {
+      "name": "nvtx",
+      "git_repository": "https://github.com/NVIDIA/NVTX",
+      "git_tag": "v3.1.0-c-cpp",
+      "git_shallow": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "pybind11",
+      "git_repository": "https://github.com/pybind/pybind11",
+      "git_tag": "f99ffd7e03001810a3e722bf48ad1a9e08415d7d"
+    },
+    {
+      "name": "ucxx",
+      "git_repository": "https://github.com/rapidsai/ucxx",
+      "git_tag": "16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5",
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    },
+    {
+      "name": "xgrammar",
+      "git_repository": "https://github.com/mlc-ai/xgrammar",
+      "git_tag": "v0.1.25",
+      "git_shallow": true,
+      "source_subdir": "dont-add-this-project-with-add-subdirectory"
+    }
+  ]
+}

@@ -8,7 +8,7 @@ Expect breaking API changes.
 ```
 
 TensorRT-LLM provides the `trtllm-bench` CLI, a packaged benchmarking utility that aims to make it
-easier for users to reproduce our officially published [performance overiew](./perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
+easier for users to reproduce our officially published [performance overview](../../developer-guide/perf-overview.md#throughput-measurements). `trtllm-bench` provides the follows:
 
 - A streamlined way to build tuned engines for benchmarking for a variety of models and platforms.
 - An entirely Python workflow for benchmarking.
@@ -63,7 +63,7 @@ sudo nvidia-smi boost-slider --vboost <max_boost_slider>
 
 While `trtllm-bench` should be able to run any network that TensorRT-LLM supports, the following are the list
 that have been validated extensively and is the same listing as seen on the
-[Performance Overview](./perf-overview.md) page.
+[Performance Overview](../../developer-guide/perf-overview.md) page.
 
 - [meta-llama/Llama-2-7b-hf](https://huggingface.co/meta-llama/Llama-2-7b-hf)
 - [meta-llama/Llama-2-70b-hf](https://huggingface.co/meta-llama/Llama-2-70b-hf)
@@ -171,11 +171,11 @@ The throughput benchmark utilizes a fixed JSON schema to specify requests. The s
 | :-------------- | :------: | :-----------: | :---------------------------------------------- |
 | `task_id`       |    Y     |    String     | Unique identifier for the request.              |
 | `prompt`        |    N*    |    String     | Input text for a generation request.            |
-| `input_ids`     |    Y*    | List[Integer] | List of logits that make up the request prompt. |
+| `input_ids`     |    Y*    | List[Integer] | List of token IDs that make up the request prompt. |
 | `output_tokens` |    Y     |    Integer    | Number of generated tokens for this request.    |
 
 ```{tip}
-\* Specifying `prompt` or `input_ids` is required. However, you can not have both prompts and logits (`input_ids`)
+\* Specifying `prompt` or `input_ids` is required. However, you cannot have both prompts and token IDs (`input_ids`)
 defined at the same time. If you specify `input_ids`, the `prompt` entry is ignored for request generation.
 ```
 
@@ -335,10 +335,10 @@ upper bound throughput number.
 
 The benchmarker reads a data file where a single line contains
 a complete JSON request entry as specified in [](#preparing-a-dataset).
-The process that the benchmarker is as follows:
+The process that the benchmarker follows is:
 
 1. Iterate over all input requests. If `logits` is specified, construct the request using the specified
-list of logits. Otherwise, tokenize the `prompt` with as specified by `--model $HF_MODEL_NAME`.
+list of logits. Otherwise, tokenize the `prompt` as specified by `--model $HF_MODEL_NAME`.
 1. Submit the dataset to the TensorRT-LLM `Executor` API as fast as possible (offline mode).
 1. Wait for all requests to return, compute statistics, and then report results.
 
@@ -698,7 +698,7 @@ follow when a checkpoint does not specify a KV cache quantization algorithm:
 | `FP8` | `null` | `FP8` | Set to `FP8` via benchmark |
 | `NVFP4` | `null` | `FP8` | Set to `FP8` via benchmark |
 
-If you would like to force the KV cache quantizaton, you can specify the following in the YAML file to force the precision
+If you would like to force the KV cache quantization, you can specify the following in the YAML file to force the precision
 when the checkpoint precision is `null`:
 
 ```yaml
