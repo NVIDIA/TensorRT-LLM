@@ -34,6 +34,7 @@ from .deep_ep import DeepEP
 from .deep_ep_low_latency import DeepEPLowLatency
 from .nvlink_one_sided import NVLinkOneSided
 from .nvlink_two_sided import NVLinkTwoSided
+from .nvlink_two_sided_flashinfer import NVLinkTwoSidedFlashinfer
 
 
 class CommunicationFactory:
@@ -55,6 +56,7 @@ class CommunicationFactory:
         expert_size_per_partition: int,
         payload_in_workspace: bool = False,
         alltoall_result_do_sum: bool = True,
+        use_flashinfer: bool = False,
     ) -> Optional[Communication]:
         """
         Create the best communication method for the given configuration
@@ -117,6 +119,7 @@ class CommunicationFactory:
                 expert_size_per_partition,
                 payload_in_workspace,
                 alltoall_result_do_sum,
+                use_flashinfer,
             )
 
         # Auto-selection: Try strategies in priority order using try-catch
@@ -140,14 +143,24 @@ class CommunicationFactory:
             logger.debug(f"NVLinkOneSided not available: {e}")
 
         try:
-            strategy = NVLinkTwoSided(
-                mapping,
-                num_experts,
-                num_slots,
-                top_k,
-                use_low_precision_combine,
-                alltoall_result_do_sum=alltoall_result_do_sum,
-            )
+            if use_flashinfer:
+                strategy = NVLinkTwoSidedFlashinfer(
+                    mapping,
+                    num_experts,
+                    num_slots,
+                    top_k,
+                    use_low_precision_combine,
+                    alltoall_result_do_sum=alltoall_result_do_sum,
+                )
+            else:
+                strategy = NVLinkTwoSided(
+                    mapping,
+                    num_experts,
+                    num_slots,
+                    top_k,
+                    use_low_precision_combine,
+                    alltoall_result_do_sum=alltoall_result_do_sum,
+                )
             logger.info("Selected communication strategy: NVLinkTwoSided")
             return strategy
         except RuntimeError as e:
@@ -203,6 +216,7 @@ class CommunicationFactory:
         expert_size_per_partition: int,
         payload_in_workspace: bool,
         alltoall_result_do_sum: bool,
+        use_flashinfer: bool,
     ) -> Communication:
         """
         Create a specific method (for debugging/testing)
@@ -225,14 +239,24 @@ class CommunicationFactory:
 
         # Create strategy - will raise RuntimeError if platform not supported
         if method in ["NVLINK_TWO_SIDED"]:
-            return NVLinkTwoSided(
-                mapping,
-                num_experts,
-                num_slots,
-                top_k,
-                use_low_precision_combine,
-                alltoall_result_do_sum=alltoall_result_do_sum,
-            )
+            if use_flashinfer:
+                return NVLinkTwoSidedFlashinfer(
+                    mapping,
+                    num_experts,
+                    num_slots,
+                    top_k,
+                    use_low_precision_combine,
+                    alltoall_result_do_sum=alltoall_result_do_sum,
+                )
+            else:
+                return NVLinkTwoSided(
+                    mapping,
+                    num_experts,
+                    num_slots,
+                    top_k,
+                    use_low_precision_combine,
+                    alltoall_result_do_sum=alltoall_result_do_sum,
+                )
         elif method in ["NVLINK_ONE_SIDED"]:
             enable_eplb = model_config.moe_load_balancer is not None
             return NVLinkOneSided(

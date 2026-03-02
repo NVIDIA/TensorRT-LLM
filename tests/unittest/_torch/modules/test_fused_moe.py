@@ -1624,6 +1624,9 @@ def run_fused_moe_nvfp4(dtype,
         if not test_all_kernels:
             return
 
+        # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
+        if getattr(fused_moe, 'use_flashinfer', False):
+            return
         # Explicitly capture context for kernel testing
         with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
             output = fused_moe.forward(x, router_logits)
