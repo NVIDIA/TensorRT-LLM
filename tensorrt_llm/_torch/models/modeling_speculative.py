@@ -1047,8 +1047,8 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         spec_config=None,  # Avoid recursive spec-dec
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
-                self.draft_config.quant_config.kv_cache_quant_algo = \
-                    model_config.quant_config.kv_cache_quant_algo
+                    self.draft_config.quant_config.kv_cache_quant_algo = \
+                        model_config.quant_config.kv_cache_quant_algo
 
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
