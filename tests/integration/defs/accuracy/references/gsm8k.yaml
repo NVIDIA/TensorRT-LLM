@@ -173,6 +173,9 @@ moonshotai/Kimi-K2-Thinking:
     accuracy: 90.84
   - quant_algo: NVFP4
     accuracy: 90.84
+moonshotai/Kimi-K2.5:
+  - quant_algo: NVFP4
+    accuracy: 93.06
 nvidia/Llama-3_3-Nemotron-Super-49B-v1:
   - accuracy: 92.57
   - quant_algo: FP8
