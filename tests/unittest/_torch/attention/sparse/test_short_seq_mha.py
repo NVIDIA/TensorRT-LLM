@@ -70,20 +70,18 @@ NN_INIT_STD = 0.02
 # ---------------------------------------------------------------------------
 # Parametrized test specs
 # ---------------------------------------------------------------------------
-# Each entry exercises a distinct code path: single-seq, multi-seq, boundary.
-BATCH_SPECS = [
-    ("single", [16]),
-    ("multi", [8, 12, 16]),
-    ("boundary_exact", [24, 16]),
+# (name, seq_lens, threshold_offset): threshold = sum(seq_lens) + offset.
+# offset=0 tests the boundary condition (threshold == total tokens).
+PREFILL_SPECS = [
+    ("single", [16], 100),
+    ("multi_boundary", [8, 12, 16], 0),
 ]
 
 # (name, [(cached_tokens, new_tokens), ...], chunk_size or None)
 # chunk_size=None -> cached-KV path; chunk_size=int -> chunked-prefill path.
 CHUNKED_SPECS = [
-    ("cached_kv_single", [(64, 32)], None),
-    ("cached_kv_multi", [(64, 32), (32, 16)], None),
-    ("chunked_prefill_single", [(64, 8)], 16),
-    ("chunked_prefill_multi", [(64, 16), (64, 8)], 32),
+    ("cached_kv", [(64, 32), (32, 16)], None),
+    ("chunked_prefill", [(64, 16), (64, 8)], 32),
 ]
 
 
@@ -344,12 +342,16 @@ def _make_metadata(
     mapping,
     sparse_config,
     cached_per_seq=None,
-    enable_cached_kv=False,
     runtime_features=None,
 ):
-    """Build and prepare attention metadata."""
+    """Build and prepare attention metadata.
+
+    When cached_per_seq is provided, enables the cached-KV context path.
+    """
     num_ctx = len(seq_lens)
-    kwargs = {"enable_context_mla_with_cached_kv": True} if enable_cached_kv else {}
+    kwargs = {}
+    if cached_per_seq is not None:
+        kwargs["enable_context_mla_with_cached_kv"] = True
     if runtime_features is not None:
         kwargs["runtime_features"] = runtime_features
     metadata = attn_cls.Metadata(
@@ -394,16 +396,19 @@ def _run_forward(
 # Tests
 # ---------------------------------------------------------------------------
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
-@pytest.mark.parametrize("batch_name,seq_lens", BATCH_SPECS, ids=[b[0] for b in BATCH_SPECS])
-def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
+@pytest.mark.parametrize(
+    "name,seq_lens,threshold_offset",
+    PREFILL_SPECS,
+    ids=[s[0] for s in PREFILL_SPECS],
+)
+def test_forward_context_short_mha(name: str, seq_lens: List[int], threshold_offset: int):
     """Short-seq MHA output vs standalone reference (kv_b_proj + RoPE + SDPA)."""
     device = torch.device("cuda")
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
     rope_config = _make_rope_config()
-    # "boundary_exact" tests threshold == total; others use threshold > total.
-    threshold = sum(seq_lens) if batch_name == "boundary_exact" else sum(seq_lens) + 100
+    threshold = sum(seq_lens) + threshold_offset
     mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
     _init_mla_weights(mla)
 
@@ -417,13 +422,7 @@ def test_forward_context_short_mha(batch_name: str, seq_lens: List[int]):
     rope_cos_sin = _make_rope_cos_sin(rope_config, device)
     softmax_scale = _compute_softmax_scale(rope_config)
     ref = _reference_attention(
-        q,
-        compressed_kv,
-        k_pe,
-        mla.kv_b_proj.weight.data,
-        rope_cos_sin,
-        seq_lens,
-        softmax_scale,
+        q, compressed_kv, k_pe, mla.kv_b_proj.weight.data, rope_cos_sin, seq_lens, softmax_scale
     )
 
     torch.testing.assert_close(output, ref, rtol=0.05, atol=0.05)
@@ -445,14 +444,12 @@ def test_threshold_zero_disables_mha():
 def test_standard_path_when_exceeds_threshold():
     """When total tokens > threshold, the standard absorption path is used."""
     device = torch.device("cuda")
-    dtype = torch.bfloat16
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
     rope_config = _make_rope_config()
     seq_lens = [32]
-    threshold = 16
-    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold=16)
     _init_mla_weights(mla)
 
     kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, seq_lens, device)
@@ -460,8 +457,8 @@ def test_standard_path_when_exceeds_threshold():
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
 
     total_tokens = sum(seq_lens)
-    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype, device=device)
-    qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
+    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+    qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
 
     metadata = _make_metadata(attn_cls, seq_lens, kv_mgr, mapping, sparse_config)
     topk_indices = mla.mqa.indexer(
@@ -483,7 +480,6 @@ def test_standard_path_when_exceeds_threshold():
 def test_agrees_with_absorption_path():
     """Short MHA and absorption paths produce numerically close results."""
     device = torch.device("cuda")
-    dtype = torch.bfloat16
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
@@ -496,6 +492,7 @@ def test_agrees_with_absorption_path():
     )
     mla_absorb, _, _, _ = _build_mla(rope_config, device, threshold=0)
 
+    # Share identical weights between the two modules.
     _init_mla_weights(mla_short)
     with torch.no_grad():
         for (_, ps), (_, pa) in zip(mla_short.named_parameters(), mla_absorb.named_parameters()):
@@ -507,8 +504,8 @@ def test_agrees_with_absorption_path():
             pa.data.copy_(ps.data)
 
     q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(seq_lens, device)
-    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype, device=device)
-    qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
+    hidden_states = torch.randn(total_tokens, HIDDEN_SIZE, dtype=torch.bfloat16, device=device)
+    qr = torch.randn(total_tokens, Q_LORA_RANK, dtype=torch.bfloat16, device=device)
     attn_cls = get_attention_backend("TRTLLM", sparse_config)
 
     def _run(mla_module):
@@ -540,17 +537,12 @@ def test_agrees_with_absorption_path():
 
 @pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
 @pytest.mark.parametrize(
-    "spec_name,chunk_specs,chunk_size",
+    "name,chunk_specs,chunk_size",
     CHUNKED_SPECS,
     ids=[s[0] for s in CHUNKED_SPECS],
 )
-def test_chunked_correctness(spec_name: str, chunk_specs: List[Tuple[int, int]], chunk_size):
-    """Chunked context (cached KV or chunked prefill) matches single-pass prefill.
-
-    When chunk_size is None, exercises the cached-KV path
-    (forward_context_with_cached_kv). When chunk_size is set, exercises the
-    chunked-prefill path (forward_context_with_chunked_prefill).
-    """
+def test_chunked_correctness(name: str, chunk_specs: List[Tuple[int, int]], chunk_size):
+    """Chunked context (cached KV or chunked prefill) matches single-pass prefill."""
     device = torch.device("cuda")
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -607,7 +599,6 @@ def test_chunked_correctness(spec_name: str, chunk_specs: List[Tuple[int, int]],
         mapping,
         sparse_config,
         cached_per_seq=cached_per_seq,
-        enable_cached_kv=True,
         runtime_features=runtime_features,
     )
     pos_c2 = torch.cat(
@@ -623,12 +614,52 @@ def test_chunked_correctness(spec_name: str, chunk_specs: List[Tuple[int, int]],
     kv_chunked.shutdown()
 
 
-if __name__ == "__main__":
-    for name, seq_lens in BATCH_SPECS:
-        test_forward_context_short_mha(name, seq_lens)
-    test_threshold_zero_disables_mha()
-    test_standard_path_when_exceeds_threshold()
-    test_agrees_with_absorption_path()
-    for name, specs, cs in CHUNKED_SPECS:
-        test_chunked_correctness(name, specs, cs)
-    print("All tests passed!")
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90+")
+def test_chunked_context_rejects_when_kv_exceeds_threshold():
+    """When max KV length (cached + new) exceeds threshold, short MHA is not used.
+
+    Regression test: previously, only new token count was checked against
+    the threshold.  With cached tokens, the effective attention span can far
+    exceed the threshold even when new_tokens is small.
+    """
+    device = torch.device("cuda")
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    rope_config = _make_rope_config()
+    # 1 sequence: 64 cached + 32 new = 96 total KV.
+    # threshold=80: chunk 1 (64 tokens) passes, chunk 2's max KV (96) exceeds.
+    cached_per_seq = [64]
+    new_per_seq = [32]
+    total_per_seq = [96]
+    threshold = 80
+
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
+    _init_mla_weights(mla)
+    attn_cls = get_attention_backend("TRTLLM", sparse_config)
+
+    q, compressed_kv, k_pe, latent_cache, position_ids = _make_inputs(total_per_seq, device)
+
+    # Chunk 1: populate KV cache with cached tokens.
+    kv_mgr = _build_kv_cache_manager(mapping, sparse_config, model_config, total_per_seq, device)
+    meta_c1 = _make_metadata(attn_cls, cached_per_seq, kv_mgr, mapping, sparse_config)
+    c1_idx = torch.arange(cached_per_seq[0], dtype=torch.long, device=device)
+    pos_c1 = torch.arange(cached_per_seq[0], device=device, dtype=torch.int32)
+    _run_forward(
+        mla, q[c1_idx], compressed_kv[c1_idx], k_pe[c1_idx], latent_cache[c1_idx], pos_c1, meta_c1
+    )
+
+    # Chunk 2: cached KV path — threshold check matters here.
+    meta_c2 = _make_metadata(
+        attn_cls, new_per_seq, kv_mgr, mapping, sparse_config, cached_per_seq=cached_per_seq
+    )
+    pos_c2 = torch.arange(cached_per_seq[0], total_per_seq[0], device=device, dtype=torch.int32)
+
+    # max_ctx_kv_len (96) > threshold (80) -> short MHA should NOT be used.
+    assert not mla._should_use_short_mha(meta_c2, pos_c2)
+
+    # With threshold large enough for the full KV -> short MHA IS used.
+    mla.short_seq_mha_threshold = total_per_seq[0] + 100
+    assert mla._should_use_short_mha(meta_c2, pos_c2)
+
+    kv_mgr.shutdown()
