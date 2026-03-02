@@ -28,7 +28,8 @@
 
 namespace tensorrt_llm::batch_manager::radix_block_tree
 {
-using BlockMatch = ValueMatch<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>, std::shared_ptr<kv_cache_manager::KVCacheBlock>>;
+using BlockMatch = ValueMatch<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>,
+    std::shared_ptr<kv_cache_manager::KVCacheBlock>>;
 using BlockMatches = std::vector<BlockMatch>;
 
 // Convenience method to claim a block. May not be used, mostly here to show how to claim blocks.
@@ -48,8 +49,8 @@ bool claimBlock(BlockMatch& match)
 // ValueKeyHashFunctor = std::hash<int> since that already exists.
 // Value = std::shared_ptr<KVCacheBlock> very important to use a pointer here since we are planning to modify
 // KVCacheBlock state. supportsPartialMatching = true, because BlockKey supports partial matching.
-class UnifiedBlockTree : public templated_trie::Trie<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>,
-                             std::shared_ptr<kv_cache_manager::KVCacheBlock>, true>
+class UnifiedBlockTree : public templated_trie::Trie<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int,
+                             std::hash<int>, std::shared_ptr<kv_cache_manager::KVCacheBlock>, true>
 {
 public:
     UnifiedBlockTree() = default;

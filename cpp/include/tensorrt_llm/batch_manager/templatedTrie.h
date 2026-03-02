@@ -485,12 +485,11 @@ public:
             if (optValue.has_value())
             {
                 valueMatches.matches.emplace_back(
-                        nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);
+                    nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);
             }
             else
             {
-                valueMatches.matches.emplace_back(
-                        nodeMatch.key, nodeMatch.node, vkey);
+                valueMatches.matches.emplace_back(nodeMatch.key, nodeMatch.node, vkey);
             }
         }
         for (auto const& nodeMatch : nodeMatches.partialMatches)
@@ -499,7 +498,7 @@ public:
             if (optValue.has_value() != nullptr)
             {
                 valueMatches.matches.emplace_back(
-                        nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);
+                    nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);
                 break; // Found longest match, we are done searching for partial match
             }
         }
