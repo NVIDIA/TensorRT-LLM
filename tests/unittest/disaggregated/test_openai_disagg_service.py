@@ -2,6 +2,7 @@ import asyncio
 from unittest.mock import AsyncMock
 
 import pytest
+import torch
 
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
@@ -14,7 +15,9 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggScheduleStyle,
     UsageInfo,
     _deserialize_first_gen_log_probs,
+    _deserialize_first_gen_logits,
     _serialize_first_gen_log_probs,
+    _serialize_first_gen_logits,
 )
 from tensorrt_llm.serve.router import Router
 
@@ -220,3 +223,49 @@ class TestFirstGenLogProbsSerializeRoundtrip:
     def test_deserialize_rejects_missing_keys(self):
         with pytest.raises(ValueError, match="missing required keys"):
             _deserialize_first_gen_log_probs([[{"token_id": 1}]])
+
+
+class TestFirstGenLogitsSerializeRoundtrip:
+    """Verify generation logits survive serialize -> deserialize."""
+
+    def test_none_passthrough(self):
+        assert _serialize_first_gen_logits(None) is None
+        assert _deserialize_first_gen_logits(None) is None
+
+    @pytest.mark.parametrize("dtype", [torch.float32, torch.float16])
+    def test_single_beam_roundtrip(self, dtype):
+        original = [torch.randn(1, 128, dtype=dtype)]
+        serialized = _serialize_first_gen_logits(original)
+        assert isinstance(serialized, list) and len(serialized) == 1
+        assert isinstance(serialized[0], dict)
+        assert set(serialized[0].keys()) == {"data", "shape", "dtype"}
+        restored = _deserialize_first_gen_logits(serialized)
+        assert len(restored) == 1
+        torch.testing.assert_close(restored[0], original[0].cpu())
+
+    def test_bfloat16_converted_to_float16(self):
+        original = [torch.randn(1, 64, dtype=torch.bfloat16)]
+        serialized = _serialize_first_gen_logits(original)
+        restored = _deserialize_first_gen_logits(serialized)
+        expected = original[0].to(torch.float16).cpu()
+        torch.testing.assert_close(restored[0], expected)
+
+    def test_multi_beam_roundtrip(self):
+        original = [
+            torch.randn(1, 32, dtype=torch.float32),
+            torch.randn(1, 32, dtype=torch.float32),
+        ]
+        serialized = _serialize_first_gen_logits(original)
+        assert len(serialized) == 2
+        restored = _deserialize_first_gen_logits(serialized)
+        assert len(restored) == 2
+        for orig, rest in zip(original, restored):
+            torch.testing.assert_close(rest, orig.cpu())
+
+    def test_deserialize_invalid_type_raises(self):
+        with pytest.raises(ValueError, match="must be a dict"):
+            _deserialize_first_gen_logits(["not_a_dict"])
+
+    def test_deserialize_missing_key_raises(self):
+        with pytest.raises(ValueError, match="missing required key"):
+            _deserialize_first_gen_logits([{"data": "abc", "shape": [1]}])
