@@ -1,3 +1,4 @@
+import functools
 import math
 import weakref
 from typing import List, Optional, Union, cast
@@ -1755,6 +1756,54 @@ class MLA(nn.Module):
 
         return attn_output
 
+    @staticmethod
+    @functools.cache
+    def cached_warmup_forward_context_with_chunked_prefill(
+            num_heads_tp, qk_nope_head_dim, qk_rope_head_dim, kv_lora_rank,
+            v_head_dim, dtype, device):
+        """Warmup torch.compile for cat operations with different tensor layouts.
+
+        Tensors are marked with torch._dynamo.maybe_mark_dynamic(..., 0) on the
+        num_tokens dimension, so for num_tokens != 1 a single warmup run is
+        enough and the compiled kernel generalizes across varying num_tokens at
+        runtime. num_tokens=1 still triggers recompile (torch.compile specializes
+        for it), so it is warmed up separately. Do not use torch.compile with
+        dynamic=True here because it completely ignores tensor layout/stride
+        information, resulting in significantly degraded performance.
+        """
+
+        def warmup(num_tokens):
+            chunked_k_nope = k_nope = torch.empty(
+                num_tokens,
+                num_heads_tp * (qk_nope_head_dim + v_head_dim),
+                dtype=dtype,
+                device=device)[:, :num_heads_tp * qk_nope_head_dim].view(
+                    num_tokens, num_heads_tp, qk_nope_head_dim)
+            chunked_k_pe = torch.empty(num_tokens,
+                                       1,
+                                       qk_rope_head_dim,
+                                       dtype=dtype,
+                                       device=device).expand(
+                                           -1, num_heads_tp, -1)
+            k_pe = torch.empty(num_tokens,
+                               1,
+                               kv_lora_rank + qk_rope_head_dim,
+                               dtype=dtype,
+                               device=device)[:, :, -qk_rope_head_dim:].expand(
+                                   -1, num_heads_tp, -1)
+            torch._dynamo.maybe_mark_dynamic(chunked_k_nope, 0)
+            torch._dynamo.maybe_mark_dynamic(chunked_k_pe, 0)
+            torch._dynamo.maybe_mark_dynamic(k_pe, 0)
+            maybe_compiled_cat((chunked_k_nope, chunked_k_pe), dim=-1)
+            maybe_compiled_cat((k_nope, k_pe), dim=-1)
+
+        # With dim 0 (num_tokens) marked dynamic, one warmup suffices for all
+        # num_tokens != 1 at runtime.
+        warmup(2)
+
+        # num_tokens=1 still triggers recompile; warm it separately.
+        warmup(1)
+
     def forward_context(
         self,
         q: torch.Tensor,
@@ -1768,6 +1817,12 @@ class MLA(nn.Module):
         if isinstance(self.mha, TrtllmAttention):
             assert isinstance(attn_metadata, TrtllmAttentionMetadata)
             trtllm_attention = cast(TrtllmAttention, self.mha)
+            if trtllm_attention.is_chunked_prefill_mla_context_for_warmup(
+                    attn_metadata):
+                self.cached_warmup_forward_context_with_chunked_prefill(
+                    self.num_heads_tp, self.qk_nope_head_dim,
+                    self.qk_rope_head_dim, self.kv_lora_rank, self.v_head_dim,
+                    q.dtype, q.device)
             if trtllm_attention.is_chunked_prefill_for_mla_context(
                     attn_metadata):
                 return self.forward_context_with_chunked_prefill(
