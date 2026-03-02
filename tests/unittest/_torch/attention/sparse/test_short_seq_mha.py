@@ -25,7 +25,7 @@ import math
 import os
 from dataclasses import dataclass
 from types import SimpleNamespace
-from typing import List
+from typing import List, Tuple
 
 import pytest
 import torch
@@ -170,6 +170,16 @@ BATCH_SPECS = [
     ("multi_short", [8, 12, 16]),
     ("multi_varied", [4, 32, 10]),
     ("single_one_token", [1]),
+]
+
+# Chunked context specifications: (name, [(cached_tokens, new_tokens), ...])
+# Each tuple represents one sequence with its cached/new token split.
+CHUNKED_CONTEXT_SPECS = [
+    ("single_small", [(16, 8)]),
+    ("single_medium", [(64, 32)]),
+    ("large_cache_small_new", [(128, 4)]),
+    ("multi_seq", [(64, 32), (32, 16)]),
+    ("multi_varied", [(128, 8), (16, 64)]),
 ]
 
 
@@ -1054,6 +1064,198 @@ def test_short_mha_disabled_with_cached_tokens_multi_seq():
     kv_cache_manager.shutdown()
 
 
+@pytest.mark.skipif(get_sm_version() < 90, reason="MLA requires SM90 (Hopper) or later")
+@pytest.mark.parametrize(
+    "spec_name,chunk_specs",
+    CHUNKED_CONTEXT_SPECS,
+    ids=[s[0] for s in CHUNKED_CONTEXT_SPECS],
+)
+def test_chunked_context_correctness(spec_name: str, chunk_specs: List[Tuple[int, int]]):
+    """Verify that chunked context produces the same output as full prefill.
+
+    For each sequence, (C, N) means C tokens are processed in chunk 1
+    (populating the KV cache via short-seq MHA) and N tokens in chunk 2
+    (with C cached tokens, routed to the absorption path).  The reference
+    is a single pass of all C+N tokens via the short-seq MHA path.
+    """
+    device = torch.device("cuda")
+    dtype = torch.bfloat16
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    rope_config = _make_rope_config()
+
+    cached_per_seq = [c for c, _n in chunk_specs]
+    new_per_seq = [n for _c, n in chunk_specs]
+    total_per_seq = [c + n for c, n in chunk_specs]
+    num_seqs = len(chunk_specs)
+    total_tokens = sum(total_per_seq)
+    total_chunk1 = sum(cached_per_seq)
+    total_chunk2 = sum(new_per_seq)
+
+    # Threshold high enough for both full-prefill and chunk-1 passes to use
+    # the short-seq MHA path.
+    threshold = total_tokens + 100
+
+    mla, mapping, sparse_config, model_config = _build_mla(rope_config, device, threshold)
+    _init_mla_weights(mla)
+    AttentionCls = get_attention_backend("TRTLLM", sparse_config)
+
+    # ---- Generate full-sequence input data ----
+    q_full = torch.randn(total_tokens, NUM_HEADS * QK_HEAD_DIM, dtype=dtype, device=device)
+    compressed_kv_full = torch.randn(total_tokens, KV_LORA_RANK, dtype=dtype, device=device)
+    k_pe_full = torch.randn(total_tokens, QK_ROPE_HEAD_DIM, dtype=dtype, device=device)
+    hidden_states_full = torch.randn(total_tokens, HIDDEN_SIZE, dtype=dtype, device=device)
+    qr_full = torch.randn(total_tokens, Q_LORA_RANK, dtype=dtype, device=device)
+    latent_cache_full = torch.cat([compressed_kv_full, k_pe_full], dim=-1)
+    position_ids_full = torch.cat(
+        [torch.arange(t, device=device, dtype=torch.int32) for t in total_per_seq]
+    )
+
+    # ---- Build index arrays for splitting packed data into chunks ----
+    chunk1_indices = []
+    chunk2_indices = []
+    offset = 0
+    for c, n in chunk_specs:
+        chunk1_indices.extend(range(offset, offset + c))
+        chunk2_indices.extend(range(offset + c, offset + c + n))
+        offset += c + n
+    chunk1_idx = torch.tensor(chunk1_indices, dtype=torch.long, device=device)
+    chunk2_idx = torch.tensor(chunk2_indices, dtype=torch.long, device=device)
+
+    # ---- Reference pass: full prefill via short-seq MHA ----
+    kv_cache_ref = _build_kv_cache_manager(
+        mapping, sparse_config, model_config, total_per_seq, device
+    )
+    output_ref = torch.empty(total_tokens, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
+    attn_metadata_ref = AttentionCls.Metadata(
+        seq_lens=torch.tensor(total_per_seq, dtype=torch.int),
+        request_ids=list(range(num_seqs)),
+        max_num_requests=num_seqs,
+        num_contexts=num_seqs,
+        prompt_lens=total_per_seq,
+        max_num_tokens=total_tokens,
+        kv_cache_manager=kv_cache_ref,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[0] * num_seqs,
+        ),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    attn_metadata_ref.prepare()
+    assert total_tokens <= threshold, "Reference must use short-seq MHA"
+
+    mla.forward_context_dsa(
+        q=q_full.clone(),
+        compressed_kv=compressed_kv_full.clone(),
+        k_pe=k_pe_full.clone(),
+        attn_metadata=attn_metadata_ref,
+        output=output_ref,
+        latent_cache=latent_cache_full.clone(),
+        topk_indices=None,
+        position_ids=position_ids_full.clone(),
+    )
+    assert torch.isfinite(output_ref).all(), "Reference output has non-finite values"
+    ref_chunk2_output = output_ref[chunk2_idx]
+
+    # ---- Chunked pass: chunk 1 (pure prefill, populates KV cache) ----
+    kv_cache_chunked = _build_kv_cache_manager(
+        mapping, sparse_config, model_config, total_per_seq, device
+    )
+
+    output_chunk1 = torch.empty(total_chunk1, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
+    attn_metadata_c1 = AttentionCls.Metadata(
+        seq_lens=torch.tensor(cached_per_seq, dtype=torch.int),
+        request_ids=list(range(num_seqs)),
+        max_num_requests=num_seqs,
+        num_contexts=num_seqs,
+        prompt_lens=cached_per_seq,
+        max_num_tokens=total_chunk1,
+        kv_cache_manager=kv_cache_chunked,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=[0] * num_seqs,
+        ),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    attn_metadata_c1.prepare()
+    assert total_chunk1 <= threshold, "Chunk 1 must use short-seq MHA"
+
+    position_ids_c1 = torch.cat(
+        [torch.arange(c, device=device, dtype=torch.int32) for c in cached_per_seq]
+    )
+    mla.forward_context_dsa(
+        q=q_full[chunk1_idx].clone(),
+        compressed_kv=compressed_kv_full[chunk1_idx].clone(),
+        k_pe=k_pe_full[chunk1_idx].clone(),
+        attn_metadata=attn_metadata_c1,
+        output=output_chunk1,
+        latent_cache=latent_cache_full[chunk1_idx].clone(),
+        topk_indices=None,
+        position_ids=position_ids_c1,
+    )
+
+    # ---- Chunked pass: chunk 2 (cached tokens → absorption path) ----
+    output_chunk2 = torch.empty(total_chunk2, NUM_HEADS * V_HEAD_DIM, dtype=dtype, device=device)
+    attn_metadata_c2 = AttentionCls.Metadata(
+        seq_lens=torch.tensor(new_per_seq, dtype=torch.int),
+        request_ids=list(range(num_seqs)),
+        max_num_requests=num_seqs,
+        num_contexts=num_seqs,
+        prompt_lens=new_per_seq,
+        max_num_tokens=total_chunk2,
+        kv_cache_manager=kv_cache_chunked,
+        kv_cache_params=KVCacheParams(
+            use_cache=True,
+            num_cached_tokens_per_seq=cached_per_seq,
+        ),
+        mapping=mapping,
+        sparse_attention_config=sparse_config,
+    )
+    attn_metadata_c2.prepare()
+    assert attn_metadata_c2.num_ctx_cached_tokens == sum(cached_per_seq)
+
+    position_ids_c2 = torch.cat(
+        [torch.arange(c, c + n, device=device, dtype=torch.int32) for c, n in chunk_specs]
+    )
+
+    # Absorption path needs topk_indices from the indexer.
+    hidden_states_c2 = hidden_states_full[chunk2_idx]
+    qr_c2 = qr_full[chunk2_idx]
+    topk_indices = mla.mqa.indexer(
+        qr_c2,
+        hidden_states_c2,
+        attn_metadata_c2,
+        position_ids_c2,
+        indexer_k=mla.mqa.indexer.wk(hidden_states_c2),
+    )
+
+    mla.forward_context_dsa(
+        q=q_full[chunk2_idx].clone(),
+        compressed_kv=compressed_kv_full[chunk2_idx].clone(),
+        k_pe=k_pe_full[chunk2_idx].clone(),
+        attn_metadata=attn_metadata_c2,
+        output=output_chunk2,
+        latent_cache=latent_cache_full[chunk2_idx].clone(),
+        topk_indices=topk_indices,
+        position_ids=position_ids_c2,
+    )
+
+    # ---- Compare chunk 2 output vs reference ----
+    assert torch.isfinite(output_chunk2).all(), "Chunk 2 output has non-finite values"
+    abs_error = (output_chunk2 - ref_chunk2_output).abs()
+    torch.testing.assert_close(output_chunk2, ref_chunk2_output, rtol=0.08, atol=0.08)
+    print(
+        f"[chunked_{spec_name}] PASSED: max_error={abs_error.max():.4f}, "
+        f"mean_error={abs_error.mean():.6f}"
+    )
+
+    kv_cache_ref.shutdown()
+    kv_cache_chunked.shutdown()
+
+
 if __name__ == "__main__":
     for batch_name, seq_lens in BATCH_SPECS:
         test_forward_context_short_mha(batch_name, seq_lens)
@@ -1063,4 +1265,6 @@ if __name__ == "__main__":
     test_short_mha_agrees_with_absorption_path()
     test_short_mha_disabled_with_cached_tokens()
     test_short_mha_disabled_with_cached_tokens_multi_seq()
+    for spec_name, chunk_specs in CHUNKED_CONTEXT_SPECS:
+        test_chunked_context_correctness(spec_name, chunk_specs)
     print("All tests passed!")
