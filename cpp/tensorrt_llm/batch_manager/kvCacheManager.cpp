@@ -1184,11 +1184,12 @@ void WindowBlockManager::offloadBlock(
     return onlyManager.findNewContextBlock(uniqueTokens, llmRequest);
 }
 
-SizeType32 BlockManager::countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+SizeType32 BlockManager::countReusableBlocks(
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
     TLLM_CHECK_WITH_INFO(!isVariableWindow(), "countReusableBlocks does not work for variable window attention");
     auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
-    return onlyManager.countReusableBlocks(uniqueTokens, llmRequest);
+    return onlyManager.countReusableBlocks(uniqueTokens, llmRequest, onlyAllocated);
 }
 
 std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
@@ -1217,7 +1218,7 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
 }
 
 SizeType32 WindowBlockManager::countReusableBlocks(
-    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
     // Chop tokens into full blocks only (allowPartial=false)
     auto blockedUniqueTokens
@@ -1240,12 +1241,19 @@ SizeType32 WindowBlockManager::countReusableBlocks(
             break;
         }
 
-        // Found a matching block that can be reused
-        ++reusableBlocks;
+        // When onlyAllocated is true, only count blocks that are already allocated
+        // to an active sequence (have refs). Sharing these blocks doesn't consume
+        // from the free pool. Free cached blocks (no refs) are already counted in
+        // the eviction policy's free count and must not be double-counted.
+        if (!onlyAllocated || matchingBlock->hasRefs())
+        {
+            ++reusableBlocks;
+        }
         searchRoot = std::move(matchingBlock);
     }
 
-    TLLM_LOG_DEBUG("%s::countReusableBlocks - Found %d reusable blocks", mLogPrefix.c_str(), reusableBlocks);
+    TLLM_LOG_DEBUG("%s::countReusableBlocks - Found %d reusable blocks (onlyAllocated=%d)", mLogPrefix.c_str(),
+        reusableBlocks, onlyAllocated);
     return reusableBlocks;
 }
 
@@ -2277,11 +2285,16 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
+        // Subtract only reusable blocks that are already allocated (have active refs from another
+        // sequence). Sharing an allocated block doesn't consume from the free pool. We must NOT
+        // subtract free reusable blocks (blocks cached in the radix tree but without active refs),
+        // because those are already counted in the eviction policy's free block count — subtracting
+        // them would double-count (once as reducing demand, once as inflating supply), causing the
+        // scheduler to over-admit requests and leading to "No free block found" errors.
         if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv())
         {
             auto const uniqueTokens = req.getUniqueTokens(0);
-            auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
+            auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
             // Only subtract from shared blocks (reusable blocks are always shared)
             auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
             numRequiredBlocks -= reusableSharedBlocks;
@@ -2341,7 +2354,6 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
 
     SizeType32 const numGenBlocksPerBeam = numTotalBlocksPerBeam - numContextBlocks;
 
-    // Get allocated blocks count first - needed to decide if reuse accounting applies
     SizeType32 numAllocBlocksPerBeam = 0;
     {
         std::scoped_lock lck(mSequencesMtx);
@@ -2353,18 +2365,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         }
     }
 
-    // Calculate reusable blocks to subtract from context blocks (for new context requests)
-    // Only apply reuse accounting if:
-    // 1. Block reuse is enabled
-    // 2. Not using variable window attention
-    // 3. Request is in context init state and first context chunk
-    // 4. No blocks have been allocated yet for this sequence (otherwise reuse already applied during allocation)
+    // Only subtract reusable blocks that are already allocated (have active refs). See the
+    // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
+    // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
     if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
         && numAllocBlocksPerBeam == 0)
     {
         auto const uniqueTokens = req.getUniqueTokens(0);
-        auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
+        auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
         numReusableContextBlocks = std::min(numReusableBlocks, numContextBlocks);
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, numReusableBlocks=%d, "
@@ -2385,7 +2394,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     SizeType32 numExtraBlocksPerBeam
         = isSlidingWindow && willCrossBlockBoundary && willCrossWindowBlockBoundary ? 1 : 0;
 
-    // Adjust for reusable context blocks
+    // Adjust for reusable context blocks (only allocated ones)
     SizeType32 const effectiveContextBlocks = numContextBlocks - numReusableContextBlocks;
 
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
@@ -2394,7 +2403,6 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
             + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
 
-    // For generation phase, we don't benefit from reuse anymore
     SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
     return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
@@ -2505,9 +2513,10 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
     return newContextBlockOpt;
 }
 
-SizeType32 KVCacheManager::countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+SizeType32 KVCacheManager::countReusableBlocks(
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
-    return mBlockManager.countReusableBlocks(uniqueTokens, llmRequest);
+    return mBlockManager.countReusableBlocks(uniqueTokens, llmRequest, onlyAllocated);
 }
 
 bool KVCacheManager::addSequence(
