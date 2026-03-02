@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Optional
 
 import torch
@@ -48,7 +49,8 @@ class Mamba2Mixer(nn.Module):
         *,
         d_model: int,
         d_state: int,
-        d_conv: int,
+
+d_conv: int,
         nheads: int,
         n_groups: int,
         head_dim: int,
@@ -338,10 +340,7 @@ class Mamba2Mixer(nn.Module):
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes,
-                    dtype=torch.int32,
-                    device=state_indices_d.device)
+                intermediate_state_indices = _cached_arange(attn_metadata.kv_cache_manager.get_max_resource_count(), state_indices_d.device)[:num_decodes]
 
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
@@ -355,7 +354,7 @@ class Mamba2Mixer(nn.Module):
                     activation="silu",
                     conv_state_indices=state_indices_d[:num_decodes],
                     intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
 
                 xbc_d = xbc_d_processed.transpose(1, 2).view(
@@ -421,7 +420,7 @@ class Mamba2Mixer(nn.Module):
                     disable_state_update=True,
                     intermediate_states_buffer=intermediate_ssm_states,
                     cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
             else:
                 self.selective_state_update_func_no_mtp(
@@ -447,3 +446,16 @@ class Mamba2Mixer(nn.Module):
         out = self.out_proj(hidden_states)
 
         return out[:num_actual_tokens]
+
+
+# We don't want to recreate an indexing vector at every call.  We can
+# just make one as long as we should ever need, and mask it.  But we
+# don't have access at init to the intermediate state cache size. And
+# in theory the same layer could be called with a new mamba cache
+# manager with a different size later.  So we lazily create the
+# vectors here in the forward pass for the sizes we need, and cache
+# them.  This should get populated in the warmup before cuda graph
+# capture, and we should only really ever need one size.
+@functools.cache
+def _cached_arange(n: int, device: torch.device) -> torch.Tensor:
+  return torch.arange(n, dtype=torch.int32, device=device)
