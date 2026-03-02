@@ -538,11 +538,10 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self,
                            enable_chunked_prefill=False,
-                           attn_backend="flashinfer"):
+                           mla_attn_backend="flashinfer_mla"):
         config = {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "attn_backend": attn_backend,
             "compile_backend": "torch-cudagraph",
             "max_batch_size": 128,
             "max_seq_len": self.MAX_SEQ_LEN,
@@ -569,6 +568,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
                     "stage": "compile",
                     "enabled": True,
                 },
+                "insert_cached_mla_attention": {
+                    "backend": mla_attn_backend,
+                },
             }
         }
         if enable_chunked_prefill:
@@ -587,9 +589,11 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(32000)
     @pytest.mark.parametrize("enable_chunked_prefill", [True, False])
-    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
-    def test_auto_dtype(self, enable_chunked_prefill, attn_backend):
-        kwargs = self.get_default_kwargs(enable_chunked_prefill, attn_backend)
+    @pytest.mark.parametrize("mla_attn_backend",
+                             ["flashinfer_mla", "trtllm_mla"])
+    def test_auto_dtype(self, enable_chunked_prefill, mla_attn_backend):
+        kwargs = self.get_default_kwargs(enable_chunked_prefill,
+                                         mla_attn_backend=mla_attn_backend)
         sampling_params = self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_PATH_BF16,
                            tokenizer=self.MODEL_PATH_BF16,
