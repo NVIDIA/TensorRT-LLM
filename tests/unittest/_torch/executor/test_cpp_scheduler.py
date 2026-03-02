@@ -277,6 +277,93 @@ class TestPipelineAwareChunkingPolicy:
         assert len(gen_reqs) == 0
 
 
+class TestCppNumChunks:
+    """Verify that cpp_num_chunks overrides pp_size for chunk count."""
+
+    def test_more_chunks_than_pp_stages(self):
+        """With pp_size=2 and cpp_num_chunks=4, a 1024-token request should
+        produce ~256-token chunks (1024/4) rather than ~512 (1024/2)."""
+        config = ContextChunkingConfig(
+            chunking_policy=ChunkingPolicy.PIPELINE_AWARE,
+            chunk_unit_size=64,
+            pp_size=2,
+            cpp_num_chunks=4,
+        )
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=8,
+            max_num_tokens=4096,
+            ctx_chunk_config=config,
+        )
+        req = _make_context_request(1, 1024)
+        ctx_reqs, _ = scheduler.schedule([req], set())
+        assert ctx_reqs[0].context_chunk_size == 256
+
+    def test_cpp_num_chunks_full_consumption(self):
+        """Repeatedly scheduling should produce exactly cpp_num_chunks chunks."""
+        config = ContextChunkingConfig(
+            chunking_policy=ChunkingPolicy.PIPELINE_AWARE,
+            chunk_unit_size=64,
+            pp_size=2,
+            cpp_num_chunks=8,
+        )
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=8,
+            max_num_tokens=4096,
+            ctx_chunk_config=config,
+        )
+        total_tokens = 1024
+        req = _make_context_request(1, total_tokens)
+        chunks = []
+        while req.context_remaining_length > 0:
+            ctx_reqs, _ = scheduler.schedule([req], set())
+            assert len(ctx_reqs) == 1
+            chunks.append(ctx_reqs[0].context_chunk_size)
+            req.move_to_next_context_chunk()
+
+        assert sum(chunks) == total_tokens
+        assert len(chunks) == 8
+
+    def test_cpp_num_chunks_none_falls_back_to_pp_size(self):
+        """When cpp_num_chunks is None, behaviour matches pp_size."""
+        config = ContextChunkingConfig(
+            chunking_policy=ChunkingPolicy.PIPELINE_AWARE,
+            chunk_unit_size=64,
+            pp_size=4,
+            cpp_num_chunks=None,
+        )
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=8,
+            max_num_tokens=4096,
+            ctx_chunk_config=config,
+        )
+        req = _make_context_request(1, 1024)
+        ctx_reqs, _ = scheduler.schedule([req], set())
+        assert ctx_reqs[0].context_chunk_size == 256
+
+    def test_cpp_num_chunks_capped_by_sequence_length(self):
+        """cpp_num_chunks should be capped when the sequence is too short."""
+        config = ContextChunkingConfig(
+            chunking_policy=ChunkingPolicy.PIPELINE_AWARE,
+            chunk_unit_size=64,
+            pp_size=2,
+            cpp_num_chunks=16,
+        )
+        scheduler = PyMicroBatchScheduler(
+            max_batch_size=8,
+            max_num_tokens=4096,
+            ctx_chunk_config=config,
+        )
+        req = _make_context_request(1, 200)
+        chunks = []
+        while req.context_remaining_length > 0:
+            ctx_reqs, _ = scheduler.schedule([req], set())
+            chunks.append(ctx_reqs[0].context_chunk_size)
+            req.move_to_next_context_chunk()
+
+        assert sum(chunks) == 200
+        assert len(chunks) <= 200 // 64 + 1
+
+
 class TestPipelineAwareChunkingSimulation:
     """Simulate CPP scheduling across multiple iterations, verifying that
     chunks of the same request can be pipelined through PP stages."""

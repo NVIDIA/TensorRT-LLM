@@ -1059,7 +1059,10 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
+    enable_cpp = (ctx_chunk_config is not None and len(ctx_chunk_config) > 3
+                  and ctx_chunk_config[3])
+    use_python_scheduler = (
+        os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1" or enable_cpp)
     if use_python_scheduler and not isinstance(kv_cache_manager,
                                                KVCacheManagerV2):
         scheduler = SimpleUnifiedScheduler(

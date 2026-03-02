@@ -1567,11 +1567,8 @@ class ContextChunkingPolicy(StrEnum, metaclass=PybindMirrorEnumMeta):
     ''' Context chunking policy. '''
     FIRST_COME_FIRST_SERVED = "FIRST_COME_FIRST_SERVED"
     EQUAL_PROGRESS = "EQUAL_PROGRESS"
-    PIPELINE_AWARE = "PIPELINE_AWARE"
 
     def _to_pybind(self):
-        if self == ContextChunkingPolicy.PIPELINE_AWARE:
-            return None
         return getattr(_ContextChunkingPolicy, self.value)
 
 

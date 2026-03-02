@@ -319,6 +319,7 @@ class ContextChunkingConfig:
     chunking_policy: ChunkingPolicy
     chunk_unit_size: int
     pp_size: int = 1
+    cpp_num_chunks: Optional[int] = None
 
 
 class MicroBatchScheduler:
@@ -651,22 +652,25 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
     def _chunk_pipeline_aware(self, requests: RequestList, capacity: Optional[int], unit_size: int):
         """Chunk context requests for pipeline-parallel overlap.
 
-        Splits each request's remaining context into roughly pp_size equal
+        Splits each request's remaining context into roughly num_chunks equal
         chunks (aligned to unit_size) so that successive chunks can be
-        pipelined across PP stages. The chunk scheduled in this iteration
-        is the first un-consumed portion up to the target size.
+        pipelined across PP stages. When cpp_num_chunks is set, it overrides
+        pp_size as the target chunk count, enabling finer-grained pipelining
+        (more chunks than stages for better overlap). The chunk scheduled in
+        this iteration is the first un-consumed portion up to the target size.
 
-        When the total prompt is too short to fill pp_size unit-aligned
-        chunks, the effective chunk count is reduced so that very small
-        contexts are not split unnecessarily.
+        When the total prompt is too short to fill the target number of
+        unit-aligned chunks, the effective chunk count is reduced so that
+        very small contexts are not split unnecessarily.
         """
-        pp_size = max(self.ctx_chunk_config.pp_size, 1)
+        target_num_chunks = self.ctx_chunk_config.cpp_num_chunks or max(
+            self.ctx_chunk_config.pp_size, 1)
         current_capacity = capacity if capacity is not None else float("inf")
 
         for req in requests:
             total_prompt_length = req.context_current_position + req.context_remaining_length
             max_possible_chunks = max(total_prompt_length // unit_size, 1)
-            num_chunks = min(pp_size, max_possible_chunks)
+            num_chunks = min(target_num_chunks, max_possible_chunks)
 
             if num_chunks <= 1:
                 target_chunk_size = req.context_remaining_length
@@ -1396,12 +1400,15 @@ class SimpleUnifiedScheduler(RequestScheduler):
         # 2. Initialize Python MicroBatch Scheduler
         py_chunk_config = None
         if ctx_chunk_config:
-            # Fix: Use string comparison to identify the policy.
-            # This works regardless of whether the input is a Python Enum, C++ Binding Enum, or String.
             input_policy = ctx_chunk_config[0]
+            unit_size = ctx_chunk_config[1]
             pp_size = ctx_chunk_config[2] if len(ctx_chunk_config) > 2 else 1
+            enable_cpp = (ctx_chunk_config[3]
+                          if len(ctx_chunk_config) > 3 else False)
+            cpp_num_chunks = (ctx_chunk_config[4]
+                              if len(ctx_chunk_config) > 4 else None)
 
-            if "PIPELINE_AWARE" in str(input_policy):
+            if enable_cpp:
                 policy_enum = ChunkingPolicy.PIPELINE_AWARE
             elif "EQUAL_PROGRESS" in str(input_policy):
                 policy_enum = ChunkingPolicy.EQUAL_PROGRESS
@@ -1409,7 +1416,7 @@ class SimpleUnifiedScheduler(RequestScheduler):
                 policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
 
             py_chunk_config = ContextChunkingConfig(
-                policy_enum, ctx_chunk_config[1], pp_size)
+                policy_enum, unit_size, pp_size, cpp_num_chunks)
 
         self.micro_batch_scheduler = PyMicroBatchScheduler(
             max_batch_size=max_batch_size,

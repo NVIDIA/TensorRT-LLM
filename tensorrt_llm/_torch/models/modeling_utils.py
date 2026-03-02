@@ -264,7 +264,7 @@ class DecoderModel(nn.Module, metaclass=PPInitCaller):
 
         hidden_states = inputs_embeds
 
-        for layer_idx, decoder_layer in enumerate(self.layers):
+        for decoder_layer in self.layers:
             hidden_states = decoder_layer(
                 position_ids=position_ids,
                 hidden_states=hidden_states,
