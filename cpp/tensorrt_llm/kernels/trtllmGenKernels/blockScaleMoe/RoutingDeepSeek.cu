@@ -712,7 +712,8 @@ void run(Data& data, void* stream)
                 data.mNumExperts);
 
             TLLM_CHECK_WITH_INFO(data.mNumFusedSharedExperts <= WarpSize,
-                "Number of fused shared experts (%d must be less than warp size.", WarpSize);
+                "Number of fused shared experts (%d) must be less than or equal to warp size (%d).",
+                data.mNumFusedSharedExperts, WarpSize);
 
             if (data.mNumFusedSharedExperts > 0)
             {
@@ -741,8 +742,9 @@ void run(Data& data, void* stream)
     {
         data.mNumExperts += data.mNumFusedSharedExperts;
         data.mTopK += data.mNumFusedSharedExperts;
-        data.mNumLocalExperts += data.mNumFusedSharedExperts;
-        // data.mLocalExpertsStartIdx += data.mNumFusedSharedExperts;
+        // Note: mNumLocalExperts should NOT be modified as fused shared experts are
+        // globally indexed at [mNumExperts, mNumExperts + mNumFusedSharedExperts),
+        // not local to each rank. Modifying it breaks locality semantics in multi-rank scenarios.
     }
 
     if (data.mPtrPermutedIdxSize != nullptr)
