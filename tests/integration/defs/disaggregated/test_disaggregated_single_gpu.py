@@ -187,8 +187,9 @@ async def run_worker(kv_cache_config,
                                 flush=True)
                             per_chunk_logits.append(shape)
                             chunk_idx += 1
-                        print(f"Worker {rank}: got streaming result {i}, sending",
-                              flush=True)
+                        print(
+                            f"Worker {rank}: got streaming result {i}, sending",
+                            flush=True)
                         intercomm.send(per_chunk_logits, dest=0, tag=MPI_RESULT)
                     else:
                         try:
@@ -197,11 +198,13 @@ async def run_worker(kv_cache_config,
                                 flush=True)
                             result = await future
                             print(f"Worker {rank}: got result {i}, sending",
-                                flush=True)
-                            intercomm.send(result.outputs, dest=0, tag=MPI_RESULT)
+                                  flush=True)
+                            intercomm.send(result.outputs,
+                                           dest=0,
+                                           tag=MPI_RESULT)
                         except Exception as e:
                             print(f"Worker {rank}: error on future {i}: {e}",
-                                flush=True)
+                                  flush=True)
                             intercomm.send(str(e), dest=0, tag=MPI_RESULT)
         except Exception as e:
             print(f"Unexpected error: {e}", flush=True)
