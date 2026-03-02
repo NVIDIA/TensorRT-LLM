@@ -702,6 +702,7 @@ std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> KVCachePromptLooku
             if (exactMatch.size() == 1)
             {
                 [[maybe_unused]] auto const& [dummy1, dummy2, exactMatchingNode] = exactMatch[0];
+                std::vector<SizeType32> toRemove;
                 for (auto windowSize : stillLooking)
                 {
                     auto block = exactMatchingNode->getBlock(windowSize);
@@ -712,8 +713,12 @@ std::unordered_map<SizeType32, std::shared_ptr<KVCacheBlock>> KVCachePromptLooku
                     else
                     {
                         // Enforce rule that all blocks must be preceded by only valid blocks (no nullptrs allowed)
-                        stillLooking.erase(windowSize);
+                        toRemove.push_back(windowSize);
                     }
+                }
+                for (auto ws : toRemove)
+                {
+                    stillLooking.erase(ws);
                 }
                 searchRoot = exactMatchingNode;
             }
@@ -770,6 +775,8 @@ KVCachePromptLookup::lookupBlocks(std::map<SizeType32, WindowBlockManager> const
                 // found exact matching node
                 [[maybe_unused]] auto const& [dummy1, dummy2, exactMatchingNode] = exactMatch[0];
                 nextSearchRoot = exactMatchingNode;
+                
+                std::vector<SizeType32> toRemove;
                 for (auto windowSize : stillLooking)
                 {
                     auto block = exactMatchingNode->getBlock(windowSize);
@@ -791,9 +798,13 @@ KVCachePromptLookup::lookupBlocks(std::map<SizeType32, WindowBlockManager> const
                         else
                         {
                             // partial match disabled, cancel
-                            stillLooking.erase(windowSize);
+                            toRemove.push_back(windowSize);
                         }
                     }
+                }
+                for (auto ws : toRemove)
+                {
+                    stillLooking.erase(ws);
                 }
             }
             else
@@ -847,7 +858,7 @@ KVCachePromptLookup::lookupBlocks(std::map<SizeType32, WindowBlockManager> const
     {
         auto& winres = results[windowSize];
         auto i = static_cast<SizeType32>(winres.size()) - 1;
-        for (; i > 0; --i)
+        for (; i >= 0; --i)
         {
             auto const& [isPartial, nuMatched, block, node] = winres[i];
             if (block != nullptr && !block->isPlaceholder())
