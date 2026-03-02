@@ -1885,7 +1885,7 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = copy.copy(model_config)
         assert hasattr(model_config.pretrained_config, 'text_config'), \
-            "KimiK25 config must have text_config"
+            "Kimi K2.5 config must have text_config"
         model_config._frozen = False
         model_config.pretrained_config = model_config.pretrained_config.text_config
         if model_config.quant_config.exclude_modules:
