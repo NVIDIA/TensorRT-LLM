@@ -446,6 +446,9 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
                     "stage": "compile",
                     "enabled": True,
                 },
+                "fuse_nvfp4_trtllm_gen_moe": {
+                    "enabled": True,
+                }
             }
         }
 
