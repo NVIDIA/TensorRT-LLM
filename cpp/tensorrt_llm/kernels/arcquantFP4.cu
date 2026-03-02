@@ -176,7 +176,8 @@ __global__ void quantize_reorder_nvfp4_kernel(
     scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
     int pos = tid + max(0, tid - GROUP_NUM(KQ - KE));
     int64_t sf_offset = get_sf_offset(row_id, pos, K);
-    __nv_fp8_e4m3 scale_ue4m3 = (__nv_fp8_e4m3) scale;
+    __nv_fp8_e4m3 scale_ue4m3;
+    scale_ue4m3.__x = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
     q_scale_tensor[sf_offset] = scale_ue4m3;
     // Use reverse scale to replace division by multiplication
     float qdq_scale = (float) scale_ue4m3;
@@ -219,7 +220,8 @@ __global__ void quantize_reorder_nvfp4_kernel(
             }
             scale = cuda_max(maxv / FP4_MAX, SCALE_EPS);
             sf_offset = get_sf_offset(row_id, pos + 1, K);
-            __nv_fp8_e4m3 scale_ue4m3_res = (__nv_fp8_e4m3) scale;
+            __nv_fp8_e4m3 scale_ue4m3_res;
+            scale_ue4m3_res.__x = __nv_cvt_float_to_fp8(scale, __NV_SATFINITE, __NV_E4M3);
             q_scale_tensor[sf_offset] = scale_ue4m3_res;
             r_scale = reciprocal_approximate_ftz((float) scale_ue4m3_res);
             for (int i = 0; i < elements_per_thread; i += 4)
