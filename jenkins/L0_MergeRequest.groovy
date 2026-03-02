@@ -10,18 +10,28 @@ import org.jsoup.Jsoup
 import org.jenkinsci.plugins.pipeline.modeldefinition.Utils as jUtils
 
 // LLM repository configuration
+@Field String LLM_REPO
 withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
     LLM_REPO = env.gitlabSourceRepoHttpUrl ? env.gitlabSourceRepoHttpUrl : "${DEFAULT_LLM_REPO}"
 }
-LLM_ROOT = "llm"
+@Field String LLM_ROOT = "llm"
 
-// LLM repository configuration
+@Field String BOT_REPO = ""
+withCredentials([string(credentialsId: 'default-git-url', variable: 'DEFAULT_GIT_URL')]) {
+    BOT_REPO = "https://${DEFAULT_GIT_URL}/ftp/llm-bloom-bot.git"
+}
+@Field String BOT_REVISION = "master"
+@Field String BOT_ROOT = "bot"
+
+// Scan repository configuration
 withCredentials([string(credentialsId: 'default-scan-repo', variable: 'DEFAULT_SCAN_REPO')]) {
     SCAN_REPO = "${DEFAULT_SCAN_REPO}"
 }
 SCAN_COMMIT = "main"
 SCAN_ROOT = "scan"
 
+// Note: These variables access 'env' which is only available during pipeline execution
+// so they cannot be @Field with initialization
 ARTIFACT_PATH = env.artifactPath ? env.artifactPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 UPLOAD_PATH = env.uploadPath ? env.uploadPath : "sw-tensorrt-generic/llm-artifacts/${JOB_NAME}/${BUILD_NUMBER}"
 
@@ -146,12 +156,15 @@ def ACTION_INFO = "action_info"
 def IMAGE_KEY_TO_TAG = "image_key_to_tag"
 @Field
 def TARGET_BRANCH = "target_branch"
+@Field
+def DOWNSTREAM_JOB_DURATION = "downstream_job_duration"
 def globalVars = [
     (GITHUB_PR_API_URL): gitlabParamsFromBot.get('github_pr_api_url', null),
     (CACHED_CHANGED_FILE_LIST): null,
     (ACTION_INFO): gitlabParamsFromBot.get('action_info', null),
     (IMAGE_KEY_TO_TAG): [:],
     (TARGET_BRANCH): gitlabParamsFromBot.get('target_branch', null),
+    (DOWNSTREAM_JOB_DURATION): [:],
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
@@ -213,7 +226,7 @@ def createKubernetesPodConfig(image, type, arch = "amd64")
     case "agent":
         containerConfig = """
                   - name: alpine
-                    image: urm.nvidia.com/docker/alpine:latest
+                    image: urm.nvidia.com/sw-tensorrt-docker-local/alpine-golem:latest
                     command: ['cat']
                     tty: true
                     resources:
@@ -834,7 +847,7 @@ def getOnlyOneGroupChanged(pipeline, testFilter, globalVars) {
     return ""
 }
 
-def collectTestResults(pipeline, testFilter)
+def collectTestResults(pipeline, testFilter, globalVars)
 {
     collectResultPodSpec = createKubernetesPodConfig("", "agent")
     trtllm_utils.launchKubernetesPod(pipeline, collectResultPodSpec, "alpine", {
@@ -868,6 +881,15 @@ def collectTestResults(pipeline, testFilter)
 
             junit(testResults: '**/results*.xml', allowEmptyResults : true)
         } // Collect test result stage
+        if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+            stage("Update GitHub Tag") {
+                // Wrap in catchError to ensure tag update failures don't fail the pipeline
+                catchError(buildResult: 'SUCCESS', stageResult: 'UNSTABLE') {
+                    trtllm_utils.llmExecStepWithRetry(pipeline, script: "which git || apk add --no-cache git", sleepTime: 10)
+                    updateGithubTagCommit(pipeline, globalVars)
+                }
+            }
+        }
         stage("Collect Perf Regression Result") {
             def yamlFiles = sh(
                 returnStdout: true,
@@ -978,7 +1000,7 @@ def getCommonParameters()
     ]
 }
 
-def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
+def triggerJob(jobName, parameters, globalVars, jenkinsUrl = "", credentials = "")
 {
     if (jenkinsUrl == "" && env.localJobCredentials) {
         jenkinsUrl = env.JENKINS_URL
@@ -995,6 +1017,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
             abortTriggeredJob: true,
         )
         status = handle.getBuildResult().toString()
+        globalVars[DOWNSTREAM_JOB_DURATION][jobName] = handle.getBuildDuration() / 1000 / 60 // Convert to minutes
     } else {
         def handle = build(
             job: jobName,
@@ -1003,6 +1026,7 @@ def triggerJob(jobName, parameters, jenkinsUrl = "", credentials = "")
         )
         echo "Triggered job: ${handle.absoluteUrl}"
         status = handle.result
+        globalVars[DOWNSTREAM_JOB_DURATION][jobName] = handle.duration / 1000 / 60 // Convert to minutes
     }
     return status
 }
@@ -1039,7 +1063,7 @@ def launchJob(jobName, reuseBuild, enableFailFast, globalVars, platform="x86_64"
 
     echo "Trigger ${jobName} job, params: ${parameters}"
 
-    def status = triggerJob(jobName, parameters)
+    def status = triggerJob(jobName, parameters, globalVars)
     if (status != "SUCCESS") {
         error "Downstream job did not succeed"
     }
@@ -1306,6 +1330,64 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     pipeline.parallel parallelJobs
 }
 
+/**
+ * Update GitHub tag for post-merge builds (triggered by GitLab mirror).
+ * Delegates all logic to the Python script jenkins/scripts/update_github_tag.py
+ *
+ * Note: Only supports post-merge builds. Pre-merge PR/MR are temporary tests
+ * and should not trigger tag updates.
+ */
+def updateGithubTagCommit(pipeline, globalVars) {
+    // Only update tag for post-merge builds
+    if (!(env.JOB_NAME ==~ /.*PostMerge.*/)) {
+        echo "Not a PostMerge build - skipping tag update"
+        return false
+    }
+
+    // In post block, currentBuild.result is already determined (SUCCESS, FAILURE, UNSTABLE, or ABORTED)
+    // It will never be null at this point since post blocks run after all stages complete
+    def buildResult = currentBuild.result ?: 'UNKNOWN'
+
+    // Checkout bot repo (needed by the Python script for failure analysis)
+    // Only needed if build has failed (not SUCCESS)
+    if (buildResult != 'SUCCESS') {
+        trtllm_utils.checkoutSource(BOT_REPO, BOT_REVISION, BOT_ROOT)
+    }
+
+    def downstreamDurationsJson = writeJSON(returnText: true, json: globalVars.get(DOWNSTREAM_JOB_DURATION, [:]))
+    def targetBranch = env.gitlabTargetBranch ?: (globalVars[TARGET_BRANCH] ?: "main")
+
+    withCredentials([
+        usernamePassword(
+            credentialsId: 'github-cred-trtllm-ci',
+            usernameVariable: 'GITHUB_USER',
+            passwordVariable: 'GITHUB_TOKEN'
+        )
+    ]) {
+        def status = sh(
+            script: """python3 ${LLM_ROOT}/jenkins/scripts/update_github_tag.py \
+                --build-result '${buildResult}' \
+                --commit-sha '${env.gitlabCommit}' \
+                --target-branch '${targetBranch}' \
+                --llm-repo '${LLM_REPO}' \
+                --downstream-durations '${downstreamDurationsJson}' \
+                --jenkins-url '${JENKINS_URL}' \
+                --job-name '${env.JOB_NAME}' \
+                --build-number '${env.BUILD_NUMBER}' \
+                --bot-root '${BOT_ROOT}'""",
+            returnStatus: true,
+            label: "Update GitHub Tag"
+        )
+
+        if (status == 0) {
+            echo "✓ GitHub tag updated successfully"
+            return true
+        }
+        echo "GitHub tag update skipped or failed (exit code: ${status})"
+        return false
+    }
+}
+
 pipeline {
     agent {
         kubernetes createKubernetesPodConfig("", "agent")
@@ -1338,7 +1420,7 @@ pipeline {
         always {
             script {
                 if (!isReleaseCheckMode) {
-                    collectTestResults(this, testFilter)
+                    collectTestResults(this, testFilter, globalVars)
                 }
             }
         }
