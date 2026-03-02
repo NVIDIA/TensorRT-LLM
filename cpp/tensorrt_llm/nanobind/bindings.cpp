@@ -40,6 +40,7 @@
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/nanobind/batch_manager/kvCacheManagerV2Utils.h"
 #include "tensorrt_llm/nanobind/batch_manager/llmRequest.h"
+#include "tensorrt_llm/nanobind/common/bindings.h"
 #include "tensorrt_llm/nanobind/common/tllmExceptions.h"
 #include "tensorrt_llm/nanobind/executor/bindings.h"
 #include "tensorrt_llm/nanobind/process_group/bindings.h"
@@ -134,11 +135,13 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
     auto mInternalBatchManagerKvCacheV2Utils
         = mInternalBatchManager.def_submodule("kv_cache_manager_v2_utils", "KV Cache Manager V2 Utils bindings");
     auto mInternalThop = mInternal.def_submodule("thop", "Torch op internal bindings");
+    auto mInternalCommon = mInternal.def_submodule("common", "Common utilities internal bindings");
     auto mExceptions = m.def_submodule("exceptions", "Exceptions internal bindings");
 
     tensorrt_llm::nanobind::executor::initBindings(mExecutor);
     tensorrt_llm::nanobind::runtime::initBindingsEarly(mInternalRuntime);
     tensorrt_llm::nanobind::common::initExceptionsBindings(mExceptions);
+    tensorrt_llm::nanobind::common::initBindings(mInternalCommon);
     tensorrt_llm::nanobind::thop::initBindings(mInternalThop);
 
     auto buildInfo = m.def_submodule("BuildInfo");
