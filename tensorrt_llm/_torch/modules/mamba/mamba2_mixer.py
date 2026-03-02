@@ -13,8 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-
 import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
@@ -61,8 +59,8 @@ class Mamba2Mixer(nn.Module):
         remove_padding: bool = True,
         apply_silu: bool = True,
         rms_norm_eps: float = 1e-5,
-        dtype: Optional[torch.dtype] = None,
-        config: Optional[ModelConfig] = None,
+        dtype: torch.dtype | None = None,
+        config: ModelConfig | None = None,
     ):
         super().__init__()
 
@@ -169,6 +167,11 @@ class Mamba2Mixer(nn.Module):
                         dtype=torch.float32,
                         requires_grad=False))
 
+        # Determine if NVFP4 quantization is enabled
+        self.is_nvfp4 = (config.quant_config is not None
+                         and config.quant_config.quant_mode is not None
+                         and config.quant_config.quant_mode.has_nvfp4())
+
         # norm
         self.norm = RMSNormGated(
             self.tp_d_inner,
@@ -176,6 +179,9 @@ class Mamba2Mixer(nn.Module):
             norm_before_gate=False,
             group_size=self.tp_d_inner // self.tp_ngroups,
             dtype=dtype,
+            # Enable fused NVFP4 quantization if possible.
+            # It might be overridden in `_try_attach_nvfp4_scale` function.
+            is_nvfp4=self.is_nvfp4,
         )
 
         # out_proj
@@ -190,12 +196,27 @@ class Mamba2Mixer(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
 
+    def post_load_weights(self):
+        """Post-process after loading weights."""
+        if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
+            self._try_attach_nvfp4_scale()
+
+    def _try_attach_nvfp4_scale(self):
+        """Attach input_scale from out_proj to norm for fused RMSNorm+Quant.
+
+        Called from post_load_weights (weights don't exist during __init__).
+        """
+        if getattr(self.out_proj, 'input_scale', None) is not None:
+            self.norm.nvfp4_scale = self.out_proj.input_scale
+        else:
+            self.norm.is_nvfp4 = False
+
     def forward(
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
         mamba_metadata: Mamba2Metadata,
-        spec_metadata: Optional[SpecMetadata] = None,
+        spec_metadata: SpecMetadata | None = None,
         **kwargs,
     ) -> torch.Tensor:
 
