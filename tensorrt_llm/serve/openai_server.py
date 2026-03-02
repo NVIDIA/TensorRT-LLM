@@ -34,8 +34,8 @@ from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (MultimodalEncoder, SchedulingParams, VisualGen, VisualGenParams,
-                                 tracing)
+from tensorrt_llm.llmapi import (MultimodalEncoder, SchedulingParams, VisualGen,
+                                 VisualGenParams, tracing)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -56,8 +56,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ErrorResponse, ImageEditRequest,
                                                 ImageGenerationRequest,
                                                 ImageGenerationResponse,
-                                                ImageObject,
-                                                KVCacheHintRequest,
+                                                ImageObject, KVCacheHintRequest,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
                                                 ResponsesRequest,
@@ -673,8 +672,8 @@ class OpenAIServer:
 
         sampling_params = request.to_sampling_params(
             vocab_size=self.tokenizer.tokenizer.vocab_size,
-            gather_generation_logits=self.llm.args.gather_generation_logits,
-            backend=self.llm.args.backend
+            gather_generation_logits=self.generator.args.gather_generation_logits,
+            backend=self.generator.args.backend
         )
 
         tool_dicts = None if request.tools is None else [
@@ -710,7 +709,7 @@ class OpenAIServer:
         messages_to_retain = convert_messages(request.messages_to_retain) if request.messages_to_retain else []
         messages = convert_messages(request.messages) if request.messages else []
 
-        self.llm.set_kv_cache_hints(
+        self.generator.set_kv_cache_hints(
             action="truncate",
             messages_to_retain=messages_to_retain,
             messages=messages,
@@ -762,7 +761,7 @@ class OpenAIServer:
             vocab_size=self.tokenizer.tokenizer.vocab_size)
         sampling_params.detokenize = False
 
-        self.llm.set_kv_cache_hints(
+        self.generator.set_kv_cache_hints(
             action="truncate",
             messages_to_retain=messages_to_retain,
             messages=messages,

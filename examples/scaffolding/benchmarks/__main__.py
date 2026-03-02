@@ -402,27 +402,52 @@ def parse_arguments():
     )
 
     # =========================================================================
-    # Poisson Warmup Arrival Rate Configuration
+    # Load Mode Configuration
     # =========================================================================
     parser.add_argument(
-        "--enable_poisson_arrival",
-        action="store_true",
-        help="[All benchmarks] Enable Poisson-distributed arrival rate within warmup window. "
-        "When enabled, requests arrive following Poisson distribution, "
-        "with all requests arriving within the warmup window.",
+        "--load_mode",
+        type=str,
+        default="concurrent",
+        choices=["concurrent", "rate"],
+        help="[All benchmarks] Load generation mode. "
+        "'concurrent': fixed concurrency pool (default). "
+        "'rate': Poisson arrival rate (requests/sec).",
     )
+
+    # -- Concurrent mode: uniform warmup --
     parser.add_argument(
-        "--poisson_warmup_window",
+        "--warmup_window",
         type=float,
-        default=60.0,
-        help="[All benchmarks] Warmup window (seconds) during which all requests must arrive "
-        "when using Poisson arrival. Default: 60.0 seconds.",
+        default=None,
+        help="[Concurrent mode] Warmup window (seconds) for uniform ramp-up. "
+        "When set, requests are evenly spaced over this window instead of all starting at once. "
+        "Only used when --load_mode=concurrent.",
+    )
+
+    # -- Rate mode: Poisson arrival rate --
+    parser.add_argument(
+        "--agent_rate",
+        type=float,
+        default=1.0,
+        help="[Rate mode] Poisson arrival rate (req/s) for agent benchmark. Default: 1.0.",
     )
     parser.add_argument(
-        "--poisson_arrival_seed",
+        "--chat_rate",
+        type=float,
+        default=1.0,
+        help="[Rate mode] Poisson arrival rate (req/s) for chat benchmark. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--multiround_rate",
+        type=float,
+        default=1.0,
+        help="[Rate mode] Poisson arrival rate (req/s) for multiround benchmark. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--rate_seed",
         type=int,
         default=42,
-        help="[All benchmarks] Random seed for Poisson arrival time generation. Default: 42.",
+        help="[Rate mode] Random seed for Poisson arrival rate. Default: 42.",
     )
 
     return parser.parse_args()

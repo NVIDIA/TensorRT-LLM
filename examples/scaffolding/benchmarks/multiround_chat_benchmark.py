@@ -28,13 +28,15 @@ from tensorrt_llm.scaffolding import Controller, ScaffoldingLlm, TRTOpenaiWorker
 from tensorrt_llm.scaffolding.benchmark import ScaffoldingBenchRequest, async_scaffolding_benchmark
 from tensorrt_llm.scaffolding.load_generation_strategy import (
     ConcurrentStrategy,
-    PoissonWarmupStrategy,
+    PoissonRateStrategy,
+    UniformWarmupStrategy,
 )
 from tensorrt_llm.scaffolding.task import ChatTask, SystemMessage, TaskStatus, UserMessage
 from tensorrt_llm.scaffolding.task_collection import (
     DropKVCacheWorkerTag,
     TaskMetricsCollector,
     drop_kv_cache_scope,
+    sub_request_node,
     with_task_collection,
 )
 
@@ -692,6 +694,7 @@ class MultiroundChatWorker(Worker):
     enable_print=False,
     capture_messages=False,
 )
+@sub_request_node("multiround_chat", is_top_level=True)
 class MultiroundChatController(Controller):
     """Controller for multi-turn chat conversations."""
 
@@ -887,13 +890,17 @@ async def async_multiround_chat_benchmark(args):
     task_collection_types = {}
     concurrency = args.multiround_concurrency
 
-    # Select strategy based on Poisson arrival flag
-    if getattr(args, "enable_poisson_arrival", False):
-        strategy = PoissonWarmupStrategy(
+    # Select strategy based on load mode
+    if getattr(args, "load_mode", "concurrent") == "rate":
+        strategy = PoissonRateStrategy(
+            rate=getattr(args, "multiround_rate", 1.0),
+            random_seed=getattr(args, "rate_seed", 42),
+        )
+    elif getattr(args, "warmup_window", None) is not None:
+        strategy = UniformWarmupStrategy(
             num_requests=num_requests,
-            warmup_window=getattr(args, "poisson_warmup_window", 60.0),
+            warmup_window=args.warmup_window,
             max_concurrency=concurrency,
-            random_seed=getattr(args, "poisson_arrival_seed", 42),
         )
     else:
         strategy = ConcurrentStrategy(concurrency=concurrency)
@@ -901,11 +908,7 @@ async def async_multiround_chat_benchmark(args):
     print("\nStarting multiround chat benchmark:")
     print(f"  Conversations: {num_requests}")
     print(f"  Max rounds: {max_rounds}")
-    print(f"  Concurrency: {concurrency}")
-    if getattr(args, "enable_poisson_arrival", False):
-        print(
-            f"  Arrival: Poisson warmup (window={args.poisson_warmup_window}s, seed={args.poisson_arrival_seed})"
-        )
+    print(f"  Strategy: {strategy}")
     print(
         f"  User delay: {data_config.user_delay.distribution} "
         f"(enabled={data_config.user_delay.enabled}, lambda={data_config.user_delay.lambda_param})"

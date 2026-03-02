@@ -16,6 +16,7 @@
  */
 
 #include "algorithms.h"
+#include "tensorrt_llm/batch_manager/agentTree.h"
 #include "tensorrt_llm/batch_manager/allocateKvCache.h"
 #include "tensorrt_llm/batch_manager/assignReqSeqSlots.h"
 #include "tensorrt_llm/batch_manager/capacityScheduler.h"
@@ -51,6 +52,38 @@ using namespace tensorrt_llm::batch_manager;
 
 void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_& m)
 {
+    auto agentTreeConfigGetstate = [](batch_scheduler::AgentTreeConfig const& self)
+    { return nb::make_tuple(self.agentPercentage, self.agentTypes, self.agentInflightSeqNum); };
+    auto agentTreeConfigSetstate = [](batch_scheduler::AgentTreeConfig& self, nb::tuple const& state)
+    {
+        if (state.size() != 3)
+        {
+            throw std::runtime_error("Invalid AgentTreeConfig state!");
+        }
+        new (&self) batch_scheduler::AgentTreeConfig();
+        self.agentPercentage = nb::cast<float>(state[0]);
+        self.agentTypes = nb::cast<std::optional<std::vector<std::string>>>(state[1]);
+        self.agentInflightSeqNum = nb::cast<SizeType32>(state[2]);
+    };
+    nb::class_<batch_scheduler::AgentTreeConfig>(m, "AgentTreeConfig")
+        .def(
+            "__init__",
+            [](batch_scheduler::AgentTreeConfig* self, float agentPercentage,
+                std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum)
+            {
+                new (self) batch_scheduler::AgentTreeConfig();
+                self->agentPercentage = agentPercentage;
+                self->agentTypes = std::move(agentTypes);
+                self->agentInflightSeqNum = agentInflightSeqNum;
+            },
+            nb::arg("agent_percentage") = -1.0f, nb::arg("agent_types") = nb::none(),
+            nb::arg("agent_inflight_seq_num") = std::numeric_limits<SizeType32>::max())
+        .def_rw("agent_percentage", &batch_scheduler::AgentTreeConfig::agentPercentage)
+        .def_rw("agent_types", &batch_scheduler::AgentTreeConfig::agentTypes)
+        .def_rw("agent_inflight_seq_num", &batch_scheduler::AgentTreeConfig::agentInflightSeqNum)
+        .def("__getstate__", agentTreeConfigGetstate)
+        .def("__setstate__", agentTreeConfigSetstate);
+
     nb::class_<CapacityScheduler>(m, CapacityScheduler::name)
         .def(nb::init<SizeType32, executor::CapacitySchedulerPolicy, bool, bool, LlmRequestState, LlmRequestState>(),
             nb::arg("max_num_requests"), nb::arg("capacity_scheduler_policy"), nb::arg("has_kv_cache_manager"),
@@ -59,8 +92,8 @@ void tensorrt_llm::nanobind::batch_manager::algorithms::initBindings(nb::module_
         .def("__call__", &CapacityScheduler::operator(), nb::arg("active_requests"),
             nb::arg("kv_cache_manager") = nullptr, nb::arg("peft_cache_manager") = nullptr,
             nb::arg("cross_kv_cache_manager") = nullptr)
-        .def("set_agent_tree_resort_policy", &CapacityScheduler::setAgentTreeResortPolicy, nb::arg("agent_percentage"),
-            nb::arg("agent_types"), nb::arg("agent_inflight_seq_num"))
+        .def("set_agent_tree_reorder_policy", &CapacityScheduler::setAgentTreeReorderPolicy,
+            nb::arg("agent_percentage"), nb::arg("agent_types"), nb::arg("agent_inflight_seq_num"))
         .def("name", [](CapacityScheduler const&) { return CapacityScheduler::name; });
 
     nb::class_<MicroBatchScheduler>(m, MicroBatchScheduler::name)

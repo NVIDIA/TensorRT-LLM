@@ -17,7 +17,7 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
-#include "tensorrt_llm/batch_manager/resortPolicy.h"
+#include "tensorrt_llm/batch_manager/reorderPolicy.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 
@@ -313,10 +313,10 @@ protected:
     static ClassName##Registrar g_##ClassName##_registrar;                                                             \
     }
 
-/// @brief Resort policy that uses agent tree hierarchy to sort and truncate requests.
+/// @brief Reorder policy that uses agent tree hierarchy to sort and truncate requests.
 /// This policy partitions requests into generation and non-generation requests,
 /// sorts/truncates non-generation requests using the agent tree, then combines them.
-class AgentTreePolicy : public ResortPolicy
+class AgentTreePolicy : public ReorderPolicy
 {
 public:
     /// @brief Constructs an AgentTreePolicy with the given agent tree configuration.
@@ -327,7 +327,7 @@ public:
     ///        then sorting/truncating non-generation requests using the agent tree.
     /// @param requests The vector of requests to be reordered.
     /// @return The reordered vector of requests.
-    [[nodiscard]] RequestVector resortRequests(RequestVector const& requests) const override;
+    [[nodiscard]] RequestVector reorderRequests(RequestVector const& requests) const override;
 
 private:
     std::optional<batch_scheduler::AgentTreeConfig> mAgentTreeConfig;

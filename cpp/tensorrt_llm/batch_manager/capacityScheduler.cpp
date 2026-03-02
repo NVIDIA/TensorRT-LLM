@@ -489,7 +489,7 @@ CapacityScheduler::CapacityScheduler(SizeType32 maxNumRequests,
     }
 }
 
-void CapacityScheduler::setAgentTreeResortPolicy(
+void CapacityScheduler::setAgentTreeReorderPolicy(
     float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum)
 {
     batch_scheduler::AgentTreeConfig config;
@@ -497,7 +497,7 @@ void CapacityScheduler::setAgentTreeResortPolicy(
     config.agentTypes = std::move(agentTypes);
     config.agentInflightSeqNum = agentInflightSeqNum;
 
-    mResortPolicy = std::make_unique<agent_tree::AgentTreePolicy>(std::move(config));
+    mReorderPolicy = std::make_unique<agent_tree::AgentTreePolicy>(std::move(config));
 }
 
 std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::operator()(RequestList const& activeRequests,
@@ -507,10 +507,8 @@ std::tuple<RequestVector, RequestVector, RequestVector> CapacityScheduler::opera
 {
     NVTX3_SCOPED_RANGE(capacitySchedulerScheduling);
 
-    // Apply resort policy if set
-    RequestList requestsToSchedule = mResortPolicy
-        ? mResortPolicy->resortRequests(activeRequests)
-        : activeRequests;
+    // Apply reorder policy if set
+    RequestList requestsToSchedule = mReorderPolicy ? mReorderPolicy->reorderRequests(activeRequests) : activeRequests;
 
     return std::visit(
         [&requestsToSchedule, &kvCacheManager, &crossKvCacheManager, &peftCacheManager](

@@ -385,6 +385,75 @@ class PoissonWarmupStrategy(LoadGenerationStrategy):
         return f"{self.strategy_type}[n={self.num_requests}, window={self.warmup_window}s]"
 
 
+class UniformWarmupStrategy(LoadGenerationStrategy):
+    """Uniform warmup strategy: requests arrive at evenly-spaced intervals within a warmup window.
+
+    This strategy linearly spaces all request arrival times across the warmup window,
+    providing a deterministic, uniform ramp-up pattern.
+
+    Characteristics:
+    - All N requests arrive within the warmup_window
+    - Inter-arrival time = warmup_window / (N - 1) for N > 1
+    - Deterministic (no randomness)
+    - Useful for concurrent mode warmup where predictable ramp-up is desired
+
+    Args:
+        num_requests: Total number of requests to send
+        warmup_window: Time window (seconds) in which all requests must arrive
+        max_concurrency: Maximum concurrency limit (optional)
+
+    Example:
+        strategy = UniformWarmupStrategy(num_requests=100, warmup_window=10.0, max_concurrency=32)
+        # All 100 requests will arrive evenly spaced over 10 seconds:
+        # t=0.00s: request 0
+        # t=0.10s: request 1
+        # t=0.20s: request 2
+        # ...
+        # t=10.0s: request 99
+    """
+
+    strategy_type: str = "uniform_warmup"
+    num_requests: int = Field(gt=0, description="Total number of requests to send")
+    warmup_window: float = Field(gt=0, description="Time window (seconds) for all arrivals")
+    max_concurrency: Optional[int] = Field(default=None, description="Maximum concurrency limit")
+
+    _arrival_times: Optional[list] = None
+
+    class Config:
+        arbitrary_types_allowed = True
+        underscore_attrs_are_private = True
+
+    def _compute_arrival_times(self) -> list:
+        """Pre-compute evenly-spaced arrival times across the warmup window."""
+        if self.num_requests == 1:
+            return [0.0]
+
+        interval = self.warmup_window / (self.num_requests - 1)
+        return [i * interval for i in range(self.num_requests)]
+
+    def get_semaphore(self):
+        """Return semaphore with specified concurrency limit if set."""
+        import asyncio
+
+        if self.max_concurrency is not None:
+            return asyncio.Semaphore(self.max_concurrency)
+        return _UnlimitedSemaphore()
+
+    async def _generate_request_times(self) -> AsyncGenerator[float, None]:
+        """Generate evenly-spaced send times within the warmup window."""
+        if self._arrival_times is None:
+            self._arrival_times = self._compute_arrival_times()
+
+        for relative_time in self._arrival_times:
+            yield self.start_time + relative_time
+
+        while True:
+            yield self.start_time + self.warmup_window
+
+    def __str__(self) -> str:
+        return f"{self.strategy_type}[n={self.num_requests}, window={self.warmup_window}s]"
+
+
 # Export all strategies
 __all__ = [
     "LoadGenerationStrategy",
@@ -394,4 +463,5 @@ __all__ = [
     "ConstantRateStrategy",
     "PoissonRateStrategy",
     "PoissonWarmupStrategy",
+    "UniformWarmupStrategy",
 ]

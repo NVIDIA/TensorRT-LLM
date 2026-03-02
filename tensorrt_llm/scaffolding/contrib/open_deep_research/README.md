@@ -58,7 +58,7 @@ trtllm-serve serve Qwen3/Qwen3-30B-A3B \
 Create `.extra-llm-api-config.yml` with the following content:
 
 ```yaml
-resort_policy_config:
+reorder_policy_config:
     policy_name: "AgentTree"
     policy_args:
         agent_percentage: 0.5
