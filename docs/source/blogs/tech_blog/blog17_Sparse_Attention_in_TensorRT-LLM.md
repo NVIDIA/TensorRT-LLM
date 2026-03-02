@@ -15,7 +15,7 @@
   - [Skip Softmax Attention (BLASST)](#skip-softmax-attention-blasst)
 - [Evaluation](#evaluation)
   - [RocketKV](#rocketkv-1)
-  - [DSA](#dsa)
+  - [DeepSeek Sparse Attention (DSA)](#dsa)
   - [Skip Softmax Attention (BLASST)](#skip-softmax-attention-blasst-1)
 - [Summary and Future Work](#summary-and-future-work)
   - [Current State](#current-state)
@@ -330,7 +330,7 @@ To better understand where the speedup comes from, Figure 7 breaks down the per-
 - **Context phase**: RocketKV shows limited benefit here. Attention is still computed densely during prefill, and the post-processing step to compress the KV cache introduces extra overhead.
 - **Generation phase**: The speedup mainly comes from reduced attention time, enabled by (1) the compressed KV cache produced after prefill and (2) dynamic Top-K selection during decode. As batch size increases, dense attention cost grows quickly, so reducing the effective KV footprint yields larger gains. By contrast, the prediction overhead does not shrink proportionally, so its relative impact becomes more visible in low-latency scenarios. In the TP=4 case, per-GPU workload is smaller, so the end-to-end speedup is more modest than one might expect from the reduction in attention work alone.
 
-### DSA
+### DeepSeek Sparse Attention (DSA)
 
 For comprehensive DSA evaluation results—including kernel optimizations, precision strategies, and benchmarks with MTP, disaggregated serving, and Wide-EP—please refer to the dedicated blog post: [Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md).
 
