@@ -1031,7 +1031,7 @@ class MLA(nn.Module):
         # extra BMMs and larger head_dim (kv_lora_rank + qk_rope_head_dim).
         # Only active when rope_fusion is True (DSA with TrtllmAttention).
         _threshold_str = os.environ.get('TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD',
-                                        '10240')
+                                        '0')
         try:
             self.short_seq_mha_threshold = int(_threshold_str)
         except ValueError as err:
@@ -1314,11 +1314,8 @@ class MLA(nn.Module):
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-            all_reduce_params (Optional[AllReduceParams]): The all reduce parameters.
+            output (torch.Tensor): Pre-allocated output tensor, written in-place.
             latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
-
-        Returns:
-            torch.Tensor: The output tensor.
         """
         # split q, k, v into context and gen batches
         num_contexts = attn_metadata.num_contexts
