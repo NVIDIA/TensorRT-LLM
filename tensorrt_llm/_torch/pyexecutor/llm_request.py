@@ -465,6 +465,22 @@ class PyResult:
             return None
         return storage.transpose(0, 1)
 
+    def get_latest_logits_unexcluded(self) -> torch.Tensor | None:
+        """Read the latest logits chunk, bypassing exclude_last_generation_logits.
+
+        Unlike the generation_logits property, this always returns the most
+        recent chunk regardless of the exclusion flag.  Callers are responsible
+        for ensuring the timing is correct (e.g. calling before the next
+        forward pass appends new logits).
+        """
+        if not self._generation_logits:
+            return None
+        storage = self._generation_logits.get(all_logits=False,
+                                              exclude_last=False)
+        if storage is None:
+            return None
+        return storage.transpose(0, 1)
+
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
         if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
