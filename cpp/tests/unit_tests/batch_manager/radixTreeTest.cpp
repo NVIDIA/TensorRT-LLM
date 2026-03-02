@@ -23,20 +23,20 @@ using namespace tensorrt_llm::batch_manager::templated_trie;
 
 // ---------------------------------------------------------------------------
 // TokensKey: a NodeKey that supports partial matching.
-//
-// Wraps a vector of ints and implements the three methods required by
-// findPartiallyMatchingNodes:
-//   numMatchingTokens(other) -- shared prefix length
-//   getNumTokens()           -- total length of this key
-//   shorten(n)               -- new key containing the first n tokens
 // ---------------------------------------------------------------------------
 struct TokensKey
 {
     std::vector<int> tokens;
+    bool partialOk = true; // controls supportsPartialMatching() at runtime
 
     bool operator==(TokensKey const& o) const
     {
         return tokens == o.tokens;
+    }
+
+    bool supportsPartialMatching() const
+    {
+        return partialOk;
     }
 
     int numMatchingTokens(TokensKey const& o) const
@@ -80,23 +80,24 @@ struct TokensKeyHasher
 // ---------------------------------------------------------------------------
 // Type aliases used throughout the tests.
 // ---------------------------------------------------------------------------
-using IntTree = Trie<int, std::hash<int>, int, std::hash<int>, int, /*supportsPartialMatching*/ false>;
-using PartialTree = Trie<TokensKey, TokensKeyHasher, int, std::hash<int>, int, /*supportsPartialMatching*/ true>;
+using IntTree = Trie<int, std::hash<int>, int, std::hash<int>, int, /*EnablePartialMatching*/ false>;
+using PartialTree = Trie<TokensKey, TokensKeyHasher, int, std::hash<int>, int, /*EnablePartialMatching*/ true>;
 
 // ---------------------------------------------------------------------------
 // Test fixture with shared helpers.
 //
 // Test groups:
-//   StringSet Tests -- StringSet end-to-end: insert, lookup, erase
+//   StringSet Tests -- StringSet end-to-end: insert, lookup, erase, edge cases
 //   Group A         -- insertNodes: prefix insertion, wasCreated / exactMatch flags
 //   Group B         -- lookupNodes (exact): key traversal, short queries, cache misses
-//   Group C         -- lookupNodes (partial): supportsPartialMatching=true, result ordering,
-//                      allowPartialMatch flag
+//   Group C         -- lookupNodes (partial): compile-time flag, runtime instance gate,
+//                      result ordering, allowPartialMatch flag
 //   Group D         -- setValue / getValue / clearValue: value storage, overwrite policy,
 //                      auto-cleanup cascade
 //   Group E         -- multi-ValueKey / Variable Sliding Window Attention (VSWA): single node
 //                      holding one cached block per attention window size
 //   Group F         -- getEdges / countNumberOfNodes: introspection and debug helpers
+//   Group G         -- lookupValues: end-to-end value retrieval via prefix key
 // ---------------------------------------------------------------------------
 class RadixTreeTest : public ::testing::Test
 {
@@ -196,6 +197,37 @@ TEST_F(RadixTreeTest, StringSetErase)
     EXPECT_FALSE(stringSet.contains("This is string 2, yeah"));
     EXPECT_TRUE(stringSet.contains("This is a loaf of bread"));
     EXPECT_EQ(stringSet.countNumberOfNodes(), 37);
+}
+
+TEST_F(RadixTreeTest, StringSetPrefixNotContained)
+{
+    // A prefix of an inserted string has no value stored and must not be found.
+    StringSet stringSet;
+    stringSet.insert("hello");
+    EXPECT_TRUE(stringSet.contains("hello"));
+    EXPECT_FALSE(stringSet.contains("hell"));
+    EXPECT_FALSE(stringSet.contains("h"));
+}
+
+TEST_F(RadixTreeTest, StringSetEraseNonExistent)
+{
+    // Erasing a string that was never inserted must not crash or corrupt the set.
+    StringSet stringSet;
+    stringSet.insert("hello");
+    stringSet.erase("world");                 // not present
+    stringSet.erase("hell");                  // prefix of "hello", not inserted
+    EXPECT_TRUE(stringSet.contains("hello")); // original still present
+}
+
+TEST_F(RadixTreeTest, StringSetEmptyString)
+{
+    // Empty string must not crash insert/erase/contains.
+    StringSet stringSet;
+    stringSet.insert("");                 // no-op
+    EXPECT_FALSE(stringSet.contains("")); // empty string never stored
+    stringSet.erase("");                  // no-op, must not crash
+    stringSet.insert("a");
+    EXPECT_TRUE(stringSet.contains("a")); // normal insert unaffected
 }
 
 // ===========================================================================
@@ -367,6 +399,23 @@ TEST_F(RadixTreeTest, PartialMatchFull)
     EXPECT_TRUE(result2.exactMatches[0].exactMatch);
 }
 
+TEST_F(RadixTreeTest, PartialMatchDisabledByInstance)
+{
+    // The tree template has supportsPartialMatching=true, and allowPartialMatch=true is
+    // passed, but the query key's supportsPartialMatching() returns false at runtime.
+    // The runtime guard in findPartiallyMatchingNodes must produce no partial results.
+    PartialTree tree;
+    tree.insertNodes({TokensKey{{1, 2, 3}}});
+
+    TokensKey queryKey;
+    queryKey.tokens = {1, 2, 9};
+    queryKey.partialOk = false; // runtime gate: this instance disables partial matching
+
+    auto result = tree.lookupNodes({queryKey}, /*allowPartialMatch=*/true);
+    EXPECT_TRUE(result.exactMatches.empty());
+    EXPECT_TRUE(result.partialMatches.empty());
+}
+
 // ===========================================================================
 // Group D: setValue / getValue / clearValue
 // ===========================================================================
@@ -532,4 +581,74 @@ TEST_F(RadixTreeTest, CountNodesConsistency)
     // the cascade stops there.  key=3 has no value but was not the node being
     // cleared so it is not pruned automatically.
     EXPECT_EQ(tree.countNumberOfNodes(), 3); // key=1, key=2, key=3 remain
+}
+
+// ===========================================================================
+// Group G: lookupValues
+//
+// lookupValues is the primary end-to-end API that combines lookupNodes with
+// per-node value retrieval. Each ValueMatch in the result carries isValid=true
+// when the node holds a value for the requested ValueKey, and isValid=false
+// when the node exists in the tree but has no value for that key.
+// ===========================================================================
+
+TEST_F(RadixTreeTest, LookupValuesHit)
+{
+    // Insert chain [1,2], store values at both nodes, verify both are returned.
+    IntTree tree;
+    auto nodes = buildChain(tree, {1, 2});
+    setFresh(nodes[0], /*vkey=*/0, /*val=*/10);
+    setFresh(nodes[1], /*vkey=*/0, /*val=*/20);
+
+    auto vm = tree.lookupValues({1, 2}, /*allowPartialMatch=*/false, /*vkey=*/0);
+    ASSERT_EQ(vm.matches.size(), 2u);
+    EXPECT_TRUE(vm.matches[0].isValid);
+    EXPECT_EQ(vm.matches[0].value, 10);
+    EXPECT_TRUE(vm.matches[1].isValid);
+    EXPECT_EQ(vm.matches[1].value, 20);
+}
+
+TEST_F(RadixTreeTest, LookupValuesMiss)
+{
+    // Query for a key not present in the tree: result is empty.
+    IntTree tree;
+    tree.insertNodes({1, 2, 3});
+
+    auto vm = tree.lookupValues({7, 8}, /*allowPartialMatch=*/false, /*vkey=*/0);
+    EXPECT_TRUE(vm.matches.empty());
+}
+
+TEST_F(RadixTreeTest, LookupValuesNoValueAtNode)
+{
+    // Nodes exist but carry no value for the queried vkey: isValid=false entries.
+    IntTree tree;
+    buildChain(tree, {1, 2});
+
+    auto vm = tree.lookupValues({1, 2}, /*allowPartialMatch=*/false, /*vkey=*/0);
+    ASSERT_EQ(vm.matches.size(), 2u);
+    EXPECT_FALSE(vm.matches[0].isValid);
+    EXPECT_FALSE(vm.matches[1].isValid);
+}
+
+TEST_F(RadixTreeTest, LookupValuesPartialHit)
+{
+    // Tree has one node keyed by [1,2,3] with a value. Query [1,2,4] partially
+    // matches (2 tokens shared). lookupValues must surface the partial match with
+    // isValid=true when the matched node carries a value.
+    PartialTree tree;
+    auto inserted = tree.insertNodes({TokensKey{{1, 2, 3}}});
+    [[maybe_unused]] auto wasSet = inserted.exactMatches[0].node->setValue(/*vkey=*/0, /*val=*/42, /*overwrite=*/false);
+
+    auto vm = tree.lookupValues({TokensKey{{1, 2, 4}}}, /*allowPartialMatch=*/true, /*vkey=*/0);
+
+    bool foundPartialWithValue = false;
+    for (auto const& m : vm.matches)
+    {
+        if (m.isValid && !m.exactMatch)
+        {
+            foundPartialWithValue = true;
+            EXPECT_EQ(m.value, 42);
+        }
+    }
+    EXPECT_TRUE(foundPartialWithValue);
 }
