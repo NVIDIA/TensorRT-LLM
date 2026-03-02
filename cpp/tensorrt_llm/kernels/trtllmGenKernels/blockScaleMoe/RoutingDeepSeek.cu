@@ -742,9 +742,7 @@ void run(Data& data, void* stream)
     {
         data.mNumExperts += data.mNumFusedSharedExperts;
         data.mTopK += data.mNumFusedSharedExperts;
-        // Note: mNumLocalExperts should NOT be modified as fused shared experts are
-        // globally indexed at [mNumExperts, mNumExperts + mNumFusedSharedExperts),
-        // not local to each rank. Modifying it breaks locality semantics in multi-rank scenarios.
+        data.mNumLocalExperts += data.mNumFusedSharedExperts;
     }
 
     if (data.mPtrPermutedIdxSize != nullptr)

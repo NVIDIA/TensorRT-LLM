@@ -3319,7 +3319,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
     def _round_up(self, x, alignment):
         return (x + alignment - 1) // alignment * alignment
 
-    def create_weights(self, module: torch.nn.Module,
+    def create_weights(self,
+                       module: torch.nn.Module,
                        n_shared_experts: int = 0):
         # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
         if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
@@ -3337,7 +3338,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             if intermediate_size_padded % 128 != 0:
                 self.weight_alignment = 128
 
-        super().create_weights(module, n_shared_experts=n_shared_experts, bias_dtype=torch.float32)
+        super().create_weights(module,
+                               n_shared_experts=n_shared_experts,
+                               bias_dtype=torch.float32)
 
     def setup_quant_scales(self, module: torch.nn.Module):
         module.quant_scales = tuple()

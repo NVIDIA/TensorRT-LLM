@@ -159,9 +159,9 @@ def routing_reference(expertLogits, topK, padding, num_fused_shared_experts=0):
         assert totalExpertsPerToken == topKLogits.shape[1]
 
         # Shared experts will have index starting at number of local experts
-        sharedIndices = torch.range(numExperts,
-                                    numExperts + num_fused_shared_experts - 1,
-                                    dtype=topKIndices.dtype)
+        sharedIndices = torch.arange(numExperts,
+                                     numExperts + num_fused_shared_experts,
+                                     dtype=topKIndices.dtype)
         sharedIndices = torch.unsqueeze(sharedIndices, 0)
         sharedIndices = sharedIndices.repeat(numTokens, 1)
         topKIndices = torch.cat((topKIndices, sharedIndices), dim=1)
