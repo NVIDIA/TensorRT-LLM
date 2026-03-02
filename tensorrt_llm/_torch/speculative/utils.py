@@ -7,6 +7,9 @@ from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.seq_slot_manager import SeqSlotManager
 from ..speculative.interface import SpecMetadata
+from .draft_target import (DraftTargetOneModelSampler,
+                           DraftTargetOneModelSpecMetadata,
+                           DraftTargetOneModelWorker)
 from .eagle3 import (Eagle3OneModelSampler, Eagle3OneModelSpecMetadata,
                      Eagle3OneModelWorker, Eagle3ResourceManager,
                      Eagle3SpecMetadata)
@@ -87,6 +90,15 @@ def get_spec_metadata(spec_config,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
+            allow_advanced_sampling=spec_config.allow_advanced_sampling,
+        )
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelSpecMetadata(
+            max_draft_len=spec_config.max_draft_len,
+            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            spec_dec_mode=spec_config.spec_dec_mode,
+            max_num_requests=max_num_requests,
+            max_num_tokens=max_num_tokens,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
@@ -179,6 +191,8 @@ def get_spec_decoder(sampler_args: TorchSampler.Args,
     if spec_config.spec_dec_mode.is_pard():
         return MTPSampler(sampler_args,
                           nextn=spec_config.tokens_per_gen_step - 1)
+    if spec_config.spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelSampler(sampler_args)
     raise ValueError(
         f"Unsupported speculative decoding mode: {spec_config.spec_dec_mode}")
 
@@ -238,6 +252,9 @@ def get_spec_worker(spec_config,
                                     use_separate_draft_kv_cache)
     if spec_dec_mode.is_pard():
         return PARDWorker(spec_config, mapping, use_separate_draft_kv_cache)
+    if spec_dec_mode.is_draft_target_one_model():
+        return DraftTargetOneModelWorker(spec_config, mapping,
+                                         use_separate_draft_kv_cache)
     return None
 
 
