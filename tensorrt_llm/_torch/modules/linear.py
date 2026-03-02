@@ -507,7 +507,8 @@ class UnquantizedLinearMethod(LinearMethodBase):
                     copy_weight_shard(module.weight, weight, shard_offset,
                                       shard_size)
 
-        if hasattr(module, "kv_scales"):
+        if hasattr(module, "kv_scales") and os.environ.get(
+                "TRTLLM_LOAD_KV_SCALES", "1") == "1":
             k_scales = [
                 w["k_scale"][...].reshape([]) for w in weights if "k_scale" in w
             ]
