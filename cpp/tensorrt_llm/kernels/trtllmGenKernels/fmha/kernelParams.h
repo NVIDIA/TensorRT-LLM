@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2020-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2020-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -24,6 +24,8 @@
 #include <cmath>
 #include <cstdint>
 #include <cute/tensor.hpp>
+#include <type_traits>
+#include <utility>
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
@@ -36,6 +38,21 @@ TRTLLM_NAMESPACE_BEGIN
 
 namespace kernels
 {
+
+namespace detail
+{
+
+template <typename T, typename = void>
+struct HasSageAttnParams : std::false_type
+{
+};
+
+template <typename T>
+struct HasSageAttnParams<T, std::void_t<decltype(std::declval<T const&>().sageAttnSfsQPtr)>> : std::true_type
+{
+};
+
+} // namespace detail
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
@@ -856,6 +873,21 @@ struct KernelParams
 
         params.ptrScaleSfKv = options.kvSfScalePtr;
         params.ptrScaleSfO = options.oSfScalePtr;
+
+        // Optionally set SageAttn parameters.
+        if constexpr (detail::HasSageAttnParams<FmhaOptions_>::value)
+        {
+            params.ptrSageAttnSfsQ = options.sageAttnSfsQPtr;
+            params.ptrSageAttnSfsK = options.sageAttnSfsKPtr;
+            params.ptrSageAttnSfsP = options.sageAttnSfsPPtr;
+            params.ptrSageAttnSfsV = options.sageAttnSfsVPtr;
+
+            params.mLogNumEltsPerSageAttnBlkQ = options.mLogNumEltsPerSageAttnBlkQ;
+            params.mLogNumEltsPerSageAttnBlkK = options.mLogNumEltsPerSageAttnBlkK;
+            params.mLogNumEltsPerSageAttnBlkP = options.mLogNumEltsPerSageAttnBlkP;
+            params.mLogNumEltsPerSageAttnBlkV = options.mLogNumEltsPerSageAttnBlkV;
+            params.mInflateMax = 0.4f;
+        }
 
         // The softmax stats buffer with shape of [numTokensQ x numHeadsQ].
         // The max/sum values are packed into float2.

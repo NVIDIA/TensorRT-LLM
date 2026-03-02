@@ -29,11 +29,19 @@ namespace kernels
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
 
-TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut)
+TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_type dtypeOut,
+    int maxNumHeadsQPerKvInCta, int numEltsPerSageAttnBlkQ, int numEltsPerSageAttnBlkK, int numEltsPerSageAttnBlkP,
+    int numEltsPerSageAttnBlkV, Data_type dataTypeQkReinterpret)
     : mSM(tensorrt_llm::common::getSMVersion())
     , mDtypeQ(dtypeQ)
     , mDtypeKv(dtypeKv)
     , mDtypeOut(dtypeOut)
+    , mMaxNumHeadsQPerKvInCta(maxNumHeadsQPerKvInCta)
+    , mNumEltsPerSageAttnBlkQ(numEltsPerSageAttnBlkQ)
+    , mNumEltsPerSageAttnBlkK(numEltsPerSageAttnBlkK)
+    , mNumEltsPerSageAttnBlkP(numEltsPerSageAttnBlkP)
+    , mNumEltsPerSageAttnBlkV(numEltsPerSageAttnBlkV)
+    , mDataTypeQkReinterpret(dataTypeQkReinterpret)
 {
     TLLM_CHECK_WITH_INFO(mSM == kSM_100 || mSM == kSM_103, "Unsupported architecture");
     TLLM_CHECK_WITH_INFO(
@@ -47,7 +55,8 @@ TllmGenFmhaRunner::TllmGenFmhaRunner(Data_type dtypeQ, Data_type dtypeKv, Data_t
     auto const [freeMemory, totalMemory] = tensorrt_llm::common::getDeviceMemoryInfo(false);
     mTotalDeviceMemory = totalMemory;
     TLLM_CHECK_WITH_INFO(mTotalDeviceMemory > 0, "Total device memory is invalid");
-    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM);
+    mKernel = getTllmFmhaKernels(mDtypeQ, mDtypeKv, mDtypeOut, mSM, maxNumHeadsQPerKvInCta, numEltsPerSageAttnBlkQ,
+        numEltsPerSageAttnBlkK, numEltsPerSageAttnBlkP, numEltsPerSageAttnBlkV, dataTypeQkReinterpret);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
