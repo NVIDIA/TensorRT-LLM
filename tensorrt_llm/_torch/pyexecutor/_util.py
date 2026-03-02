@@ -42,8 +42,9 @@ from .resource_manager import (KVCacheManager, KVCacheManagerV2,
 from .sampler import (EarlyStopSampler, EarlyStopWithMMResult, TorchSampler,
                       TRTLLMSampler)
 from .scheduler import (BindCapacityScheduler, BindMicroBatchScheduler,
-                        KVCacheV2DummyScheduler, SimpleScheduler,
-                        SimpleUnifiedScheduler)
+                        KVCacheV2DummyScheduler, SimpleScheduler)
+from .scheduler.unified_scheduler import (ScheduleStepConfig,
+                                          SimpleUnifiedScheduler)
 from .seq_slot_manager import SeqSlotManager
 
 GB = 1 << 30
@@ -1059,9 +1060,35 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
+    max_total_draft_tokens = (spec_config.tokens_per_gen_step -
+                              1) if spec_config is not None else 0
+
     use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
     if use_python_scheduler and not isinstance(kv_cache_manager,
                                                KVCacheManagerV2):
+        # Build ScheduleStepConfig from llm_args
+        adp_cfg = llm_args.attention_dp_config
+        adp_enable_balance = adp_cfg is not None and adp_cfg.enable_balance
+        schedule_step_config = ScheduleStepConfig(
+            enable_attention_dp=mapping.enable_attention_dp,
+            attention_dp_enable_balance=adp_enable_balance,
+            attention_dp_time_out_iters=adp_cfg.timeout_iters
+            if adp_enable_balance else 0,
+            attention_dp_batching_wait_iters=adp_cfg.batching_wait_iters
+            if adp_enable_balance else 0,
+            batch_wait_timeout_iters=llm_args.batch_wait_timeout_iters,
+            batch_wait_max_tokens_ratio=llm_args.batch_wait_max_tokens_ratio,
+            max_num_active_requests=model_engine.get_max_num_sequences(),
+            max_batch_size=max_batch_size,
+            max_num_tokens=max_num_tokens,
+            benchmark_req_queues_size=int(
+                os.environ.get("TLLM_BENCHMARK_REQ_QUEUES_SIZE", 0)),
+        )
+
+        from .scheduler.adp_router import DefaultADPRouter
+        adp_router = DefaultADPRouter(
+            dist=dist) if mapping.enable_attention_dp else None
+
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1072,7 +1099,13 @@ def create_py_executor_instance(
             scheduler_policy=scheduler_config.capacity_scheduler_policy,
             ctx_chunk_config=ctx_chunk_config,
             two_step_lookahead=mapping.has_pp(),
-            scheduler_capacity=scheduler_capacity)
+            scheduler_capacity=scheduler_capacity,
+            config=schedule_step_config,
+            adp_router=adp_router,
+            dist=dist,
+            drafter=drafter,
+            max_total_draft_tokens=max_total_draft_tokens,
+        )
     else:
         if isinstance(kv_cache_manager, KVCacheManagerV2):
             capacity_scheduler = KVCacheV2DummyScheduler(
@@ -1120,8 +1153,7 @@ def create_py_executor_instance(
         max_beam_width=max_beam_width,
         max_draft_len=spec_config.max_draft_len
         if spec_config is not None else 0,
-        max_total_draft_tokens=(spec_config.tokens_per_gen_step -
-                                1) if spec_config is not None else 0,
+        max_total_draft_tokens=max_total_draft_tokens,
         kv_cache_transceiver=kv_cache_transceiver,
         guided_decoder=guided_decoder,
         start_worker=start_worker,

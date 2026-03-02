@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,7 +20,7 @@ This module contains:
 - Waiting queues (FCFS)
 """
 
-# Re-export from scheduler.py
+# Re-export from scheduler.py (C++ bindings path)
 from .adp_router import ADPRouter, DefaultADPRouter, RankState
 from .scheduler import (
     BindCapacityScheduler,
@@ -28,14 +28,20 @@ from .scheduler import (
     CapacityScheduler,
     KVCacheV2DummyScheduler,
     MicroBatchScheduler,
-    PyCapacityScheduler,
-    PyMicroBatchScheduler,
     RequestList,
     RequestScheduler,
     ScheduledRequests,
     SchedulerOutput,
     SerializableSchedulerOutput,
     SimpleScheduler,
+)
+
+# Re-export from unified_scheduler.py (Python-only path)
+from .unified_scheduler import (
+    PyCapacityScheduler,
+    PyMicroBatchScheduler,
+    ScheduleResult,
+    ScheduleStepConfig,
     SimpleUnifiedScheduler,
 )
 
@@ -43,20 +49,23 @@ from .scheduler import (
 from .waiting_queue import FCFSWaitingQueue, WaitingQueue, create_waiting_queue
 
 __all__ = [
-    # Schedulers
+    # Schedulers (C++ bindings path)
     "BindCapacityScheduler",
     "BindMicroBatchScheduler",
     "CapacityScheduler",
     "KVCacheV2DummyScheduler",
     "MicroBatchScheduler",
-    "PyCapacityScheduler",
-    "PyMicroBatchScheduler",
     "RequestList",
     "RequestScheduler",
     "ScheduledRequests",
     "SchedulerOutput",
     "SerializableSchedulerOutput",
     "SimpleScheduler",
+    # Schedulers (Python-only path)
+    "PyCapacityScheduler",
+    "PyMicroBatchScheduler",
+    "ScheduleResult",
+    "ScheduleStepConfig",
     "SimpleUnifiedScheduler",
     # ADP
     "ADPRouter",
