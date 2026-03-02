@@ -621,7 +621,15 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             dtype=torch.int,
             device='cpu',
         )
-        kv_lens = cached_token_lens + self.seq_lens_kv
+        if self.enable_helix:
+            # For Helix CP, inactive ranks only attend to previously cached
+            # tokens (no new token appended), while active ranks add new tokens.
+            # This mirrors the kv_lens logic in TrtllmAttentionMetadata.prepare().
+            active_rank = ~self.helix_is_inactive_rank_cpu[:self.num_seqs]
+            kv_lens = cached_token_lens.clone()
+            kv_lens[active_rank] += self.seq_lens_kv[active_rank]
+        else:
+            kv_lens = cached_token_lens + self.seq_lens_kv
 
         # Prepare to support skip indexer
         num_extra_kv_tokens = self.kv_cache_params.num_extra_kv_tokens

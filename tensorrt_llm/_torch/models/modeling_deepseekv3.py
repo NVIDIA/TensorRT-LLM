@@ -764,6 +764,7 @@ class DeepseekV32Attention(MLA):
         model_config: ModelConfig[PretrainedConfig],
         layer_idx: Optional[int] = None,
         aux_stream: Optional[torch.cuda.Stream] = None,
+        mapping_with_cp: Optional[Mapping] = None,
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
@@ -789,6 +790,7 @@ class DeepseekV32Attention(MLA):
                          dtype=config.torch_dtype,
                          config=model_config,
                          aux_stream=aux_stream,
+                         mapping_with_cp=mapping_with_cp,
                          reduce_output=reduce_output)
 
         self.indexer = self.mqa.indexer
@@ -1008,7 +1010,7 @@ class Deepseekv3MoE(nn.Module):
                 num_experts=num_experts,
                 experts_per_token=top_k,
                 moe_ep_size=model_config.mapping.moe_ep_size,
-                dtype=dtype)
+                dtype=torch.float32)
 
     def _compute_shared_expert_tp_size(
             self, intermediate_size: int,
@@ -1070,7 +1072,7 @@ class Deepseekv3MoE(nn.Module):
             experts_per_token=self.top_k,
             moe_ep_size=self.model_config.mapping.moe_ep_size,
             device=device,
-            dtype=self.dtype)
+            dtype=torch.float32)
 
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, do_finalize):
@@ -1197,21 +1199,21 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             #KVCacheManager only support 1 layer for separate draft engine
             layer_idx_for_attention = layer_idx - model_config.pretrained_config.num_hidden_layers
 
+        # When enable_attention_dp is True, TP reduction is skipped since each DP rank
+        # works on different batch elements. However, with CP > 1, attention is split
+        # across CP ranks for the SAME batch element, so reduction is still needed
+        # within the CP group.
+        needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
+        needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
+        )
         if config.model_type == "deepseek_v32":
             self.self_attn = DeepseekV32Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,
                 aux_stream=aux_stream_dict[AuxStreamType.Attention],
-                reduce_output=not self.enable_attention_dp
-                and self.mapping.tp_size > 1)
+                mapping_with_cp=mapping_with_cp,
+                reduce_output=needs_tp_reduce or needs_cp_reduce)
         else:
-            # When enable_attention_dp is True, TP reduction is skipped since each DP rank
-            # works on different batch elements. However, with CP > 1, attention is split
-            # across CP ranks for the SAME batch element, so reduction is still needed
-            # within the CP group.
-            needs_tp_reduce = not self.enable_attention_dp and self.mapping.tp_size > 1
-            needs_cp_reduce = mapping_with_cp is not None and mapping_with_cp.has_cp_helix(
-            )
             self.self_attn = DeepseekV3Attention(
                 model_config,
                 layer_idx=layer_idx_for_attention,

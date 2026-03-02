@@ -956,7 +956,7 @@ protected:
             auto indexerKCacheBlockRange = blockRange.getBlockRangeForWindow(windowSizes[0], true);
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                fillBlockData(*it, blockIdx, llmRequest->getPromptLen(), windowSizes[0], true);
+                fillBlockData(*it, blockIdx, initial, windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -1024,11 +1024,20 @@ protected:
         }
         if (mManager->isEnableIndexerKCache())
         {
+            size_t indexerInitial = llmRequest->getPromptLen();
+            std::vector<int> indexerGlobalBlockIds;
+            if (request->mCPMetaData.has_value())
+            {
+                auto const& cpData = request->mCPMetaData.value();
+                indexerInitial = cpData.mTotalSeqLenAcrossCPRanks;
+                indexerGlobalBlockIds = cpData.mGlobalBlockIds;
+            }
             auto indexerKCacheBlockRange = blockRange.getBlockRangeForWindow(windowSizes[0], true);
             blockIdx = 0;
             for (auto it = indexerKCacheBlockRange.begin(); it != indexerKCacheBlockRange.end(); ++it)
             {
-                verifyBlockData(*it, llmRequest->getPromptLen(), blockIdx, windowSizes[0], true);
+                verifyBlockData(*it, indexerInitial,
+                    indexerGlobalBlockIds.empty() ? blockIdx : indexerGlobalBlockIds[blockIdx], windowSizes[0], true);
                 blockIdx++;
             }
         }
@@ -1830,7 +1839,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & PP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
@@ -1849,7 +1861,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLA, AsymmetricalCacheTest,
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP on gen side for GQA/MHA.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForGQA, AsymmetricalCacheTest,
@@ -1906,7 +1921,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest0WithCPForMLAUnevenLayer, Asymmetrical
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests high context PP with PP and CP on gen side with uneven layer distribution.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
@@ -1925,7 +1943,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest1WithCPForMLAUnevenLayer, Asymmetrical
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests high context PP with pure CP on gen side with uneven layer distribution.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, AsymmetricalCacheTest,
@@ -1944,7 +1965,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTest2WithCPForMLAUnevenLayer, Asymmetrical
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(false),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheTestWithDP,
@@ -1963,7 +1987,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA0, AsymmetricalCacheT
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(false),
         /*generationDP*/ testing::Values(true),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial DP on context side while non-trivial CP & DP on gen side.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheTestWithDP,
@@ -1982,7 +2009,10 @@ INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForMLA1, AsymmetricalCacheT
         /*isMLA*/ testing::Values(true),
         /*contextDP*/ testing::Values(true),
         /*generationDP*/ testing::Values(true),
-        /*isWindow*/ testing::Values(false), testing::Values(false), testing::Values(0), testing::Values(128)));
+        /*isWindow*/ testing::Values(false),
+        /*isIndexerKCache*/ testing::Values(true),
+        /*indexerDimPerHead*/ testing::Values(256),
+        /*indexerKCacheQuantBlockSize*/ testing::Values(128)));
 
 // Tests cases where there's non-trivial TP and PP on context side while non-trivial CP & DP on gen side for GQA/MHA.
 INSTANTIATE_TEST_CASE_P(AsymmetricCaseTestWithCPAndDPForGQA0, AsymmetricalCacheTestWithDP,
