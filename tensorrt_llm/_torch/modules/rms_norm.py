@@ -20,6 +20,7 @@ from typing import Optional, Tuple, TypeAlias, Union, cast
 import torch
 from torch import nn
 
+from ..._utils import get_sm_version
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
 from ..utils import Fp4QuantizedTensor
@@ -73,6 +74,17 @@ class RMSNorm(nn.Module):
         self.variance_epsilon = eps
         self.use_gemma = use_gemma
         self.use_cuda_tile = use_cuda_tile
+
+        # fused_add_rms_norm_quant only supports SM 9.x / 10.x because:
+        #  - Device code is guarded by is_major_v<9> || is_major_v<10>
+        #    (ws_layernorm.cuh:828, low_latency_layernorm.cuh:157).
+        # On unsupported SMs, fall back to flashinfer/generic RMSNorm and let
+        # the downstream linear layer handle FP4 quantization.
+        if self.is_nvfp4:
+            sm_version = get_sm_version()
+            if not (90 <= sm_version < 110):
+                self.is_nvfp4 = False
+                return_hp_output = False
         self.return_hp_output = return_hp_output
 
     def forward(
