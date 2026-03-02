@@ -21,7 +21,7 @@ def test_fmha():
         all_archs = [80, 86, 89, 90, 100, 120]
 
         # Select the family we belong to (e.g. 103 -> 100)
-        test_arch = max(filter(lambda x: x < test_arch, all_archs))
+        test_arch = max(filter(lambda x: x <= test_arch, all_archs))
 
         build_only_on_archs = filter(lambda x: x != test_arch, all_archs)
 
