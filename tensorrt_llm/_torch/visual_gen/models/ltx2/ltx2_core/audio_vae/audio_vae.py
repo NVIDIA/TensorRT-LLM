@@ -179,7 +179,7 @@ class AudioDecoder(torch.nn.Module):
         return torch.tanh(h) if self.tanh_out else h
 
 
-def decode_audio(latent: torch.Tensor, audio_decoder: "AudioDecoder", vocoder: "Vocoder") -> torch.Tensor:
+def decode_audio(latent: torch.Tensor, audio_decoder: AudioDecoder, vocoder: Vocoder) -> torch.Tensor:
     decoded_audio = audio_decoder(latent)
     decoded_audio = vocoder(decoded_audio).squeeze(0).float()
     return decoded_audio

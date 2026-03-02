@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""LTX2 Text-to-Video+Audio generation using TensorRT-LLM Visual Generation."""
+"""LTX2 Text/Image-to-Video generation using TensorRT-LLM Visual Generation."""
 
 import argparse
 import time

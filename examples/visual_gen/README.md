@@ -125,7 +125,9 @@ python visual_gen_wan_t2v.py \
     --cfg_size 2 --ulysses_size 4 \
     --output_path output.mp4
 ```
+GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 
+---
 
 ## WAN (Image-to-Video)
 
@@ -139,22 +141,124 @@ python visual_gen_wan_i2v.py \
 ```
 
 
+---
+
+## LTX2 (Text/Image-to-Video with Audio)
+
+LTX2 generates video **with audio** from text prompts or input images.
+It uses a Gemma3 text encoder (provided separately via `--text_encoder_path`)
+and supports BF16, FP8, and FP4 precision checkpoints.
+
+### LTX-2 Native Checkpoint Format
+
+LTX-2 native checkpoints pack all model components into a **single safetensors
+file** with prefixed tensor keys. This document describes the layout using the
+BF16 checkpoint as a reference.
+
+#### File Overview
+
+```
+ltx-2-19b-dev.safetensors
+  Total tensors : 6,404
+  Metadata keys : license, encrypted_wandb_properties, _quantization_metadata, config
+```
+
+The `config` metadata key contains a JSON dict with per-component configuration
+(e.g., `config["transformer"]`). The `_quantization_metadata` key holds the
+ModelOpt quantization recipe (present only in quantized checkpoints).
+
+#### Component Prefixes
+
+Every tensor key is prefixed by its component name. The weight loader strips the
+prefix when loading (e.g., `model.diffusion_model.proj_out.weight` becomes
+`proj_out.weight` for the transformer).
+
+| Prefix | Component | Tensors | Description |
+|--------|-----------|---------|-------------|
+| `model.diffusion_model.` | Transformer (DiT) | 5,920 | Video + audio denoising transformer |
+| `vae.` | Video VAE | 187 | Video encoder/decoder |
+| `audio_vae.` | Audio VAE | 102 | Audio encoder/decoder |
+| `vocoder.` | Vocoder | 194 | Mel-spectrogram to waveform |
+| `text_embedding_projection.` | Text projection | 1 | Aggregated text embedding projection |
+
+### Basic Usage
+
+**Text-to-Video (single GPU):**
+```bash
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/bf16/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A woman with long brown hair and light skin smiles" \
+    --height 720 --width 1280 --num_frames 121 \
+    --steps 40 --guidance_scale 4.0 --seed 42 \
+    --output_path output_t2v.mp4
+```
+
+**Image-to-Video:**
+```bash
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/bf16/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A fluffy white puppy running" \
+    --image /path/to/input_image.jpg \
+    --image_cond_strength 1.0 \
+    --height 720 --width 1280 --num_frames 121 \
+    --steps 40 --seed 42 \
+    --output_path output_i2v.mp4
+```
+
+### Precision Variants
+
+LTX2 ships checkpoints at three precision levels. Simply point `--model_path` at the
+appropriate directory:
+
+```bash
+# FP8
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp8/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A serene mountain landscape at sunset" \
+    --height 720 --width 1280 --num_frames 121 \
+    --output_path output_fp8.mp4
+
+# FP4
+python visual_gen_ltx2.py \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp4/ \
+    --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
+    --prompt "A serene mountain landscape at sunset" \
+    --height 512 --width 768 --num_frames 121 \
+    --output_path output_fp4.mp4
+```
+
+---
+
 ## Common Arguments
 
-| Argument | FLUX | WAN | Default | Description |
-|----------|------|-----|---------|-------------|
-| `--height` | ✓ | ✓ | 1024 / 720 | Output height |
-| `--width` | ✓ | ✓ | 1024 / 1280 | Output width |
-| `--num_frames` | — | ✓ | 81 | Number of frames |
-| `--steps` | ✓ | ✓ | 50 | Denoising steps |
-| `--guidance_scale` | ✓ | ✓ | 3.5 / 5.0 | Guidance strength |
-| `--seed` | ✓ | ✓ | 42 | Random seed |
-| `--enable_teacache` | ✓ | ✓ | False | Cache optimization |
-| `--teacache_thresh` | ✓ | ✓ | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
-| `--cfg_size` | — | ✓ | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | ✓ | 1 | Sequence parallelism |
-| `--linear_type` | ✓ | ✓ | default | Quantization type |
+| Argument | FLUX | WAN | LTX2 | Default | Description |
+|----------|------|-----|------|---------|-------------|
+| `--model_path` | ✓ | ✓ | — | Path to model checkpoint directory |
+| `--text_encoder_path` | — | ✓ | — | Path to Gemma3 text encoder |
+| `--prompt` | ✓ | ✓ | — | Text prompt for generation |
+| `--negative_prompt` | — | ✓ | *(built-in)* | Negative prompt |
+| `--height` | ✓ | ✓ | ✓ | 1024 / 720 | Output height |
+| `--width` | ✓ | ✓ | ✓ | 1024 / 1280 | Output width |
+| `--num_frames` | — | ✓ | ✓ | 81 / 121 | Number of frames |
+| `--frame_rate` | — | ✓ | 24.0 | Output frame rate (fps) |
+| `--steps` | ✓ | ✓ | ✓ | 50 / 40 | Denoising steps |
+| `--guidance_scale` | ✓ | ✓ | ✓ | 3.5 / 5.0 / 4.0 | Guidance strength |
+| `--seed` | ✓ | ✓ | ✓ | 42 | Random seed |
+| `--image` | — | ✓ | None | Input image for image-to-video |
+| `--image_cond_strength` | — | ✓ | 1.0 | Image conditioning strength |
+| `--enable_teacache` | ✓ | ✓ | — | False | Cache optimization |
+| `--teacache_thresh` | ✓ | ✓ | — | 0.2 | TeaCache similarity threshold |
+| `--attention_backend` | ✓ | ✓ | — | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
+| `--cfg_size` | — | ✓ | — | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | ✓ | — | 1 | Sequence parallelism |
+| `--linear_type` | ✓ | ✓ | — | default | Quantization type |
+| `--enhance_prompt` | — | ✓ | False | Gemma3 prompt enhancement |
+| `--stg_scale` | — | ✓ | 0.0 | Spatiotemporal guidance scale |
+| `--modality_scale` | — | ✓ | 1.0 | Cross-modal guidance scale |
+| `--rescale_scale` | — | ✓ | 0.0 | Variance-preserving rescale factor |
 
 ## Troubleshooting
 
@@ -182,6 +286,7 @@ python visual_gen_wan_i2v.py \
 
 - **FLUX**: `.png` (image)
 - **WAN**: `.mp4` if FFmpeg is installed, otherwise `.avi` (video)
+- **LTX2**: `.mp4` (video with audio), `.gif` (animated), `.png` (single frame)
 
 ## Serving
 

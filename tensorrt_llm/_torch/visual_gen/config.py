@@ -524,7 +524,7 @@ class DiffusionModelConfig(BaseModel):
 
     @classmethod
     def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
-        """Try to read embedded config from a single-safetensors checkpoint (LTX-2).
+        """Try to read embedded config from a single-safetensors checkpoint (LTX-2 specific).
 
         Accepts either a directory (globs for ``*.safetensors``) or a direct
         path to a ``.safetensors`` file.
@@ -576,7 +576,7 @@ class DiffusionModelConfig(BaseModel):
         Supports two checkpoint formats:
         * **Diffusers directory layout** -- ``model_index.json`` with
           component sub-directories each containing ``config.json``.
-        * **LTX-2 native single-safetensors** -- no ``model_index.json``;
+        * **LTX-2 specific single-safetensors** -- no ``model_index.json``;
           config embedded in the safetensors metadata header under a
           ``"config"`` key.  The transformer section is extracted as
           ``pretrained_config`` and the full dict is stored in
@@ -633,7 +633,7 @@ class DiffusionModelConfig(BaseModel):
                     if transformer_2_spec and transformer_2_spec[0] is not None:
                         pretrained_config.boundary_ratio = model_index["boundary_ratio"]
         else:
-            # ---------- Single safetensors (LTX-2 native) ----------
+            # ---------- Single safetensors (LTX-2 specific) ----------
             native_config = cls._try_load_safetensors_config(checkpoint_path)
 
             if native_config is not None:
@@ -663,19 +663,11 @@ class DiffusionModelConfig(BaseModel):
                         qc["ignore"] = cleaned
                     pretrained_config.quantization_config = qc
             else:
-                # Fallback: look for a bare config.json next to the checkpoint
-                config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path
-                config_path = config_dir / "config.json"
-                if not config_path.exists():
-                    raise ValueError(
-                        f"Config not found at {checkpoint_dir}. "
-                        "Expected model_index.json (diffusers), "
-                        "safetensors with embedded config metadata, "
-                        "or a config.json file."
-                    )
-                with open(config_path) as f:
-                    config_dict = json.load(f)
-                pretrained_config = SimpleNamespace(**config_dict)
+                raise ValueError(
+                    f"Config not found at {checkpoint_dir}. "
+                    "Expected model_index.json (diffusers) or "
+                    "safetensors with embedded config metadata."
+                )
 
         # Resolve quant config
         if args and args.quant_config.quant_algo is not None:

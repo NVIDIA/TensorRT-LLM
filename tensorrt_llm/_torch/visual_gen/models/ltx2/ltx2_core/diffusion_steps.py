@@ -20,6 +20,11 @@ class EulerDiffusionStep(DiffusionStepProtocol):
         sigmas: torch.Tensor,
         step_index: int,
     ) -> torch.Tensor:
+        if step_index < 0 or step_index >= len(sigmas) - 1:
+            raise ValueError(
+                f"step_index={step_index} out of bounds for sigmas with length {len(sigmas)}"
+            )
+
         sigma = sigmas[step_index]
         sigma_next = sigmas[step_index + 1]
         dt = sigma_next - sigma

@@ -49,17 +49,14 @@ class WeightLoader(BaseWeightLoader):
         """
         Load weights from checkpoint directory.
 
-        Supports three layouts:
+        Supports two layouts:
 
         * **Pipeline (diffusers)** -- ``model_index.json`` with component
           sub-directories, each containing weight files.
-        * **Single safetensors (LTX-2 native)** -- no ``model_index.json``;
-          component sub-directories absent; weight files sit in the root
-          with prefixed keys (e.g. ``transformer.``, ``video_vae.``).
-          Only keys matching the requested component prefix are returned
-          (prefix stripped).
-        * **Standalone** -- no ``model_index.json`` and no component sub-dirs;
-          weight files in the root directory without prefixes.
+        * **Single safetensors (specific to LTX-2 models)** -- no ``model_index.json``;
+          weight files sit in the root directory with prefixed keys
+          (e.g. ``transformer.``, ``video_vae.``).  Only keys matching the
+          requested component prefix are returned (prefix stripped).
 
         Args:
             checkpoint_dir: Path to checkpoint (pipeline root or component dir)
@@ -72,9 +69,11 @@ class WeightLoader(BaseWeightLoader):
         """
         checkpoint_path = Path(checkpoint_dir)
 
+        # Check if this is a pipeline (has model_index.json)
         model_index = checkpoint_path / "model_index.json"
         is_pipeline = model_index.exists()
 
+        # Load weights for each component
         all_weights = {}
         for component in self.components:
             if is_pipeline:
@@ -82,9 +81,6 @@ class WeightLoader(BaseWeightLoader):
                 if not component_dir.exists():
                     raise ValueError(f"Component '{component}' not found in {checkpoint_dir}")
                 weight_dir = component_dir
-                prefix_filter = None
-            elif (checkpoint_path / component).exists():
-                weight_dir = checkpoint_path / component
                 prefix_filter = None
             else:
                 weight_dir = checkpoint_path
