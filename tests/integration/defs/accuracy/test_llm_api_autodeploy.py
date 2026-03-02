@@ -735,3 +735,94 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+
+class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
+    """Accuracy tests for models from the AutoDeploy model registry.
+
+    Config = yaml_extra (merged) + config_overrides.
+    Model paths are resolved via hf_id_to_local_model_dir.
+    """
+
+    # Each param: (model_name, config_overrides, tasks). Marks skip when machine lacks GPUs/memory.
+    MODEL_REGISTRY_ACCURACY_PARAMS = [
+        pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
+                     id="meta-llama_Llama-3.1-8B-Instruct"),
+        pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
+                     id="google_gemma-3-1b-it"),
+        pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
+                     id="mistralai_Ministral-8B-Instruct-2410"),
+        pytest.param("mistralai/Codestral-22B-v0.1", {}, [MMLU, GSM8K],
+                     id="mistralai_Codestral-22B-v0.1"),
+        pytest.param("nvidia/Llama-3.1-Nemotron-Nano-8B-v1", {}, [MMLU, GSM8K],
+                     id="nvidia_Llama-3.1-Nemotron-Nano-8B-v1"),
+        pytest.param(
+            "Qwen/QwQ-32B",
+            {},
+            [MMLU],
+            marks=pytest.mark.skip_less_device_memory(80000),
+            id="Qwen_QwQ-32B",
+        ),
+        pytest.param(
+            "meta-llama/Llama-3.3-70B-Instruct",
+            {},
+            [MMLU, GSM8K],
+            marks=pytest.mark.skip_less_device_memory(80000),
+            id="meta-llama_Llama-3.3-70B-Instruct",
+        ),
+    ]
+
+    @staticmethod
+    def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
+        """Return (yaml_extra paths, world_size) from model registry."""
+        registry_path = (Path(__file__).resolve().parents[4] /
+                         "examples/auto_deploy/model_registry")
+        with open(registry_path / "models.yaml") as f:
+            registry = yaml.safe_load(f)
+        for entry in registry["models"]:
+            if entry["name"] == model_name:
+                config_dir = registry_path / "configs"
+                paths = [str(config_dir / f) for f in entry["yaml_extra"]]
+                # world_size from world_size_N.yaml (last match wins)
+                world_size = 1
+                for f in entry["yaml_extra"]:
+                    s = str(f)
+                    if "world_size_" in s and s.endswith(".yaml"):
+                        world_size = int(
+                            s.replace("world_size_", "").replace(".yaml", ""))
+                return paths, world_size
+        raise ValueError(f"Model '{model_name}' not found in model registry")
+
+    def get_default_sampling_params(self):
+        # Use end_id=None so _setup runs and tokenizes stop sequences (e.g. GSM8K).
+        return SamplingParams(end_id=None,
+                              pad_id=None,
+                              n=1,
+                              use_beam_search=False)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("accuracy_check", [False])
+    @pytest.mark.parametrize("model_name,config_overrides,tasks",
+                             MODEL_REGISTRY_ACCURACY_PARAMS)
+    def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
+                                      accuracy_check):
+        model_path = hf_id_to_local_model_dir(model_name)
+        yaml_paths, registry_world_size = self._get_registry_yaml_extra(
+            model_name)
+        effective_world_size = config_overrides.get("world_size",
+                                                    registry_world_size)
+        if get_device_count() < effective_world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        sampling_params = self.get_default_sampling_params()
+
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
+                           yaml_extra=yaml_paths,
+                           **config_overrides) as llm:
+            if accuracy_check:
+                for task_cls in tasks:
+                    task = task_cls(model_name)
+                    try:
+                        task.evaluate(llm, sampling_params=sampling_params)
+                    except (AssertionError, RuntimeError, ValueError) as e:
+                        raise type(e)(f"[{task_cls.__name__}] {e}") from None

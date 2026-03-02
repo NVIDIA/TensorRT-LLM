@@ -45,6 +45,13 @@ HF_ID_TO_LLM_MODELS_SUBDIR = {
     "yuhuili/EAGLE3-LLaMA3.1-Instruct-8B": "EAGLE3-LLaMA3.1-Instruct-8B",
     "zai-org/GLM-4.7-Flash": "GLM-4.7-Flash",
     "DeepInfra/GLM-4.7-Flash-NVFP4": "GLM-4.7-Flash-NVFP4",
+    # AutoDeploy accuracy tests - overlapping with model registry
+    "google/gemma-3-1b-it": "gemma/gemma-3-1b-it",
+    "Qwen/QwQ-32B": "QwQ-32B",
+    "meta-llama/Llama-3.3-70B-Instruct": "llama-3.3-models/Llama-3.3-70B-Instruct",
+    "mistralai/Codestral-22B-v0.1": "Codestral-22B-v0.1",
+    "mistralai/Ministral-8B-Instruct-2410": "Ministral-8B-Instruct-2410",
+    "nvidia/Llama-3.1-Nemotron-Nano-8B-v1": "Llama-3.1-Nemotron-Nano-8B-v1",
 }
 
 
