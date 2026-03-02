@@ -24,7 +24,7 @@ def model_path(model_name: str):
 @pytest.fixture(scope="module")
 def server(model_path: str):
     args = ["--kv_cache_free_gpu_memory_fraction", "0.8"]
-    # fix port to facilitate concise trtllm-serve examples
+    # use dynamic port
     with RemoteOpenAIServer(model_path, cli_args=args) as remote_server:
         yield remote_server
 
