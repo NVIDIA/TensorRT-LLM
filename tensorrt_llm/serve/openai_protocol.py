@@ -1378,6 +1378,8 @@ class VideoJob(OpenAIBaseModel):
     fps: Optional[int] = Field(default=None, description="Frames per second")
     size: Optional[str] = Field(default=None,
                                 description="Video dimensions in 'WxH' format")
+    output_path: Optional[str] = Field(
+        default=None, description="Actual path where the video file was saved")
 
 
 class VideoJobList(OpenAIBaseModel):
