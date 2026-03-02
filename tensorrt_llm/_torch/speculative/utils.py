@@ -32,11 +32,6 @@ def get_spec_metadata(spec_config,
                       is_draft_model=False,
                       max_seq_len=262144):
     if spec_config.spec_dec_mode.is_mtp_one_model():
-        # Get SA manager from spec_resource_manager if MTP+SA mode
-        sa_manager = None
-        if spec_resource_manager is not None and hasattr(
-                spec_resource_manager, 'sa_manager'):
-            sa_manager = spec_resource_manager.sa_manager
         return MTPSpecMetadata(
             max_draft_len=spec_config.max_draft_len,
             max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
@@ -44,7 +39,6 @@ def get_spec_metadata(spec_config,
             mtp_num_modules=spec_config.num_nextn_predict_layers,
             max_num_requests=max_num_requests,
             mtp_hidden_states_manager=spec_resource_manager,
-            sa_manager=sa_manager,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
         )
     if spec_config.spec_dec_mode.is_mtp_eagle():
@@ -92,6 +86,7 @@ def get_spec_metadata(spec_config,
             max_num_tokens=max_num_tokens,
             layers_to_capture=spec_config.eagle3_layers_to_capture,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_pard():
         return PARDSpecMetadata(
@@ -171,6 +166,22 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             sa_manager=sa_manager,
         )
+    if spec_dec_mode.is_eagle3_one_model():
+        sa_manager = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            sa_manager = SuffixAutomatonManager(spec_config, max_num_requests,
+                                                max_seq_len)
+        if sa_manager is not None:
+            return Eagle3ResourceManager(
+                spec_config,
+                model_config.torch_dtype,
+                model_config.hidden_size,
+                max_num_requests,
+                max_seq_len,
+                max_num_tokens,
+                sa_manager=sa_manager,
+            )
+        return None
     if spec_dec_mode.is_eagle3() or spec_dec_mode.is_mtp_eagle():
         assert draft_model_engine is not None, "Draft model engine is required for Eagle3 and MTP Eagle two model flow."
         return Eagle3ResourceManager(
