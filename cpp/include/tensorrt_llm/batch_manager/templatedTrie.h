@@ -45,27 +45,27 @@
 //
 // NodeKey is a custom data type with a notion of tokens. The NodeKey we use for KV cache block lookups is struct
 // BlockKey, which has a property called uniqueTokens. uniqueTokens is a vector of fixed size, the size is equal to
-// block length, which is sometimes refered to as 'tokens_per_block'. BlockKey supports partial matching. Partial
+// block length, which is sometimes referred to as 'tokens_per_block'. BlockKey supports partial matching. Partial
 // matching means the entire BlockKey did not match, but the first 'N' tokens did. Not all NodeKeys support partial
-// matching, you enable or disable this feature with template argument 'supportsPartialMatching'.
+// matching, you enable or disable this feature with template argument 'EnablePartialMatching'.
 //
 
 namespace tensorrt_llm::batch_manager::templated_trie
 {
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 class Node;
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 class Trie;
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 struct NodeMatch
 {
-    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using NodePtr = std::shared_ptr<_Node>;
 
     NodeMatch() = default;
@@ -85,11 +85,11 @@ struct NodeMatch
 };
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 struct NodeMatches
 {
     using _NodeMatch
-        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
 
     // Nodes matched exactly from beginning of prefix
     std::vector<_NodeMatch> exactMatches;
@@ -98,15 +98,15 @@ struct NodeMatches
 };
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 struct ValueMatch
 {
-    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using NodePtr = std::shared_ptr<_Node>;
 
     ValueMatch() = default;
 
-    explicit ValueMatch(NodeKey& nk, NodePtr& n, ValueKey vk)
+    explicit ValueMatch(NodeKey const& nk, NodePtr const& n, ValueKey vk)
         : isValid{false}
         , key{nk}
         , node{n}
@@ -115,7 +115,7 @@ struct ValueMatch
     {
     }
 
-    explicit ValueMatch(NodeKey& nk, NodePtr& n, ValueKey vk, Value const& v, bool em)
+    explicit ValueMatch(NodeKey const& nk, NodePtr const& n, ValueKey vk, Value const& v, bool em)
         : isValid{true}
         , key{nk}
         , node{n}
@@ -134,23 +134,23 @@ struct ValueMatch
 };
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 struct ValueMatches
 {
     using _ValueMatch
-        = ValueMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = ValueMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     std::vector<_ValueMatch> matches;
 };
 
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 class Node
 {
 public:
     using PrefixKey = std::vector<NodeKey>;
     using NodePtr = std::shared_ptr<Node>;
     using _NodeMatch
-        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using NodeMatchPtr = std::shared_ptr<_NodeMatch>;
 
     Node() = default;
@@ -274,18 +274,20 @@ public:
     //! \return vector of matching nodes, sorted in descending order of number of matched tokens.
     [[nodiscard]] std::vector<_NodeMatch> findPartiallyMatchingNodes(NodeKey const& key) const
     {
-        if constexpr (supportsPartialMatching)
+        if constexpr (EnablePartialMatching)
         {
+            // Runtime check: the specific key instance may disable partial matching (e.g. BlockKey with extraKeys).
+            if (!key.supportsPartialMatching())
+            {
+                return {};
+            }
             std::vector<std::pair<int, NodePtr>> matches;
             for (auto nn : mNextNodes)
             {
-                if (key.supportsPartialMatching())
+                int numMatched = key.numMatchingTokens(nn.first);
+                if (numMatched > 0)
                 {
-                    int numMatched = key.numMatchingTokens(nn.first);
-                    if (numMatched > 0)
-                    {
-                        matches.emplace_back(numMatched, nn.second);
-                    }
+                    matches.emplace_back(numMatched, nn.second);
                 }
             }
             auto results = std::vector<_NodeMatch>();
@@ -320,7 +322,7 @@ public:
     }
 
 private:
-    friend Trie<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    friend Trie<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
 
     // Private debugging method.
     void _getEdges(std::vector<NodeKey> edge, std::vector<std::vector<NodeKey>>& edges) const
@@ -368,27 +370,31 @@ private:
 //! \brief A radix search tree used to look up values for given prefixes.
 //! \tparam NodeKey Single node key. A prefix key is required for lookup from root and is a vector of node key.
 //! \tparam NodeKeyHashFunctor Hash functor for node key. Can be std::hash<NodeKey> if std::hash is implemented for
-//! NodeKey. \tparam ValueKey Value key. Think of this as a channel selector, for instance multiple window sizes can be
-//! handled if ValueKey is an int. \tparam ValueKeyHashFunctor Hash functor for value key. Can be std::hash<ValueKey> if
-//! std::hash is implemented for ValueKey. \tparam Value Object holding value. \tparam supportsPartialMatching Set to
-//! true if NodeKey supports partial matching and you know how to extract a subset of matched tokens from Value.
+//! NodeKey.
+//! \tparam ValueKey Value key. Think of this as a channel selector, for instance multiple window sizes can be
+//! handled if ValueKey is an int.
+//! \tparam ValueKeyHashFunctor Hash functor for value key. Can be std::hash<ValueKey> if std::hash is implemented for
+//! ValueKey.
+//! \tparam Value Object holding value.
+//! \tparam EnablePartialMatching Set to true to allow the tree to
+//! attempt partial matching.
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
-    bool supportsPartialMatching>
+    bool EnablePartialMatching>
 class Trie
 {
 public:
     using PrefixKey = std::vector<NodeKey>;
-    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+    using _Node = Node<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using NodePtr = std::shared_ptr<_Node>;
     using _NodeMatch
-        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = NodeMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using _NodeMatches
-        = NodeMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = NodeMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using NodeMatchesPtr = std::shared_ptr<_NodeMatches>;
     using _ValueMatch
-        = ValueMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = ValueMatch<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using _ValueMatches
-        = ValueMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, supportsPartialMatching>;
+        = ValueMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using ValueMatchesPtr = std::shared_ptr<_ValueMatches>;
 
     explicit Trie()
@@ -443,7 +449,7 @@ public:
             }
             else
             {
-                if (supportsPartialMatching && allowPartialMatch)
+                if (EnablePartialMatching && allowPartialMatch)
                 {
                     auto partialMatches = prevNode->findPartiallyMatchingNodes(key);
                     results.partialMatches.insert(
@@ -484,7 +490,7 @@ public:
         _ValueMatches valueMatches;
         for (auto const& nodeMatch : nodeMatches.exactMatches)
         {
-            auto optValue = nodeMatch.node->getValue();
+            auto optValue = nodeMatch.node->getValue(vkey);
             if (optValue.has_value())
             {
                 valueMatches.matches.emplace_back(
@@ -497,8 +503,8 @@ public:
         }
         for (auto const& nodeMatch : nodeMatches.partialMatches)
         {
-            auto optValue = nodeMatch.node->getValue();
-            if (optValue.has_value() != nullptr)
+            auto optValue = nodeMatch.node->getValue(vkey);
+            if (optValue.has_value())
             {
                 valueMatches.matches.emplace_back(
                     nodeMatch.key, nodeMatch.node, vkey, optValue.value(), nodeMatch.exactMatch);

@@ -110,6 +110,9 @@ bool BlockKey::operator==(BlockKey const& other) const noexcept
 
 BlockKey BlockKey::shorten(int newNumTokens) const
 {
+    TLLM_CHECK_WITH_INFO(extraKeys.empty(),
+        "shorten() cannot be called on a BlockKey with extraKeys (partial matching is disabled when multimodal data is "
+        "present).");
     TLLM_CHECK_WITH_INFO(
         newNumTokens >= 0 && newNumTokens <= getNumTokens(), "newNumTokens must be >= 0 and <= getNumTokens()");
     BlockKey result(*this);
@@ -148,7 +151,7 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     // block
     if (!blockKey.extraKeys.empty())
     {
-        for (auto const& [mmHash, startOffset] : blockKey.extraKeys)
+        for (auto const& [mmHash, startOffset, uuid] : blockKey.extraKeys)
         {
             // Hash the multimodal hash array in 32-bit chunks (more efficient)
             for (size_t i = 0; i < 32; i += 4)

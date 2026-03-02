@@ -17,7 +17,6 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/templatedTrie.h"
-#include <cstdio>
 #include <string>
 
 namespace tensorrt_llm::batch_manager::templated_trie
@@ -30,10 +29,12 @@ public:
 
     void insert(std::string str)
     {
+        if (str.empty())
+        {
+            return;
+        }
         std::vector<char> prefix(str.begin(), str.end());
         auto matches = insertNodes(prefix);
-        printf("1. prefix.size() = %ld, str.length() = %ld, matches.exactMatches.size() = %ld\n", prefix.size(),
-            str.length(), matches.exactMatches.size());
         auto last_match = matches.exactMatches.back();
         [[maybe_unused]] auto wasOverwritten = last_match.node->setValue(1, static_cast<int>(str.size()),
             /*overwrite*/ true); // store value for last node so nodes don't get deleted.
@@ -41,6 +42,10 @@ public:
 
     void erase(std::string str)
     {
+        if (str.empty())
+        {
+            return;
+        }
         std::vector<char> prefix(str.begin(), str.end());
         auto matches = lookupNodes(prefix, /*allowPartialMatch*/ false);
         if (matches.exactMatches.size() == prefix.size())
@@ -53,10 +58,12 @@ public:
 
     [[nodiscard]] bool contains(std::string str) const
     {
+        if (str.empty())
+        {
+            return false;
+        }
         std::vector<char> prefix(str.begin(), str.end());
         auto matches = lookupNodes(prefix, /*allowPartialMatch*/ false);
-        printf("2. prefix.size() = %ld, str.length() = %ld, matches.exactMatches.size() = %ld\n", prefix.size(),
-            str.length(), matches.exactMatches.size());
         if (matches.exactMatches.size() == prefix.size())
         {
             auto last_match = matches.exactMatches.back();
