@@ -1509,7 +1509,7 @@ class MLA(nn.Module):
         # forward_context_with_chunked_prefill as needed.
         use_short_mha_for_ctx = (num_contexts > 0
                                  and self._should_use_short_mha(
-                                     num_ctx_tokens, position_ids))
+                                     attn_metadata, position_ids))
 
         # Skip the indexer entirely when the short MHA path handles all
         # context tokens and there are no generation tokens.
@@ -1618,18 +1618,23 @@ class MLA(nn.Module):
 
         return attn_output
 
-    def _should_use_short_mha(self, num_ctx_tokens: int,
+    def _should_use_short_mha(self, attn_metadata: AttentionMetadata,
                               position_ids: Optional[torch.Tensor]) -> bool:
         """Check if the short-seq MHA optimization should be used for context.
 
-        This checks only new token count vs threshold.  When cached tokens
-        exist, the caller should route through forward_context() which
-        dispatches to the appropriate cached-KV handler
-        (forward_context_with_cached_kv or forward_context_with_chunked_prefill).
+        Uses max_ctx_kv_len (max total KV length per context sequence,
+        including cached tokens) when available, to correctly account for
+        chunked context where the full attention span exceeds the threshold
+        even if the new token count is small.  Falls back to num_ctx_tokens
+        (total new context tokens) when max_ctx_kv_len is not set.
         """
-        return (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
-                and self.mapping.cp_size == 1 and position_ids is not None
-                and num_ctx_tokens <= self.short_seq_mha_threshold)
+        if not (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
+                and self.mapping.cp_size == 1 and position_ids is not None):
+            return False
+        effective_len = getattr(attn_metadata, 'max_ctx_kv_len', 0)
+        if effective_len == 0:
+            effective_len = attn_metadata.num_ctx_tokens
+        return effective_len <= self.short_seq_mha_threshold
 
     def forward_context_dsa(
         self,
@@ -1644,9 +1649,12 @@ class MLA(nn.Module):
     ) -> torch.Tensor:
         """Run context-phase attention for DSA models.
 
-        Dispatches to the short-seq MHA path (forward_context_default) when
-        the total packed context tokens are within the threshold, or falls
-        through to the absorption/sparse MLA path otherwise.
+        Dispatches to the short-seq MHA path (forward_context) when the max
+        per-sequence KV length (including cached tokens) is within the
+        threshold, or falls through to the absorption/sparse MLA path
+        otherwise.  forward_context() further dispatches to the appropriate
+        handler (forward_context_default, forward_context_with_cached_kv, or
+        forward_context_with_chunked_prefill) based on cached-KV state.
 
         Args:
             q: Query tensor, shape [num_ctx_tokens, num_heads * qk_head_dim].
@@ -1665,8 +1673,7 @@ class MLA(nn.Module):
         # because dense attention is faster than sparse routing at this scale.
         # forward_context() handles cached tokens by dispatching to
         # forward_context_with_cached_kv or forward_context_with_chunked_prefill.
-        num_ctx_tokens = q.shape[0]
-        if self._should_use_short_mha(num_ctx_tokens, position_ids):
+        if self._should_use_short_mha(attn_metadata, position_ids):
             return self.forward_context(q, compressed_kv, k_pe, position_ids,
                                         attn_metadata, output, latent_cache)
 
