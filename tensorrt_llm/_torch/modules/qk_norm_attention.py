@@ -237,8 +237,8 @@ class QKNormRoPEAttention(Attention):
         rotary_dim = int(self.head_dim * partial_rotary_factor)
 
         torch.ops.trtllm.fused_qk_norm_rope(
-            qkv, self.num_heads, self.num_key_value_heads,
-            self.num_key_value_heads, self.head_dim, rotary_dim,
+            qkv, self.attn_num_heads, self.attn_num_key_value_heads,
+            self.attn_num_key_value_heads, self.head_dim, rotary_dim,
             self.q_norm.variance_epsilon, self.q_norm.weight,
             self.k_norm.weight,
             self.pos_embd_params.rope.theta, self.pos_embd_params.is_neox,
