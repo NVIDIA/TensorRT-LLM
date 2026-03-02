@@ -22,6 +22,8 @@ from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
@@ -49,8 +51,7 @@ class Mamba2Mixer(nn.Module):
         *,
         d_model: int,
         d_state: int,
-
-d_conv: int,
+        d_conv: int,
         nheads: int,
         n_groups: int,
         head_dim: int,
@@ -192,6 +193,9 @@ d_conv: int,
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
 
+        self.aux_steram = torch.cuda.Stream()
+        self.events = [torch.cuda.Event(), torch.cuda.Event()]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -326,10 +330,6 @@ d_conv: int,
             ssm_states[state_indices_p] = current_ssm_states
 
         if num_decodes > 0:
-            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            # Convert dt early so we can do PDL between conv1d and selective state.
-            dt_d = dt_d.to(dtype=torch.float32)
-
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
@@ -340,33 +340,54 @@ d_conv: int,
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
-                intermediate_state_indices = _cached_arange(attn_metadata.kv_cache_manager.get_max_resource_count(), state_indices_d.device)[:num_decodes]
+                intermediate_state_indices = _cached_arange(
+                    attn_metadata.kv_cache_manager.get_max_resource_count(),
+                    state_indices_d.device)[:num_decodes]
 
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
                                             -1).transpose(1, 2)
-                # TODO:support tree structure [TRTLLM-10320]
-                xbc_d_processed = causal_conv1d_update_triton(
-                    xbc_d_reshaped,
-                    conv_states,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=state_indices_d[:num_decodes],
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=intermediate_state_indices,
-                )
 
-                xbc_d = xbc_d_processed.transpose(1, 2).view(
-                    num_decode_tokens, -1)
+                def conv1d():
+                    # TODO:support tree structure [TRTLLM-10320]
+                    xbc_d_processed = causal_conv1d_update_triton(
+                        xbc_d_reshaped,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d[:num_decodes],
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+
+                    return xbc_d_processed.transpose(1, 2).view(
+                        num_decode_tokens, -1)
 
             else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
+
+                def conv1d():
+                    return causal_conv1d_update(
+                        xbc_d,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d)
+
+            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
+            def convert_dt():
+                return dt_d.to(dtype=torch.float32)
+
+            # If we're in a cuda graph and using PDL on conv1d, the next kernel
+            # if PDL'd will launch when convert_dt is done and conv1d triggers
+            # dependent kernels.  If these don't happen in parallel, then
+            # convert will go second and we lose PDL, but we're using cuda
+            # graphs for low latency so that seems ok.
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d, convert_dt,
+                                                    self.events[0],
+                                                    self.events[1],
+                                                    self.aux_steram)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -448,14 +469,9 @@ d_conv: int,
         return out[:num_actual_tokens]
 
 
-# We don't want to recreate an indexing vector at every call.  We can
-# just make one as long as we should ever need, and mask it.  But we
-# don't have access at init to the intermediate state cache size. And
-# in theory the same layer could be called with a new mamba cache
-# manager with a different size later.  So we lazily create the
-# vectors here in the forward pass for the sizes we need, and cache
-# them.  This should get populated in the warmup before cuda graph
-# capture, and we should only really ever need one size.
+# We want to cache the largest indexing vector we'd ever need and mask it, vs
+# recreating it.  But we don't know the size at __init__, and it could even
+# change later if the mamba cache manager changes.
 @functools.cache
 def _cached_arange(n: int, device: torch.device) -> torch.Tensor:
-  return torch.arange(n, dtype=torch.int32, device=device)
+    return torch.arange(n, dtype=torch.int32, device=device)
