@@ -1125,6 +1125,48 @@ __global__ void moeA2ACombineKernel(
 #endif
 }
 
+// Vectorized per-element type-conversion helpers.
+// SrcT → float → DstT, using vec_t for wide loads and stores.
+// VEC_SIZE is in elements (not bytes), so both SrcT and DstT vectors hold VEC_SIZE values.
+template <int VEC_SIZE, typename ThreadingPolicy, typename SrcT, typename DstT>
+__device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elements)
+{
+    using flashinfer::vec_t;
+
+    int const stride = ThreadingPolicy::stride() * VEC_SIZE;
+
+    for (int e = ThreadingPolicy::offset() * VEC_SIZE; e < num_elements; e += stride)
+    {
+        // Vectorized load of VEC_SIZE SrcT elements.
+        vec_t<SrcT, VEC_SIZE> in_vec;
+        in_vec.load(src + e);
+
+        // Convert each element SrcT → float → DstT.
+        vec_t<DstT, VEC_SIZE> out_vec;
+#pragma unroll
+        for (int j = 0; j < VEC_SIZE; ++j)
+            out_vec[j] = DstT(static_cast<float>(in_vec[j]));
+
+        // Vectorized store of VEC_SIZE DstT elements.
+        out_vec.store(dst + e);
+    }
+}
+
+template <typename ThreadingPolicy, typename SrcT, typename DstT>
+__device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
+{
+    if (num_elements % 16 == 0)
+        vectorized_quant_impl<16, ThreadingPolicy, SrcT, DstT>(dst, src, num_elements);
+    else if (num_elements % 8 == 0)
+        vectorized_quant_impl<8, ThreadingPolicy, SrcT, DstT>(dst, src, num_elements);
+    else if (num_elements % 4 == 0)
+        vectorized_quant_impl<4, ThreadingPolicy, SrcT, DstT>(dst, src, num_elements);
+    else if (num_elements % 2 == 0)
+        vectorized_quant_impl<2, ThreadingPolicy, SrcT, DstT>(dst, src, num_elements);
+    else
+        vectorized_quant_impl<1, ThreadingPolicy, SrcT, DstT>(dst, src, num_elements);
+}
+
 // FP8 prepare kernel: quantize BF16 MoE output to FP8 in the combine workspace.
 // This replaces the byte-copy prepare kernel when combine_fp8 is enabled.
 template <typename ThreadingPolicy>
@@ -1165,14 +1207,9 @@ __global__ void moeA2APrepareCombineQuantFP8Kernel(uint8_t* recv_buffer_fp8,
     // Source: BF16 payload, Dest: FP8 workspace (1 byte/element, same element count)
     size_t token_base = static_cast<size_t>(global_token_idx) * elements_per_token;
     __nv_bfloat16 const* src = payload_bf16 + token_base;
-    uint8_t* dst = recv_buffer_fp8 + token_base;
+    __nv_fp8_e4m3* dst = reinterpret_cast<__nv_fp8_e4m3*>(recv_buffer_fp8 + token_base);
 
-    for (int e = ThreadingPolicy::offset(); e < elements_per_token; e += ThreadingPolicy::stride())
-    {
-        float f_val = static_cast<float>(src[e]);
-        __nv_fp8_e4m3 fp8_val = __nv_fp8_e4m3(f_val); // scale = 1.0, clips to [-448, 448]
-        dst[e] = fp8_val.__x;
-    }
+    vectorized_quant<ThreadingPolicy, __nv_bfloat16, __nv_fp8_e4m3>(dst, src, elements_per_token);
 }
 
 void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)

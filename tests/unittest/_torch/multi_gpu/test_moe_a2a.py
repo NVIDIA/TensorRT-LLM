@@ -696,8 +696,11 @@ class TestMoEAlltoAll:
         assert torch.cuda.device_count() >= ep_size, (
             f"Need at least {ep_size} GPUs, found {torch.cuda.device_count()}")
 
-        hidden_size = 1024  # smaller than test_combine for faster iteration
+        # gpt-oss-20b
+        hidden_size = 2880
         num_experts = 32
+
+        # Large enough workspace
         workspace_size_per_rank = 512 * 1024 * 1024
 
         results = mpi_pool_executor.map(
@@ -1015,8 +1018,8 @@ def verify_combine_fp8(all_results, ep_size):
         try:
             torch.testing.assert_close(fp8_output,
                                        bf16_output,
-                                       rtol=0.20,
-                                       atol=1.0)
+                                       rtol=0.13,
+                                       atol=0.5)
         except AssertionError as e:
             abs_diff = (fp8_output - bf16_output).abs()
             max_diff = abs_diff.max().item()
