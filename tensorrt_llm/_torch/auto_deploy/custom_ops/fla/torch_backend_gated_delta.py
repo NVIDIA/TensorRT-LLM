@@ -18,6 +18,10 @@
 The Gated Delta Rule extends the basic Delta Rule with an exponential decay gate ``g``:
   S = S * exp(g) + k * (v - S^T @ k) * beta
 
+This op accepts raw (un-normalized, un-expanded) q/k and raw gating projections
+(a, b) together with per-head parameters (A_log, dt_bias). L2 normalization,
+GQA repeat-interleave, and gating computation are performed internally.
+
 This module provides:
   - ``_torch_gated_delta_step``:   single-token recurrence (decode)
   - ``_torch_gated_delta_prefill``: loop-based prefill over the sequence dimension
@@ -31,6 +35,7 @@ Reference:
 from typing import List, Tuple
 
 import torch
+import torch.nn.functional as F
 from torch._ops import OpOverloadPacket
 from torch.fx import Node
 
@@ -45,6 +50,7 @@ from ..attention_interface import (
     ResourceHandlerDict,
     StateResourceHandler,
 )
+from .fla_gated_delta import _l2norm
 
 # ---------------------------------------------------------------------------
 # Core recurrence helpers
@@ -65,8 +71,8 @@ def _torch_gated_delta_step(
     All computation is performed in float32 for numerical stability.
 
     Args:
-        q:     [B, H, K]
-        k:     [B, H, K]
+        q:     [B, H, K]       (already l2-normalized and GQA-expanded)
+        k:     [B, H, K]       (already l2-normalized and GQA-expanded)
         v:     [B, H, V]
         g:     [B, H]          gating / decay values (negative, log-space)
         beta:  [B, H]          beta scaling values
@@ -84,18 +90,11 @@ def _torch_gated_delta_step(
     beta = beta.float()
     state = state.float()
 
-    # Apply decay gate to state
-    state = state * torch.exp(g[..., None, None])  # [B, H, K, V]
-
-    # Delta update: v' = v - S^T @ k
-    v_prime = v - torch.einsum("bhk,bhkv->bhv", k, state)  # [B, H, V]
-    v_prime = v_prime * beta[..., None]  # [B, H, V]
-
-    # Update state: S = S + k outer v'
-    state = state + torch.einsum("bhk,bhv->bhkv", k, v_prime)  # [B, H, K, V]
-
-    # Output: o = (q * scale) @ S
-    output = torch.einsum("bhk,bhkv->bhv", q * scale, state)  # [B, H, V]
+    state = state * torch.exp(g[..., None, None])
+    v_prime = v - torch.einsum("bhk,bhkv->bhv", k, state)
+    v_prime = v_prime * beta[..., None]
+    state = state + torch.einsum("bhk,bhv->bhkv", k, v_prime)
+    output = torch.einsum("bhk,bhkv->bhv", q * scale, state)
 
     return output, state
 
@@ -114,7 +113,7 @@ def _torch_gated_delta_prefill(
     Iterates ``_torch_gated_delta_step`` over the sequence dimension.
 
     Args:
-        q:     [B, S, H, K]  (bsnd layout)
+        q:     [B, S, H, K]  (bsnd layout, already l2-normalized and GQA-expanded)
         k:     [B, S, H, K]
         v:     [B, S, H, V]
         g:     [B, S, H]
@@ -131,21 +130,66 @@ def _torch_gated_delta_prefill(
     outputs = []
 
     for t in range(S):
-        # Slice at time t from bsnd: q[:, t] gives [B, H, K]
         o_t, state = _torch_gated_delta_step(
-            q[:, t],  # [B, H, K]
-            k[:, t],  # [B, H, K]
-            v[:, t],  # [B, H, V]
-            g[:, t],  # [B, H]
-            beta[:, t],  # [B, H]
-            state,  # [B, H, K, V]
+            q[:, t],
+            k[:, t],
+            v[:, t],
+            g[:, t],
+            beta[:, t],
+            state,
             scale,
         )
-        outputs.append(o_t)  # [B, H, V]
+        outputs.append(o_t)
 
-    # Stack along seq dim: [B, S, H, V]
     output = torch.stack(outputs, dim=1)
     return output, state
+
+
+# ---------------------------------------------------------------------------
+# Preprocessing: L2 norm + GQA expand + gating computation
+# ---------------------------------------------------------------------------
+
+
+def _preprocess_raw_inputs(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    a: torch.Tensor,
+    b_proj: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
+    HV: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Apply L2 normalization, GQA expansion, and gating computation.
+
+    Args:
+        q:       [..., H_k, K]
+        k:       [..., H_k, K]
+        a:       [..., HV]       raw gating projection
+        b_proj:  [..., HV]       raw beta projection
+        A_log:   [HV]            log of decay base
+        dt_bias: [HV]            gating bias
+        HV:      number of value heads
+
+    Returns:
+        q_out:  [..., HV, K] (l2-normed, expanded)
+        k_out:  [..., HV, K] (l2-normed, expanded)
+        g:      [..., HV]    (decay gate in log-space)
+        beta:   [..., HV]    (sigmoid-activated scaling)
+    """
+    H_k = q.shape[-2]
+    interleave = HV // H_k
+
+    q_out = _l2norm(q.float()).to(q.dtype)
+    k_out = _l2norm(k.float()).to(k.dtype)
+
+    if interleave > 1:
+        q_out = q_out.repeat_interleave(interleave, dim=-2)
+        k_out = k_out.repeat_interleave(interleave, dim=-2)
+
+    g = -A_log.float().exp() * F.softplus(a.float() + dt_bias)
+    beta = b_proj.float().sigmoid()
+
+    return q_out, k_out, g, beta
 
 
 # ---------------------------------------------------------------------------
@@ -157,62 +201,48 @@ def _torch_gated_delta_prefill(
     "auto_deploy::torch_cached_gated_delta_rule", mutates_args=("delta_cache",)
 )
 def torch_cached_gated_delta_rule(
-    # INPUTS (dense but may be flattened across sequences)
+    # INPUTS (raw, un-normalized, un-expanded)
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     # STANDARD METADATA
     batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
     # CACHES
-    delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
+    delta_cache: torch.Tensor,  # [max_batch_size, HV, K, V]
     # CONSTANTS
     scale: float,
 ) -> torch.Tensor:
     """Cached gated delta rule using pure-torch recurrence.
 
     Handles mixed prefill + decode batches. Inputs use the autodeploy bsnd layout.
-
-    Args:
-        q:    [B, S, H, K]
-        k:    [B, S, H, K]
-        v:    [B, S, H, V]
-        g:    [B, S, H]
-        beta: [B, S, H]
-        batch_info_host: [num_prefill, num_prefill_tokens, num_decode] on host
-        cu_seqlen:       cumulative sequence lengths for prefill sequences
-        slot_idx:        per-sequence slot indices into delta_cache
-        use_initial_states: per-sequence bool (True if cache history exists)
-        delta_cache:     [max_slots, H, K, V] recurrent state cache
-        scale:           query scaling factor
-
-    Returns:
-        output: [B, S, H, V]
+    L2 normalization, GQA expansion, and gating (g/beta) are computed internally.
     """
-    b, s, num_heads, _ = q.shape
+    bsz, s, H_k, _ = q.shape
+    HV = v.shape[2]
 
-    # Pre-allocate output
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
 
-    # Clean up metadata
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
     slot_idx = slot_idx[:num_seq].to(torch.long)
     use_initial_states = use_initial_states[:num_seq]
 
-    # Flatten for indexing: [B*S, H, D]
-    q_flat = q.reshape(b * s, num_heads, -1)
-    k_flat = k.reshape(b * s, num_heads, -1)
-    v_flat = v.reshape(b * s, num_heads, -1)
-    g_flat = g.reshape(b * s, num_heads)
-    beta_flat = beta.reshape(b * s, num_heads)
-    y_flat = y.reshape(b * s, num_heads, -1)
+    # Flatten for indexing: [B*S, ...]
+    q_flat = q.reshape(bsz * s, H_k, -1)
+    k_flat = k.reshape(bsz * s, H_k, -1)
+    v_flat = v.reshape(bsz * s, HV, -1)
+    a_flat = a.reshape(bsz * s, HV)
+    b_flat = b.reshape(bsz * s, HV)
+    y_flat = y.reshape(bsz * s, HV, -1)
 
     key_dim = q.shape[-1]
     value_dim = v.shape[-1]
@@ -224,20 +254,22 @@ def torch_cached_gated_delta_rule(
             end = cu_seqlen_prefill[seq_idx + 1].item()
             slot = slot_idx[seq_idx]
 
-            # Gather per-sequence tensors: [1, seq_len, H, D]
-            q_seq = q_flat[start:end].unsqueeze(0)  # [1, S, H, K]
-            k_seq = k_flat[start:end].unsqueeze(0)  # [1, S, H, K]
-            v_seq = v_flat[start:end].unsqueeze(0)  # [1, S, H, V]
-            g_seq = g_flat[start:end].unsqueeze(0)  # [1, S, H]
-            beta_seq = beta_flat[start:end].unsqueeze(0)  # [1, S, H]
+            q_seq = q_flat[start:end].unsqueeze(0)  # [1, S_i, H_k, K]
+            k_seq = k_flat[start:end].unsqueeze(0)  # [1, S_i, H_k, K]
+            v_seq = v_flat[start:end].unsqueeze(0)  # [1, S_i, HV, V]
+            a_seq = a_flat[start:end].unsqueeze(0)  # [1, S_i, HV]
+            b_seq = b_flat[start:end].unsqueeze(0)  # [1, S_i, HV]
 
-            # Initial state for this sequence
+            q_proc, k_proc, g_seq, beta_seq = _preprocess_raw_inputs(
+                q_seq, k_seq, a_seq, b_seq, A_log, dt_bias, HV
+            )
+
             if use_initial_states[seq_idx]:
-                init_state = delta_cache[slot].unsqueeze(0).clone()  # [1, H, K, V]
+                init_state = delta_cache[slot].unsqueeze(0).clone()
             else:
                 init_state = torch.zeros(
                     1,
-                    num_heads,
+                    HV,
                     key_dim,
                     value_dim,
                     dtype=torch.float32,
@@ -245,8 +277,8 @@ def torch_cached_gated_delta_rule(
                 )
 
             y_seq, final_state = _torch_gated_delta_prefill(
-                q_seq,
-                k_seq,
+                q_proc,
+                k_proc,
                 v_seq,
                 g_seq,
                 beta_seq,
@@ -254,10 +286,7 @@ def torch_cached_gated_delta_rule(
                 init_state,
             )
 
-            # Write output
             y_flat[start:end] = y_seq.squeeze(0).to(y_flat.dtype)
-
-            # Write final state back to cache
             delta_cache[slot] = final_state.squeeze(0).to(delta_cache.dtype)
 
     # ---- DECODE ----
@@ -267,30 +296,29 @@ def torch_cached_gated_delta_rule(
             seq_idx = num_prefill + i
             slot = slot_idx[seq_idx]
 
-            # Single token: [H, D]
-            q_tok = q_flat[token_idx]  # [H, K]
-            k_tok = k_flat[token_idx]  # [H, K]
-            v_tok = v_flat[token_idx]  # [H, V]
-            g_tok = g_flat[token_idx]  # [H]
-            beta_tok = beta_flat[token_idx]  # [H]
+            q_tok = q_flat[token_idx].unsqueeze(0)  # [1, H_k, K]
+            k_tok = k_flat[token_idx].unsqueeze(0)  # [1, H_k, K]
+            v_tok = v_flat[token_idx].unsqueeze(0)  # [1, HV, V]
+            a_tok = a_flat[token_idx].unsqueeze(0)  # [1, HV]
+            b_tok = b_flat[token_idx].unsqueeze(0)  # [1, HV]
 
-            # Load state from cache
-            state = delta_cache[slot].unsqueeze(0).clone()  # [1, H, K, V]
+            q_proc, k_proc, g_tok, beta_tok = _preprocess_raw_inputs(
+                q_tok, k_tok, a_tok, b_tok, A_log, dt_bias, HV
+            )
+
+            state = delta_cache[slot].unsqueeze(0).clone()
 
             o_tok, new_state = _torch_gated_delta_step(
-                q_tok.unsqueeze(0),  # [1, H, K]
-                k_tok.unsqueeze(0),  # [1, H, K]
-                v_tok.unsqueeze(0),  # [1, H, V]
-                g_tok.unsqueeze(0),  # [1, H]
-                beta_tok.unsqueeze(0),  # [1, H]
-                state,  # [1, H, K, V]
+                q_proc,
+                k_proc,
+                v_tok,
+                g_tok,
+                beta_tok,
+                state,
                 scale,
             )
 
-            # Write output
             y_flat[token_idx] = o_tok.squeeze(0).to(y_flat.dtype)
-
-            # Write state back to cache
             delta_cache[slot] = new_state.squeeze(0).to(delta_cache.dtype)
 
     return y
@@ -301,8 +329,10 @@ def torch_cached_gated_delta_rule_fake(
     q: torch.Tensor,
     k: torch.Tensor,
     v: torch.Tensor,
-    g: torch.Tensor,
-    beta: torch.Tensor,
+    a: torch.Tensor,
+    b: torch.Tensor,
+    A_log: torch.Tensor,
+    dt_bias: torch.Tensor,
     batch_info_host: torch.Tensor,
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
@@ -331,8 +361,8 @@ class TorchGatedDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_num_qkv_args(cls) -> int:
-        # q, k, v, g, beta
-        return 5
+        # q, k, v, a, b, A_log, dt_bias
+        return 7
 
     @classmethod
     def get_source_attention_op(cls) -> OpOverloadPacket:
@@ -352,7 +382,8 @@ class TorchGatedDeltaBackend(AttentionDescriptor):
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]
-        num_heads = key_node.meta["val"].shape[-2]
+        # State is per value-head: [HV, K, V]
+        num_heads = value_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
 
