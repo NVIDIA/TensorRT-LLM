@@ -17,6 +17,8 @@ comparison tests (reference re-implementations on the same weights):
   9. position_embeddings passthrough equivalence
  10. get_rope_index correctness
  11. torch.export with cos/sin extra inputs
+ 12. VLM wrapper text-only position_ids passthrough (2D -> 3D)
+ 13. Custom export info dynamic shapes for 3D mRoPE position_ids
 """
 
 import pytest
@@ -35,6 +37,7 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     Qwen3_5MoeModel,
     Qwen3_5MoeSparseMoeBlock,
     Qwen3_5MoeTextConfig,
+    Qwen3_5MoeTextExportInfo,
     Qwen3_5MoeTextModel,
     Qwen3_5MoeTextRotaryEmbedding,
     Qwen3_5MoeTopKRouter,
@@ -600,8 +603,7 @@ def ref_multimodal_forward(model, input_ids, pixel_values=None, image_grid_thw=N
       2. vision model on pixel_values -> image_embeds
       3. masked_scatter image_embeds into inputs_embeds
       4. get_rope_index -> position_ids (3, B, S)
-      5. rotary_emb -> (cos, sin)
-      6. language_model(inputs_embeds, position_embeddings)
+      5. language_model(inputs_embeds, position_ids)
 
     This validates the multimodal wrapper orchestration: embedding merge,
     mRoPE position ID computation, and correct forwarding to the LM.
@@ -626,13 +628,10 @@ def ref_multimodal_forward(model, input_ids, pixel_values=None, image_grid_thw=N
     # 4. Compute mRoPE position IDs
     position_ids, _ = model.get_rope_index(input_ids, image_grid_thw)
 
-    # 5. Compute cos/sin from rotary embedding
-    position_embeddings = model.rotary_emb(inputs_embeds, position_ids)
-
-    # 6. Call language model with pre-computed position embeddings
+    # 5. Call language model with 3D position_ids (text model computes cos/sin internally)
     return model.language_model(
         inputs_embeds=inputs_embeds,
-        position_embeddings=position_embeddings,
+        position_ids=position_ids,
     )
 
 
@@ -1356,3 +1355,102 @@ def test_export_text_model_with_rope_cos_sin():
         atol=1e-5,
         msg="Dynamic shape export should work with different batch/seq dims",
     )
+
+
+# =============================================================================
+# VLM Wrapper Text-Only Position IDs Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_vlm_wrapper_text_only_position_ids():
+    """Test that the VLM wrapper correctly uses executor-provided 2D position_ids
+    for text-only inputs, expanding them to 3D and producing the same result as
+    the text model with equivalent 3D position_ids.
+
+    This simulates the AD executor flow: the executor provides 2D position_ids
+    with correct offsets for chunked prefill, and the VLM wrapper expands them
+    to 3D before passing to the text model graph.
+    """
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    B, S = 2, 8
+    input_ids = torch.randint(0, 50, (B, S))
+
+    # Simulate executor-provided 2D position_ids with an offset (chunked prefill chunk 2)
+    offset = 64
+    position_ids_2d = torch.arange(offset, offset + S).unsqueeze(0).expand(B, -1)
+
+    # VLM wrapper path: receives 2D, expands to 3D internally
+    output_wrapper = model(input_ids=input_ids, position_ids=position_ids_2d)
+
+    # Direct text model path: manually expand 2D→3D and call text model
+    position_ids_3d = position_ids_2d[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_output = model.model.language_model(
+        inputs_embeds=inputs_embeds, position_ids=position_ids_3d
+    )
+    ref_logits = model.lm_head(text_output.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output_wrapper.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="VLM wrapper text-only should produce same output as direct text model with 3D pos IDs",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_position_ids_not_ignored():
+    """Verify that different position_ids produce different outputs, confirming
+    the executor's position_ids are actually used (not ignored/overwritten)."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    B, S = 1, 8
+    input_ids = torch.randint(0, 50, (B, S))
+
+    # Two different position_ids (simulating different chunk offsets)
+    pos_ids_a = torch.arange(0, S).unsqueeze(0)
+    pos_ids_b = torch.arange(100, 100 + S).unsqueeze(0)
+
+    output_a = model(input_ids=input_ids, position_ids=pos_ids_a)
+    output_b = model(input_ids=input_ids, position_ids=pos_ids_b)
+
+    assert not torch.allclose(output_a.logits, output_b.logits, atol=1e-4), (
+        "Different position_ids should produce different outputs -- "
+        "position_ids must not be ignored by the VLM wrapper"
+    )
+
+
+# =============================================================================
+# Custom Export Info Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_custom_export_info_3d_position_ids():
+    """Verify Qwen3_5MoeTextExportInfo defines 3D position_ids dynamic shapes."""
+    from torch.export import Dim
+
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+
+    export_info = Qwen3_5MoeTextExportInfo.from_autoinferred(model)
+    shapes = export_info.dynamic_shape_lookup
+
+    assert "position_ids" in shapes, "Export info should include position_ids"
+    pos_dims = shapes["position_ids"]
+    assert 1 in pos_dims and 2 in pos_dims, (
+        f"3D position_ids should have dynamic dims 1 (batch) and 2 (seq), got {pos_dims}"
+    )
+    assert 0 not in pos_dims, f"Dim 0 (=3 for mRoPE) should be static, but got dynamic: {pos_dims}"
+    assert isinstance(pos_dims[1], Dim), f"Dim 1 should be a Dim instance, got {type(pos_dims[1])}"
+    assert isinstance(pos_dims[2], Dim), f"Dim 2 should be a Dim instance, got {type(pos_dims[2])}"

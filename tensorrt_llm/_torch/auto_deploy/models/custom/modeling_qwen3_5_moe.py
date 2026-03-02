@@ -15,9 +15,10 @@ This implementation differs from the HuggingFace original in the following ways:
     (tensorrt_llm/_torch/auto_deploy/models/patches/qwen3_next.py).
   * The MoE implementation uses expert lists (individual nn.Linear layers per expert)
     that directly match the checkpoint structure, dispatched via torch_moe op.
-  * mRoPE cos/sin can be computed outside the export boundary (Option 3) and
-    passed in as ``position_embeddings`` to allow 3D spatial position IDs for
-    multimodal inputs without requiring the export graph to handle mRoPE internally.
+  * The VLM wrapper passes 3D ``position_ids (3, B, S)`` to the text model,
+    which computes mRoPE cos/sin internally via its own ``rotary_emb``.
+    For text-only inputs the wrapper expands the executor's 2D positions to 3D;
+    for multimodal inputs it computes spatial (T, H, W) positions via ``get_rope_index``.
 
 This allows us to have a "pytorch" native reference implementation decoupled from bugs and
 dependency issues in the source, while remaining weight-compatible with HF checkpoints.
@@ -29,6 +30,7 @@ from typing import List, Optional, Tuple, Union
 import torch
 import torch.nn.functional as F
 from torch import nn
+from torch.export import Dim
 from transformers import AutoConfig
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
@@ -37,7 +39,12 @@ from transformers.modeling_outputs import BaseModelOutputWithPooling
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
+from tensorrt_llm._torch.auto_deploy.models.hf import (
+    AutoModelForCausalLMFactory,
+    AutoModelForImageTextToTextFactory,
+    TextModelExportInfo,
+)
 
 # =============================================================================
 # Configuration
@@ -1285,8 +1292,9 @@ class Qwen3_5MoeModel(nn.Module):
     """Multimodal wrapper: vision tower + embedding merge + mRoPE + language model.
 
     This module is NOT exported. It orchestrates the vision pipeline in plain
-    PyTorch and calls the (potentially exported) language model with pre-computed
-    ``(cos, sin)`` position embeddings (Option 3 for mRoPE).
+    PyTorch and calls the (potentially exported) language model with 3D
+    ``position_ids (3, B, S)`` so that the text model's internal ``rotary_emb``
+    computes the correct mRoPE cos/sin.
     """
 
     def __init__(self, config: Qwen3_5MoeConfig):
@@ -1294,9 +1302,6 @@ class Qwen3_5MoeModel(nn.Module):
         self.config = config
         self.visual = Qwen3_5MoeVisionModel(config.vision_config)
         self.language_model = Qwen3_5MoeTextModel(config.text_config)
-
-        # mRoPE embedding -- computed in this wrapper, passed to language model
-        self.rotary_emb = Qwen3_5MoeTextRotaryEmbedding(config.text_config)
 
         # Cache rope_deltas for decode steps
         self.rope_deltas: Optional[torch.Tensor] = None
@@ -1498,10 +1503,12 @@ class Qwen3_5MoeModel(nn.Module):
 
         Steps:
             1. Embed input_ids -> inputs_embeds
-            2. Run vision tower on pixel_values -> masked_scatter into embeds
-            3. Compute mRoPE position_ids via get_rope_index (or use external ones)
-            4. Compute (cos, sin) from rotary_emb
-            5. Call language_model (TextModel) with (inputs_embeds, position_embeddings)
+            2. (Multimodal) Run vision tower on pixel_values -> masked_scatter into embeds
+            3. Build 3D mRoPE position_ids ``(3, B, S)``:
+               - Text-only: expand executor-provided 2D ``position_ids`` to 3D.
+               - Multimodal: compute spatial positions via ``get_rope_index``.
+            4. Call language_model with ``(inputs_embeds, position_ids)``; the text
+               model's internal ``rotary_emb`` computes cos/sin from the 3D positions.
         """
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1527,29 +1534,23 @@ class Qwen3_5MoeModel(nn.Module):
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
-        # TODO: Multi-modal case isn't handled here yet. Remove this once we have a proper way to handle multimodal
-        # position_ids. ADExecutor always provides a text-only position_ids.
-        if position_ids is not None:
-            # External position_ids (from AD runtime / nest_sequences) — pass
-            # directly to the language model which handles mRoPE expansion.
-            return self.language_model(
-                inputs_embeds=inputs_embeds,
-                position_ids=position_ids,
+        # Build 3D mRoPE position IDs
+        if pixel_values is None and pixel_values_videos is None:
+            # Text-only: replicate executor-provided 2D positions across all 3 mRoPE dims
+            position_ids_3d = position_ids[None].expand(3, -1, -1)
+        else:
+            # Multimodal: compute spatial (T, H, W) positions for vision tokens
+            position_ids_3d, self.rope_deltas = self.get_rope_index(
+                input_ids,
+                image_grid_thw,
+                video_grid_thw,
+                attention_mask=attention_mask,
             )
 
-        # Compute 3D position IDs and mRoPE cos/sin
-        position_ids, self.rope_deltas = self.get_rope_index(
-            input_ids,
-            image_grid_thw,
-            video_grid_thw,
-            attention_mask=attention_mask,
-        )
-        position_embeddings = self.rotary_emb(inputs_embeds, position_ids)
-
-        # Call language model with pre-computed position embeddings
         return self.language_model(
             inputs_embeds=inputs_embeds,
-            position_embeddings=position_embeddings,
+            position_ids=position_ids_3d,
+            **kwargs,
         )
 
 
@@ -1576,6 +1577,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
     def forward(
         self,
         input_ids: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         pixel_values: Optional[torch.Tensor] = None,
         pixel_values_videos: Optional[torch.Tensor] = None,
@@ -1585,6 +1587,7 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
     ) -> Qwen3_5MoeConditionalOutput:
         outputs = self.model(
             input_ids=input_ids,
+            position_ids=position_ids,
             attention_mask=attention_mask,
             pixel_values=pixel_values,
             pixel_values_videos=pixel_values_videos,
@@ -1598,6 +1601,34 @@ class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
 
 
 # =============================================================================
+# Custom Export Info and Factory
+# =============================================================================
+
+
+class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
+    """Export info for mRoPE models that receive 3D position_ids ``(3, B, S)``.
+
+    Dim 0 is always 3 (temporal, height, width) and is static; dims 1 and 2
+    (batch, sequence) are dynamic.
+    """
+
+    def _init_dynamic_shape_lookup(self):
+        base = super()._init_dynamic_shape_lookup()
+        batch_size_dyn = Dim.DYNAMIC
+        seq_len_dyn = Dim.DYNAMIC
+        base["position_ids"] = {1: batch_size_dyn, 2: seq_len_dyn}
+        return base
+
+
+@ModelFactoryRegistry.register("Qwen3_5MoeForConditionalGeneration")
+class Qwen3_5MoeFactory(AutoModelForImageTextToTextFactory):
+    """Factory for Qwen3.5 MoE that uses 3D mRoPE position_ids export info."""
+
+    def get_export_infos(self, model: nn.Module):
+        return [Qwen3_5MoeTextExportInfo.from_autoinferred(model)]
+
+
+# =============================================================================
 # Registration
 # =============================================================================
 
@@ -1605,6 +1636,4 @@ AutoConfig.register("qwen3_5_moe", Qwen3_5MoeConfig)
 AutoConfig.register("qwen3_5_moe_text", Qwen3_5MoeTextConfig)
 
 AutoModelForCausalLMFactory.register_custom_model_cls("Qwen3_5MoeTextConfig", Qwen3_5MoeForCausalLM)
-AutoModelForCausalLMFactory.register_custom_model_cls(
-    "Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration
-)
+Qwen3_5MoeFactory.register_custom_model_cls("Qwen3_5MoeConfig", Qwen3_5MoeForConditionalGeneration)
