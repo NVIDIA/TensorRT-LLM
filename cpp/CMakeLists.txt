@@ -279,7 +279,8 @@ include_directories(
   ${maybe_nvtx_includedir}
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/include
   ${CMAKE_BINARY_DIR}/_deps/cutlass-src/tools/util/include
-  ${CMAKE_BINARY_DIR}/_deps/json-src/include)
+  ${CMAKE_BINARY_DIR}/_deps/json-src/include
+  ${NCCL_INCLUDE_DIR})
 
 if(${CUDAToolkit_VERSION} VERSION_GREATER_EQUAL "11")
   add_definitions("-DENABLE_BF16")
