@@ -638,9 +638,12 @@ def trtllm_mla_with_cache(
     kv_cache_block_offsets = _GlobalTrtllmMLAPlanner.block_offsets
     host_kv_cache_pool_mapping = _GlobalTrtllmMLAPlanner.host_pool_mapping
 
-    # thop.attention applies q_scaling / sqrt(head_size) internally, so pass 1.0
-    # to get the standard 1/sqrt(head_size) scaling for decode.
-    thop_q_scaling = 1.0
+    # thop.attention applies q_scaling / sqrt(head_size) internally, where
+    # head_size = gen_head_size = kv_lora_rank + qk_rope_head_dim.
+    # The correct MLA scale is 1/sqrt(qk_head_dim) (or the user-provided `scale`),
+    # NOT 1/sqrt(gen_head_size). Compensate so that:
+    #   thop_q_scaling / sqrt(gen_head_size) == scale
+    thop_q_scaling = scale * math.sqrt(gen_head_size)
 
     def _make_decode_shared():
         return (
