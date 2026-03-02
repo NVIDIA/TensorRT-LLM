@@ -73,9 +73,9 @@ The following tables summarize the current coverage:
 
 The demo videos below show the real-world acceleration that these algorithms deliver on long-context workloads. Both demos use `max_batch_size=64` and `samples=128`.
 
-https://github.com/user-attachments/assets/26ad6ba4-8254-4eb7-bf28-e40e4434d2f0
+https://github.com/user-attachments/assets/ce170850-216e-4a96-90eb-ddf59ede2a4a
 
-https://github.com/user-attachments/assets/eeaa4eef-e822-4f60-9aa1-1653c95c2df8
+https://github.com/user-attachments/assets/ee18f495-6645-4ad9-8958-a855b8999035
 
 **Note**: Today, sparse attention support in TensorRT-LLM is primarily targeted at NVIDIA Blackwell and newer architectures.
 
