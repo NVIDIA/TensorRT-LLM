@@ -72,7 +72,8 @@ struct BlockKey
 
     bool supportsPartialMatching() const noexcept
     {
-        return true;
+        // partial matching is not supported for MmKey vector
+        return extraKeys.empty();
     }
 
     int numMatchingTokens(BlockKey const& other) const noexcept

@@ -279,10 +279,13 @@ public:
             std::vector<std::pair<int, NodePtr>> matches;
             for (auto nn : mNextNodes)
             {
-                int numMatched = key.numMatchingTokens(nn.first);
-                if (numMatched > 0)
+                if (key.supportsPartialMatching())
                 {
-                    matches.emplace_back(numMatched, nn.second);
+                    int numMatched = key.numMatchingTokens(nn.first);
+                    if (numMatched > 0)
+                    {
+                        matches.emplace_back(numMatched, nn.second);
+                    }
                 }
             }
             auto results = std::vector<_NodeMatch>();
