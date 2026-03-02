@@ -127,21 +127,21 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     if (parentHash == 0 && blockKey.cacheSaltID)
     {
         // Only hashing the cache salt ID for the first block in the sequence
-        seed = __hash64(blockKey.cacheSaltID.value(), seed);
+        seed = hash64Mix(blockKey.cacheSaltID.value(), seed);
     }
 
     for (auto const& uniqueToken : blockKey.uniqueTokens)
     {
-        seed = __hash32(static_cast<uint32_t>(uniqueToken.tokenId), seed);
+        seed = hash32Mix(static_cast<uint32_t>(uniqueToken.tokenId), seed);
         if (blockKey.usesExtraIds)
         {
-            seed = __hash64(uniqueToken.tokenExtraId, seed);
+            seed = hash64Mix(uniqueToken.tokenExtraId, seed);
         }
     }
 
     if (blockKey.loraTaskId)
     {
-        seed = __hash64(blockKey.loraTaskId.value(), seed);
+        seed = hash64Mix(blockKey.loraTaskId.value(), seed);
     }
 
     // Add extra keys for multimodal data mixing in external multimodal item hash and token offset within this sequence
@@ -158,11 +158,11 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
                     | (static_cast<uint32_t>(mmHash[i + 2]) << 16) | (static_cast<uint32_t>(mmHash[i + 3]) << 24);
 
                 // Mix the word into the seed
-                seed = __hash32(word, seed);
+                seed = hash32Mix(word, seed);
             }
 
             // Hash the start offset
-            seed = __hash64(static_cast<uint64_t>(startOffset), seed);
+            seed = hash64Mix(static_cast<uint64_t>(startOffset), seed);
         }
     }
 
