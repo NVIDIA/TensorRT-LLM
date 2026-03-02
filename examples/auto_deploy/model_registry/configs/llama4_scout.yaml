@@ -7,3 +7,7 @@ trust_remote_code: true
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 768, 1024]
 kv_cache_config:
   dtype: fp8
+# https://github.com/NVIDIA/TensorRT-LLM/issues/11819 - disabling preload until root caused
+transforms:
+  load_weights:
+    disable_preload: true
