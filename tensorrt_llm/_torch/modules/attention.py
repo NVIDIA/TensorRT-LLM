@@ -1631,9 +1631,8 @@ class MLA(nn.Module):
         if not (self.short_seq_mha_threshold > 0 and not self.apply_rotary_emb
                 and self.mapping.cp_size == 1 and position_ids is not None):
             return False
-        effective_len = getattr(attn_metadata, 'max_ctx_kv_len', 0)
-        if effective_len == 0:
-            effective_len = attn_metadata.num_ctx_tokens
+        effective_len = getattr(attn_metadata, 'max_ctx_kv_len',
+                                attn_metadata.num_ctx_tokens)
         return effective_len <= self.short_seq_mha_threshold
 
     def forward_context_dsa(
