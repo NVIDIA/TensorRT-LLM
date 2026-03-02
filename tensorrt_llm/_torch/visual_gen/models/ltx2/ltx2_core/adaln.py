@@ -14,13 +14,17 @@ class AdaLayerNormSingle(torch.nn.Module):
     Produces scale/shift/gate modulation parameters from timestep embeddings.
     """
 
-    def __init__(self, embedding_dim: int, embedding_coefficient: int = 6):
+    def __init__(self, embedding_dim: int, embedding_coefficient: int = 6,
+                 make_linear=None):
         super().__init__()
+        if make_linear is None:
+            make_linear = torch.nn.Linear
         self.emb = PixArtAlphaCombinedTimestepSizeEmbeddings(
-            embedding_dim, size_emb_dim=embedding_dim // 3
+            embedding_dim, size_emb_dim=embedding_dim // 3,
+            make_linear=make_linear,
         )
         self.silu = torch.nn.SiLU()
-        self.linear = torch.nn.Linear(
+        self.linear = make_linear(
             embedding_dim, embedding_coefficient * embedding_dim, bias=True
         )
 

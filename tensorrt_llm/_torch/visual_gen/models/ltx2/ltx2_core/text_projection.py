@@ -13,12 +13,15 @@ class PixArtAlphaTextProjection(torch.nn.Module):
         hidden_size: int,
         out_features: int | None = None,
         act_fn: str = "gelu_tanh",
+        make_linear=None,
     ):
         super().__init__()
+        if make_linear is None:
+            make_linear = torch.nn.Linear
         if out_features is None:
             out_features = hidden_size
-        self.linear_1 = torch.nn.Linear(
-            in_features=in_features, out_features=hidden_size, bias=True
+        self.linear_1 = make_linear(
+            in_features, hidden_size, bias=True
         )
         if act_fn == "gelu_tanh":
             self.act_1 = torch.nn.GELU(approximate="tanh")
@@ -26,8 +29,8 @@ class PixArtAlphaTextProjection(torch.nn.Module):
             self.act_1 = torch.nn.SiLU()
         else:
             raise ValueError(f"Unknown activation function: {act_fn}")
-        self.linear_2 = torch.nn.Linear(
-            in_features=hidden_size, out_features=out_features, bias=True
+        self.linear_2 = make_linear(
+            hidden_size, out_features, bias=True
         )
 
     def forward(self, caption: torch.Tensor) -> torch.Tensor:

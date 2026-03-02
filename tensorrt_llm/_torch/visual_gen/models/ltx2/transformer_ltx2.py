@@ -810,11 +810,11 @@ class LTXModel(nn.Module):
 
     # -- Initialization helpers ----------------------------------------------
 
-    def _make_linear(self, in_features: int, out_features: int) -> nn.Module:
+    def _make_linear(self, in_features: int, out_features: int, bias: bool = True) -> nn.Module:
         """Create a Linear layer using the configured backend."""
         dtype = self.model_config.torch_dtype if self.model_config else None
         if _is_pytorch_mode(self.model_config):
-            return nn.Linear(in_features, out_features, bias=True, dtype=dtype)
+            return nn.Linear(in_features, out_features, bias=bias, dtype=dtype)
 
         Linear, *_ = _trtllm_imports()
         quant_config = self.model_config.quant_config if self.model_config else None
@@ -826,7 +826,7 @@ class LTXModel(nn.Module):
         )
         mapping = getattr(self.model_config, "mapping", None) if self.model_config else None
         return Linear(
-            in_features, out_features, bias=True, dtype=dtype,
+            in_features, out_features, bias=bias, dtype=dtype,
             mapping=mapping, quant_config=quant_config,
             skip_create_weights_in_init=skip_create,
             force_dynamic_quantization=force_dq,
@@ -834,9 +834,12 @@ class LTXModel(nn.Module):
 
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
         self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
-        self.adaln_single = AdaLayerNormSingle(self.inner_dim)
+        self.adaln_single = AdaLayerNormSingle(
+            self.inner_dim, make_linear=self._make_linear,
+        )
         self.caption_projection = PixArtAlphaTextProjection(
             in_features=caption_channels, hidden_size=self.inner_dim,
+            make_linear=self._make_linear,
         )
         self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
         self.norm_out = nn.LayerNorm(
@@ -846,9 +849,12 @@ class LTXModel(nn.Module):
 
     def _init_audio(self, in_channels, out_channels, caption_channels, norm_eps):
         self.audio_patchify_proj = self._make_linear(in_channels, self.audio_inner_dim)
-        self.audio_adaln_single = AdaLayerNormSingle(self.audio_inner_dim)
+        self.audio_adaln_single = AdaLayerNormSingle(
+            self.audio_inner_dim, make_linear=self._make_linear,
+        )
         self.audio_caption_projection = PixArtAlphaTextProjection(
             in_features=caption_channels, hidden_size=self.audio_inner_dim,
+            make_linear=self._make_linear,
         )
         self.audio_scale_shift_table = nn.Parameter(
             torch.empty(2, self.audio_inner_dim)
@@ -861,15 +867,19 @@ class LTXModel(nn.Module):
     def _init_audio_video(self, num_scale_shift_values):
         self.av_ca_video_scale_shift_adaln_single = AdaLayerNormSingle(
             self.inner_dim, embedding_coefficient=num_scale_shift_values,
+            make_linear=self._make_linear,
         )
         self.av_ca_audio_scale_shift_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim, embedding_coefficient=num_scale_shift_values,
+            make_linear=self._make_linear,
         )
         self.av_ca_a2v_gate_adaln_single = AdaLayerNormSingle(
             self.inner_dim, embedding_coefficient=1,
+            make_linear=self._make_linear,
         )
         self.av_ca_v2a_gate_adaln_single = AdaLayerNormSingle(
             self.audio_inner_dim, embedding_coefficient=1,
+            make_linear=self._make_linear,
         )
 
     def _init_preprocessors(self, cross_pe_max_pos):
@@ -1146,18 +1156,23 @@ class LTXModel(nn.Module):
         """Post-load hooks: convert embedding modules to target dtype."""
         target_dtype = self.model_config.torch_dtype if self.model_config else torch.bfloat16
 
-        for mod in [
-            getattr(self, "adaln_single", None),
-            getattr(self, "caption_projection", None),
-            getattr(self, "audio_adaln_single", None),
-            getattr(self, "audio_caption_projection", None),
-            getattr(self, "av_ca_video_scale_shift_adaln_single", None),
-            getattr(self, "av_ca_audio_scale_shift_adaln_single", None),
-            getattr(self, "av_ca_a2v_gate_adaln_single", None),
-            getattr(self, "av_ca_v2a_gate_adaln_single", None),
-        ]:
-            if mod is not None:
-                mod.to(target_dtype)
+        # In TRT-LLM mode these modules now contain quantized Linear layers
+        # that manage their own dtypes; a blanket .to() would corrupt float32
+        # scale parameters (input_scale, alpha, weight_scale_2) required by
+        # NVFP4 kernels.  Only convert in pure-PyTorch mode.
+        if _is_pytorch_mode(self.model_config):
+            for mod in [
+                getattr(self, "adaln_single", None),
+                getattr(self, "caption_projection", None),
+                getattr(self, "audio_adaln_single", None),
+                getattr(self, "audio_caption_projection", None),
+                getattr(self, "av_ca_video_scale_shift_adaln_single", None),
+                getattr(self, "av_ca_audio_scale_shift_adaln_single", None),
+                getattr(self, "av_ca_a2v_gate_adaln_single", None),
+                getattr(self, "av_ca_v2a_gate_adaln_single", None),
+            ]:
+                if mod is not None:
+                    mod.to(target_dtype)
 
         if not _is_pytorch_mode(self.model_config):
             Linear, *_ = _trtllm_imports()

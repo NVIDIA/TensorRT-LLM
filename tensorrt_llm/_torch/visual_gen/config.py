@@ -537,7 +537,7 @@ class DiffusionModelConfig(BaseModel):
 
     @classmethod
     def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
-        """Try to read embedded config from a single-safetensors checkpoint.
+        """Try to read embedded config from a single-safetensors checkpoint (LTX-2).
 
         Accepts either a directory (globs for ``*.safetensors``) or a direct
         path to a ``.safetensors`` file.
@@ -561,7 +561,11 @@ class DiffusionModelConfig(BaseModel):
             with safetensors.torch.safe_open(str(sft_files[0]), framework="pt") as f:
                 meta = f.metadata()
                 if meta and "config" in meta:
-                    return json.loads(meta["config"])
+                    config = json.loads(meta["config"])
+                    if "quantization_config" in meta:
+                        config["quantization_config"] = json.loads(
+                            meta["quantization_config"])
+                    return config
         except Exception:
             pass
         return None
@@ -649,6 +653,28 @@ class DiffusionModelConfig(BaseModel):
                 transformer_dict = native_config.get("transformer", {})
                 pretrained_config = SimpleNamespace(**transformer_dict)
                 extra_attrs["ltx2_native_config"] = native_config
+
+                # quantization_config lives as a separate safetensors metadata
+                # key, not inside the transformer section. Propagate it so
+                # the quant-config resolution below can pick it up.
+                if "quantization_config" in native_config:
+                    qc = native_config["quantization_config"]
+                    # ModelOpt prefixes module names with the wrapped model
+                    # attribute (e.g. "velocity_model.proj_out"). Strip that
+                    # wrapper prefix so the ignore list matches TRT-LLM names.
+                    _MODELOPT_WRAPPER_PREFIXES = (
+                        "velocity_model.", "denoiser.", "unet.", "dit.",
+                    )
+                    if "ignore" in qc and qc["ignore"]:
+                        cleaned = []
+                        for entry in qc["ignore"]:
+                            for wp in _MODELOPT_WRAPPER_PREFIXES:
+                                if entry.startswith(wp):
+                                    entry = entry[len(wp):]
+                                    break
+                            cleaned.append(entry)
+                        qc["ignore"] = cleaned
+                    pretrained_config.quantization_config = qc
             else:
                 # Fallback: look for a bare config.json next to the checkpoint
                 config_dir = checkpoint_path.parent if checkpoint_path.is_file() else checkpoint_path

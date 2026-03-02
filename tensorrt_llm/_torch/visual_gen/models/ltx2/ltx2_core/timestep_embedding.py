@@ -44,18 +44,21 @@ class TimestepEmbedding(torch.nn.Module):
         post_act_fn: str | None = None,
         cond_proj_dim: int | None = None,
         sample_proj_bias: bool = True,
+        make_linear=None,
     ):
         super().__init__()
-        self.linear_1 = torch.nn.Linear(in_channels, time_embed_dim, sample_proj_bias)
+        if make_linear is None:
+            make_linear = torch.nn.Linear
+        self.linear_1 = make_linear(in_channels, time_embed_dim, bias=sample_proj_bias)
         self.cond_proj = (
-            torch.nn.Linear(cond_proj_dim, in_channels, bias=False)
+            make_linear(cond_proj_dim, in_channels, bias=False)
             if cond_proj_dim is not None
             else None
         )
         self.act = torch.nn.SiLU()
         time_embed_dim_out = out_dim if out_dim is not None else time_embed_dim
-        self.linear_2 = torch.nn.Linear(
-            time_embed_dim, time_embed_dim_out, sample_proj_bias
+        self.linear_2 = make_linear(
+            time_embed_dim, time_embed_dim_out, bias=sample_proj_bias
         )
         self.post_act = None
 
@@ -100,14 +103,15 @@ class Timesteps(torch.nn.Module):
 class PixArtAlphaCombinedTimestepSizeEmbeddings(torch.nn.Module):
     """PixArt-Alpha combined timestep + size embeddings."""
 
-    def __init__(self, embedding_dim: int, size_emb_dim: int):
+    def __init__(self, embedding_dim: int, size_emb_dim: int, make_linear=None):
         super().__init__()
         self.outdim = size_emb_dim
         self.time_proj = Timesteps(
             num_channels=256, flip_sin_to_cos=True, downscale_freq_shift=0
         )
         self.timestep_embedder = TimestepEmbedding(
-            in_channels=256, time_embed_dim=embedding_dim
+            in_channels=256, time_embed_dim=embedding_dim,
+            make_linear=make_linear,
         )
 
     def forward(
