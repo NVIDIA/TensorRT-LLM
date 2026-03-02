@@ -26,9 +26,7 @@ from typing import Dict, List, NamedTuple, Optional
 
 from _pytest.nodes import Item
 from _pytest.python import Function
-from defs.trt_test_alternative import (check_output, popen, print_error,
-                                       print_info)
-from test_common.http_utils import wait_for_endpoint_ready
+from defs.trt_test_alternative import check_output, print_error, print_info
 
 from ..common import get_trt_llm_lib_dir, venv_mpi_check_output
 from ..local_venv import PythonVenvRunnerImpl
@@ -112,8 +110,6 @@ class PerfMetricType(str, Enum):
     SEQ_THROUGHPUT = "SEQ_THROUGHPUT"
     SEQ_LATENCY = "SEQ_LATENCY"
     KV_CACHE_SIZE = "KV_CACHE_SIZE"
-    DISAGG_SERVER_E2EL = "DISAGG_SERVER_E2EL"
-    DISAGG_SERVER_TTFT = "DISAGG_SERVER_TTFT"
     PER_USER_OUTPUT_THROUGHPUT = "PER_USER_OUTPUT_THROUGHPUT"
     PER_GPU_OUTPUT_THROUGHPUT = "PER_GPU_OUTPUT_THROUGHPUT"
 
@@ -238,55 +234,6 @@ class PerfBenchScriptTestCmds(NamedTuple):
                 self.benchmark_cmds[cmd_idx - 1 - len(self.data_cmds)])
 
         return cmd_str
-
-
-class PerfDisaggScriptTestCmds(NamedTuple):
-    ctx_cmd: str
-    gen_cmd: str
-    server_cmd: str
-    client_cmd: List[str]
-    benchmark_cmd: List[str]
-
-    def run_cmd(self, cmd_idx: int, venv) -> str:
-        output = ""
-        try:
-            with (  # Start ctx workers
-                    open('output_ctx.log', 'w') as output_ctx,
-                    popen(self.ctx_cmd,
-                          stdout=output_ctx,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as ctx_workers_proc,
-                    # Start gen workers
-                    open('output_gen.log', 'w') as output_gen,
-                    popen(self.gen_cmd,
-                          stdout=output_gen,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as gen_workers_proc,
-                    # Start server
-                    open('output_server.log', 'w') as output_server,
-                    popen(self.server_cmd,
-                          stdout=output_server,
-                          stderr=subprocess.STDOUT,
-                          env=venv._new_env,
-                          shell=True) as server_proc):
-                wait_for_endpoint_ready(
-                    f"http://localhost:8000/health",
-                    timeout=1800)  # 30 minutes for large models
-                check_output(self.client_cmd, env=venv._new_env)
-                output += check_output(self.benchmark_cmd, env=venv._new_env)
-        finally:
-            server_proc.terminate()
-            ctx_workers_proc.terminate()
-            gen_workers_proc.terminate()
-            server_proc.wait()
-            ctx_workers_proc.wait()
-            gen_workers_proc.wait()
-        return output
-
-    def get_cmd_str(self, cmd_idx) -> List[str]:
-        return ["disaggregated server tests, please check config files"]
 
 
 class AbstractPerfScriptTestClass(abc.ABC):
