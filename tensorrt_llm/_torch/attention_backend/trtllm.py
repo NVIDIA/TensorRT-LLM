@@ -1980,6 +1980,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and metadata.num_ctx_cached_tokens > 0
                 and metadata.runtime_features.chunked_prefill)
 
+    def is_chunked_prefill_mla_context_for_warmup(
+        self,
+        metadata: TrtllmAttentionMetadata,
+    ) -> bool:
+        """Chunked prefill MLA context check for warmup; does not check num_ctx_cached_tokens."""
+        return (self.is_mla_enable and metadata.kv_cache_manager is not None
+                and metadata.enable_context_mla_with_cached_kv
+                and metadata.runtime_features.chunked_prefill)
+
     def load_paged_kv_cache_for_mla(
         self,
         metadata: TrtllmAttentionMetadata,
