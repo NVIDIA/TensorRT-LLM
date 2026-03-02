@@ -1092,6 +1092,17 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_qwen_next"),
+            pytest.param(
+                {
+                    "num_experts": 2048,
+                    "top_k": 32,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_large_experts"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
@@ -1175,6 +1186,17 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_qwen_next"),
+            pytest.param(
+                {
+                    "num_experts": 2048,
+                    "top_k": 32,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_large_experts"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1328,7 +1350,7 @@ class TestMoeFp4:
             pytest.skip("https://nvbugs/5434352")
 
         assert top_k <= num_experts
-        assert top_k <= 22
+        assert top_k <= 32
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
@@ -2003,7 +2025,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
     tile_tokens_dim = 8
 
     assert top_k <= num_experts
-    assert top_k <= 8
+    assert top_k <= 32
     assert num_experts % 4 == 0
 
     if are_groups_valid(top_k_groups, n_groups):
