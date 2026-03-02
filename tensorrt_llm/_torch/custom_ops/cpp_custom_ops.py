@@ -207,6 +207,12 @@ def _register_fake():
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
 
+    @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
+    def _(input: torch.Tensor):
+        scale_shape = [1] * input.dim()
+        return (input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
+                input.new_empty(scale_shape, dtype=input.dtype))
+
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
