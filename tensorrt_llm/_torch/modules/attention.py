@@ -987,29 +987,6 @@ class MLA(nn.Module):
         mscale = yarn_get_mscale(scaling_factor, mscale_all_dim)
         q_scaling = 1.0 / (mscale * mscale)
 
-        if not self.is_dsa:
-            self.mha = create_attention(
-                config.attn_backend,
-                self.layer_idx,
-                self.num_heads_tp,
-                head_dim=self.qk_head_dim,
-                num_kv_heads=self.num_key_value_heads_tp,
-                pos_embd_params=pos_embd_params,
-                quant_config=quant_config,
-                q_scaling=q_scaling,
-                is_mla_enable=True,
-                q_lora_rank=self.q_lora_rank,
-                kv_lora_rank=self.kv_lora_rank,
-                qk_nope_head_dim=self.qk_nope_head_dim,
-                qk_rope_head_dim=self.qk_rope_head_dim,
-                v_head_dim=self.v_head_dim,
-                predicted_tokens_per_seq=self.predicted_tokens_per_seq,
-                skip_create_weights_in_init=config.skip_create_weights_in_init,
-                sparse_attention_config=config.sparse_attention_config,
-            )
-        else:
-            self.mha = None
-
         self.mqa = create_attention(
             config.attn_backend,
             self.layer_idx,
@@ -1061,12 +1038,12 @@ class MLA(nn.Module):
             raise ValueError(
                 f"TRTLLM_MLA_SHORT_SEQ_MHA_THRESHOLD must be an integer, "
                 f"got '{_threshold_str}'") from err
-        if (self.is_dsa and self.short_seq_mha_threshold > 0
-                and not self.apply_rotary_emb):
-            # Dense MHA attention backend for the short-seq path. Uses plain
-            # TrtllmAttention (sparse_attention_config=None) because this path
-            # computes dense attention over all tokens. TrtllmAttention has no
-            # weight parameters, so memory overhead is negligible.
+
+        # MHA attention backend: used by non-DSA (standard MLA) and optionally
+        # by DSA for the short-seq path (dense attention, no sparse config).
+        _short_seq_mha = (self.is_dsa and self.short_seq_mha_threshold > 0
+                          and not self.apply_rotary_emb)
+        if not self.is_dsa or _short_seq_mha:
             self.mha = create_attention(
                 config.attn_backend,
                 self.layer_idx,
@@ -1084,8 +1061,11 @@ class MLA(nn.Module):
                 v_head_dim=self.v_head_dim,
                 predicted_tokens_per_seq=self.predicted_tokens_per_seq,
                 skip_create_weights_in_init=config.skip_create_weights_in_init,
-                sparse_attention_config=None,
+                sparse_attention_config=(None if _short_seq_mha else
+                                         config.sparse_attention_config),
             )
+        else:
+            self.mha = None
 
         self.llama_4_scaling = False
         if hasattr(config.pretrained_config, 'llama_4_scaling'):
