@@ -7,6 +7,7 @@ from torch import nn
 from transformers import LlamaConfig, PretrainedConfig
 
 from tensorrt_llm.logger import logger
+from tensorrt_llm.mapping import create_draft_mapping
 
 from ...functional import PositionEmbeddingType
 from ..attention_backend import AttentionMetadata
@@ -961,7 +962,11 @@ class MTPDraftModelForCausalLM(DecoderModelForCausalLM[MTPDraftModel,
         )
 
 
-def get_draft_model(model_config, draft_config, lm_head, model):
+def get_draft_model(model_config,
+                    draft_config,
+                    lm_head,
+                    model,
+                    draft_model_config=None):
     assert getattr(model_config, 'spec_config', None) is not None
     spec_dec_mode = model_config.spec_config.spec_dec_mode
     if spec_dec_mode.is_eagle3_one_model():
@@ -979,7 +984,8 @@ def get_draft_model(model_config, draft_config, lm_head, model):
             )
 
     elif spec_dec_mode.is_mtp_one_model():
-        return MTPForCausalLM(model_config,
+        mtp_config = draft_model_config if draft_model_config is not None else model_config
+        return MTPForCausalLM(mtp_config,
                               model_config.pretrained_config.num_hidden_layers,
                               lm_head, model)
     elif spec_dec_mode.is_mtp_eagle():
@@ -1009,6 +1015,13 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
         spec_config = getattr(model_config, 'spec_config', None)
         self.spec_config = spec_config
         if spec_config and spec_config.spec_dec_mode.use_one_engine():
+            draft_tp = getattr(spec_config, 'draft_tp_size', None)
+            draft_mapping = create_draft_mapping(model_config.mapping,
+                                                 draft_tp)
+            self._draft_mapping = (draft_mapping
+                                   if draft_mapping is not model_config.mapping
+                                   else None)
+
             # Only create draft_model for modes MTP, Eagle3 (not SA)
             if not spec_config.spec_dec_mode.is_sa():
                 if spec_config.spec_dec_mode.is_eagle3_one_model():
@@ -1017,7 +1030,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             MistralConfigLoader
                         self.draft_config = MistralConfigLoader().load(
                             spec_config.speculative_model,
-                            mapping=model_config.mapping,
+                            mapping=draft_mapping,
                             moe_backend=model_config.moe_backend,
                             moe_max_num_tokens=model_config.moe_max_num_tokens,
                             max_num_tokens=model_config.max_num_tokens,
@@ -1031,7 +1044,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                             trust_remote_code=True,
                             attn_backend=model_config.attn_backend,
                             moe_backend=model_config.moe_backend,
-                            mapping=model_config.mapping,
+                            mapping=draft_mapping,
                             spec_config=model_config.spec_config,
                             max_num_tokens=model_config.max_num_tokens,
                             moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1048,7 +1061,7 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                         trust_remote_code=True,
                         attn_backend=model_config.attn_backend,
                         moe_backend=model_config.moe_backend,
-                        mapping=model_config.mapping,
+                        mapping=draft_mapping,
                         spec_config=None,  # Avoid recursive spec-dec
                         max_num_tokens=model_config.max_num_tokens,
                         moe_max_num_tokens=model_config.moe_max_num_tokens)
@@ -1058,23 +1071,30 @@ class SpecDecOneEngineForCausalLM(DecoderModelForCausalLM[TModel, TConfig],
                 self.use_separate_draft_kv_cache = should_use_separate_draft_kv_cache(
                     spec_config)
 
+                draft_model_config = None
+                if draft_mapping is not model_config.mapping:
+                    draft_model_config = replace(model_config,
+                                                 mapping=draft_mapping)
+                    if self.draft_config is None:
+                        self.draft_config = draft_model_config
+
                 self.draft_model = get_draft_model(model_config,
                                                    self.draft_config,
-                                                   self.lm_head, self.model)
+                                                   self.lm_head, self.model,
+                                                   draft_model_config)
                 if self.draft_model is not None:
                     self.epilogue.append(self.draft_model)
                 if spec_config.spec_dec_mode.is_pard(
                 ) and self.draft_model is not None:
                     self.draft_model.logits_processor = self.logits_processor
 
-            # EAGLE3-specific logic: merge extra_attrs from draft model for Llama3
-            if (self.draft_config is not None and model_config.spec_config.
-                    spec_dec_mode.is_eagle3_one_model()
-                    and model_config.spec_config.eagle3_model_arch == "llama3"):
+            if (self.draft_config is not None
+                    and hasattr(self.draft_config, 'extra_attrs')
+                    and self.draft_config is not model_config):
                 for key, value in self.draft_config.extra_attrs.items():
-                    assert key in ('attn_layers', 'mla_layers')
-                    assert key in model_config.extra_attrs
-                    model_config.extra_attrs[key].update(value)
+                    if key in ('attn_layers', 'mla_layers'):
+                        model_config.extra_attrs.setdefault(key, {}).update(
+                            value)
 
             # spec_worker is created for all one-engine modes (MTP, Eagle3, SA)
             self.spec_worker = get_spec_worker(

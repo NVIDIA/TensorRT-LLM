@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -686,3 +686,257 @@ class DeviceMeshTopology(DeviceMeshTopologyImpl, Mapping):
         ), "DeviceMeshTopology is only available in Ray orchestrator mode."
 
         super().__init__(*args, **kwargs)
+
+
+def _get_all_tp_groups(mapping: "Mapping") -> List[List[int]]:
+    """Return TP group rank-lists for every PP/CP stage in the cluster."""
+    if hasattr(mapping, 'tp_groups') and mapping.tp_groups:
+        return mapping.tp_groups
+    tp_size = mapping.tp_size
+    pp_size = mapping.pp_size
+    cp_size = mapping.cp_size
+    groups = []
+    for pp in range(pp_size):
+        for cp in range(cp_size):
+            start = pp * tp_size * cp_size + cp
+            end = (pp + 1) * tp_size * cp_size + cp
+            groups.append(list(range(start, end, cp_size)))
+    return groups
+
+
+class DraftMapping:
+    """Mapping for draft models with smaller TP than the target model.
+
+    In one-model speculative decoding, the draft model (typically much smaller)
+    can run with a smaller TP size than the target model. Ranks are partitioned
+    into groups of ``draft_tp_size``, each of which independently computes the
+    same draft tokens with reduced communication overhead.
+
+    This object provides the subset of the Mapping interface that draft model
+    layers (Linear, Attention, etc.) and the weight loader need.
+    """
+
+    def __init__(self, target_mapping: "Mapping", draft_tp_size: int):
+        if draft_tp_size == target_mapping.tp_size:
+            raise ValueError(
+                "draft_tp_size equals target tp_size; use the target mapping directly."
+            )
+        if target_mapping.tp_size % draft_tp_size != 0:
+            raise ValueError(
+                f"target tp_size ({target_mapping.tp_size}) must be divisible by "
+                f"draft_tp_size ({draft_tp_size}).")
+
+        self._target = target_mapping
+        self._global_rank = target_mapping.rank
+
+        self.tp_size = draft_tp_size
+        self.pp_size = target_mapping.pp_size
+        self.pp_rank = target_mapping.pp_rank
+        self.cp_size = 1
+        self.cp_rank = 0
+        self.gpus_per_node = target_mapping.gpus_per_node
+
+        self.world_size = draft_tp_size * self.pp_size
+        self.rank = (self.pp_rank * draft_tp_size +
+                     target_mapping.tp_rank % draft_tp_size)
+        self.enable_attention_dp = target_mapping.enable_attention_dp
+        self.enable_lm_head_tp_in_adp = target_mapping.enable_lm_head_tp_in_adp
+
+        self.moe_tp_size = min(draft_tp_size, target_mapping.moe_tp_size)
+        self.moe_ep_size = 1
+        self.moe_cluster_size = 1
+        self.moe_tp_cluster_ep_size = self.moe_tp_size
+
+        self.attn_tp_size = draft_tp_size
+        self.attn_cp_size = 1
+
+        target_tp_rank = target_mapping.tp_rank
+        target_tp_group = list(target_mapping.tp_group)
+        target_tp_size = target_mapping.tp_size
+
+        self._tp_rank = target_tp_rank % draft_tp_size
+
+        group_index = target_tp_rank // draft_tp_size
+        start = group_index * draft_tp_size
+        self._tp_group = target_tp_group[start:start + draft_tp_size]
+
+        self._tp_group_pg = None
+        self._moe_tp_group = self._tp_group[:self.moe_tp_size]
+
+        if mpi_disabled() and draft_tp_size > 1 and torch.distributed.is_initialized():
+            all_tp_groups = _get_all_tp_groups(target_mapping)
+            num_sub = target_tp_size // draft_tp_size
+            for tp_grp in all_tp_groups:
+                for i in range(num_sub):
+                    sub_ranks = tp_grp[i * draft_tp_size:(i + 1) *
+                                       draft_tp_size]
+                    pg = torch.distributed.new_group(sub_ranks)
+                    if target_mapping.rank in sub_ranks:
+                        self._tp_group_pg = pg
+        elif mpi_disabled() and draft_tp_size == 1:
+            from tensorrt_llm._torch.device_mesh import SingleProcessGroup
+            self._tp_group_pg = SingleProcessGroup.get_group()
+
+        self.pp_groups = target_mapping.pp_groups
+        self.pp_partition = getattr(target_mapping, 'pp_partition', None)
+        self.cp_config = {}
+        self.tp_groups = []
+        self.cp_groups = []
+        self.moe_cluster_groups = []
+        self.moe_tp_groups = []
+        self.moe_ep_groups = []
+
+    def __eq__(self, other):
+        if not isinstance(other, DraftMapping):
+            return NotImplemented
+        return (self.tp_size == other.tp_size and self.rank == other.rank
+                and self._tp_group == other._tp_group)
+
+    def __hash__(self):
+        return hash((self.tp_size, self.rank, tuple(self._tp_group)))
+
+    @property
+    def tp_rank(self):
+        return self._tp_rank
+
+    @property
+    def tp_group(self):
+        return self._tp_group
+
+    @property
+    def tp_group_pg(self):
+        if self._tp_group_pg is None:
+            from tensorrt_llm._torch.device_mesh import SingleProcessGroup
+            return SingleProcessGroup.get_group()
+        return self._tp_group_pg
+
+    @property
+    def moe_tp_rank(self):
+        return self._tp_rank % self.moe_tp_size
+
+    @property
+    def moe_ep_rank(self):
+        return 0
+
+    @property
+    def moe_cluster_rank(self):
+        return 0
+
+    @property
+    def moe_tp_group(self):
+        return self._moe_tp_group
+
+    @property
+    def moe_tp_group_pg(self):
+        return self.tp_group_pg
+
+    @property
+    def moe_ep_group(self):
+        return self._tp_group[:1]
+
+    @property
+    def moe_ep_group_pg(self):
+        from tensorrt_llm._torch.device_mesh import SingleProcessGroup
+        return SingleProcessGroup.get_group()
+
+    @property
+    def dp_size(self):
+        return self.tp_size if self.enable_attention_dp else 1
+
+    def has_tp(self):
+        return self.tp_size > 1
+
+    def has_pp(self):
+        return self.pp_size > 1
+
+    def has_cp(self):
+        return False
+
+    def has_cp_ulysses(self):
+        return False
+
+    def has_cp_helix(self):
+        return False
+
+    def has_moe_tp(self):
+        return self.moe_tp_size > 1
+
+    def has_moe_ep(self):
+        return False
+
+    def has_moe_cluster(self):
+        return False
+
+    def is_first_pp_rank(self):
+        return self.pp_rank == 0
+
+    def is_last_pp_rank(self):
+        return self.pp_rank == self.pp_size - 1
+
+    @property
+    def node_rank(self):
+        return self._global_rank // self.gpus_per_node
+
+    @property
+    def local_rank(self):
+        return self._global_rank % self.gpus_per_node
+
+    def get_node_rank(self, rank: int):
+        return rank // self.gpus_per_node
+
+    def get_local_rank(self, rank: int):
+        return rank % self.gpus_per_node
+
+    def is_multi_node(self):
+        return self.world_size > self.gpus_per_node
+
+    def is_second_last_pp_rank(self):
+        return self.pp_rank == self.pp_size - 2
+
+    def pp_layers(self, num_layers):
+        return self._target.pp_layers(num_layers)
+
+    def pp_rank_of_layer(self, layer_idx: int, num_layers: int) -> int:
+        return self._target.pp_rank_of_layer(layer_idx, num_layers)
+
+    def ep_experts(self, num_experts):
+        return list(range(num_experts))
+
+    def prev_pp_rank(self):
+        return self._target.prev_pp_rank()
+
+    def next_pp_rank(self):
+        return self._target.next_pp_rank()
+
+    def to_dict(self):
+        return {
+            'world_size': self.world_size,
+            'rank': self.rank,
+            'gpus_per_node': self.gpus_per_node,
+            'cp_size': self.cp_size,
+            'tp_size': self.tp_size,
+            'pp_size': self.pp_size,
+            'moe_tp_size': self.moe_tp_size,
+            'moe_cluster_size': self.moe_cluster_size,
+            'moe_ep_size': self.moe_ep_size,
+            'enable_attention_dp': self.enable_attention_dp,
+            'enable_lm_head_tp_in_adp': self.enable_lm_head_tp_in_adp,
+        }
+
+
+def create_draft_mapping(target_mapping: "Mapping",
+                         draft_tp_size: int) -> "Mapping":
+    """Create a mapping for a draft model that uses smaller TP than the target.
+
+    Args:
+        target_mapping: The target model's Mapping.
+        draft_tp_size: The TP size for the draft model.  Must evenly divide
+            the target's TP size.
+
+    Returns:
+        The target mapping unchanged if ``draft_tp_size`` equals the target
+        TP size, otherwise a ``DraftMapping`` with the appropriate sub-groups.
+    """
+    if draft_tp_size is None or draft_tp_size == target_mapping.tp_size:
+        return target_mapping
+    return DraftMapping(target_mapping, draft_tp_size)
