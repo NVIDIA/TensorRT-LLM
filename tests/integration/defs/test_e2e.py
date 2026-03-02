@@ -2047,6 +2047,7 @@ def test_draft_token_tree_quickstart_advanced_eagle3_depth_1_tree(
     ])
 
 
+@pytest.mark.skip_less_device_memory(50000)
 @pytest.mark.parametrize("model_name,model_path", [
     ("Llama-3.1-8B-Instruct", "llama-3.1-model/Llama-3.1-8B-Instruct"),
 ])
