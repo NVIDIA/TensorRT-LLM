@@ -91,7 +91,7 @@ class TensorParallelMode(str, enum.Enum):
         return 1 if mode == cls.ROW else 0
 
     # Helper to shard the corresponding per-channel activation scales
-    # Which shard along the dimension orthogonal to the weights
+    # which are sharded along the dimension orthogonal to the weights
     @classmethod
     def flip(cls, mode):
         return cls.ROW if mode == cls.COLUMN else cls.COLUMN
@@ -190,7 +190,7 @@ def load_weights_vanilla_helper(module: Linear,
 
     if weight is not None:
         if module.has_weight_only_quant:
-            # NOTE: without the preprocess during the runtime, the gemm output nan's. in order to use the preprocess_weights_for_mixed_gemm
+            # NOTE: without the preprocess during the runtime, the gemm outputs NaNs. In order to use the preprocess_weights_for_mixed_gemm
             # we need to cast the weight to int8 first.
             activation_dtype = torch.float8_e4m3fn if module.has_w4a8_awq else torch.float16
             weight_dtype, _ = get_weight_dtype_and_id(module)
@@ -543,7 +543,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         # K, V scales for NVFP4 KV cache
         module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                      requires_grad=False)
-        # K, V scales for NVFP4 KV cache
+        # Inverse K, V scales for NVFP4 KV cache
         module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                          requires_grad=False)
         if bias:
@@ -891,7 +891,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         return output
 
     def _get_scale_name(self, weights: List[Dict]):
-        # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
+        # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
         # Actually they hold identical values of data_amax / 448.
         scale_name = "weight_scale_inv"
         if scale_name not in weights[0]:
@@ -1037,7 +1037,7 @@ class FP8BlockScalesLinearMethod(UnquantizedLinearMethod):
         return output
 
     def _get_scale_name(self, weights: List[Dict]):
-        # `weight_scale_inv` for DS recipe and  `weight_scale` for ModelOpt recipe.
+        # `weight_scale_inv` for DS recipe and `weight_scale` for ModelOpt recipe.
         # Actually they hold identical values of data_amax / 448.
         for w in weights:
             if "weight_scale_inv" in w:
@@ -1202,7 +1202,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # K, V scales for NVFP4 KV cache
         module.kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                      requires_grad=False)
-        # K, V scales for NVFP4 KV cache
+        # Inverse K, V scales for NVFP4 KV cache
         module.inv_kv_scales = Parameter(torch.ones(3, dtype=torch.float32),
                                          requires_grad=False)
 
@@ -1503,14 +1503,8 @@ class NVFP4LinearMethod(LinearMethodBase):
             copy_weight(module.pre_quant_scale, pre_quant_scale)
 
     def post_load_weights(self, module: Linear):
+        """Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements."""
         super().post_load_weights(module)
-        """
-        Pad weight and weight_scale tensors to meet torch trtllm NVFP4 GEMM alignment requirements.
-
-        Args:
-            row_alignment: Required row alignment (default: 32)
-            col_alignment: Required column alignment (default: 16)
-        """
         row_alignment, col_alignment = 32, 16
         row_pad_size = (row_alignment - module.weight.size(0)) % row_alignment
         col_pad_size = (col_alignment - module.weight.size(1)) % col_alignment
@@ -1654,7 +1648,7 @@ class W4A8NVFP4FP8LinearMethod(LinearMethodBase):
                     weight_scale_2 = w["weight_scale_2"][...]
                 else:
                     assert weight_scale_2 == w["weight_scale_2"][...], (
-                        f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}*6"
+                        f"The weight_scale_2 should be same for all the weights: {weight_scale_2} vs. {w['weight_scale_2']}"
                     )
 
         # TODO: ModelOpt's o_proj.weight_scale_2 is bfloat16, which should be float32
@@ -2167,7 +2161,7 @@ class W4A8_AWQ_LinearMethod(LinearMethodBase):
          1. multiply pre_quant_scale to input
          2. quantize input to fp8 using input_scale
          3. unpack_weights and multiply by weight_scales (int4 -> fp16)
-         4. divied by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8).
+         4. divided by weight_scale_2 (fp16 -> fp8 to allow gemm in fp8).
          5. apply gemm in fp8.
          6. rescale using alpha which is input_scale * weight_scale_2
         """
@@ -2703,7 +2697,7 @@ class Linear(nn.Module):
 
         weight_mode = self.weights_loading_config.weight_mode
         if not isinstance(self.quant_method, UnquantizedLinearMethod):
-            assert allow_partial_loading is False, "allow_partial_loading is only supported for non-unquantized linear methods now"
+            assert allow_partial_loading is False, "allow_partial_loading is only supported for unquantized linear methods now"
         self.quant_method.load_weights(
             self,
             weights,

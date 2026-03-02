@@ -2868,13 +2868,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         pin_memory: bool = True,
         preallocate_extra_steps: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pin_memory = pin_memory and prefer_pinned()
-        """Extract the logprobs from the request
+        """Extract the logprobs from the request.
 
         Returns:
             logprobs_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
             logprobs_indices_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
         """
+        pin_memory = pin_memory and prefer_pinned()
         num_generated_tokens = request.max_beam_num_tokens - request.py_prompt_len
         assert request.py_num_logprobs == 0, (
             "Beam search only supports returning the sampled logprob per token"
@@ -3056,10 +3056,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> None:
         """Update the request with the corrected tokens and logprobs for each beam.
 
-        arguments:
+        Args:
             request: The request to update
             beam_history: The beam history used to update the request
-            finish_reasons: The finish reasons to use to check if the beam is finished (Shape: (beam_width,))
         """
 
         beam_width = request.sampling_config.beam_width
