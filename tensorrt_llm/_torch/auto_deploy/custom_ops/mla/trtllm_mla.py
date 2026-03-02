@@ -361,11 +361,15 @@ def _write_latent_cache_to_paged_kv(
 ) -> None:
     """Write latent_cache tokens into the paged KV cache during prefill.
 
-    The kv_cache has HND layout: [num_pages, 2, num_kv_heads, page_size, head_dim].
-    With kv_factor=2, each logical page occupies 2 physical blocks (K=even, V=odd).
+    The kv_cache has HND layout: [num_pages, kv_factor, num_kv_heads, page_size, head_dim].
+    Block offsets are physical indices into the interleaved pool (all layers share one
+    pool), so they include a stride of num_layers * kv_factor per logical page. We
+    recover the page index and kv slot by dividing by the stride ratio between dim 0
+    and dim 1 of the (potentially non-contiguous) per-layer view.
     For MLA both K and V slots store the same latent data.
     """
-    flat_cache = kv_cache.view(-1, kv_cache.shape[-2], kv_cache.shape[-1])
+    blocks_per_page = kv_cache.stride(0) // kv_cache.stride(1)
+    num_kv_h = kv_cache.shape[2]
     token_offset = 0
     for seq_idx in range(num_prefill):
         seq_start = int(input_pos_host[seq_idx])
@@ -375,9 +379,11 @@ def _write_latent_cache_to_paged_kv(
             page_idx = abs_pos // tokens_per_block
             slot_in_page = abs_pos % tokens_per_block
             k_block = int(kv_cache_block_offsets[0, seq_idx, 0, page_idx])
-            flat_cache[k_block, slot_in_page] = latent_cache[token_offset]
+            p, r = k_block // blocks_per_page, k_block % blocks_per_page
+            kv_cache[p, r // num_kv_h, r % num_kv_h, slot_in_page] = latent_cache[token_offset]
             v_block = int(kv_cache_block_offsets[0, seq_idx, 1, page_idx])
-            flat_cache[v_block, slot_in_page] = latent_cache[token_offset]
+            p, r = v_block // blocks_per_page, v_block % blocks_per_page
+            kv_cache[p, r // num_kv_h, r % num_kv_h, slot_in_page] = latent_cache[token_offset]
             token_offset += 1
 
 
