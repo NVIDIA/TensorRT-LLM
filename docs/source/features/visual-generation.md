@@ -37,6 +37,16 @@ pip install git+https://github.com/huggingface/diffusers.git
 pip install av
 ```
 
+**Optional: Flash Attention V4 (Blackwell GPUs / sm100)**
+
+Flash Attention V4 (FA4) provides higher speedup on Blackwell GPUs (sm100). If you want to enable it, we recommend using this version which has been validated by us:
+
+```bash
+git clone https://github.com/Dao-AILab/flash-attention.git tensorrt_llm/_torch/visual_gen/3rdparty/flash-attention
+cd tensorrt_llm/_torch/visual_gen/3rdparty/flash-attention && git checkout ea8f73506369d7cdd498396474107a978858138c && cd -
+export PYTHONPATH=$PYTHONPATH:${PROJECT_PATH}/3rdparty/flash-attention/
+```
+
 ### Python API
 
 The example scripts under `examples/visual_gen/` demonstrate direct Python usage. For Wan2.1 text-to-video generation:
@@ -210,7 +220,7 @@ After these steps, the framework automatically handles:
 | **Multi-GPU Parallelism** | CFG parallel, Ulysses sequence parallel (more strategies planned) |
 | **TeaCache** | Caches transformer outputs when timestep embeddings change slowly |
 | **Quantization** | Dynamic (on-the-fly from BF16) and static (pre-quantized checkpoints), both via ModelOpt `quantization_config` format |
-| **Attention Backends** | Vanilla (torch SDPA) and TRT-LLM optimized fused kernels |
+| **Attention Backends** | Vanilla (torch SDPA), TRT-LLM optimized fused kernels, and Flash Attention V4 (FA4, Blackwell / sm100) |
 | **`trtllm-serve`** | OpenAI-compatible endpoints for image/video generation (sync + async) |
 
 ### Future Work

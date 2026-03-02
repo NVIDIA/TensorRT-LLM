@@ -45,8 +45,8 @@ class PipelineComponent(str, Enum):
 class AttentionConfig(BaseModel):
     """Configuration for Attention layers."""
 
-    backend: Literal["VANILLA", "TRTLLM"] = PydanticField(
-        "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM"
+    backend: Literal["VANILLA", "TRTLLM", "FA4"] = PydanticField(
+        "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM, FA4"
     )
 
 
