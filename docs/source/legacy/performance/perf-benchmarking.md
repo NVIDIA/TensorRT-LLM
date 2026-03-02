@@ -706,7 +706,7 @@ kv_cache_dtype: "fp8"
 ```
 
 ```{tip}
-The two valid values for `kv_cache_dtype` are `auto` and `fp8`.
+The valid values for `kv_cache_dtype` are `auto`, `fp8`, and `nvfp4`.
 ```
 
 ## Low Latency Benchmark
