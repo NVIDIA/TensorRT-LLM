@@ -283,7 +283,9 @@ class Llama4MoE(nn.Module):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=1 if self.enable_attention_dp else None,
-            reduce_output=False)
+            reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True)
 
         self.experts = create_moe(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
@@ -331,10 +333,11 @@ class Llama4MoE(nn.Module):
         all_rank_num_tokens=None,
         final_all_reduce_params: Optional[AllReduceParams] = None,
         cutlass_min_latency_mode: Optional[bool] = False,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         # Only enable multi-stream for cuda graph since switch stream has extra host overhead
         # This design is mainly for low latency use case. Need to improve for max throughput use case.
-        fn0 = lambda: self.shared_expert(hidden_states)
+        fn0 = lambda: self.shared_expert(hidden_states, lora_params=lora_params)
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, cutlass_min_latency_mode)
         shared_output, routed_output = maybe_execute_in_parallel(
@@ -478,6 +481,7 @@ class Llama4DecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         # Only enable min-latency mode on Blackwell
@@ -502,6 +506,7 @@ class Llama4DecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -542,6 +547,7 @@ class Llama4DecoderLayer(DecoderLayer):
             final_all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_feed_forward_allreduce),
             cutlass_min_latency_mode=cutlass_min_latency_mode,
+            lora_params=lora_params,
         )
 
         if spec_metadata is not None:
