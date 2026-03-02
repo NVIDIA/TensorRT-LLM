@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc5" />
+  <meta name="docsearch:version" content="1.3.0rc6" />
 
 
   </head>
@@ -531,58 +531,7 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="speculative-decoding">
 <h1>Speculative Decoding<a class="headerlink" href="#speculative-decoding" title="Link to this heading">#</a></h1>
-<p>There are two flavors of speculative decoding currently supported in the PyTorch backend:</p>
-<ul class="simple">
-<li><p>The “one model” implementation – a variant which inserts a drafter directly into the model code as a submodule.</p></li>
-<li><p>The “two model” implementation – a variant which produces draft tokens in the <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code>. The draft tokens are attached to requests before they are passed
-into the target model’s <code class="docutils literal notranslate"><span class="pre">ModelEngine</span></code>.</p></li>
-</ul>
-<p>In general, the one model implementation is faster. It’s able to achieve better performance in extreme low latency
-scenarios because it can launch the entire drafting loop as a single CUDA graph. The trade off is flexibility. The one model implementation
-does not support dynamic draft lengths. Additionally, only a subset of models/speculative decoding algorithms support the one model implementation.
-The table below enumerates all of the algorithm/model combinations that are supported.</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Speculative Decoding Algorithm</p></th>
-<th class="head"><p>Model</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>EAGLE 3</p></td>
-<td><p>Llama 4 Maverick</p></td>
-</tr>
-<tr class="row-odd"><td><p>MTP</p></td>
-<td><p>Deepseek V3/R1</p></td>
-</tr>
-<tr class="row-even"><td><p>EAGLE-style MTP</p></td>
-<td><p>Deepseek V3/R1</p></td>
-</tr>
-</tbody>
-</table>
-</div>
-<p>The two model implementation supports the following speculative decoding algorithms:</p>
-<div class="pst-scrollable-table-container"><table class="table">
-<thead>
-<tr class="row-odd"><th class="head"><p>Speculative Decoding Algorithm</p></th>
-<th class="head"><p>Model</p></th>
-</tr>
-</thead>
-<tbody>
-<tr class="row-even"><td><p>EAGLE 3</p></td>
-<td><p>Llama 4 Maverick, Llama 3.1 8B, Llama 3.3 70B</p></td>
-</tr>
-<tr class="row-odd"><td><p>Draft/target</p></td>
-<td><p>All models</p></td>
-</tr>
-<tr class="row-even"><td><p>NGram</p></td>
-<td><p>All models</p></td>
-</tr>
-<tr class="row-odd"><td><p>User-provided</p></td>
-<td><p>All models</p></td>
-</tr>
-</tbody>
-</table>
-</div>
+<p>Speculative decoding is a technique for accelerating LLM inference at low batch sizes. A lightweight drafting mechanism proposes candidate tokens, and the target model verifies them in a single forward pass. Tokens that match are accepted, reducing the number of sequential forward passes needed.</p>
 <section id="quick-start">
 <h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h2>
 <p>For all speculation algorithms, when speculation is enabled, a single sequence of draft tokens with length <code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code> is created for every request. There is currently no way to dynamically disable speculation, thus speed ups are only observable at low batch sizes.</p>
@@ -615,18 +564,14 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 </ul>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">Eagle3DecodingConfig</span>
 
-<span class="c1"># Enable to use the faster one-model implementation for Llama 4.</span>
-<span class="n">eagle3_one_model</span> <span class="o">=</span> <span class="kc">False</span>
 <span class="n">model</span> <span class="o">=</span> <span class="s2">&quot;meta-llama/Llama-3.1-8B-Instruct&quot;</span>
 <span class="n">speculative_model</span> <span class="o">=</span> <span class="s2">&quot;yuhuili/EAGLE3-LLaMA3.1-Instruct-8B&quot;</span>
 
 <span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span>
     <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">3</span><span class="p">,</span>
-    <span class="n">speculative_model</span><span class="o">=</span><span class="n">speculative_model</span><span class="p">,</span>
-    <span class="n">eagle3_one_model</span><span class="o">=</span><span class="n">eagle3_one_model</span><span class="p">)</span>
+    <span class="n">speculative_model</span><span class="o">=</span><span class="n">speculative_model</span><span class="p">)</span>
 
-<span class="c1"># Only need to disable overlap scheduler if eagle3_one_model is False.</span>
-<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">disable_overlap_scheduler</span><span class="o">=</span><span class="kc">True</span><span class="p">)</span>
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
 </pre></div>
 </div>
 </section>
@@ -706,15 +651,13 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 </div></blockquote>
 <p>The rest of the argument names/valid values are the same as in their corresponding configuration class described in the Quick Start section. For example, a YAML configuration could look like this:</p>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Using a HuggingFace Hub model ID (auto-downloaded)</span>
-<span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 <span class="nt">speculative_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
 <span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
 <span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">yuhuili/EAGLE3-LLaMA3.1-Instruct-8B</span>
 </pre></div>
 </div>
 <div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># Or using a local path</span>
-<span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
 <span class="nt">speculative_config</span><span class="p">:</span>
 <span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
 <span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
@@ -725,111 +668,12 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <p class="admonition-title">Note</p>
 <p>The field name <code class="docutils literal notranslate"><span class="pre">speculative_model_dir</span></code> can also be used as an alias for <code class="docutils literal notranslate"><span class="pre">speculative_config.speculative_model</span></code>. For example:</p>
 <div class="highlight-none notranslate"><div class="highlight"><pre><span></span>speculative_config:
-  decoding_type: Eagle
+  decoding_type: Eagle3
   max_draft_len: 4
   speculative_model_dir: /path/to/draft/model
 </pre></div>
 </div>
 </div>
-</section>
-<section id="developer-guide">
-<h2>Developer Guide<a class="headerlink" href="#developer-guide" title="Link to this heading">#</a></h2>
-<p>This section describes the components of a speculative decoding algorithm. All of the interfaces are defined in <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/speculative/interface.py"><code class="docutils literal notranslate"><span class="pre">_torch/speculative/interface.py</span></code></a>.</p>
-<ol class="arabic simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">SpeculativeDecodingMode</span></code>: this is a simple <code class="docutils literal notranslate"><span class="pre">IntEnum</span></code>, one for each supported algorithm. There are a few
-nontrivial methods, however.</p></li>
-</ol>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">needs_kv_cache_rewind</span></code>. See “KV Cache Rewind” below. In general, this is true for all two model speculative
-decoding algorithms.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">extend_ctx</span></code>: If true, the speculative decoding dispatches requests with <code class="docutils literal notranslate"><span class="pre">py_draft_tokens</span></code> attached to them
-to the <em>prefill</em> version of the attention kernels. This usually needs to be true. The exception is when you’re on
-Blackwell using the TensorRT LLM attention backend. In that case, use the generation kernels for better performance.
-This optimized kernel has one limitation; all draft lengths must be the same (or padding must be used) in this case.</p></li>
-</ul>
-<blockquote>
-<div><p><em>These may be refactored in the future to reduce the difficulty of adding a new speculative
-decoding algorithm. <code class="docutils literal notranslate"><span class="pre">extend_ctx</span></code> in particular is problematic. Ideally, we would move all of the kernel dispatching logic
-to a lower level of abstraction.</em></p>
-</div></blockquote>
-<ol class="arabic simple" start="2">
-<li><p><code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code>: Defines all metadata that should be passed to the model during the forward pass to facilitate speculative decoding.
-Each speculative decoding algorithm defines a subclass of <code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code>. Similar to <code class="docutils literal notranslate"><span class="pre">AttentionMetadata</span></code>, each <code class="docutils literal notranslate"><span class="pre">CUDAGraphRunner</span></code> owns
-its own <code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code>, and CUDA-graph compatible <code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code> objects may be created by invoking <code class="docutils literal notranslate"><span class="pre">create_cuda_graph_metadata(batch_size)</span></code>.
-<code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code> has many fields. Many of them are exclusively used by the one model implementation. For the two model implementation, the
-main purpose of <code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code> is to facilitate the capture of hidden states. In EAGLE 3, we need to capture hidden states from the
-target model to use as draft model inputs. The <code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code> stores a list of layers to capture and the model calls
-<code class="docutils literal notranslate"><span class="pre">maybe_capture_hidden_states(layer_id,</span> <span class="pre">hidden_states,</span> <span class="pre">residual)</span></code> during its forward pass. If the layer ID is in the list of layers to capture,
-the hidden states are saved. For CUDA graph compatibility, these may be saved in pre-allocated buffers.</p></li>
-</ol>
-<p><code class="docutils literal notranslate"><span class="pre">SpecMetadata</span></code> is derived from a <code class="docutils literal notranslate"><span class="pre">SpecConfig</span></code> object in <code class="docutils literal notranslate"><span class="pre">_torch/speculative/utils.py</span></code>. There are a few other optional components created in
-this file too:</p>
-<ol class="arabic simple" start="4">
-<li><p><code class="docutils literal notranslate"><span class="pre">ResourceManager</span></code>: Create a custom resource manager to prepare and free resources before and after target forward passes; see
-the section on <code class="docutils literal notranslate"><span class="pre">ResourceManager</span></code> in <code class="docutils literal notranslate"><span class="pre">arch.md</span></code>. This is used by the n-gram method to manage its pool. The one model implementation also uses
-<code class="docutils literal notranslate"><span class="pre">ResourceManager</span></code>s to manage hidden states.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">Sampler</span></code>: Each speculative decoding algorithm can optionally create its own sampler. This is mostly used by the one model implementation.
-The default <code class="docutils literal notranslate"><span class="pre">TorchSampler</span></code> is used as a fallback if no custom sampler is provided. EAGLE 3 two model also has a simple custom decoder to handle
-differences in the draft/target model vocab sizes.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">Worker</span></code>: This is exclusive to the one-model implementation. The <code class="docutils literal notranslate"><span class="pre">Worker</span></code> is the object that gets injected into the target model as a
-submodule.</p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">Drafter</span></code>: All of the logic required to actually produce draft tokens should be implemented in a <code class="docutils literal notranslate"><span class="pre">Drafter</span></code> subclass. There is a single
-abstract method, <code class="docutils literal notranslate"><span class="pre">prepare_draft_tokens</span></code>. It takes a set of requests (a <code class="docutils literal notranslate"><span class="pre">ScheduledRequests</span></code> object) and returns nothing. The <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/tensorrt_llm/_torch/pyexecutor/py_executor.py#L162"><code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code></a> expects
-draft tokens to be attached to the <code class="docutils literal notranslate"><span class="pre">py_draft_tokens</span></code> field of request that speculation is to be done for.</p></li>
-</ol>
-</section>
-<section id="two-model-speculative-decoding-architecture">
-<h2>Two Model Speculative Decoding Architecture<a class="headerlink" href="#two-model-speculative-decoding-architecture" title="Link to this heading">#</a></h2>
-<p>Two-model based speculation implementations do not support overlap scheduler. It will be disabled automatically.</p>
-<p>In this approach, there are two new steps to the <code class="docutils literal notranslate"><span class="pre">PyExecutor</span></code>’s <code class="docutils literal notranslate"><span class="pre">_executor_loop</span></code>.</p>
-<ul class="simple">
-<li><p><code class="docutils literal notranslate"><span class="pre">_prepare_draft_requests</span></code></p></li>
-<li><p><code class="docutils literal notranslate"><span class="pre">_prepare_draft_tokens</span></code></p></li>
-</ul>
-<section id="prepare-draft-requests">
-<h3><code class="docutils literal notranslate"><span class="pre">_prepare_draft_requests</span></code><a class="headerlink" href="#prepare-draft-requests" title="Link to this heading">#</a></h3>
-<p>This stage occurs for all speculative decoding algorithms before scheduling. The purpose
-of this stage is to make the KV cache and scheduler aware of the fact that speculative decoding
-will occur. Draft tokens take up extra KV cache pages and count towards the executor’s
-<code class="docutils literal notranslate"><span class="pre">max_num_tokens</span></code> limit. Thus, we need a way to tell the scheduler that drafting will occur
-<strong>before we do the scheduling</strong>.</p>
-<p>To achieve this, we simply attach the maximum number of draft tokens to each request. The
-scheduler and KV cache manager will automatically account for tokens attached to the
-<code class="docutils literal notranslate"><span class="pre">py_draft_tokens</span></code> attribute.</p>
-<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">for</span> <span class="n">req</span> <span class="ow">in</span> <span class="bp">self</span><span class="o">.</span><span class="n">active_requests</span><span class="p">:</span>
-    <span class="n">req</span><span class="o">.</span><span class="n">py_draft_tokens</span> <span class="o">=</span> <span class="p">[</span><span class="mi">0</span><span class="p">]</span> <span class="o">*</span> <span class="n">max_draft_len</span>
-</pre></div>
-</div>
-</section>
-<section id="prepare-draft-tokens">
-<h3><code class="docutils literal notranslate"><span class="pre">_prepare_draft_tokens</span></code><a class="headerlink" href="#prepare-draft-tokens" title="Link to this heading">#</a></h3>
-<p>This stage occurs after scheduling and KV cache allocation. The purpose of this stage
-is to attach draft tokens to the <code class="docutils literal notranslate"><span class="pre">py_draft_tokens</span></code> attribute. This occurs by calling <code class="docutils literal notranslate"><span class="pre">self.drafter.prepare_draft_tokens</span></code>;
-each speculative decoding algorithm should have a concrete instance of the <code class="docutils literal notranslate"><span class="pre">Drafter</span></code> class associated with it that defines
-the drafting logic.</p>
-<p>In addition to producing all “real” draft tokens, <code class="docutils literal notranslate"><span class="pre">_prepare_draft_tokens</span></code> currently must also pad
-all <code class="docutils literal notranslate"><span class="pre">py_draft_tokens</span></code> to the maximum draft length. This is a CUDA graph limitation - the target
-model captures its CUDA graphs using the maximum number of draft tokens on each request.</p>
-</section>
-<section id="verification-and-sampling">
-<h3>Verification and Sampling<a class="headerlink" href="#verification-and-sampling" title="Link to this heading">#</a></h3>
-<p>Once the draft tokens are obtained, the target model runs a forward pass through the usual flow.
-Everything is the same, except that the logits for all the draft tokens are returned and passed
-to the sampler.</p>
-<p>Currently, only greedy sampling is supported for speculative decoding. A draft token is accepted if
-matches the previously decoded token exactly. For example, suppose there is a generation request
-<code class="docutils literal notranslate"><span class="pre">[t,</span> <span class="pre">d1,</span> <span class="pre">d2,</span> <span class="pre">d3]</span></code>, where <code class="docutils literal notranslate"><span class="pre">d1</span></code>, <code class="docutils literal notranslate"><span class="pre">d2</span></code>, and <code class="docutils literal notranslate"><span class="pre">d3</span></code> are drat tokens. Suppose the token after <code class="docutils literal notranslate"><span class="pre">t</span></code> is <code class="docutils literal notranslate"><span class="pre">d1</span></code>
-(determined with the <code class="docutils literal notranslate"><span class="pre">argmax</span></code> of the logits). <code class="docutils literal notranslate"><span class="pre">d1</span></code> is then accepted. If the token after <code class="docutils literal notranslate"><span class="pre">d1</span></code> is <code class="docutils literal notranslate"><span class="pre">d2</span></code>,
-then <code class="docutils literal notranslate"><span class="pre">d2</span></code> can be accepted. And so on until draft tokens cannot be accepted anymore.</p>
-</section>
-<section id="kv-cache-rewind">
-<h3>KV Cache Rewind<a class="headerlink" href="#kv-cache-rewind" title="Link to this heading">#</a></h3>
-<p>KV cache space allocated to rejected tokens is freed before the next iteration. This is achieved by setting
-the <code class="docutils literal notranslate"><span class="pre">request.py_rewind_len</span></code> attribute to <code class="docutils literal notranslate"><span class="pre">num_draft_tokens_allocated</span> <span class="pre">-</span> <span class="pre">num_accepted_tokens</span></code>. The pages are
-freed as part of the <code class="docutils literal notranslate"><span class="pre">resource_manager.free_resources</span></code> routine.</p>
-<p>The purpose of KV cache rewind is to avoid complicated page reuse logic in the KV cache manager’s <code class="docutils literal notranslate"><span class="pre">prepare_resources</span></code>
-function. In practice, this is very cheap since the blocks are just marked as available; no memory is actually freed.</p>
-</section>
 </section>
 </section>
 
@@ -891,14 +735,6 @@ function. In practice, this is very cheap since the blocks are just marked as av
 </ul>
 </li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-bench-and-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#developer-guide">Developer Guide</a></li>
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#two-model-speculative-decoding-architecture">Two Model Speculative Decoding Architecture</a><ul class="nav section-nav flex-column">
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-draft-requests"><code class="docutils literal notranslate"><span class="pre">_prepare_draft_requests</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-draft-tokens"><code class="docutils literal notranslate"><span class="pre">_prepare_draft_tokens</span></code></a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#verification-and-sampling">Verification and Sampling</a></li>
-<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#kv-cache-rewind">KV Cache Rewind</a></li>
-</ul>
-</li>
 </ul>
   </nav></div>
 
@@ -990,9 +826,9 @@ function. In practice, this is very cheap since the blocks are just marked as av
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 23, 2026.</p>
+  <p>Last updated on February 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
   
 </div></div>
       

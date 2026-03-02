@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc5" />
+  <meta name="docsearch:version" content="1.3.0rc6" />
 
 
   </head>
@@ -987,14 +987,15 @@ window.addEventListener("load", load);</script>
                     <span class="n">get_origin</span><span class="p">)</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">trt</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">BaseModel</span><span class="p">,</span> <span class="n">ConfigDict</span><span class="p">,</span> <span class="n">Field</span><span class="p">,</span> <span class="n">PrivateAttr</span><span class="p">,</span> <span class="n">ValidationInfo</span><span class="p">,</span>
-                      <span class="n">field_validator</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">ConfigDict</span><span class="p">,</span> <span class="n">Field</span><span class="p">,</span> <span class="n">PrivateAttr</span><span class="p">,</span> <span class="n">ValidationInfo</span><span class="p">,</span>
+                      <span class="n">field_validator</span><span class="p">,</span> <span class="n">model_validator</span><span class="p">)</span>
 
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._ipc_utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">IpcMemory</span><span class="p">,</span> <span class="n">can_access_peer</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">get_sm_version</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..bindings.internal.runtime</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">lamport_initialize</span><span class="p">,</span>
                                          <span class="n">lamport_initialize_all</span><span class="p">,</span>
                                          <span class="n">max_workspace_size_lowprecision</span><span class="p">)</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">..llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">StrictBaseModel</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">..mapping</span><span class="w"> </span><span class="kn">import</span> <span class="n">Mapping</span>
 
@@ -1050,7 +1051,7 @@ window.addEventListener("load", load);</script>
 
 <div class="viewcode-block" id="PluginConfig">
 <a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">PluginConfig</span><span class="p">(</span><span class="n">BaseModel</span><span class="p">):</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">PluginConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;The config that manages plugin-related options.</span>
 
 <span class="sd">    There are two option categories:</span>
@@ -1062,7 +1063,7 @@ window.addEventListener("load", load);</script>
 <span class="sd">        * True, which means the plugin is enabled;</span>
 <span class="sd">        * False, which means the plugin is disabled.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
-    <span class="n">model_config</span> <span class="o">=</span> <span class="n">ConfigDict</span><span class="p">(</span><span class="n">validate_assignment</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">extra</span><span class="o">=</span><span class="s2">&quot;ignore&quot;</span><span class="p">)</span>
+    <span class="n">model_config</span> <span class="o">=</span> <span class="n">ConfigDict</span><span class="p">(</span><span class="n">validate_assignment</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span> <span class="n">extra</span><span class="o">=</span><span class="s2">&quot;forbid&quot;</span><span class="p">)</span>
 
     <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;float16&quot;</span><span class="p">,</span>
                        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Base dtype for the model and plugins&quot;</span><span class="p">)</span>
@@ -1315,7 +1316,10 @@ window.addEventListener("load", load);</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">from_arguments</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">args</span><span class="p">:</span> <span class="n">argparse</span><span class="o">.</span><span class="n">Namespace</span><span class="p">):</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;Create a PluginConfig from argparse arguments.&quot;&quot;&quot;</span>
         <span class="n">args</span> <span class="o">=</span> <span class="nb">vars</span><span class="p">(</span><span class="n">args</span><span class="p">)</span>
-        <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">args</span><span class="p">)</span>
+        <span class="c1"># Filter to only include fields that are part of PluginConfig</span>
+        <span class="n">valid_fields</span> <span class="o">=</span> <span class="nb">set</span><span class="p">(</span><span class="bp">cls</span><span class="o">.</span><span class="n">model_fields</span><span class="o">.</span><span class="n">keys</span><span class="p">())</span>
+        <span class="n">filtered_args</span> <span class="o">=</span> <span class="p">{</span><span class="n">k</span><span class="p">:</span> <span class="n">v</span> <span class="k">for</span> <span class="n">k</span><span class="p">,</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">args</span><span class="o">.</span><span class="n">items</span><span class="p">()</span> <span class="k">if</span> <span class="n">k</span> <span class="ow">in</span> <span class="n">valid_fields</span><span class="p">}</span>
+        <span class="n">obj</span> <span class="o">=</span> <span class="bp">cls</span><span class="p">(</span><span class="o">**</span><span class="n">filtered_args</span><span class="p">)</span>
 
         <span class="c1"># We want to know if the user explicitly disabled the gemm_plugin</span>
         <span class="c1"># because nvfp4 gemm uses plugin by default currently</span>
@@ -1344,9 +1348,8 @@ window.addEventListener("load", load);</script>
                 <span class="nb">setattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">field_name</span><span class="p">,</span> <span class="kc">False</span><span class="p">)</span></div>
 
 
-<div class="viewcode-block" id="PluginConfig.validate">
-<a class="viewcode-back" href="../../../legacy/python-api/tensorrt_llm.plugin.html#tensorrt_llm.plugin.PluginConfig.validate">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="nf">validate</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">_validate_sm_compatibility</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;PluginConfig&quot;</span><span class="p">:</span>
         <span class="n">unsupported_plugins</span> <span class="o">=</span> <span class="p">{</span>
             <span class="c1"># bert_attention_plugin is handled within BertAttention</span>
             <span class="mi">100</span><span class="p">:</span> <span class="p">[</span>
@@ -1360,9 +1363,9 @@ window.addEventListener("load", load);</script>
             <span class="k">for</span> <span class="n">plugin</span> <span class="ow">in</span> <span class="n">unsupported_plugins</span><span class="p">[</span><span class="n">sm</span><span class="p">]:</span>
                 <span class="n">val</span> <span class="o">=</span> <span class="nb">getattr</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">plugin</span><span class="p">,</span> <span class="kc">None</span><span class="p">)</span>
                 <span class="k">if</span> <span class="n">val</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="n">val</span> <span class="o">!=</span> <span class="kc">False</span><span class="p">:</span>
-                    <span class="k">raise</span> <span class="ne">NotImplementedError</span><span class="p">(</span>
-                        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">plugin</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">val</span><span class="si">}</span><span class="s2"> is not supported on SM </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span></div>
-
+                    <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                        <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="n">plugin</span><span class="si">}</span><span class="s2">=</span><span class="si">{</span><span class="n">val</span><span class="si">}</span><span class="s2"> is not supported on SM </span><span class="si">{</span><span class="n">sm</span><span class="si">}</span><span class="s2">.&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span>
 
     <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">context_fmha_type</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
@@ -1891,9 +1894,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 23, 2026.</p>
+  <p>Last updated on February 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
   
 </div></div>
       

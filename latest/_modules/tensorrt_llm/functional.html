@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc5" />
+  <meta name="docsearch:version" content="1.3.0rc6" />
 
 
   </head>
@@ -996,7 +996,7 @@ window.addEventListener("load", load);</script>
                      <span class="n">fp16_array</span><span class="p">,</span> <span class="n">fp32_array</span><span class="p">,</span> <span class="n">get_sm_version</span><span class="p">,</span> <span class="n">int32_array</span><span class="p">,</span>
                      <span class="n">int64_array</span><span class="p">,</span> <span class="n">np_dtype_to_trt</span><span class="p">,</span> <span class="n">str_dtype_to_trt</span><span class="p">,</span>
                      <span class="n">trt_dtype_to_np</span><span class="p">,</span> <span class="n">trt_dtype_to_str</span><span class="p">)</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">.network</span><span class="w"> </span><span class="kn">import</span> <span class="n">PluginInfo</span><span class="p">,</span> <span class="n">set_np_weight</span><span class="p">,</span> <span class="n">set_plugin_info</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.network</span><span class="w"> </span><span class="kn">import</span> <span class="n">PluginInfo</span><span class="p">,</span> <span class="n">get_np_weight</span><span class="p">,</span> <span class="n">set_np_weight</span><span class="p">,</span> <span class="n">set_plugin_info</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.plugin</span><span class="w"> </span><span class="kn">import</span> <span class="n">TRT_LLM_PLUGIN_NAMESPACE</span><span class="p">,</span> <span class="n">current_all_reduce_helper</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">.quantization</span><span class="w"> </span><span class="kn">import</span> <span class="n">QuantMode</span>
 
@@ -4827,6 +4827,24 @@ window.addEventListener("load", load);</script>
 
 
 
+<span class="k">def</span><span class="w"> </span><span class="nf">_get_trt_weight</span><span class="p">(</span><span class="n">weight</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Tuple</span><span class="p">[</span><span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">,</span> <span class="nb">bool</span><span class="p">]:</span>
+    <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
+                          <span class="ow">and</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">is_weight_constant</span><span class="p">:</span>
+        <span class="n">ndarray</span> <span class="o">=</span> <span class="n">get_np_weight</span><span class="p">(</span><span class="n">default_trtnet</span><span class="p">(),</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">name</span><span class="p">)</span>
+        <span class="k">if</span> <span class="n">ndarray</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">trt_weight</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">(</span><span class="n">np_dtype_to_trt</span><span class="p">(</span><span class="n">ndarray</span><span class="o">.</span><span class="n">dtype</span><span class="p">),</span>
+                                     <span class="n">ndarray</span><span class="o">.</span><span class="n">ctypes</span><span class="o">.</span><span class="n">data</span><span class="p">,</span>
+                                     <span class="nb">int</span><span class="p">(</span><span class="n">np</span><span class="o">.</span><span class="n">prod</span><span class="p">(</span><span class="n">ndarray</span><span class="o">.</span><span class="n">shape</span><span class="p">)))</span>
+        <span class="k">else</span><span class="p">:</span>
+            <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="vm">__class__</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">IConstantLayer</span>
+            <span class="n">trt_weight</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">trt_weight</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+
+    <span class="k">return</span> <span class="n">trt_weight</span><span class="p">,</span> <span class="n">is_weight_constant</span>
+
+
 <div class="viewcode-block" id="conv1d">
 <a class="viewcode-back" href="../../legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.conv1d">[docs]</a>
 <span class="k">def</span><span class="w"> </span><span class="nf">conv1d</span><span class="p">(</span><span class="nb">input</span><span class="p">:</span> <span class="n">Tensor</span><span class="p">,</span>
@@ -4839,30 +4857,32 @@ window.addEventListener("load", load);</script>
 
     <span class="n">noutput</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span>
     <span class="n">kernel_size</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">2</span><span class="p">]</span>
-    <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                          <span class="ow">and</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-    <span class="n">weight</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_weight_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+    <span class="n">kernel_shape</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Dims</span><span class="p">([</span><span class="n">kernel_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
+
+    <span class="n">trt_weight</span><span class="p">,</span> <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">weight</span><span class="p">)</span>
+    <span class="n">weight_tensor</span> <span class="o">=</span> <span class="n">weight</span>
 
     <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">bias</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                            <span class="ow">and</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-        <span class="n">bias</span> <span class="o">=</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_bias_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="n">bias</span>
+        <span class="n">trt_bias</span><span class="p">,</span> <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">bias</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">trt_bias</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">input_shuffled</span> <span class="o">=</span> <span class="n">stack</span><span class="p">([</span><span class="nb">input</span><span class="p">],</span> <span class="n">dim</span><span class="o">=</span><span class="nb">input</span><span class="o">.</span><span class="n">ndim</span><span class="p">())</span>
-    <span class="n">kernel_size</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Dims</span><span class="p">([</span><span class="n">kernel_size</span><span class="p">,</span> <span class="mi">1</span><span class="p">])</span>
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_convolution_nd</span><span class="p">(</span><span class="n">input_shuffled</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span>
-                                                <span class="n">noutput</span><span class="p">,</span> <span class="n">kernel_size</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span>
-                                                <span class="n">bias</span><span class="p">)</span>
+                                                <span class="n">noutput</span><span class="p">,</span> <span class="n">kernel_shape</span><span class="p">,</span>
+                                                <span class="n">trt_weight</span><span class="p">,</span> <span class="n">trt_bias</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">stride_nd</span> <span class="o">=</span> <span class="p">(</span><span class="n">stride</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">padding_nd</span> <span class="o">=</span> <span class="p">(</span><span class="n">padding</span><span class="p">,</span> <span class="mi">0</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">dilation_nd</span> <span class="o">=</span> <span class="p">(</span><span class="n">dilation</span><span class="p">,</span> <span class="mi">2</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">num_groups</span> <span class="o">=</span> <span class="n">groups</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">is_weight_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">bias_tensor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
     <span class="n">output_2d</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="n">output_1d</span> <span class="o">=</span> <span class="n">squeeze</span><span class="p">(</span><span class="n">output_2d</span><span class="p">,</span> <span class="n">dim</span><span class="o">=-</span><span class="mi">1</span><span class="p">)</span>
@@ -4891,18 +4911,21 @@ window.addEventListener("load", load);</script>
 
     <span class="n">noutput</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span>
     <span class="n">kernel_size</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">kernel_shape</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Dims</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">kernel_size</span><span class="p">))</span>
 
-    <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                          <span class="ow">and</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-    <span class="n">weight</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_weight_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+    <span class="n">trt_weight</span><span class="p">,</span> <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">weight</span><span class="p">)</span>
+    <span class="n">weight_tensor</span> <span class="o">=</span> <span class="n">weight</span>
 
     <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">bias</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                            <span class="ow">and</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-        <span class="n">bias</span> <span class="o">=</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_bias_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="n">bias</span>
+        <span class="n">trt_bias</span><span class="p">,</span> <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">bias</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">trt_bias</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_convolution_nd</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span> <span class="n">noutput</span><span class="p">,</span>
-                                                <span class="n">kernel_size</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+                                                <span class="n">kernel_shape</span><span class="p">,</span> <span class="n">trt_weight</span><span class="p">,</span>
+                                                <span class="n">trt_bias</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">stride_nd</span> <span class="o">=</span> <span class="n">stride</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">padding_nd</span> <span class="o">=</span> <span class="n">padding</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">dilation_nd</span> <span class="o">=</span> <span class="n">dilation</span>
@@ -4914,9 +4937,9 @@ window.addEventListener("load", load);</script>
         <span class="n">layer</span><span class="o">.</span><span class="n">post_padding</span> <span class="o">=</span> <span class="n">post_padding</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">is_weight_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">bias_tensor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
     <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
 
@@ -4958,18 +4981,21 @@ window.addEventListener("load", load);</script>
 
     <span class="n">noutput</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="mi">0</span><span class="p">]</span>
     <span class="n">kernel_size</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">3</span><span class="p">],</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">kernel_shape</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Dims</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">kernel_size</span><span class="p">))</span>
 
-    <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                          <span class="ow">and</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-    <span class="n">weight</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_weight_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+    <span class="n">trt_weight</span><span class="p">,</span> <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">weight</span><span class="p">)</span>
+    <span class="n">weight_tensor</span> <span class="o">=</span> <span class="n">weight</span>
 
     <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">bias</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                            <span class="ow">and</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-        <span class="n">bias</span> <span class="o">=</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_bias_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="n">bias</span>
+        <span class="n">trt_bias</span><span class="p">,</span> <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">bias</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">trt_bias</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_convolution_nd</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span> <span class="n">noutput</span><span class="p">,</span>
-                                                <span class="n">kernel_size</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+                                                <span class="n">kernel_shape</span><span class="p">,</span> <span class="n">trt_weight</span><span class="p">,</span>
+                                                <span class="n">trt_bias</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">stride_nd</span> <span class="o">=</span> <span class="n">stride</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">padding_nd</span> <span class="o">=</span> <span class="n">padding</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">dilation_nd</span> <span class="o">=</span> <span class="n">dilation</span>
@@ -4977,9 +5003,9 @@ window.addEventListener("load", load);</script>
     <span class="n">layer</span><span class="o">.</span><span class="n">dilation_nd</span> <span class="o">=</span> <span class="n">dilation</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">is_weight_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">bias_tensor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
     <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
     <span class="k">return</span> <span class="n">output</span></div>
@@ -5008,26 +5034,29 @@ window.addEventListener("load", load);</script>
 
     <span class="n">noutput</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="mi">1</span><span class="p">]</span>
     <span class="n">kernel_size</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">2</span><span class="p">],</span> <span class="n">weight</span><span class="o">.</span><span class="n">size</span><span class="p">()[</span><span class="o">-</span><span class="mi">1</span><span class="p">])</span>
+    <span class="n">kernel_shape</span> <span class="o">=</span> <span class="n">trt</span><span class="o">.</span><span class="n">Dims</span><span class="p">(</span><span class="nb">list</span><span class="p">(</span><span class="n">kernel_size</span><span class="p">))</span>
 
-    <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">weight</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                          <span class="ow">and</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-    <span class="n">weight</span> <span class="o">=</span> <span class="n">weight</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_weight_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+    <span class="n">trt_weight</span><span class="p">,</span> <span class="n">is_weight_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">weight</span><span class="p">)</span>
+    <span class="n">weight_tensor</span> <span class="o">=</span> <span class="n">weight</span>
 
     <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
-        <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="p">(</span><span class="n">bias</span><span class="o">.</span><span class="n">producer</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span>
-                            <span class="ow">and</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">type</span> <span class="o">==</span> <span class="n">trt</span><span class="o">.</span><span class="n">LayerType</span><span class="o">.</span><span class="n">CONSTANT</span><span class="p">)</span>
-        <span class="n">bias</span> <span class="o">=</span> <span class="n">bias</span><span class="o">.</span><span class="n">producer</span><span class="o">.</span><span class="n">weights</span> <span class="k">if</span> <span class="n">is_bias_constant</span> <span class="k">else</span> <span class="n">trt</span><span class="o">.</span><span class="n">Weights</span><span class="p">()</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="n">bias</span>
+        <span class="n">trt_bias</span><span class="p">,</span> <span class="n">is_bias_constant</span> <span class="o">=</span> <span class="n">_get_trt_weight</span><span class="p">(</span><span class="n">bias</span><span class="p">)</span>
+    <span class="k">else</span><span class="p">:</span>
+        <span class="n">bias_tensor</span> <span class="o">=</span> <span class="kc">None</span>
+        <span class="n">trt_bias</span> <span class="o">=</span> <span class="kc">None</span>
 
     <span class="n">layer</span> <span class="o">=</span> <span class="n">default_trtnet</span><span class="p">()</span><span class="o">.</span><span class="n">add_deconvolution_nd</span><span class="p">(</span><span class="nb">input</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">,</span> <span class="n">noutput</span><span class="p">,</span>
-                                                  <span class="n">kernel_size</span><span class="p">,</span> <span class="n">weight</span><span class="p">,</span> <span class="n">bias</span><span class="p">)</span>
+                                                  <span class="n">kernel_shape</span><span class="p">,</span> <span class="n">trt_weight</span><span class="p">,</span>
+                                                  <span class="n">trt_bias</span><span class="p">)</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">stride_nd</span> <span class="o">=</span> <span class="n">stride</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">padding_nd</span> <span class="o">=</span> <span class="n">padding</span>
     <span class="n">layer</span><span class="o">.</span><span class="n">num_groups</span> <span class="o">=</span> <span class="n">groups</span>
 
     <span class="k">if</span> <span class="ow">not</span> <span class="n">is_weight_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
-    <span class="k">if</span> <span class="n">bias</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
-        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">1</span><span class="p">,</span> <span class="n">weight_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
+    <span class="k">if</span> <span class="n">bias_tensor</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span> <span class="ow">and</span> <span class="ow">not</span> <span class="n">is_bias_constant</span><span class="p">:</span>
+        <span class="n">layer</span><span class="o">.</span><span class="n">set_input</span><span class="p">(</span><span class="mi">2</span><span class="p">,</span> <span class="n">bias_tensor</span><span class="o">.</span><span class="n">trt_tensor</span><span class="p">)</span>
 
     <span class="n">output</span> <span class="o">=</span> <span class="n">_create_tensor</span><span class="p">(</span><span class="n">layer</span><span class="o">.</span><span class="n">get_output</span><span class="p">(</span><span class="mi">0</span><span class="p">),</span> <span class="n">layer</span><span class="p">)</span>
 
@@ -9227,9 +9256,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 23, 2026.</p>
+  <p>Last updated on February 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
   
 </div></div>
       

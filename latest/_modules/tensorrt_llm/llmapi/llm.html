@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc5" />
+  <meta name="docsearch:version" content="1.3.0rc6" />
 
 
   </head>
@@ -1157,17 +1157,16 @@ window.addEventListener("load", load);</script>
                         <span class="sa">f</span><span class="s2">&quot;</span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="vm">__class__</span><span class="o">.</span><span class="vm">__name__</span><span class="si">}</span><span class="s2"> got invalid argument: </span><span class="si">{</span><span class="n">key</span><span class="si">}</span><span class="s2">&quot;</span>
                     <span class="p">)</span>
 
-            <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">llm_args_cls</span><span class="o">.</span><span class="n">from_kwargs</span><span class="p">(</span>
-                <span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
-                <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
-                <span class="n">tokenizer_mode</span><span class="o">=</span><span class="n">tokenizer_mode</span><span class="p">,</span>
-                <span class="n">skip_tokenizer_init</span><span class="o">=</span><span class="n">skip_tokenizer_init</span><span class="p">,</span>
-                <span class="n">trust_remote_code</span><span class="o">=</span><span class="n">trust_remote_code</span><span class="p">,</span>
-                <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="n">tensor_parallel_size</span><span class="p">,</span>
-                <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
-                <span class="n">revision</span><span class="o">=</span><span class="n">revision</span><span class="p">,</span>
-                <span class="n">tokenizer_revision</span><span class="o">=</span><span class="n">tokenizer_revision</span><span class="p">,</span>
-                <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">args</span> <span class="o">=</span> <span class="n">llm_args_cls</span><span class="p">(</span><span class="n">model</span><span class="o">=</span><span class="n">model</span><span class="p">,</span>
+                                     <span class="n">tokenizer</span><span class="o">=</span><span class="n">tokenizer</span><span class="p">,</span>
+                                     <span class="n">tokenizer_mode</span><span class="o">=</span><span class="n">tokenizer_mode</span><span class="p">,</span>
+                                     <span class="n">skip_tokenizer_init</span><span class="o">=</span><span class="n">skip_tokenizer_init</span><span class="p">,</span>
+                                     <span class="n">trust_remote_code</span><span class="o">=</span><span class="n">trust_remote_code</span><span class="p">,</span>
+                                     <span class="n">tensor_parallel_size</span><span class="o">=</span><span class="n">tensor_parallel_size</span><span class="p">,</span>
+                                     <span class="n">dtype</span><span class="o">=</span><span class="n">dtype</span><span class="p">,</span>
+                                     <span class="n">revision</span><span class="o">=</span><span class="n">revision</span><span class="p">,</span>
+                                     <span class="n">tokenizer_revision</span><span class="o">=</span><span class="n">tokenizer_revision</span><span class="p">,</span>
+                                     <span class="o">**</span><span class="n">kwargs</span><span class="p">)</span>
 
         <span class="k">except</span> <span class="ne">Exception</span> <span class="k">as</span> <span class="n">e</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">error</span><span class="p">(</span>
@@ -1378,9 +1377,6 @@ window.addEventListener("load", load);</script>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">_executor</span><span class="o">.</span><span class="n">is_shutdown</span><span class="p">():</span>
             <span class="k">raise</span> <span class="ne">RuntimeError</span><span class="p">(</span><span class="s2">&quot;LLM is shutting down&quot;</span><span class="p">)</span>
 
-        <span class="n">arrival_time</span> <span class="o">=</span> <span class="n">steady_clock_now</span><span class="p">(</span>
-        <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="k">else</span> <span class="kc">None</span>
-
         <span class="n">sampling_params</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">_prepare_sampling_params</span><span class="p">(</span><span class="n">sampling_params</span><span class="p">)</span>
 
         <span class="n">cache_salt_id</span> <span class="o">=</span> <span class="n">get_cache_salt_id</span><span class="p">(</span>
@@ -1402,6 +1398,9 @@ window.addEventListener("load", load);</script>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">prompt_token_ids</span><span class="p">,</span> <span class="n">prompt</span><span class="p">,</span> <span class="n">query_token_ids</span><span class="p">,</span> <span class="n">multimodal_params</span> <span class="o">=</span> <span class="p">(</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">_preprocess</span><span class="p">(</span><span class="n">inputs</span><span class="p">,</span> <span class="n">sampling_params</span><span class="p">,</span> <span class="n">disaggregated_params</span><span class="p">))</span>
+
+        <span class="n">arrival_time</span> <span class="o">=</span> <span class="n">steady_clock_now</span><span class="p">(</span>
+        <span class="p">)</span> <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">args</span><span class="o">.</span><span class="n">return_perf_metrics</span> <span class="k">else</span> <span class="kc">None</span>
 
         <span class="bp">self</span><span class="o">.</span><span class="n">_check_arguments</span><span class="p">(</span>
             <span class="nb">len</span><span class="p">(</span><span class="n">prompt_token_ids</span><span class="p">),</span>
@@ -2379,9 +2378,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 23, 2026.</p>
+  <p>Last updated on February 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
   
 </div></div>
       
