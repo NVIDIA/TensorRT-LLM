@@ -21,6 +21,8 @@ from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
@@ -198,6 +200,9 @@ class Mamba2Mixer(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
 
+        self.aux_steram = torch.cuda.Stream()
+        self.events = [torch.cuda.Event(), torch.cuda.Event()]
+
     def post_load_weights(self):
         """Post-process after loading weights."""
         if self.norm.is_nvfp4 and self.norm.nvfp4_scale is None:
@@ -347,10 +352,6 @@ class Mamba2Mixer(nn.Module):
             ssm_states[state_indices_p] = current_ssm_states
 
         if num_decodes > 0:
-            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            # Convert dt early so we can do PDL between conv1d and selective state.
-            dt_d = dt_d.to(dtype=torch.float32)
-
             is_target_verify = attn_metadata.kv_cache_manager.is_speculative(
             ) and spec_metadata is not None
             if is_target_verify:
@@ -368,28 +369,47 @@ class Mamba2Mixer(nn.Module):
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
                                             -1).transpose(1, 2)
-                # TODO:support tree structure [TRTLLM-10320]
-                xbc_d_processed = causal_conv1d_update_triton(
-                    xbc_d_reshaped,
-                    conv_states,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=state_indices_d[:num_decodes],
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=intermediate_state_indices,
-                )
 
-                xbc_d = xbc_d_processed.transpose(1, 2).view(
-                    num_decode_tokens, -1)
+                def conv1d():
+                    # TODO:support tree structure [TRTLLM-10320]
+                    xbc_d_processed = causal_conv1d_update_triton(
+                        xbc_d_reshaped,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d[:num_decodes],
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+
+                    return xbc_d_processed.transpose(1, 2).view(
+                        num_decode_tokens, -1)
 
             else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
+
+                def conv1d():
+                    return causal_conv1d_update(
+                        xbc_d,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d)
+
+            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
+            def convert_dt():
+                return dt_d.to(dtype=torch.float32)
+
+            # If we're in a cuda graph and using PDL on conv1d, the next kernel
+            # if PDL'd will launch when convert_dt is done and conv1d triggers
+            # dependent kernels.  If these don't happen in parallel, then
+            # convert will go second and we lose PDL, but we're using cuda
+            # graphs for low latency so that seems ok.
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d, convert_dt,
+                                                    self.events[0],
+                                                    self.events[1],
+                                                    self.aux_steram)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
