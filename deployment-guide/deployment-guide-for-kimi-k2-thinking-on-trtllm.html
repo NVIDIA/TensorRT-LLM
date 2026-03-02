@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc5" />
+  <meta name="docsearch:version" content="1.3.0rc6" />
 
 
   </head>
@@ -567,31 +567,47 @@ make<span class="w"> </span>-C<span class="w"> </span>docker<span class="w"> </s
 </pre></div>
 </div>
 </section>
-<section id="launch-the-tensorrt-llm-server">
-<h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
-<p>Prepare an <code class="docutils literal notranslate"><span class="pre">EXTRA_OPTIONS_YAML_FILE</span></code> that specifies LLM API arguments when deploying the model. An example YAML file is as follows:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
-<span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8448</span>
-<span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8212</span>
-<span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
-<span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
-<span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="nt">pipeline_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<span class="nt">print_iter_log</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="nt">kv_cache_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.75</span>
-<span class="w">  </span><span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
-<span class="nt">cache_transceiver_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">UCX</span>
-<span class="w">  </span><span class="nt">max_tokens_in_buffer</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8448</span>
-<span class="nt">trust_remote_code</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<section id="recommended-performance-settings">
+<h3>Recommended Performance Settings<a class="headerlink" href="#recommended-performance-settings" title="Link to this heading">#</a></h3>
+<p>We maintain YAML configuration files with recommended performance settings in the <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs"><code class="docutils literal notranslate"><span class="pre">examples/configs</span></code></a> directory. These config files are present in the TensorRT LLM container at the path <code class="docutils literal notranslate"><span class="pre">/app/tensorrt_llm/examples/configs</span></code>. You can use these out-of-the-box, or adjust them to your specific use case.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_DIR</span><span class="o">=</span>/app/tensorrt_llm<span class="w"> </span><span class="c1"># change as needed to match your environment</span>
+<span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/configs/curated/kimi-k2-thinking.yaml
 </pre></div>
 </div>
-<p>This YAML file specifies configurations that deploy the model with 8-way expert parallelism for the MoE part and 8-way attention data parallelism. It also enables <code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code>, so that it works with the Kimi K2 Thinking customized <a class="reference external" href="https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4/blob/main/tokenization_kimi.py">tokenizer</a>.</p>
-<p>With the <code class="docutils literal notranslate"><span class="pre">EXTRA_OPTIONS_YAML_FILE</span></code>, use the following example command to launch the TensorRT LLM server with the Kimi-K2-Thinking-NVFP4 model from within the container.</p>
+<p>Note: if you don’t have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.</p>
+<div class="dropdown admonition">
+<p class="admonition-title">Show code</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">EXTRA_LLM_API_FILE</span><span class="o">=</span>/tmp/config.yml
+
+cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${EXTRA_LLM_API_FILE}</span>
+
+<span class="s">max_batch_size: 128</span>
+<span class="s">max_num_tokens: 8448</span>
+<span class="s">max_seq_len: 8212</span>
+<span class="s">tensor_parallel_size: 8</span>
+<span class="s">moe_expert_parallel_size: 8</span>
+<span class="s">enable_attention_dp: true</span>
+<span class="s">pipeline_parallel_size: 1</span>
+<span class="s">print_iter_log: true</span>
+<span class="s">kv_cache_config:</span>
+<span class="s">  free_gpu_memory_fraction: 0.75</span>
+<span class="s">  dtype: fp8</span>
+<span class="s">cache_transceiver_config:</span>
+<span class="s">  backend: UCX</span>
+<span class="s">  max_tokens_in_buffer: 8448</span>
+<span class="s">trust_remote_code: true</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
+</div>
+</section>
+<section id="launch-the-tensorrt-llm-server">
+<h3>Launch the TensorRT LLM Server<a class="headerlink" href="#launch-the-tensorrt-llm-server" title="Link to this heading">#</a></h3>
+<p>This YAML config deploys the model with 8-way expert parallelism for the MoE part and 8-way attention data parallelism. It also enables <code class="docutils literal notranslate"><span class="pre">trust_remote_code</span></code>, so that it works with the Kimi K2 Thinking customized <a class="reference external" href="https://huggingface.co/nvidia/Kimi-K2-Thinking-NVFP4/blob/main/tokenization_kimi.py">tokenizer</a>.</p>
+<p>With the <code class="docutils literal notranslate"><span class="pre">EXTRA_LLM_API_FILE</span></code>, use the following example command to launch the TensorRT LLM server with the Kimi-K2-Thinking-NVFP4 model from within the container.</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>trtllm-serve<span class="w"> </span>nvidia/Kimi-K2-Thinking-NVFP4<span class="w"> </span><span class="se">\</span>
 <span class="w">    </span>--host<span class="w"> </span><span class="m">0</span>.0.0.0<span class="w"> </span>--port<span class="w"> </span><span class="m">8000</span><span class="w"> </span><span class="se">\</span>
-<span class="w">    </span>--config<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_OPTIONS_YAML_FILE</span><span class="si">}</span>
+<span class="w">    </span>--config<span class="w"> </span><span class="si">${</span><span class="nv">EXTRA_LLM_API_FILE</span><span class="si">}</span>
 </pre></div>
 </div>
 <p>TensorRT LLM will load weights and select the best kernels during startup. The server is successfully launched when the following log is shown:</p>
@@ -611,116 +627,124 @@ INFO:     Uvicorn running on http://localhost:8000 (Press CTRL+C to quit)
 <section id="deploy-kimi-k2-thinking-on-gb200-nvl72-through-slurm-with-wide-ep-and-disaggregated-serving">
 <h2>Deploy Kimi K2 Thinking on GB200 NVL72 through SLURM with wide EP and disaggregated serving<a class="headerlink" href="#deploy-kimi-k2-thinking-on-gb200-nvl72-through-slurm-with-wide-ep-and-disaggregated-serving" title="Link to this heading">#</a></h2>
 <p>TensorRT LLM provides a set of SLURM scripts that can be easily configured through YAML files and automatically launch SLURM jobs on GB200 NVL72 clusters for deployment, benchmarking, and accuracy testing purposes. The scripts are located at <code class="docutils literal notranslate"><span class="pre">examples/disaggregated/slurm/benchmark</span></code>. Refer to <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/wide_ep/slurm_scripts">this page</a> for more details and example wide EP config files.</p>
-<p>For Kimi K2 Thinking, an example configuration for SLURM arguments and the scripts is as follows:</p>
-<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># SLURM Configuration</span>
-<span class="nt">slurm</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">script_file</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;disaggr_torch.slurm&quot;</span>
-<span class="w">  </span><span class="nt">partition</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;partition&gt;&quot;</span>
-<span class="w">  </span><span class="nt">account</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;account&gt;&quot;</span>
-<span class="w">  </span><span class="nt">job_time</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;02:00:00&quot;</span>
-<span class="w">  </span><span class="nt">job_name</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;job_name&gt;&quot;</span>
-<span class="w">  </span><span class="nt">extra_args</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="w"> </span><span class="c1"># Cluster specific arguments, e.g. &quot;--gres=gpu:4 --exclude=node1,node2&quot;</span>
-<span class="w">  </span><span class="nt">numa_bind</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w"> </span><span class="c1"># Only enable for GB200 NVL72</span>
-
-<span class="c1"># Benchmark Mode</span>
-<span class="nt">benchmark</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">mode</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;e2e&quot;</span><span class="w">  </span><span class="c1"># Options: e2e, gen_only</span>
-<span class="w">  </span><span class="nt">use_nv_sa_benchmark</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">  </span><span class="c1"># Whether to use NVIDIA SA benchmark script</span>
-<span class="w">  </span><span class="nt">multi_round</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span><span class="w">  </span><span class="c1"># Number of benchmark rounds</span>
-<span class="w">  </span><span class="nt">benchmark_ratio</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.8</span><span class="w">  </span><span class="c1"># Benchmark ratio</span>
-<span class="w">  </span><span class="nt">streaming</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span><span class="w">  </span><span class="c1"># Enable streaming mode</span>
-<span class="w">  </span><span class="nt">concurrency_list</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;16&quot;</span>
-<span class="w">  </span><span class="nt">input_length</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">  </span><span class="c1"># Input sequence length</span>
-<span class="w">  </span><span class="nt">output_length</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span><span class="w">  </span><span class="c1"># Output sequence length</span>
-<span class="w">  </span><span class="nt">dataset_file</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;dataset_file&gt;&quot;</span>
-
-<span class="c1"># Hardware Configuration</span>
-<span class="nt">hardware</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">gpus_per_node</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">  </span><span class="c1"># Modify this with your hardware configuration</span>
-<span class="w">  </span><span class="nt">num_ctx_servers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span><span class="w">  </span><span class="c1"># Number of context servers</span>
-<span class="w">  </span><span class="nt">num_gen_servers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span><span class="w">  </span><span class="c1"># Number of generation servers</span>
-
-<span class="c1"># Environment Configuration</span>
-<span class="nt">environment</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">container_mount</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;container_mount&gt;&quot;</span><span class="w">  </span><span class="c1"># Format: path1:path1,path2:path2</span>
-<span class="w">  </span><span class="nt">container_image</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;container_image&gt;&quot;</span>
-<span class="w">  </span><span class="nt">model_path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;model_path&gt;&quot;</span>
-<span class="w">  </span><span class="nt">trtllm_repo</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;trtllm_repo&gt;&quot;</span>
-<span class="w">  </span><span class="nt">build_wheel</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span><span class="w">  </span><span class="c1"># Don&#39;t build the wheel when launching multiple jobs</span>
-<span class="w">  </span><span class="nt">trtllm_wheel_path</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&quot;</span><span class="w">  </span><span class="c1"># Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead</span>
-<span class="w">  </span><span class="nt">work_dir</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;&lt;full_path_to_work_dir&gt;&quot;</span>
-<span class="w">  </span><span class="nt">worker_env_var</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;TLLM_LOG_LEVEL=INFO</span><span class="nv"> </span><span class="s">TRTLLM_SERVER_DISABLE_GC=1</span><span class="nv"> </span><span class="s">TRTLLM_WORKER_DISABLE_GC=1</span><span class="nv"> </span><span class="s">TRTLLM_ENABLE_PDL=1</span><span class="nv"> </span><span class="s">ENROOT_ALLOW_DEV=yes&quot;</span>
-<span class="w">  </span><span class="nt">server_env_var</span><span class="p">:</span><span class="w"> </span><span class="s">&quot;TRTLLM_SERVER_DISABLE_GC=1&quot;</span>
-
-<span class="c1"># Worker Configuration</span>
-<span class="nt">worker_config</span><span class="p">:</span>
-<span class="w">  </span><span class="nt">gen</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32</span>
-<span class="w">    </span><span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32</span>
-<span class="w">    </span><span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">    </span><span class="nt">enable_lm_head_tp_in_adp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">    </span><span class="nt">pipeline_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<span class="w">    </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
-<span class="w">    </span><span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
-<span class="w">    </span><span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">9236</span>
-<span class="w">    </span><span class="nt">cuda_graph_config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">enable_padding</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">      </span><span class="nt">batch_sizes</span><span class="p">:</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">16</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">32</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">64</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">128</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">256</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">512</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">768</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1024</span>
-<span class="w">      </span><span class="p p-Indicator">-</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">2048</span>
-<span class="w">    </span><span class="nt">print_iter_log</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">    </span><span class="nt">kv_cache_config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
-<span class="w">      </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.6</span>
-<span class="w">      </span><span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
-<span class="w">    </span><span class="nt">moe_config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">WIDEEP</span>
-<span class="w">      </span><span class="nt">use_low_precision_moe_combine</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">      </span><span class="nt">load_balancer</span><span class="p">:</span>
-<span class="w">        </span><span class="nt">num_slots</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">416</span>
-<span class="w">        </span><span class="nt">layer_updates_per_iter</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<span class="w">    </span><span class="nt">cache_transceiver_config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">UCX</span>
-<span class="w">      </span><span class="nt">max_tokens_in_buffer</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8448</span>
-<span class="w">    </span><span class="nt">stream_interval</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">20</span>
-<span class="w">    </span><span class="nt">num_postprocess_workers</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
-<span class="w">    </span><span class="nt">trust_remote_code</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">  </span><span class="nt">ctx</span><span class="p">:</span>
-<span class="w">    </span><span class="nt">max_batch_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<span class="w">    </span><span class="nt">max_num_tokens</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8448</span>
-<span class="w">    </span><span class="nt">max_seq_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8212</span>
-<span class="w">    </span><span class="nt">tensor_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
-<span class="w">    </span><span class="nt">moe_expert_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
-<span class="w">    </span><span class="nt">enable_attention_dp</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">    </span><span class="nt">pipeline_parallel_size</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">1</span>
-<span class="w">    </span><span class="nt">print_iter_log</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">    </span><span class="nt">cuda_graph_config</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">null</span>
-<span class="w">    </span><span class="nt">disable_overlap_scheduler</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
-<span class="w">    </span><span class="nt">kv_cache_config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">enable_block_reuse</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">false</span>
-<span class="w">      </span><span class="nt">free_gpu_memory_fraction</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">0.75</span>
-<span class="w">      </span><span class="nt">dtype</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">fp8</span>
-<span class="w">    </span><span class="nt">cache_transceiver_config</span><span class="p">:</span>
-<span class="w">      </span><span class="nt">backend</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">UCX</span>
-<span class="w">      </span><span class="nt">max_tokens_in_buffer</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">8448</span>
-<span class="w">    </span><span class="nt">trust_remote_code</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<p>For Kimi K2 Thinking, an example configuration for SLURM arguments and the scripts is provided at <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/blob/main/examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml"><code class="docutils literal notranslate"><span class="pre">examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml</span></code></a>.</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">TRTLLM_DIR</span><span class="o">=</span>/app/tensorrt_llm<span class="w"> </span><span class="c1"># change as needed to match your environment</span>
+<span class="nv">SLURM_CONFIG_FILE</span><span class="o">=</span><span class="si">${</span><span class="nv">TRTLLM_DIR</span><span class="si">}</span>/examples/wide_ep/slurm_scripts/kimi-k2-thinking.yaml
 </pre></div>
+</div>
+<p>Note: if you don’t have access to the source code locally, you can manually create the YAML config file using the code in the dropdown below.</p>
+<div class="dropdown admonition">
+<p class="admonition-title">Show code</p>
+<div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nv">SLURM_CONFIG_FILE</span><span class="o">=</span>/tmp/slurm-config.yml
+
+cat<span class="w"> </span><span class="s">&lt;&lt; EOF &gt; ${SLURM_CONFIG_FILE}</span>
+
+<span class="s"># SLURM Configuration</span>
+<span class="s">slurm:</span>
+<span class="s">  script_file: &quot;disaggr_torch.slurm&quot;</span>
+<span class="s">  partition: &quot;&lt;partition&gt;&quot;</span>
+<span class="s">  account: &quot;&lt;account&gt;&quot;</span>
+<span class="s">  job_time: &quot;02:00:00&quot;</span>
+<span class="s">  job_name: &quot;&lt;job_name&gt;&quot;</span>
+<span class="s">  extra_args: &quot;&quot; # Cluster specific arguments, e.g. &quot;--gres=gpu:4 --exclude=node1,node2&quot;</span>
+<span class="s">  numa_bind: true # Only enable for GB200 NVL72</span>
+
+<span class="s"># Benchmark Mode</span>
+<span class="s">benchmark:</span>
+<span class="s">  mode: &quot;e2e&quot;  # Options: e2e, gen_only</span>
+<span class="s">  use_nv_sa_benchmark: false  # Whether to use NVIDIA SA benchmark script</span>
+<span class="s">  multi_round: 8  # Number of benchmark rounds</span>
+<span class="s">  benchmark_ratio: 0.8  # Benchmark ratio</span>
+<span class="s">  streaming: true  # Enable streaming mode</span>
+<span class="s">  concurrency_list: &quot;16&quot;</span>
+<span class="s">  input_length: 1024  # Input sequence length</span>
+<span class="s">  output_length: 1024  # Output sequence length</span>
+<span class="s">  dataset_file: &quot;&lt;dataset_file&gt;&quot;</span>
+
+<span class="s"># Hardware Configuration</span>
+<span class="s">hardware:</span>
+<span class="s">  gpus_per_node: 4  # Modify this with your hardware configuration</span>
+<span class="s">  num_ctx_servers: 4  # Number of context servers</span>
+<span class="s">  num_gen_servers: 1  # Number of generation servers</span>
+
+<span class="s"># Environment Configuration</span>
+<span class="s">environment:</span>
+<span class="s">  container_mount: &quot;&lt;container_mount&gt;&quot;  # Format: path1:path1,path2:path2</span>
+<span class="s">  container_image: &quot;&lt;container_image&gt;&quot;</span>
+<span class="s">  model_path: &quot;&lt;model_path&gt;&quot;</span>
+<span class="s">  trtllm_repo: &quot;&lt;trtllm_repo&gt;&quot;</span>
+<span class="s">  build_wheel: false  # Don&#39;t build the wheel when launching multiple jobs</span>
+<span class="s">  trtllm_wheel_path: &quot;&quot;  # Path to pre-built TensorRT-LLM wheel. If provided, install from this wheel instead</span>
+<span class="s">  work_dir: &quot;&lt;full_path_to_work_dir&gt;&quot;</span>
+<span class="s">  worker_env_var: &quot;TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes&quot;</span>
+<span class="s">  server_env_var: &quot;TRTLLM_SERVER_DISABLE_GC=1&quot;</span>
+
+<span class="s"># Worker Configuration</span>
+<span class="s">worker_config:</span>
+<span class="s">  gen:</span>
+<span class="s">    tensor_parallel_size: 32</span>
+<span class="s">    moe_expert_parallel_size: 32</span>
+<span class="s">    enable_attention_dp: true</span>
+<span class="s">    enable_lm_head_tp_in_adp: true</span>
+<span class="s">    pipeline_parallel_size: 1</span>
+<span class="s">    max_batch_size: 128</span>
+<span class="s">    max_num_tokens: 128</span>
+<span class="s">    max_seq_len: 9236</span>
+<span class="s">    cuda_graph_config:</span>
+<span class="s">      enable_padding: true</span>
+<span class="s">      batch_sizes:</span>
+<span class="s">      - 1</span>
+<span class="s">      - 2</span>
+<span class="s">      - 4</span>
+<span class="s">      - 8</span>
+<span class="s">      - 16</span>
+<span class="s">      - 32</span>
+<span class="s">      - 64</span>
+<span class="s">      - 128</span>
+<span class="s">    print_iter_log: true</span>
+<span class="s">    kv_cache_config:</span>
+<span class="s">      enable_block_reuse: false</span>
+<span class="s">      free_gpu_memory_fraction: 0.6</span>
+<span class="s">      dtype: fp8</span>
+<span class="s">    moe_config:</span>
+<span class="s">      backend: WIDEEP</span>
+<span class="s">      use_low_precision_moe_combine: true</span>
+<span class="s">      load_balancer:</span>
+<span class="s">        num_slots: 416</span>
+<span class="s">        layer_updates_per_iter: 1</span>
+<span class="s">    cache_transceiver_config:</span>
+<span class="s">      backend: UCX</span>
+<span class="s">      max_tokens_in_buffer: 8448</span>
+<span class="s">    stream_interval: 20</span>
+<span class="s">    num_postprocess_workers: 4</span>
+<span class="s">    trust_remote_code: true</span>
+<span class="s">  ctx:</span>
+<span class="s">    max_batch_size: 1</span>
+<span class="s">    max_num_tokens: 8448</span>
+<span class="s">    max_seq_len: 8212</span>
+<span class="s">    tensor_parallel_size: 4</span>
+<span class="s">    moe_expert_parallel_size: 4</span>
+<span class="s">    enable_attention_dp: true</span>
+<span class="s">    pipeline_parallel_size: 1</span>
+<span class="s">    print_iter_log: true</span>
+<span class="s">    cuda_graph_config: null</span>
+<span class="s">    disable_overlap_scheduler: true</span>
+<span class="s">    kv_cache_config:</span>
+<span class="s">      enable_block_reuse: false</span>
+<span class="s">      free_gpu_memory_fraction: 0.75</span>
+<span class="s">      dtype: fp8</span>
+<span class="s">    cache_transceiver_config:</span>
+<span class="s">      backend: UCX</span>
+<span class="s">      max_tokens_in_buffer: 8448</span>
+<span class="s">    trust_remote_code: true</span>
+<span class="s">EOF</span>
+</pre></div>
+</div>
 </div>
 <p>It includes SLURM-specific configurations, benchmark and hardware details, and environment settings. The <code class="docutils literal notranslate"><span class="pre">worker_config</span></code> field includes detailed settings for context and generation servers when deploying a disaggregated server, with each specified as a list of LLM API arguments.</p>
 <p>To launch SLURM jobs with the YAML config file, execute the following command:</p>
 <div class="highlight-shell notranslate"><div class="highlight"><pre><span></span><span class="nb">cd</span><span class="w"> </span>&lt;TensorRT<span class="w"> </span>LLM<span class="w"> </span>root&gt;/examples/disaggregated/slurm/benchmark
-python3<span class="w"> </span>submit.py<span class="w"> </span>-c<span class="w"> </span>config.yaml
+python3<span class="w"> </span>submit.py<span class="w"> </span>-c<span class="w"> </span><span class="si">${</span><span class="nv">SLURM_CONFIG_FILE</span><span class="si">}</span>
 </pre></div>
 </div>
 </section>
@@ -892,6 +916,7 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#models">Models</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-kimi-k2-thinking-on-dgx-b200-through-docker">Deploy Kimi K2 Thinking on DGX B200 through Docker</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#prepare-docker-image">Prepare Docker image</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#recommended-performance-settings">Recommended Performance Settings</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-the-tensorrt-llm-server">Launch the TensorRT LLM Server</a></li>
 </ul>
 </li>
@@ -990,9 +1015,9 @@ chmod<span class="w"> </span>+x<span class="w"> </span>bench.sh
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 23, 2026.</p>
+  <p>Last updated on February 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
   
 </div></div>
       

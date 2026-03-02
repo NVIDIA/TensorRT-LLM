@@ -2,7 +2,7 @@ Deepseek R1 Reasoning Parser
 ============================
 Refer to the `trtllm-serve documentation <https://nvidia.github.io/TensorRT-LLM/commands/trtllm-serve.html>`_ for starting a server.
 
-Source https://github.com/NVIDIA/TensorRT-LLM/blob/630fccb3ca072a0560f5ea461d57bdab5faa434b/examples/serve/deepseek_r1_reasoning_parser.sh.
+Source https://github.com/NVIDIA/TensorRT-LLM/blob/617440d385f091007daafe8bb7206e9a748bb84b/examples/serve/deepseek_r1_reasoning_parser.sh.
 
 .. literalinclude:: ../../../examples/serve/deepseek_r1_reasoning_parser.sh
     :lines: 1-23

@@ -61,7 +61,7 @@ append: EOF
 Below is an example command to launch the TensorRT LLM server with the Qwen3-Next model from within the container.
 
 ```shell
-trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --host 0.0.0.0 --port 8000 --config ${EXTRA_LLM_API_FILE}
+trtllm-serve Qwen/Qwen3-Next-80B-A3B-Thinking --host 0.0.0.0 --port 8000 --reasoning_parser deepseek-r1 --config ${EXTRA_LLM_API_FILE}
 ```
 
 After the server is set up, the client can now send prompt requests to the server and receive results.
@@ -172,7 +172,7 @@ Here is an example response:
 * For performance issues, check GPU utilization with nvidia-smi while the server is running.
 * If the container fails to start, verify that the NVIDIA Container Toolkit is properly installed.
 * For connection issues, make sure the server port (`8000` in this guide) is not being used by another application.
-
+* If you are using trtllm-serve and the thinking model of Qwen3-Next, make sure to add this server arg `--reasoning_parser deepseek-r1`.
 
 
 ## Benchmarking Performance
@@ -227,7 +227,3 @@ Run `bench.sh` to begin a serving benchmark. This will take a long time if you r
 ```shell
 ./bench.sh
 ```
-
-## Known Issues
-
-Qwen3-Next-80B-A3B exhibits relatively low accuracy on the SciCode-AA-v2 benchmark.

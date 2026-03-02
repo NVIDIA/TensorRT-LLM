@@ -497,7 +497,7 @@ window.addEventListener("load", load);</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc5';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +510,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc5" />
+  <meta name="docsearch:version" content="1.3.0rc6" />
 
 
   </head>
@@ -973,10 +973,12 @@ window.addEventListener("load", load);</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">typing</span><span class="w"> </span><span class="kn">import</span> <span class="n">Any</span><span class="p">,</span> <span class="n">List</span><span class="p">,</span> <span class="n">Optional</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">filelock</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">pydantic</span><span class="w"> </span><span class="kn">import</span> <span class="n">Field</span><span class="p">,</span> <span class="n">model_validator</span>
 
 <span class="kn">import</span><span class="w"> </span><span class="nn">tensorrt_llm</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.builder</span><span class="w"> </span><span class="kn">import</span> <span class="n">BuildConfig</span>
-<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">enable_llm_debug</span><span class="p">,</span> <span class="n">print_colored</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi.utils</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">,</span> <span class="n">enable_llm_debug</span><span class="p">,</span>
+                                       <span class="n">print_colored</span><span class="p">)</span>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.logger</span><span class="w"> </span><span class="kn">import</span> <span class="n">logger</span>
 
 
@@ -993,44 +995,39 @@ window.addEventListener("load", load);</script>
 
 <div class="viewcode-block" id="BuildCacheConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig">[docs]</a>
-<span class="k">class</span><span class="w"> </span><span class="nc">BuildCacheConfig</span><span class="p">:</span>
+<span class="k">class</span><span class="w"> </span><span class="nc">BuildCacheConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
 <span class="sd">    Configuration for the build cache.</span>
-
-<span class="sd">    Attributes:</span>
-<span class="sd">        cache_root (str): The root directory for the build cache.</span>
-<span class="sd">        max_records (int): The maximum number of records to store in the cache.</span>
-<span class="sd">        max_cache_storage_gb (float): The maximum amount of storage (in GB) to use for the cache.</span>
 
 <span class="sd">    Note:</span>
 <span class="sd">        The build-cache assumes the weights of the model are not changed during the execution. If the weights are</span>
 <span class="sd">        changed, you should remove the caches manually.</span>
 <span class="sd">    &quot;&quot;&quot;</span>
 
-<div class="viewcode-block" id="BuildCacheConfig.__init__">
-<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig.__init__">[docs]</a>
-    <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span>
-                 <span class="n">cache_root</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">,</span>
-                 <span class="n">max_records</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="mi">10</span><span class="p">,</span>
-                 <span class="n">max_cache_storage_gb</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="mi">256</span><span class="p">):</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_cache_root</span> <span class="o">=</span> <span class="n">cache_root</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_max_records</span> <span class="o">=</span> <span class="n">max_records</span>
-        <span class="bp">self</span><span class="o">.</span><span class="n">_max_cache_storage_gb</span> <span class="o">=</span> <span class="n">max_cache_storage_gb</span></div>
+    <span class="n">cache_root</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Path</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The root directory for the build cache. Falls back to env var if not provided.&quot;</span>
+    <span class="p">)</span>
+    <span class="n">max_records</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">10</span><span class="p">,</span>
+        <span class="n">gt</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The maximum number of records to store in the cache.&quot;</span><span class="p">)</span>
+    <span class="n">max_cache_storage_gb</span><span class="p">:</span> <span class="nb">float</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mf">256.0</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The maximum amount of storage (in GB) to use for the cache.&quot;</span>
+    <span class="p">)</span>
 
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">cache_root</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="n">Path</span><span class="p">:</span>
-        <span class="n">_build_cache_enabled</span><span class="p">,</span> <span class="n">_build_cache_root</span> <span class="o">=</span> <span class="n">get_build_cache_config_from_env</span><span class="p">(</span>
-        <span class="p">)</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_cache_root</span> <span class="ow">or</span> <span class="n">Path</span><span class="p">(</span><span class="n">_build_cache_root</span><span class="p">)</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">max_records</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_records</span>
-
-    <span class="nd">@property</span>
-    <span class="k">def</span><span class="w"> </span><span class="nf">max_cache_storage_gb</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
-        <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">_max_cache_storage_gb</span></div>
+<div class="viewcode-block" id="BuildCacheConfig.set_default_cache_root">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.BuildCacheConfig.set_default_cache_root">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_default_cache_root</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s2">&quot;BuildCacheConfig&quot;</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Set cache_root from environment variable if not provided.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">cache_root</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="n">_</span><span class="p">,</span> <span class="n">default_cache_root</span> <span class="o">=</span> <span class="n">get_build_cache_config_from_env</span><span class="p">()</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">cache_root</span> <span class="o">=</span> <span class="n">Path</span><span class="p">(</span><span class="n">default_cache_root</span><span class="p">)</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+</div>
 
 
 
@@ -1045,16 +1042,10 @@ window.addEventListener("load", load);</script>
     <span class="n">CACHE_VERSION</span> <span class="o">=</span> <span class="mi">0</span>
 
     <span class="k">def</span><span class="w"> </span><span class="fm">__init__</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">BuildCacheConfig</span><span class="p">]</span> <span class="o">=</span> <span class="kc">None</span><span class="p">):</span>
-
-        <span class="n">_</span><span class="p">,</span> <span class="n">default_cache_root</span> <span class="o">=</span> <span class="n">get_build_cache_config_from_env</span><span class="p">()</span>
         <span class="n">config</span> <span class="o">=</span> <span class="n">config</span> <span class="ow">or</span> <span class="n">BuildCacheConfig</span><span class="p">()</span>
-
-        <span class="bp">self</span><span class="o">.</span><span class="n">cache_root</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">cache_root</span> <span class="ow">or</span> <span class="n">Path</span><span class="p">(</span><span class="n">default_cache_root</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">cache_root</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">cache_root</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_records</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_records</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_cache_storage_gb</span> <span class="o">=</span> <span class="n">config</span><span class="o">.</span><span class="n">max_cache_storage_gb</span>
-
-        <span class="k">if</span> <span class="n">config</span><span class="o">.</span><span class="n">max_records</span> <span class="o">&lt;</span> <span class="mi">1</span><span class="p">:</span>
-            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_records should be greater than 0&quot;</span><span class="p">)</span>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">free_storage_in_gb</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">float</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&#39;&#39;&#39; Get the free storage capacity of the cache. &#39;&#39;&#39;</span>
@@ -1396,9 +1387,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 23, 2026.</p>
+  <p>Last updated on February 27, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/630fccb">630fccb</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
   
 </div></div>
       
