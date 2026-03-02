@@ -16,6 +16,7 @@
  */
 
 #include "kvCacheManager.h"
+#include "pybind11/pybind11.h"
 #include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/peftCacheManager.h"
 #include "tensorrt_llm/pybind/common/bindTypes.h"
@@ -148,10 +149,10 @@ public:
     }
 
     SizeType32 copyBlockOffsets(tensorrt_llm::runtime::ITensor& output, SizeType32 outputSlotOffset,
-        tb::LlmRequest::RequestIdType requestId) const override
+        tb::LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override
     {
         PYBIND11_OVERLOAD_PURE(
-            SizeType32, tbk::BaseKVCacheManager, copyBlockOffsets, output, outputSlotOffset, requestId);
+            SizeType32, tbk::BaseKVCacheManager, copyBlockOffsets, output, outputSlotOffset, requestId, windowSize);
     }
 
     bool isEnableBlockReuse() const override
@@ -341,6 +342,18 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
     py::class_<tbk::BlockKeyHasher>(m, "BlockKeyHasher")
         .def_static("hash", &tbk::BlockKeyHasher::hash, py::arg("block_key"), py::arg("parent_hash") = 0);
 
+    py::class_<tbk::LinearAttentionMetadata>(m, "LinearAttentionMetadata")
+        .def(py::init<>())
+        .def_readwrite("linear_layer_indices", &tbk::LinearAttentionMetadata::linearLayerIndices)
+        .def_readwrite("cache_type", &tbk::LinearAttentionMetadata::cacheType)
+        .def_readwrite("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
+        .def_readwrite("input_features_bytes_per_token", &tbk::LinearAttentionMetadata::inputFeaturesBytesPerToken)
+        .def_readwrite("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval);
+
+    py::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
+        .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates)
+        .value("INPUT_FEATURES", tbk::LinearAttentionMetadata::LinearCacheType::kInputFeatures);
+
     py::class_<tbk::KVCacheEventManager, std::shared_ptr<tbk::KVCacheEventManager>>(m, "KVCacheEventManager")
         .def(py::init<size_t, std::optional<SizeType32>, std::optional<SizeType32>, SizeType32>(),
             py::arg("max_kv_event_entries"), py::arg("attention_dp_rank") = std::nullopt,
@@ -351,6 +364,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("is_cross_attention"), py::arg("dtype"), py::arg("model_config"), py::arg("world_config"),
             py::arg("window_size_to_layers"), py::arg("allotted_primary_mem_bytes"),
             py::arg("allotted_secondary_mem_bytes"), py::arg("extra_cost_memory"), py::arg("kv_factor"),
+            py::arg("max_batch_size"), py::arg("linear_attention_metadata") = std::nullopt,
             py::call_guard<py::gil_scoped_release>())
         .def("allocate_pools", &BaseKVCacheManager::allocatePools, py::call_guard<py::gil_scoped_release>())
         .def("release_pools", &BaseKVCacheManager::releasePools, py::call_guard<py::gil_scoped_release>())
@@ -431,6 +445,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             },
             py::call_guard<py::gil_scoped_release>())
         .def(
+            "get_recurrent_states_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor
+            {
+                auto const& pool = self.getBlockManager().getRecurrentStatesPool();
+                return tr::Torch::tensor(pool.primaryPtr);
+            },
+            py::call_guard<py::gil_scoped_release>())
+        .def(
             "get_unique_primary_pool", [](tbk::BaseKVCacheManager& self) { return self.getUniquePrimaryPool(); },
             py::call_guard<py::gil_scoped_release>())
         .def(
@@ -468,6 +490,20 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                 }
             },
             py::call_guard<py::gil_scoped_release>())
+        // .def(
+        //     "copy_linear_batch_block_offsets",
+        //     [](tbk::BaseKVCacheManager& self, at::Tensor output,
+        //         std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
+        //         SizeType32 const offset)
+        //     {
+        //         auto _output = from_torch(output);
+        //         TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
+        //         for (size_t i = 0; i < requestIds.size(); ++i)
+        //         {
+        //             self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i], LinearAttentionMetadata::kRecurrentStates);
+        //         }
+        //     },
+        //     py::call_guard<py::gil_scoped_release>())
         .def(
             "get_latest_events",
             [](tbk::BaseKVCacheManager& self, std::optional<double> timeout_ms = std::nullopt)
@@ -508,7 +544,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
                  std::vector<SizeType32> const&, std::optional<tbk::TempAttentionWindowInputs> const&,
                  nvinfer1::DataType, SizeType32, bool, int64_t, bool, bool, tbk::CacheType,
                  std::optional<tensorrt_llm::executor::RetentionPriority>, std::shared_ptr<tbk::KVCacheEventManager>,
-                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32>(),
+                 bool, bool, std::shared_ptr<tbc::KvCacheConnectorManager>, bool, SizeType32, SizeType32,
+                 std::optional<tbk::LinearAttentionMetadata>>(),
             py::arg("num_kv_heads_per_layer"), py::arg("size_per_head"), py::arg("tokens_per_block"),
             py::arg("blocks_per_window"), py::arg("max_num_sequences"), py::arg("max_beam_width"),
             py::arg("max_attention_window_vec"), py::arg("temp_attention_window_inputs"), py::arg("dtype"),
@@ -519,6 +556,7 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(py::module_& m)
             py::arg("enable_partial_reuse") = true, py::arg("copy_on_partial_reuse") = true,
             py::arg("kv_connector_manager") = nullptr, py::arg("enable_indexer_k_cache") = false,
             py::arg("indexer_k_cache_quant_block_size") = 128, py::arg("indexer_k_cache_index_head_dim") = 0,
+            py::arg("linear_attention_metadata") = std::nullopt,
             py::call_guard<py::gil_scoped_release>());
 }
 

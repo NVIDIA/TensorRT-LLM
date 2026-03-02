@@ -156,9 +156,9 @@ public:
     }
 
     SizeType32 copyBlockOffsets(tensorrt_llm::runtime::ITensor& output, SizeType32 outputSlotOffset,
-        tb::LlmRequest::RequestIdType requestId) const override
+        tb::LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override
     {
-        NB_OVERRIDE_PURE(copyBlockOffsets, output, outputSlotOffset, requestId);
+        NB_OVERRIDE_PURE(copyBlockOffsets, output, outputSlotOffset, requestId, windowSize);
     }
 
     bool isEnableBlockReuse() const override
@@ -432,6 +432,14 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             },
             nb::call_guard<nb::gil_scoped_release>())
         .def(
+            "get_recurrent_states_pool",
+            [](tbk::BaseKVCacheManager& self) -> at::Tensor
+            {
+                auto const& pool = self.getBlockManager().getRecurrentStatesPool();
+                return tr::Torch::tensor(pool.primaryPtr);
+            },
+            nb::call_guard<nb::gil_scoped_release>())
+        .def(
             "get_indexer_k_cache_pool_data",
             [](tbk::BaseKVCacheManager& self, SizeType32 layer_idx) -> at::Tensor
             {
@@ -477,6 +485,20 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
                 }
             },
             nb::call_guard<nb::gil_scoped_release>())
+        //  .def(
+        //      "copy_linear_batch_block_offsets",
+        //      [](tbk::BaseKVCacheManager& self, at::Tensor output,
+        //          std::vector<tb::LlmRequest::RequestIdType> const& requestIds, SizeType32 const beamWidth,
+        //          SizeType32 const offset)
+        //      {
+        //          auto _output = from_torch(output);
+        //          TLLM_CHECK_WITH_INFO(_output.has_value(), "Invalid output tensor.");
+        //          for (size_t i = 0; i < requestIds.size(); ++i)
+        //          {
+        //              self.copyBlockOffsets(*(_output.value()), i * beamWidth + offset, requestIds[i], LinearAttentionMetadata::kRecurrentStates);
+        //          }
+        //      },
+        //      nb::call_guard<nb::gil_scoped_release>())
         .def(
             "get_latest_events",
             [](tbk::BaseKVCacheManager& self, std::optional<double> timeout_ms = std::nullopt)

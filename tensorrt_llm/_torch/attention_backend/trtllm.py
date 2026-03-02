@@ -1536,6 +1536,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             sparse_attn_indices_block_size = self.sparse_attention_config.get_indices_block_size(
             )
 
+        # print(f"local_layer_idx: {self.get_local_layer_idx(metadata)}")
+        # print(f"metadata.host_kv_cache_pool_pointers: {metadata.host_kv_cache_pool_pointers}")
+        # print(f"metadata.host_kv_cache_pool_mapping: {metadata.host_kv_cache_pool_mapping}")
         self.wrapper.plan(
             layer_idx=self.get_local_layer_idx(metadata),
             tokens_per_block=metadata.tokens_per_block,

@@ -169,6 +169,39 @@ def input_guard(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
 contiguous = input_guard
 
 
+def input_guard_exclude(exclude_args: list[str]):
+    def decorator(fn: Callable[..., torch.Tensor]) -> Callable[..., torch.Tensor]:
+        @functools.wraps(fn)
+        def wrapper(*args, **kwargs):
+            contiguous_args = (i if (not isinstance(i, torch.Tensor) or i in exclude_args) else
+                            i.contiguous() for i in args)
+            contiguous_kwargs = {
+                k: (v if (not isinstance(v, torch.Tensor) or k in exclude_args) else v.contiguous())
+                for k, v in kwargs.items()
+            }
+
+            tensor = None
+            for arg in args:
+                if isinstance(arg, torch.Tensor):
+                    tensor = arg
+                    break
+            if tensor is None:
+                for value in kwargs.values():
+                    if isinstance(value, torch.Tensor):
+                        tensor = value
+                        break
+
+            if tensor is not None:
+                ctx = custom_device_ctx(tensor.device.index)
+            else:
+                ctx = contextlib.nullcontext()
+
+            with ctx:
+                return fn(*contiguous_args, **contiguous_kwargs)
+
+        return wrapper
+    return decorator
+
 def require_version(version, hint):
     """
     Perform a runtime check of the dependency versions, using the exact same syntax used by pip.

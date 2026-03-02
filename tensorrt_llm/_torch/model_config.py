@@ -615,7 +615,7 @@ class ModelConfig(Generic[TConfig]):
     def get_num_attention_layers(self):
         if is_nemotron_hybrid(self.pretrained_config):
             return self.pretrained_config.hybrid_override_pattern.count("*")
-        elif hasattr(
+        elif os.environ.get("AAAA") in ["1", "2"] and hasattr(
                 self.pretrained_config, "architectures"
         ) and self.pretrained_config.architectures is not None and self.pretrained_config.architectures[
                 0] in ["Qwen3NextForCausalLM"]:

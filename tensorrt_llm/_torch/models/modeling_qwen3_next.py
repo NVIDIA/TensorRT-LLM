@@ -389,6 +389,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         self.allreduce = AllReduce(mapping=model_config.mapping,
                                    strategy=model_config.allreduce_strategy)
         self.aux_stream = aux_stream
+        self.layer_idx = layer_idx
 
         self.gate = Qwen3NextGate(
             hidden_size=self.hidden_dim,
@@ -466,7 +467,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 use_dp_padding=use_dp_padding,
                 do_finalize=do_finalize,
             )
-            return final_hidden_states
+            return router_logits, final_hidden_states
 
         def _compute_shared_output():
             shared_expert_output = self.shared_expert(hidden_states)
@@ -474,7 +475,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
                 self.shared_expert_gate(hidden_states)) * shared_expert_output
             return shared_expert_output
 
-        final_hidden_states, shared_expert_output = maybe_execute_in_parallel(
+        routed_output, shared_expert_output = maybe_execute_in_parallel(
             _compute_routed_output,
             _compute_shared_output,
             self.event_dict[EventType.Main],
@@ -482,9 +483,26 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             self.aux_stream,
         )
         if not do_finalize:
-            return final_hidden_states
+            return routed_output[0]
+        
+        router_logits, routed_output = routed_output
 
-        final_hidden_states = final_hidden_states + shared_expert_output
+        final_hidden_states = routed_output + shared_expert_output
+
+        # dump_dir = os.environ.get("AAAA")
+        # torch.cuda.synchronize()
+        # if dump_dir is not None and self.layer_idx <= 2:
+        #     os.makedirs(dump_dir, exist_ok=True)
+        #     nt = attn_metadata.num_tokens
+        #     torch.save(router_logits, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_router_logits.pt"))
+        #     torch.save(routed_output, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_routed_output.pt"))
+        #     torch.save(shared_expert_output, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_shared_expert_output.pt"))
+        #     torch.save(final_hidden_states, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_final_mlp_states.pt"))
+        #     torch.save(self.experts.w3_w1_weight, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_w3_w1_weight.pt"))
+        #     torch.save(self.experts.w2_weight, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_w2_weight.pt"))
+        #     torch.save(self.experts.w3_w1_bias, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_w3_w1_bias.pt"))
+        #     torch.save(self.experts.w2_bias, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_w2_bias.pt"))
+
 
         if not self.enable_attention_dp and self.mapping.tp_size > 1:
             final_hidden_states = self.allreduce(
@@ -841,7 +859,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         query_start_loc = torch.arange(0,
                                        num_decodes + 1,
                                        device=cu_seqlens.device).to(torch.long)
-
+        # dump_dir = os.environ.get("AAAA")
+        # if dump_dir is not None and self.layer_idx <= 2:
+        #     torch.cuda.synchronize()
+        #     torch.save(conv_states[cache_indices[0]].clone(), os.path.join(dump_dir, f"nt{num_decodes}_layer{self.layer_idx}_conv_states_before.pt"))
+        #     torch.save(ssm_states[cache_indices[0]].clone(), os.path.join(dump_dir, f"nt{num_decodes}_layer{self.layer_idx}_ssm_states_before.pt"))
         mixed_qkv = causal_conv1d_update(
             mixed_qkv,
             conv_states,
@@ -850,6 +872,9 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             self.activation,
             conv_state_indices=cache_indices,
         )
+
+        # torch.cuda.synchronize()
+        # print(f"Layer {self.layer_idx} mixed_qkv: {hex(mixed_qkv.data_ptr())} \n{mixed_qkv[0:3, 0:5]}")
 
         # Direct slicing instead of torch.split for better performance
         key_size = self.key_dim // self.attn_tp_size
@@ -878,7 +903,15 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             use_qk_l2norm_in_kernel=True,
             softplus_beta=1.0,
             softplus_threshold=20.0,
+            layer_idx=self.layer_idx,
         )
+        # print(f"Layer {self.layer_idx} core_attn_out: {hex(core_attn_out.data_ptr())} \n{core_attn_out[0:3, 0:5]}")
+
+        # if dump_dir is not None and self.layer_idx <= 2:
+        #     torch.cuda.synchronize()
+        #     torch.save(conv_states[cache_indices[0]].clone(), os.path.join(dump_dir, f"nt{num_decodes}_layer{self.layer_idx}_conv_states_after.pt"))
+        #     torch.save(ssm_states[cache_indices[0]].clone(), os.path.join(dump_dir, f"nt{num_decodes}_layer{self.layer_idx}_ssm_states_after.pt"))
+
 
         return core_attn_out
 
@@ -943,6 +976,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                 cache_indices=cache_indices,
                 query_start_loc=query_start_loc).transpose(0, 1)
 
+        # print(f"EXTEND Layer {self.layer_idx} mixed_qkv: {hex(mixed_qkv.data_ptr())} \n{mixed_qkv[0:3, 0:5]}")
         key_split_dim = self.key_dim // self.attn_tp_size
         value_split_dim = self.value_dim // self.attn_tp_size
 
@@ -996,6 +1030,7 @@ class Qwen3NextGatedDeltaNet(nn.Module):
         last_recurrent_state = last_recurrent_state.to(ssm_states.dtype,
                                                        copy=False)
         ssm_states[cache_indices] = last_recurrent_state
+        # print(f"PREFILL Layer {self.layer_idx} core_attn_out: {hex(core_attn_out.data_ptr())} \n{core_attn_out[0:3, 0:5]}")
 
         return core_attn_out
 
@@ -1037,6 +1072,11 @@ class Qwen3NextGatedDeltaNet(nn.Module):
             ssm_states[state_indices_p] = 0
             # conv_states[state_indices_p] = 0 # not necessary
 
+        # if self.layer_idx == 0:
+        #     print(f"state_indices_d: {state_indices_d}")
+        #     print(f"ssm_states for decode req: {ssm_states[state_indices_d]}")
+        #     print(f"stride of ssm_states: {ssm_states.stride()}")
+        #     print(f"stride of conv_states: {conv_states.stride()}")
         def _compute_projected_states_qkvz():
             return self.in_proj_qkvz(hidden_states)
 
@@ -1069,6 +1109,16 @@ class Qwen3NextGatedDeltaNet(nn.Module):
                                     (query, key, value))
             mixed_qkv = torch.cat((query, key, value), dim=-1)
 
+        # print(f"Layer {self.layer_idx} original mixed_qkv: {hex(mixed_qkv.data_ptr())} \n{mixed_qkv[0:3, 0:5]}")
+        # dump_dir = os.environ.get("AAAA")
+        # torch.cuda.synchronize()
+        # if dump_dir is not None and self.layer_idx <= 2:
+        #     os.makedirs(dump_dir, exist_ok=True)
+        #     nt = attn_metadata.num_tokens
+        #     torch.save(hidden_states, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_hidden_states.pt"))
+        #     torch.save(projected_states_qkvz, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_projected_states_qkvz.pt"))
+        #     torch.save(projected_states_ba, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_projected_states_ba.pt"))
+        #     torch.save(mixed_qkv, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_mixed_qkv.pt"))
         kwargs = {
             "mixed_qkv": mixed_qkv,
             "a": a,
@@ -1203,6 +1253,7 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
                            and self.fusion_config.POST_MOE_FUSION
                            and self.model_config.moe_backend == 'TRTLLM'
                            and self.mlp.experts.has_nvfp4)
+        # after_linear_attn = hidden_states.clone()
 
         hidden_states = self.mlp(
             hidden_states,
@@ -1250,6 +1301,13 @@ class Qwen3NextLinearDecoderLayer(nn.Module):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
+        # after_linear_attn_mlp = hidden_states.clone()
+        # dump_dir = os.environ.get("AAAA")
+        # if dump_dir is not None and self.layer_idx <= 2:
+        #     os.makedirs(dump_dir, exist_ok=True)
+        #     nt = attn_metadata.num_tokens
+        #     torch.save(after_linear_attn, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_after_linear_attn.pt"))
+        #     torch.save(after_linear_attn_mlp, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_after_linear_attn_mlp.pt"))
         return hidden_states, residual
 
 
@@ -1331,8 +1389,9 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         if spec_metadata is not None and spec_metadata.is_layer_capture(
                 self.layer_idx):
             self.fusion_config.POST_MOE_FUSION = False
-
+        # layernorm = hidden_states.clone()
         # Self Attention
+        # print(f"host_kv_cache_block_offsets: {attn_metadata.host_kv_cache_block_offsets[:,0,:,0:8]}")
         hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
@@ -1341,7 +1400,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                 enable_allreduce=not self.disable_attn_allreduce),
             **kwargs,
         )
-
+        # after_attention = hidden_states.clone()
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(
                 hidden_states,
@@ -1410,7 +1469,15 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             if self.next_layer_layernorm is not None:
                 hidden_states, residual = self.next_layer_layernorm(
                     hidden_states, residual)
-
+        # after_mlp = hidden_states.clone()
+        # dump_dir = os.environ.get("AAAA")
+        # torch.cuda.synchronize()
+        # if dump_dir is not None and self.layer_idx <= 5:
+        #     os.makedirs(dump_dir, exist_ok=True)
+        #     nt = attn_metadata.num_tokens
+        #     torch.save(layernorm, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_layernorm.pt"))
+        #     torch.save(after_attention, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_after_attention.pt"))
+        #     torch.save(after_mlp, os.path.join(dump_dir, f"nt{nt}_layer{self.layer_idx}_after_mlp.pt"))
         return hidden_states, residual
 
 
