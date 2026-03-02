@@ -1550,9 +1550,11 @@ class PyExecutor:
 
     def _handle_executed_batch(self, executed_batch: Optional[BatchStatePP]):
         finished_requests = []
+        context_requests_chunking = []
         if executed_batch is not None:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
                 sample_state = executed_batch.sample_state
+                context_requests_chunking = sample_state.scheduled_requests.context_requests_chunking
                 sample_state.scheduled_requests.context_requests_chunking = []
                 self._update_requests(executed_batch.sample_state)
                 if self.kv_cache_transceiver:
@@ -1582,7 +1584,7 @@ class PyExecutor:
 
         if self.enable_iter_perf_stats and executed_batch is not None:
             sample_state = executed_batch.sample_state
-            sample_state.scheduled_requests.context_requests_chunking = executed_batch.scheduled_requests.context_requests_chunking
+            sample_state.scheduled_requests.context_requests_chunking = context_requests_chunking
             self._process_iter_stats(
                 finished_requests,
                 self.active_requests,
