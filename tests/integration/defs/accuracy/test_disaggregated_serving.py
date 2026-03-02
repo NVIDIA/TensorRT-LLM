@@ -1622,13 +1622,12 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
     MODEL_NAME = "nvidia/NVIDIA-Nemotron-3-Super-120B-012726"
     MODEL_PATH = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-FP8-FP8KV-012726"
 
-    @pytest.mark.skip_less_device(8)
-    def test_auto_dtype(self):
+    def _make_configs(self, backend: str):
         ctx_server_config = {
             "max_batch_size": 32,
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": backend,
                 "max_tokens_in_buffer": 8192,
             },
             "tensor_parallel_size": 4,
@@ -1647,7 +1646,7 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
             "max_batch_size": 32,
             "disable_overlap_scheduler": False,
             "cache_transceiver_config": {
-                "backend": "UCX",
+                "backend": backend,
                 "max_tokens_in_buffer": 8192,
             },
             "tensor_parallel_size": 2,
@@ -1680,7 +1679,18 @@ class TestNemotron3Super120B(LlmapiAccuracyTestHarness):
                 "urls": ["localhost:8002"]
             }
         }
-        with launch_disaggregated_llm(disaggregated_server_config,
-                                      ctx_server_config, gen_server_config,
+        return ctx_server_config, gen_server_config, disaggregated_server_config
+
+    @pytest.mark.skip_less_device(8)
+    def test_auto_dtype(self):
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("UCX")
+        with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
+                                      self.MODEL_PATH) as llm:
+            run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
+
+    @pytest.mark.skip_less_device(8)
+    def test_nixl_backend(self):
+        ctx_cfg, gen_cfg, disagg_cfg = self._make_configs("NIXL")
+        with launch_disaggregated_llm(disagg_cfg, ctx_cfg, gen_cfg,
                                       self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])

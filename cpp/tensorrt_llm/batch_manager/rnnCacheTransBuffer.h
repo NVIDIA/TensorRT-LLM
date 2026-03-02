@@ -55,8 +55,10 @@ public:
         return mRnnStateManager;
     }
 
-    /// @brief set dtypes
-    // void setDtypes(RnnCacheState const& cacheState) noexcept;
+    [[nodiscard]] BufferKind getBufferKind() const override
+    {
+        return BufferKind::kRNN;
+    }
 
 private:
     /// @brief Compute transfer buffer size from RNN state configuration.
