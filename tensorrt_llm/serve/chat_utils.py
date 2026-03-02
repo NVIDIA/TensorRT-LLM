@@ -277,21 +277,28 @@ def parse_chat_messages_coroutines(
     mm_placeholder_counts = []
     mm_data_tracker = MultimodalDataTracker(model_config.model_type,
                                             multimodal_server_config)
-
     for msg in messages:
         parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
         conversation.append(parsed_msg)
+
+        # Track placeholders added for this message only.
+        msg_placeholder_counts = {}
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
-                mm_data_tracker.add_data(mdata["modality"],
-                                         mdata["data"],
-                                         is_embedding=mdata["is_embedding"])
-        mm_placeholder_count = mm_data_tracker.placeholder_counts()
-        if mm_placeholder_count:
+                placeholder = mm_data_tracker.add_data(
+                    mdata["modality"],
+                    mdata["data"],
+                    is_embedding=mdata["is_embedding"])
+                if placeholder:
+                    msg_placeholder_counts[
+                        placeholder] = msg_placeholder_counts.get(
+                            placeholder, 0) + 1
+
+        if msg_placeholder_counts:
             parsed_msg["content"] = add_multimodal_placeholders(
                 model_config.model_type, parsed_msg["content"],
-                mm_placeholder_count)
-        mm_placeholder_counts.append(mm_placeholder_count)
+                msg_placeholder_counts)
+        mm_placeholder_counts.append(msg_placeholder_counts)
 
     return conversation, mm_data_tracker.retrieve_all_async(
     ), mm_placeholder_counts

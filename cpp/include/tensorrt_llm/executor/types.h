@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <functional>
@@ -69,6 +70,29 @@ using MedusaChoices = std::vector<std::vector<SizeType32>>;
 using EagleChoices = std::vector<std::vector<SizeType32>>;
 using PriorityType = float;
 using BufferView = std::basic_string_view<uint8_t>;
+
+//! MmKey is used in KVCacheBlock when multimodal data presents in a block.
+//! Hash is a 32-byte array; startOffset is the per-block token offset; uuid is optional.
+struct MmKey
+{
+    std::array<uint8_t, 32> hash;
+    SizeType32 startOffset{};
+    std::optional<std::string> uuid{std::nullopt};
+
+    MmKey() = default;
+
+    MmKey(std::array<uint8_t, 32> hash, SizeType32 startOffset, std::optional<std::string> uuid = std::nullopt)
+        : hash(std::move(hash))
+        , startOffset(startOffset)
+        , uuid(std::move(uuid))
+    {
+    }
+
+    bool operator==(MmKey const& other) const noexcept
+    {
+        return hash == other.hash && startOffset == other.startOffset && uuid == other.uuid;
+    }
+};
 
 enum class DataType
 {

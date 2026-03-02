@@ -3,6 +3,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.disagg_utils import DisaggServerConfig
 from tensorrt_llm.serve.openai_disagg_service import OpenAIDisaggregatedService
 from tensorrt_llm.serve.openai_protocol import (
@@ -12,6 +13,8 @@ from tensorrt_llm.serve.openai_protocol import (
     DisaggregatedParams,
     DisaggScheduleStyle,
     UsageInfo,
+    _deserialize_first_gen_log_probs,
+    _serialize_first_gen_log_probs,
 )
 from tensorrt_llm.serve.router import Router
 
@@ -151,3 +154,69 @@ async def test_send_disagg_request(monkeypatch, stream, schedule_style):
                 result.choices[0].disaggregated_params.disagg_request_id
                 == ctx_req.disaggregated_params.disagg_request_id
             )
+
+
+class TestFirstGenLogProbsSerializeRoundtrip:
+    """Roundtrip tests for _serialize/_deserialize_first_gen_log_probs."""
+
+    def test_none_passthrough(self):
+        assert _serialize_first_gen_log_probs(None) is None
+        assert _deserialize_first_gen_log_probs(None) is None
+
+    def test_single_token_roundtrip(self):
+        original = [{10: Logprob(logprob=-0.5, rank=1)}]
+        serialized = _serialize_first_gen_log_probs(original)
+        recovered = _deserialize_first_gen_log_probs(serialized)
+        assert len(recovered) == len(original)
+        for orig_pos, rec_pos in zip(original, recovered):
+            assert set(orig_pos.keys()) == set(rec_pos.keys())
+            for tid in orig_pos:
+                assert rec_pos[tid].logprob == orig_pos[tid].logprob
+                assert rec_pos[tid].rank == orig_pos[tid].rank
+
+    def test_multi_token_topk_roundtrip(self):
+        original = [
+            {
+                100: Logprob(logprob=-0.1, rank=1),
+                200: Logprob(logprob=-2.3, rank=2),
+                300: Logprob(logprob=-5.0, rank=3),
+            },
+            {
+                400: Logprob(logprob=-0.05, rank=1),
+                500: Logprob(logprob=-3.7, rank=2),
+            },
+        ]
+        serialized = _serialize_first_gen_log_probs(original)
+        recovered = _deserialize_first_gen_log_probs(serialized)
+        assert len(recovered) == len(original)
+        for orig_pos, rec_pos in zip(original, recovered):
+            assert set(orig_pos.keys()) == set(rec_pos.keys())
+            for tid in orig_pos:
+                assert rec_pos[tid].logprob == pytest.approx(orig_pos[tid].logprob)
+                assert rec_pos[tid].rank == orig_pos[tid].rank
+
+    def test_rank_none_preserved(self):
+        original = [{42: Logprob(logprob=-1.0, rank=None)}]
+        recovered = _deserialize_first_gen_log_probs(_serialize_first_gen_log_probs(original))
+        assert recovered[0][42].rank is None
+
+    def test_empty_list_roundtrip(self):
+        original = []
+        recovered = _deserialize_first_gen_log_probs(_serialize_first_gen_log_probs(original))
+        assert recovered == []
+
+    def test_serialize_rejects_non_list(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            _serialize_first_gen_log_probs("bad")
+
+    def test_serialize_rejects_non_dict_entry(self):
+        with pytest.raises(ValueError, match="must be a dict"):
+            _serialize_first_gen_log_probs(["not_a_dict"])
+
+    def test_deserialize_rejects_non_list_entry(self):
+        with pytest.raises(ValueError, match="must be a list"):
+            _deserialize_first_gen_log_probs(["not_a_list"])
+
+    def test_deserialize_rejects_missing_keys(self):
+        with pytest.raises(ValueError, match="missing required keys"):
+            _deserialize_first_gen_log_probs([[{"token_id": 1}]])

@@ -130,7 +130,6 @@ std::tuple<std::vector<runtime::ITensor::SharedPtr>, size_t, bool> BaseTransBuff
         size_t preBufferEleSize = 0;
         for (int i = 0; i < targetNum; i++)
         {
-            // Strict checking.
             if (preBufferEleSize + requestedNumberOfElements[i] <= mNumberOfElements)
             {
                 auto slice = runtime::ITensor::slice(

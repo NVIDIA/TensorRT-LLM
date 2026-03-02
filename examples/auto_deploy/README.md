@@ -1,6 +1,6 @@
 # 🔥🚀⚡ AutoDeploy Examples
 
-This folder contains runnable examples for **AutoDeploy**. For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/torch/auto_deploy/auto-deploy.html).
+This folder contains runnable examples for **AutoDeploy**. For general AutoDeploy documentation, motivation, support matrix, and feature overview, please see the [official docs](https://nvidia.github.io/TensorRT-LLM/features/auto_deploy/auto-deploy.html).
 
 ______________________________________________________________________
 
@@ -123,7 +123,7 @@ llm = LLM(
     world_size=<DESIRED_WORLD_SIZE>,
     compile_backend="torch-compile",
     model_kwargs={"num_hidden_layers": 2}, # test with smaller model configuration
-    attn_backend="flashinfer", # choose between "triton" and "flashinfer"
+    attn_backend="flashinfer", # choose between "triton", "trtllm" and "flashinfer"
     skip_loading_weights=False,
     model_factory="AutoModelForCausalLM", # choose appropriate model factory
     max_seq_len=<MAX_SEQ_LEN>,

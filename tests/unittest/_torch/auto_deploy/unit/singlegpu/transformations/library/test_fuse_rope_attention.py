@@ -23,8 +23,8 @@ import torch
 from torch.export import Dim
 
 # Import modules to register custom ops (torch.ops.auto_deploy.*)
-import tensorrt_llm._torch.auto_deploy.custom_ops.torch_attention  # noqa: F401
-import tensorrt_llm._torch.auto_deploy.custom_ops.torch_rope  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.attention.torch_attention  # noqa: F401
+import tensorrt_llm._torch.auto_deploy.custom_ops.rope.torch_rope  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 

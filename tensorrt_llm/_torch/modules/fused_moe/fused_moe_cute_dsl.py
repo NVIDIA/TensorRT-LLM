@@ -1,10 +1,26 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import math
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import torch.nn.functional as F
 
-from tensorrt_llm._utils import is_sm_100f
+from tensorrt_llm._utils import get_sm_version, is_sm_100f
+from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 from ...autotuner import (AutoTuner, ConstraintSpec, DynamicTensorSpec,
                           OptimizationProfile, TunableRunner, TuningConfig)
@@ -312,6 +328,69 @@ class CuteDslFusedMoE(CutlassFusedMoE):
         model_config (ModelConfig): Configuration object for the model.
     """
 
+    @classmethod
+    def can_implement(
+        cls,
+        quant_algo: Optional[QuantAlgo],
+        dtype_activation: torch.dtype = torch.bfloat16,
+        swiglu_gptoss_style: bool = False,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Check if CuteDslFusedMoE can implement the given quantization algorithm.
+
+        CuteDslFusedMoE supports:
+        - NVFP4: SM in {100, 103}
+
+        Does NOT support unquantized mode. Output dtype is hardcoded to bfloat16.
+        Does NOT support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit).
+
+        Args:
+            quant_algo: The quantization algorithm to check (None for unquantized)
+            dtype_activation: The activation input data type. Only bfloat16 is supported
+                because output dtype is hardcoded to bfloat16 (input/output dtype must match).
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                CuteDslFusedMoE does NOT support swiglu_gptoss_style.
+
+        Returns:
+            Tuple[bool, Optional[str]]: (can_implement, skip_reason)
+        """
+        from .interface import _warn_and_return
+
+        sm_version = get_sm_version()
+
+        # CuteDslFusedMoE requires at least SM90
+        if sm_version < 90:
+            return _warn_and_return(
+                f"CuteDslFusedMoE requires SM >= 90, got SM{sm_version}")
+
+        # Check dtype_activation: output is hardcoded to bfloat16, so input must also be bfloat16
+        # to maintain input/output dtype consistency
+        if dtype_activation != torch.bfloat16:
+            return _warn_and_return(
+                f"CuteDslFusedMoE only supports bfloat16 activation (output is hardcoded to bfloat16), "
+                f"got {dtype_activation}")
+
+        # CuteDslFusedMoE does NOT support unquantized mode
+        if quant_algo is None:
+            return _warn_and_return(
+                "CuteDslFusedMoE does not support unquantized mode")
+
+        # CuteDslFusedMoE does NOT support swiglu_gptoss_style
+        if swiglu_gptoss_style:
+            return _warn_and_return(
+                "CuteDslFusedMoE does not support swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit)"
+            )
+
+        # NVFP4 - SM in {100, 103}
+        if quant_algo == QuantAlgo.NVFP4:
+            if sm_version not in {100, 103}:
+                return _warn_and_return(
+                    f"NVFP4 requires SM100 or SM103, got SM{sm_version}")
+            return True, None
+
+        return _warn_and_return(
+            f"CuteDslFusedMoE does not support quant_algo={quant_algo}")
+
     def __init__(
         self,
         *,
@@ -618,6 +697,10 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             b_sf=self.quant_scales[1],
             offset_array=expert_first_token_offset,
         )
+        top_k = self.routing_method.top_k
+        if token_selected_experts is not None:
+            top_k = token_selected_experts.shape[-1]
+
         x = torch.ops.trtllm.moe_finalize_scale_op(
             x,
             None,  # biases
@@ -630,7 +713,7 @@ class CuteDslFusedMoE(CutlassFusedMoE):
             token_final_scales.size(0),  # num_rows
             self.hidden_size,  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
+            top_k,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
             self.tp_rank,

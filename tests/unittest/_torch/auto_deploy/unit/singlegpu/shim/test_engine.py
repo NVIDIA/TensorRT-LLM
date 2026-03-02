@@ -249,6 +249,13 @@ class _DummyHybridKVCacheManager:
         self.mamba_cache_free_blocks = num_slots
 
     def get_cache_indices(self, request):
+        # For generation requests (which have max_beam_num_tokens), return the
+        # correct number of blocks since ADEngine no longer truncates for them.
+        # For context requests, return many dummy page IDs; ADEngine truncates.
+        num_tokens = getattr(request, "max_beam_num_tokens", None)
+        if num_tokens is not None:
+            num_blocks = self.get_num_kv_blocks(num_tokens)
+            return list(range(num_blocks))
         return list(range(1024))
 
     def get_num_kv_blocks(self, num_tokens: int) -> int:

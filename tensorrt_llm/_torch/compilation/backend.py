@@ -78,6 +78,9 @@ class Backend:
                 )
                 register_ar_fusions(cls._custom_pass_instances, mapping,
                                     ub_enabled)
+                # Fallback: fuse remaining add+rmsnorm not preceded by allreduce
+                cls._custom_pass_instances.append(PatternMatcherPass())
+                register_add_norm(cls._custom_pass_instances[-1])
             else:
                 register_add_norm(cls._custom_pass_instances[0])
         return cls._custom_pass_instances

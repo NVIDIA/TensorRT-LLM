@@ -37,6 +37,7 @@ struct GeneralFP4AddBiasResidualPreLayerNormParam
     T const* bias = nullptr;
     T const* gamma = nullptr;
     T const* beta = nullptr;
+    T* high_precision_normed_output = nullptr;
 
     int m;
     int n;

@@ -1,4 +1,5 @@
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -6,6 +7,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc128.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -13,6 +15,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc16.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -20,6 +23,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc256.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -27,6 +31,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc32.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -34,6 +39,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc4.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -41,6 +47,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc64.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -48,6 +55,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp4_conc8.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -55,6 +63,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc128.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -62,6 +71,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -69,6 +79,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc256.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -76,6 +87,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -83,6 +95,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -90,6 +103,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -97,6 +111,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/1k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -104,6 +119,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc128.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -111,6 +127,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc16.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -118,6 +135,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc256.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -125,6 +143,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc32.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -132,6 +151,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc4.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -139,6 +159,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc64.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -146,6 +167,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp4_conc8.yaml
   num_gpus: 4
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -153,6 +175,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc128.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -160,6 +183,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -167,6 +191,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc256.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -174,6 +199,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -181,6 +207,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -188,6 +215,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: nvidia/DeepSeek-R1-0528-FP4-v2
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -195,6 +223,7 @@
   config_path: examples/configs/database/nvidia/DeepSeek-R1-0528-FP4-v2/B200/8k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -202,6 +231,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -209,6 +239,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -216,6 +247,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -223,6 +255,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -230,6 +263,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/1k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -237,6 +271,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -244,6 +279,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -251,6 +287,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -258,6 +295,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -265,6 +303,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/B200/8k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -272,6 +311,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -279,6 +319,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -286,6 +327,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -293,6 +335,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -300,6 +343,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/1k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -307,6 +351,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -314,6 +359,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -321,6 +367,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -328,6 +375,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: deepseek-ai/DeepSeek-R1-0528
+  arch: DeepseekV3ForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -335,6 +383,7 @@
   config_path: examples/configs/database/deepseek-ai/DeepSeek-R1-0528/H200/8k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -342,6 +391,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc16.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -349,6 +399,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc32.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -356,6 +407,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc4.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -363,6 +415,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc64.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -370,6 +423,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp1_conc8.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -377,6 +431,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc16.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -384,6 +439,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc32.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -391,6 +447,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc4.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -398,6 +455,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc64.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -405,6 +463,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp2_conc8.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -412,6 +471,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc16.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -419,6 +479,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc32.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -426,6 +487,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc4.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -433,6 +495,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc64.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -440,6 +503,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp4_conc8.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -447,6 +511,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -454,6 +519,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -461,6 +527,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -468,6 +535,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 1024
@@ -475,6 +543,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -482,6 +551,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp1_conc16.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -489,6 +559,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp1_conc32.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -496,6 +567,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp1_conc4.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -503,6 +575,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp1_conc64.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -510,6 +583,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp1_conc8.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -517,6 +591,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc16.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -524,6 +599,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc32.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -531,6 +607,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc4.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -538,6 +615,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc64.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -545,6 +623,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp2_conc8.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -552,6 +631,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc16.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -559,6 +639,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc32.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -566,6 +647,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc4.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -573,6 +655,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc64.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -580,6 +663,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp4_conc8.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -587,6 +671,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc16.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -594,6 +679,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc32.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -601,6 +687,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc4.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -608,6 +695,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc64.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 1024
   osl: 8192
@@ -615,6 +703,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/1k8k_tp8_conc8.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -622,6 +711,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc16.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -629,6 +719,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc32.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -636,6 +727,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc4.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -643,6 +735,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc64.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -650,6 +743,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp1_conc8.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -657,6 +751,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc16.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -664,6 +759,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc32.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -671,6 +767,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc4.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -678,6 +775,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc64.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -685,6 +783,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp2_conc8.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -692,6 +791,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc16.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -699,6 +799,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc32.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -706,6 +807,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc4.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -713,6 +815,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc64.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -720,6 +823,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp4_conc8.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -727,6 +831,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -734,6 +839,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -741,6 +847,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -748,6 +855,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: B200_NVL
   isl: 8192
   osl: 1024
@@ -755,6 +863,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/B200/8k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -762,6 +871,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc16.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -769,6 +879,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc32.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -776,6 +887,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc4.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -783,6 +895,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc64.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -790,6 +903,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp1_conc8.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -797,6 +911,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc16.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -804,6 +919,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc32.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -811,6 +927,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc4.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -818,6 +935,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc64.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -825,6 +943,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp2_conc8.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -832,6 +951,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc16.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -839,6 +959,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc32.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -846,6 +967,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc4.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -853,6 +975,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc64.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -860,6 +983,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp4_conc8.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -867,6 +991,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -874,6 +999,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -881,6 +1007,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -888,6 +1015,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 1024
@@ -895,6 +1023,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k1k_tp8_conc8.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -902,6 +1031,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp1_conc16.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -909,6 +1039,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp1_conc32.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -916,6 +1047,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp1_conc4.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -923,6 +1055,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp1_conc64.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -930,6 +1063,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp1_conc8.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -937,6 +1071,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp2_conc16.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -944,6 +1079,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp2_conc32.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -951,6 +1087,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp2_conc4.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -958,6 +1095,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp2_conc64.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -965,6 +1103,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp2_conc8.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -972,6 +1111,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc16.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -979,6 +1119,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc32.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -986,6 +1127,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc4.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -993,6 +1135,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc64.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -1000,6 +1143,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp4_conc8.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -1007,6 +1151,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc16.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -1014,6 +1159,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc32.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -1021,6 +1167,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc4.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -1028,6 +1175,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc64.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 1024
   osl: 8192
@@ -1035,6 +1183,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/1k8k_tp8_conc8.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1042,6 +1191,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc16.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1049,6 +1199,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc32.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1056,6 +1207,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc4.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1063,6 +1215,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc64.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1070,6 +1223,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp1_conc8.yaml
   num_gpus: 1
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1077,6 +1231,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc16.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1084,6 +1239,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc32.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1091,6 +1247,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc4.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1098,6 +1255,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc64.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1105,6 +1263,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp2_conc8.yaml
   num_gpus: 2
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1112,6 +1271,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc16.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1119,6 +1279,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc32.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1126,6 +1287,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc4.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1133,6 +1295,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc64.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1140,6 +1303,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp4_conc8.yaml
   num_gpus: 4
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1147,6 +1311,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc16.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1154,6 +1319,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc32.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1161,6 +1327,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc4.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024
@@ -1168,6 +1335,7 @@
   config_path: examples/configs/database/openai/gpt-oss-120b/H200/8k1k_tp8_conc64.yaml
   num_gpus: 8
 - model: openai/gpt-oss-120b
+  arch: GptOssForCausalLM
   gpu: H200_SXM
   isl: 8192
   osl: 1024

@@ -863,7 +863,7 @@ kv_cache_config:
 " >> ${path_config}
 ```
 
-For further details, please refer to [speculative-decoding.md](../../../../docs/source/advanced/speculative-decoding.md)
+For further details, please refer to [speculative-decoding.md](../../../../docs/source/legacy/advanced/speculative-decoding.md)
 
 ### Dynamo
 

@@ -14,7 +14,8 @@ dependencies = [
     "breathe (>=4.36.0,<5.0.0)",
     "sphinx-copybutton (>=0.5.2,<0.6.0)",
     "autodoc-pydantic (>=2.2.0,<3.0.0)",
-    "sphinx-togglebutton (>=0.4.4,<0.5.0)"
+    "sphinx-togglebutton (>=0.4.4,<0.5.0)",
+    "sphinxcontrib-mermaid (>=2.0.0,<3.0.0)"
 ]
 
 

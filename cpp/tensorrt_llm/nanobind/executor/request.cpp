@@ -305,22 +305,29 @@ void initRequestBindings(nb::module_& m)
         .def("__setstate__", loraConfigSetstate);
 
     auto multimodalInputGetstate = [](tle::MultimodalInput const& self)
-    { return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths()); };
+    {
+        return nb::make_tuple(self.getMultimodalHashes(), self.getMultimodalPositions(), self.getMultimodalLengths(),
+            self.getMultimodalUuids());
+    };
     auto multimodalInputSetstate = [](tle::MultimodalInput& multimodalInput, nb::tuple const& state)
     {
-        if (state.size() != 3)
+        if (state.size() != 4)
         {
             throw std::runtime_error("Invalid MultimodalInput state!");
         }
         new (&multimodalInput) tle::MultimodalInput(nb::cast<std::vector<std::vector<SizeType32>>>(state[0]),
-            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]));
+            nb::cast<std::vector<SizeType32>>(state[1]), nb::cast<std::vector<SizeType32>>(state[2]),
+            nb::cast<std::optional<std::vector<std::optional<std::string>>>>(state[3]));
     };
     nb::class_<tle::MultimodalInput>(m, "MultimodalInput")
-        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>>(),
-            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"))
+        .def(nb::init<std::vector<std::vector<SizeType32>>, std::vector<SizeType32>, std::vector<SizeType32>,
+                 std::optional<std::vector<std::optional<std::string>>>>(),
+            nb::arg("multimodal_hashes"), nb::arg("multimodal_positions"), nb::arg("multimodal_lengths"),
+            nb::arg("multimodal_uuids") = nb::none())
         .def_prop_ro("multimodal_hashes", &tle::MultimodalInput::getMultimodalHashes)
         .def_prop_ro("multimodal_positions", &tle::MultimodalInput::getMultimodalPositions)
         .def_prop_ro("multimodal_lengths", &tle::MultimodalInput::getMultimodalLengths)
+        .def_prop_ro("multimodal_uuids", &tle::MultimodalInput::getMultimodalUuids)
         .def("__getstate__", multimodalInputGetstate)
         .def("__setstate__", multimodalInputSetstate);
 
@@ -703,7 +710,7 @@ void initRequestBindings(nb::module_& m)
         nb::arg("guided_decoding_params") = nb::none(),
         nb::arg("language_adapter_uid") = nb::none(),
         nb::arg("allotted_time_ms") = nb::none(),
-        nb::arg("cache_salt_id") = nb::none(),
+                nb::arg("cache_salt_id") = nb::none(),
         nb::arg("disagg_request_id") = nb::none()
     )         // clang-format on
         .def_prop_ro("input_token_ids", &tle::Request::getInputTokenIds)

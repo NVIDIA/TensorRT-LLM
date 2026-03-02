@@ -4,7 +4,7 @@ In Transformer-based models, the KV (Key-Value) Cache is a mechanism used to opt
 Since KV Cache requires memory to store, it is also an important resource.
 In TensorRT LLM, KV Cache is managed by the `KVCacheManager`.
 
-For details of the TensorRT LLM `KVCacheManager` implementation see [KV Cache Management](../advanced/kv-cache-management.md).
+For details of the TensorRT LLM `KVCacheManager` implementation see [KV Cache Management](../legacy/advanced/kv-cache-management.md).
 
 ## KV Cache Manager Introduction
 
@@ -24,7 +24,7 @@ The interfaces from `BaseResourceManager` include:
   If KV Cache is organized in blocks and free space is available within a block, actual allocation may not occur.
 - **update_resources**: Called at the end of each step for the current batch to update allocated resources.
   For KV Cache, updates may not be necessary, so this function currently performs no operations.
-  If KV Cache reuse is supported in Python, updates like KV Cache Radix Tree management occurs here.
+  If KV Cache reuse is supported in Python, updates like KV Cache Radix Tree management occur here.
 - **free_resources**: Called when a request finishes to free the resources allocated for that request.
   For KV Cache, if reuse is not enabled, the KV Cache memory used by the request should be recycled.
   In the C++ binding implementation, this might involve calling the binding's `remove_sequence` method to free the KV Cache memory related to that request.
