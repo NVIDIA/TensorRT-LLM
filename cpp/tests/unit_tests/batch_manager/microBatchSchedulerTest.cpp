@@ -18,10 +18,13 @@
 #include <gmock/gmock.h>
 #include <gtest/gtest.h>
 
+#include "tensorrt_llm/batch_manager/capacityScheduler.h"
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/batch_manager/kvCacheManager.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
 #include "tensorrt_llm/batch_manager/microBatchScheduler.h"
 
+#include <numeric>
 #include <optional>
 
 using namespace tensorrt_llm::runtime;
@@ -794,6 +797,424 @@ TEST_F(MicroBatchSchedulerTest, DraftTokensGreaterThanChunkSize)
             EXPECT_EQ(newRequests.size(), 0);
         }
     }
+}
+
+TEST_F(MicroBatchSchedulerTest, ReusableTokensReduceComputeBudget)
+{
+    // Test that reusable tokens (set by the capacity scheduler as a side effect of
+    // getNeededBlocksOneStep / getRemainingBlocksToCompletion) allow more context
+    // requests to be scheduled within a tight maxNumTokens budget.
+    constexpr SizeType32 maxNumTokens = 20;
+    constexpr SizeType32 maxBatchSize = 4;
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler = std::make_shared<MicroBatchScheduler>();
+
+    constexpr int32_t maxNewTokens = 5;
+    constexpr int32_t promptLen = 20;
+
+    // Test 1: Without reusable tokens, only 1 request fits in the budget
+    // (20 context tokens == maxNumTokens, leaving no room for request 1)
+    {
+        RequestVector activeRequests;
+        activeRequests.push_back(createRequest(promptLen, maxNewTokens, 0));
+        activeRequests.push_back(createRequest(promptLen, maxNewTokens, 1));
+
+        ReqIdsSet inflightReqIds;
+        auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+        EXPECT_EQ(ctx.size(), 1) << "Without reuse, only 1 request fits (20 tokens = budget)";
+        EXPECT_EQ(gen.size(), 0);
+    }
+
+    // Test 2: With reusable tokens set on both requests, both fit.
+    // Each request has 15 reusable tokens -> compute cost = max(1, 20-15) = 5 per request.
+    // Total compute = 5 + 5 = 10 < 20 budget.
+    {
+        RequestVector activeRequests;
+        auto req0 = createRequest(promptLen, maxNewTokens, 0);
+        auto req1 = createRequest(promptLen, maxNewTokens, 1);
+        req0->setEstimatedReusableTokens(15);
+        req1->setEstimatedReusableTokens(15);
+        activeRequests.push_back(req0);
+        activeRequests.push_back(req1);
+
+        ReqIdsSet inflightReqIds;
+        auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+        EXPECT_EQ(ctx.size(), 2) << "With reuse (15 each), both fit: 5 + 5 = 10 compute < 20 budget";
+        EXPECT_EQ(gen.size(), 0);
+    }
+}
+
+TEST_F(MicroBatchSchedulerTest, ReusableTokensWithChunkedContextFCFS)
+{
+    // Test that reusable tokens are correctly accounted for in FCFS chunking:
+    // the reusable portion is "free" and doesn't consume the forward-pass compute budget.
+    constexpr SizeType32 maxNumTokens = 15;
+    constexpr SizeType32 maxBatchSize = 4;
+    constexpr SizeType32 chunkUnitSize = 5;
+    constexpr ContextChunkingPolicy ctxChunkPolicy{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED};
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler
+        = std::make_shared<MicroBatchScheduler>(ContextChunkingConfig{ctxChunkPolicy, chunkUnitSize}, std::nullopt);
+
+    constexpr int32_t maxNewTokens = 5;
+    constexpr int32_t promptLen = 20;
+
+    // Without reuse: 20 context tokens > 15 budget -> chunked to 15 tokens
+    {
+        RequestVector activeRequests;
+        activeRequests.push_back(createRequest(promptLen, maxNewTokens, 0));
+
+        ReqIdsSet inflightReqIds;
+        auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+        EXPECT_EQ(ctx.size(), 1);
+        EXPECT_EQ(ctx.at(0)->getContextChunkSize(), 15) << "Without reuse, chunked to 15 tokens";
+    }
+
+    // With 10 reusable tokens: compute = 20 - 10 = 10 < 15 budget -> full context fits
+    {
+        RequestVector activeRequests;
+        auto req0 = createRequest(promptLen, maxNewTokens, 0);
+        req0->setEstimatedReusableTokens(10);
+        activeRequests.push_back(req0);
+
+        ReqIdsSet inflightReqIds;
+        auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+        EXPECT_EQ(ctx.size(), 1);
+        EXPECT_EQ(ctx.at(0)->getContextChunkSize(), promptLen)
+            << "With 10 reusable tokens, full context fits (compute = 10 < 15)";
+    }
+}
+
+TEST_F(MicroBatchSchedulerTest, ReusableTokensZeroHasNoEffect)
+{
+    // Verify that zero reusable tokens (the default) produces identical scheduling
+    // to the original behavior — this guards against regressions.
+    constexpr SizeType32 maxNumTokens = 12;
+    constexpr SizeType32 maxBatchSize = 4;
+
+    mNumContexts = 1;
+    mContextRequests.resize(mNumContexts);
+    mMicroBatchScheduler = std::make_shared<MicroBatchScheduler>();
+
+    constexpr int32_t maxNewTokens = 10;
+    constexpr int32_t promptLen = 10;
+
+    RequestVector activeRequests;
+    auto req0 = createRequest(promptLen, maxNewTokens, 0);
+    auto req1 = createRequest(promptLen, maxNewTokens, 1);
+    // Explicitly set to 0 — same as default
+    req0->setEstimatedReusableTokens(0);
+    req1->setEstimatedReusableTokens(0);
+    activeRequests.push_back(req0);
+    activeRequests.push_back(req1);
+
+    ReqIdsSet inflightReqIds;
+    auto const [ctx, gen] = (*mMicroBatchScheduler)(activeRequests, inflightReqIds, maxBatchSize, maxNumTokens);
+    // 10 tokens fits, but 10 + 10 = 20 > 12, so only 1 context request scheduled
+    EXPECT_EQ(ctx.size(), 1);
+    EXPECT_EQ(gen.size(), 0);
+}
+
+////
+// Combined Capacity Scheduler + Micro Batch Scheduler tests.
+// These verify the end-to-end data flow: the capacity scheduler populates
+// estimatedReusableTokens on requests (via getNeededBlocksOneStep), then
+// the micro batch scheduler reads that value for compute budget decisions.
+////
+
+class CombinedSchedulerTest : public ::testing::Test
+{
+protected:
+    static std::shared_ptr<kv_cache_manager::KVCacheManager> createKvCacheManager(SizeType32 maxNumRequests,
+        SizeType32 tokensPerBlock, SizeType32 maxNumTokens, SizeType32 maxNumTokensPerSeq, bool enableReuse)
+    {
+        auto const maxNumBlocks = (maxNumTokens + tokensPerBlock - 1) / tokensPerBlock;
+        auto stream = std::make_shared<tensorrt_llm::runtime::CudaStream>();
+
+        using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
+        auto const blocksPerWindow = BlocksPerWindow{{maxNumTokensPerSeq, {maxNumBlocks, 0}}};
+
+        return std::make_shared<kv_cache_manager::KVCacheManager>(
+            /*numLayers=*/10, /*nbKvHeads=*/10, /*sizePerHead=*/1, tokensPerBlock, blocksPerWindow, maxNumRequests,
+            /*maxBeamWidth=*/1, std::vector<SizeType32>{maxNumTokensPerSeq}, std::nullopt, nvinfer1::DataType::kHALF,
+            /*sinkTokenLength=*/0, stream, maxNumTokensPerSeq, enableReuse, /*onboardBlocks=*/true);
+    }
+
+    static std::shared_ptr<LlmRequest> createRequestWithTokens(
+        std::shared_ptr<std::vector<int32_t>> inputTokens, int32_t maxNewTokens, uint64_t reqId)
+    {
+        tensorrt_llm::runtime::SamplingConfig samplingConfig;
+        return std::make_shared<LlmRequest>(reqId, maxNewTokens, inputTokens, samplingConfig, /*isStreaming=*/false);
+    }
+};
+
+TEST_F(CombinedSchedulerTest, CapacitySchedulerSetsReusableTokensForMicroBatch)
+{
+    // End-to-end flow:
+    // 1. Request 0 completes context → blocks stored in radix tree
+    // 2. Capacity scheduler (MAX_UTILIZATION) calls getNeededBlocksOneStep for request 1
+    //    → traverses radix tree, finds reusable blocks, sets estimatedReusableTokens
+    // 3. Micro batch scheduler reads estimatedReusableTokens → reduces compute cost →
+    //    request 1 fits in a tight token budget that wouldn't fit without reuse
+
+    constexpr SizeType32 tokensPerBlock = 10;
+    constexpr SizeType32 kvCacheMaxNumTokens = 100;
+    constexpr SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    constexpr SizeType32 maxNumRequests = 4;
+
+    auto kvCacheManager = createKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, /*enableReuse=*/true);
+
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, /*hasKvCacheManager=*/true);
+
+    auto microBatchScheduler = MicroBatchScheduler();
+
+    // promptLen = 30 → 3 blocks, 2 full blocks stored by storeContextBlocks
+    // (formula: (promptLen-1)/tokensPerBlock = 29/10 = 2) → estimatedReusableTokens = 20
+    constexpr int32_t promptLen = 30;
+    constexpr int32_t maxNewTokens = 5;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    auto req0 = createRequestWithTokens(inputTokens, maxNewTokens, 0);
+    auto req1 = createRequestWithTokens(inputTokens, maxNewTokens, 1);
+
+    // === Iteration 0: Schedule request 0, populate cache ===
+    RequestList activeList;
+    activeList.push_back(req0);
+    activeList.push_back(req1);
+
+    auto [scheduled0, disaggInit0, paused0]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+
+    // Request 0 should be scheduled
+    ASSERT_GE(scheduled0.size(), 1u);
+
+    // Process request 0: addSequence → complete context → store blocks
+    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    req0->moveToNextContextChunk();
+    kvCacheManager->storeContextBlocks(*req0);
+    req0->addNewTokens({0});
+    req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    kvCacheManager->addToken(req0->mRequestId);
+
+    // Handle paused requests (req1 deferred for reuse benefit)
+    for (auto const& req : paused0)
+    {
+        if (req->mRequestId != 0)
+        {
+            req->pause(/*maxInputLen=*/1000);
+        }
+    }
+
+    // === Iteration 1: Capacity scheduler sets estimatedReusableTokens on req1 ===
+    auto [scheduled1, disaggInit1, paused1]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+
+    // Verify estimatedReusableTokens was set on req1 by getNeededBlocksOneStep
+    EXPECT_EQ(req1->getEstimatedReusableTokens(), 20) << "2 full blocks (tokens 0-9, 10-19) reusable = 20 tokens";
+
+    // === Micro batch scheduler with tight budget ===
+    // Budget = 15. Without reuse: req1 = 30 tokens → doesn't fit alongside gen req0.
+    // With reuse: req1 compute = max(1, 30-20) = 10, plus req0 gen = 1, total = 11 < 15.
+    RequestVector microBatchActive;
+    for (auto& req : scheduled1)
+    {
+        microBatchActive.push_back(req);
+    }
+
+    constexpr SizeType32 maxNumTokensBudget = 15;
+    constexpr SizeType32 maxBatchSize = 4;
+    ReqIdsSet inflightReqIds;
+    auto [ctx, gen] = microBatchScheduler(microBatchActive, inflightReqIds, maxBatchSize, maxNumTokensBudget);
+
+    // Request 1 should be scheduled (context) thanks to reuse
+    bool req1InCtx = std::any_of(ctx.begin(), ctx.end(), [](auto const& r) { return r->mRequestId == 1; });
+    EXPECT_TRUE(req1InCtx) << "With 20 reusable tokens, req1 compute cost = 10 fits in 15 budget";
+
+    // Request 0 should be scheduled (generation)
+    bool req0InGen = std::any_of(gen.begin(), gen.end(), [](auto const& r) { return r->mRequestId == 0; });
+    EXPECT_TRUE(req0InGen) << "Request 0 (gen, 1 token) should be scheduled";
+
+    // === Compare: without reuse, req1 would NOT fit ===
+    auto req2 = createRequestWithTokens(inputTokens, maxNewTokens, 2);
+    req2->setEstimatedReusableTokens(0);
+
+    RequestVector noReuseActive;
+    noReuseActive.push_back(req0); // gen (1 token)
+    noReuseActive.push_back(req2); // ctx (30 tokens, no reuse)
+
+    ReqIdsSet inflightReqIds2;
+    auto [ctx2, gen2] = microBatchScheduler(noReuseActive, inflightReqIds2, maxBatchSize, maxNumTokensBudget);
+
+    // Without reuse: gen(1) + ctx(30) = 31 > 15 → req2 doesn't fit
+    bool req2InCtx = std::any_of(ctx2.begin(), ctx2.end(), [](auto const& r) { return r->mRequestId == 2; });
+    EXPECT_FALSE(req2InCtx) << "Without reuse, 30 context tokens + 1 gen token exceeds 15 budget";
+
+    kvCacheManager->removeSequence(req0->mRequestId, req0);
+}
+
+TEST_F(CombinedSchedulerTest, CapacitySchedulerReusableTokensWithChunkedMicroBatch)
+{
+    // Same pipeline but with chunked prefill.
+    // Without reuse the context is chunked; with reuse it fits without chunking.
+
+    constexpr SizeType32 tokensPerBlock = 10;
+    constexpr SizeType32 kvCacheMaxNumTokens = 100;
+    constexpr SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    constexpr SizeType32 maxNumRequests = 4;
+
+    auto kvCacheManager = createKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, /*enableReuse=*/true);
+
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, /*hasKvCacheManager=*/true);
+
+    // FCFS chunking with chunkUnitSize = 5
+    constexpr SizeType32 chunkUnitSize = 5;
+    auto microBatchScheduler = MicroBatchScheduler(
+        ContextChunkingConfig{ContextChunkingPolicy::kFIRST_COME_FIRST_SERVED, chunkUnitSize}, std::nullopt);
+
+    constexpr int32_t promptLen = 30;
+    constexpr int32_t maxNewTokens = 5;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    auto req0 = createRequestWithTokens(inputTokens, maxNewTokens, 0);
+    auto req1 = createRequestWithTokens(inputTokens, maxNewTokens, 1);
+
+    // Iteration 0: Schedule and process request 0
+    RequestList activeList;
+    activeList.push_back(req0);
+    activeList.push_back(req1);
+
+    auto [scheduled0, disaggInit0, paused0]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+
+    kvCacheManager->addSequence(req0->mRequestId, promptLen, /*beamWidth=*/1, req0);
+    req0->moveToNextContextChunk();
+    kvCacheManager->storeContextBlocks(*req0);
+    req0->addNewTokens({0});
+    req0->setState(LlmRequestState::kGENERATION_IN_PROGRESS);
+    kvCacheManager->addToken(req0->mRequestId);
+
+    for (auto const& req : paused0)
+    {
+        if (req->mRequestId != 0)
+        {
+            req->pause(/*maxInputLen=*/1000);
+        }
+    }
+
+    // Iteration 1: Capacity scheduler sets estimatedReusableTokens on req1
+    auto [scheduled1, disaggInit1, paused1]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+
+    EXPECT_EQ(req1->getEstimatedReusableTokens(), 20);
+
+    // Micro batch scheduler with tight budget (15 tokens)
+    // With reuse: compute = max(0, 30-20) = 10 < 15 → full context fits, no chunking needed
+    RequestVector microBatchActive;
+    for (auto& req : scheduled1)
+    {
+        microBatchActive.push_back(req);
+    }
+
+    constexpr SizeType32 maxNumTokensBudget = 15;
+    constexpr SizeType32 maxBatchSize = 4;
+    ReqIdsSet inflightReqIds;
+    auto [ctx, gen] = microBatchScheduler(microBatchActive, inflightReqIds, maxBatchSize, maxNumTokensBudget);
+
+    // With reuse, full context should fit without chunking
+    for (auto const& req : ctx)
+    {
+        if (req->mRequestId == 1)
+        {
+            EXPECT_EQ(req->getContextChunkSize(), promptLen)
+                << "With 20 reusable tokens, full 30-token context fits (compute = 10 < 15)";
+        }
+    }
+
+    // === Compare: without reuse, context gets chunked ===
+    auto req2 = createRequestWithTokens(inputTokens, maxNewTokens, 2);
+    req2->setEstimatedReusableTokens(0);
+
+    RequestVector noReuseActive;
+    noReuseActive.push_back(req2); // ctx only, no gen
+
+    ReqIdsSet inflightReqIds2;
+    auto [ctx2, gen2] = microBatchScheduler(noReuseActive, inflightReqIds2, maxBatchSize, maxNumTokensBudget);
+
+    ASSERT_EQ(ctx2.size(), 1u);
+    EXPECT_EQ(ctx2.at(0)->getContextChunkSize(), 15)
+        << "Without reuse, 30-token context chunked to 15 (budget limit, aligned to chunkUnitSize=5)";
+
+    kvCacheManager->removeSequence(req0->mRequestId, req0);
+}
+
+TEST_F(CombinedSchedulerTest, NoReuseMicroBatchUnchanged)
+{
+    // When block reuse is disabled, estimatedReusableTokens stays 0
+    // and the micro batch scheduler behaves identically to before.
+
+    constexpr SizeType32 tokensPerBlock = 10;
+    constexpr SizeType32 kvCacheMaxNumTokens = 100;
+    constexpr SizeType32 kvCacheMaxNumTokensPerSeq = 50;
+    constexpr SizeType32 maxNumRequests = 4;
+
+    // Reuse DISABLED
+    auto kvCacheManager = createKvCacheManager(
+        maxNumRequests, tokensPerBlock, kvCacheMaxNumTokens, kvCacheMaxNumTokensPerSeq, /*enableReuse=*/false);
+
+    auto capacityScheduler
+        = CapacityScheduler(maxNumRequests, CapacitySchedulerPolicy::kMAX_UTILIZATION, /*hasKvCacheManager=*/true);
+
+    auto microBatchScheduler = MicroBatchScheduler();
+
+    constexpr int32_t promptLen = 20;
+    constexpr int32_t maxNewTokens = 5;
+    auto inputTokens = std::make_shared<std::vector<int32_t>>(promptLen);
+    std::iota(inputTokens->begin(), inputTokens->end(), 0);
+
+    auto req0 = createRequestWithTokens(inputTokens, maxNewTokens, 0);
+    auto req1 = createRequestWithTokens(inputTokens, maxNewTokens, 1);
+
+    // With reuse disabled, both requests are scheduled in iteration 0
+    RequestList activeList;
+    activeList.push_back(req0);
+    activeList.push_back(req1);
+
+    auto [scheduled0, disaggInit0, paused0]
+        = capacityScheduler(activeList, *kvCacheManager, /*peftCacheManager=*/std::nullopt);
+
+    // Both should be scheduled (no beneficialToSkip without reuse)
+    EXPECT_EQ(scheduled0.size(), 2u);
+
+    // estimatedReusableTokens should be 0 for both
+    EXPECT_EQ(req0->getEstimatedReusableTokens(), 0);
+    EXPECT_EQ(req1->getEstimatedReusableTokens(), 0);
+
+    // Micro batch scheduler with budget that fits only 1 context request
+    // Budget = 25: first req = 20 tokens, second req = 20 tokens → 40 > 25
+    RequestVector microBatchActive;
+    for (auto& req : scheduled0)
+    {
+        microBatchActive.push_back(req);
+    }
+
+    constexpr SizeType32 maxNumTokensBudget = 25;
+    constexpr SizeType32 maxBatchSize = 4;
+    ReqIdsSet inflightReqIds;
+    auto [ctx, gen] = microBatchScheduler(microBatchActive, inflightReqIds, maxBatchSize, maxNumTokensBudget);
+
+    // Without reuse: each request costs 20 tokens, only 1 fits in budget of 25
+    EXPECT_EQ(ctx.size(), 1u) << "Without reuse, only 1 of 2 context requests fits in 25-token budget";
+    EXPECT_EQ(gen.size(), 0u);
 }
 
 class ContextChunkingTest : public MicroBatchSchedulerTest

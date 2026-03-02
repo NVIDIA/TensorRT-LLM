@@ -489,6 +489,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("find_new_context_block", &BaseKVCacheManager::findNewContextBlock, nb::arg("unique_tokens"),
             nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
+        .def("count_reusable_blocks", &BaseKVCacheManager::countReusableBlocks, nb::arg("unique_tokens"),
+            nb::arg("llm_request"), nb::call_guard<nb::gil_scoped_release>())
         .def("get_cache_block_ids", &BaseKVCacheManager::getCacheBlockIds, nb::call_guard<nb::gil_scoped_release>())
         .def("get_batch_cache_block_ids", &BaseKVCacheManager::getBatchCacheBlockIds,
             nb::call_guard<nb::gil_scoped_release>())
