@@ -619,8 +619,7 @@ class TrtllmAttentionWrapper:
                 mla_bmm2_scale,
                 quant_q_buffer,
                 self.quant_config,
-                self.kv_cache_manager,
-                self.request_ids,
+                self.kv_cache_manager
             )
         else:
             thop.attention(
@@ -1955,7 +1954,6 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             helix_is_inactive_rank=metadata.helix_is_inactive_rank,
             quant_config=self.quant_config,
             kv_cache_manager=metadata.kv_cache_manager,
-            request_ids=metadata.request_ids,
         )
 
         self.wrapper.run(q,
