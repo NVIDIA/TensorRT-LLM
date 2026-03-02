@@ -282,17 +282,7 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
-        for req in state.scheduled_requests.context_requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
-                continue
-            new_token = add_token(req, new_tokens, beam_idx=beam_idx)
-            TorchSampler._handle_stop_criteria(req,
-                                               new_token,
-                                               max_seq_len=self.max_seq_len,
-                                               beam_idx=beam_idx)
-            self._request_common_handling(req, next_draft_tokens_list)
-
-        for req in state.scheduled_requests.generation_requests:
+        for req in state.requests:
             if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
@@ -320,14 +310,19 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
         # next_new_tokens_device: input tokens for the next iteration, device tensor, shape: batch_size, nextn + 1
 
-        requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.py_seq_slot for r in requests])
+        finished_context_requests = scheduled_requests.context_requests_last_chunk
+        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
+        num_sampling_requests = len(sampling_requests)
+
+        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests],
+                                dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
 
-        o_new_tokens = outputs['new_tokens'][:len(requests)]
-        o_new_tokens_lens = outputs['new_tokens_lens'][:len(requests)]
-        o_next_draft_tokens = outputs['next_draft_tokens'][:len(requests)]
-        o_next_new_tokens = outputs['next_new_tokens'][:len(requests)]
+        o_new_tokens = outputs['new_tokens'][:num_sampling_requests]
+        o_new_tokens_lens = outputs['new_tokens_lens'][:num_sampling_requests]
+        o_next_draft_tokens = outputs[
+            'next_draft_tokens'][:num_sampling_requests]
+        o_next_new_tokens = outputs['next_new_tokens'][:num_sampling_requests]
 
         new_tokens = self.store.new_tokens
         next_new_tokens = self.store.next_new_tokens
@@ -352,9 +347,9 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
         sampler_event = self._record_sampler_event()
         # add dummy draft tokens to context requests to prepare kv cache in advance
         # with the max draft token length
-        for request in scheduled_requests.context_requests:
+        for request in finished_context_requests:
             request.py_draft_tokens = [1] * self.draft_len
-        return SampleStateMTP(scheduled_requests=scheduled_requests,
+        return SampleStateMTP(requests=sampling_requests,
                               device=device,
                               host=host,
                               sampler_event=sampler_event)
