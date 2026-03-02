@@ -1015,13 +1015,9 @@ class MTPWorker(SpecWorkerBase):
             # context
             if num_contexts > 0:
                 hidden_states_ctx = hidden_states[:num_ctx_tokens, :]
-                input_prompt_ids = input_ids[:num_ctx_tokens]
-                input_ids_ctx = torch.empty_like(input_prompt_ids,
-                                                 dtype=torch.int32,
-                                                 device="cuda")
-                input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
-                input_ids_ctx[last_tokens_idx[:num_contexts]] = \
-                    accepted_tokens[:num_contexts, 0]
+                input_ids_ctx = self._prepare_context_input_ids(
+                    input_ids, num_ctx_tokens, last_tokens_idx, accepted_tokens,
+                    num_contexts)
                 return_input_ids_list.append(input_ids_ctx)
                 return_hidden_states_list.append(hidden_states_ctx)
             # generation
@@ -1364,13 +1360,9 @@ class MTPEagleWorker(MTPWorker):
         num_contexts = attn_metadata.num_contexts
 
         # context
-        input_prompt_ids = input_ids[:attn_metadata.num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_prompt_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_prompt_ids[1:])
-        input_ids_ctx[
-            last_tokens_idx[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        input_ids_ctx = self._prepare_context_input_ids(
+            input_ids, attn_metadata.num_ctx_tokens, last_tokens_idx,
+            accepted_tokens, num_contexts)
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()

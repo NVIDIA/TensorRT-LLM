@@ -601,14 +601,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         hidden_states = draft_model.apply_eagle3_fc(hidden_states)
 
         # context
-        input_ctx_ids = input_ids[:attn_metadata.num_ctx_tokens]
-        input_ids_ctx = torch.empty_like(input_ctx_ids,
-                                         dtype=torch.int32,
-                                         device="cuda")
-        input_ids_ctx[:-1].copy_(input_ctx_ids[1:])
-        input_ids_ctx[
-            spec_metadata.
-            gather_ids[:num_contexts]] = accepted_tokens[:num_contexts, 0]
+        input_ids_ctx = self._prepare_context_input_ids(
+            input_ids, attn_metadata.num_ctx_tokens, spec_metadata.gather_ids,
+            accepted_tokens, num_contexts)
 
         # generation
         input_ids_gen = accepted_tokens[num_contexts:, :].flatten()
