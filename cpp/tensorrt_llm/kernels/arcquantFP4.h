@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -16,25 +16,28 @@
 
 #pragma once
 
+#include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/runtime/common.h"
 
-#include <ATen/cuda/EmptyTensor.h>
-#include <cstdint>
-#include <optional>
+namespace tc = tensorrt_llm::common;
 
 TRTLLM_NAMESPACE_BEGIN
 
-namespace torch_ext
+namespace kernels
 {
-std::tuple<at::Tensor, at::Tensor> fp4_quantize(at::Tensor const& self, std::optional<at::Tensor> const& globalScale,
-    int64_t sfVecSize, bool sfUseUE8M0, bool isSfSwizzledLayout);
 
-at::Tensor calculate_nvfp4_global_scale(at::Tensor const& input, std::optional<at::Tensor> const& tokensPerBatch);
+enum class ArcQuantType
+{
+    ACT,
+    WEIGHT,
+};
 
-std::tuple<at::Tensor, at::Tensor> fp4_quantize_with_reorder_residual(
-    at::Tensor const& X, at::Tensor const& input_scale, at::Tensor const& reorder_index, int64_t KE, bool is_act);
-} // namespace torch_ext
+template <typename T, int group_size, ArcQuantType quant_type>
+void run_quantize_reorder_nvfp4(int16_t* hidden_states, float* input_scale, int16_t* reorder_index, uint8_t* q_out,
+    uint8_t* q_scale, int seq_len, int KQ, int KE, cudaStream_t stream);
+
+} // namespace kernels
 
 TRTLLM_NAMESPACE_END
