@@ -17,7 +17,6 @@
 
 #include "hashUtils.h"
 
-#include <cstring>
 #include <stdexcept>
 #include <utility>
 
@@ -56,22 +55,6 @@ Hasher::Hasher(uint64_t seed)
         seed >>= 8;
     }
     update(seedBytes, 8);
-}
-
-Hasher::Hasher(std::optional<uint64_t> seed)
-{
-    initCtx();
-    if (seed.has_value())
-    {
-        uint64_t s = seed.value();
-        uint8_t seedBytes[8];
-        for (int i = 0; i < 8; ++i)
-        {
-            seedBytes[i] = static_cast<uint8_t>(s & 0xFF);
-            s >>= 8;
-        }
-        update(seedBytes, 8);
-    }
 }
 
 Hasher::~Hasher() = default;
@@ -126,18 +109,6 @@ Hasher& Hasher::update(void const* data, size_t size)
         throw std::runtime_error("Failed to update SHA-256 digest");
     }
     return *this;
-}
-
-uint64_t Hasher::digest() const
-{
-    auto bytes = digestBytes();
-    // Return first 8 bytes as little-endian uint64_t
-    uint64_t result = 0;
-    for (int i = 7; i >= 0; --i)
-    {
-        result = (result << 8) | bytes[i];
-    }
-    return result;
 }
 
 std::array<uint8_t, Hasher::kDigestSize> Hasher::digestBytes() const

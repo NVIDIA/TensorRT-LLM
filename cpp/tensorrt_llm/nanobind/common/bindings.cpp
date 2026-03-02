@@ -19,7 +19,6 @@
 #include "tensorrt_llm/common/hashUtils.h"
 
 #include <nanobind/nanobind.h>
-#include <nanobind/stl/optional.h>
 #include <nanobind/stl/vector.h>
 
 #include <stdexcept>
@@ -36,7 +35,6 @@ void initBindings(nb::module_& m)
     nb::class_<tc::Hasher>(m, "Hasher")
         .def(nb::init<>(), "Create hasher with seed = 0")
         .def(nb::init<uint64_t>(), nb::arg("seed"), "Create hasher with explicit seed")
-        .def(nb::init<std::optional<uint64_t>>(), nb::arg("seed"), "Create hasher with optional seed")
         .def(
             "__init__",
             [](tc::Hasher* self, nb::bytes data)
@@ -83,8 +81,7 @@ void initBindings(nb::module_& m)
                 auto digestBytes = self.digestBytes();
                 return nb::bytes(reinterpret_cast<char const*>(digestBytes.data()), digestBytes.size());
             },
-            "Get the final hash as 32 bytes (SHA-256)")
-        .def("digest_int", &tc::Hasher::digest, "Get the final hash as a 64-bit integer");
+            "Get the final hash as 32 bytes (SHA-256)");
 }
 
 } // namespace tensorrt_llm::nanobind::common

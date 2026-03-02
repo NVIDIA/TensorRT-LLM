@@ -979,7 +979,7 @@ class TestDisaggregatedServing(unittest.TestCase):
 class TestKVCacheReusePerformance(TestKVCacheManagerV2):
     """Test class for measuring KV cache reuse performance."""
 
-    def test_cache_reuse_performance(self, profile: bool = False) -> None:
+    def test_cache_reuse_performance(self, profile: bool = True) -> None:
         """Performance test for KV cache reuse (prefill only).
 
         - First pass: 20 requests with 1000 tokens per prompt (cold cache).
