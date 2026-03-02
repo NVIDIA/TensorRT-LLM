@@ -4859,6 +4859,9 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           extra_evaluator_kwargs=extra_evaluator_kwargs)
 
     @pytest.mark.skip_less_device(4)
+    @pytest.mark.parametrize(
+        "use_rejection_sampling", [True, False],
+        ids=["rejection_sampling", "no_rejection_sampling"])
     @pytest.mark.parametrize("overlap_scheduler", [True, False],
                              ids=["overlap_scheduler", "no_overlap_scheduler"])
     @pytest.mark.parametrize("one_model", [True, False],
@@ -4872,11 +4875,15 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("v2_kv_cache", [True, False],
                              ids=["v2_kv_cache", "v1_kv_cache"])
     def test_eagle3_4gpus(self, v2_kv_cache, moe_backend, one_model,
-                          overlap_scheduler, mocker):
+                          overlap_scheduler, use_rejection_sampling, mocker):
         if get_sm_version() == 90:
             pytest.skip(
                 "https://nvbugs/5636916: Remaining Hopper Eagle Accuracy Issue for only TP=4"
             )
+
+        # Rejection sampling is only supported for one_model
+        if not one_model and use_rejection_sampling:
+            pytest.skip("Rejection sampling is not supported for two_model")
 
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
@@ -4902,10 +4909,12 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
 
         eagle_model_dir = f"{llm_models_root()}/gpt_oss/gpt-oss-120b-Eagle3"
         draft_len = 3
-        spec_config = Eagle3DecodingConfig(max_draft_len=draft_len,
-                                           speculative_model=eagle_model_dir,
-                                           eagle3_one_model=one_model,
-                                           allow_advanced_sampling=True)
+        spec_config = Eagle3DecodingConfig(
+            max_draft_len=draft_len,
+            speculative_model=eagle_model_dir,
+            eagle3_one_model=one_model,
+            allow_advanced_sampling=True,
+            use_rejection_sampling=use_rejection_sampling)
 
         max_seq_len = MAX_INPUT_LEN + MAX_OUTPUT_LEN
         llm = LLM(self.MODEL_PATH,
