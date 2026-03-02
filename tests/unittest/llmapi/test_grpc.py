@@ -15,11 +15,13 @@
 """Unit tests for gRPC server components."""
 
 import asyncio
+import io
 import os
 import sys
 
 import pytest
 import torch
+from PIL import Image
 
 from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
 from tensorrt_llm.grpc.grpc_request_manager import (
@@ -712,3 +714,174 @@ class TestGrpcServiceEndToEnd:
         response = _run_async(run())
         assert response.backend == "tensorrt-llm"
         assert response.world_size >= 1
+
+
+# ============================================================================
+# End-to-end multimodal gRPC service tests (with VLM model)
+# ============================================================================
+
+vlm_model_name = "Qwen3/Qwen3-VL-8B-Instruct"
+
+
+def get_test_image_path():
+    return str(llm_models_root() / "multimodals" / "test_data" / "seashore.png")
+
+
+@pytest.fixture(scope="module")
+def grpc_vlm_service():
+    """Create a real VLM LLM, request manager, and servicer for multimodal e2e testing.
+
+    Uses Qwen3-VL-8B-Instruct for vision-language model testing.
+    Shared across all tests in this module.
+    """
+    from tensorrt_llm._tensorrt_engine import LLM
+
+    model_path = get_model_path(vlm_model_name)
+    llm = LLM(
+        model=model_path,
+        kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6),
+        fast_build=True,
+    )
+    tokenizer = llm.tokenizer
+
+    request_manager = GrpcRequestManager(llm)
+    servicer = TrtllmServiceServicer(request_manager, model_path=model_path)
+
+    yield llm, tokenizer, request_manager, servicer
+
+    llm.shutdown()
+
+
+@skip_no_gpu
+class TestGrpcMultimodalEndToEnd:
+    """End-to-end tests for multimodal gRPC service flow.
+
+    Tests the full pipeline: gRPC request with image bytes -> servicer ->
+    request manager -> VLM -> response.
+    Uses Qwen3-VL-8B-Instruct with test images from LLM_MODELS_ROOT.
+    """
+
+    def test_generate_with_image(self, grpc_vlm_service):
+        """Test non-streaming generation with a single image input."""
+        llm, tokenizer, request_manager, servicer = grpc_vlm_service
+
+        # Build a chat prompt with image placeholder
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "Describe this image briefly.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        # Load test image as raw bytes
+        image_path = get_test_image_path()
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        request = pb2.GenerateRequest(
+            request_id="e2e-mm-single",
+            tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
+            multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
+            sampling_config=pb2.SamplingConfig(temperature=0.0),
+            max_tokens=32,
+            streaming=False,
+        )
+
+        async def run():
+            responses = []
+            async for resp in servicer.Generate(request, _MockContext()):
+                responses.append(resp)
+            return responses
+
+        responses = _run_async(run())
+
+        completes = [r for r in responses if r.HasField("complete")]
+        assert len(completes) == 1
+
+        resp = completes[0]
+        assert resp.request_id == "e2e-mm-single"
+        assert len(resp.complete.output_token_ids) > 0
+        assert resp.complete.finish_reason in ("stop", "length")
+
+    def test_generate_with_image_streaming(self, grpc_vlm_service):
+        """Test streaming generation with a single image input."""
+        llm, tokenizer, request_manager, servicer = grpc_vlm_service
+
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "What do you see?<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        image_path = get_test_image_path()
+        with open(image_path, "rb") as f:
+            image_bytes = f.read()
+
+        request = pb2.GenerateRequest(
+            request_id="e2e-mm-stream",
+            tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
+            multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
+            sampling_config=pb2.SamplingConfig(temperature=0.0),
+            max_tokens=32,
+            streaming=True,
+        )
+
+        async def run():
+            responses = []
+            async for resp in servicer.Generate(request, _MockContext()):
+                responses.append(resp)
+            return responses
+
+        responses = _run_async(run())
+
+        chunks = [r for r in responses if r.HasField("chunk")]
+        completes = [r for r in responses if r.HasField("complete")]
+
+        assert len(chunks) >= 1
+        for chunk_resp in chunks:
+            assert len(chunk_resp.chunk.token_ids) > 0
+
+        # Reassemble all delta tokens and verify they match the complete response
+        all_streamed_tokens = []
+        for chunk_resp in chunks:
+            all_streamed_tokens.extend(chunk_resp.chunk.token_ids)
+
+        assert len(completes) == 1
+        complete_tokens = list(completes[0].complete.output_token_ids)
+        assert all_streamed_tokens == complete_tokens
+
+    def test_generate_with_rgba_image(self, grpc_vlm_service):
+        """Test that RGBA images (PNG with alpha) are handled correctly via RGB conversion."""
+        llm, tokenizer, request_manager, servicer = grpc_vlm_service
+
+        prompt = (
+            "<|im_start|>user\n<|vision_start|><|image_pad|><|vision_end|>"
+            "Describe this image.<|im_end|>\n<|im_start|>assistant\n"
+        )
+        prompt_token_ids = tokenizer.encode(prompt)
+
+        # Create a synthetic RGBA image to test RGB conversion
+        rgba_image = Image.new("RGBA", (64, 64), (255, 0, 0, 128))
+        buf = io.BytesIO()
+        rgba_image.save(buf, format="PNG")
+        image_bytes = buf.getvalue()
+
+        request = pb2.GenerateRequest(
+            request_id="e2e-mm-rgba",
+            tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
+            multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
+            sampling_config=pb2.SamplingConfig(temperature=0.0),
+            max_tokens=16,
+            streaming=False,
+        )
+
+        async def run():
+            responses = []
+            async for resp in servicer.Generate(request, _MockContext()):
+                responses.append(resp)
+            return responses
+
+        responses = _run_async(run())
+
+        completes = [r for r in responses if r.HasField("complete")]
+        assert len(completes) == 1
+        assert len(completes[0].complete.output_token_ids) > 0

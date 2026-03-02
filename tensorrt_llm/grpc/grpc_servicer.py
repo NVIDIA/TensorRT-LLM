@@ -20,6 +20,7 @@ with external routers (e.g., sgl-router) using pre-tokenized input.
 """
 
 import asyncio
+import io
 import time
 from collections.abc import AsyncGenerator
 from typing import List, Union
@@ -27,6 +28,7 @@ from typing import List, Union
 import grpc
 
 from tensorrt_llm.executor.result import Logprob, TokenLogprobs
+from tensorrt_llm.inputs.utils import _load_and_convert_image
 from tensorrt_llm.logger import logger
 
 from . import trtllm_service_pb2, trtllm_service_pb2_grpc
@@ -117,6 +119,17 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 request.disaggregated_params if request.HasField("disaggregated_params") else None
             )
 
+            # Extract multimodal images if present
+            multimodal_images = None
+            if request.HasField("multimodal_input") and request.multimodal_input.image_data:
+                multimodal_images = [
+                    _load_and_convert_image(io.BytesIO(img_bytes))
+                    for img_bytes in request.multimodal_input.image_data
+                ]
+                logger.info(
+                    f"Request {request_id}: extracted {len(multimodal_images)} multimodal images"
+                )
+
             # Track tokens sent per sequence index to avoid duplicates
             # TRT-LLM's token_ids_diff doesn't clear between iterations for n>1
             sent_token_counts: dict[int, int] = {}
@@ -130,6 +143,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 streaming=request.streaming,
                 lora_request=lora_request,
                 disaggregated_params=disaggregated_params,
+                multimodal_images=multimodal_images,
             ):
                 # Check if client disconnected
                 if context.cancelled():
