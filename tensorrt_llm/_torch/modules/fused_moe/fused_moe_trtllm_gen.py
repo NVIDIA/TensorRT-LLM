@@ -32,16 +32,16 @@ from ...custom_ops.trtllm_gen_custom_ops import \
 from ...distributed import allgather
 from ...expert_statistic import ExpertStatistic
 from ...model_config import ModelConfig
-from ...utils import (ActivationType, AuxStreamType, Fp4QuantizedTensor)
+from ...utils import ActivationType, AuxStreamType, Fp4QuantizedTensor
 from ..gated_mlp import GatedMLP
 from .interface import AlltoallMethodType, MoE, MoEWeightLoadingMode
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, NVFP4TRTLLMGenFusedMoEBaseMethod,
-    NVFP4TRTLLMGenFusedMoEMethod, W4A8MXFP4FP8TRTLLMGenFusedMoEMethod,
-    W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod, W4A8NVFP4FP8TRTLLMGenFusedMoEMethod,
-    W4A16MXFP4TRTLLMGenFusedMoEMethod)
+    DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod,
+    NVFP4TRTLLMGenFusedMoEBaseMethod, NVFP4TRTLLMGenFusedMoEMethod,
+    W4A8MXFP4FP8TRTLLMGenFusedMoEMethod, W4A8MXFP4MXFP8TRTLLMGenFusedMoEMethod,
+    W4A8NVFP4FP8TRTLLMGenFusedMoEMethod, W4A16MXFP4TRTLLMGenFusedMoEMethod)
 # isort: on
 from .routing import BaseMoeRoutingMethod, DeepSeekV3MoeRoutingMethod
 
@@ -276,14 +276,16 @@ class TRTLLMGenFusedMoE(MoE):
 
         self._weights_created = False
         self.num_fused_shared_expert = 0
-        if not model_config.skip_create_weights_in_init:
-            self.create_weights()
-        self.layer_idx = layer_idx
 
+        # Set num_fused_shared_expert BEFORE create_weights() to ensure correct buffer sizes
         if model_config.mapping.dp_size == 1 and (
                 self.quant_config.layer_quant_mode.has_fp8_block_scales()
                 or self.quant_config.layer_quant_mode.has_nvfp4()):
             self.num_fused_shared_expert = model_config.pretrained_config.n_shared_experts
+
+        if not model_config.skip_create_weights_in_init:
+            self.create_weights()
+        self.layer_idx = layer_idx
 
     def _to_trtllm_gen_activation_type(self,
                                        activation_type: ActivationType) -> int:
@@ -345,7 +347,7 @@ class TRTLLMGenFusedMoE(MoE):
         if self.quant_config is not None and self.quant_config.layer_quant_mode.has_any_quant(
                 exclude_kv_cache=True):
             if self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                return DeepSeekFP8TRTLLMGenBlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod(
                 ) if self.swiglu_alpha is not None or self.activation_type == ActivationType.Relu2 else NVFP4TRTLLMGenFusedMoEBaseMethod(
