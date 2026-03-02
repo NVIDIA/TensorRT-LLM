@@ -4,7 +4,7 @@
 
 ```{note}
 Note:
-This feature is currently in prototype, and the related API is subjected to change in future versions.
+This feature is currently in prototype, and the related API is subject to change in future versions.
 ```
 Currently TRT-LLM supports `disaggregated-service`, where the context and generation phases of a request can run on different executors. TRT-LLM's disaggregated service relies on the executor API, please make sure to read the [executor page](executor.md) before reading the document.
 
@@ -43,7 +43,7 @@ There are some other useful environment variables that may help when encounterin
 
 *Q. What are the limitations of disaggregated-service in TRT-LLM?*
 
-A. Currently, only `decoder-only engine` and `beamWidth=1` are supported, and the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention headers.
+A. Currently, only `decoder-only engine` and `beamWidth=1` are supported, and the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
 
 *Q. Is the engine used by disaggregated-service different from other engines?*
 
@@ -63,7 +63,7 @@ A. Yes, but it's not recommended, TRT-LLM does not implement proper scheduling f
 
 *Q. Does disaggregated-service in TRT-LLM support multi-gpu and multi-node?*
 
-A. Yes, it's recommended that different executor use different GPUs . We support context-only executor and genertion-only executor run on same node or different nodes. The `participantIds` and `deviceIds` used by each executor need to be explicitly set by the user, and the `participantIds` of each executor must not be intersecting.
+A. Yes, it's recommended that different executor use different GPUs. We support context-only executor and generation-only executor run on same node or different nodes. The `participantIds` and `deviceIds` used by each executor need to be explicitly set by the user, and the `participantIds` of each executor must not be intersecting.
 
 ### Debugging FAQs
 

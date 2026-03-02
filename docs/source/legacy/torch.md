@@ -2,7 +2,7 @@
 
 ```{note}
 Note:
-This feature is currently in beta, and the related API is subjected to change in future versions.
+This feature is currently in beta, and the related API is subject to change in future versions.
 ```
 To enhance the usability of the system and improve developer efficiency, TensorRT LLM launches a new backend based on PyTorch.
 

@@ -36,7 +36,7 @@ from torch.types import Number
 
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
 
-from ...._utils import nvtx_range, str_dtype_to_torch
+from ...._utils import nvtx_range, prefer_pinned, str_dtype_to_torch
 from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
@@ -135,7 +135,7 @@ class InputBuffer:
         if self._total_bytes > 0:
             self._device_buffer = torch.empty(self._total_bytes, dtype=torch.uint8)
             self._host_buffer = torch.empty(
-                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=True
+                self._total_bytes, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
             )
         else:
             self._device_buffer = torch.empty(0, dtype=torch.uint8)
@@ -154,7 +154,7 @@ class InputBuffer:
             byte_size = numel * dtype.itemsize
             self._trunc_device_bufs[name] = torch.empty(byte_size, dtype=torch.uint8)
             self._trunc_host_bufs[name] = torch.empty(
-                byte_size, dtype=torch.uint8, device="cpu", pin_memory=True
+                byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
             )
             # Create typed views
             self._device_views[name] = self._trunc_device_bufs[name].view(dtype)
@@ -287,7 +287,7 @@ class InputBuffer:
         # Host buffer must be re-allocated for pinned memory
         old_host = self._trunc_host_bufs[name]
         self._trunc_host_bufs[name] = torch.empty(
-            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=True
+            new_byte_size, dtype=torch.uint8, device="cpu", pin_memory=prefer_pinned()
         )
         self._trunc_host_bufs[name][: old_host.numel()].copy_(old_host)
         del old_host
@@ -1123,7 +1123,14 @@ class SequenceInfo:
     @nvtx_range("ad_maybe_gather_logits")
     def maybe_gather_and_squeeze_logits(self, logits: torch.Tensor) -> torch.Tensor:
         """Maybe gather the logits if logits have not been gathered yet."""
-        num_tokens = logits.shape[0] * logits.shape[1]
+        if logits.dim() == 3:
+            num_tokens = logits.shape[0] * logits.shape[1]
+        elif logits.dim() == 2:
+            num_tokens = logits.shape[0]
+        else:
+            raise AssertionError(
+                f"Unexpected logits rank in AD gather path: shape={tuple(logits.shape)}"
+            )
         num_tokens_to_gather, gather_required = self._get_arg("logits_gather_info_host").tolist()
         if gather_required and num_tokens_to_gather < num_tokens:
             logits = torch.ops.auto_deploy.gather_logits_before_lm_head(
@@ -1131,7 +1138,18 @@ class SequenceInfo:
                 self._get_arg("logits_gather_indices"),
                 self._get_arg("logits_gather_info_host"),
             )
-        return logits.squeeze(int(self.is_generate))
+        # Keep canonical 2D logits [tokens, vocab] unchanged.
+        # Only squeeze layout dimensions when logits are still 3D:
+        # - generate layout: [batch, 1, vocab] -> [batch, vocab]
+        # - packed layout:   [1, tokens, vocab] -> [tokens, vocab]
+        if logits.dim() == 3:
+            logits = logits.squeeze(1 if self.is_generate else 0)
+        elif logits.dim() != 2:
+            raise AssertionError(
+                f"Unexpected logits rank after AD gather path: shape={tuple(logits.shape)}"
+            )
+        assert logits.shape[-1] > 1, f"Invalid logits vocab axis: shape={tuple(logits.shape)}"
+        return logits
 
     @nvtx_range("ad_unnest_sequences")
     def unnest_sequences(self, t_nested: torch.Tensor) -> List[torch.Tensor]:

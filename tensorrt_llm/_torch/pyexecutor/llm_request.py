@@ -6,6 +6,7 @@ import torch
 
 import tensorrt_llm.bindings
 from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
 from tensorrt_llm.sampling_params import LogprobMode
@@ -109,7 +110,7 @@ class LogitsStorage:
                 (self.seq_length, self.beam_width, self.vocab_size),
                 dtype=logits.dtype,
                 device='cpu',
-                pin_memory=True,
+                pin_memory=prefer_pinned(),
                 requires_grad=False)
 
     def _init_chunked_storage(self, logits: torch.Tensor):
@@ -120,7 +121,7 @@ class LogitsStorage:
             (self.seq_length, self.beam_width, self.vocab_size),
             dtype=logits.dtype,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
             requires_grad=False)
 
     def append(self, logits: torch.Tensor):
@@ -466,12 +467,15 @@ class PyResult:
 
     @property
     def log_probs(self) -> list[TokenLogprobs] | None:
-        return self._log_probs and hasattr(
-            self._log_probs, 'log_probs') and self._log_probs.log_probs
+        if not self._log_probs or not hasattr(self._log_probs, 'log_probs'):
+            return None
+        return self._log_probs.log_probs
 
     @property
     def cum_log_probs(self) -> list[float] | None:
-        return self._log_probs and self._log_probs.cum_log_probs
+        if not self._log_probs or not hasattr(self._log_probs, 'cum_log_probs'):
+            return None
+        return self._log_probs.cum_log_probs
 
     @property
     def mm_embedding_handles(self) -> List[Dict[str, Any]] | None:

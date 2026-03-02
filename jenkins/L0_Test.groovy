@@ -1948,7 +1948,7 @@ def runLLMDocBuild(pipeline, config)
     sh "pwd && ls -alh"
     sh "env | sort"
     // allow to checkout from forked repo, svc_tensorrt needs to have access to the repo, otherwise clone will fail
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
     sh "mkdir TensorRT-LLM"
     sh "cp -r ${LLM_ROOT}/ TensorRT-LLM/src/"
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \"*\"")
@@ -2135,13 +2135,13 @@ def getMakoOpts(getMakoScript, makoArgs=[]) {
     return makoOptsJson
 }
 
-def parseMultiNodeTaskConfigFromStageName(String stageName) {
+def parseTaskConfigFromStageName(String stageName) {
     def taskConfig = null
-    def matcher = (stageName =~ /([^-]+)-(\d+)_GPUs(?:-(\d+)_Nodes)?/)
+    def matcher = (stageName =~ /([^-]+)(?:-(\d+)_GPUs)?(?:-(\d+)_Nodes)?/)
     if (matcher.find()) {
         taskConfig = [
             gpu: "${matcher.group(1)}",
-            system_gpu_count: "${matcher.group(2)}",
+            system_gpu_count: matcher.group(2) ?: "1", // Default to 1 if _GPUs not present
             node_count: matcher.group(3) ?: "1" // Default to 1 if _Nodes not present
         ]
     }
@@ -2200,7 +2200,7 @@ def getMakoArgsFromStageName(stageName, parseSysinfo=false) {
     }
 
     if (parseSysinfo) {
-        def taskConfig = parseMultiNodeTaskConfigFromStageName(stageName)
+        def taskConfig = parseTaskConfigFromStageName(stageName)
         if (taskConfig) {
             makoArgs += [
                 "gpu=${taskConfig.gpu}",
@@ -2961,7 +2961,7 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     sh "env | sort"
     sh "ccache -sv"
 
-    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", true, true)
+    trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, "tensorrt_llm", false, true)
     if (env.alternativeTRT) {
         sh "cd tensorrt_llm/ && sed -i 's#tensorrt~=.*\$#tensorrt#g' requirements.txt && cat requirements.txt"
     }
@@ -3207,10 +3207,6 @@ def launchTestJobs(pipeline, testFilter)
         "H100_PCIe-AutoDeploy-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-CPP-1": ["h100-cr", "l0_h100", 1, 1],
         "H100_PCIe-TensorRT-1": ["h100-cr", "l0_h100", 1, 1],
-        "B200_PCIe-PyTorch-1": ["b100-ts2", "l0_b200", 1, 3],
-        "B200_PCIe-PyTorch-2": ["b100-ts2", "l0_b200", 2, 3],
-        "B200_PCIe-PyTorch-3": ["b100-ts2", "l0_b200", 3, 3],
-        "B200_PCIe-AutoDeploy-1": ["b100-ts2", "l0_b200", 1, 1],
         "RTX5090-PyTorch-1": ["rtx-5090", "l0_gb202", 1, 1],
         "RTX5080-TensorRT-1": ["rtx-5080", "l0_gb203", 1, 2],
         "RTX5080-TensorRT-2": ["rtx-5080", "l0_gb203", 2, 2],
@@ -3251,9 +3247,6 @@ def launchTestJobs(pipeline, testFilter)
         // "H100_PCIe-TensorRT-Post-Merge-4": ["h100-cr", "l0_h100", 4, 5],
         // "H100_PCIe-TensorRT-Post-Merge-5": ["h100-cr", "l0_h100", 5, 5],
         "H100_PCIe-FMHA-Post-Merge-1": ["h100-cr", "l0_h100", 1, 1],
-        "B200_PCIe-Triton-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 1],
-        "B200_PCIe-PyTorch-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
-        "B200_PCIe-PyTorch-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         // "B200_PCIe-TensorRT-Post-Merge-1": ["b100-ts2", "l0_b200", 1, 2],
         // "B200_PCIe-TensorRT-Post-Merge-2": ["b100-ts2", "l0_b200", 2, 2],
         "H100_PCIe-TensorRT-Perf-1": ["h100-cr", "l0_perf", 1, 1],
@@ -3304,12 +3297,19 @@ def launchTestJobs(pipeline, testFilter)
         "DGX_H100-4_GPUs-PyTorch-Others-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-PyTorch-Ray-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
         "DGX_H100-4_GPUs-AutoDeploy-1": ["auto:dgx-h100-x4", "l0_dgx_h100", 1, 1, 4],
+        "DGX_B200-PyTorch-1": ["auto:dgx-b200-flex", "l0_b200", 1, 3, 1, 1, true],
+        "DGX_B200-PyTorch-2": ["auto:dgx-b200-flex", "l0_b200", 2, 3, 1, 1, true],
+        "DGX_B200-PyTorch-3": ["auto:dgx-b200-flex", "l0_b200", 3, 3, 1, 1, true],
+        "DGX_B200-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
+        "DGX_B200-Triton-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 1, 1, 1, true],
+        "DGX_B200-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_b200", 1, 2, 1, 1, true],
+        "DGX_B200-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_b200", 2, 2, 1, 1, true],
         "DGX_B200-4_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Ray-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
         "DGX_B200-4_GPUs-AutoDeploy-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 4, 1, true],
-        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 2, 4, 1, true],
         "DGX_B200-4_GPUs-PyTorch-Post-Merge-2": ["auto:dgx-b200-flex", "l0_dgx_b200", 2, 2, 4, 1, true],
+        "DGX_B200-8_GPUs-PyTorch-1": ["auto:dgx-b200-flex", "l0_dgx_b200", 1, 1, 8, 1, true],
         "B300-PyTorch-1": ["b300-single", "l0_b300", 1, 1],
         "DGX_B300-4_GPUs-PyTorch-1": ["b300-x4", "l0_dgx_b300", 1, 1, 4],
         "DGX_B300-4_GPUs-PyTorch-Post-Merge-1": ["b300-x4", "l0_dgx_b300", 1, 2, 4],
@@ -3622,7 +3622,7 @@ def launchTestJobs(pipeline, testFilter)
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
-                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, true, true)
+                        trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install requests")
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y tensorrt")

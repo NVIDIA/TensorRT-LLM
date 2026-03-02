@@ -161,7 +161,7 @@ trtllm-bench --model nvidia/DeepSeek-R1-FP4 \
 ```
 
 Explanation:
-- `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published. See [TensorRT LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
+- `trtllm-bench`: A CLI benchmarking utility that aims to make it easier for users to reproduce our officially published results. See [TensorRT LLM Benchmarking](https://nvidia.github.io/TensorRT-LLM/performance/perf-benchmarking.html) for details.
 - `--dataset`: Prompt dataset used to benchmark. Our official benchmark dataset has ISL = 1K, OSL = 2K
 - `--num_requests`: Num requests used for the benchmark.
 - `--concurrency`: Total concurrency for the system.
@@ -408,7 +408,7 @@ Average request latency (ms):                     181540.5739
 To benchmark TensorRT LLM on DeepSeek models with more ISL/OSL combinations, you can use the `trtllm-bench prepare-dataset` subcommand to generate the dataset and use similar commands mentioned in the previous section. TensorRT LLM is working on enhancements that can make the benchmark process smoother.
 ### WIP: Enable more features by default
 
-Currently, there are some features that need to be enabled through a user-defined file `config.yml`, such as attention dp. We're working on to enable those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
+Currently, there are some features that need to be enabled through a user-defined file `config.yml`, such as attention dp. We're working on enabling those features by default, so that users can get good out-of-the-box performance on DeepSeek models.
 
 Note that, `max_batch_size` and `max_num_tokens` can easily affect the performance. The default values for them are already carefully designed and should deliver good performance on overall cases, however, you may still need to tune it for peak performance.
 
@@ -424,4 +424,4 @@ For more details on `max_num_tokens`, refer to [Tuning Max Batch Size and Max Nu
 
 ### Out of memory issues
 
-It's possible seeing OOM issues on some cases. Considering reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.
+It's possible to see OOM issues in some cases. Consider reducing `kv_cache_free_gpu_mem_fraction` to a smaller value as a workaround. We're working on the investigation and addressing the problem.

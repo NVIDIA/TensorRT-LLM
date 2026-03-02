@@ -76,6 +76,7 @@ class Attention(nn.Module):
             backend_name = base_backend
         self.attn_backend = backend_name
         self.qk_norm = qk_norm
+        self.qk_norm_mode = qk_norm_mode
         self.layer_idx = layer_idx if layer_idx is not None else 0
         self.eps = eps
 
@@ -85,17 +86,15 @@ class Attention(nn.Module):
         self._init_qkv_proj()
 
         if self.qk_norm:
-            if qk_norm_mode == "per_head":
-                q_norm_dim = self.head_dim
-                kv_norm_dim = self.head_dim
-            else:
-                q_norm_dim = self.q_dim
-                kv_norm_dim = self.kv_dim
+            # "full": norm over all heads combined (e.g. WAN, dim=q_dim)
+            # "per_head": norm over each head independently (e.g. FLUX, dim=head_dim)
+            q_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.q_dim
+            k_norm_dim = self.head_dim if qk_norm_mode == "per_head" else self.kv_dim
             self.norm_q = RMSNorm(
                 hidden_size=q_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
             self.norm_k = RMSNorm(
-                hidden_size=kv_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
+                hidden_size=k_norm_dim, eps=self.eps, dtype=self.dtype, has_weights=True
             )
 
         # TODO: Use weight mapper to create just a Linear module
@@ -216,13 +215,8 @@ class Attention(nn.Module):
 
     def apply_qk_norm(self, q: torch.Tensor, k: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.qk_norm:
-            if q.ndim == 4:
-                shape = q.shape
-                q = self.norm_q(q.reshape(-1, shape[-1])).view(shape)
-                k = self.norm_k(k.reshape(-1, k.shape[-1])).view(k.shape)
-            else:
-                q = self.norm_q(q)
-                k = self.norm_k(k)
+            q = self.norm_q(q)
+            k = self.norm_k(k)
         return q, k
 
     def _attn_impl(

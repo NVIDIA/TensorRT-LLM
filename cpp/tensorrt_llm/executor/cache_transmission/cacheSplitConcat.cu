@@ -762,7 +762,8 @@ __global__ void splitKVCacheForMLAKernel(T const** __restrict__ inputBlocks, T**
 template <typename T, int subWarpSize, int subWarpNumInGroup, int vecSizeByte>
 __global__ void splitKVCacheKernel(T const** __restrict__ inputBlocks, T** __restrict__ outputCaches,
     int tokensPerBlock, int numLayers, int headNum, int dimsPerHead, int inputBlockNum, int domainPPSize,
-    int domainTPSize, int headNumDomainTP, uint64_t* prefixLayerNumDevPtr)
+    int domainTPSize, int headNumDomainTP, uint64_t* prefixLayerNumDevPtr, int domainCPSize, bool isCPRoundRobin,
+    uint64_t* prefixBlockNumDevPtr)
 {
 
     // layerNumDomainPP =  numLayers/domainPPSize
@@ -776,10 +777,25 @@ __global__ void splitKVCacheKernel(T const** __restrict__ inputBlocks, T** __res
     static_assert(vecSizeByte >= sizeof(T));
     int constexpr numElePerThread = vecSizeByte / sizeof(T);
     using VecType = typename common::BytesToType<vecSizeByte>::type;
+
+    // Number of TP output caches (after duplicate head reduction).
+    int const numTPOutputCaches = headNum / headNumDomainTP;
+
 #pragma unroll 1
 
     for (int blockId = blockIdx.y; blockId < inputBlockNum; blockId += gridDim.y)
     {
+        // CP block distribution: determine which CP rank gets this block and the local block id.
+        // Default to CP round-robin.
+        int rankInDomainCP = blockId % domainCPSize;    // genCPRank to which this block belongs.
+        int blockIdInDomainCP = blockId / domainCPSize; // localBlockId on genCPRank.
+        if (domainCPSize > 1 && !isCPRoundRobin)
+        {
+            // Contiguous block distribution: use prefix sum to find the CP rank.
+            getBlockIdInDomainCPandRankInDomainCP(
+                blockId, domainCPSize, prefixBlockNumDevPtr, blockIdInDomainCP, rankInDomainCP);
+        }
+
 #pragma unroll 1
 
         for (int layerId = blockIdx.x; layerId < numLayers; layerId += gridDim.x)
@@ -802,12 +818,14 @@ __global__ void splitKVCacheKernel(T const** __restrict__ inputBlocks, T** __res
                 T const* vInputPtr = inputBlockPtr + (layerId * 2 + 1) * headNum * tokensPerBlock * dimsPerHead
                     + headId * tokensPerBlock * dimsPerHead;
 
-                int outputCacheIdx = headId / headNumDomainTP * domainPPSize + rankInDomainPP;
+                // Output cache ordering: [CP, reduced_TP, PP]
+                int const outputCacheIdx = rankInDomainCP * (numTPOutputCaches * domainPPSize)
+                    + headId / headNumDomainTP * domainPPSize + rankInDomainPP;
                 T* outputCachePtr = outputCaches[outputCacheIdx];
 
-                int headIdInDomainTP = headId % headNumDomainTP;
+                int const headIdInDomainTP = headId % headNumDomainTP;
                 T* kOutputPtr = outputCachePtr
-                    + static_cast<int64_t>(blockId)
+                    + static_cast<int64_t>(blockIdInDomainCP)
                         * (static_cast<int64_t>(layerNumInSpecPP * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead))
                     + static_cast<int64_t>(layerIdInDomainPP) * 2 * headNumDomainTP * tokensPerBlock * dimsPerHead
                     + static_cast<int64_t>(headIdInDomainTP) * tokensPerBlock * dimsPerHead;
@@ -1319,7 +1337,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
             splitKVCacheKernel<T, subWarpSize, subWarpNumInGroup, 16>
                 <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                     tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, domainPPSize, domainTPSize,
-                    headNumDomainTP, prefixLayerNumDevPtr);
+                    headNumDomainTP, prefixLayerNumDevPtr, domainCPSize, isCPRoundRobin, prefixBlockNumDevPtr);
         }
         break;
     }
@@ -1344,7 +1362,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
             splitKVCacheKernel<T, subWarpSize, subWarpNumInGroup, 8>
                 <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                     tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, domainPPSize, domainTPSize,
-                    headNumDomainTP, prefixLayerNumDevPtr);
+                    headNumDomainTP, prefixLayerNumDevPtr, domainCPSize, isCPRoundRobin, prefixBlockNumDevPtr);
         }
         break;
     }
@@ -1373,7 +1391,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheKernel<T, subWarpSize, subWarpNumInGroup, 4>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, domainPPSize, domainTPSize,
-                        headNumDomainTP, prefixLayerNumDevPtr);
+                        headNumDomainTP, prefixLayerNumDevPtr, domainCPSize, isCPRoundRobin, prefixBlockNumDevPtr);
             }
             break;
         }
@@ -1406,7 +1424,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheKernel<T, subWarpSize, subWarpNumInGroup, 2>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, domainPPSize, domainTPSize,
-                        headNumDomainTP, prefixLayerNumDevPtr);
+                        headNumDomainTP, prefixLayerNumDevPtr, domainCPSize, isCPRoundRobin, prefixBlockNumDevPtr);
             }
             break;
         }
@@ -1435,7 +1453,7 @@ void splitKVCache(std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>
                 splitKVCacheKernel<T, subWarpSize, subWarpNumInGroup, 1>
                     <<<gridDim, blockDimx, 0, bufferManager.getStream().get()>>>(inputBlockPtrsDev, outputCachePtrsDev,
                         tokensPerBlock, numLayers, headNum, dimsPerHead, inputBlockNumSum, domainPPSize, domainTPSize,
-                        headNumDomainTP, prefixLayerNumDevPtr);
+                        headNumDomainTP, prefixLayerNumDevPtr, domainCPSize, isCPRoundRobin, prefixBlockNumDevPtr);
             }
             break;
         }

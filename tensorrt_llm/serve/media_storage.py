@@ -6,14 +6,477 @@ This module provides storage handlers for persisting generated media assets
 """
 
 import os
+import shutil
+import struct
+import subprocess  # nosec B404
+import tempfile
+from abc import ABC, abstractmethod
 from io import BytesIO
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, List, Optional
 
 import torch
 from PIL import Image
 
 from tensorrt_llm.logger import logger
+
+# Video encoder availability flags (cached after first check)
+_FFMPEG_PATH: Optional[str] = None
+_VIDEO_ENCODER: Optional["VideoEncoder"] = None
+
+
+def _check_ffmpeg_available() -> bool:
+    """Check if ffmpeg CLI is available and cache its path."""
+    global _FFMPEG_PATH
+    if _FFMPEG_PATH is None:
+        ffmpeg_path = shutil.which("ffmpeg")
+        if ffmpeg_path is not None:
+            try:
+                result = subprocess.run(
+                    [ffmpeg_path, "-version"],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.returncode == 0:
+                    _FFMPEG_PATH = ffmpeg_path
+                else:
+                    _FFMPEG_PATH = ""
+            except (FileNotFoundError, OSError):
+                _FFMPEG_PATH = ""
+        else:
+            _FFMPEG_PATH = ""
+    return bool(_FFMPEG_PATH)
+
+
+def _get_ffmpeg_path() -> str:
+    """Get the cached ffmpeg path. Must call _check_ffmpeg_available() first."""
+    if _FFMPEG_PATH is None:
+        _check_ffmpeg_available()
+    return _FFMPEG_PATH or ""
+
+
+class VideoEncoder(ABC):
+    """Abstract base class for video encoders."""
+
+    @abstractmethod
+    def encode_video(
+        self,
+        video: torch.Tensor,
+        output_path: str,
+        frame_rate: float,
+        audio: Optional[torch.Tensor] = None,
+    ) -> str:
+        """Encode video frames to file.
+
+        Args:
+            video: Video frames as torch.Tensor (T, H, W, C) uint8
+            output_path: Path to save the video
+            frame_rate: Frames per second
+            audio: Optional audio as torch.Tensor
+
+        Returns:
+            Path where the video was saved
+        """
+        pass
+
+    @staticmethod
+    def _validate_video_tensor(video: torch.Tensor) -> None:
+        """Validate video tensor format."""
+        if not isinstance(video, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor for video, got {type(video)}")
+
+    @staticmethod
+    def _validate_audio_tensor(audio: torch.Tensor) -> torch.Tensor:
+        """Validate and normalize audio tensor format.
+
+        Args:
+            audio: Audio tensor in various formats
+
+        Returns:
+            Normalized audio tensor in (samples, channels) format as int16
+        """
+        if not isinstance(audio, torch.Tensor):
+            raise ValueError(f"Expected torch.Tensor for audio, got {type(audio)}")
+
+        audio_tensor = audio
+
+        # Handle different audio tensor dimensions
+        if audio_tensor.ndim == 1:
+            # Mono audio: (samples,) -> (samples, 1)
+            audio_tensor = audio_tensor[:, None]
+        elif audio_tensor.ndim == 2:
+            # If shape[1] != 2 and shape[0] == 2, transpose to (samples, channels)
+            if audio_tensor.shape[1] != 2 and audio_tensor.shape[0] == 2:
+                audio_tensor = audio_tensor.T
+            if audio_tensor.shape[1] > 2:
+                audio_tensor = audio_tensor[:, :2]
+        elif audio_tensor.ndim == 3:
+            if audio_tensor.shape[0] == 1:
+                audio_tensor = audio_tensor.squeeze(0)
+            else:
+                audio_tensor = audio_tensor[0]
+            if audio_tensor.shape[1] != 2 and audio_tensor.shape[0] == 2:
+                audio_tensor = audio_tensor.T
+            if audio_tensor.shape[1] > 2:
+                audio_tensor = audio_tensor[:, :2]
+        else:
+            raise ValueError(
+                f"Unsupported audio tensor shape: {audio_tensor.shape}. "
+                f"Expected 1D, 2D, or 3D tensor."
+            )
+
+        if audio_tensor.shape[1] > 2:
+            audio_tensor = audio_tensor[:, :2]
+
+        # Convert to int16 if needed
+        if audio_tensor.dtype != torch.int16:
+            audio_tensor = torch.clip(audio_tensor, -1.0, 1.0)
+            audio_tensor = (audio_tensor * 32767.0).to(torch.int16)
+
+        return audio_tensor
+
+
+class FfmpegCliEncoder(VideoEncoder):
+    """Video encoder using ffmpeg CLI for both encoding and muxing.
+
+    This encoder pipes raw RGB frames to ffmpeg for H.264 encoding
+    and MP4 container muxing. Does not require any Python video libraries,
+    only the ffmpeg CLI tool.
+    """
+
+    def encode_video(
+        self,
+        video: torch.Tensor,
+        output_path: str,
+        frame_rate: float,
+        audio: Optional[torch.Tensor] = None,
+    ) -> str:
+        """Encode video using ffmpeg CLI.
+
+        Args:
+            video: Video frames as torch.Tensor (T, H, W, C) uint8 RGB
+            output_path: Path to save the video
+            frame_rate: Frames per second
+            audio: Optional audio as torch.Tensor
+
+        Returns:
+            Path where the video was saved
+        """
+        self._validate_video_tensor(video)
+
+        # Convert video tensor to numpy: (T, H, W, C) uint8
+        video_np = video.cpu().numpy()
+        num_frames, height, width, channels = video_np.shape
+
+        if channels != 3:
+            raise ValueError(f"Expected 3-channel RGB video, got {channels} channels")
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            # Handle audio if provided
+            audio_input_args = []
+            audio_output_args = []
+            if audio is not None:
+                audio_tensor = self._validate_audio_tensor(audio)
+                audio_np = audio_tensor.cpu().numpy()
+                tmp_audio_path = os.path.join(tmp_dir, "audio.wav")
+                self._write_wav(tmp_audio_path, audio_np, sample_rate=24000)
+                audio_input_args = ["-i", tmp_audio_path]
+                audio_output_args = ["-c:a", "aac", "-shortest"]
+
+            # Build ffmpeg command
+            # Input: raw RGB frames piped via stdin
+            # Output: H.264 encoded MP4
+            ffmpeg_path = _get_ffmpeg_path()
+            cmd = [
+                ffmpeg_path,
+                "-y",  # Overwrite output
+                "-f",
+                "rawvideo",  # Input format
+                "-pix_fmt",
+                "rgb24",  # Pixel format
+                "-s",
+                f"{width}x{height}",  # Frame size
+                "-r",
+                str(frame_rate),  # Frame rate
+                "-i",
+                "-",  # Read from stdin
+                *audio_input_args,  # Audio input (if any)
+                "-c:v",
+                "libx264",  # Video codec
+                "-pix_fmt",
+                "yuv420p",  # Output pixel format
+                "-preset",
+                "medium",  # Encoding preset
+                "-crf",
+                "23",  # Quality (lower = better)
+                *audio_output_args,  # Audio output args (if any)
+                output_path,
+            ]
+
+            try:
+                # Run ffmpeg with raw frames piped to stdin
+                process = subprocess.Popen(
+                    cmd,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                )
+
+                # Write all frames to ffmpeg stdin
+                raw_frames = video_np.tobytes()
+                stdout, stderr = process.communicate(input=raw_frames)
+
+                if process.returncode != 0:
+                    raise RuntimeError(f"ffmpeg encoding failed: {stderr.decode()}")
+
+            except FileNotFoundError:
+                raise RuntimeError("ffmpeg not found. Install ffmpeg for video encoding.")
+
+        logger.info(f"Saved video{' with audio' if audio is not None else ''} to {output_path}")
+        return output_path
+
+    def _write_wav(self, path: str, audio: Any, sample_rate: int = 24000) -> None:
+        """Write audio to WAV file.
+
+        Args:
+            path: Output path
+            audio: Audio data as numpy array (samples, channels) int16
+            sample_rate: Audio sample rate
+        """
+        import wave
+
+        import numpy as np
+
+        # Ensure stereo
+        if audio.ndim == 1:
+            audio = np.column_stack([audio, audio])
+        elif audio.shape[1] == 1:
+            audio = np.column_stack([audio, audio])
+
+        # Interleave channels for WAV format
+        audio_interleaved = audio.flatten().astype(np.int16)
+
+        with wave.open(path, "wb") as wav_file:
+            wav_file.setnchannels(2)
+            wav_file.setsampwidth(2)  # 16-bit
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(audio_interleaved.tobytes())
+
+
+class PurePythonEncoder(VideoEncoder):
+    """Pure Python video encoder using MJPEG in AVI container.
+
+    This encoder creates Motion JPEG (MJPEG) videos in AVI format using only
+    Python standard library and PIL (for JPEG encoding). No ffmpeg or other
+    external video libraries required.
+
+    Note: Audio is not supported with this encoder.
+    """
+
+    def encode_video(
+        self,
+        video: torch.Tensor,
+        output_path: str,
+        frame_rate: float,
+        audio: Optional[torch.Tensor] = None,
+    ) -> str:
+        """Encode video as MJPEG in AVI container.
+
+        Args:
+            video: Video frames as torch.Tensor (T, H, W, C) uint8 RGB
+            output_path: Path to save the video
+            frame_rate: Frames per second
+            audio: Optional audio (NOT SUPPORTED - will be ignored with warning)
+
+        Returns:
+            Path where the video was saved
+        """
+        if audio is not None:
+            logger.warning(
+                "PurePythonEncoder does not support audio. "
+                "Audio will be ignored. Use FfmpegCliEncoder for audio support."
+            )
+
+        self._validate_video_tensor(video)
+
+        # Convert video tensor to numpy: (T, H, W, C) uint8
+        video_np = video.cpu().numpy()
+        num_frames, height, width, channels = video_np.shape
+
+        if channels != 3:
+            raise ValueError(f"Expected 3-channel RGB video, got {channels} channels")
+
+        # Convert frames to JPEG
+        jpeg_frames: List[bytes] = []
+        for frame in video_np:
+            pil_image = Image.fromarray(frame)
+            buffer = BytesIO()
+            pil_image.save(buffer, format="JPEG", quality=85)
+            jpeg_frames.append(buffer.getvalue())
+
+        # Write AVI file
+        self._write_mjpeg_avi(output_path, jpeg_frames, width, height, frame_rate)
+
+        logger.info(f"Saved video to {output_path}")
+        return output_path
+
+    def _write_mjpeg_avi(
+        self,
+        output_path: str,
+        jpeg_frames: List[bytes],
+        width: int,
+        height: int,
+        frame_rate: float,
+    ) -> None:
+        """Write MJPEG frames to AVI container.
+
+        Args:
+            output_path: Output file path
+            jpeg_frames: List of JPEG-encoded frames
+            width: Frame width
+            height: Frame height
+            frame_rate: Frames per second
+        """
+        num_frames = len(jpeg_frames)
+        usec_per_frame = int(1000000 / frame_rate)
+
+        # Build movi chunk with all frames
+        movi_data = b""
+        frame_index: List[tuple] = []  # (offset, size) for each frame
+
+        for jpeg_data in jpeg_frames:
+            original_size = len(jpeg_data)
+            # Record offset within movi (after 'movi' fourcc)
+            frame_index.append((len(movi_data) + 4, original_size))
+
+            # 00dc = compressed video chunk
+            chunk = b"00dc" + struct.pack("<I", original_size) + jpeg_data
+            # Pad to word boundary
+            if original_size % 2:
+                chunk += b"\x00"
+            movi_data += chunk
+
+        # Build index (idx1)
+        idx1_data = b""
+        for offset, size in frame_index:
+            idx1_data += b"00dc"  # chunk id
+            idx1_data += struct.pack("<I", 0x10)  # flags: AVIIF_KEYFRAME
+            idx1_data += struct.pack("<I", offset)  # offset from movi
+            idx1_data += struct.pack("<I", size)  # chunk size
+
+        # Calculate sizes
+        movi_list_size = 4 + len(movi_data)  # 'movi' + data
+        idx1_size = len(idx1_data)
+
+        # Build AVI headers
+        # Main AVI header (avih)
+        avih = struct.pack(
+            "<IIIIIIIIIIIIII",
+            usec_per_frame,  # dwMicroSecPerFrame
+            0,  # dwMaxBytesPerSec
+            0,  # dwPaddingGranularity
+            0x10,  # dwFlags (AVIF_HASINDEX)
+            num_frames,  # dwTotalFrames
+            0,  # dwInitialFrames
+            1,  # dwStreams
+            max(len(f) for f in jpeg_frames),  # dwSuggestedBufferSize
+            width,  # dwWidth
+            height,  # dwHeight
+            0,
+            0,
+            0,
+            0,  # dwReserved[4]
+        )
+
+        # Stream header (strh) for video
+        strh = struct.pack(
+            "<4s4sIHHIIIIIIIIHHHH",
+            b"vids",  # fccType
+            b"MJPG",  # fccHandler
+            0,  # dwFlags
+            0,  # wPriority
+            0,  # wLanguage
+            0,  # dwInitialFrames
+            1,  # dwScale
+            int(frame_rate),  # dwRate
+            0,  # dwStart
+            num_frames,  # dwLength
+            max(len(f) for f in jpeg_frames),  # dwSuggestedBufferSize
+            0,  # dwQuality
+            0,  # dwSampleSize
+            0,
+            0,  # rcFrame left, top
+            width,
+            height,  # rcFrame right, bottom
+        )
+
+        # Stream format (strf) for video - BITMAPINFOHEADER
+        strf = struct.pack(
+            "<IiiHHIIiiII",
+            40,  # biSize
+            width,  # biWidth
+            height,  # biHeight (positive = bottom-up, but MJPEG handles it)
+            1,  # biPlanes
+            24,  # biBitCount
+            0x47504A4D,  # biCompression = 'MJPG' (little-endian)
+            width * height * 3,  # biSizeImage
+            0,  # biXPelsPerMeter
+            0,  # biYPelsPerMeter
+            0,  # biClrUsed
+            0,  # biClrImportant
+        )
+
+        # Build strl LIST (stream list)
+        strh_chunk = b"strh" + struct.pack("<I", len(strh)) + strh
+        strf_chunk = b"strf" + struct.pack("<I", len(strf)) + strf
+        strl_data = strh_chunk + strf_chunk
+        strl_list = b"LIST" + struct.pack("<I", 4 + len(strl_data)) + b"strl" + strl_data
+
+        # Build hdrl LIST (header list)
+        avih_chunk = b"avih" + struct.pack("<I", len(avih)) + avih
+        hdrl_data = avih_chunk + strl_list
+        hdrl_list = b"LIST" + struct.pack("<I", 4 + len(hdrl_data)) + b"hdrl" + hdrl_data
+
+        # Build movi LIST
+        movi_list = b"LIST" + struct.pack("<I", movi_list_size) + b"movi" + movi_data
+
+        # Build idx1 chunk
+        idx1_chunk = b"idx1" + struct.pack("<I", idx1_size) + idx1_data
+
+        # Calculate total RIFF size
+        riff_data = hdrl_list + movi_list + idx1_chunk
+        riff_size = 4 + len(riff_data)  # 'AVI ' + data
+
+        # Write the file
+        with open(output_path, "wb") as f:
+            f.write(b"RIFF")
+            f.write(struct.pack("<I", riff_size))
+            f.write(b"AVI ")
+            f.write(riff_data)
+
+
+def get_video_encoder() -> Optional["VideoEncoder"]:
+    """Get the best available video encoder (cached singleton).
+
+    Checks availability in order:
+    1. ffmpeg CLI - Full-featured solution (supports audio)
+    2. Pure Python MJPEG/AVI - No external dependencies (video only, no audio)
+
+    Returns:
+        VideoEncoder instance, or None if no encoder is available
+    """
+    global _VIDEO_ENCODER
+    if _VIDEO_ENCODER is None:
+        if _check_ffmpeg_available():
+            logger.info("Using ffmpeg CLI for video encoding")
+            _VIDEO_ENCODER = FfmpegCliEncoder()
+        else:
+            logger.warning(
+                "FFmpeg is unavailable so no MP4 generation support."
+                "Using pure Python MJPEG/AVI encoder (no audio support)"
+            )
+            _VIDEO_ENCODER = PurePythonEncoder()
+    return _VIDEO_ENCODER
 
 
 class MediaStorage:
@@ -169,15 +632,16 @@ class MediaStorage:
 
         # Save based on format
         if format == "mp4":
-            MediaStorage._save_mp4(video, audio, output_path, frame_rate)
+            # _save_mp4 may return a different path (e.g., .avi when using PurePythonEncoder)
+            output_path = MediaStorage._save_mp4(video, audio, output_path, frame_rate)
         elif format == "gif":
-            MediaStorage._save_gif(video, output_path, frame_rate)
+            output_path = MediaStorage._save_gif(video, output_path, frame_rate)
         elif format == "png":
-            MediaStorage._save_middle_frame(video, output_path)
+            output_path = MediaStorage._save_middle_frame(video, output_path)
         else:
             logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
             output_path = output_path.rsplit(".", 1)[0] + ".mp4"
-            MediaStorage._save_mp4(video, audio, output_path, frame_rate)
+            output_path = MediaStorage._save_mp4(video, audio, output_path, frame_rate)
 
         return output_path
 
@@ -203,24 +667,28 @@ class MediaStorage:
             tmp_path = tmp_file.name
 
         try:
-            # Save to temporary file
-            MediaStorage.save_video(video, tmp_path, audio, frame_rate, format)
+            # Save to temporary file (may return different path than requested)
+            actual_path = MediaStorage.save_video(video, tmp_path, audio, frame_rate, format)
 
-            # Read bytes
-            with open(tmp_path, "rb") as f:
+            # Read bytes from the actual saved path
+            with open(actual_path, "rb") as f:
                 video_bytes = f.read()
 
             return video_bytes
         finally:
-            # Clean up temporary file
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            # Clean up temporary file(s) - check both original and actual path
+            for path in [tmp_path, actual_path if "actual_path" in locals() else None]:
+                if path and os.path.exists(path):
+                    os.unlink(path)
 
     @staticmethod
     def _save_mp4(
         video: torch.Tensor, audio: Optional[torch.Tensor], output_path: str, frame_rate: float
     ) -> str:
         """Save video with optional audio as MP4.
+
+        Uses ffmpeg CLI if available (supports audio), otherwise raises an error
+        to prompt ffmpeg installation.
 
         Args:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
@@ -230,144 +698,35 @@ class MediaStorage:
 
         Returns:
             Path where the video was saved
+
+        Raises:
+            RuntimeError: If ffmpeg is not available for MP4 encoding
         """
-        try:
-            from fractions import Fraction
-
-            import av
-
-            if not isinstance(video, torch.Tensor):
-                raise ValueError(f"Expected torch.Tensor for video, got {type(video)}")
-
-            # Convert video tensor to numpy: (T, H, W, C) uint8
-            video_np = video.cpu().numpy()
-            num_frames, height, width, channels = video_np.shape
-
-            # Ensure RGB format (3 channels)
-            if channels != 3:
-                raise ValueError(f"Expected 3-channel RGB video, got {channels} channels")
-
-            # Open output container
-            container = av.open(output_path, mode="w")
-
-            # Add video stream (H.264 codec)
-            video_stream = container.add_stream("libx264", rate=int(frame_rate))
-            video_stream.width = width
-            video_stream.height = height
-            video_stream.pix_fmt = "yuv420p"
-            video_stream.options = {"preset": "medium", "crf": "23"}
-
-            # Pre-process audio and add audio stream BEFORE any muxing.
-            # All streams must be registered before the first mux() call
-            # (which triggers container header writing).
-            audio_stream = None
-            audio_tensor = None
-            audio_sample_rate = 24000  # Default sample rate
-            if audio is not None:
-                if not isinstance(audio, torch.Tensor):
-                    raise ValueError(f"Expected torch.Tensor for audio, got {type(audio)}")
-
-                # Prepare audio tensor: convert to (samples, channels) format
-                audio_tensor = audio
-
-                # Handle different audio tensor dimensions
-                if audio_tensor.ndim == 1:
-                    # Mono audio: (samples,) -> (samples, 1)
-                    audio_tensor = audio_tensor[:, None]
-                elif audio_tensor.ndim == 2:
-                    # If shape[1] != 2 and shape[0] == 2, transpose to (samples, channels)
-                    if audio_tensor.shape[1] != 2 and audio_tensor.shape[0] == 2:
-                        audio_tensor = audio_tensor.T
-                    if audio_tensor.shape[1] > 2:
-                        audio_tensor = audio_tensor[:, :2]
-                elif audio_tensor.ndim == 3:
-                    if audio_tensor.shape[0] == 1:
-                        audio_tensor = audio_tensor.squeeze(0)
-                    else:
-                        audio_tensor = audio_tensor[0]
-                    if audio_tensor.shape[1] != 2 and audio_tensor.shape[0] == 2:
-                        audio_tensor = audio_tensor.T
-                    if audio_tensor.shape[1] > 2:
-                        audio_tensor = audio_tensor[:, :2]
-                else:
-                    raise ValueError(
-                        f"Unsupported audio tensor shape: {audio_tensor.shape}. "
-                        f"Expected 1D, 2D, or 3D tensor."
-                    )
-
-                if audio_tensor.shape[1] > 2:
-                    audio_tensor = audio_tensor[:, :2]
-
-                # Convert to int16 if needed
-                if audio_tensor.dtype != torch.int16:
-                    audio_tensor = torch.clip(audio_tensor, -1.0, 1.0)
-                    audio_tensor = (audio_tensor * 32767.0).to(torch.int16)
-
-                # Add audio stream now (before any muxing)
-                audio_stream = container.add_stream("aac", rate=audio_sample_rate)
-                audio_stream.codec_context.sample_rate = audio_sample_rate
-                audio_stream.codec_context.layout = "stereo"
-                audio_stream.codec_context.time_base = Fraction(1, audio_sample_rate)
-
-            # --- Encode video frames ---
-            for frame_array in video_np:
-                frame = av.VideoFrame.from_ndarray(frame_array, format="rgb24")
-                for packet in video_stream.encode(frame):
-                    container.mux(packet)
-
-            # Flush video encoder
-            for packet in video_stream.encode():
-                container.mux(packet)
-
-            # --- Encode audio (after video is done) ---
-            if audio_stream is not None and audio_tensor is not None:
-                # Build packed int16 frame: (1, samples*channels)
-                audio_np = audio_tensor.contiguous().reshape(1, -1).cpu().numpy()
-
-                frame_in = av.AudioFrame.from_ndarray(audio_np, format="s16", layout="stereo")
-                frame_in.sample_rate = audio_sample_rate
-
-                # Use AudioResampler to convert s16→fltp (AAC's native format)
-                cc = audio_stream.codec_context
-                audio_resampler = av.audio.resampler.AudioResampler(
-                    format=cc.format or "fltp",
-                    layout=cc.layout or "stereo",
-                    rate=cc.sample_rate or audio_sample_rate,
-                )
-
-                audio_next_pts = 0
-                for rframe in audio_resampler.resample(frame_in):
-                    if rframe.pts is None:
-                        rframe.pts = audio_next_pts
-                    audio_next_pts += rframe.samples
-                    rframe.sample_rate = audio_sample_rate
-                    container.mux(audio_stream.encode(rframe))
-
-                # Flush audio encoder
-                for packet in audio_stream.encode():
-                    container.mux(packet)
-
-            # Close container
-            container.close()
-
-            logger.info(f"Saved video{' with audio' if audio is not None else ''} to {output_path}")
-            return output_path
-
-        except ImportError:
-            logger.warning(
-                "PyAV (av) library not available. "
-                "Falling back to saving middle frame as PNG. "
-                "Install with: pip install av"
+        # Check if ffmpeg is required but not available
+        encoder = get_video_encoder()
+        if isinstance(encoder, PurePythonEncoder) and output_path.lower().endswith(".mp4"):
+            raise RuntimeError(
+                "MP4 format requires ffmpeg to be installed. Please install ffmpeg "
+                "(e.g., 'apt-get install ffmpeg' on Ubuntu/Debian) or use AVI format instead. "
+                "See https://ffmpeg.org/download.html for installation instructions."
             )
-            png_path = output_path.replace(".mp4", ".png")
-            return MediaStorage._save_middle_frame(video, png_path)
+
+        try:
+            if encoder is not None:
+                return encoder.encode_video(video, output_path, frame_rate, audio)
+            else:
+                logger.warning(
+                    "No video encoder available. Falling back to saving middle frame as PNG."
+                )
+                png_path = os.path.splitext(output_path)[0] + ".png"
+                return MediaStorage._save_middle_frame(video, png_path)
         except Exception as e:
-            logger.error(f"Error encoding video with PyAV: {e}")
+            logger.error(f"Error encoding video: {e}")
             import traceback
 
             logger.error(traceback.format_exc())
             logger.warning("Falling back to saving middle frame as PNG.")
-            png_path = output_path.replace(".mp4", ".png")
+            png_path = os.path.splitext(output_path)[0] + ".png"
             return MediaStorage._save_middle_frame(video, png_path)
 
     @staticmethod
