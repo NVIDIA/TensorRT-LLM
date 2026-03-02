@@ -7,6 +7,8 @@ import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
 from tensorrt_llm import deep_gemm
+from tensorrt_llm._torch.modules.fused_moe.routing import (
+    ROUTING_METHOD_TYPE_TO_CLASS, RoutingMethodType)
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
@@ -34,6 +36,75 @@ def bmm_out(a: torch.Tensor, b: torch.Tensor, out: torch.Tensor) -> None:
     torch.bmm(a, b, out=out)
 
 
+def prepare_dummy_token_selected_experts_hook(
+    input: torch.Tensor,
+    top_k: int,
+    num_experts: int,
+    n_group: Optional[int],
+    topk_group: Optional[int],
+    routed_scaling_factor: Optional[float],
+    routing_method_type: int = int(RoutingMethodType.Default),
+    use_customized_router: bool = False,
+):
+    """
+    Creates a hook function that generates dummy token_selected_experts for tuning.
+
+    Args:
+        input: Input tensor to determine shape and device
+        top_k: Number of experts per token
+        num_experts: Total number of experts
+        routing_method_type: Type of routing method to use
+
+    Returns:
+        A hook function that can be used with the tuner
+    """
+    tuner = AutoTuner.get()
+    if not tuner.is_tuning_mode or not use_customized_router:
+        return lambda inputs: inputs
+
+    input_tensor = input[0]
+
+    # Get routing method
+    routing_cls_kwargs = {}
+    if routing_method_type == int(RoutingMethodType.DeepSeekV3):
+        routing_cls_kwargs.update({
+            'n_group':
+            n_group,
+            'topk_group':
+            topk_group,
+            'routed_scaling_factor':
+            routed_scaling_factor,
+            'is_fused':
+            False,
+            'callable_e_score_correction_bias':
+            lambda: torch.randn(
+                num_experts, dtype=torch.bfloat16, device=input_tensor.device)
+        })
+    routing_method = ROUTING_METHOD_TYPE_TO_CLASS[routing_method_type](
+        top_k=top_k, **routing_cls_kwargs)
+
+    def create_dummy_token_selected_experts(
+        inputs: List[torch.Tensor], ) -> List[torch.Tensor]:
+        input_tensor = inputs[0]  # First tensor is the input
+        # Generate dummy routing logits with correct shape
+        routing_logits_for_tuner = torch.randn(input_tensor.shape[0],
+                                               num_experts,
+                                               dtype=torch.bfloat16,
+                                               device=input_tensor.device)
+
+        # Apply routing to get properly shaped token_selected_experts
+        topk_ids_for_tuner, topk_weights_for_tuner = routing_method.apply(
+            routing_logits_for_tuner)
+
+        # Replace the token_selected_experts tensor (inputs[1]) with our generated one
+        if len(inputs) > 1:
+            inputs[1] = topk_ids_for_tuner
+
+        return inputs
+
+    return create_dummy_token_selected_experts
+
+
 class MoERunner(TunableRunner):
     # avoid overhead of creating a new runner in forward pass
     runner_dict = dict()
@@ -41,7 +112,9 @@ class MoERunner(TunableRunner):
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets,
             last_positive_power_of_2), ),
+        constraint_specs=(ConstraintSpec(1, 0, lambda shapes: shapes[0][0]), ),
         tune_max_num_tokens=8192,
+        inputs_pre_hook=None,  # Will be set dynamically in fused_moe function
         distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
     )
 
@@ -86,6 +159,7 @@ class MoERunner(TunableRunner):
         self.use_fused_finalize = use_fused_finalize
         self.activation_type = activation_type
         self.unpadded_hidden_size = unpadded_hidden_size if unpadded_hidden_size is not None else 0
+        self.use_customized_router = False
 
         instance_key = (x_dtype, weight_dtype, output_dtype,
                         use_deepseek_fp8_block_scale, use_w4_group_scaling,
@@ -130,10 +204,12 @@ class MoERunner(TunableRunner):
         gemm_idx: int = 0,
         tactic: int = -1,
         do_preparation: bool = False,
+        **kwargs,
     ):
-        x, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
+        x, token_selected_experts, fc1_expert_weights, fc1_expert_biases, fc2_expert_weights, fc2_expert_biases = inputs
         self.fused_moe_runner.run_gemm_profile(
             x,
+            token_selected_experts,
             fc1_expert_weights,
             fc1_expert_biases,
             fc2_expert_weights,
@@ -152,6 +228,7 @@ class MoERunner(TunableRunner):
             do_preparation,
             self.activation_type,
             self.unpadded_hidden_size,
+            self.use_customized_router,
         )
 
 
@@ -188,6 +265,10 @@ def fused_moe(
     tuner_num_tokens: Optional[int] = None,
     tuner_top_k: Optional[int] = None,
     activation_type: int = int(ActivationType.Swiglu),
+    routing_method_type: int = int(RoutingMethodType.Default),
+    n_group: Optional[int] = None,
+    topk_group: Optional[int] = None,
+    routed_scaling_factor: Optional[float] = None,
     unpadded_hidden_size: Optional[int] = None,
     out_tensor: Optional[torch.Tensor] = None,
 ) -> List[torch.Tensor]:
@@ -227,28 +308,44 @@ def fused_moe(
         unpadded_hidden_size=unpadded_hidden_size,
     )
 
-    MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+    tuning_config = MoERunner.tuning_config
+    tuning_config.inputs_pre_hook = prepare_dummy_token_selected_experts_hook(
+        tuner_input,
+        tuner_top_k,
+        fc1_expert_weights.shape[0] *
+        ep_size,  # num_experts from weight tensor shape
+        n_group,
+        topk_group,
+        routed_scaling_factor,
+        routing_method_type,
+        moe_runner.use_customized_router,
+    )
 
+    MoERunner.tuning_config.tune_max_num_tokens = tune_max_num_tokens
+    input_tensors = [
+        tuner_input,
+        token_selected_experts,
+        fc1_expert_weights,
+        fc1_expert_biases,
+        fc2_expert_weights,
+        fc2_expert_biases,
+    ]
     _, gemm_tactic_1 = tuner.choose_one(
         "trtllm::fused_moe::gemm1",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        input_tensors,
         gemm_idx=1,
+        ep_size=ep_size,
     )
 
     _, gemm_tactic_2 = tuner.choose_one(
         "trtllm::fused_moe::gemm2",
         [moe_runner],
         MoERunner.tuning_config,
-        [
-            tuner_input, fc1_expert_weights, fc1_expert_biases,
-            fc2_expert_weights, fc2_expert_biases
-        ],
+        input_tensors,
         gemm_idx=2,
+        ep_size=ep_size,
     )
 
     run_moe = moe_runner.fused_moe_runner.run_moe_min_latency if min_latency_mode else moe_runner.fused_moe_runner.run_moe
@@ -313,7 +410,11 @@ def _(input: torch.Tensor,
       tune_max_num_tokens: int = 8192,
       tuner_num_tokens: Optional[int] = None,
       tuner_top_k: Optional[int] = None,
-      activation_type: ActivationType = ActivationType.Swiglu,
+      activation_type: int = int(ActivationType.Swiglu),
+      routing_method_type: int = int(RoutingMethodType.Default),
+      n_group: Optional[int] = None,
+      topk_group: Optional[int] = None,
+      routed_scaling_factor: Optional[float] = None,
       unpadded_hidden_size: Optional[int] = None,
       out_tensor: Optional[torch.Tensor] = None):
     seq_len = input.shape[0]
