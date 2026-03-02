@@ -23,22 +23,30 @@ from _torch.helpers import calc_diff, per_block_cast_to_fp8
 from utils.util import getSMVersion
 
 from tensorrt_llm._torch.autotuner import AutoTuner
+from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import (
+    FP8BlockScalingGroupedGemmInputsHelper,
+)
 
 
-def _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_experts, k, n, max_tokens_per_group):
+def _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_tokens, num_experts, top_k, k, n):
     """Prepare inputs and reference output for fp8 block-scale grouped GEMM."""
     random.seed(0)
     torch.random.manual_seed(0)
 
-    group_m = []
-    for i in range(num_experts):
-        group_m.append(random.randint(0, max_tokens_per_group))
-    group_m = torch.tensor(group_m, dtype=torch.int32, device="cuda")
-    group_m_cum = torch.cumsum(group_m, dim=0)
-    group_offset = torch.cat([torch.zeros(1, dtype=torch.int32, device="cuda"), group_m_cum], dim=0)
-    group_offset = group_offset.to(torch.int32)
+    helper = FP8BlockScalingGroupedGemmInputsHelper(
+        num_experts=num_experts,
+        top_k=top_k,
+        num_local_experts=num_experts,
+        local_expert_offset=0,
+    )
+    num_tokens_per_expert = helper.generate_num_tokens_per_expert(num_tokens, approx_max_load=True)
 
-    m = sum(group_m)
+    group_offset = torch.zeros(num_experts + 1, dtype=torch.int32, device="cuda")
+    group_offset[1:] = torch.cumsum(
+        torch.tensor(num_tokens_per_expert, dtype=torch.int32, device="cuda"), dim=0
+    )
+
+    m = int(group_offset[-1].item())
     a = torch.randn((m, k), device="cuda", dtype=dtype) / k
     b = torch.randn((num_experts, n, k), device="cuda", dtype=dtype) / k
     output_expected = torch.zeros((m, n), device="cuda", dtype=dtype)
@@ -65,14 +73,13 @@ def _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_experts, k, n, max_t
     getSMVersion() not in (100, 103),
     reason="The test is for SM100/SM103. Current SM is %d." % getSMVersion(),
 )
-@pytest.mark.parametrize("num_experts", [72])
-@pytest.mark.parametrize("k", [1536])
-@pytest.mark.parametrize("n", [2560])
-@pytest.mark.parametrize("max_tokens_per_group", [10, 50, 100, 128, 256, 512, 1000, 1024])
+@pytest.mark.parametrize("num_tokens", [1024, 8192])
+@pytest.mark.parametrize("num_experts, top_k", [(72, 6), (256, 8)])
+@pytest.mark.parametrize("k, n", [(7168, 2048), (2048, 7168), (2560, 1536), (1536, 2560)])
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
-def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_experts, k, n, max_tokens_per_group):
+def test_cute_dsl_fp8_block_scale_grouped_gemm(dtype, num_tokens, num_experts, top_k, k, n):
     a_fp8, a_scale, b_fp8, b_scale, group_offset, output_expected = (
-        _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_experts, k, n, max_tokens_per_group)
+        _prepare_fp8_block_scale_grouped_gemm_inputs(dtype, num_tokens, num_experts, top_k, k, n)
     )
 
     with AutoTuner.get().capture() as tactics_capture:
