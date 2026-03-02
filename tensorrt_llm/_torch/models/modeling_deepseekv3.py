@@ -1884,23 +1884,24 @@ class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         model_config = copy.copy(model_config)
-        if hasattr(model_config.pretrained_config, 'text_config'):
-            model_config._frozen = False
-            model_config.pretrained_config = model_config.pretrained_config.text_config
-            if model_config.quant_config.exclude_modules:
-                model_config.quant_config = copy.copy(model_config.quant_config)
-                p = self._LANG_PREFIX
-                mapped = []
-                for m in model_config.quant_config.exclude_modules:
-                    if m.startswith(p):
-                        rest = m[len(p):]
-                        if rest.startswith('layers.'):
-                            rest = 'model.' + rest
-                        mapped.append(rest)
-                    else:
-                        mapped.append(m)
-                model_config.quant_config.exclude_modules = mapped
-            model_config._frozen = True
+        assert hasattr(model_config.pretrained_config, 'text_config'), \
+            "KimiK25 config must have text_config"
+        model_config._frozen = False
+        model_config.pretrained_config = model_config.pretrained_config.text_config
+        if model_config.quant_config.exclude_modules:
+            model_config.quant_config = copy.copy(model_config.quant_config)
+            p = self._LANG_PREFIX
+            mapped = []
+            for m in model_config.quant_config.exclude_modules:
+                if m.startswith(p):
+                    rest = m[len(p):]
+                    if rest.startswith('layers.'):
+                        rest = 'model.' + rest
+                    mapped.append(rest)
+                else:
+                    mapped.append(m)
+            model_config.quant_config.exclude_modules = mapped
+        model_config._frozen = True
         super().__init__(model_config)
 
     def load_weights(self, weights: ConsumableWeightsDict):
