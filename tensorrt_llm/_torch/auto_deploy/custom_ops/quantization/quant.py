@@ -62,6 +62,20 @@ FP4_MAX = 6.0
 FP4_GLOBAL_SCALE_MAX = FP8_MAX * FP4_MAX
 
 
+def _resolve_out_dtype_or_raise(out_dtype: str) -> torch.dtype:
+    try:
+        dtype = getattr(torch, out_dtype)
+    except AttributeError as e:
+        raise RuntimeError(
+            f"Unsupported out_dtype={out_dtype!r}; expected a valid torch dtype name."
+        ) from e
+    if dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise RuntimeError(
+            f"Unsupported out_dtype={out_dtype!r}; expected one of float16/bfloat16/float32."
+        )
+    return dtype
+
+
 def _to_fp8(x, scale):
     return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
 
@@ -145,7 +159,7 @@ def trtllm_quant_fp8_linear(
     # dtype must be explicit (out_dtype) or inferable from bias dtype.
     if input.dtype == torch.float8_e4m3fn:
         if out_dtype is not None:
-            input_dtype = getattr(torch, out_dtype)
+            input_dtype = _resolve_out_dtype_or_raise(out_dtype)
         elif bias is not None and bias.dtype in (torch.float16, torch.bfloat16, torch.float32):
             input_dtype = bias.dtype
         else:
@@ -183,7 +197,7 @@ def trtllm_quant_fp8_linear_fake(
     # Match real op behavior: FP8 input requires explicit output dtype.
     if input.dtype == torch.float8_e4m3fn:
         if out_dtype is not None:
-            linear_out_dtype = getattr(torch, out_dtype)
+            linear_out_dtype = _resolve_out_dtype_or_raise(out_dtype)
         elif bias is not None and bias.dtype in (torch.float16, torch.bfloat16, torch.float32):
             linear_out_dtype = bias.dtype
         else:
@@ -207,8 +221,9 @@ def trtllm_fp8_prequant_linear(
 ) -> torch.Tensor:
     """FP8 linear op for already-quantized activations."""
     assert input_fp8.dtype == torch.float8_e4m3fn
+    assert input_scale is not None
 
-    output_dtype = getattr(torch, out_dtype)
+    output_dtype = _resolve_out_dtype_or_raise(out_dtype)
     output = _trtllm_fp8_prequant_linear_core(
         input_fp8, weight_fp8, input_scale, weight_scale, output_dtype
     )
@@ -226,7 +241,8 @@ def trtllm_fp8_prequant_linear_fake(
     weight_scale: Optional[torch.Tensor] = None,
     out_dtype: str = "bfloat16",
 ) -> torch.Tensor:
-    output_dtype = getattr(torch, out_dtype)
+    assert input_scale is not None
+    output_dtype = _resolve_out_dtype_or_raise(out_dtype)
     n = weight_fp8.shape[0]
     out_shape = (*input_fp8.shape[:-1], n)
     return torch.empty(out_shape, dtype=output_dtype, device=input_fp8.device)

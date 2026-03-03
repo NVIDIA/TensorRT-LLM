@@ -24,8 +24,12 @@ from torch.fx import GraphModule, Node
 from ...custom_ops.normalization.flashinfer_fused_add_rms_norm import flashinfer_fused_add_rms_norm
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
-from ...utils._graph import get_attr_by_name
-from ...utils.node_utils import extract_op_args, extract_output_tuple, is_op
+from ...utils.node_utils import (
+    extract_op_args,
+    extract_output_tuple,
+    get_shared_input_scale_for_fp8_linears,
+    is_op,
+)
 from ..interface import (
     BaseTransform,
     SharedConfig,
@@ -35,42 +39,10 @@ from ..interface import (
 )
 
 
-def _same_scale_source(a: Node, b: Node, gm: "GraphModule | None" = None) -> bool:
-    if a is b:
-        return True
-    if a.op == "get_attr" and b.op == "get_attr":
-        if a.target == b.target:
-            return True
-        if gm is not None:
-            try:
-                val_a = get_attr_by_name(gm, a.target)
-                val_b = get_attr_by_name(gm, b.target)
-            except AttributeError:
-                return False
-            if isinstance(val_a, torch.Tensor) and isinstance(val_b, torch.Tensor):
-                return torch.equal(val_a, val_b)
-    return False
-
-
 def _find_fp8_linear_consumers(
     norm_node: Node,
-    gm: "GraphModule | None" = None,
 ) -> Tuple[List[Node], "Node | None"]:
-    fp8_linear_users = []
-    shared_scale = None
-
-    for user in norm_node.users:
-        if is_op(user, torch.ops.auto_deploy.trtllm_quant_fp8_linear):
-            _, _, _, in_scale, _ = extract_op_args(
-                user, "input", "weight_fp8", "bias", "input_scale", "weight_scale"
-            )
-            if shared_scale is None:
-                shared_scale = in_scale
-            elif not _same_scale_source(in_scale, shared_scale, gm):
-                return [], None
-            fp8_linear_users.append(user)
-
-    return fp8_linear_users, shared_scale
+    return get_shared_input_scale_for_fp8_linears(norm_node.users)
 
 
 def _get_out_dtype_str(norm_node: Node) -> str:
@@ -137,7 +109,7 @@ class FuseRMSNormQuantFP8(BaseTransform):
             if fused_node is not None and id(fused_node) in processed_fused_nodes:
                 continue
 
-            fp8_linear_users, _ = _find_fp8_linear_consumers(node, gm)
+            fp8_linear_users, _ = _find_fp8_linear_consumers(node)
             if not fp8_linear_users:
                 continue
 

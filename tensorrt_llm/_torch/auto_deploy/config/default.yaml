@@ -142,6 +142,7 @@ transforms:
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    requires_shape_prop: true
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm

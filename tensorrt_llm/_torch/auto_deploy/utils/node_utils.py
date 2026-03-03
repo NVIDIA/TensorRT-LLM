@@ -523,6 +523,34 @@ def collect_terminal_users_through_passthrough(
     return terminal_users, True
 
 
+def get_shared_input_scale_for_fp8_linears(
+    nodes: Iterable[Node],
+) -> Tuple[List[Node], Optional[Node]]:
+    """Return FP8 linear nodes and their shared input_scale if one exists."""
+    fp8_linear_nodes: List[Node] = [
+        node for node in nodes if is_op(node, torch.ops.auto_deploy.trtllm_quant_fp8_linear)
+    ]
+    if not fp8_linear_nodes:
+        return [], None
+
+    first_scale = extract_op_args(
+        fp8_linear_nodes[0], "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+    )[3]
+    if not isinstance(first_scale, Node):
+        return [], None
+
+    for node in fp8_linear_nodes[1:]:
+        scale = extract_op_args(node, "input", "weight_fp8", "bias", "input_scale", "weight_scale")[
+            3
+        ]
+        if not isinstance(scale, Node):
+            return [], None
+        if scale is not first_scale and scale.target != first_scale.target:
+            return [], None
+
+    return fp8_linear_nodes, first_scale
+
+
 def filtered_nodes(
     nodes: Iterable[Node],
     target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,

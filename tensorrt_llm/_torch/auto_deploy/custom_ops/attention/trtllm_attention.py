@@ -43,7 +43,7 @@ from ...utils.logger import ad_logger
 from ...utils.node_utils import (
     collect_terminal_users_through_passthrough,
     extract_op_args,
-    is_op,
+    get_shared_input_scale_for_fp8_linears,
     set_op_args,
 )
 from ..attention_interface import (
@@ -636,11 +636,7 @@ class TrtllmAttention(AttentionDescriptor):
             source_attn_node, max_traversal_nodes=256
         )
 
-        fp8_users = [
-            user
-            for user in terminal_users
-            if is_op(user, torch.ops.auto_deploy.trtllm_quant_fp8_linear)
-        ]
+        fp8_users, first_scale = get_shared_input_scale_for_fp8_linears(terminal_users)
         if traversal_ok and fp8_users and len(fp8_users) == len(terminal_users):
             # trtllm_quant_fp8_linear needs explicit out_dtype when input is already FP8
             # and bias is absent.
@@ -651,25 +647,12 @@ class TrtllmAttention(AttentionDescriptor):
             if out_dtype_str is not None:
                 for user in fp8_users:
                     set_op_args(user, out_dtype=out_dtype_str)
-
-            first_scale = extract_op_args(
-                fp8_users[0], "input", "weight_fp8", "bias", "input_scale", "weight_scale"
-            )[3]
-            if isinstance(first_scale, Node):
-                same_scale = True
-                for user in fp8_users[1:]:
-                    user_scale = extract_op_args(
-                        user, "input", "weight_fp8", "bias", "input_scale", "weight_scale"
-                    )[3]
-                    if not isinstance(user_scale, Node) or user_scale.target != first_scale.target:
-                        same_scale = False
-                        break
-                if same_scale:
-                    # Ensure graph topological order: first_scale is often first created
-                    # at the downstream linear, so move it before attention if needed.
-                    if first_scale.op == "get_attr":
-                        source_attn_node.prepend(first_scale)
-                    out_scale = first_scale
+            if first_scale is not None:
+                # Ensure graph topological order: first_scale is often first created
+                # at the downstream linear, so move it before attention if needed.
+                if first_scale.op == "get_attr":
+                    source_attn_node.prepend(first_scale)
+                out_scale = first_scale
 
         return [
             scale,
