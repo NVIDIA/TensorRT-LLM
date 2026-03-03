@@ -402,6 +402,9 @@ def create_py_executor(
             dist=dist,
             spec_config=spec_config,
             checkpoint_loader=checkpoint_loader,
+            model_weights_memory_tag=(
+                ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value
+                if enable_sleep else None),
         )
 
     validate_feature_combination(llm_args, model_engine, llm_args.sampler_type)
@@ -464,6 +467,9 @@ def create_py_executor(
                 spec_config=draft_spec_config,
                 is_draft_model=True,
                 drafting_loop_wrapper=drafting_loop_wrapper,
+                model_weights_memory_tag=(
+                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT.value
+                    if enable_sleep else None),
             )
             # For DeepseekV3 MTP, we need to set the num_hidden_layers to 1 for the draft model
             if spec_config.spec_dec_mode.is_mtp_eagle():
