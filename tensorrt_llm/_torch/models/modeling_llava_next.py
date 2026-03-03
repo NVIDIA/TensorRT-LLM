@@ -95,6 +95,46 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         image_token = processor.image_token
         return image_token * num_images
 
+    def _expand_image_placeholders_in_token_ids(
+        self,
+        prompt_token_ids: List[int],
+        num_mm_tokens_per_image: List[int],
+    ) -> Tuple[List[int], List[int], List[int]]:
+        """
+        Shared logic: replace each image placeholder token in prompt_token_ids
+        with placeholder_id repeated num_mm_tokens_per_image[i] times.
+
+        Returns:
+            (expanded_ids, mm_token_length, mm_token_offsets)
+        """
+        image_token_id = self.config.image_token_index
+        placeholder_id = self.vocab_size + 1
+
+        expanded: List[int] = []
+        mm_token_length: List[int] = []
+        mm_token_offsets: List[int] = []
+        image_idx = 0
+        for tok in prompt_token_ids:
+            if tok == image_token_id:
+                if image_idx >= len(num_mm_tokens_per_image):
+                    raise ValueError(
+                        "More image placeholder tokens in prompt than "
+                        "num_mm_tokens_per_image entries")
+                n = num_mm_tokens_per_image[image_idx]
+                mm_token_offsets.append(len(expanded))
+                expanded.extend([placeholder_id] * n)
+                mm_token_length.append(n)
+                image_idx += 1
+            else:
+                expanded.append(tok)
+
+        if image_idx != len(num_mm_tokens_per_image):
+            raise ValueError(
+                f"Expected {len(num_mm_tokens_per_image)} image placeholders, "
+                f"found {image_idx}. Ensure the prompt contains the model image "
+                f"placeholder (token id {image_token_id}).")
+        return expanded, mm_token_length, mm_token_offsets
+
     def expand_prompt_token_ids_for_mm(
         self,
         prompt_token_ids: List[int],
@@ -107,29 +147,8 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
         hf_processor_mm_kwargs is optional; LLaVA does not use it for expansion.
         """
-        image_token_id = self.config.image_token_index
-        vocab_size = self.config.vocab_size
-        placeholder_id = vocab_size + 1
-
-        expanded: List[int] = []
-        image_idx = 0
-        for tok in prompt_token_ids:
-            if tok == image_token_id:
-                if image_idx >= len(num_mm_tokens_per_image):
-                    raise ValueError(
-                        "More image placeholder tokens in prompt than "
-                        "num_mm_tokens_per_image entries")
-                n = num_mm_tokens_per_image[image_idx]
-                expanded.extend([placeholder_id] * n)
-                image_idx += 1
-            else:
-                expanded.append(tok)
-
-        if image_idx != len(num_mm_tokens_per_image):
-            raise ValueError(
-                f"Expected {len(num_mm_tokens_per_image)} image placeholders, "
-                f"found {image_idx}. Ensure the prompt contains the model image "
-                f"placeholder (token id {image_token_id}).")
+        expanded, _, _ = self._expand_image_placeholders_in_token_ids(
+            prompt_token_ids, num_mm_tokens_per_image)
         return expanded
 
     def _postprocess(
@@ -215,14 +234,16 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     def get_prompt_token_ids(
-        self, inputs: TextPrompt,
+        self, prompt_token_ids: List[int],
         mm_handles: List[Dict[str,
                               Any]]) -> Tuple[List[int], List[int], List[int]]:
         """
         Build input token ids with multimodal placeholders expanded to the number of MM tokens.
 
+        Uses an already tokenized prompt. Delegates expansion to _expand_image_placeholders_in_token_ids.
+
         Args:
-            inputs: Text prompt input container. Must contain a non-empty prompt string.
+            prompt_token_ids: An already tokenized text prompt.
             mm_handles: List of multimodal embedding handles.
 
         Returns:
@@ -231,11 +252,6 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 - mm_token_length: per-image MM token lengths
                 - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
         """
-        # TODO: Move this function to the base input processor class when extending for more models
-        text_prompt = inputs.get("prompt")
-        if not text_prompt:
-            raise ValueError("Text prompt is required but not provided")
-
         if not isinstance(mm_handles, list):
             raise ValueError("mm_handles must be a list")
 
@@ -246,49 +262,27 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 raise RuntimeError(
                     f"Multimodal embedding {i} hidden size {hidden_size} must match model hidden size {expected_hidden_size}"
                 )
-        input_ids = self.tokenizer(text_prompt,
-                                   return_tensors="pt").input_ids[0]
 
-        vocab_size = self.config.text_config.vocab_size
-        image_token_index = self.config.image_token_index
+        num_mm_tokens_per_image = [h["tensor_size"][0] for h in mm_handles]
+        expanded_ids, mm_token_length, mm_token_offsets = (
+            self._expand_image_placeholders_in_token_ids(
+                prompt_token_ids, num_mm_tokens_per_image))
 
-        image_mask = input_ids == image_token_index
-        image_positions = torch.where(image_mask)[0]
-        num_images = len(image_positions)
-        assert num_images == len(
-            mm_handles), "Number of images must match number of mm_handles"
-        total_mm_tokens = sum(mm_handle["tensor_size"][0]
-                              for mm_handle in mm_handles)
-        final_length = len(input_ids) - num_images + total_mm_tokens
-        # Create output tensor
-        expanded_ids = torch.empty(final_length, dtype=input_ids.dtype)
-        placeholder_id = vocab_size + 1
-
-        # Fill the expanded sequence
-        write_pos = 0
-        image_cnt = 0
-        mm_token_length = []
-        mm_token_offsets = []
-        for read_pos in range(len(input_ids)):
-            if input_ids[read_pos] == image_token_index:
-                # Replace with placeholder id
-                mm_token_num = mm_handles[image_cnt]["tensor_size"][0]
-                expanded_ids[write_pos:write_pos + mm_token_num] = \
-                    placeholder_id
-                mm_token_offsets.append(write_pos)
-                mm_token_length.append(mm_token_num)
-                write_pos += mm_token_num
-                image_cnt += 1
-            else:
-                # Copy text token as-is
-                expanded_ids[write_pos] = input_ids[read_pos]
-                write_pos += 1
-
-        assert write_pos == final_length, f"Write position mismatch: {write_pos} != {final_length}"
-        assert mm_token_length[-1] + mm_token_offsets[
-            -1] <= final_length, f"mm_token_length[-1] + mm_token_offsets[-1] ({mm_token_length[-1] + mm_token_offsets[-1]}) should be less than or equal to final_length ({final_length})"
-        return expanded_ids.to(
-            torch.int32).tolist(), mm_token_length, mm_token_offsets
+        # Final assertions to check the correctness of the expanded ids.
+        final_length = len(expanded_ids)
+        expected_final_length = (len(prompt_token_ids) -
+                                 len(num_mm_tokens_per_image) +
+                                 sum(num_mm_tokens_per_image))
+        assert final_length == expected_final_length, (
+            f"Write position mismatch: {final_length} != {expected_final_length}"
+        )
+        if mm_token_length:
+            assert mm_token_length[-1] + mm_token_offsets[-1] <= final_length, (
+                f"mm_token_length[-1] + mm_token_offsets[-1] "
+                f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
+                f"than or equal to final_length ({final_length})")
+        logger.info(f"expanded_ids: {expanded_ids}")
+        return expanded_ids, mm_token_length, mm_token_offsets
 
     def attach_multimodal_embeddings(
         self, inputs: TextPrompt,

@@ -491,13 +491,17 @@ class BaseLLM:
         prompt = None
 
         if is_mm_disagg:
+            logger.info(f"[preprocess] is_mm_disagg: {is_mm_disagg}")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
             prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
-                inputs, mm_handles)
+                inputs["prompt_token_ids"], mm_handles)
+            logger.info(
+                f"After returning from get_prompt_token_ids: {prompt_token_ids}"
+            )
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -525,7 +529,13 @@ class BaseLLM:
         elif "prompt" in inputs or ("prompt_token_ids" in inputs and
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
-            if 'multi_modal_data' in inputs and inputs['multi_modal_data']:
+            # _mm_data = inputs.get('multi_modal_data')
+            # _has_mm_data = (_mm_data is not None and
+            #                 (not isinstance(_mm_data, dict) or len(_mm_data) > 0))
+            # _mm_emb = inputs.get('multi_modal_embeddings')
+            # _has_mm_emb = (_mm_emb is not None and
+            #                (not isinstance(_mm_emb, dict) or len(_mm_emb) > 0))
+            if 'multi_modal_data' in inputs:  #and _has_mm_data:
                 logger.info(
                     f"[preprocess] multi_modal_data: {inputs['multi_modal_data']}"
                 )
@@ -539,8 +549,7 @@ class BaseLLM:
                 with nvtx_range_debug("input_processor_with_hash"):
                     prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                         inputs, sampling_params)
-            elif 'multi_modal_embeddings' in inputs and inputs[
-                    'multi_modal_embeddings']:
+            elif 'multi_modal_embeddings' in inputs:  #and _has_mm_emb:
                 logger.info(
                     f"[preprocess] multi_modal_embeddings: {inputs['multi_modal_embeddings']}"
                 )
