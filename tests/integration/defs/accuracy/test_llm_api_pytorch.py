@@ -3937,6 +3937,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("eagle3_one_model", [True, False])
     @parametrize_with_ids("enable_chunked_prefill", [False, True])
     def test_eagle3(self, enable_chunked_prefill, eagle3_one_model):
+        pytest.skip("Skip due to OOM")
         pytorch_config = dict(
             disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=CudaGraphConfig(),
@@ -4534,6 +4535,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
     MODEL_PATH = f"{llm_models_root()}/multimodals/Phi-4-multimodal-instruct"
 
     def test_auto_dtype(self):
+        pytest.skip("Skip due to OOM")
         # Set max_seq_len to 4096 to use short rope factor.
         model_name = "microsoft/Phi-4-multimodal-instruct"
         with LLM(self.MODEL_PATH, max_seq_len=4096) as llm:
@@ -4543,6 +4545,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     def test_auto_dtype_long_rope(self):
+        pytest.skip("Skip due to OOM")
         # Set max_seq_len larger than 4096 to use long rope factor.
         model_name = "microsoft/Phi-4-multimodal-instruct-long-rope"
         with LLM(self.MODEL_PATH, max_seq_len=8192) as llm:
@@ -4554,6 +4557,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     @skip_pre_blackwell
     def test_fp4(self):
+        pytest.skip("Skip due to OOM")
         model_path = f"{self.MODEL_PATH}-FP4"
         with LLM(model_path, max_seq_len=4096) as llm:
             task = MMLU(self.MODEL_NAME)

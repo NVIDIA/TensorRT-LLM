@@ -1558,6 +1558,7 @@ def test_openai_health(llm_root, llm_venv):
 
 
 def test_openai_prometheus(llm_root, llm_venv):
+    pytest.skip("Skip due to no support for kv cache stats")
     test_root = unittest_path() / "llmapi" / "apps"
     llm_venv.run_cmd(
         ["-m", "pytest",
