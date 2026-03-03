@@ -244,7 +244,9 @@ def create_draft_kv_cache_manager_maybe(
         return None
 
     # Get the appropriate KV cache manager class
-    kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
+    kv_cache_manager_cls = get_kv_cache_manager_cls(
+        draft_model_engine.model.model_config, kv_cache_config_tuned
+    )
 
     return _create_kv_cache_manager(
         model_engine=draft_model_engine,
