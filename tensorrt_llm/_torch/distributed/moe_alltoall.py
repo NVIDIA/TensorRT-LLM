@@ -295,7 +295,7 @@ class MoeAlltoAll:
             payload: [ep_size, max_tokens_per_rank, num_elements_per_token] tensor to combine. The dtype must be float32, bfloat16 or float16.
             runtime_max_tokens_per_rank: Maximum of the number of tokens of each DP rank's local batch.
             payload_in_workspace: If True, 'payload' is a view into 'workspace' at 'combine_payload_offset' and no staging copy is needed. If False, the op stages 'payload' into the workspace region before combining.
-            fp8_combine: If True, quantize BF16 payload to FP8 for NVLink transfer (halves bandwidth). Output is always BF16.
+            fp8_combine: If True, quantize the combine payload to FP8 for NVLink transfer (halves NVLink bandwidth usage, output precision is preserved).
 
         Returns:
             combined_output: [local_num_tokens, num_elements_per_token] tensor of combined results
