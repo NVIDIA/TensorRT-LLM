@@ -40,7 +40,12 @@ from tensorrt_llm.quantization import QuantMode
 from .....llmapi.llm_args import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
 from ...utils.logger import ad_logger
-from ...utils.node_utils import extract_op_args
+from ...utils.node_utils import (
+    collect_terminal_users_through_passthrough,
+    extract_op_args,
+    is_op,
+    set_op_args,
+)
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -317,6 +322,7 @@ def trtllm_mha_with_cache(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -366,8 +372,9 @@ def trtllm_mha_with_cache(
     v_flat = v.reshape(num_tokens, num_kv_heads * head_dim)
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
-    # Prepare output
-    output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
+    # Prepare output. If out_scale is set, attention quantizes output to FP8.
+    out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    output = torch.empty(num_tokens, num_heads * head_dim, dtype=out_dtype, device=q.device)
 
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
@@ -413,7 +420,7 @@ def trtllm_mha_with_cache(
         None,  # cache_indirection (beam search)
         kv_scale_oq,  # kv_scale_orig_quant
         kv_scale_qo,  # kv_scale_quant_orig
-        None,  # out_scale
+        out_scale,  # out_scale
         None,  # rotary_inv_freq
         None,  # rotary_cos_sin
         None,  # latent_cache (MLA)
@@ -498,9 +505,11 @@ def trtllm_mha_with_cache_fake(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
-    return torch.empty_like(q.contiguous())
+    out_dtype = torch.float8_e4m3fn if out_scale is not None else q.dtype
+    return torch.empty_like(q.contiguous(), dtype=out_dtype)
 
 
 # =============================================================================
@@ -580,7 +589,8 @@ class TrtllmAttention(AttentionDescriptor):
     def get_constants(cls, source_attn_node: Node) -> List[Constant]:
         """Extract constants from the source attention node.
 
-        Returns scale, sliding_window, kv_scale_orig_quant, and kv_scale_quant_orig.
+        Returns scale, sliding_window, kv_scale_orig_quant, kv_scale_quant_orig,
+        and optional output quant scale for FP8 linear consumers.
         Everything else (num_heads, head_dim, max_context_length, etc.) is inferred
         from tensor shapes or SequenceInfo metadata at runtime.
         """
@@ -616,9 +626,55 @@ class TrtllmAttention(AttentionDescriptor):
         # Get sliding_window from source attention node
         sliding_window = extract_op_args(source_attn_node, "sliding_window")[0]
 
+        # Detect whether all terminal consumers (after trivial passthrough nodes)
+        # are FP8 quantized linears with a shared input_scale. If so, pass that
+        # scale to thop.attention to quantize output directly and avoid a separate
+        # quantization kernel.
+        out_scale = None
+
+        terminal_users, traversal_ok = collect_terminal_users_through_passthrough(
+            source_attn_node, max_traversal_nodes=256
+        )
+
+        fp8_users = [
+            user
+            for user in terminal_users
+            if is_op(user, torch.ops.auto_deploy.trtllm_quant_fp8_linear)
+        ]
+        if traversal_ok and fp8_users and len(fp8_users) == len(terminal_users):
+            # trtllm_quant_fp8_linear needs explicit out_dtype when input is already FP8
+            # and bias is absent.
+            out_dtype_str = None
+            val = source_attn_node.meta.get("val")
+            if hasattr(val, "dtype"):
+                out_dtype_str = str(val.dtype).replace("torch.", "")
+            if out_dtype_str is not None:
+                for user in fp8_users:
+                    set_op_args(user, out_dtype=out_dtype_str)
+
+            first_scale = extract_op_args(
+                fp8_users[0], "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+            )[3]
+            if isinstance(first_scale, Node):
+                same_scale = True
+                for user in fp8_users[1:]:
+                    user_scale = extract_op_args(
+                        user, "input", "weight_fp8", "bias", "input_scale", "weight_scale"
+                    )[3]
+                    if not isinstance(user_scale, Node) or user_scale.target != first_scale.target:
+                        same_scale = False
+                        break
+                if same_scale:
+                    # Ensure graph topological order: first_scale is often first created
+                    # at the downstream linear, so move it before attention if needed.
+                    if first_scale.op == "get_attr":
+                        source_attn_node.prepend(first_scale)
+                    out_scale = first_scale
+
         return [
             scale,
             sliding_window,
             1.0,  # kv_scale_orig_quant (hard-coded, same as FlashInfer)
             1.0,  # kv_scale_quant_orig (hard-coded, same as FlashInfer)
+            out_scale,
         ]

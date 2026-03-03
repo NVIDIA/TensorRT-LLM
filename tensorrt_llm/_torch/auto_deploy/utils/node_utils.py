@@ -472,6 +472,57 @@ def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     return is_match
 
 
+def is_trivial_passthrough_user(node: Node) -> bool:
+    """Check whether a node is a trivial layout/index passthrough op."""
+    if node.op == "call_method":
+        return node.target in {
+            "view",
+            "reshape",
+            "transpose",
+            "permute",
+            "contiguous",
+            "__getitem__",
+        }
+    if node.op == "call_function":
+        if node.target is operator.getitem:
+            return True
+        return (
+            is_op(node, torch.ops.aten.view)
+            or is_op(node, torch.ops.aten.reshape)
+            or is_op(node, torch.ops.aten.transpose)
+            or is_op(node, torch.ops.aten.permute)
+            or is_op(node, torch.ops.aten.contiguous)
+        )
+    return False
+
+
+def collect_terminal_users_through_passthrough(
+    source_node: Node,
+    *,
+    max_traversal_nodes: int = 256,
+) -> Tuple[List[Node], bool]:
+    """Collect terminal users while traversing trivial passthrough users.
+
+    Returns:
+        (terminal_users, traversal_ok)
+    """
+    terminal_users: List[Node] = []
+    stack = list(source_node.users)
+    seen = set()
+    while stack:
+        user = stack.pop()
+        if user in seen:
+            continue
+        seen.add(user)
+        if len(seen) > max_traversal_nodes:
+            return [], False
+        if is_trivial_passthrough_user(user):
+            stack.extend(list(user.users))
+            continue
+        terminal_users.append(user)
+    return terminal_users, True
+
+
 def filtered_nodes(
     nodes: Iterable[Node],
     target: Union[Callable[[Node], bool], Union[OperatorLike, Iterable[OperatorLike]]] = None,
