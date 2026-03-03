@@ -1,0 +1,20 @@
+attention_dp_config:
+  batching_wait_iters: 0
+  enable_balance: true
+  timeout_iters: 60
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+enable_attention_dp: true
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.8
+moe_config:
+  backend: TRTLLM
+print_iter_log: true
+tensor_parallel_size: 4
+moe_expert_parallel_size: 4
+trust_remote_code: true
+backend: pytorch
+max_num_tokens: 4096
+max_seq_len: 2068
