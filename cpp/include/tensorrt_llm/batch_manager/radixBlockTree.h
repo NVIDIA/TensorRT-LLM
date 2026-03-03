@@ -32,16 +32,6 @@ using BlockMatch = ValueMatch<kv_cache_manager::BlockKey, kv_cache_manager::Bloc
     std::shared_ptr<kv_cache_manager::KVCacheBlock>>;
 using BlockMatches = std::vector<BlockMatch>;
 
-// Convenience method to claim a block. May not be used, mostly here to show how to claim blocks.
-bool claimBlock(BlockMatch& match)
-{
-    if (match.node != nullptr && match.value != nullptr && !match.value->hasRefs())
-    {
-        return match.node->clearValue(match.vkey);
-    }
-    return false;
-}
-
 // The following template arguments are used:
 // NodeKey = BlockKey
 // NodeKeyHashFunctor = BlockKeyHasher

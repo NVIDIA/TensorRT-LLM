@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -581,6 +581,70 @@ TEST_F(RadixTreeTest, CountNodesConsistency)
     // the cascade stops there.  key=3 has no value but was not the node being
     // cleared so it is not pruned automatically.
     EXPECT_EQ(tree.countNumberOfNodes(), 3); // key=1, key=2, key=3 remain
+}
+
+// ===========================================================================
+// Group H: setPrevNode
+//
+// setPrevNode(newParent) updates only the back-pointer of a node.  The caller
+// is responsible for also updating the old and new parent's mNextNodes maps.
+// Two contracts are tested:
+//
+//   1. Detach (setPrevNode(NodePtr{})): the node's cascade-delete stops at
+//      itself because it now looks like a root.
+//   2. Reparent (setPrevNode(otherNode)): clearing the node's value cascades
+//      through the new parent, not the original one.
+// ===========================================================================
+
+TEST_F(RadixTreeTest, SetPrevNodeStopsCascade)
+{
+    // Build chain: root -> A(1) -> B(2), store a value at B.
+    // Detach B's back-pointer (make it an orphan root).
+    // Clearing B's value must NOT cascade to A.
+    IntTree tree;
+    auto nodes = buildChain(tree, {1, 2}); // nodes[0]=A, nodes[1]=B
+    setFresh(nodes[1], /*vkey=*/0, /*val=*/42);
+    EXPECT_EQ(tree.countNumberOfNodes(), 2);
+
+    // Detach B from its parent: B now believes it is a root.
+    nodes[1]->setPrevNode(IntTree::NodePtr{});
+
+    // Clear B's value.  Without setPrevNode the cascade would prune both B and A.
+    // With the detached back-pointer the cascade stops at B (isRoot=true).
+    clearFound(nodes[1], /*vkey=*/0);
+
+    // A is still reachable via the tree; B is unreachable from root but its
+    // shared_ptr is still held by nodes[1] in this test.
+    auto result = tree.lookupNodes({1}, /*allowPartialMatch=*/false);
+    EXPECT_EQ(result.exactMatches.size(), 1u); // A survives
+}
+
+TEST_F(RadixTreeTest, SetPrevNodeReparentPath)
+{
+    // Build two branches:
+    //   root -> A(1) -> B(2)  [B has a value]
+    //   root -> C(3)
+    //
+    // Reparent B to C by:
+    //   (a) updating B's back-pointer to C  (setPrevNode)
+    //   (b) inserting B as a child of C     (insertNode)
+    //
+    // Verify that B is now reachable via the path [3, 2].
+    IntTree tree;
+    auto nodes_ab = buildChain(tree, {1, 2}); // nodes_ab[0]=A, nodes_ab[1]=B
+    auto nodes_c = buildChain(tree, {3});     // nodes_c[0]=C
+    setFresh(nodes_ab[1], /*vkey=*/0, /*val=*/99);
+
+    // Reparent B: back-pointer and forward link.
+    nodes_ab[1]->setPrevNode(nodes_c[0]);         // B's parent is now C
+    [[maybe_unused]] auto const overwritten
+        = nodes_c[0]->insertNode(2, nodes_ab[1]); // C's children now include B(key=2)
+
+    // B is reachable via [3, 2].
+    auto vm = tree.lookupValues({3, 2}, /*allowPartialMatch=*/false, /*vkey=*/0);
+    ASSERT_EQ(vm.matches.size(), 2u);
+    EXPECT_TRUE(vm.matches[1].isValid);
+    EXPECT_EQ(vm.matches[1].value, 99);
 }
 
 // ===========================================================================

@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,10 @@
 #pragma once
 
 #include "tensorrt_llm/batch_manager/common.h"
+#include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cstddef>
+#include <memory>
 #include <optional>
 
 //
@@ -161,12 +163,17 @@ public:
     {
     }
 
-    void setPrevNode(NodePtr& prevNode)
+    //! \brief Update the back-pointer to this node's parent.
+    //! \details Only updates mPrevNode (the back-edge). The caller is responsible for also
+    //! updating the old and new parent's mNextNodes forward maps: remove this node from the old
+    //! parent's map, and insert it into the new parent's map.
+    //! Typical use: detaching a node before eviction, or reparenting during tree restructuring.
+    //! Pass an empty NodePtr{} to make this node behave as a root — the cascade-delete in
+    //! clearValue / clearNode will stop here instead of propagating upward.
+    //! \param prevNode The new parent node. Pass NodePtr{} to detach from the current parent.
+    void setPrevNode(NodePtr const& prevNode)
     {
-        if (mPrevNode != nullptr)
-        {
-            mPrevNode->clearValue(mKey);
-        }
+        mPrevNode = prevNode;
     }
 
     //! \brief Insert child node. Will overwrite existing node with same nkey.
@@ -185,12 +192,15 @@ public:
         if (itr != mNextNodes.end())
         {
             mNextNodes.erase(itr);
-            auto const isRoot = mPrevNode == nullptr;
+            auto const isRoot = mPrevNode.expired();
             auto const canBeDeleted = !isRoot && mValue.empty() && mNextNodes.empty();
             if (canBeDeleted)
             {
                 // Node has no values and no descendants. Delete it
-                [[maybe_unused]] auto const wasDeleted = mPrevNode->clearNode(mKey);
+                if (auto parent = mPrevNode.lock())
+                {
+                    [[maybe_unused]] auto const wasDeleted = parent->clearNode(mKey);
+                }
             }
             return true;
         }
@@ -217,7 +227,7 @@ public:
     }
 
     //! \brief Clear value for vkey.
-    //! \param vKey Key.
+    //! \param vkey Key.
     //! \return True if value was cleared.
     [[nodiscard]] bool clearValue(ValueKey const& vkey)
     {
@@ -225,12 +235,15 @@ public:
         if (itr != mValue.end())
         {
             mValue.erase(itr);
-            auto const isRoot = mPrevNode == nullptr;
+            auto const isRoot = mPrevNode.expired();
             auto const canBeDeleted = !isRoot && mValue.empty() && mNextNodes.empty();
             if (canBeDeleted)
             {
                 // Node has no values and no descendants. Delete it
-                [[maybe_unused]] auto const wasDeleted = mPrevNode->clearNode(mKey);
+                if (auto parent = mPrevNode.lock())
+                {
+                    [[maybe_unused]] auto const wasDeleted = parent->clearNode(mKey);
+                }
             }
             return true;
         }
@@ -276,18 +289,20 @@ public:
     {
         if constexpr (EnablePartialMatching)
         {
-            // Runtime check: the specific key instance may disable partial matching (e.g. BlockKey with extraKeys).
+            // Runtime check: the specific key instance may disable partial matching (e.g. BlockKey with extraKeys
+            // for multimodal content). This is by design — returning empty here is correct, not an error, because
+            // multimodal blocks require an exact key match and cannot be partially reused.
             if (!key.supportsPartialMatching())
             {
                 return {};
             }
             std::vector<std::pair<int, NodePtr>> matches;
-            for (auto nn : mNextNodes)
+            for (auto const& [nodeKey, node] : mNextNodes)
             {
-                int numMatched = key.numMatchingTokens(nn.first);
+                int numMatched = key.numMatchingTokens(nodeKey);
                 if (numMatched > 0)
                 {
-                    matches.emplace_back(numMatched, nn.second);
+                    matches.emplace_back(numMatched, node);
                 }
             }
             auto results = std::vector<_NodeMatch>();
@@ -327,7 +342,7 @@ private:
     // Private debugging method.
     void _getEdges(std::vector<NodeKey> edge, std::vector<std::vector<NodeKey>>& edges) const
     {
-        auto const isRoot = mPrevNode == nullptr;
+        auto const isRoot = mPrevNode.expired();
         if (!isRoot)
         {
             edge.emplace_back(mKey);
@@ -348,7 +363,7 @@ private:
     // Private debugging method.
     void _countNodes(int& count) const
     {
-        auto const isRoot = mPrevNode == nullptr;
+        auto const isRoot = mPrevNode.expired();
         if (!isRoot)
         {
             ++count;
@@ -363,7 +378,7 @@ private:
     NodeKey mKey;
     std::unordered_map<ValueKey, Value, ValueKeyHashFunctor> mValue;
 
-    NodePtr mPrevNode = nullptr;
+    std::weak_ptr<Node> mPrevNode;
     std::unordered_map<NodeKey, NodePtr, NodeKeyHashFunctor> mNextNodes;
 };
 
@@ -376,8 +391,7 @@ private:
 //! \tparam ValueKeyHashFunctor Hash functor for value key. Can be std::hash<ValueKey> if std::hash is implemented for
 //! ValueKey.
 //! \tparam Value Object holding value.
-//! \tparam EnablePartialMatching Set to true to allow the tree to
-//! attempt partial matching.
+//! \tparam EnablePartialMatching Set to true to allow the tree to attempt partial matching.
 template <class NodeKey, class NodeKeyHashFunctor, class ValueKey, class ValueKeyHashFunctor, class Value,
     bool EnablePartialMatching>
 class Trie
@@ -430,7 +444,7 @@ public:
     }
 
     //! \brief Look up nodes matching given key.
-    //! \param key Key for prefix we are looking for.
+    //! \param pkey Key for prefix we are looking for.
     //! \param allowPartialMatch If true, consider partial match for last node.
     //! \return An object containing results of the lookup + meta-data about how nodes were matched.
     [[nodiscard]] _NodeMatches lookupNodes(PrefixKey const& pkey, bool allowPartialMatch) const

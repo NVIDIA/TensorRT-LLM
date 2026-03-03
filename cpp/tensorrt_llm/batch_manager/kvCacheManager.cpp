@@ -49,8 +49,6 @@ using namespace tensorrt_llm::batch_manager::eviction_policy;
 
 using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>;
 
-// TODO: Replace search structure with radix tree
-
 namespace
 {
 
