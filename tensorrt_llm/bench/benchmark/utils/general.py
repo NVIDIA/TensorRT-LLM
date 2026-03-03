@@ -83,14 +83,28 @@ def get_settings(params: dict, dataset_metadata: DatasetMetadata, model: str,
     mamba_ssm_cache_dtype = params.get("mamba_ssm_cache_dtype", "auto")
     kv_cache_config = {}
     if extra_llm_api_options:
-        with open(extra_llm_api_options, 'r') as f:
-            llm_args_dict = yaml.safe_load(f)
-            kv_cache_config = llm_args_dict.get("kv_cache_config", {
-                "dtype": "auto",
-            })
-            kv_cache_dtype = kv_cache_config.get("dtype", "auto")
-            mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
-                                                        mamba_ssm_cache_dtype)
+        files = extra_llm_api_options
+        if isinstance(files, str):
+            files = [files]
+
+        llm_args_dict = {}
+        for opt_file in files:
+            with open(opt_file, 'r') as f:
+                file_dict = yaml.safe_load(f) or {}
+                for key, value in file_dict.items():
+                    if key in llm_args_dict and isinstance(
+                            llm_args_dict[key], dict) and isinstance(
+                                value, dict):
+                        llm_args_dict[key] = {**llm_args_dict[key], **value}
+                    else:
+                        llm_args_dict[key] = value
+
+        kv_cache_config = llm_args_dict.get("kv_cache_config", {
+            "dtype": "auto",
+        })
+        kv_cache_dtype = kv_cache_config.get("dtype", "auto")
+        mamba_ssm_cache_dtype = kv_cache_config.get("mamba_ssm_cache_dtype",
+                                                    mamba_ssm_cache_dtype)
 
         enable_chunked_prefill = llm_args_dict.get("enable_chunked_prefill",
                                                    enable_chunked_prefill)

@@ -65,9 +65,10 @@ from tensorrt_llm.sampling_params import SamplingParams
     "--extra_llm_api_options",
     "extra_llm_api_options",
     type=str,
-    default=None,
+    multiple=True,
     help=
     "Path to a YAML file that overwrites the parameters specified by trtllm-bench. "
+    "Can be specified multiple times; files are deep-merged in order (later files take precedence). "
     "Can be specified as either --config or --extra_llm_api_options.")
 @optgroup.option("--sampler_options",
                  type=click.Path(exists=True,
@@ -407,7 +408,8 @@ def throughput_command(
     exec_settings["settings_config"]["dynamic_max_batch_size"] = True
 
     # LlmArgs
-    exec_settings["extra_llm_api_options"] = params.pop("extra_llm_api_options")
+    extra_opts = params.pop("extra_llm_api_options")
+    exec_settings["extra_llm_api_options"] = extra_opts or None
     exec_settings["iteration_log"] = options.iteration_log
 
     # Construct the runtime configuration dataclass.
