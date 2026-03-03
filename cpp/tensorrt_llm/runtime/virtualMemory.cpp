@@ -406,6 +406,7 @@ static const std::shared_ptr<AllocConf> bgConf{std::shared_ptr<AllocConf>{}, &Al
 
 static std::shared_mutex currentConfMutex;
 static std::shared_ptr<AllocConf> currentConf = bgConf;
+static std::vector<std::shared_ptr<AllocConf>> confStack;
 
 CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
 {
@@ -413,21 +414,20 @@ CudaVirtualMemoryAllocator getVirtualMemoryAllocator()
     return CudaVirtualMemoryAllocator{currentConf};
 }
 
-void setVirtualMemoryAllocator(
+void pushVirtualMemoryAllocator(
     std::string const& tag, CudaVirtualMemoryAllocator::RestoreMode mode, std::shared_ptr<CudaStream> backStream)
 {
     std::unique_lock lock(currentConfMutex);
-
-    TLLM_CHECK_WITH_INFO(currentConf == bgConf,
-        "An active virtual memory allocator (tag: %s, mode: %d, stream: %p) is already present",
-        currentConf->mTag.c_str(), currentConf->mMode, currentConf->mBackStream.get());
+    confStack.push_back(currentConf);
     currentConf = std::make_shared<AllocConf>(getVirtualMemoryManager(), tag, mode, backStream);
 }
 
-void clearVirtualMemoryAllocator()
+void popVirtualMemoryAllocator()
 {
     std::unique_lock lock(currentConfMutex);
-    currentConf = bgConf;
+    TLLM_CHECK_WITH_INFO(!confStack.empty(), "popVirtualMemoryAllocator called with empty stack");
+    currentConf = confStack.back();
+    confStack.pop_back();
 }
 
 } // namespace tensorrt_llm::runtime

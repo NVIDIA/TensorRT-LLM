@@ -25,6 +25,8 @@ from ..models.modeling_utils import (DecoderModelForCausalLM, MetaInitMode,
                                      timing)
 from ..modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer, maybe_create_moe_load_balancer)
+from ..virtual_memory import RestoreMode
+from ..virtual_memory import scope as virtual_memory_scope
 
 _KV_CACHE_MAP = {
     "fp8": QuantAlgo.FP8.value,
@@ -182,6 +184,15 @@ def _construct_checkpoint_loader(
     return checkpoint_loader
 
 
+def _apply_to_buffers_only(model: torch.nn.Module, fn):
+    """Apply *fn* to every buffer in *model*, skipping parameters.
+    """
+    for module in model.modules():
+        for key, buf in module._buffers.items():
+            if buf is not None:
+                module._buffers[key] = fn(buf)
+
+
 class ModelLoader:
     """
     Handles the loading, configuration, and weight initialization of a PyTorch model.
@@ -195,7 +206,8 @@ class ModelLoader:
                  sparse_attention_config: Optional["SparseAttentionConfig"],
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
-                 lora_config: Optional[LoraConfig] = None):
+                 lora_config: Optional[LoraConfig] = None,
+                 model_weights_memory_tag: Optional[str] = None):
         """
         Initializes the ModelLoader.
 
@@ -206,6 +218,9 @@ class ModelLoader:
             max_num_tokens: The maximum number of tokens the engine will handle.
             max_seq_len: The maximum sequence length.
             lora_config: Configuration for LoRA.
+            model_weights_memory_tag: When set, parameter allocations during
+                ``load()`` are placed under a separate virtual-memory tag so
+                they can be released/materialized independently of buffers.
         """
         self.llm_args = llm_args
         self.mapping = mapping
@@ -214,6 +229,8 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+        self.model_weights_memory_tag = model_weights_memory_tag
+        self._weight_pool_proxy = None
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -285,7 +302,18 @@ class ModelLoader:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
 
-                model._apply(init_meta_tensor)
+                if self.model_weights_memory_tag is not None:
+                    # Allocate buffers to the outer virtual_memory_scope,
+                    # but parameters (weights) to the dedicated
+                    # inner virtual_memory_scope.
+                    _apply_to_buffers_only(model, init_meta_tensor)
+
+                    with virtual_memory_scope(self.model_weights_memory_tag,
+                                              RestoreMode.NONE) as pool:
+                        model._apply(init_meta_tensor)
+                    self._weight_pool_proxy = pool
+                else:
+                    model._apply(init_meta_tensor)
                 config = config_copy
 
             except Exception:
@@ -297,7 +325,40 @@ class ModelLoader:
                 if 'memo' in locals():
                     del memo
 
-            model.to("cuda")
+            if self.model_weights_memory_tag is not None \
+                    and self._weight_pool_proxy is None:
+                # Allocate buffers to the outer virtual_memory_scope,
+                # but parameters (weights) to the dedicated
+                # inner virtual_memory_scope.
+                memo = dict()
+
+                def copy_buffer_to_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        # Copy if not on CUDA.
+                        # Add to memo so model._apply later skips buffers.
+                        cuda_t = t.cuda()
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
+                    return memo[t]
+
+                _apply_to_buffers_only(model, copy_buffer_to_cuda)
+
+                def allocate_weights_on_cuda(t: torch.Tensor):
+                    if t not in memo:
+                        # Reallocate inside the scope,
+                        # even if the weight is already on CUDA
+                        memo[t] = torch.empty_like(t, device='cuda')
+                    return memo[t]
+
+                with virtual_memory_scope(self.model_weights_memory_tag,
+                                          RestoreMode.PINNED) as pool:
+                    model._apply(allocate_weights_on_cuda)
+                self._weight_pool_proxy = pool
+
+                del memo
+            else:
+                model.to("cuda")
+
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
                 f"Use {rank_model_storage / (1024**3):.2f} GB for model weights."
