@@ -639,7 +639,7 @@ class MediaStorage:
             output_path: Path to save the video
             audio: Optional audio as torch.Tensor
             frame_rate: Frames per second (default: 24.0)
-            format: Video format (mp4, gif, png). If None, infer from extension
+            format: Video format (mp4, avi). If None, infer from extension
 
         Returns:
             Path where the video was saved
@@ -662,10 +662,6 @@ class MediaStorage:
         # Save based on format
         if format in ("mp4", "avi"):
             output_path = MediaStorage._save_encoded_video(video, audio, output_path, frame_rate)
-        elif format == "gif":
-            output_path = MediaStorage._save_gif(video, output_path, frame_rate)
-        elif format == "png":
-            output_path = MediaStorage._save_middle_frame(video, output_path)
         else:
             logger.warning(f"Unsupported video format: {format}, defaulting to mp4")
             output_path = output_path.rsplit(".", 1)[0] + ".mp4"
@@ -683,7 +679,7 @@ class MediaStorage:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
             audio: Optional audio as torch.Tensor
             frame_rate: Frames per second
-            format: Video format (mp4, gif)
+            format: Video format (mp4, avi)
 
         Returns:
             Video bytes
@@ -716,8 +712,7 @@ class MediaStorage:
         """Save video with optional audio using the best available encoder.
 
         For MP4 output, ffmpeg CLI is required. For AVI output, the pure Python
-        MJPEG encoder is used directly. Falls back to saving the middle frame
-        as PNG if no encoder is available.
+        MJPEG encoder is used directly.
 
         Args:
             video: Video frames as torch.Tensor (T, H, W, C) uint8
@@ -741,74 +736,7 @@ class MediaStorage:
             )
 
         try:
-            if encoder is not None:
-                return encoder.encode_video(video, output_path, frame_rate, audio)
-            else:
-                logger.warning(
-                    "No video encoder available. Falling back to saving middle frame as PNG."
-                )
-                png_path = os.path.splitext(output_path)[0] + ".png"
-                return MediaStorage._save_middle_frame(video, png_path)
+            return encoder.encode_video(video, output_path, frame_rate, audio)
         except Exception as e:
             logger.error(f"Error encoding video: {e}")
-            import traceback
-
-            logger.error(traceback.format_exc())
-            logger.warning("Falling back to saving middle frame as PNG.")
-            png_path = os.path.splitext(output_path)[0] + ".png"
-            return MediaStorage._save_middle_frame(video, png_path)
-
-    @staticmethod
-    def _save_gif(video: torch.Tensor, output_path: str, frame_rate: float) -> str:
-        """Save video as animated GIF.
-
-        Args:
-            video: Video frames as torch.Tensor (T, H, W, C) uint8
-            output_path: Output path for GIF
-            frame_rate: Frames per second
-
-        Returns:
-            Path where the GIF was saved
-        """
-        if not isinstance(video, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor for video, got {type(video)}")
-
-        # Convert to numpy and then to list of PIL Images
-        video_np = video.cpu().numpy()
-        frames = [Image.fromarray(video_np[i]) for i in range(video_np.shape[0])]
-
-        # Save as GIF
-        duration_ms = int(1000 / frame_rate)
-        frames[0].save(
-            output_path,
-            save_all=True,
-            append_images=frames[1:],
-            optimize=False,
-            duration=duration_ms,
-            loop=0,
-        )
-        logger.info(f"Saved video as GIF to {output_path} ({len(frames)} frames)")
-        return output_path
-
-    @staticmethod
-    def _save_middle_frame(video: torch.Tensor, output_path: str) -> str:
-        """Save middle frame of video as PNG.
-
-        Args:
-            video: Video frames as torch.Tensor (T, H, W, C) uint8
-            output_path: Output path for PNG
-
-        Returns:
-            Path where the frame was saved
-        """
-        if not isinstance(video, torch.Tensor):
-            raise ValueError(f"Expected torch.Tensor for video, got {type(video)}")
-
-        # Extract middle frame
-        video_np = video.cpu().numpy()
-        frame_idx = video_np.shape[0] // 2
-        image = Image.fromarray(video_np[frame_idx])
-
-        image.save(output_path)
-        logger.info(f"Saved frame {frame_idx} to {output_path}")
-        return output_path
+            raise e
