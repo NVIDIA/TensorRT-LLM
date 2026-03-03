@@ -3,6 +3,7 @@
 import java.lang.InterruptedException
 import groovy.transform.Field
 import groovy.json.JsonOutput
+import groovy.json.JsonSlurper
 import com.nvidia.bloom.KubernetesManager
 import com.nvidia.bloom.Constants
 import org.jenkinsci.plugins.workflow.cps.CpsThread
@@ -340,18 +341,62 @@ def mergeWaiveList(pipeline, globalVars)
     sh "cp ${LLM_ROOT}/tests/integration/test_lists/waives.txt ./waives_CUR_${env.gitlabCommit}.txt"
     sh "cp ${LLM_ROOT}/jenkins/scripts/mergeWaiveList.py ./"
 
-    try {
-        // Get TOT waive list
-        LLM_TOT_ROOT = "llm-tot"
-        targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
-        echo "Target branch: ${targetBranch}"
-        withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-            trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
-        }
-        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
-        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-        sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+    // Get TOT waive list
+    LLM_TOT_ROOT = "llm-tot"
+    targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
+    echo "Target branch: ${targetBranch}"
 
+    def targetBranchTOTCommit = ""
+    def isGetTOTWaiveList = false
+    try {
+        withCredentials([usernamePassword(credentialsId: 'svc_tensorrt_gitlab_api_token', usernameVariable: 'GITHUB_USER', passwordVariable: 'GITHUB_PASSWORD')]) {
+            try {
+                def apiUrl = "https://api.github.com/repos/NVIDIA/TensorRT-LLM/commits?sha=${targetBranch}&per_page=1"
+                def connection = new URL(apiUrl).openConnection()
+                connection.setRequestProperty("Authorization", "Basic " + "${GITHUB_USER}:${GITHUB_PASSWORD}".bytes.encodeBase64().toString())
+                connection.setRequestMethod("GET")
+                def response = connection.inputStream.text
+                def json = new JsonSlurper().parseText(response)
+                targetBranchTOTCommit = json[0].sha
+            } catch (Exception e) {
+                echo "Could not get target branch commit from GitHub API: ${e.message}"
+            }
+        }
+        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+        sh "wget https://urm.nvidia.com/artifactory/vcs-remote/NVIDIA/TensorRT-LLM/raw/${targetBranchTOTCommit}/tests/integration/test_lists/waives.txt -O waives_TOT_${targetBranchTOTCommit}.txt"
+        isGetTOTWaiveList = true
+    } catch (InterruptedException e) {
+        throw e
+    } catch (Exception e) {
+        echo "Failed to checkout TOT waive list from public GitHub repository. Error: ${e.toString()}"
+    }
+
+    if (!isGetTOTWaiveList) {
+        try {
+            withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
+                trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, false)
+            }
+            targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
+            echo "Target branch TOT commit: ${targetBranchTOTCommit}"
+            sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+            isGetTOTWaiveList = true
+        } catch (InterruptedException e) {
+            throw e
+        } catch (Exception e) {
+            echo "Failed to checkout TOT waive list from internal GitLab repository. Error: ${e.toString()}"
+        }
+    }
+
+    if (!isGetTOTWaiveList) {
+        catchError(
+            buildResult: 'SUCCESS',
+            stageResult: 'UNSTABLE') {
+            error "Failed to get TOT waive list. Fallback to use the default test waive list from the PR."
+        }
+        return
+    }
+
+    try {
         // Get waive list diff in current MR
         def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
 
