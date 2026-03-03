@@ -5970,20 +5970,16 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             assert accept_rate > 0.2, \
                 f"Acceptance rate too low for prompt {i}: {accept_rate:.2f}"
 
-    @pytest.mark.skip(reason="FP16 model checkpoint is not yet available")
     @skip_pre_hopper
     @pytest.mark.skip_less_device(4)
     @pytest.mark.skip_less_device_memory(80000)
     def test_fp16_4gpu_mtp_ar(self):
-        # TODO: FP16 model checkpoint is not yet available.
-        # Update model_path once the fp16 checkpoint is uploaded.
         max_draft_len = 7
         mtp_config = MTPDecodingConfig(
             num_nextn_predict_layers=max_draft_len,
             mtp_eagle_one_model=True,
         )
-        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-FP16"
-
+        model_path = f"{llm_models_root()}/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-012726"
         llm_common_config = dict(
             model=model_path,
             tensor_parallel_size=4,
