@@ -9,6 +9,7 @@ from output_handler import OutputHandler
 from tensorrt_llm import logger
 from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
 
+logger.set_level("info")
 
 def parse_args():
     parser = argparse.ArgumentParser(

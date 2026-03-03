@@ -938,7 +938,7 @@ class LTXModel(nn.Module):
         target_dtype = self.model_config.torch_dtype if self.model_config else torch.bfloat16
 
         model_keys = {
-            name + "." + pname
+            (name + "." + pname) if name else pname
             for name, mod in self.named_modules()
             for pname, p in mod._parameters.items()
             if p is not None
@@ -946,21 +946,19 @@ class LTXModel(nn.Module):
         checkpoint_keys = set(weights.keys())
         missing = model_keys - checkpoint_keys
         unexpected = checkpoint_keys - model_keys
-        dynamic_quant_enabled = (
+        quantized = (
             self.model_config is not None
             and self.model_config.quant_config.quant_algo is not None
+        )
+        dynamic_weight_quant = (
+            self.model_config is not None
+            and self.model_config.dynamic_weight_quant
         )
         if missing:
             logger.warning(
                 f"LTXModel: {len(missing)} model params NOT in checkpoint: "
                 f"{sorted(missing)[:20]}{'...' if len(missing) > 20 else ''}"
             )
-            if dynamic_quant_enabled:
-                logger.info(
-                    "Dynamic quantization is enabled -- missing scale parameters "
-                    "(e.g. weight_scale, input_scale) are expected and will be "
-                    "computed by DynamicLinearWeightLoader during weight loading."
-                )
         if unexpected:
             logger.warning(
                 f"LTXModel: {len(unexpected)} checkpoint keys NOT in model: "
@@ -971,6 +969,19 @@ class LTXModel(nn.Module):
             f"LTXModel weight check: {len(loaded)} matched, "
             f"{len(missing)} missing, {len(unexpected)} unexpected"
         )
+        if quantized and missing:
+            if dynamic_weight_quant:
+                logger.info(
+                    "Dynamic quantization is enabled -- missing scale parameters "
+                    "(e.g. weight_scale, input_scale) are expected and will be "
+                    "computed by DynamicLinearWeightLoader during weight loading."
+                )
+            else:
+                logger.info(
+                    "Pre-quantized checkpoint -- missing parameters "
+                    "(e.g. alpha, inv_input_scale, kv_scales) are derived from "
+                    "checkpoint scales during Linear.load_weights()."
+                )
 
         for param_name, param in self._parameters.items():
             if param is not None and param_name in weights:

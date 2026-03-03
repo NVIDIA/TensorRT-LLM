@@ -17,7 +17,7 @@ Dynamic Quantization:
 import os
 import time
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, List, Optional
 
 import safetensors.torch
 import torch
@@ -37,12 +37,21 @@ if TYPE_CHECKING:
 
 
 def _load_LTX_2_transformer_weights(
-    checkpoint_dir: str, prefix: str,
+    checkpoint_dir: str,
+    prefix: str,
+    exclude_prefixes: Optional[List[str]] = None,
 ) -> Dict[str, torch.Tensor]:
     """Read transformer weights from a LTX-2 specific single-safetensor checkpoint.
 
     Scans all ``.safetensors`` files in *checkpoint_dir* for keys starting
     with *prefix*, strips the prefix, and returns the resulting state dict.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory.
+        prefix: Key prefix for transformer weights (e.g. ``model.diffusion_model.``).
+        exclude_prefixes: Sub-prefixes (after stripping *prefix*) to skip.
+            Used to filter out non-transformer components that share the
+            same checkpoint prefix (e.g. ``audio_embeddings_connector.``).
     """
     d = Path(checkpoint_dir)
     if d.is_file() and d.suffix == ".safetensors":
@@ -53,12 +62,17 @@ def _load_LTX_2_transformer_weights(
     if not sft_paths:
         raise ValueError(f"No safetensors files found in {checkpoint_dir}")
 
+    exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
+
     weights: Dict[str, torch.Tensor] = {}
     for path in sft_paths:
         with safetensors.torch.safe_open(path, framework="pt") as f:
             for key in f.keys():
                 if key.startswith(prefix):
-                    weights[key[len(prefix):]] = f.get_tensor(key)
+                    stripped = key[len(prefix):]
+                    if stripped.startswith(exclude_prefixes):
+                        continue
+                    weights[stripped] = f.get_tensor(key)
 
     if not weights:
         raise ValueError(
@@ -236,7 +250,10 @@ class PipelineLoader:
         LTX_2_specific_prefix = getattr(pipeline, "TRANSFORMER_PREFIX", None)
         if LTX_2_specific_prefix is not None:
             logger.info("Loading transformer weights via LTX_2 specific checkpoint path")
-            weights = _load_LTX_2_transformer_weights(checkpoint_dir, LTX_2_specific_prefix)
+            exclude = getattr(pipeline, "TRANSFORMER_EXCLUDE_PREFIXES", None)
+            weights = _load_LTX_2_transformer_weights(
+                checkpoint_dir, LTX_2_specific_prefix, exclude_prefixes=exclude,
+            )
         else:
             # --- Path B: diffusers-compatible (WeightLoader) -----------------
             if pipeline.transformer is None:

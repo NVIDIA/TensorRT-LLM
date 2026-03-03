@@ -261,6 +261,10 @@ class LTX2Pipeline(BasePipeline):
     # ------------------------------------------------------------------
 
     TRANSFORMER_PREFIX = "model.diffusion_model."
+    TRANSFORMER_EXCLUDE_PREFIXES = [
+        "audio_embeddings_connector.",
+        "video_embeddings_connector.",
+    ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load transformer weights.
