@@ -82,7 +82,7 @@ class RMSNorm(nn.Module):
         # the downstream linear layer handle FP4 quantization.
         if self.is_nvfp4:
             sm_version = get_sm_version()
-            if not (90 <= sm_version < 110):
+            if not (90 <= sm_version < 120):
                 self.is_nvfp4 = False
                 return_hp_output = False
         self.return_hp_output = return_hp_output
