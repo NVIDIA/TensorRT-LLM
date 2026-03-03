@@ -511,7 +511,7 @@ class TrtllmAttentionWrapper:
             spec_decoding_tensor_params.append(self.spec_decoding_bl_tree_mask)
             spec_decoding_tensor_params.append(
                 self.spec_bl_tree_first_sparse_mask_offset_kv)
-        mla_tensor_params = [
+        helix_tensor_params = [
             self.helix_position_offsets, self.helix_is_inactive_rank
         ]
 
@@ -520,7 +520,8 @@ class TrtllmAttentionWrapper:
 
         out_scale = self.out_scale_sf if self.use_nvfp4_output else self.out_scale
 
-        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and trtllm_gen.is_supported(
+        helix_active = self.helix_position_offsets is not None
+        if _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION and not helix_active and trtllm_gen.is_supported(
                 q=q,
                 num_heads=self.num_heads,
                 num_kv_heads=self.num_kv_heads,
@@ -603,7 +604,6 @@ class TrtllmAttentionWrapper:
                 self.v_head_dim,
                 self.mrope_rotary_cos_sin,
                 self.mrope_position_deltas,
-                mla_tensor_params,
                 self.attention_chunk_size,
                 self.softmax_stats_tensor,
                 spec_decoding_bool_params,
@@ -686,7 +686,7 @@ class TrtllmAttentionWrapper:
                 self.v_head_dim,
                 self.mrope_rotary_cos_sin,
                 self.mrope_position_deltas,
-                mla_tensor_params,
+                helix_tensor_params,
                 self.attention_chunk_size,
                 self.softmax_stats_tensor,
                 spec_decoding_bool_params,
@@ -1980,6 +1980,15 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
                 and metadata.num_ctx_cached_tokens > 0
                 and metadata.runtime_features.chunked_prefill)
 
+    def is_chunked_prefill_mla_context_for_warmup(
+        self,
+        metadata: TrtllmAttentionMetadata,
+    ) -> bool:
+        """Chunked prefill MLA context check for warmup; does not check num_ctx_cached_tokens."""
+        return (self.is_mla_enable and metadata.kv_cache_manager is not None
+                and metadata.enable_context_mla_with_cached_kv
+                and metadata.runtime_features.chunked_prefill)
+
     def load_paged_kv_cache_for_mla(
         self,
         metadata: TrtllmAttentionMetadata,
@@ -2197,7 +2206,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         # runs AFTER this method in the MLA generation path.
         self.wrapper.ensure_rope_table_size(metadata.max_seq_len)
 
-        mla_tensor_params = [
+        helix_tensor_params = [
             metadata.helix_position_offsets, metadata.helix_is_inactive_rank
         ]
 
@@ -2223,7 +2232,7 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
             self.kv_scale_quant_orig,
             out_scale,
             metadata.block_ids_per_seq,
-            mla_tensor_params,
+            helix_tensor_params,
             self.wrapper.predicted_tokens_per_seq,
             self.get_local_layer_idx(metadata),
             self.wrapper.num_heads,

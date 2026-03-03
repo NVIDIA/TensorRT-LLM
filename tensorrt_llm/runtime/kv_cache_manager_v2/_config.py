@@ -85,6 +85,12 @@ class BufferConfig:
     role: DataRole
     size: int
 
+    tokens_per_block_override: int | None = None
+    """
+    If not None, overrides the tokens_per_block in KVCacheManagerConfig. Must be a factor of tokens_per_block in
+    KVCacheManagerConfig and size should be based on tokens_per_block_override.
+    """
+
 
 @dataclass(slots=True)
 class AttentionLayerConfig:
@@ -150,4 +156,10 @@ class KVCacheManagerConfig:
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
         assert len(set(layer.layer_id for layer in self.layers)) == len(self.layers), (
             "duplicate layer id"
+        )
+        assert all(
+            buffer.tokens_per_block_override is None
+            or self.tokens_per_block % buffer.tokens_per_block_override == 0
+            for layer in self.layers
+            for buffer in layer.buffers
         )

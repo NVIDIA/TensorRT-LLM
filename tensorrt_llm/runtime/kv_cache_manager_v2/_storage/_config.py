@@ -24,10 +24,12 @@ from .._storage._core import PoolGroupIndex, PoolIndex
 from .._utils import (
     HomoTuple,
     TypedIndexList,
+    exact_div,
     filled_list,
     get_uniform_attribute,
     is_sorted,
     typed_map,
+    value_or,
 )
 
 
@@ -92,13 +94,15 @@ class BufferAttr:
     life_cycle_id: LifeCycleId
     pool_index: PoolIndex
     offset: int
-    size: int
+    size: int  # expanded size of the buffer
+    expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
 
 
 @dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
+    expansion: dict[BufferId, int]  # expansion factor of page due to heterogeneous tokens_per_block
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
@@ -121,7 +125,11 @@ class StorageConfig:
                     offset = 0
                     for b in cb.buffer_ids:
                         ret[b] = BufferAttr(
-                            life_cycle_id, PoolIndex(pool), offset, cb.single_buffer_size
+                            life_cycle_id,
+                            PoolIndex(pool),
+                            offset,
+                            cb.single_buffer_size,
+                            self.expansion.get(b, 1),
                         )
                         offset += cb.single_buffer_size
         return ret
@@ -153,14 +161,19 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         lambda: defaultdict[int, list[BufferId]](list[BufferId])
     )
     life_cycle_registry = LifeCycleRegistry(config)
+    tokens_per_block = config.tokens_per_block
+    expansion_map = dict[BufferId, int]()
     for layer in config.layers:
-        life_cycle = LifeCycle.make(
-            layer.window_size, layer.num_sink_tokens, config.tokens_per_block
-        )
+        life_cycle = LifeCycle.make(layer.window_size, layer.num_sink_tokens, tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
         size_to_buffers = buffer_groups[life_cycle_id]
         for buffer in layer.buffers:
-            size_to_buffers[buffer.size].append(BufferId(layer.layer_id, buffer.role))
+            tokens_per_block_override = value_or(buffer.tokens_per_block_override, tokens_per_block)
+            expansion = exact_div(tokens_per_block, tokens_per_block_override)
+            size = buffer.size * expansion
+            buf_id = BufferId(layer.layer_id, buffer.role)
+            expansion_map[buf_id] = expansion
+            size_to_buffers[size].append(buf_id)
     # Create one slot group for each life cycle.
     # It's possible that buffers with different sizes form coalesced buffers with the same coalesced size.
     # @TODO: add test for this case.
@@ -183,4 +196,8 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         TypedIndexList[PoolGroupIndex, SlotDesc],
         [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],
     )
-    return StorageConfig(cache_tiers=tuple(config.cache_tiers), slot_desc_list=slot_desc_list)
+    return StorageConfig(
+        cache_tiers=tuple(config.cache_tiers),
+        slot_desc_list=slot_desc_list,
+        expansion=expansion_map,
+    )
