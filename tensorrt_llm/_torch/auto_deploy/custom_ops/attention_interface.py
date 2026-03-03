@@ -41,6 +41,22 @@ from ..utils.logger import ad_logger
 
 Constant = Union[int, float, str, None]
 
+_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY = "trtllm_attention_input_scale"
+
+
+def set_trtllm_attention_fp8_input_scale(attn_node: Node, input_scale: Node) -> None:
+    attn_node.meta[_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY] = input_scale
+
+
+def get_trtllm_attention_fp8_input_scale(attn_node: Node) -> Optional[Node]:
+    scale = attn_node.meta.get(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY)
+    return scale if isinstance(scale, Node) else None
+
+
+def clear_trtllm_attention_fp8_input_scale(attn_node: Node) -> None:
+    attn_node.meta.pop(_TRTLLM_ATTN_FP8_INPUT_SCALE_KEY, None)
+
+
 # Torch dtype → numpy dtype for fast list-to-tensor conversion.
 # numpy's list→array conversion is ~2-3x faster than torch.tensor(list) for large lists.
 _TORCH_TO_NUMPY_DTYPE: Dict[torch.dtype, np.dtype] = {

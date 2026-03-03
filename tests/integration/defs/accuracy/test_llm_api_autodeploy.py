@@ -620,6 +620,38 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestLlama3_1_8BInstructFP8HFCheckpoint(LlmapiAccuracyTestHarness):
+    """Accuracy regression test for the direct HF FP8 Llama 3.1 checkpoint via AutoDeploy."""
+
+    MODEL_NAME = "nvidia/Llama-3.1-8B-Instruct-FP8"
+    CONFIG_YAML = str(_AD_CONFIGS_DIR / "llama3_1_8b.yaml")
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(32000)
+    @pytest.mark.parametrize("attn_backend", ["flashinfer", "trtllm"])
+    def test_accuracy(self, attn_backend):
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           yaml_extra=[self.CONFIG_YAML],
+                           trust_remote_code=True,
+                           attn_backend=attn_backend) as llm:
+            llm.args.quant_config.quant_algo = QuantAlgo.FP8
+            llm.args.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+
+            sampling_params = self.get_default_sampling_params()
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Qwen3.5-397B-A17B via AutoDeploy.
 

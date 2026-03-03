@@ -84,6 +84,9 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_from_graph:
     stage: pattern_matcher
+  fuse_trtllm_attn_quant_fp8:
+    stage: pattern_matcher
+    enabled: false
   # SwiGLU pattern matching must run AFTER quantization transforms. For pre-quantized
   # checkpoints (e.g., NVFP4), quantization converts torch_linear_simple ops to quantized
   # ops first, and then match_nvfp4_swiglu_pattern captures the NVFP4 SwiGLU pattern.
@@ -155,6 +158,7 @@ transforms:
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    requires_shape_prop: true
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -205,6 +209,9 @@ transforms:
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
