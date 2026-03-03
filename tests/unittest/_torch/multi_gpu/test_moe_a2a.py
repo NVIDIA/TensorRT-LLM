@@ -593,21 +593,27 @@ class TestMoEAlltoAll:
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k",
+        "mpi_pool_executor,all_num_tokens,top_k,payload_in_workspace",
         [
-            # (num_workers, all_num_tokens, top_k)
-            (4, [32, 32, 32, 32], 2),
-            (4, [16, 32, 64, 48], 2),
-            (2, [100, 50], 2),
-            (4, [32, 32, 32, 32], 4),
-            (4, [32, 32, 32, 32], 10),  # (top_k=10 is used by Qwen3-next)
-            (4, [32, 32, 32, 32], 22),
-            (4, [1, 1, 1, 1], 2),
-            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4),
-            (4, [32, 0, 16, 0], 2),
+            # (num_workers, all_num_tokens, top_k, payload_in_workspace)
+            (4, [32, 32, 32, 32], 2, False),
+            (4, [16, 32, 64, 48], 2, False),
+            (2, [100, 50], 2, False),
+            (4, [32, 32, 32, 32], 4, False),
+            (4, [32, 32, 32, 32], 10, False),  # top_k=10 used by Qwen3-next
+            (4, [32, 32, 32, 32], 22, False),
+            (4, [1, 1, 1, 1], 2, False),
+            (8, [640, 640, 640, 640, 640, 640, 640, 640], 4, False),
+            (4, [32, 0, 16, 0], 2, False),
+            # payload_in_workspace=True: MoE output already in workspace buffer
+            (4, [32, 32, 32, 32], 2, True),
+            (4, [32, 0, 16, 0], 2, True),
+            (4, [16, 32, 64, 48], 2, True),  # non-uniform tokens
+            (4, [32, 32, 32, 32], 4, True),  # top_k=4
         ],
         indirect=["mpi_pool_executor"])
-    def test_combine(self, mpi_pool_executor, all_num_tokens, top_k):
+    def test_combine(self, mpi_pool_executor, all_num_tokens, top_k,
+                     payload_in_workspace):
         """Test MoE A2A combine with MNNVL across multiple GPUs"""
 
         try:
@@ -640,8 +646,8 @@ class TestMoEAlltoAll:
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_moe_combine_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
-                    num_experts, hidden_size, invalid_token_expert_id)] *
-                 ep_size),
+                    num_experts, hidden_size, invalid_token_expert_id,
+                    payload_in_workspace)] * ep_size),
         )
 
         # Collect results
@@ -662,19 +668,22 @@ class TestMoEAlltoAll:
 
     @pytest.mark.threadleak(enabled=False)
     @pytest.mark.parametrize(
-        "mpi_pool_executor,all_num_tokens,top_k",
+        "mpi_pool_executor,all_num_tokens,top_k,payload_in_workspace",
         [
-            # Basic 4-rank uniform
-            (4, [32, 32, 32, 32], 2),
-            # Non-uniform token distribution
-            (4, [16, 32, 64, 48], 2),
-            # Zero-token edge case
-            (4, [32, 0, 16, 0], 2),
-            # Larger top_k
-            (4, [32, 32, 32, 32], 4),
+            # payload_in_workspace=False: staged quantization (external payload)
+            (4, [32, 32, 32, 32], 2, False),
+            (4, [16, 32, 64, 48], 2, False),
+            (4, [32, 0, 16, 0], 2, False),
+            (4, [32, 32, 32, 32], 4, False),
+            # payload_in_workspace=True: in-place BF16→FP8 quantization in workspace
+            (4, [32, 32, 32, 32], 2, True),
+            (4, [32, 0, 16, 0], 2, True),
+            (4, [16, 32, 64, 48], 2, True),  # non-uniform tokens
+            (4, [32, 32, 32, 32], 4, True),  # top_k=4
         ],
         indirect=["mpi_pool_executor"])
-    def test_combine_fp8(self, mpi_pool_executor, all_num_tokens, top_k):
+    def test_combine_fp8(self, mpi_pool_executor, all_num_tokens, top_k,
+                         payload_in_workspace):
         """Test FP8 combine: quantize BF16 MoE output to FP8 over NVLink, accumulate as BF16.
 
         Runs two back-to-back dispatch+combine rounds on the same MoeAlltoAll instance
@@ -706,7 +715,7 @@ class TestMoEAlltoAll:
         results = mpi_pool_executor.map(
             run_moe_a2a_dispatch_moe_combine_fp8_single_rank,
             *zip(*[(ep_size, all_num_tokens, top_k, workspace_size_per_rank,
-                    num_experts, hidden_size)] * ep_size),
+                    num_experts, hidden_size, payload_in_workspace)] * ep_size),
         )
 
         try:
@@ -718,10 +727,14 @@ class TestMoEAlltoAll:
         verify_combine_fp8(all_results, ep_size)
 
 
-def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
+def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size,
+                                                 all_num_tokens,
+                                                 top_k,
                                                  workspace_size_per_rank,
-                                                 num_experts, hidden_size,
-                                                 invalid_token_expert_id):
+                                                 num_experts,
+                                                 hidden_size,
+                                                 invalid_token_expert_id,
+                                                 payload_in_workspace=False):
     """Worker function for dispatch and combine test."""
     rank = tllm.mpi_rank()
     torch.cuda.set_device(rank)
@@ -792,8 +805,18 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(ep_size, all_num_tokens, top_k,
                 ep_size, max_num_tokens, hidden_states_recv.shape[-1])
 
         with torch.cuda.profiler.profile():
-            combined_output = moe_a2a.combine(hidden_states_recv,
-                                              max_num_tokens)
+            if payload_in_workspace:
+                # Copy fake-MoE output into the workspace buffer and combine from there.
+                ws = moe_a2a.get_combine_payload_tensor_in_workspace(
+                    max_num_tokens, hidden_size, torch.bfloat16)
+                ws.copy_(hidden_states_recv.view(-1, hidden_size))
+                combined_output = moe_a2a.combine(ws.view(
+                    ep_size, max_num_tokens, hidden_size),
+                                                  max_num_tokens,
+                                                  payload_in_workspace=True)
+            else:
+                combined_output = moe_a2a.combine(hidden_states_recv,
+                                                  max_num_tokens)
 
         # Verify completion flags after combine
         completion_flags_offset = moe_a2a.metainfo[MoeAlltoAll._METAINFO_INDEX[
@@ -909,16 +932,24 @@ def verify_combine(all_results, ep_size):
                 raise AssertionError(error_msg)
 
 
-def run_moe_a2a_dispatch_moe_combine_fp8_single_rank(ep_size, all_num_tokens,
-                                                     top_k,
-                                                     workspace_size_per_rank,
-                                                     num_experts, hidden_size):
+def run_moe_a2a_dispatch_moe_combine_fp8_single_rank(
+        ep_size,
+        all_num_tokens,
+        top_k,
+        workspace_size_per_rank,
+        num_experts,
+        hidden_size,
+        payload_in_workspace=False):
     """Worker for FP8 combine test.
 
     Runs two sequential dispatch+combine rounds on the same MoeAlltoAll instance
     with identical input data:
       - Round 1: BF16 combine (reference)
       - Round 2: FP8 combine (under test)
+
+    When payload_in_workspace=True the MoE output is copied into the workspace
+    buffer and combine is called with payload_in_workspace=True, exercising the
+    in-place FP8 quantization path.
 
     Returns (fp8_combined_output, bf16_combined_output) on CPU.
     """
@@ -979,17 +1010,32 @@ def run_moe_a2a_dispatch_moe_combine_fp8_single_rank(ep_size, all_num_tokens,
             )
             return moe_out.view(ep_size, max_num_tokens, hs.shape[-1])
 
-        # Round 1: BF16 combine (reference)
-        moe_out_r1 = dispatch_and_fake_moe()
-        bf16_output = moe_a2a.combine(moe_out_r1,
-                                      max_num_tokens,
-                                      fp8_combine=False)
+        def _combine(moe_out, fp8_combine):
+            """Call combine, optionally staging moe_out via workspace buffer."""
+            if payload_in_workspace:
+                ws = moe_a2a.get_combine_payload_tensor_in_workspace(
+                    max_num_tokens, hidden_size, torch.bfloat16)
+                ws.copy_(moe_out.view(-1, hidden_size))
+                return moe_a2a.combine(
+                    ws.view(ep_size, max_num_tokens, hidden_size),
+                    max_num_tokens,
+                    payload_in_workspace=True,
+                    fp8_combine=fp8_combine,
+                )
+            return moe_a2a.combine(
+                moe_out,
+                max_num_tokens,
+                fp8_combine=fp8_combine,
+            )
 
-        # Round 2: FP8 combine — identical data, identical routing
+        # Round 1: BF16 combine (reference).
+        # Clone moe_out before combine() resets state so round 2 can reuse it.
+        moe_out_r1 = dispatch_and_fake_moe()
+        bf16_output = _combine(moe_out_r1, fp8_combine=False)
+
+        # Round 2: re-dispatch to restore combine state, then FP8 combine.
         moe_out_r2 = dispatch_and_fake_moe()
-        fp8_output = moe_a2a.combine(moe_out_r2,
-                                     max_num_tokens,
-                                     fp8_combine=True)
+        fp8_output = _combine(moe_out_r2, fp8_combine=True)
 
         return (fp8_output.cpu(), bf16_output.cpu())
 
