@@ -55,14 +55,20 @@ def main():
     p = argparse.ArgumentParser()
     p.add_argument("--llm-src", required=True)
     p.add_argument("--isolate-list", required=True)
-    p.add_argument("--base-cmd", required=True)
+    p.add_argument(
+        "--base-cmd",
+        nargs=argparse.REMAINDER,
+        required=True,
+        help="Base command with environment variables and pytest options",
+    )
     p.add_argument("--stage-name", required=True)
     p.add_argument("--output-dir", required=True)
     args = p.parse_args()
 
     llm_src = Path(args.llm_src)
     isolate_list = Path(args.isolate_list)
-    base_cmd = args.base_cmd
+    # base_cmd is now a list, join it back into a string
+    base_cmd = " ".join(args.base_cmd)
     stage = args.stage_name
     output_dir = Path(args.output_dir)
 

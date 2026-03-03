@@ -196,7 +196,7 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
         !cmd.contains("--csv=") &&
         !cmd.contains("--periodic-junit-xmlpath")
     }
-    def baseCmdStr = filteredBaseCmd.join(" ").replace("'", "'\\''")
+    def baseCmdStr = filteredBaseCmd.join(" ")
 
     def scriptPath = "${llmSrc}/jenkins/scripts/run_isolated_tests.py"
     def rerunFailed = false
@@ -207,9 +207,9 @@ def runIsolatedTests(preprocessedLists, testCmdLine, llmSrc, stageName) {
             python3 '${scriptPath}' \
               --llm-src '${llmSrc}' \
               --isolate-list '${isolateTestList}' \
-              --base-cmd '${baseCmdStr}' \
               --stage-name '${stageName}' \
-              --output-dir '${WORKSPACE}/${stageName}'
+              --output-dir '${WORKSPACE}/${stageName}' \
+              --base-cmd ${baseCmdStr}
         """
         // If we reach here, all tests passed
         return false
