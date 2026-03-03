@@ -33,6 +33,7 @@ std::vector<MmKey> generateBlockHashExtraKeys(
     auto const multimodalHashes = llmRequest.getMultimodalHashes();
     auto const multimodalPositions = llmRequest.getMultimodalPositions();
     auto const multimodalLengths = llmRequest.getMultimodalLengths();
+    auto const multimodalUuids = llmRequest.getMultimodalUuids();
 
     if (!multimodalHashes || !multimodalPositions || !multimodalLengths || !(*multimodalHashes)
         || (*multimodalHashes)->empty() || !(*multimodalPositions) || (*multimodalPositions)->empty()
@@ -48,7 +49,7 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         return {};
     }
 
-    std::vector<MmKey> extraKeys; // MmKey = std::pair<std::array<uint8_t, 32>, SizeType32>
+    std::vector<MmKey> extraKeys;
     extraKeys.reserve((*multimodalPositions)->size());
     std::array<uint8_t, 32> mmHashArray;
 
@@ -78,7 +79,15 @@ std::vector<MmKey> generateBlockHashExtraKeys(
         if (endTokenIdx > startPos && startTokenIdx < startPos + length)
         {
             uint64_t mmStartInBlock = (startPos >= startTokenIdx) ? 0 : static_cast<uint64_t>(startTokenIdx - startPos);
-            extraKeys.emplace_back(mmHashArray, mmStartInBlock);
+
+            // Get UUID if available
+            std::optional<std::string> uuid = std::nullopt;
+            if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
+            {
+                uuid = (*(*multimodalUuids))[i];
+            }
+
+            extraKeys.emplace_back(mmHashArray, mmStartInBlock, std::move(uuid));
         }
     }
 
@@ -130,29 +139,35 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
     if (parentHash == 0 && blockKey.cacheSaltID)
     {
         // Only hashing the cache salt ID for the first block in the sequence
-        seed = hash64Mix(blockKey.cacheSaltID.value(), seed);
+        uint64_t c = blockKey.cacheSaltID.value();
+        seed = hash64Mix(c, seed);
     }
 
     for (auto const& uniqueToken : blockKey.uniqueTokens)
     {
-        seed = hash32Mix(static_cast<uint32_t>(uniqueToken.tokenId), seed);
+        uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
+        seed = hash32Mix(a, seed);
         if (blockKey.usesExtraIds)
         {
-            seed = hash64Mix(uniqueToken.tokenExtraId, seed);
+            uint64_t b = uniqueToken.tokenExtraId;
+            seed = hash64Mix(b, seed);
         }
     }
 
     if (blockKey.loraTaskId)
     {
-        seed = hash64Mix(blockKey.loraTaskId.value(), seed);
+        uint64_t c = blockKey.loraTaskId.value();
+        seed = hash64Mix(c, seed);
     }
 
     // Add extra keys for multimodal data mixing in external multimodal item hash and token offset within this sequence
     // block
     if (!blockKey.extraKeys.empty())
     {
-        for (auto const& [mmHash, startOffset, uuid] : blockKey.extraKeys)
+        for (auto const& mmKey : blockKey.extraKeys)
         {
+            auto const& mmHash = mmKey.hash;
+            auto const& startOffset = mmKey.startOffset;
             // Hash the multimodal hash array in 32-bit chunks (more efficient)
             for (size_t i = 0; i < 32; i += 4)
             {
@@ -165,7 +180,8 @@ size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) no
             }
 
             // Hash the start offset
-            seed = hash64Mix(static_cast<uint64_t>(startOffset), seed);
+            uint64_t e = static_cast<uint64_t>(startOffset);
+            seed = hash64Mix(e, seed);
         }
     }
 
