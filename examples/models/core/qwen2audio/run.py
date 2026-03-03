@@ -27,7 +27,6 @@ from utils import add_common_args
 import tensorrt_llm
 import tensorrt_llm.profiler as profiler
 from tensorrt_llm import logger
-from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.llmapi.kv_cache_type import KVCacheType
 from tensorrt_llm.quantization import QuantMode
 from tensorrt_llm.runtime import (PYTHON_BINDINGS, ModelConfig, ModelRunner,
@@ -625,7 +624,6 @@ def parse_arguments():
 
 
 if __name__ == "__main__":
-    emit_engine_arch_deprecation("run.py")
     args = parse_arguments()
     tensorrt_llm.logger.set_level(args.log_level)
 
