@@ -20,6 +20,7 @@ context_servers:
   cuda_graph_config: null
   cache_transceiver_config:
     backend: UCX
+    # Intentionally small to reproduce buffer overflow bug
     max_tokens_in_buffer: 2048
 generation_servers:
   num_instances: 1
@@ -40,4 +41,5 @@ generation_servers:
   cuda_graph_config: null
   cache_transceiver_config:
     backend: UCX
+    # Intentionally small to reproduce buffer overflow bug
     max_tokens_in_buffer: 2048
