@@ -1,5 +1,7 @@
 # CPU Affinity configuration in TensorRT-LLM
 
+NOTE: Trivial change to documentation to trigger CI (non-empty commit)
+
 ## NUMA-aware affinity in TensorRT-LLM
 
 TensorRT-LLM is frequently deployed on
