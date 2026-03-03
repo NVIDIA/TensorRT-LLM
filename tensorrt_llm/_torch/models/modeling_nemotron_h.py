@@ -269,6 +269,8 @@ class NemotronHMOE(nn.Module):
         assert hidden_states_hp.shape[-1] == self.hidden_dim
         orig_shape = hidden_states_hp.shape
         hidden_states_hp_2d = hidden_states_hp.view(-1, self.hidden_dim)
+        # MTP sublayer may pass a corrected all_rank_num_tokens via kwargs,
+        # since attn_metadata still holds the main model's token count.
         all_rank_num_tokens = kwargs.get('all_rank_num_tokens',
                                          attn_metadata.all_rank_num_tokens)
 

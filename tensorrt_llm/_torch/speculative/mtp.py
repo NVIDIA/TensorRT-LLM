@@ -1365,7 +1365,8 @@ class MTPEagleWorker(MTPWorker):
                     # update metadata
                     # some attention metadata needs to be updated when changing seq_lens/kv_lens
                     attn_metadata.update_for_spec_dec()
-                    # Disable spec-dec mode for subsequent iterations (i>0).
+                    # Disable spec-dec mode for subsequent iterations (i>0)
+                    # as draft model only infer 1 token for the subsequent inference.
                     if hasattr(attn_metadata, 'use_spec_decoding'):
                         attn_metadata.use_spec_decoding = False
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
