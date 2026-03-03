@@ -109,30 +109,7 @@ def parse_args():
     parser.add_argument(
         "--enable_sage_attention",
         action="store_true",
-        help="Enable SageAttention (per-block FP8/INT8 quantised Q/K/V). Requires TRTLLM backend.",
-    )
-    parser.add_argument(
-        "--sage_num_elts_per_blk_q",
-        type=int,
-        default=1,
-        help="SageAttention: elements per quantization block for Q (0 disables)",
-    )
-    parser.add_argument(
-        "--sage_num_elts_per_blk_k",
-        type=int,
-        default=4,
-        help="SageAttention: elements per quantization block for K (0 disables)",
-    )
-    parser.add_argument(
-        "--sage_num_elts_per_blk_v",
-        type=int,
-        default=1,
-        help="SageAttention: elements per quantization block for V (0 disables)",
-    )
-    parser.add_argument(
-        "--sage_qk_int8",
-        action="store_true",
-        help="SageAttention: use INT8 (vs E4M3) for Q/K quantization",
+        help="Enable SageAttention (per-block INT8 quantised Q/K/V). Requires TRTLLM backend.",
     )
 
     # Parallelism
@@ -190,10 +167,10 @@ def main():
     }
     if args.enable_sage_attention:
         attention_cfg["sage_attention_config"] = {
-            "num_elts_per_blk_q": args.sage_num_elts_per_blk_q,
-            "num_elts_per_blk_k": args.sage_num_elts_per_blk_k,
-            "num_elts_per_blk_v": args.sage_num_elts_per_blk_v,
-            "qk_int8": args.sage_qk_int8,
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 4,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
         }
 
     diffusion_config = {

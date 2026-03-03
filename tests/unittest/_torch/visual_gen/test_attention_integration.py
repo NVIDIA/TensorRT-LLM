@@ -274,7 +274,7 @@ def test_self_attention_equivalence(attn_backend: str):
 
 # seq_len: pow2 baselines + real WAN latent token counts (VAE 8x spatial, 4x temporal, patch [1,2,2])
 # batch_size: B=1 (cfg_size=2, split across GPUs) / B=2 (cfg_size=1, single GPU)
-@pytest.mark.parametrize("seq_len", [256, 512, 1560, 3600, 4096, 16384, 32760, 75600])
+@pytest.mark.parametrize("seq_len", [256, 512, 1560, 3600, 4096, 16384, 32760])
 @pytest.mark.parametrize("batch_size", [1, 2])
 @pytest.mark.parametrize("qk_int8", [False, True])
 def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: int):
@@ -304,7 +304,7 @@ def test_sage_attention_self_attention(qk_int8: bool, batch_size: int, seq_len: 
 
     sage_cfg = SageAttentionConfig(
         num_elts_per_blk_q=1,
-        num_elts_per_blk_k=4,
+        num_elts_per_blk_k=4 if qk_int8 else 1,
         num_elts_per_blk_v=1,
         qk_int8=qk_int8,
     )

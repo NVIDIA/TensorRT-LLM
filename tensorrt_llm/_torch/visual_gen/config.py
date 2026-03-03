@@ -60,7 +60,7 @@ class SageAttentionConfig(BaseModel):
     num_elts_per_blk_v: int = PydanticField(
         1, ge=0, description="Elements per quantization block for V (0 disables)"
     )
-    qk_int8: bool = PydanticField(False, description="Use INT8 (vs E4M3) for Q/K quantization")
+    qk_int8: bool = PydanticField(True, description="Use INT8 (vs E4M3) for Q/K quantization")
 
 
 class AttentionConfig(BaseModel):

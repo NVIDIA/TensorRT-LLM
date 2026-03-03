@@ -81,6 +81,18 @@ python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_wan_t2v.py \
     --output_path wan_cat_piano.png
 
 echo ""
+echo "=== WAN Example 1b: With SageAttention ==="
+python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_wan_t2v.py \
+    --height 480 \
+    --width 832 \
+    --num_frames 33 \
+    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers/ \
+    --prompt "A cute cat playing piano" \
+    --output_path wan_cat_piano_sage.png \
+    --attention_backend TRTLLM \
+    --enable_sage_attention
+
+echo ""
 echo "=== WAN Example 2: With TeaCache ==="
 python ${PROJECT_ROOT}/examples/visual_gen/visual_gen_wan_t2v.py \
     --height 480 \

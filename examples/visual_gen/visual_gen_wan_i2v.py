@@ -111,6 +111,13 @@ def parse_args():
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
 
+    # SageAttention (requires --attention_backend TRTLLM)
+    parser.add_argument(
+        "--enable_sage_attention",
+        action="store_true",
+        help="Enable SageAttention (per-block INT8 quantised Q/K/V). Requires TRTLLM backend.",
+    )
+
     # Parallelism
     parser.add_argument(
         "--cfg_size",
@@ -148,11 +155,20 @@ def main():
         quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
     # 1. Setup Configuration
+    attention_cfg = {
+        "backend": args.attention_backend,
+    }
+    if args.enable_sage_attention:
+        attention_cfg["sage_attention_config"] = {
+            "num_elts_per_blk_q": 1,
+            "num_elts_per_blk_k": 4,
+            "num_elts_per_blk_v": 1,
+            "qk_int8": True,
+        }
+
     diffusion_config = {
         "model_type": "wan2",
-        "attention": {
-            "backend": args.attention_backend,
-        },
+        "attention": attention_cfg,
         "teacache": {
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,
