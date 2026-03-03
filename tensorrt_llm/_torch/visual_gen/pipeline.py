@@ -11,9 +11,9 @@ from tensorrt_llm.mapping import Mapping
 
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
-from .teacache import TeaCacheBackend
-from .parallelism import setup_vae_parallelism
 from .modules.parallel_vae import BaseParallelVAEAdapter
+from .parallelism import setup_vae_parallelism
+from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
@@ -32,6 +32,7 @@ class BasePipeline(nn.Module):
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._parallel_vae_enabled: bool = False
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -107,7 +108,7 @@ class BasePipeline(nn.Module):
         Override this property and use in self._run_warmup() for model-specific warmup.
         """
         return []
-    
+
     @property
     def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:
         """Return the VAE adapter class for the pipeline."""
@@ -181,7 +182,7 @@ class BasePipeline(nn.Module):
         logger.info("TeaCache: Initializing...")
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
-    
+
     def setup_parallel_vae(self):
         if self.model_config.parallel.disable_parallel_vae:
             return
@@ -192,9 +193,7 @@ class BasePipeline(nn.Module):
 
         adapter_cls = self.vae_adapter_class
         if adapter_cls is None:
-            logger.warning(
-                f"Parallel VAE not supported for {self.__class__.__name__}"
-            )
+            logger.warning(f"Parallel VAE not supported for {self.__class__.__name__}")
             return
 
         vae_rank, vae_world_size, adj_groups = setup_vae_parallelism(self.model_config)
@@ -205,6 +204,7 @@ class BasePipeline(nn.Module):
             vae_world_size,
             adj_groups,
         )
+        self._parallel_vae_enabled = True
         logger.info(
             f"Parallel VAE enabled: {adapter_cls.__name__}, "
             f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
@@ -227,7 +227,7 @@ class BasePipeline(nn.Module):
         compile_mode = "default"
 
         # Compiling transformer blocks provides max performance value.
-        targets = self.transformer_components #+ [PipelineComponent.VAE]
+        targets = self.transformer_components
 
         for name in targets:
             model = getattr(self, name, None)
@@ -338,14 +338,13 @@ class BasePipeline(nn.Module):
             Single result if no extra_latents, tuple of results if extra_latents provided.
             Non-rank-0 processes return None placeholders.
         """
-        
-        if not self.model_config.parallel.disable_parallel_vae:
+
+        if self._parallel_vae_enabled:
             primary_result = decode_fn(latents)
             if extra_latents:
                 extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
                 return (primary_result,) + tuple(extra_results)
             return primary_result
-
 
         if self.rank == 0:
             primary_result = decode_fn(latents)

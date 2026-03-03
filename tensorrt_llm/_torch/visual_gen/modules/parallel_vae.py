@@ -1,11 +1,10 @@
 from abc import ABC, abstractmethod
-from typing import List, Literal, Optional, Tuple
-
-from diffusers.models.autoencoders.vae import DecoderOutput
+from typing import List, Literal
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from diffusers.models.autoencoders.vae import DecoderOutput
 
 
 class BaseParallelVAEAdapter(ABC):
@@ -37,9 +36,7 @@ class BaseParallelVAEAdapter(ABC):
         self._wrap_encode()
 
     @abstractmethod
-    def _get_chunk_dims(
-        self, split_dim: Literal["height", "width"]
-    ) -> dict:
+    def _get_chunk_dims(self, split_dim: Literal["height", "width"]) -> dict:
         """Return a dict mapping layer role to the tensor dim to split.
 
         Example for WAN with split_dim="height":
@@ -68,10 +65,11 @@ class BaseParallelVAEAdapter(ABC):
         world_size = self.world_size
 
         def parallel_decode(latents, return_dict=True):
-            assert latents.shape[input_dim] % world_size == 0, (
-                f"Dim {input_dim} (size {latents.shape[input_dim]}) "
-                f"not divisible by world_size {world_size}"
-            )
+            if latents.shape[input_dim] % world_size != 0:
+                raise ValueError(
+                    f"Dim {input_dim} (size {latents.shape[input_dim]}) "
+                    f"not divisible by world_size {world_size}"
+                )
             local_latents = latents.chunk(world_size, dim=input_dim)[rank]
             local_out = original_decode(local_latents, return_dict=False)
             local_video = local_out[0] if isinstance(local_out, tuple) else local_out
@@ -92,10 +90,11 @@ class BaseParallelVAEAdapter(ABC):
         world_size = self.world_size
 
         def parallel_encode(video, **kwargs):
-            assert video.shape[input_dim] % world_size == 0, (
-                f"Dim {input_dim} (size {video.shape[input_dim]}) "
-                f"not divisible by world_size {world_size}"
-            )
+            if video.shape[input_dim] % world_size != 0:
+                raise ValueError(
+                    f"Dim {input_dim} (size {video.shape[input_dim]}) "
+                    f"not divisible by world_size {world_size}"
+                )
             local_video = video.chunk(world_size, dim=input_dim)[rank]
             local_latents = original_encode(local_video, **kwargs)
             gathered = [torch.empty_like(local_latents) for _ in range(world_size)]

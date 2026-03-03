@@ -2,8 +2,8 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Optional, Tuple
 
 import torch
+import torch.distributed as dist
 import torch.nn as nn
-import torch.distributed as dist    
 
 from ...modules.linear import Linear, WeightMode, WeightsLoadingConfig
 from ...modules.rms_norm import RMSNorm
@@ -313,14 +313,8 @@ class ParallelVaeAttentionBlock(torch.nn.Module):
         rank: This rank's position in the VAE parallel group.
         world_size: Total ranks in the VAE parallel group.
     """
-    
-    def __init__(
-        self, 
-        module: nn.Module, 
-        chunk_dim: int, 
-        rank: int, 
-        world_size: int
-    ) -> None:
+
+    def __init__(self, module: nn.Module, chunk_dim: int, rank: int, world_size: int) -> None:
         super().__init__()
         self.module = module
         self.rank = rank
@@ -329,8 +323,8 @@ class ParallelVaeAttentionBlock(torch.nn.Module):
 
     def forward(self, hidden_states: torch.Tensor, *args: Any, **kwargs: Any) -> torch.Tensor:
         gathered_tensors = [torch.zeros_like(hidden_states) for _ in range(self.world_size)]
-        # Do we need hidden_states to be contiguous here?
-        dist.all_gather(gathered_tensors, hidden_states)
+
+        dist.all_gather(gathered_tensors, hidden_states.contiguous())
         combined_tensor = torch.cat(gathered_tensors, dim=self.chunk_dim)
 
         forward_output = self.module(combined_tensor, *args, **kwargs)
@@ -338,5 +332,7 @@ class ParallelVaeAttentionBlock(torch.nn.Module):
         chunk_sizes = [t.size(self.chunk_dim) for t in gathered_tensors]
 
         start_idx = sum(chunk_sizes[: self.rank])
-        local_output = torch.narrow(forward_output, self.chunk_dim, start_idx, chunk_sizes[self.rank])
+        local_output = torch.narrow(
+            forward_output, self.chunk_dim, start_idx, chunk_sizes[self.rank]
+        )
         return local_output

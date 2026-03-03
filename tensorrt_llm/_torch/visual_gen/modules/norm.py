@@ -1,9 +1,7 @@
-from typing import List, Tuple
-
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
 import torch.distributed as dist
+import torch.nn as nn
+
 
 class GroupNormParallel(torch.nn.Module):
     """GroupNorm with all-reduced statistics across spatial splits.
@@ -21,11 +19,7 @@ class GroupNormParallel(torch.nn.Module):
         world_size: The number of ranks in the world.
     """
 
-    def __init__(
-        self, 
-        module: nn.Module, 
-        world_size: int
-    ) -> None:
+    def __init__(self, module: nn.Module, world_size: int) -> None:
         super().__init__()
         self.module = module
         self.world_size = world_size
@@ -34,7 +28,9 @@ class GroupNormParallel(torch.nn.Module):
         shape = hidden_states.shape
         N, C, G = shape[0], shape[1], self.module.num_groups
         if C % G != 0:
-            raise ValueError(f"Channel dimension {C} must be divisible by number of groups {G} for parallel group normalization")
+            raise ValueError(
+                f"Channel dimension {C} must be divisible by number of groups {G} for parallel group normalization"
+            )
 
         hidden_states = hidden_states.reshape(N, G, -1)
 
@@ -43,7 +39,11 @@ class GroupNormParallel(torch.nn.Module):
 
         mean = mean / self.world_size
 
-        var = ((hidden_states - mean.to(hidden_states.dtype)) ** 2).mean(-1, keepdim=True).to(torch.float32)
+        var = (
+            ((hidden_states - mean.to(hidden_states.dtype)) ** 2)
+            .mean(-1, keepdim=True)
+            .to(torch.float32)
+        )
 
         dist.all_reduce(var)
         var = var / self.world_size

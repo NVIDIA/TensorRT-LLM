@@ -105,9 +105,7 @@ def setup_vae_parallelism(
 ) -> Tuple[int, int, List[dist.ProcessGroup]]:
     """Create process groups for parallel VAE decoding.
 
-    Uses all ranks in the global group.  If the final latent only exists
-    on a subset of ranks (e.g. CFG group 0), it is broadcast to all
-    ranks before decoding.
+    Uses all ranks in the global group.
 
     Args:
         model_config: Model configuration containing parallel settings.
@@ -120,12 +118,6 @@ def setup_vae_parallelism(
             "torch.distributed.init_process_group() must be called before "
             "setting up VAE parallelism"
         )
-    
-    ulysses_size = model_config.parallel.dit_ulysses_size
-    cfg_size = model_config.parallel.dit_cfg_size
-
-    if ulysses_size * cfg_size == 1:
-        return 0, 1, []
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()

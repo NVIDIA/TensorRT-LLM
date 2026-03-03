@@ -1,20 +1,12 @@
 from typing import Literal
 
 import torch.nn as nn
-from diffusers.models.autoencoders.autoencoder_kl_wan import (
-    AutoencoderKLWan,
-    WanAttentionBlock,
-    WanCausalConv3d,
-)
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, WanCausalConv3d
 
-from tensorrt_llm._torch.visual_gen.utils import as_tuple
-from tensorrt_llm._torch.visual_gen.modules.parallel_vae import BaseParallelVAEAdapter
 from tensorrt_llm._torch.visual_gen.modules.attention import ParallelVaeAttentionBlock
-from tensorrt_llm._torch.visual_gen.modules.conv import (
-    HaloExchangeConv, 
-    HaloExchangeConvStride2, 
-)
-from tensorrt_llm.logger import logger
+from tensorrt_llm._torch.visual_gen.modules.conv import HaloExchangeConv, HaloExchangeConv2dStride2
+from tensorrt_llm._torch.visual_gen.modules.parallel_vae import BaseParallelVAEAdapter
+from tensorrt_llm._torch.visual_gen.utils import as_tuple
 
 
 class WanCausalConvHalo(HaloExchangeConv):
@@ -60,8 +52,7 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
         targets = [
             (name, module)
             for name, module in model.named_modules()
-            if isinstance(module, WanCausalConv3d)
-            and max(module.kernel_size) > 1
+            if isinstance(module, WanCausalConv3d) and max(module.kernel_size) > 1
         ]
         for name, module in targets:
             self._replace_module(
@@ -128,7 +119,7 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
 
         WanResample.resample for downsample modes is:
             Sequential(ZeroPad2d((0,1,0,1)), Conv2d(dim, dim, 3, stride=(2,2)))
-        We replace the entire Sequential with HaloExchangeConvStride2, which
+        We replace the entire Sequential with HaloExchangeConv2dStride2, which
         absorbs the ZeroPad2d logic.
         """
         targets = [
@@ -146,7 +137,7 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
             self._replace_module(
                 model,
                 name,
-                HaloExchangeConvStride2(
+                HaloExchangeConv2dStride2(
                     conv_module,
                     self.chunk_dims["conv2d"],
                     self.adj_groups,
