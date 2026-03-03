@@ -97,6 +97,25 @@ class EnergyMonitor:
                 pass
         return False
 
+    def get_current_energy(self):
+        """Get total energy consumed (Joules) since __enter__ without stopping.
+
+        Unlike total_energy which is only available after __exit__, this method
+        can be called at any point while the monitor is active to get a live
+        reading of energy consumed so far.
+        """
+        if not self._enabled or self._start_energies is None:
+            return None
+        try:
+            total_energy = 0.0
+            for handle, start_energy in zip(self._handles, self._start_energies):
+                energy = (nvmlDeviceGetTotalEnergyConsumption(handle) - start_energy) / 1000.0
+                total_energy += energy
+            return total_energy * self._world_size / self._device_count
+        except NVMLError as e:
+            logger.warning(f"Failed to read GPU energy: {e}")
+            return None
+
     @property
     def total_energy(self):
         return self._total_energy
