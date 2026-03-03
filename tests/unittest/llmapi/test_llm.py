@@ -120,8 +120,9 @@ def llm_test_harness(model_dir: str,
 
     tp_size = llm_kwargs.get('tensor_parallel_size', 1)
     pp_size = llm_kwargs.get('pipeline_parallel_size', 1)
+    cp_size = llm_kwargs.get('context_parallel_size', 1)
     backend = llm_kwargs.get('backend', None)
-    world_size = tp_size * pp_size
+    world_size = tp_size * pp_size * cp_size
     if world_size > torch.cuda.device_count():
         pytest.skip(
             f"world_size ({world_size}) is greater than available GPUs ({torch.cuda.device_count()})"
