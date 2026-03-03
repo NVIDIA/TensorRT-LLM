@@ -96,10 +96,10 @@ class TestGatherTokensOp:
         expected = hidden_states[:, gather_indices, :]
         torch.testing.assert_close(output, expected)
 
-    def test_2d_singleton_token_format(self):
-        """Test gather op with 2D singleton input [tokens, hidden]."""
+    def test_singleton_token_format(self):
+        """Test gather op with 3D singleton input [1, 1, hidden]."""
         hidden_size = 128
-        hidden_states = torch.randn(1, hidden_size, device="cuda", dtype=torch.float16)
+        hidden_states = torch.randn(1, 1, hidden_size, device="cuda", dtype=torch.float16)
         gather_indices = torch.tensor([0], dtype=torch.long, device="cuda")
         logits_gather_info_host = torch.tensor([1, 1], dtype=torch.int32, device="cpu")
 
@@ -108,7 +108,7 @@ class TestGatherTokensOp:
         )
 
         # 2D input should stay 2D to preserve vocab axis after LM head.
-        assert output.shape == (1, hidden_size)
+        assert output.shape == (1, 1, hidden_size)
         torch.testing.assert_close(output, hidden_states)
 
     def test_fake_implementation_generate_format(self):
