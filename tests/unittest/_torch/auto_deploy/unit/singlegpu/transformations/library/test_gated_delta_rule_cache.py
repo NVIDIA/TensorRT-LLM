@@ -74,6 +74,9 @@ class GatedDeltaRuleModel(nn.Module):
 
     Architecture:
       input_ids -> embedding -> linear projections -> torch_gated_delta_rule -> output proj
+
+    The op internally performs L2 normalization, GQA repeat-interleave, and gating
+    computation from raw a/b projections and per-head A_log/dt_bias parameters.
     """
 
     def __init__(
@@ -93,8 +96,10 @@ class GatedDeltaRuleModel(nn.Module):
         self.q_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.k_proj = nn.Linear(hidden_size, num_heads * key_dim, bias=False)
         self.v_proj = nn.Linear(hidden_size, num_heads * value_dim, bias=False)
-        self.g_proj = nn.Linear(hidden_size, num_heads, bias=False)
-        self.beta_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.a_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.b_proj = nn.Linear(hidden_size, num_heads, bias=False)
+        self.A_log = nn.Parameter(torch.zeros(num_heads))
+        self.dt_bias = nn.Parameter(torch.zeros(num_heads))
         self.o_proj = nn.Linear(num_heads * value_dim, hidden_size, bias=False)
 
     @torch.no_grad()
@@ -102,24 +107,20 @@ class GatedDeltaRuleModel(nn.Module):
         self, input_ids: torch.Tensor, position_ids: Optional[torch.Tensor] = None
     ) -> torch.Tensor:
         x = self.embed_tokens(input_ids)  # [B, S, hidden]
-        b, s, _ = x.shape
+        bsz, s, _ = x.shape
 
-        q = self.q_proj(x).view(b, s, self.num_heads, self.key_dim)
-        k = self.k_proj(x).view(b, s, self.num_heads, self.key_dim)
-        v = self.v_proj(x).view(b, s, self.num_heads, self.value_dim)
+        q = self.q_proj(x).view(bsz, s, self.num_heads, self.key_dim)
+        k = self.k_proj(x).view(bsz, s, self.num_heads, self.key_dim)
+        v = self.v_proj(x).view(bsz, s, self.num_heads, self.value_dim)
+        a = self.a_proj(x)  # [B, S, H]
+        b = self.b_proj(x)  # [B, S, H]
 
-        # L2 normalize Q and K
-        q = torch.nn.functional.normalize(q, dim=-1)
-        k = torch.nn.functional.normalize(k, dim=-1)
-
-        # g should be negative (decay), beta should be in (0, 1)
-        g = -torch.nn.functional.softplus(self.g_proj(x))  # [B, S, H]
-        beta = torch.sigmoid(self.beta_proj(x))  # [B, S, H]
-
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q, k, v, g, beta)
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q, k, v, a, b, self.A_log, self.dt_bias
+        )
         # attn_out: [B, S, H, V]
 
-        attn_out = attn_out.reshape(b, s, -1)
+        attn_out = attn_out.reshape(bsz, s, -1)
         return self.o_proj(attn_out)
 
 
