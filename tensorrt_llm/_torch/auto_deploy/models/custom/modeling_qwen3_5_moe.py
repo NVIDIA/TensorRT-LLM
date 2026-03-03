@@ -1288,6 +1288,157 @@ class Qwen3_5MoeConditionalOutput(ModelOutput):
     logits: Optional[torch.FloatTensor] = None
 
 
+def compute_mrope_positions(
+    input_ids: torch.LongTensor,
+    image_grid_thw: Optional[torch.LongTensor],
+    video_grid_thw: Optional[torch.LongTensor],
+    image_token_id: int,
+    video_token_id: int,
+    vision_start_token_id: int,
+    spatial_merge_size: int,
+    attention_mask: Optional[torch.Tensor] = None,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute 3D mRoPE position IDs for multimodal sequences.
+
+    Standalone function usable by both the model forward and the input processor.
+    For each sample in the batch, scans for vision placeholder tokens and assigns
+    spatial (T, H, W) positions to vision tokens while text tokens get sequential
+    positions.
+
+    Args:
+        input_ids: Token IDs, shape ``(B, S)``.
+        image_grid_thw: Grid dimensions ``(N_images, 3)`` with ``(T, H, W)`` per image.
+        video_grid_thw: Grid dimensions ``(N_videos, 3)`` with ``(T, H, W)`` per video.
+        image_token_id: Token ID for image placeholders.
+        video_token_id: Token ID for video placeholders.
+        vision_start_token_id: Token ID marking the start of a vision segment.
+        spatial_merge_size: Factor by which the vision patch merger reduces spatial dims.
+        attention_mask: Optional mask, shape ``(B, S)``.
+
+    Returns:
+        ``(position_ids, mrope_position_deltas)`` where ``position_ids`` has
+        shape ``(3, B, S)`` and ``mrope_position_deltas`` has shape ``(B, 1)``.
+    """
+    if video_grid_thw is not None:
+        video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+        video_grid_thw[:, 0] = 1
+
+    mrope_position_deltas = []
+
+    if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
+        total_input_ids = input_ids
+        if attention_mask is None:
+            attention_mask = torch.ones_like(total_input_ids)
+        position_ids = torch.ones(
+            3,
+            input_ids.shape[0],
+            input_ids.shape[1],
+            dtype=input_ids.dtype,
+            device=input_ids.device,
+        )
+        image_index, video_index = 0, 0
+        attention_mask = attention_mask.to(total_input_ids.device)
+
+        for i, ids in enumerate(total_input_ids):
+            ids = ids[attention_mask[i] == 1]
+            vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
+            vision_tokens = ids[vision_start_indices + 1]
+            image_nums = int((vision_tokens == image_token_id).sum().item())
+            video_nums = int((vision_tokens == video_token_id).sum().item())
+            input_tokens = ids.tolist()
+            llm_pos_ids_list: list = []
+            st = 0
+            remain_images, remain_videos = image_nums, video_nums
+
+            for _ in range(image_nums + video_nums):
+                ed_image = (
+                    input_tokens.index(image_token_id, st)
+                    if image_token_id in input_tokens and remain_images > 0
+                    else len(input_tokens) + 1
+                )
+                ed_video = (
+                    input_tokens.index(video_token_id, st)
+                    if video_token_id in input_tokens and remain_videos > 0
+                    else len(input_tokens) + 1
+                )
+
+                if ed_image < ed_video:
+                    t, h, w = image_grid_thw[image_index].tolist()
+                    image_index += 1
+                    remain_images -= 1
+                    ed = ed_image
+                else:
+                    t, h, w = video_grid_thw[video_index].tolist()
+                    video_index += 1
+                    remain_videos -= 1
+                    ed = ed_video
+
+                llm_grid_t = int(t)
+                llm_grid_h = int(h) // spatial_merge_size
+                llm_grid_w = int(w) // spatial_merge_size
+                text_len = ed - st
+
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+                t_index = (
+                    torch.arange(llm_grid_t)
+                    .view(-1, 1)
+                    .expand(-1, llm_grid_h * llm_grid_w)
+                    .flatten()
+                )
+                h_index = (
+                    torch.arange(llm_grid_h)
+                    .view(1, -1, 1)
+                    .expand(llm_grid_t, -1, llm_grid_w)
+                    .flatten()
+                )
+                w_index = (
+                    torch.arange(llm_grid_w)
+                    .view(1, 1, -1)
+                    .expand(llm_grid_t, llm_grid_h, -1)
+                    .flatten()
+                )
+                llm_pos_ids_list.append(
+                    torch.stack([t_index, h_index, w_index]) + text_len + st_idx
+                )
+                st = ed + llm_grid_t * llm_grid_h * llm_grid_w
+
+            if st < len(input_tokens):
+                st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
+                text_len = len(input_tokens) - st
+                llm_pos_ids_list.append(torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx)
+
+            llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
+            position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(
+                device=position_ids.device, dtype=position_ids.dtype
+            )
+            mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
+
+        mrope_position_deltas = torch.tensor(
+            mrope_position_deltas, device=input_ids.device
+        ).unsqueeze(1)
+        return position_ids, mrope_position_deltas
+    else:
+        if attention_mask is not None:
+            position_ids = attention_mask.long().cumsum(-1) - 1
+            position_ids.masked_fill_(attention_mask == 0, 1)
+            position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
+            max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
+            mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
+        else:
+            position_ids = (
+                torch.arange(input_ids.shape[1], device=input_ids.device)
+                .view(1, 1, -1)
+                .expand(3, input_ids.shape[0], -1)
+            )
+            mrope_position_deltas = torch.zeros(
+                [input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype
+            )
+
+        return position_ids, mrope_position_deltas
+
+
 class Qwen3_5MoeModel(nn.Module):
     """Multimodal wrapper: vision tower + embedding merge + mRoPE + language model.
 
@@ -1316,144 +1467,17 @@ class Qwen3_5MoeModel(nn.Module):
         video_grid_thw: Optional[torch.LongTensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Compute 3D mRoPE position IDs for multimodal sequences.
-
-        For each sample in the batch, scans for vision placeholder tokens and
-        assigns spatial (T, H, W) positions to vision tokens while text tokens
-        get sequential positions.
-
-        Returns:
-            ``(position_ids, mrope_position_deltas)`` where ``position_ids`` has
-            shape ``(3, B, S)`` and ``mrope_position_deltas`` has shape ``(B, 1)``.
-        """
-        # Split multi-frame videos into per-frame entries
-        if video_grid_thw is not None:
-            video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
-            video_grid_thw[:, 0] = 1
-
-        spatial_merge_size = self.config.vision_config.spatial_merge_size
-        image_token_id = self.config.image_token_id
-        video_token_id = self.config.video_token_id
-        vision_start_token_id = self.config.vision_start_token_id
-        mrope_position_deltas = []
-
-        if input_ids is not None and (image_grid_thw is not None or video_grid_thw is not None):
-            total_input_ids = input_ids
-            if attention_mask is None:
-                attention_mask = torch.ones_like(total_input_ids)
-            position_ids = torch.ones(
-                3,
-                input_ids.shape[0],
-                input_ids.shape[1],
-                dtype=input_ids.dtype,
-                device=input_ids.device,
-            )
-            image_index, video_index = 0, 0
-            attention_mask = attention_mask.to(total_input_ids.device)
-
-            for i, ids in enumerate(total_input_ids):
-                ids = ids[attention_mask[i] == 1]
-                vision_start_indices = torch.argwhere(ids == vision_start_token_id).squeeze(1)
-                vision_tokens = ids[vision_start_indices + 1]
-                image_nums = int((vision_tokens == image_token_id).sum().item())
-                video_nums = int((vision_tokens == video_token_id).sum().item())
-                input_tokens = ids.tolist()
-                llm_pos_ids_list: list = []
-                st = 0
-                remain_images, remain_videos = image_nums, video_nums
-
-                for _ in range(image_nums + video_nums):
-                    ed_image = (
-                        input_tokens.index(image_token_id, st)
-                        if image_token_id in input_tokens and remain_images > 0
-                        else len(input_tokens) + 1
-                    )
-                    ed_video = (
-                        input_tokens.index(video_token_id, st)
-                        if video_token_id in input_tokens and remain_videos > 0
-                        else len(input_tokens) + 1
-                    )
-
-                    if ed_image < ed_video:
-                        t, h, w = image_grid_thw[image_index].tolist()
-                        image_index += 1
-                        remain_images -= 1
-                        ed = ed_image
-                    else:
-                        t, h, w = video_grid_thw[video_index].tolist()
-                        video_index += 1
-                        remain_videos -= 1
-                        ed = ed_video
-
-                    llm_grid_t = int(t)
-                    llm_grid_h = int(h) // spatial_merge_size
-                    llm_grid_w = int(w) // spatial_merge_size
-                    text_len = ed - st
-
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-                    )
-
-                    # Vision token spatial positions
-                    t_index = (
-                        torch.arange(llm_grid_t)
-                        .view(-1, 1)
-                        .expand(-1, llm_grid_h * llm_grid_w)
-                        .flatten()
-                    )
-                    h_index = (
-                        torch.arange(llm_grid_h)
-                        .view(1, -1, 1)
-                        .expand(llm_grid_t, -1, llm_grid_w)
-                        .flatten()
-                    )
-                    w_index = (
-                        torch.arange(llm_grid_w)
-                        .view(1, 1, -1)
-                        .expand(llm_grid_t, llm_grid_h, -1)
-                        .flatten()
-                    )
-                    llm_pos_ids_list.append(
-                        torch.stack([t_index, h_index, w_index]) + text_len + st_idx
-                    )
-                    st = ed + llm_grid_t * llm_grid_h * llm_grid_w
-
-                # Trailing text
-                if st < len(input_tokens):
-                    st_idx = llm_pos_ids_list[-1].max() + 1 if llm_pos_ids_list else 0
-                    text_len = len(input_tokens) - st
-                    llm_pos_ids_list.append(
-                        torch.arange(text_len).view(1, -1).expand(3, -1) + st_idx
-                    )
-
-                llm_positions = torch.cat(llm_pos_ids_list, dim=1).reshape(3, -1)
-                position_ids[..., i, attention_mask[i] == 1] = llm_positions.to(position_ids.device)
-                mrope_position_deltas.append(llm_positions.max() + 1 - len(total_input_ids[i]))
-
-            mrope_position_deltas = torch.tensor(
-                mrope_position_deltas, device=input_ids.device
-            ).unsqueeze(1)
-            return position_ids, mrope_position_deltas
-        else:
-            # Text-only path
-            if attention_mask is not None:
-                position_ids = attention_mask.long().cumsum(-1) - 1
-                position_ids.masked_fill_(attention_mask == 0, 1)
-                position_ids = position_ids.unsqueeze(0).expand(3, -1, -1)
-                max_position_ids = position_ids.max(0, keepdim=False)[0].max(-1, keepdim=True)[0]
-                mrope_position_deltas = max_position_ids + 1 - attention_mask.shape[-1]
-            else:
-                position_ids = (
-                    torch.arange(input_ids.shape[1], device=input_ids.device)
-                    .view(1, 1, -1)
-                    .expand(3, input_ids.shape[0], -1)
-                )
-                mrope_position_deltas = torch.zeros(
-                    [input_ids.shape[0], 1], device=input_ids.device, dtype=input_ids.dtype
-                )
-
-            return position_ids, mrope_position_deltas
+        """Compute 3D mRoPE position IDs. Delegates to ``compute_mrope_positions``."""
+        return compute_mrope_positions(
+            input_ids=input_ids,
+            image_grid_thw=image_grid_thw,
+            video_grid_thw=video_grid_thw,
+            image_token_id=self.config.image_token_id,
+            video_token_id=self.config.video_token_id,
+            vision_start_token_id=self.config.vision_start_token_id,
+            spatial_merge_size=self.config.vision_config.spatial_merge_size,
+            attention_mask=attention_mask,
+        )
 
     def get_image_features(
         self, pixel_values: torch.Tensor, image_grid_thw: torch.LongTensor
@@ -1496,24 +1520,33 @@ class Qwen3_5MoeModel(nn.Module):
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
-        position_ids: Optional[torch.LongTensor] = None,
+        mrope_position_deltas: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Qwen3_5MoeOutput:
         """Multimodal forward: vision encoding + embedding merge + mRoPE + text model.
 
-        Steps:
-            1. Embed input_ids -> inputs_embeds
-            2. (Multimodal) Run vision tower on pixel_values -> masked_scatter into embeds
-            3. Build 3D mRoPE position_ids ``(3, B, S)``:
-               - Text-only: expand executor-provided 2D ``position_ids`` to 3D.
-               - Multimodal: compute spatial positions via ``get_rope_index``.
-            4. Call language_model with ``(inputs_embeds, position_ids)``; the text
-               model's internal ``rotary_emb`` computes cos/sin from the 3D positions.
+        Three position-handling branches:
+
+        A. **Text-only (no images ever)**: ``pixel_values`` is ``None`` and
+           ``rope_deltas`` has never been set.  Expand the executor's 2D
+           ``position_ids`` to 3D (all dims identical).
+
+        B. **Image chunk**: ``pixel_values`` is present.  Run the vision tower,
+           merge embeddings, and recompute full 3D mRoPE ``position_ids`` via
+           ``get_rope_index``.  Cache ``rope_deltas`` for subsequent decode.
+
+        C. **Text-only after image (decode steps)**: ``pixel_values`` is
+           ``None`` but ``rope_deltas`` was cached from a prior image forward.
+           Adjust the executor's 2D ``position_ids`` by ``rope_deltas`` to
+           account for mRoPE position compression, then expand to 3D.
         """
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
+        has_images = pixel_values is not None and image_grid_thw is not None
+        has_videos = pixel_values_videos is not None and video_grid_thw is not None
+
         # Image embedding merge
-        if pixel_values is not None and image_grid_thw is not None:
+        if has_images:
             image_embeds_list = self.get_image_features(pixel_values, image_grid_thw)
             image_embeds = torch.cat(image_embeds_list, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype
@@ -1524,7 +1557,7 @@ class Qwen3_5MoeModel(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
 
         # Video embedding merge
-        if pixel_values_videos is not None and video_grid_thw is not None:
+        if has_videos:
             video_embeds_list = self.get_video_features(pixel_values_videos, video_grid_thw)
             video_embeds = torch.cat(video_embeds_list, dim=0).to(
                 inputs_embeds.device, inputs_embeds.dtype
@@ -1535,17 +1568,21 @@ class Qwen3_5MoeModel(nn.Module):
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
 
         # Build 3D mRoPE position IDs
-        if pixel_values is None and pixel_values_videos is None:
-            # Text-only: replicate executor-provided 2D positions across all 3 mRoPE dims
-            position_ids_3d = position_ids[None].expand(3, -1, -1)
-        else:
-            # Multimodal: compute spatial (T, H, W) positions for vision tokens
+        if has_images or has_videos:
+            # Branch B: multimodal -- recompute full 3D positions
             position_ids_3d, self.rope_deltas = self.get_rope_index(
                 input_ids,
                 image_grid_thw,
                 video_grid_thw,
                 attention_mask=attention_mask,
             )
+        elif self.rope_deltas is not None:
+            # Branch C: text-only after image -- adjust for mRoPE compression
+            delta = mrope_position_deltas if mrope_position_deltas is not None else self.rope_deltas
+            position_ids_3d = (position_ids + delta)[None].expand(3, -1, -1)
+        else:
+            # Branch A: text-only (no images ever) -- straight 2D -> 3D expansion
+            position_ids_3d = position_ids[None].expand(3, -1, -1)
 
         return self.language_model(
             inputs_embeds=inputs_embeds,
@@ -1620,12 +1657,59 @@ class Qwen3_5MoeTextExportInfo(TextModelExportInfo):
         return base
 
 
+class Qwen3_5MoeInputProcessor:
+    """Input processor that wraps an ``ADInputProcessor`` and adds mRoPE delta computation.
+
+    Uses composition (not inheritance) to avoid a circular import with
+    ``auto_deploy.llm``.  After the base tokenization/multimodal processing,
+    this runs the mRoPE position computation on the full token sequence to
+    produce ``mrope_position_deltas``.  The VLM wrapper later uses this delta
+    to adjust the executor's sequential 2D ``position_ids`` so that text
+    tokens after vision tokens get correct mRoPE positions.
+    """
+
+    def __init__(self, base_processor, config: Qwen3_5MoeConfig):
+        self._base = base_processor
+        self._mrope_config = config
+
+    def __call__(self, inputs, sampling_params):
+        token_ids, extra = self._base(inputs, sampling_params)
+
+        if extra is not None and "multimodal_data" in extra:
+            mm_data = extra["multimodal_data"]
+            image_grid_thw = mm_data.get("image_grid_thw")
+            video_grid_thw = mm_data.get("video_grid_thw")
+
+            if image_grid_thw is not None or video_grid_thw is not None:
+                input_ids_t = torch.tensor([token_ids], dtype=torch.long)
+                _, deltas = compute_mrope_positions(
+                    input_ids=input_ids_t,
+                    image_grid_thw=image_grid_thw,
+                    video_grid_thw=video_grid_thw,
+                    image_token_id=self._mrope_config.image_token_id,
+                    video_token_id=self._mrope_config.video_token_id,
+                    vision_start_token_id=self._mrope_config.vision_start_token_id,
+                    spatial_merge_size=self._mrope_config.vision_config.spatial_merge_size,
+                )
+                mm_data["mrope_position_deltas"] = deltas
+
+        return token_ids, extra
+
+
 @ModelFactoryRegistry.register("Qwen3_5MoeForConditionalGeneration")
 class Qwen3_5MoeFactory(AutoModelForImageTextToTextFactory):
     """Factory for Qwen3.5 MoE that uses 3D mRoPE position_ids export info."""
 
     def get_export_infos(self, model: nn.Module):
         return [Qwen3_5MoeTextExportInfo.from_autoinferred(model)]
+
+    def init_input_processor(self, base_input_processor):
+        """Wrap the base input processor with mRoPE delta pre-computation."""
+        if not hasattr(self, "_cached_model_config"):
+            self._cached_model_config = AutoConfig.from_pretrained(
+                self.model, trust_remote_code=True
+            )
+        return Qwen3_5MoeInputProcessor(base_input_processor, self._cached_model_config)
 
 
 # =============================================================================

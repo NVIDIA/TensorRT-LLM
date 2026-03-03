@@ -127,7 +127,11 @@ class LLM(_TorchLLM):
         pass
 
     def _create_input_processor(self) -> ADInputProcessor:
-        return ADInputProcessor(self.tokenizer, self.factory.init_processor())
+        processor = self.factory.init_processor()
+        base = ADInputProcessor(self.tokenizer, processor)
+        if hasattr(self.factory, "init_input_processor"):
+            return self.factory.init_input_processor(base)
+        return base
 
     def _prefetch_model(self):
         """Prefetch the model for the LLM."""
