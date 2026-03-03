@@ -1437,8 +1437,8 @@ class AutoTuner:
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
         if dtype == torch.float4_e2m1fn_x2:
-            return (torch.rand(shapes, device=device) * 10 - 5
-                    ).to(torch.uint8).view(dtype)
+            return (torch.rand(shapes, device=device) * 10 - 5).to(
+                torch.uint8).view(dtype)
         else:
             return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
