@@ -244,8 +244,19 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
+        # Pydantic v2 wraps Iterable-typed TypedDict fields in ValidatorIterator,
+        # a lazy single-use iterator. Materialize to a regular list so the data
+        # can be safely iterated and copied.
+        if not isinstance(tool_calls, list):
+            tool_calls = list(tool_calls)
+
         result["tool_calls"] = []
         for item in tool_calls:
+            # Make a copy to avoid mutating the original
+            item = dict(item)
+            if "function" in item:
+                item["function"] = dict(item["function"])
+
             if content := item["function"].get("arguments"):
                 if isinstance(content, str):
                     item["function"]["arguments"] = json.loads(content)
