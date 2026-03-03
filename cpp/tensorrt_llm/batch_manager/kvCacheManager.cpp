@@ -1305,18 +1305,13 @@ SizeType32 WindowBlockManager::addSequence(
     TLLM_CHECK(emplaceDone);
 
     auto constexpr beamIdx = 0;
+    // TODO: We simply use llmRequest.getUniqueTokens(beamIdx) when sequence is stored. How come we do this differently when we look for reusable blocks?
     auto const& uniqueTokens = (mCacheType == CacheType::kSELF || mCacheType == CacheType::kSELFKONLY)
         ? llmRequest.getUniqueTokens(beamIdx)
         : *(llmRequest.getEncoderUniqueTokens().value());
 
     // Ignore last token because it can't be recovered
     auto blockedUniqueTokens = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, inputLength - 1, mTokensPerBlock, true);
-    // Add empty block if last token is separated
-    if (inputLength % mTokensPerBlock == 1)
-    {
-        blockedUniqueTokens.emplace_back();
-    }
-
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
     auto config = llmRequest.getKvCacheRetentionConfig();

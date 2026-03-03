@@ -28,8 +28,7 @@
 
 namespace tensorrt_llm::batch_manager::radix_block_tree
 {
-using BlockMatch = ValueMatch<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>,
-    std::shared_ptr<kv_cache_manager::KVCacheBlock>>;
+using BlockMatch = templated_trie::ValueMatch<kv_cache_manager::BlockKey, kv_cache_manager::BlockKeyHasher, int, std::hash<int>, std::shared_ptr<kv_cache_manager::KVCacheBlock>, true>;
 using BlockMatches = std::vector<BlockMatch>;
 
 // Convenience method to claim a block. May not be used, mostly here to show how to claim blocks.
