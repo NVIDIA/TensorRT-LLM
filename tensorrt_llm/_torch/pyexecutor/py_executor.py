@@ -1562,6 +1562,15 @@ class PyExecutor:
             with torch.cuda.nvtx.range("_handle_executed_batch_pp"):
                 sample_state = executed_batch.sample_state
                 sample_state.scheduled_requests.context_requests = executed_batch.finished_ctx_reqs
+                ctx_only_in_finished = [
+                    r for r in executed_batch.finished_ctx_reqs
+                    if r.is_context_only_request
+                ]
+                if ctx_only_in_finished:
+                    logger.info(
+                        f"[DISAGG_DEBUG] _handle_executed_batch: "
+                        f"finished_ctx_reqs has {len(ctx_only_in_finished)} ctx_only reqs: "
+                        f"{[r.py_request_id for r in ctx_only_in_finished]}")
                 self._update_requests(executed_batch.sample_state)
                 if self.kv_cache_transceiver:
                     self._send_kv_async(executed_batch.finished_ctx_reqs)
@@ -2918,13 +2927,28 @@ class PyExecutor:
 
         if self.kv_cache_transceiver:
             for req in scheduled_requests:
+                logger.info(
+                    f"[DISAGG_DEBUG] _send_kv_async: req={req.py_request_id}, "
+                    f"is_context_only={req.is_context_only_request}, "
+                    f"is_context_finished={req.is_context_finished}, "
+                    f"is_finished_due_to_length={req.is_finished_due_to_length}, "
+                    f"is_finished_due_to_cancellation={req.is_finished_due_to_cancellation}, "
+                    f"state={req.state}, is_finished={req.is_finished}")
                 if req.is_context_only_request and (
                         req.is_context_finished or req.is_finished_due_to_length
                 ) and not req.is_finished_due_to_cancellation:
+                    logger.info(
+                        f"[DISAGG_DEBUG] _send_kv_async: calling respond_and_send_async "
+                        f"for req={req.py_request_id}")
                     # Order is important here: we need to start the transfer before responding
                     # to make sure the blocks are stored for reuse before they are sent.
                     self.async_transfer_manager.start_transfer(req)
                     self.kv_cache_transceiver.respond_and_send_async(req)
+                    logger.info(
+                        f"[DISAGG_DEBUG] _send_kv_async: after respond_and_send_async "
+                        f"req={req.py_request_id}, "
+                        f"context_phase_params={req.context_phase_params}, "
+                        f"state={req.state}")
 
                     if self.kv_cache_transceiver.kv_transfer_timeout_ms is not None:
                         req.py_kv_transfer_start_time = time.time()
@@ -3385,9 +3409,25 @@ class PyExecutor:
                 request.update_perf_metrics(self.iter_counter)
 
             request_done = False
+            if request.is_context_only_request:
+                _all_tokens = request.get_tokens(0)
+                _gen_token = _all_tokens[-1] if len(_all_tokens) > 0 else None
+                logger.info(
+                    f"[DISAGG_DEBUG] _handle_responses: ctx_only req={req_id}, "
+                    f"state={request.state}, "
+                    f"is_finished={request.is_finished}, "
+                    f"py_decoding_iter={request.py_decoding_iter}, "
+                    f"context_phase_params={request.context_phase_params}, "
+                    f"is_disagg_context_transmission_state={request.is_disagg_context_transmission_state}, "
+                    f"num_tokens={len(_all_tokens)}, last_token_id={_gen_token}, "
+                    f"finish_reasons={request.finish_reasons}")
             if request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)
+                if response and request.is_context_only_request:
+                    logger.info(
+                        f"[DISAGG_DEBUG] _handle_responses: created response for ctx_only "
+                        f"req={req_id}, is_final={response.result.is_final}")
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens

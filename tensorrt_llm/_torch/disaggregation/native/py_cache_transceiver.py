@@ -103,6 +103,10 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         return KVSlice(is_last_slice=True, block_ids=block_ids)
 
     def respond_and_send_async(self, req: LlmRequest):
+        logger.info(
+            f"[DISAGG_DEBUG] respond_and_send_async: ENTER req={req.request_id}, "
+            f"py_request_id={req.py_request_id}, state={req.state}"
+        )
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
         send_session = self.transfer_worker.create_tx_session(req)
         self.send_sessions[req.request_id] = send_session
@@ -110,13 +114,20 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         send_task_id = send_session.send(kv_slice)
         self.send_task_ids[req.request_id] = send_task_id
 
-        req.context_phase_params = ContextPhaseParams(
+        cpp = ContextPhaseParams(
             first_gen_tokens=[],
             req_id=req.request_id,
             opaque_state=None,
             draft_tokens=None,
             ctx_dp_rank=self.dp_rank,
             disagg_info_endpoint=self.context_info_endpoint,
+        )
+        req.context_phase_params = cpp
+        logger.info(
+            f"[DISAGG_DEBUG] respond_and_send_async: SET context_phase_params "
+            f"req={req.request_id}, req_id_in_cpp={cpp.req_id}, "
+            f"state={req.state}, "
+            f"verify_readback={req.context_phase_params}"
         )
         self.send_req_id_to_request[req.request_id] = req
 

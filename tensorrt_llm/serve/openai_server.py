@@ -902,6 +902,18 @@ class OpenAIServer:
             if disaggregated_params and disaggregated_params.request_type and disaggregated_params.request_type == "context_only":
                 # Include prompt token ids for context-only requests
                 pp_result.prompt_token_ids = response.prompt_token_ids
+                logger.info(
+                    f"[DISAGG_DEBUG] completion_response: context_only response, "
+                    f"request_id={response.request_id}, "
+                    f"output.disagg_params={response.outputs[0].disaggregated_params}, "
+                    f"num_choices={len(pp_result.choices)}"
+                )
+                if pp_result.choices:
+                    dp = pp_result.choices[0].disaggregated_params
+                    logger.info(
+                        f"[DISAGG_DEBUG] completion_response: choice[0].disagg_params="
+                        f"{dp}, ctx_request_id={getattr(dp, 'ctx_request_id', 'N/A')}"
+                    )
             await self._extract_metrics(response, raw_request)
             return pp_result
 

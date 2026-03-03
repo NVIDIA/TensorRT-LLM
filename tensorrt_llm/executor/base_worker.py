@@ -629,6 +629,14 @@ class BaseWorker(GenerationExecutor):
 
         logprob_params = self._get_logprob_params(request)
 
+        if request.disaggregated_params is not None:
+            logger.info(
+                f"[DISAGG_DEBUG] generate_async: creating GenerationResult with "
+                f"disagg_params: request_type={request.disaggregated_params.request_type}, "
+                f"ctx_request_id={request.disaggregated_params.ctx_request_id}, "
+                f"disagg_request_id={request.disaggregated_params.disagg_request_id}, "
+                f"client_id={client_id}")
+
         result = GenerationResult(
             request,
             background_error_handler=self._handle_background_error,
