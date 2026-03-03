@@ -170,7 +170,6 @@ class Communication(ABC):
     def combine(
         self,
         final_hidden_states: torch.Tensor,  # MoE computation output
-        fp8_combine: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -180,7 +179,6 @@ class Communication(ABC):
 
         Args:
             final_hidden_states: Output from MoE computation
-            fp8_combine: If True, quantize BF16 payload to FP8 for NVLink transfer (halves bandwidth)
             **kwargs: Strategy-specific arguments
 
         Returns:
