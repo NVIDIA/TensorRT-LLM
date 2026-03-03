@@ -144,6 +144,7 @@ def calculate_metrics(
     selected_percentiles: list[float],
     goodput_config_dict: dict[str, float],
     total_energy: Optional[float] = None,
+    total_energy_query_time: Optional[float] = None,
 ) -> tuple[BenchmarkMetrics, list[int]]:
     actual_output_lens: list[int] = []
     total_input = 0
@@ -233,7 +234,7 @@ def calculate_metrics(
     total_output_tokens = sum(actual_output_lens)
     if total_energy is not None and total_energy > 0:
         output_tps_per_w = total_output_tokens / total_energy
-        total_gpu_power_w = total_energy / dur_s if dur_s > 0 else 0.0
+        total_gpu_power_w = total_energy / total_energy_query_time if total_energy_query_time > 0 else 0.0
     else:
         output_tps_per_w = None
         total_gpu_power_w = None
@@ -478,12 +479,14 @@ async def benchmark(
     await session.close()
 
     # Compute energy delta for this benchmark run
-    total_energy = None
+    total_energy, total_energy_query_time = None, None
     if (energy_start is not None and energy_end is not None
             and "total_energy_j" in energy_start
             and "total_energy_j" in energy_end):
         total_energy = (energy_end["total_energy_j"] -
                         energy_start["total_energy_j"])
+        total_energy_query_time = energy_end["query_time"] - energy_start[
+            "query_time"]
 
     metrics, actual_output_lens = calculate_metrics(
         input_requests=input_requests,
@@ -494,6 +497,7 @@ async def benchmark(
         selected_percentiles=selected_percentiles,
         goodput_config_dict=goodput_config_dict,
         total_energy=total_energy,
+        total_energy_query_time=total_energy_query_time,
     )
 
     print("{s:{c}^{n}}".format(s=' Serving Benchmark Result ', n=50, c='='))

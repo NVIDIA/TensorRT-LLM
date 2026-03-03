@@ -588,6 +588,7 @@ class OpenAIServer:
                                 status_code=503)
         return JSONResponse(content={
             "total_energy_j": round(total_energy, 4),
+            "query_time": time.perf_counter(),
         })
 
     async def set_steady_clock_offset(
