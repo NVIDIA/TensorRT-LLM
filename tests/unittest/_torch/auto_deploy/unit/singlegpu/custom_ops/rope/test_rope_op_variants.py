@@ -292,3 +292,148 @@ def test_ds_impl_and_hf_impl(dtype, head_dim, atol, rtol):
 
     torch.testing.assert_close(q_rotated_hf2.transpose(1, 2), q_rotated_hf, rtol=rtol, atol=atol)
     torch.testing.assert_close(k_rotated_hf2.transpose(1, 2), k_rotated_hf, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("head_dim", [64, 256])
+@pytest.mark.parametrize(
+    "dtype,atol,rtol",
+    [
+        (torch.bfloat16, 1e-4, 1e-4),
+        (torch.float16, 5e-4, 5e-4),
+    ],
+    ids=["bfloat16", "float16"],
+)
+def test_flashinfer_custom_op_strided_interleaved(dtype, atol, rtol, head_dim):
+    """
+    Verify FlashInfer's RoPE handles non-contiguous (strided) q/k inputs
+    with is_neox=False (interleaved mode), matching contiguous-input results
+    and complex-multiplication reference.
+    """
+    device = "cuda"
+    batch = 2
+    seq_len = 4
+    n_head = 3
+    extra_dim = 16
+
+    inv_freq = 1.0 / (
+        10000
+        ** (torch.arange(0, head_dim // 2, dtype=torch.float32, device=device) / (head_dim // 2))
+    )
+    positions_range = torch.arange(seq_len, dtype=torch.float32, device=device)
+    angles = positions_range.unsqueeze(1) * inv_freq.unsqueeze(0)
+    freqs_cis = torch.polar(torch.ones((seq_len, head_dim // 2), device=device), angles)
+    freqs_cis_batch = freqs_cis.unsqueeze(0).expand(batch, -1, -1)
+
+    # Complex-frequency cos_sin_cache: [cos_from_freqs || sin_from_freqs]
+    cos_from_freqs = torch.real(freqs_cis)
+    sin_from_freqs = torch.imag(freqs_cis)
+    cos_sin_cache = torch.cat([cos_from_freqs, sin_from_freqs], dim=-1)  # [seq, head_dim]
+    cos_sin_cache_expand = (
+        cos_sin_cache.unsqueeze(0).expand(batch, -1, -1).contiguous().view(batch * seq_len, -1)
+    )
+
+    # Create strided tensors via split
+    full_q = torch.randn(batch, seq_len, n_head, head_dim + extra_dim, dtype=dtype, device=device)
+    full_k = torch.randn(batch, seq_len, n_head, head_dim + extra_dim, dtype=dtype, device=device)
+    q_strided, _ = torch.split(full_q, [head_dim, extra_dim], dim=-1)
+    k_strided, _ = torch.split(full_k, [head_dim, extra_dim], dim=-1)
+
+    assert not q_strided.is_contiguous()
+    assert not k_strided.is_contiguous()
+
+    q_contig = q_strided.contiguous()
+    k_contig = k_strided.contiguous()
+
+    positions = torch.cat([torch.arange(seq_len, device=device) for _ in range(batch)])
+
+    # Strided path (is_neox=False)
+    custom_q_strided, custom_k_strided = torch.ops.auto_deploy.flashinfer_rope(
+        q_strided, k_strided, positions, cos_sin_cache_expand, False
+    )
+
+    # Contiguous path
+    custom_q_contig, custom_k_contig = torch.ops.auto_deploy.flashinfer_rope(
+        q_contig, k_contig, positions, cos_sin_cache_expand, False
+    )
+
+    # Complex reference
+    out_q_ref, out_k_ref = apply_rotary_pos_emb_complex(q_contig, k_contig, freqs_cis_batch)
+
+    # Strided matches contiguous
+    torch.testing.assert_close(custom_q_strided, custom_q_contig, rtol=rtol, atol=atol)
+    torch.testing.assert_close(custom_k_strided, custom_k_contig, rtol=rtol, atol=atol)
+    # Both match complex reference
+    torch.testing.assert_close(custom_q_strided, out_q_ref, rtol=rtol, atol=atol)
+    torch.testing.assert_close(custom_k_strided, out_k_ref, rtol=rtol, atol=atol)
+
+
+@pytest.mark.parametrize("has_bias", [True, False])
+def test_rope_deinterleave_load_hook(has_bias):
+    """
+    Test _rope_deinterleave_load_hook permutes weights correctly:
+    - q_b_proj: nope portion unchanged, rope portion de-interleaved by perm
+    - kv_a_proj: first kv_lora_rank rows unchanged, last qk_rope_head_dim rows permuted
+    - bias (when present): same split+permute pattern as kv_a_proj weight
+    """
+    from tensorrt_llm._torch.auto_deploy.models.custom.mla_rope_utils import (
+        _rope_deinterleave_load_hook,
+    )
+
+    qk_rope_head_dim = 64
+    qk_nope_head_dim = 128
+    num_heads = 4
+    kv_lora_rank = 512
+    q_lora_rank = 128
+    hidden_size = 256
+    num_layers = 1
+
+    qk_head_dim = qk_nope_head_dim + qk_rope_head_dim
+    d = qk_rope_head_dim
+    perm = torch.cat([torch.arange(0, d, 2), torch.arange(1, d, 2)])
+
+    state_dict = {}
+    layer_prefix = "model.layers.0.self_attn."
+
+    # q_b_proj.weight: [num_heads * qk_head_dim, q_lora_rank]
+    q_weight = torch.randn(num_heads * qk_head_dim, q_lora_rank)
+    state_dict[layer_prefix + "q_b_proj.weight"] = q_weight.clone()
+
+    # kv_a_proj_with_mqa.weight: [kv_lora_rank + qk_rope_head_dim, hidden_size]
+    kv_weight = torch.randn(kv_lora_rank + qk_rope_head_dim, hidden_size)
+    state_dict[layer_prefix + "kv_a_proj_with_mqa.weight"] = kv_weight.clone()
+
+    if has_bias:
+        kv_bias = torch.randn(kv_lora_rank + qk_rope_head_dim)
+        state_dict[layer_prefix + "kv_a_proj_with_mqa.bias"] = kv_bias.clone()
+
+    _rope_deinterleave_load_hook(
+        state_dict,
+        "",
+        qk_rope_head_dim=qk_rope_head_dim,
+        qk_nope_head_dim=qk_nope_head_dim,
+        num_heads=num_heads,
+        kv_lora_rank=kv_lora_rank,
+        num_layers=num_layers,
+    )
+
+    # Check q_b_proj: nope portion unchanged, rope portion permuted
+    q_out = state_dict[layer_prefix + "q_b_proj.weight"]
+    q_out_3d = q_out.view(num_heads, qk_head_dim, -1)
+    q_orig_3d = q_weight.view(num_heads, qk_head_dim, -1)
+
+    torch.testing.assert_close(
+        q_out_3d[:, :qk_nope_head_dim, :], q_orig_3d[:, :qk_nope_head_dim, :]
+    )
+    torch.testing.assert_close(
+        q_out_3d[:, qk_nope_head_dim:, :], q_orig_3d[:, qk_nope_head_dim:, :][:, perm, :]
+    )
+
+    # Check kv_a_proj: first kv_lora_rank rows unchanged, last qk_rope_head_dim rows permuted
+    kv_out = state_dict[layer_prefix + "kv_a_proj_with_mqa.weight"]
+    torch.testing.assert_close(kv_out[:kv_lora_rank, :], kv_weight[:kv_lora_rank, :])
+    torch.testing.assert_close(kv_out[kv_lora_rank:, :], kv_weight[kv_lora_rank:, :][perm, :])
+
+    if has_bias:
+        kv_bias_out = state_dict[layer_prefix + "kv_a_proj_with_mqa.bias"]
+        torch.testing.assert_close(kv_bias_out[:kv_lora_rank], kv_bias[:kv_lora_rank])
+        torch.testing.assert_close(kv_bias_out[kv_lora_rank:], kv_bias[kv_lora_rank:][perm])

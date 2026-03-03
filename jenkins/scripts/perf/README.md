@@ -38,8 +38,27 @@ SLACK BOT SENDS MESSAGE
 Updates fields on existing perf records that match a query scope and posts the
 updated documents back to OpenSearch.
 
-**Format**
+**Operators**
+
+- SET clause: Only `=` is supported.
+- WHERE clause: Supports `=`, `!=`, `>`, `<`, `>=`, `<=` operators.
+- `=` and `!=` operators are allowed for all fields.
+- `>`, `<`, `>=`, `<=` operators are only allowed for `ts_created` field (timestamp) or fields starting with `d_` (double type) or `l_` (integer type).
+
+**ts_created Date Formats**
+
+The `ts_created` field accepts date strings in the following formats:
+- `'Feb 18, 2026 @ 22:32:02.960'` (with milliseconds)
+- `'Feb 18, 2026 @ 22:32:02'` (without milliseconds)
+- `'2026/02/18'` (date only)
+
+**Note:** All date strings are interpreted as UTC for consistent timestamp conversion across different environments.
+
+**Examples**
 
 ```
-UPDATE SET <field>=<value> [AND <field>=<value> ...] [WHERE <field>=<value> [AND <field>=<value> ...]]
+UPDATE SET b_is_valid=false WHERE s_test_case_name='test1'
+UPDATE SET b_is_valid=false WHERE s_gpu_type!='H100'
+UPDATE SET b_is_valid=false WHERE d_latency > 100.5 AND l_count >= 10
+UPDATE SET b_is_valid=false WHERE ts_created <= 'Feb 18, 2026 @ 22:32:02.960' AND s_test_case_name='test1'
 ```

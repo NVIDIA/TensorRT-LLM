@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -100,25 +100,25 @@ class ConfigurableMoE(MoE):
         cls,
         quant_algo,
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ):
         """
         ConfigurableMoE is a wrapper class that delegates to specific backends.
 
         To check capability, query the specific backend class directly:
-        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, gptoss_style)
-        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, gptoss_style)
+        - CutlassFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
+        - TRTLLMGenFusedMoE.can_implement(quant_algo, dtype_activation, swiglu_gptoss_style)
         - etc.
 
         Args:
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled
 
         Returns:
             Tuple[bool, Optional[str]]: Always returns (False, reason)
         """
-        del quant_algo, dtype_activation, gptoss_style  # Unused - wrapper class
+        del quant_algo, dtype_activation, swiglu_gptoss_style  # Unused - wrapper class
         return False, (
             "ConfigurableMoE is a wrapper class. "
             "Query the specific backend (CutlassFusedMoE, TRTLLMGenFusedMoE, etc.) directly."
@@ -495,7 +495,13 @@ class ConfigurableMoE(MoE):
             # When using communication, dispatch will create tensors with shape:
             # [ep_size * max_tokens_per_rank, ...] due to padding for balanced distribution
             # So we need to allocate workspace based on this size
-            num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
+            if isinstance(self.comm, DeepEPLowLatency):
+                # deeptplowlatency dispatch outputs shape is
+                # [#local_experts * moe_ep_size * max_tokens_per_rank, hidden size]
+                # local_experts = self.num_slots / moe_ep_size
+                num_rows = self.num_slots * max(all_rank_num_tokens)
+            else:
+                num_rows = self.mapping.moe_ep_size * max(all_rank_num_tokens)
 
         workspaces = self.backend.get_workspaces([num_rows])
         return workspaces[0]

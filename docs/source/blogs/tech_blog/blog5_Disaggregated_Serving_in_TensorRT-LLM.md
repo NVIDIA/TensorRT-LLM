@@ -53,11 +53,11 @@ In aggregated LLM serving, both the context and generation phases share the same
 
 Disaggregated serving resolves these challenges by decoupling the two phases, allowing each to run on separate GPU pools and using different parallelism strategies. This separation removes the interference between context and generation phases, as shown in Figure 2, and enables independent optimization of TTFT and TPOT. Although disaggregation incurs overhead for transferring the KV cache blocks from context to generation GPUs, the advantages can be substantial—particularly for workloads with long input sequences and moderate output lengths where interference is most severe.
 
-You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rational and design considerations of disaggregated serving.
+You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rationale and design considerations of disaggregated serving.
 
 ## Disaggregated Serving in TensorRT LLM
 
-There are three different approaches to do disaggregation LLM inference with TensorRT LLM, where each approach offers distinct architectural and operational characteristics suited to different deployment scenarios.
+There are three different approaches to do disaggregated LLM inference with TensorRT LLM, where each approach offers distinct architectural and operational characteristics suited to different deployment scenarios.
 
 ### trtllm-serve
 

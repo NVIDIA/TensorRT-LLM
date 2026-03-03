@@ -291,16 +291,6 @@ def trtllm_moe_fused_fake(
     return torch.empty_like(x)
 
 
-# NOTE(suyogg): If compile ever fails because of this, just write a triton kernel
-# for this function and use it as a custom op.
-@torch.compile
-def _quantize_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Quantize tensor to FP8 with clamping (matches torch_quant_fp8_linear)."""
-    FP8_MIN = torch.finfo(torch.float8_e4m3fn).min
-    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
-    return (x / scale).clamp(FP8_MIN, FP8_MAX).to(torch.float8_e4m3fn)
-
-
 def _validate_mlp_style_and_act_fn(is_gated_mlp: bool, act_fn: int) -> None:
     assert (is_gated_mlp and act_fn in [ActivationType.Silu, ActivationType.Swiglu]) or (
         not is_gated_mlp and act_fn == ActivationType.Relu2
@@ -363,8 +353,10 @@ def trtllm_quant_fp8_moe_fused(
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
 
-    # Quantize the input using precomputed max scale
-    x_q_fp8 = _quantize_fp8(x2d, fc1_act_scale)
+    # Quantize the input using precomputed max scale.
+    # Use the optimized CUDA kernel (same as PT backend's static_quantize path) instead of
+    # Python-traced ops that compile to a slower Triton kernel.
+    x_q_fp8, _ = torch.ops.tensorrt_llm.static_quantize_e4m3_per_tensor(x2d, fc1_act_scale)
 
     # Prepare quant_scales for TensorRT-LLM (Cutlass) FP8 format:
     # [fc1_dequant_scale, fc2_act_scale_reciprocal, fc2_dequant_scale, gemm1_input_dequant_scale]

@@ -458,7 +458,6 @@ def main():
         )
 
     plugin_config = PluginConfig.from_arguments(args)
-    plugin_config.validate()
     if args.fast_build:
         plugin_config.manage_weights = True
 

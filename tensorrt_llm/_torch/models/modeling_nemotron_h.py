@@ -281,10 +281,8 @@ class NemotronHMOE(nn.Module):
             # Gate uses high precision input for accurate routing decisions.
             router_logits = self.gate(hidden_states_hp_2d)
 
-            routed_hidden_states = hidden_states
-            if self.use_latent_moe:
-                routed_hidden_states = self.fc1_latent_proj(
-                    routed_hidden_states)
+            routed_hidden_states = self.fc1_latent_proj(
+                hidden_states_hp) if self.use_latent_moe else hidden_states
 
             final_hidden_states = self.experts(
                 routed_hidden_states,

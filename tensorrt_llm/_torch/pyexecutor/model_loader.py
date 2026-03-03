@@ -37,7 +37,12 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
                                            mamba_ssm_cache_dtype: str) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+        hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
+                           None)
+        if hf_dtype is not None:
+            mamba_ssm_cache_dtype = str_dtype_to_torch(hf_dtype)
+        else:
+            mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 

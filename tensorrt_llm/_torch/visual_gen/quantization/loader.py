@@ -13,8 +13,10 @@ from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.quantization.ops import (
     quantize_fp8_blockwise,
     quantize_fp8_per_tensor,
+    quantize_nvfp4,
 )
 from tensorrt_llm.quantization.mode import QuantAlgo
+from tensorrt_llm.quantization.utils import fp4_utils
 
 
 class DynamicLinearWeightLoader:
@@ -59,7 +61,7 @@ class DynamicLinearWeightLoader:
         weights_config = getattr(module, "weights_loading_config", None)
         if weights_config is not None:
             weight_mode = getattr(weights_config, "weight_mode", None)
-            if weight_mode == WeightMode.FUSED_QKV_LINEAR:
+            if weight_mode in (WeightMode.FUSED_QKV_LINEAR, WeightMode.FUSED_GATE_UP_LINEAR):
                 fused_names = self._get_fused_names(full_name)
                 return self._get_fused_weights(full_name, weights, fused_names)
 
@@ -86,7 +88,7 @@ class DynamicLinearWeightLoader:
     def _get_fused_names(self, full_name: str) -> List[str]:
         """Get checkpoint names for a fused module from params_map."""
         for suffix, names in self.params_map.items():
-            if full_name.endswith(suffix):
+            if full_name == suffix or full_name.endswith("." + suffix):
                 return names
         raise ValueError(
             f"No params_map entry for fused module '{full_name}'. "
@@ -155,6 +157,12 @@ class DynamicLinearWeightLoader:
                 return False  # Already quantized
             return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
 
+        # For NVFP4: quantize if weight is high precision
+        if quant_algo == QuantAlgo.NVFP4:
+            if weight.dtype == fp4_utils.float4_e2m1x2:
+                return False  # Already quantized
+            return weight.dtype in (torch.bfloat16, torch.float16, torch.float32)
+
         return False
 
     def _maybe_dynamic_quantize(
@@ -172,13 +180,86 @@ class DynamicLinearWeightLoader:
 
         if quant_algo == QuantAlgo.FP8:
             qweight, scale = quantize_fp8_per_tensor(weight)
+            return {**weight_dict, "weight": qweight, "weight_scale": scale}
         elif quant_algo == QuantAlgo.FP8_BLOCK_SCALES:
             block_size = self.quant_config.group_size if self.quant_config else 128
             qweight, scale = quantize_fp8_blockwise(weight, block_size=block_size)
+            return {**weight_dict, "weight": qweight, "weight_scale": scale}
+        elif quant_algo == QuantAlgo.NVFP4:
+            qweight, weight_scale, weight_scale_2 = quantize_nvfp4(weight)
+            return {
+                **weight_dict,
+                "weight": qweight,
+                "weight_scale": weight_scale,
+                "weight_scale_2": weight_scale_2,
+            }
         else:
             return weight_dict
 
-        return {**weight_dict, "weight": qweight, "weight_scale": scale}
+    def _is_fused_nvfp4_dynamic(
+        self,
+        weight_dicts: List[Dict[str, torch.Tensor]],
+        quant_algo: Optional[QuantAlgo],
+        name: str,
+    ) -> bool:
+        if len(weight_dicts) <= 1:
+            return False
+        if quant_algo != QuantAlgo.NVFP4:
+            return False
+        return any(self._should_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts)
+
+    def _quantize_fused_nvfp4(
+        self, weight_dicts: List[Dict[str, torch.Tensor]]
+    ) -> List[Dict[str, torch.Tensor]]:
+        """Quantize fused weights (Q,K,V or gate,up) together as a single tensor.
+
+        For NVFP4 dynamic quantization, fused weights MUST be quantized together
+        to ensure consistent global scale. Quantizing separately then concatenating
+        causes each component to use different global scales, leading to incorrect
+        dequantization.
+
+        Returns:
+            List of weight dicts with quantized weights that can be concatenated
+            correctly by the linear module's load_weights method.
+        """
+        # Extract and concatenate BF16 weights
+        bf16_weights = []
+        for wd in weight_dicts:
+            weight = wd.get("weight")
+            if weight is None:
+                raise ValueError("Missing weight in fused weight dict")
+            if weight.device.type != "cuda":
+                weight = weight.cuda()
+            bf16_weights.append(weight)
+
+        fused_weight = torch.cat(bf16_weights, dim=0)
+
+        # Quantize the fused weight as a single tensor
+        qweight, weight_scale, weight_scale_2 = quantize_nvfp4(fused_weight)
+
+        # Split quantized weight back into components
+        # The quantized weight has shape [total_out, in//2]
+        split_sizes = [w.shape[0] for w in bf16_weights]
+        qweight_splits = torch.split(qweight, split_sizes, dim=0)
+
+        # Split 2D weight_scale [total_out, scale_cols] along dim=0
+        weight_scale_splits = torch.split(weight_scale, split_sizes, dim=0)
+
+        # Build output weight dicts - each component gets:
+        # - Its portion of the quantized weight
+        # - Its portion of the block scales
+        # - The SAME global scale (weight_scale_2) for all
+        result = []
+        for i, wd in enumerate(weight_dicts):
+            new_wd = {
+                **wd,
+                "weight": qweight_splits[i],
+                "weight_scale": weight_scale_splits[i],
+                "weight_scale_2": weight_scale_2,
+            }
+            result.append(new_wd)
+
+        return result
 
     def load_linear_weights(
         self, module: Linear, name: str, weight_dicts: List[Dict[str, torch.Tensor]]
@@ -190,8 +271,14 @@ class DynamicLinearWeightLoader:
         else:
             quant_algo = self._get_quant_algo_for_layer(name)
 
-        quantized_weight_dicts = [
-            self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
-        ]
+        # Special handling for fused NVFP4 dynamic quantization
+        # Fused weights (Q,K,V or gate,up) must be quantized TOGETHER
+        # to ensure consistent global scale
+        if self._is_fused_nvfp4_dynamic(weight_dicts, quant_algo, name):
+            quantized_weight_dicts = self._quantize_fused_nvfp4(weight_dicts)
+        else:
+            quantized_weight_dicts = [
+                self._maybe_dynamic_quantize(wd, quant_algo, name) for wd in weight_dicts
+            ]
 
         module.load_weights(quantized_weight_dicts)

@@ -22,8 +22,14 @@ Before running these examples, ensure you have:
 
    ```bash
    pip install git+https://github.com/huggingface/diffusers.git
-   pip install av
    ```
+
+   **Optional**: For better video compression (H.264/MP4), install [ffmpeg](https://ffmpeg.org/):
+   ```bash
+   # Ubuntu/Debian
+   apt-get install ffmpeg
+   ```
+   If ffmpeg is not available, the server will use a pure Python encoder that outputs MJPEG/AVI format. See [FFmpeg download page](https://ffmpeg.org/download.html) for installation instructions on other platforms.
 
 2. **Server Running**: The TensorRT-LLM visual generation server must be running
    ```bash
@@ -34,6 +40,8 @@ Before running these examples, ensure you have:
 
    ```bash
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
+   trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
@@ -48,24 +56,29 @@ Before running these examples, ensure you have:
 Current supported & tested models:
 
 1. WAN T2V/I2V for video generation (t2v, ti2v, delete_video)
+2. FLUX.1 for image generation (t2i)
+3. FLUX.2 for image generation (t2i)
 
-### 1. Synchronous Image Generation (`sync_t2i.py`)
+### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
-Demonstrates synchronous text-to-image generation using the OpenAI SDK.
+Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports FLUX.1 and FLUX.2.
 
 **Features:**
 - Generates images from text prompts
-- Supports configurable image size and quality
+- Supports configurable model, image size, and quality
 - Returns base64-encoded images or URLs
 - Saves generated images to disk
 
 **Usage:**
 ```bash
-# Use default localhost server
+# FLUX.2 (default)
 python sync_image_gen.py
 
-# Specify custom server URL
-python sync_image_gen.py http://your-server:8000/v1
+# FLUX.1
+python sync_image_gen.py --model flux1
+
+# Custom server and prompt
+python sync_image_gen.py --base-url http://your-server:8000/v1 --prompt "A sunset"
 ```
 
 **API Endpoint:** `POST /v1/images/generations`
@@ -228,7 +241,7 @@ You can customize these by:
 ## Common Parameters
 
 ### Image Generation
-- `model`: Model identifier (e.g., "wan")
+- `model`: Model identifier (e.g., "flux1", "flux2")
 - `prompt`: Text description
 - `n`: Number of images to generate
 - `size`: Image dimensions (e.g., "512x512", "1024x1024")
@@ -275,7 +288,12 @@ curl -X GET "http://localhost:8000/v1/videos/{video_id}"
 
 ### Download Video
 ```bash
+# The server returns either MP4 (with ffmpeg) or AVI (without ffmpeg)
+# Check the Content-Type header to determine the format
 curl -X GET "http://localhost:8000/v1/videos/{video_id}/content" -o output.mp4
+
+# Or use -J -O to let curl use the server-provided filename
+curl -X GET "http://localhost:8000/v1/videos/{video_id}/content" -J -O
 ```
 
 ### Delete Video
@@ -315,8 +333,18 @@ Errors are displayed with full stack traces for debugging.
 Generated files are saved to the current working directory:
 
 - `output_generation.png` - Synchronous image generation (`sync_image_gen.py`)
-- `output_sync.mp4` - Synchronous video generation (`sync_video_gen.py`)
-- `output_async.mp4` - Asynchronous video generation (`async_video_gen.py`)
-- `output_multipart.mp4` - Multipart example output (`multipart_example.py`)
+- `output_sync.mp4` or `output_sync.avi` - Synchronous video generation (`sync_video_gen.py`)
+- `output_async.mp4` or `output_async.avi` - Asynchronous video generation (`async_video_gen.py`)
 
 **Note:** You can customize output filenames using the `--output` parameter in all scripts.
+
+## Video Encoding
+
+The server supports two video encoding modes:
+
+| Encoder | Format | Requirements | Features |
+|---------|--------|--------------|----------|
+| **FFmpeg (H.264)** | MP4 | ffmpeg installed | Better compression, audio support |
+| **Pure Python (MJPEG)** | AVI | None (built-in) | No external dependencies |
+
+The server automatically selects the best available encoder. The example scripts detect the actual format from the server response and adjust the output filename extension accordingly.

@@ -88,6 +88,7 @@ class DiskCacheTierConfig:
 class BufferConfig:
     role: DataRole
     size: int
+    tokens_per_block_override: int | None = None
 
 @dataclass(slots=True)
 class HelixConfig:
@@ -210,10 +211,9 @@ class BufferId(NamedTuple):
     role: DataRole
 
 @dataclass(slots=True, frozen=True)
-class BufferSlice:
-    buffer_id: BufferId
-    num_slices: int = 1
-    slice_index: int = 1
+class ExpandedBuffer:
+    id: BufferId
+    expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
 
 @dataclass(slots=True, frozen=True)
 class AggregatedPageDesc:
@@ -226,16 +226,28 @@ class AggregatedPageDesc:
     size: int
     stride: int
     layer_group_id: LayerGroupId
-    buffers: Sequence[BufferSlice]
+    buffers: Sequence[ExpandedBuffer]
 
 # From _core/_kv_cache_manager.py
+@dataclass(slots=True, frozen=True)
+class PageIndexConverter:
+    scale: int
+    expansion: int
+
+    def __call__(self, base_index: int) -> Iterator[int]: ...
+
 class KVCacheManager:
     def __init__(self, config: KVCacheManagerConfig) -> None: ...
+    def __del__(self) -> None: ...
+    def shutdown(self) -> None: ...
     def clear_reusable_blocks(self) -> None: ...
     def get_mem_pool_base_address(self, layer_id: LayerId, data_role: DataRole) -> MemAddress: ...
     def get_page_stride(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_upper_bound(self, layer_id: LayerId, data_role: DataRole) -> int: ...
     def get_page_index_scale(self, layer_id: LayerId, data_role: DataRole) -> int: ...
+    def get_page_index_converter(
+        self, layer_id: LayerId, data_role: DataRole
+    ) -> PageIndexConverter: ...
     def create_kv_cache(
         self,
         lora_task_id: int | None = None,
@@ -262,7 +274,5 @@ class KVCacheManager:
     def layer_grouping(self) -> Sequence[Sequence[LayerId]]: ...
     @property
     def all_buffer_ids(self) -> Iterator[BufferId]: ...
-    def get_aggregated_pages(
-        self, buffers: Iterable[BufferSlice]
-    ) -> Iterator[AggregatedPageDesc]: ...
+    def get_aggregated_pages(self, buffers: Iterable[BufferId]) -> Iterator[AggregatedPageDesc]: ...
     def clamp_max_seq_len_for_mem(self, batch_size: int, token_num_upper_bound: int) -> int: ...

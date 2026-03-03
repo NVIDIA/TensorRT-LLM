@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
@@ -110,6 +111,7 @@ class PipelineLoader:
     def load(
         self,
         checkpoint_dir: Optional[str] = None,
+        skip_warmup: bool = False,
     ) -> "BasePipeline":
         """
         Load a diffusion pipeline with optional dynamic quantization.
@@ -124,6 +126,7 @@ class PipelineLoader:
 
         Args:
             checkpoint_dir: Local path or HF Hub model ID (uses args.checkpoint_path if not provided)
+            skip_warmup: If True, skip warmup inference after loading (useful for testing)
 
         Returns:
             Loaded pipeline (WanPipeline, FluxPipeline, etc.) - type auto-detected
@@ -177,7 +180,7 @@ class PipelineLoader:
         if pipeline.transformer is None:
             raise ValueError("Pipeline has no transformer component")
 
-        transformer_components = getattr(pipeline, "transformer_components", ["transformer"])
+        transformer_components = pipeline.transformer_components
         logger.info(f"Transformer components: {transformer_components}")
 
         transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
@@ -205,6 +208,28 @@ class PipelineLoader:
         # =====================================================================
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
+
+        if config.torch_compile.enable_torch_compile:
+            torch._dynamo.config.cache_size_limit = 128
+            pipeline.torch_compile()
+        else:
+            logger.info("torch.compile disabled by config")
+
+        if not skip_warmup:
+            if config.torch_compile.enable_autotune:
+                with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
+                    pipeline.warmup()
+            else:
+                pipeline.warmup()
+
+        if config.pipeline.enable_layerwise_nvtx_marker:
+            from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
+
+            marker = LayerwiseNvtxMarker()
+            module_prefix = pipeline.__class__.__name__
+            for transformer_component in transformer_components:
+                logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
+                marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 
         logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
         return pipeline

@@ -244,7 +244,9 @@ def create_draft_kv_cache_manager_maybe(
         return None
 
     # Get the appropriate KV cache manager class
-    kv_cache_manager_cls = get_kv_cache_manager_cls(draft_model_engine.model.model_config)
+    kv_cache_manager_cls = get_kv_cache_manager_cls(
+        draft_model_engine.model.model_config, kv_cache_config_tuned
+    )
 
     return _create_kv_cache_manager(
         model_engine=draft_model_engine,
@@ -518,7 +520,7 @@ class ADEngine(ModelEngine):
 
         # check for max total draft tokens
         if self.spec_config is not None:
-            self.max_total_draft_tokens = self.spec_config.max_total_draft_tokens
+            self.max_total_draft_tokens = self.spec_config.tokens_per_gen_step - 1
         else:
             self.max_total_draft_tokens = 0
 
@@ -748,7 +750,7 @@ class ADEngine(ModelEngine):
             if use_overlap:
                 mask_scatter_indices.extend(list(range(cu_seqlen[-2], cu_seqlen[-1])))
 
-            # get cache indices
+            # get cache indices and truncate the number of blocks according to total tokens
             cache_indices = kv_cache_manager.get_cache_indices(request)
             cache_loc.extend(cache_indices)
             pages_per_seq.append(len(cache_indices))
@@ -766,12 +768,24 @@ class ADEngine(ModelEngine):
         gather_required = len(context_requests) > 0 and not gather_context_logits
         logits_gather_info = [len(logits_gather_indices), int(gather_required)]
 
-        # update the sequence info object now
+        # Compute batch_info explicitly based on actual request ordering rather than
+        # relying on the seq_len > 1 heuristic in nest_sequences. With chunked prefill,
+        # a context request may have context_chunk_size=1, giving seq_len=1. The heuristic
+        # would misclassify it as decode, causing host_request_types to be inconsistent
+        # with the actual request ordering (context + extend first, then generation).
+        # This mismatch leads to incorrect token splitting in thop.attention.
+        num_prefill_seqs = num_ctx_requests + len(extend_requests)
+        num_prefill_tokens = sum(seq_len[:num_prefill_seqs])
+        num_decode_seqs = len(generation_requests)
+        batch_info = [num_prefill_seqs, num_prefill_tokens, num_decode_seqs]
+
+        # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             position_ids=position_ids,
             seq_len=seq_len,
             input_pos=input_pos,
+            batch_info=batch_info,
             cu_seqlen=cu_seqlen,
             cache_loc=cache_loc,
             pages_per_seq=pages_per_seq,
@@ -784,13 +798,9 @@ class ADEngine(ModelEngine):
             logits_gather_info=logits_gather_info,
             _gather_idx=None if new_tokens is None else flat_gather_indices,
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
+            _ungathered_input_ids=new_tokens.flatten() if new_tokens is not None else None,
             **extra_args,
         )
-        # scatter the new tokens into the input_ids tensor if provided
-        if new_tokens is not None:
-            self.cache_seq_interface.info.rescatter_input_ids(new_tokens.flatten())
-
-        self.cache_seq_interface.info.run_host_prepare_for_attention_forward()
 
         if spec_resource_manager is not None and isinstance(
             spec_resource_manager, ADHiddenStateManager
@@ -1055,7 +1065,7 @@ def create_autodeploy_executor(ad_config: LlmArgs, tokenizer: Optional[Tokenizer
     max_total_draft_tokens = (
         0
         if ad_config.speculative_config is None
-        else ad_config.speculative_config.max_total_draft_tokens
+        else ad_config.speculative_config.tokens_per_gen_step - 1
     )
 
     # initialize model engine

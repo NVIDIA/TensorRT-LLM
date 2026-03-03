@@ -185,6 +185,29 @@ class TrtllmAttention(BaseTrtllmAttention):
             max_seq_len=max_seq_len,
         )
 
+    # Needed to work with torch compile cause of attention metadata
+    # make attn metadata as input for it to work
+    @torch.compiler.disable
+    def _prepare_metadata(self, batch_size: int, seq_len: int):
+        return self.metadata.prepare(batch_size, seq_len)
+
+    @torch.compile
+    def _concat_qkv(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        batch_size: int,
+        seq_len: int,
+        kv_seq_len: int,
+    ):
+        # Separate Q, K, V provided - fuse them
+        q = q.view(batch_size * seq_len, -1)
+        k = k.view(batch_size * kv_seq_len, -1)
+        v = v.view(batch_size * kv_seq_len, -1)
+        qkv = torch.cat([q, k, v], dim=-1)
+        return qkv
+
     def forward(
         self,
         q: torch.Tensor,
@@ -218,12 +241,8 @@ class TrtllmAttention(BaseTrtllmAttention):
         # Handle cross-attention where K/V have different sequence length than Q
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
 
-        # Separate Q, K, V provided - fuse them
-        q = q.view(batch_size * seq_len, -1)
-        k = k.view(batch_size * kv_seq_len, -1)
-        v = v.view(batch_size * kv_seq_len, -1)
-        qkv = torch.cat([q, k, v], dim=-1)
-        prepared_metadata = self.metadata.prepare(batch_size, seq_len)
+        qkv = self._concat_qkv(q, k, v, batch_size, seq_len, kv_seq_len)
+        prepared_metadata = self._prepare_metadata(batch_size, seq_len)
         output = super().forward(
             q=qkv,
             k=None,

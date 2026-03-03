@@ -111,7 +111,7 @@ printed.
 
 #### XQA Optimization
 
-Another optimization for MQA/GQA in generation phase called XQA optimization.
+Another optimization for MQA/GQA in the generation phase is called XQA optimization.
 
 Support matrix of the XQA optimization:
  - FP16 / BF16 compute data type.
@@ -162,7 +162,7 @@ which is expected to increase the total throughput. Chunking contexts also remov
 constraints on input length. To enable this feature, the FMHA paged kv-cache also
 needs to be enabled. Except for the last one, the size of the context chunk needs
 to be an integer multiple of the kv-cache block size. Refer to
-[the performance best practices](../performance/perf-best-practices.md#chunked-context) for usage.
+[the chunked context feature](../../features/long-sequence.md) for usage.
 
 ## KV Cache
 
@@ -253,13 +253,13 @@ Similar to the cyclic KV cache feature in TensorRT-LLM, `max_attention_window_si
 parameter is used to determine `N`. Different from the cyclic KV cache feature,
 the first `S` tokens, called sink tokens, are always kept in the attention window,
 where `S` is determined by `sink_token_length` parameter in `GenerationSession.setup`.
-But in context phase, the self-attentions is dense in the official implementation of
+But in context phase, the self-attention is dense in the official implementation of
 StreamingLLM, and it uses all of the tokens for computation and only saves `N` tokens
 to the KV cache.
 
 In addition, the relative position embedding is also changed in StreamingLLM.
 When determining the relative distance and adding positional information to tokens,
-StreamingLLM use the positions within the cache rather than those in the original text.
+StreamingLLM uses the positions within the cache rather than those in the original text.
 
 `streamingllm` flag is used to enable this feature.
 

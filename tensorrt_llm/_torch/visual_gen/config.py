@@ -29,7 +29,9 @@ class PipelineComponent(str, Enum):
     TRANSFORMER = "transformer"
     VAE = "vae"
     TEXT_ENCODER = "text_encoder"
+    TEXT_ENCODER_2 = "text_encoder_2"
     TOKENIZER = "tokenizer"
+    TOKENIZER_2 = "tokenizer_2"
     SCHEDULER = "scheduler"
     IMAGE_ENCODER = "image_encoder"
     IMAGE_PROCESSOR = "image_processor"
@@ -192,15 +194,27 @@ class TeaCacheConfig(BaseModel):
         return self
 
 
-class PipelineConfig(BaseModel):
-    """General pipeline configuration."""
+class TorchCompileConfig(BaseModel):
+    """Configuration for torch.compile and autotuning."""
 
     enable_torch_compile: bool = True
-    torch_compile_models: str = PipelineComponent.TRANSFORMER
-    torch_compile_mode: str = "default"
-    fuse_qkv: bool = True
+    enable_fullgraph: bool = False
+    enable_autotune: bool = True
 
-    # Offloading Config
+
+class CudaGraphConfig(BaseModel):
+    """Configuration for CUDA graph capture/replay."""
+
+    enable_cuda_graph: bool = False
+
+
+class PipelineConfig(BaseModel):
+    """Model-specific pipeline configuration."""
+
+    fuse_qkv: bool = True
+    enable_layerwise_nvtx_marker: bool = False
+
+    # Offloading
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
@@ -261,6 +275,8 @@ class DiffusionArgs(BaseModel):
 
     # Sub-configs (dict input for quant_config is coerced to QuantConfig in model_validator)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
+    torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
+    cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -383,6 +399,8 @@ class DiffusionModelConfig(BaseModel):
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
+    cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -455,6 +473,10 @@ class DiffusionModelConfig(BaseModel):
         # This allows simple configs like {"quant_algo": "FP8"} to work.
         if quant_algo is not None and not quant_config_dict.get("config_groups"):
             dynamic_weight_quant = quant_config_dict.get("dynamic", True)
+            # NVFP4 requires dynamic activation quantization when using dynamic mode
+            # since input_scale is not calibrated
+            if quant_algo == QuantAlgo.NVFP4 and dynamic_weight_quant:
+                dynamic_activation_quant = True
 
         quant_config = QuantConfig(
             quant_algo=quant_algo,
@@ -485,12 +507,15 @@ class DiffusionModelConfig(BaseModel):
 
         Args:
             checkpoint_dir: Path to checkpoint
-            args: DiffusionArgs containing user config (quant, pipeline, attention, parallel, teacache)
+            args: DiffusionArgs containing user config
+                - (torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
 
         # Extract sub-configs from args or use defaults
+        torch_compile_cfg = args.torch_compile if args else TorchCompileConfig()
+        cuda_graph_cfg = args.cuda_graph if args else CudaGraphConfig()
         pipeline_cfg = args.pipeline if args else PipelineConfig()
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
@@ -555,6 +580,8 @@ class DiffusionModelConfig(BaseModel):
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,
             # Sub-configs from DiffusionArgs
+            torch_compile=torch_compile_cfg,
+            cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
             parallel=parallel_cfg,

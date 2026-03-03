@@ -5,7 +5,7 @@ This document shows how to build and run a model using Medusa decoding([`Github`
 ## Overview
 Different from other models, Medusa decoding needs a base model and Medusa heads. The TensorRT LLM Medusa Decoding implementation can be found in [tensorrt_llm/models/medusa/model.py](../../tensorrt_llm/models/medusa/model.py). The implementation adds Medusa heads to a base model.
 
-For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/advanced/speculative-decoding.html).
+For more info about Medusa visit [speculative decoding documentation](https://nvidia.github.io/TensorRT-LLM/features/speculative-decoding.html).
 
 ## Support Matrix
   * GPU Compute Capability >= 8.0 (Ampere or newer)

@@ -5261,7 +5261,7 @@ For more information, please refer to <http://unlicense.org>
   - `Tracker`: https://github.com/tox-dev/py-filelock/issues
 
 
-## flashinfer-python (0.6.3)
+## flashinfer-python (0.6.4)
 
 ### Licenses
 License: `Apache-2.0`
@@ -33478,7 +33478,6 @@ limitations under the License.
   - `Homepage`: https://github.com/NVIDIA/Model-Optimizer
 
 
-<<<<<<< HEAD
 ## nvidia-modelopt-core (0.33.1)
 
 ### Licenses
@@ -33506,10 +33505,7 @@ limitations under the License.
   - `Homepage`: https://github.com/NVIDIA/Model-Optimizer
 
 
-## nvidia-nccl-cu12 (2.27.3)
-=======
 ## nvidia-nccl-cu13 (2.27.7)
->>>>>>> fd7624b32 (modify ATTRIBUTIONS-Python.md)
 
 ### Licenses
 License: `BSD-3-Clause`
