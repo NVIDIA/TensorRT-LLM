@@ -1065,7 +1065,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": True,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
+                "free_gpu_memory_fraction": 0.6,
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
@@ -1075,7 +1075,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
         gen_server_config = {
             "disable_overlap_scheduler": False,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.8,
+                "free_gpu_memory_fraction": 0.6,
             },
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
