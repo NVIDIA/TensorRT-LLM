@@ -113,3 +113,27 @@ class SADraftEnhancer:
             self.sa_spec_index += 1
 
         return draft_tokens
+
+    def maybe_override_all_draft_tokens(
+        self,
+        draft_tokens: torch.Tensor,
+    ) -> torch.Tensor:
+        """Override all K draft positions at once (for parallel-draft workers like PARD).
+
+        Unlike ``maybe_override_draft_tokens`` which overrides one position per
+        call, this method overrides all K columns in a single vectorized operation.
+
+        Args:
+            draft_tokens: [num_gens, K] draft tokens from the neural drafter.
+
+        Returns:
+            The (potentially overridden) draft tokens tensor.
+        """
+        if self.sa_match_len is not None and self.sa_match_len.shape[0] > 0:
+            K = draft_tokens.shape[1]
+            mask = (
+                (self.sa_match_len >= self.sa_spec_threshold).unsqueeze(1).expand_as(draft_tokens)
+            )
+            draft_tokens = torch.where(mask, self.sa_draft_tokens[:, :K], draft_tokens)
+
+        return draft_tokens

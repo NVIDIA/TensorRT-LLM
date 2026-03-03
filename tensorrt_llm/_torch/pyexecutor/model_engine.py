@@ -3456,15 +3456,21 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, etc.)
+        # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)
         use_sa_spec = (self.spec_config is not None
                        and getattr(self.spec_config, 'use_sa_spec', False))
         if use_sa_spec and resource_manager is not None and self.mapping.is_last_pp_rank(
         ):
+            from tensorrt_llm._torch.speculative.suffix_automaton import \
+                SuffixAutomatonManager
             spec_rm = resource_manager.get_resource_manager(
                 ResourceManagerType.SPEC_RESOURCE_MANAGER)
-            sa_manager = getattr(spec_rm, 'sa_manager',
-                                 None) if spec_rm is not None else None
+            sa_manager = None
+            if spec_rm is not None:
+                if isinstance(spec_rm, SuffixAutomatonManager):
+                    sa_manager = spec_rm
+                else:
+                    sa_manager = getattr(spec_rm, 'sa_manager', None)
             if sa_manager is not None:
                 for request in itertools.chain(
                         scheduled_requests.context_requests,

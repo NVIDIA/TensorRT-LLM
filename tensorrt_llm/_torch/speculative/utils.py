@@ -95,6 +95,7 @@ def get_spec_metadata(spec_config,
             spec_dec_mode=spec_config.spec_dec_mode,
             max_num_requests=max_num_requests,
             allow_advanced_sampling=spec_config.allow_advanced_sampling,
+            spec_resource_manager=spec_resource_manager,
         )
     if spec_config.spec_dec_mode.is_save_hidden_states():
         return SaveHiddenStatesSpecMetadata(
@@ -200,6 +201,11 @@ def get_spec_resource_manager(model_engine, draft_model_engine=None):
             max_num_requests,
             max_num_tokens,
         )
+    if spec_dec_mode.is_pard():
+        if getattr(spec_config, 'use_sa_spec', False):
+            return SuffixAutomatonManager(spec_config, max_num_requests,
+                                          max_seq_len)
+        return None
     if spec_dec_mode.is_ngram():
         return NGramPoolManager(spec_config, max_num_requests)
     if spec_dec_mode.is_sa():
