@@ -180,36 +180,28 @@ def split_graph_at_dynamic_ops(gm: GraphModule) -> SplitInfo:
         keep_original_order=True,
     )
 
-    # Analyze the split result to identify dynamic vs static submodules
+    # Analyze the split result to identify dynamic vs static submodules.
+    # split_module names submodules "submod_{partition_id}", so the name suffix
+    # IS the partition ID.  We classify each submodule directly by checking its
+    # partition ID against dynamic_partitions.  This avoids fragile alignment
+    # between partition_ids_in_order and submod_names (they can diverge when
+    # get_attr-only partitions exist in the original graph but split_module
+    # does not create submodules for them).
     submod_names = []
     for name, _ in split_gm.named_children():
         if name.startswith("submod_"):
             submod_names.append(name)
 
-    # Sort by index
     submod_names.sort(key=lambda n: int(n.split("_")[1]))
-
-    # Build a mapping from partition ID to submod index
-    # The split_module assigns submod_N names in order of first-seen partition IDs
-    partition_ids_in_order = []
-    seen = set()
-    for node in gm.graph.nodes:
-        if node.op in ("placeholder", "output"):
-            continue
-        pid = node_to_partition.get(node, 0)
-        if pid not in seen:
-            seen.add(pid)
-            partition_ids_in_order.append(pid)
 
     dynamic_indices = []
     static_indices = []
-    for idx, pid in enumerate(partition_ids_in_order):
-        if idx >= len(submod_names):
-            break
+    for name in submod_names:
+        pid = int(name.split("_")[1])
         if pid in dynamic_partitions:
-            dynamic_indices.append(idx)
+            dynamic_indices.append(pid)
         else:
-            static_indices.append(idx)
+            static_indices.append(pid)
 
     ad_logger.info(
         f"Piecewise split: {len(submod_names)} submodules "

@@ -379,10 +379,12 @@ class PiecewiseCapturedGraph(nn.Module):
         self,
         model: nn.Module,
         piecewise_num_tokens: Optional[List[int]] = None,
+        capture_lm_head: bool = False,
     ):
         super().__init__()
         self.original_model = model
         self.piecewise_num_tokens = piecewise_num_tokens or []
+        self.capture_lm_head = capture_lm_head
         self.split_info: Optional[SplitInfo] = None
         self.split_gm: Optional[GraphModule] = None
         self._is_prepared = False
@@ -415,8 +417,28 @@ class PiecewiseCapturedGraph(nn.Module):
 
         # Phase 1: wrap static segments in ADPiecewiseRunner
         # Track which indices got a runner so we can link dynamic ops later.
+        #
+        # Optionally exclude the trailing static partition (final_norm + lm_head)
+        # from capture.  The lm_head produces a [num_tokens, vocab_size] output
+        # whose graph-pool cost is enormous (e.g. 4-6 GiB at nt=8192 for 256K
+        # vocab).  Excluding it lets that partition run eagerly, matching the
+        # PyTorch backend's piecewise behaviour.
+        static_indices = list(self.split_info.static_submod_indices)
+        if (
+            not self.capture_lm_head
+            and static_indices
+            and self.split_info.dynamic_submod_indices
+            and static_indices[-1] > max(self.split_info.dynamic_submod_indices)
+        ):
+            trailing_idx = static_indices.pop()
+            ad_logger.info(
+                "PiecewiseCapturedGraph: excluding trailing static submod_%d "
+                "(lm_head) from capture — will run eagerly",
+                trailing_idx,
+            )
+
         runner_by_idx: Dict[int, ADPiecewiseRunner] = {}
-        for idx in self.split_info.static_submod_indices:
+        for idx in static_indices:
             submod_name = f"submod_{idx}"
             if not hasattr(self.split_gm, submod_name):
                 continue
@@ -442,12 +464,18 @@ class PiecewiseCapturedGraph(nn.Module):
         # - Metadata-prep ops → MetadataStabilizer (stable output addresses)
         # - Attention/SSM/delta/logits → DynamicOpWrapper (out= pre-alloc)
         # - Conv ops → left unwrapped (already inplace)
+        # Iterate over all actual submod indices in order (not range(N), because
+        # indices are partition IDs that may have gaps from empty partitions).
+        dynamic_set = set(self.split_info.dynamic_submod_indices)
+        all_submod_indices = sorted(
+            self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
+        )
         current_static_runner: Optional[ADPiecewiseRunner] = None
         num_stabilized = 0
-        for idx in range(self.split_info.num_submodules):
+        for idx in all_submod_indices:
             if idx in runner_by_idx:
                 current_static_runner = runner_by_idx[idx]
-            elif idx in self.split_info.dynamic_submod_indices:
+            elif idx in dynamic_set:
                 submod_name = f"submod_{idx}"
                 if not hasattr(self.split_gm, submod_name):
                     continue
