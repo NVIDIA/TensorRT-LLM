@@ -177,6 +177,9 @@ deepseek-ai/DeepSeek-V3-Lite:
     accuracy: 71.27
   - spec_dec_algo: MTP
     accuracy: 71.39
+  - spec_dec_algo: MTP
+    extra_acc_spec: use_sa_spec
+    accuracy: 71.39
   - quant_algo: FP8_BLOCK_SCALES
     spec_dec_algo: MTP
     accuracy: 71.29
