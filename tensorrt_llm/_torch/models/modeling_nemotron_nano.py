@@ -69,10 +69,16 @@ class NanoV2VLVisionEncoder(transformers.PreTrainedModel):
         self.vit_hidden_size = config.vit_hidden_size
         self.vision_projection_hidden_size = config.projector_hidden_size
         self.llm_hidden_size = config.llm_config.hidden_size
+
+        # Different versions of the configuration code may have a different name for the same value.
+        eps = getattr(config.llm_config, "rms_norm_eps", None)
+        if eps is None:
+            eps = getattr(config.llm_config, "layer_norm_epsilon")
+
         self.mlp1 = nn.Sequential(
             nn.RMSNorm(
                 self.vit_hidden_size * int(1 / self.downsample_ratio) ** 2,
-                eps=config.llm_config.rms_norm_eps,
+                eps=eps,
                 dtype=config.torch_dtype,
             ),
             nn.Linear(
