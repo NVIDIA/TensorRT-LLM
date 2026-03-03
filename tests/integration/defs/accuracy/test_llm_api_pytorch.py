@@ -3412,7 +3412,12 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     @skip_pre_blackwell
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(120000)
-    def test_nvfp4(self):
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp",
+        [(1, False), (1, True), (8, False), (8, True)],
+        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp):
         model_name = "moonshotai/Kimi-K2.5"
         model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
@@ -3421,9 +3426,9 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
                  tensor_parallel_size=8,
                  max_batch_size=16,
                  pipeline_parallel_size=1,
-                 moe_expert_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
                  kv_cache_config=kv_cache_config,
-                 enable_attention_dp=True,
+                 enable_attention_dp=attention_dp,
                  trust_remote_code=True,
                  speculative_config=None) as llm:
             assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
