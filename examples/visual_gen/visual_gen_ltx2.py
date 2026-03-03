@@ -174,6 +174,18 @@ def parse_args():
         "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise nvtx marker"
     )
 
+    # Dynamic quantization
+    parser.add_argument(
+        "--linear_type",
+        type=str,
+        default="default",
+        choices=["default", "trtllm-fp8-per-tensor", "trtllm-fp8-blockwise", "trtllm-nvfp4"],
+        help=(
+            "Dynamic quantization mode for linear layers. "
+            "Quantizes weights on-the-fly during loading from an unquantized checkpoint."
+        ),
+    )
+
     # Output format
     parser.add_argument(
         "--output_type",
@@ -191,6 +203,15 @@ def main():
 
     # world_size = cfg_size * ulysses_size
     n_workers = args.cfg_size * args.ulysses_size
+
+    # Convert linear_type to quant_config
+    quant_config = None
+    if args.linear_type == "trtllm-fp8-per-tensor":
+        quant_config = {"quant_algo": "FP8", "dynamic": True}
+    elif args.linear_type == "trtllm-fp8-blockwise":
+        quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
+    elif args.linear_type == "trtllm-nvfp4":
+        quant_config = {"quant_algo": "NVFP4", "dynamic": True}
 
     # Setup Configuration
     diffusion_config = {
@@ -213,6 +234,9 @@ def main():
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     }
+
+    if quant_config is not None:
+        diffusion_config["quant_config"] = quant_config
 
     # Initialize VisualGen
     logger.info(

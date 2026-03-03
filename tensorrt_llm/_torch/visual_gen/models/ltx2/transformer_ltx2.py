@@ -946,11 +946,21 @@ class LTXModel(nn.Module):
         checkpoint_keys = set(weights.keys())
         missing = model_keys - checkpoint_keys
         unexpected = checkpoint_keys - model_keys
+        dynamic_quant_enabled = (
+            self.model_config is not None
+            and self.model_config.quant_config.quant_algo is not None
+        )
         if missing:
             logger.warning(
                 f"LTXModel: {len(missing)} model params NOT in checkpoint: "
                 f"{sorted(missing)[:20]}{'...' if len(missing) > 20 else ''}"
             )
+            if dynamic_quant_enabled:
+                logger.info(
+                    "Dynamic quantization is enabled -- missing scale parameters "
+                    "(e.g. weight_scale, input_scale) are expected and will be "
+                    "computed by DynamicLinearWeightLoader during weight loading."
+                )
         if unexpected:
             logger.warning(
                 f"LTXModel: {len(unexpected)} checkpoint keys NOT in model: "
