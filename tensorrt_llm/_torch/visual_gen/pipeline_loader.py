@@ -307,7 +307,7 @@ class PipelineLoader:
 
             marker = LayerwiseNvtxMarker()
             module_prefix = pipeline.__class__.__name__
-            for transformer_component in transformer_components:
+            for transformer_component in pipeline.transformer_components:
                 logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
                 marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 

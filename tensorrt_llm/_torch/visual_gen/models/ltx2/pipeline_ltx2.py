@@ -233,6 +233,29 @@ class LTX2Pipeline(BasePipeline):
     def dtype(self):
         return self.model_config.torch_dtype
 
+    @property
+    def common_warmup_shapes(self) -> list:
+        """Return list of common warmup shapes (height, width, num_frames)."""
+        return [(512, 768, 121)]
+
+    def _run_warmup(self, warmup_steps: int) -> None:
+        """Run warmup inference to trigger torch.compile and CUDA init."""
+        for height, width, num_frames in self.common_warmup_shapes:
+            logger.info(
+                f"Warmup: LTX2 {height}x{width}, {num_frames} frames, {warmup_steps} steps"
+            )
+            with torch.no_grad():
+                self.forward(
+                    prompt="warmup",
+                    negative_prompt="",
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    num_inference_steps=warmup_steps,
+                    guidance_scale=4.0,
+                    seed=0,
+                )
+
     # ------------------------------------------------------------------
     # Transformer weight loading
     # ------------------------------------------------------------------
