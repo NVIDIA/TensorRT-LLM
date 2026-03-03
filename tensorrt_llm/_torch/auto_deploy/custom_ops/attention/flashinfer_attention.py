@@ -379,82 +379,12 @@ def flashinfer_mha_with_cache(
         kv_layout=_GlobalFlashInferPlanner.kv_layout,
     )
 
+    bs = b * s
     if out is not None:
-        # Use pre-allocated output buffer, writing directly into it
-        out_flat = out.view(-1, n_heads, head_dim)
-
-        if num_prefill > 0:
-            q_prefill = q[:num_prefill_tokens]
-
-            pp_prefill = PlanParams(
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                head_dim=head_dim,
-                num_seq=num_prefill,
-                page_size=page_size,
-                q_dtype=q_prefill.dtype,
-                kv_dtype=kv_cache.dtype,
-                sm_scale=scale,
-            )
-
-            wrapper_prefill = _GlobalFlashInferPlanner.plan_prefill(
-                qo_indptr_host=cu_seqlen_host[: num_prefill + 1],
-                kv_page_indptr_host=cu_num_pages_host[: num_prefill + 1],
-                kv_page_indices=cache_loc,
-                kv_last_page_len_host=last_page_len_host[:num_prefill],
-                kv_lens_arr_host=seq_len_with_cache_host[:num_prefill],
-                plan_params=pp_prefill,
-            )
-
-            wrapper_prefill.run(
-                q_prefill,
-                kv_cache,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                enable_pdl=get_env_enable_pdl(),
-                out=out_flat[:num_prefill_tokens],
-            )
-
-        if num_decode > 0:
-            q_decode = q[num_prefill_tokens:num_total_tokens]
-
-            pp_decode = PlanParams(
-                n_heads=n_heads,
-                n_kv_heads=n_kv_heads,
-                head_dim=head_dim,
-                num_seq=num_decode,
-                page_size=page_size,
-                q_dtype=q_decode.dtype,
-                kv_dtype=kv_cache.dtype,
-                sm_scale=scale,
-            )
-
-            wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
-                kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
-                kv_page_indices=cache_loc,
-                kv_last_page_len=last_page_len[num_prefill:num_seq],
-                plan_params=pp_decode,
-            )
-
-            wrapper_decode.run(
-                q_decode,
-                kv_cache,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                enable_pdl=get_env_enable_pdl(),
-                out=out_flat[num_prefill_tokens:num_total_tokens],
-            )
-
-        out_flat[num_total_tokens:].zero_()
-        return out.new_empty(0)
-
-    # check if we need to re-combine outputs
-    if num_prefill > 0 and num_decode > 0:
-        y = torch.empty_like(q)
+        y = out.view(-1, n_heads, head_dim)
     else:
-        y = None
+        y = torch.zeros((bs, n_heads, head_dim), dtype=q.dtype, device=q.device)
 
-    # now run split prefill, decode
     if num_prefill > 0:
         q_prefill = q[:num_prefill_tokens]
 
@@ -478,17 +408,14 @@ def flashinfer_mha_with_cache(
             plan_params=pp_prefill,
         )
 
-        y_prefill = wrapper_prefill.run(
+        wrapper_prefill.run(
             q_prefill,
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
+            out=y[:num_prefill_tokens],
         )
-        if y is not None:
-            y[:num_prefill_tokens] = y_prefill
-        else:
-            y = y_prefill
 
     if num_decode > 0:
         q_decode = q[num_prefill_tokens:num_total_tokens]
@@ -504,7 +431,6 @@ def flashinfer_mha_with_cache(
             sm_scale=scale,
         )
 
-        # run the flashinfer planner and obtain the correct wrapper
         wrapper_decode = _GlobalFlashInferPlanner.plan_decode(
             kv_page_indptr=cu_num_pages[num_prefill : num_seq + 1],
             kv_page_indices=cache_loc,
@@ -512,31 +438,21 @@ def flashinfer_mha_with_cache(
             plan_params=pp_decode,
         )
 
-        y_decode = wrapper_decode.run(
+        wrapper_decode.run(
             q_decode,
             kv_cache,
             k_scale=k_scale,
             v_scale=v_scale,
             enable_pdl=get_env_enable_pdl(),
+            out=y[num_prefill_tokens:num_total_tokens],
         )
-        if y is not None:
-            y[num_prefill_tokens:num_total_tokens] = y_decode
-        else:
-            y = y_decode
 
-    # Reshape to match input shape [b, s, ...]
-    # y has shape [num_total_tokens, n_heads, head_dim] (pure) or [b*s, n_heads, head_dim] (mixed).
-    # q_shape_og is [b, s, ...] which may be padded (bucketed) for piecewise CG.
-    # Pad with zeros if y is smaller than the padded shape, so downstream ops
-    # (o_proj, residual add, LayerNorm) don't see garbage in padding positions.
-    bs = b * s
-    if y.shape[0] < bs:
-        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
-        y_padded[: y.shape[0]] = y
-        y = y_padded
-    elif num_total_tokens < bs:
-        # Mixed batch: y is already [b*s, ...] but positions [num_total_tokens:] are uninitialized
-        y[num_total_tokens:].zero_()
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        return out.new_empty(0)
 
     return y.view(q_shape_og)
 
