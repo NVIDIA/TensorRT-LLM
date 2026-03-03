@@ -60,8 +60,8 @@ protected:
         return std::make_shared<tb::LlmRequest>(requestId, maxNewTokens, inputTokens, samplingConfig, false,
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
             std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false, std::nullopt,
-            std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
+            std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, false, false,
+            std::nullopt, std::nullopt, false, std::nullopt, false, std::nullopt, false, std::nullopt,
             tensorrt_llm::executor::Request::kDefaultPriority, std::nullopt, std::nullopt, std::nullopt,
             tb::LlmRequestType::LLMREQUEST_TYPE_CONTEXT_AND_GENERATION, std::nullopt, 1, std::nullopt, std::nullopt,
             false, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, std::nullopt, agentHierarchy);
@@ -124,7 +124,10 @@ protected:
     RequestVector sortByAgentTree(float agentRatio, std::optional<std::vector<std::string>> const& agentTypes,
         RequestVector const& requests, SizeType32 reservedCount = 0)
     {
-        auto rootNode = tbat::createAgentTreeRoot(agentRatio, agentTypes);
+        tb::batch_scheduler::AgentTreeConfig config;
+        config.agentPercentage = agentRatio;
+        config.agentTypes = agentTypes;
+        auto rootNode = tbat::createAgentTreeRoot(config);
         return tbat::sortAndTruncateRequestsByAgentTree(rootNode, requests, reservedCount);
     }
 

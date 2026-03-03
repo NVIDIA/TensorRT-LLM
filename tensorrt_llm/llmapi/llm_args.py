@@ -2208,8 +2208,8 @@ class ReorderRequestPolicyConfig(StrictBaseModel):
     """
     policy_name: Optional[Literal["AgentTree"]] = Field(
         default=None, description="The name of the request reordering policy.")
-    policy_args: Dict[str, Any] = Field(
-        default={},
+    policy_args: AgentTreeConfig = Field(
+        default_factory=AgentTreeConfig,
         description="The arguments of the request reordering policy.")
 
 
