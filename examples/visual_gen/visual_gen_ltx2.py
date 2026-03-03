@@ -187,6 +187,16 @@ def parse_args():
         ),
     )
 
+    # Attention Backend
+    parser.add_argument(
+        "--attention_backend",
+        type=str,
+        default="VANILLA",
+        choices=["VANILLA", "TRTLLM"],
+        help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
+        "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
+    )
+
     # Output format
     parser.add_argument(
         "--output_type",
@@ -218,6 +228,9 @@ def main():
     diffusion_config = {
         "model_type": "ltx2",
         "text_encoder_path": args.text_encoder_path,
+        "attention": {
+            "backend": args.attention_backend,
+        },
         "teacache": {
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,
