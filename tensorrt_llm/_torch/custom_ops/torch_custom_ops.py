@@ -1460,16 +1460,59 @@ def deep_gemm_gen_tuning_buckets(x: int):
     return buckets
 
 
+def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
+    """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
+    TACTIC_TRITON = 1
+    if tactic == TACTIC_TRITON:
+        a, a_sf = triton_fp8_quantize_1x128(input, use_ue8m0=True)
+    else:
+        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
+    a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+        a_sf.transpose(0, 1))
+    return a, a_sf
+
+
+class Fp8QuantKernelRunner(TunableRunner):
+    """Profiles only the FP8 1x128 quantization kernel (no GEMM).
+
+    Selects between CUDA and Triton quantization backends.
+    Uses empty gen_tuning_buckets so only actual M values are profiled.
+    """
+
+    TACTIC_CUDA = 0
+    TACTIC_TRITON = 1
+
+    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
+        0, 0, ()), ), )
+
+    def get_valid_tactics(
+        self,
+        inputs: List[torch.Tensor],
+        profile: OptimizationProfile,
+    ) -> List[int]:
+        return [self.TACTIC_CUDA, self.TACTIC_TRITON]
+
+    def forward(
+        self,
+        inputs: List[torch.Tensor],
+        tactic: int = -1,
+    ) -> torch.Tensor:
+        input = inputs[0]
+        a, a_sf = _fp8_quantize_1x128_ue8m0(input, tactic)
+        return a
+
+
 class fp8SwapABGemmRunner(TunableRunner):
-    TACTIC_CUDA_QUANT = 0
-    TACTIC_TRITON_QUANT = 1
+    """Runs quantize + DeepGemm FP8 GEMM. Single tactic for JIT warmup."""
 
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, deep_gemm_gen_tuning_buckets), ), )
 
-    def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool):
+    def __init__(self, output_dtype: torch.dtype, disable_ue8m0_cast: bool,
+                 quant_tactic: int):
         self.output_dtype = output_dtype
         self.disable_ue8m0_cast = disable_ue8m0_cast
+        self.quant_tactic = quant_tactic
 
     def unique_id(self):
         return (
@@ -1482,18 +1525,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        return [self.TACTIC_CUDA_QUANT, self.TACTIC_TRITON_QUANT]
-
-    def _quantize(self, input: torch.Tensor, tactic: int):
-        # SM100-only: CUDA kernel returns scale as [scale_k, m] (2D) on SM100,
-        # but 1D with m_padded stride on SM90
-        if tactic == self.TACTIC_TRITON_QUANT:
-            a, a_sf = triton_fp8_quantize_1x128(input, use_ue8m0=True)
-        else:
-            a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
-        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-            a_sf.transpose(0, 1))
-        return a, a_sf
+        return [0]
 
     def forward(
         self,
@@ -1501,7 +1533,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
-        a, a_sf = self._quantize(input, tactic)
+        a, a_sf = _fp8_quantize_1x128_ue8m0(input, self.quant_tactic)
         output = torch.empty(
             (input.size(0), weight.size(0)),
             device=input.device,
@@ -1526,18 +1558,31 @@ def fp8_swap_ab_gemm(
     disable_ue8m0_cast: bool = False,
 ) -> torch.Tensor:
     tuner = AutoTuner.get()
-    fp8_swap_ab_gemm_runner = fp8SwapABGemmRunner(
-        output_dtype,
-        disable_ue8m0_cast,
+
+    # Step 1: Select best quantization kernel (CUDA vs Triton).
+    # Profiles only _quantize (no GEMM), with empty M-buckets.
+    quant_runner = Fp8QuantKernelRunner()
+    _, quant_tactic = tuner.choose_one(
+        "trtllm::fp8_quant_1x128_tactic",
+        [quant_runner],
+        Fp8QuantKernelRunner.tuning_config,
+        [input],
     )
 
+    # Step 2: Run quantize + GEMM. Single tactic triggers DeepGemm JIT
+    # warmup across M-buckets without re-profiling the quant kernel.
+    gemm_runner = fp8SwapABGemmRunner(
+        output_dtype,
+        disable_ue8m0_cast,
+        quant_tactic=quant_tactic,
+    )
     _, best_tactic = tuner.choose_one(
         "trtllm::fp8_swap_ab_gemm",
-        [fp8_swap_ab_gemm_runner],
+        [gemm_runner],
         fp8SwapABGemmRunner.tuning_config,
         [input, weight, weight_scale],
     )
-    return fp8_swap_ab_gemm_runner(
+    return gemm_runner(
         inputs=[input, weight, weight_scale],
         tactic=best_tactic,
     )

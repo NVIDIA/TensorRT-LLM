@@ -726,6 +726,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self.is_tuning_mode = False
+        self.tune_on_miss = False
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
@@ -934,9 +935,15 @@ class AutoTuner:
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
+            if not is_cache_hit and self.tune_on_miss:
+                self.is_tuning_mode = True
+                try:
+                    return self.choose_one(custom_op, runners, tuning_config,
+                                           inputs, **kwargs)
+                finally:
+                    self.is_tuning_mode = False
+
             best_runner = runners[best_runner_id]
-            # TODO: check the stored runner and tactic can implement this shape here
-            # Log the cache miss. Expect no cache miss in inference.
             if not is_cache_hit:
                 logger.warning_once(
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
