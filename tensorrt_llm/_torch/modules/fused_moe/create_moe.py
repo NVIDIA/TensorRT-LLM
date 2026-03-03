@@ -378,7 +378,7 @@ def create_moe(
                 # Workaround for test cases where TRTLLM backend falls back to CutlassFusedMoE due to quant_config incompatibility
                 # Log warning and continue with the fallback backend
                 logger.warning(
-                    f"ENABLE_CONFIGURABLE_MOE is set but TRTLLM backend fell back to {moe_cls.__name__} due to quant_config. "
+                    f"ENABLE_CONFIGURABLE_MOE is set but {requested_backend} backend fell back to {moe_cls.__name__} due to quant_config. "
                     f"ConfigurableMoE only supports TRTLLMGenFusedMoE and CuteDslFusedMoE backends. "
                     f"Continuing with legacy MoE backend {moe_cls.__name__}.")
             else:

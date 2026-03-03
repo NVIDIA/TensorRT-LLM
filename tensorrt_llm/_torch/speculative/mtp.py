@@ -1309,7 +1309,7 @@ class MTPEagleWorker(MTPWorker):
                             -1, hidden_states_gathered.shape[-1])
                     else:
                         raise ValueError(
-                            f"In MTPEagleWorker.forward(), token_count > max_num_requests, which is not supported"
+                            "In MTPEagleWorker.forward(), token_count > max_num_requests, which is not supported"
                         )
                     logits = draft_model.mtp_layers[0].shared_head(
                         padded_hidden_states, draft_model.lm_head,
