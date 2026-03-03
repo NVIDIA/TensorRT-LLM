@@ -1813,17 +1813,24 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
-    @parametrize_with_ids("fp8kv,attention_dp,cuda_graph,overlap_scheduler",
-                          [(False, False, False, False),
-                           (True, False, False, False),
-                           (False, True, False, False),
-                           (False, False, True, False),
-                           (False, False, False, True),
-                           (True, False, True, True), (True, True, True, True)])
+    @parametrize_with_ids(
+        "fp8kv,attention_dp,cuda_graph,overlap_scheduler,low_precision_moe_combine",
+        [
+            (False, False, False, False, False),
+            (True, False, False, False, False),
+            (False, True, False, False, False),
+            (False, False, True, False, False),
+            (False, False, False, True, False),
+            (True, False, True, True, False),
+            (True, True, True, True, False),
+            (True, False, True, True, True),
+            (True, True, True, True, True),
+        ])
     @parametrize_with_ids("mtp_nextn", [0, 2])
     @parametrize_with_ids("moe_backend", ["CUTLASS", "TRTLLM", "CUTEDSL"])
     def test_nvfp4(self, fp8kv, attention_dp, cuda_graph, overlap_scheduler,
-                   torch_compile, mtp_nextn, moe_backend):
+                   low_precision_moe_combine, torch_compile, mtp_nextn,
+                   moe_backend):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -1836,7 +1843,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             disable_overlap_scheduler=not overlap_scheduler,
             cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
             torch_compile_config=torch_compile_config,
-            moe_config=MoeConfig(backend=moe_backend))
+            moe_config=MoeConfig(
+                backend=moe_backend,
+                use_low_precision_moe_combine=low_precision_moe_combine),
+        )
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
