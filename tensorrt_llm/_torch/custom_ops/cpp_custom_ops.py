@@ -149,6 +149,10 @@ def _register_fake():
             shape, dtype=out_dtype if out_dtype is not None else mat_a.dtype)
         return ret
 
+    @torch.library.register_fake("trtllm::cublas_mm_out")
+    def _(mat_a, mat_b, bias, out):
+        return out
+
     @torch.library.register_fake("trtllm::dsv3_router_gemm_op")
     def _(mat_a, mat_b, bias, out_dtype):
         shape = list(mat_a.shape)
