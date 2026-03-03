@@ -856,7 +856,8 @@ def _compute_pytorch_prompt_logprobs(
     context_logits = response.result.context_logits
     assert context_logits is not None, "context_logits cannot be None when prompt_logprobs is requested."
     logprobs_result = compute_logprobs(logprob_params.prompt_logprobs, None,
-                                       context_logits, None, None)
+                                       context_logits, None,
+                                       generation_result.prompt_token_ids, None)
     if generation_result._streaming:
         generation_result._cached_prompt_logprobs = logprobs_result.prompt
 
@@ -899,6 +900,7 @@ def _get_logprobs(worker,
                                            logprob_params.logprobs,
                                            response.result.context_logits,
                                            response.result.generation_logits,
+                                           generation_result.prompt_token_ids,
                                            response.result.output_token_ids[0])
 
         if logprob_params.drop_context_logits:
