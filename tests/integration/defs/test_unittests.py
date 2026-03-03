@@ -136,7 +136,10 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     command = [
         '-m', 'pytest', ignore_opt, "-vv", "--tb=short", "-rF",
-        "--timeout=2400", "--timeout-method=thread"
+        "--timeout=2400", "--timeout-method=thread",
+        "--periodic-junit",
+        "--periodic-batch-size=1",
+        "--periodic-save-unfinished-test",
     ]
     if test_prefix:
         command += [f"--test-prefix={test_prefix}"]
@@ -184,7 +187,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     if num_workers == 1:
         # Do not bother with pytest-xdist at all if we don't need parallel execution
-        command += ["-p", "no:xdist", f"--junitxml={output_xml}"]
+        command += ["-p", "no:xdist", f"--periodic-junit-xmlpath={output_xml}"]
         passed = run_command(command)
     else:
         # Avoid .xml extension to prevent CI from reading failures from it
@@ -192,7 +195,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
             output_dir,
             f'parallel-sub-results-unittests-{case_fn}.xml.intermediate')
         parallel_command = command + [
-            "-n", f"{num_workers}", f"--junitxml={parallel_output_xml}"
+            "-n", f"{num_workers}", f"--periodic-junit-xmlpath={parallel_output_xml}"
         ]
         passed = run_command(parallel_command, num_workers)
 
@@ -209,7 +212,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
                 f'retry-sub-results-unittests-{case_fn}.xml.intermediate')
             # Run failed case sequentially.
             retry_command = command + [
-                "-p", "no:xdist", '--lf', f"--junitxml={retry_output_xml}"
+                "-p", "no:xdist", '--lf', f"--periodic-junit-xmlpath={retry_output_xml}"
             ]
             passed = run_command(retry_command)
 
