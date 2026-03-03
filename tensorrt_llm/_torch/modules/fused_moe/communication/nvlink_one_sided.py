@@ -148,6 +148,7 @@ class NVLinkOneSided(Communication):
         hidden_size: Optional[int] = None,
         dtype: Optional[torch.dtype] = None,
         num_experts: Optional[int] = None,
+        use_low_precision_combine: bool = False,
     ):
         """
         Initialize NVLinkOneSided with workspace allocation.
@@ -163,6 +164,9 @@ class NVLinkOneSided(Communication):
             dtype: Data type (optional, for auto workspace calculation)
             num_experts: (Optional) Number of experts for EPLB stats (must be <= num_slots). DO NOT provide this parameter if EPLB is not enabled.
                 Note: The terminology is mapped to `eplb_stats_num_experts` in this class and the kernels.
+            use_low_precision_combine: If True, quantize the combine payload to FP8 for NVLink
+                transfer (halves NVLink bandwidth usage, output precision is preserved).
+                Corresponds to model_config.use_low_precision_moe_combine.
         """
         super().__init__(mapping)
 
@@ -174,6 +178,7 @@ class NVLinkOneSided(Communication):
         self.top_k = top_k
         self.max_num_tokens_per_rank = max_num_tokens_per_rank
         self.payload_in_workspace = payload_in_workspace
+        self.use_low_precision_combine = use_low_precision_combine
         if num_experts is not None:
             assert num_experts > 0 and num_experts <= num_slots, (
                 "num_experts must be in (0, num_slots]"
@@ -418,7 +423,6 @@ class NVLinkOneSided(Communication):
     def combine(
         self,
         final_hidden_states: torch.Tensor,
-        fp8_combine: bool = False,
         **kwargs,
     ) -> torch.Tensor:
         """
@@ -428,8 +432,6 @@ class NVLinkOneSided(Communication):
             final_hidden_states: Output from MoE computation
                 Shape: [ep_size, max_tokens_per_rank, hidden_size] or
                        [ep_size * max_tokens_per_rank, hidden_size] (will be reshaped)
-            fp8_combine: If True, quantize BF16 payload to FP8 for NVLink transfer
-                         (halves NVLink bandwidth usage, output is always BF16)
 
         Returns:
             Combined output tensor [local_num_tokens, hidden_size]
@@ -475,7 +477,7 @@ class NVLinkOneSided(Communication):
             self.top_k,
             int(combine_payload_offset),
             bool(self.payload_in_workspace),
-            bool(fp8_combine),
+            bool(self.use_low_precision_combine),
         )
 
         # Reset state for next round

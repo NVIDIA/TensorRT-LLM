@@ -133,6 +133,7 @@ class CommunicationFactory:
                 hidden_size=hidden_size,
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
+                use_low_precision_combine=use_low_precision_combine,
             )
             logger.info("Selected communication strategy: NVLinkOneSided")
             return strategy
@@ -244,6 +245,7 @@ class CommunicationFactory:
                 hidden_size=hidden_size,
                 dtype=act_dtype,
                 num_experts=num_experts if enable_eplb else None,
+                use_low_precision_combine=use_low_precision_combine,
             )
         elif method == "DEEPEP":
             return DeepEP(
