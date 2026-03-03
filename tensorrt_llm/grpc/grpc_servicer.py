@@ -491,9 +491,12 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 cached_tokens=cached_tokens,
             )
 
-            # Add stop reason if available
-            if hasattr(completion, "stop_reason") and completion.stop_reason:
-                complete.stop_reason = str(completion.stop_reason)
+            # Add matched stop if available (int token ID or str stop sequence)
+            if hasattr(completion, "stop_reason") and completion.stop_reason is not None:
+                if isinstance(completion.stop_reason, int):
+                    complete.matched_token_id = completion.stop_reason
+                else:
+                    complete.matched_stop_str = str(completion.stop_reason)
 
             # Add generation logprobs if available
             if completion.logprobs:
