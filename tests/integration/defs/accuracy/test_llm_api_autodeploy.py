@@ -528,7 +528,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for GLM-4.7-Flash variants"""
 
     MODEL_NAME = "GLM-4.7-Flash"
-    MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
+    MODEL_PATH_BF16 = "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--zai-org--GLM-4.7-Flash/snapshots/a9308079ef95921451a690cd2d16cb572e564642/"
     MODEL_PATH_NVFP4 = hf_id_to_local_model_dir("DeepInfra/GLM-4.7-Flash-NVFP4")
 
     # Set minimum possible seq len + small buffer, for test speed & memory usage
@@ -552,15 +552,12 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.88
+                "free_gpu_memory_fraction": 0.8
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
             },
             "transforms": {
-                "compile_model": {
-                    "piecewise_enabled": True,
-                },
                 "fuse_nvfp4_moe": {
                     "allow_different_input_scales": True,
                 },
@@ -578,6 +575,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             config["enable_chunked_prefill"] = True
             config[
                 "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config["transforms"]["compile_model"] = {
+                "piecewise_enabled": True,
+            }
         return config
 
     def get_default_sampling_params(self):
