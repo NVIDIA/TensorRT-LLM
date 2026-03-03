@@ -331,6 +331,10 @@ class TRTLLMGenFusedMoE(MoE):
 
         return True
 
+    def _get_data_or_none(self, attr_name: str) -> Optional[torch.Tensor]:
+        attr = getattr(self, attr_name, None)
+        return attr.data if attr is not None else None
+
     def select_alltoall_method_type(self) -> AlltoallMethodType:
         # If no attention DP, no need to use AlltoAll.
         if self.mapping.dp_size == 1:
@@ -625,15 +629,10 @@ class TRTLLMGenFusedMoE(MoE):
                 -2] // factor
             act_type = self._to_trtllm_gen_activation_type(self.activation_type)
 
-            output1_scale_scalar = getattr(
-                self, 'fc31_scale_c', None).data if getattr(
-                    self, 'fc31_scale_c', None) is not None else None
-            output1_scale_gate_scalar = getattr(
-                self, 'fc31_alpha', None).data if getattr(
-                    self, 'fc31_alpha', None) is not None else None
-            output2_scale_scalar = getattr(
-                self, 'fc2_alpha', None).data if getattr(
-                    self, 'fc2_alpha', None) is not None else None
+            output1_scale_scalar = self._get_data_or_none("fc31_scale_c")
+            output1_scale_gate_scalar = self._get_data_or_none("fc31_alpha")
+            output2_scale_scalar = self._get_data_or_none("fc2_alpha")
+
             outputs = self.op_backend.run_fp4_block_scale_moe(
                 router_logits,
                 routing_bias,
