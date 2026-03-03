@@ -263,10 +263,6 @@ public:
         std::vector<std::optional<size_t>> const& cacheBufferIds, int validConnectionIdx);
     void setSenderState(std::vector<MemoryDesc> cacheReceiverBufferDescs, int valideSegmentIdx,
         std::vector<std::pair<size_t, size_t>> offsetRatios, std::vector<uint8_t> bufferKinds);
-    void setActiveSenderBufferIdx(size_t bufferIdx);
-    [[nodiscard]] size_t getSenderBufferCount() const;
-    [[nodiscard]] std::optional<size_t> getCacheBufferId(size_t bufferIdx = 0) const;
-    [[nodiscard]] size_t getCacheBufferIdCount() const;
     void setHasLoadRemoteAgent(bool hasLoadRemoteAgent);
     [[nodiscard]] bool hasLoadRemoteAgent() const;
     void sendReadySignal(DataContext const& ctx, bool isReady) const;
@@ -316,7 +312,6 @@ public:
         batch_manager::RequestInfo& requestInfo, std::atomic<bool> const& terminateFlag);
     [[nodiscard]] std::vector<batch_manager::BaseTransBufferManager*> const& getCacheTransBufferManagers() const;
     [[nodiscard]] std::vector<uint8_t> const& getBufferKinds() const;
-    [[nodiscard]] batch_manager::BaseTransBufferManager* findManagerForKind(batch_manager::BufferKind kind) const;
     void updateUnhandledNotifications();
     [[nodiscard]] BaseTransferAgent* getAgent() const;
     AgentConnection* connect(std::string const& remoteAgentName, std::string const& address,

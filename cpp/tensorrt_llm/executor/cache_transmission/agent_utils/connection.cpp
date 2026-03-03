@@ -81,27 +81,6 @@ AgentConnection::AgentConnection(
     TLLM_CHECK(!mCacheTransBufferManagers.empty());
 }
 
-std::optional<size_t> AgentConnection::getCacheBufferId(size_t bufferIdx) const
-{
-    TLLM_CHECK(bufferIdx < mCacheBufferIds.size());
-    return mCacheBufferIds[bufferIdx];
-}
-
-size_t AgentConnection::getCacheBufferIdCount() const
-{
-    return mCacheBufferIds.size();
-}
-
-size_t AgentConnection::getSenderBufferCount() const
-{
-    return mSenderState.mCacheReceiverBufferDescs.size();
-}
-
-void AgentConnection::setActiveSenderBufferIdx(size_t bufferIdx)
-{
-    mSenderState.setActiveBufferIdx(bufferIdx);
-}
-
 MemoryDesc const& AgentConnection::SenderState::activeBufferDesc() const
 {
     TLLM_CHECK(!mCacheReceiverBufferDescs.empty());
@@ -527,18 +506,6 @@ std::vector<batch_manager::BaseTransBufferManager*> const& AgentConnectionManage
 std::vector<uint8_t> const& AgentConnectionManager::getBufferKinds() const
 {
     return mBufferKinds;
-}
-
-batch_manager::BaseTransBufferManager* AgentConnectionManager::findManagerForKind(batch_manager::BufferKind kind) const
-{
-    for (size_t i = 0; i < mCacheTransBufferManagers.size(); i++)
-    {
-        if (mCacheTransBufferManagers[i]->getBufferKind() == kind)
-        {
-            return mCacheTransBufferManagers[i];
-        }
-    }
-    return nullptr;
 }
 
 AgentConnection* AgentConnectionManager::connect(std::string const& remoteAgentName, std::string const& connectionInfo,
