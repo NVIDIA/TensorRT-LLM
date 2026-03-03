@@ -1,5 +1,5 @@
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -12,6 +12,8 @@ from tensorrt_llm.mapping import Mapping
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .teacache import TeaCacheBackend
+from .parallelism import setup_vae_parallelism
+from .modules.parallel_vae import BaseParallelVAEAdapter
 
 if TYPE_CHECKING:
     from .config import DiffusionModelConfig
@@ -105,6 +107,11 @@ class BasePipeline(nn.Module):
         Override this property and use in self._run_warmup() for model-specific warmup.
         """
         return []
+    
+    @property
+    def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:
+        """Return the VAE adapter class for the pipeline."""
+        return None
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -174,6 +181,35 @@ class BasePipeline(nn.Module):
         logger.info("TeaCache: Initializing...")
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
+    
+    def setup_parallel_vae(self):
+        if self.model_config.parallel.disable_parallel_vae:
+            return
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        if self.vae is None:
+            return
+
+        adapter_cls = self.vae_adapter_class
+        if adapter_cls is None:
+            logger.warning(
+                f"Parallel VAE not supported for {self.__class__.__name__}"
+            )
+            return
+
+        vae_rank, vae_world_size, adj_groups = setup_vae_parallelism(self.model_config)
+        adapter_cls(
+            self.vae,
+            self.model_config.parallel.parallel_vae_split_dim,
+            vae_rank,
+            vae_world_size,
+            adj_groups,
+        )
+        logger.info(
+            f"Parallel VAE enabled: {adapter_cls.__name__}, "
+            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
+            f"world_size={vae_world_size}"
+        )
 
     def torch_compile(self) -> None:
         """Apply torch.compile to pipeline components based on TorchCompileConfig.
@@ -191,7 +227,7 @@ class BasePipeline(nn.Module):
         compile_mode = "default"
 
         # Compiling transformer blocks provides max performance value.
-        targets = self.transformer_components
+        targets = self.transformer_components #+ [PipelineComponent.VAE]
 
         for name in targets:
             model = getattr(self, name, None)
@@ -289,6 +325,7 @@ class BasePipeline(nn.Module):
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
         """Execute VAE decoding. Only rank 0 performs decoding.
+        If parallel VAE is enabled, all processes perform decoding.
 
         Args:
             latents: Primary latents to decode (e.g., video)
@@ -301,6 +338,15 @@ class BasePipeline(nn.Module):
             Single result if no extra_latents, tuple of results if extra_latents provided.
             Non-rank-0 processes return None placeholders.
         """
+        
+        if not self.model_config.parallel.disable_parallel_vae:
+            primary_result = decode_fn(latents)
+            if extra_latents:
+                extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
+                return (primary_result,) + tuple(extra_results)
+            return primary_result
+
+
         if self.rank == 0:
             primary_result = decode_fn(latents)
 

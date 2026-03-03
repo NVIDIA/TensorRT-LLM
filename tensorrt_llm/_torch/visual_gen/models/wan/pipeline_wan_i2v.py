@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from typing import Optional, Tuple, Union
+from typing import Optional, Tuple, Type, Union
 
 import PIL.Image
 import torch
@@ -26,6 +26,7 @@ from tensorrt_llm.logger import logger
 # Import shared coefficients from T2V pipeline
 from .pipeline_wan import WAN_TEACACHE_COEFFICIENTS
 from .transformer_wan import WanTransformer3DModel
+from .vae import WanParallelVAEAdapter
 
 # Use same coefficients
 WAN_I2V_TEACACHE_COEFFICIENTS = WAN_TEACACHE_COEFFICIENTS
@@ -99,6 +100,10 @@ class WanImageToVideoPipeline(BasePipeline):
     def common_warmup_shapes(self) -> list:
         """Return list of common warmup shapes for the pipeline."""
         return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+    
+    @property
+    def vae_adapter_class(self) -> Type[WanParallelVAEAdapter]:
+        return WanParallelVAEAdapter
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")

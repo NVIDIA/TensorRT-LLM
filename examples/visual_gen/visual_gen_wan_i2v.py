@@ -127,6 +127,9 @@ def parse_args():
         default=1,
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
+    parser.add_argument(
+        "--disable_parallel_vae", action="store_true", help="Disable parallel VAE"
+    )
 
     # CUDA graph
     parser.add_argument(
@@ -180,6 +183,7 @@ def main():
         "parallel": {
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "disable_parallel_vae": args.disable_parallel_vae,
         },
         "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,

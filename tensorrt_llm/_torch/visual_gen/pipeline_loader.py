@@ -203,6 +203,9 @@ class PipelineLoader:
         # =====================================================================
         pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
 
+        if not config.parallel.disable_parallel_vae:
+            pipeline.setup_parallel_vae()
+
         # =====================================================================
         # STEP 5: Post-load Hooks (TeaCache setup, etc.)
         # =====================================================================
