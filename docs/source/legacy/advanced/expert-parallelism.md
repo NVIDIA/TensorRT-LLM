@@ -12,7 +12,7 @@ Mixture of Experts (MoE) architectures have become widespread, with models such 
 
 ## Tensor Parallel vs Expert Parallel
 
-Parallelism on multi-GPUs is necessary if the MoE model can not be accommodated by a single GPU’s memory.  We have supported two kinds of parallel patterns for MoE structure, Tensor Parallel (default pattern), Expert Parallel, and a hybrid of the two.
+Parallelism on multi-GPUs is necessary if the MoE model cannot be accommodated by a single GPU’s memory. We support three kinds of parallel patterns for MoE structure: Tensor Parallel (default pattern), Expert Parallel, and a hybrid of the two.
 
 <img src="https://github.com/NVIDIA/TensorRT-LLM/blob/main/docs/source/blogs/media/tp_ep.png?raw=true" alt="tensor parallel vs expert parallel" width="500" height="auto">
 
@@ -27,4 +27,4 @@ The default parallel pattern is Tensor Parallel. You can enable Expert Parallel 
 
 Ensure the product of `moe_tp_size` and `moe_ep_size` is equal to `tp_size`, since the total number of MoE parallelism across all GPUs must match the total number of parallelism in other parts of the model.
 
-The other parameters related to the MoE structure, such as `num_experts_per_tok` (TopK in previous context) and `num_local_experts,` can be found in the model’s configuration file, such as the one for [Mixtral 8x7B model](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json).
+The other parameters related to the MoE structure, such as `num_experts_per_tok` (TopK in previous context) and `num_local_experts`, can be found in the model’s configuration file, such as the one for [Mixtral 8x7B model](https://huggingface.co/mistralai/Mixtral-8x7B-v0.1/blob/main/config.json).

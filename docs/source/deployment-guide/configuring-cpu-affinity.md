@@ -59,7 +59,7 @@ that are spawned by `mpi4py`'s `MPIPoolExecutor` class within TensorRT-LLM
 
 ### Slurm
 
-If Slurm is configured to use a affinity or cgroup task plugin, then Slurm may
+If Slurm is configured to use an affinity or cgroup task plugin, then Slurm may
 also configure CPU affinity by default in a way that is not sensitized to NUMA
 topology. To prevent this, Slurm jobs should be launched accordingly:
 

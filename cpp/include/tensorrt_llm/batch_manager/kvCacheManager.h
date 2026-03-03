@@ -849,9 +849,12 @@ public:
     //!          of the request's context are already cached.
     //! \param uniqueTokens The unique tokens representing the request's context.
     //! \param llmRequest The request to check for reusable blocks.
+    //! \param onlyAllocated If true, only count blocks that have active references (already allocated
+    //!        to another sequence). Free cached blocks are excluded because they are already counted
+    //!        in the eviction policy's free count.
     //! \return The number of full blocks that can be reused.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -1154,7 +1157,7 @@ public:
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
@@ -1617,9 +1620,10 @@ public:
     //!          of the request's context are already cached.
     //! \param uniqueTokens The unique tokens representing the request's context.
     //! \param llmRequest The request to check for reusable blocks.
+    //! \param onlyAllocated If true, only count blocks that have active references.
     //! \return The number of full blocks that can be reused.
     [[nodiscard]] virtual SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const
         = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
@@ -1996,7 +2000,7 @@ public:
 
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const override;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.
