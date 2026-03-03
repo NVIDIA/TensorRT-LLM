@@ -202,7 +202,7 @@ Different types of runtime are provided for encoder-decoder models. Following an
 - Python runtime w/ Static Batching
 - (NEW) C++ runtime w/ Paged KV Cache and Inflight Batching
 
-Please refer to the documentation for the details of [paged kv cache](../../../../docs/source/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../../../docs/source/advanced/gpt-attention.md#inflight-batching).
+Please refer to the documentation for the details of [paged kv cache](../../../../docs/source/legacy/advanced/gpt-attention.md#paged-kv-cache) and [inflight batching](../../../../docs/source/legacy/advanced/gpt-attention.md#inflight-batching).
 
 #### Run C++ runtime
 **Note: to use inflight batching and paged kv cache features in C++ runtime, please make sure you have set `--paged_kv_cache enable` (which is by default enabled) in the `trtllm-build` command of the decoder. Meanwhile, if using Python runtime, it is recommended to disable this flag by `--paged_kv_cache disable` to avoid any unnecessary overhead.**

@@ -18,11 +18,11 @@ import math
 import os
 import time
 import unittest
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from pathlib import Path
-from typing import Any, Generator
+from typing import Any, Callable, ContextManager, Generator, Protocol
 
 import psutil
 import pynvml
@@ -520,6 +520,12 @@ def device_sleep(
         time.sleep(spin_s)
 
 
+class UutProvider(Protocol):
+
+    def __call__(self, is_warmup: bool) -> ContextManager[Callable[[], None]]:
+        ...
+
+
 @contextmanager
 def assert_no_cuda_sync(
     sync_timeout_s: float = 5, ) -> Generator[None, None, None]:
@@ -561,6 +567,47 @@ def assert_no_cuda_sync(
 
     sleep_ctl.cancel()
     scope_finished_event.synchronize()
+
+
+def run_test_with_warmup(
+    uut_provider: UutProvider,
+    warmup_sizes_bytes: tuple[int] = (4 * 2**30, ),
+    *,
+    max_sync_s: float | None,
+):
+    """Run UUT including setup and warmup.
+
+    This is mainly used to check that the UUT does not CUDA device sync. Thus,
+    given that PyTorch's caching memory allocator can device sync when it runs
+    out of cached GPU memory segments, the warmup allocates some GPU memory.
+
+    The warmup also runs the test once. This avoids issues with things like lazy loading
+    of device code. The UUT provider can use the 'is_warmup' argument to adapt its
+    behavior to the warmup and final test runs.
+
+    If max_sync_s is provided, this helper checks that the UUT does not device sync,
+    assuming that the sync (CPU) part of the code takes no longer than max_sync_s
+    seconds to complete.
+
+    It is the user's responsibility to ensure that the amount of submitted work
+    does not exceed the CUDA driver/device queue capacity, which would make
+    the execution appear synchronous.
+    """
+    with torch.cuda.Stream():
+        with uut_provider(is_warmup=True) as uut:
+            bufs = []
+            for warmup_size in warmup_sizes_bytes:
+                bufs.append(
+                    torch.ones(warmup_size,
+                               device=torch.cuda.current_device(),
+                               dtype=torch.int8))
+            del bufs
+            uut()
+
+        with uut_provider(is_warmup=False) as uut:
+            with (assert_no_cuda_sync(sync_timeout_s=max_sync_s)
+                  if max_sync_s is not None else nullcontext()):
+                uut()
 
 
 _pynvmlInited = False

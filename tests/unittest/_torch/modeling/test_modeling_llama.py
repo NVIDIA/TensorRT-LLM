@@ -17,7 +17,8 @@ from tensorrt_llm._torch.metadata import KVCacheParams
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm._torch.pyexecutor.resource_manager import (
+    KVCacheManager, _update_kv_cache_draft_token_location)
 from tensorrt_llm._torch.pyexecutor.scheduler import ScheduledRequests
 from tensorrt_llm._torch.speculative.utils import SpecDecodingTensor
 from tensorrt_llm._utils import get_sm_version
@@ -406,7 +407,7 @@ class TestLlama(unittest.TestCase):
 
             llama = LlamaForCausalLM(model_config).to(dtype).to(device)
             llama.load_weights(hf_llama.state_dict())
-        num_blocks = 1
+        num_blocks = 2
         tokens_per_block = 32
         head_dim = llama.config.hidden_size // llama.config.num_attention_heads
         num_layers = llama.config.num_hidden_layers
@@ -568,9 +569,10 @@ class TestLlama(unittest.TestCase):
             scheduled_requests = ScheduledRequests()
             scheduled_requests.generation_requests = [request]
             kv_cache_manager.max_draft_len = gen_input_ids_0.size(-1) - 1
-            kv_cache_manager.update_kv_cache_draft_token_location(
-                scheduled_requests, attn_metadata_gen_phase_0,
-                kv_cache_dtype_byte_size)
+            _update_kv_cache_draft_token_location(kv_cache_manager,
+                                                  scheduled_requests,
+                                                  attn_metadata_gen_phase_0,
+                                                  kv_cache_dtype_byte_size)
             if request.py_rewind_len > 0:
                 kv_cache_manager.rewind_kv_cache(request, request.py_rewind_len)
         torch.cuda.synchronize()

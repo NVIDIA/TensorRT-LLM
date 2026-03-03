@@ -96,6 +96,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (2, f"{test_configs_root}/disagg_config_cuda_graph_padding.yaml"),
         "mixed": (2, f"{test_configs_root}/disagg_config_mixed.yaml"),
         "overlap": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
+        "overlap_transceiver_runtime_python":
+        (2,
+         f"{test_configs_root}/disagg_config_overlap_transceiver_runtime_python.yaml"
+         ),
         "tool_calls": (2, f"{test_configs_root}/disagg_config_overlap.yaml"),
         "perf_metrics": (2, f"{test_configs_root}/disagg_config_metrics.yaml"),
         "trtllm_sampler":
@@ -131,6 +135,10 @@ def get_test_config(test_desc, example_dir, test_root):
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_nixl.yaml"
          ),
+        "deepseek_v3_lite_fp8_transceiver_runtime_python":
+        (4,
+         f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_transceiver_runtime_python.yaml"
+         ),
         "deepseek_v3_lite_fp8_tp1":
         (2,
          f"{test_configs_root}/disagg_config_ctxtp1_gentp1_deepseek_v3_lite.yaml"
@@ -146,6 +154,10 @@ def get_test_config(test_desc, example_dir, test_root):
         "deepseek_v3_lite_fp8_attention_dp":
         (4,
          f"{test_configs_root}/disagg_config_ctxtp2_gentp2_deepseek_v3_lite_attention_dp.yaml"
+         ),
+        "deepseek_v3_lite_fp8_attention_dp_gen_only":
+        (4,
+         f"{test_configs_root}/disagg_config_gentp2_deepseek_v3_lite_attention_dp_gen_only.yaml"
          ),
         "deepseek_v3_lite_fp_8_attention_dp_overlap":
         (4,
@@ -384,7 +396,7 @@ def run_client_tests(example_dir,
         if client_test_set.chat_streaming and client_test_set.verify_streaming_chat:
             output_files.append('output_streaming_chat.json')
 
-        if test_desc.startswith("gen_only"):
+        if test_desc.endswith("gen_only") or test_desc.startswith("gen_only"):
             continue
 
         for output_file in output_files:
@@ -436,11 +448,11 @@ def run_disaggregated_test(example_dir,
     cleanup_output_files()
     run_env = env.copy()
 
-    # on some CI nodes , we set UCX_TLS to "^ib" to avoid the issue that IB equipped but not available.
+    # on some CI nodes , we set UCX_TLS to "^ib,gdr_copy" to avoid the issue that IB equipped but not available, and gdr_copy pin buffer failed.
     # we set UCX_MM_ERROR_HANDLING to "y" to avoid the issue that NIXL cannot use IB or TCP for notify on some CI nodes,
     # setting it to "y" will enable NIXL to use system memory for notify.
 
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))
@@ -826,6 +838,26 @@ def test_disaggregated_overlap(disaggregated_test_root, llm_venv,
 
     run_disaggregated_test(disaggregated_example_root,
                            "overlap",
+                           env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.parametrize("llama_model_root", ['TinyLlama-1.1B-Chat-v1.0'],
+                         indirect=True)
+def test_disaggregated_overlap_transceiver_runtime_python(
+        disaggregated_test_root, llm_venv, disaggregated_example_root,
+        llama_model_root):
+    src_dst_dict = {
+        llama_model_root:
+        f"{llm_venv.get_working_directory()}/TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    run_disaggregated_test(disaggregated_example_root,
+                           "overlap_transceiver_runtime_python",
                            env=llm_venv._new_env,
                            cwd=llm_venv.get_working_directory())
 
@@ -1260,7 +1292,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
@@ -1287,10 +1319,35 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
+                           env=env,
+                           cwd=llm_venv.get_working_directory(),
+                           model_path=deepseek_v3_model_root)
+
+
+@skip_no_hopper
+@skip_arm
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = "^ib,gdr_copy"
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_transceiver_runtime_python",
                            env=env,
                            cwd=llm_venv.get_working_directory(),
                            model_path=deepseek_v3_model_root)
@@ -1313,7 +1370,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
             os.symlink(src, dst, target_is_directory=True)
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib"
+    env["UCX_TLS"] = "^ib,gdr_copy"
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
@@ -1341,6 +1398,31 @@ def test_disaggregated_deepseek_v3_lite_fp8_attention_dp(
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_attention_dp",
                            env=llm_venv._new_env,
+                           cwd=llm_venv.get_working_directory())
+
+
+@skip_no_hopper
+@pytest.mark.skip_less_device(4)
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+def test_disaggregated_deepseek_v3_lite_fp8_attention_dp_gen_only(
+        disaggregated_test_root, disaggregated_example_root, llm_venv,
+        deepseek_v3_model_root):
+    src_dst_dict = {
+        deepseek_v3_model_root:
+        f"{llm_venv.get_working_directory()}/DeepSeek-V3-Lite/fp8",
+    }
+
+    for src, dst in src_dst_dict.items():
+        if not os.path.islink(dst):
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            os.symlink(src, dst, target_is_directory=True)
+
+    env = llm_venv._new_env.copy()
+    env['TRTLLM_DISAGG_BENCHMARK_GEN_ONLY'] = '1'
+    run_disaggregated_test(disaggregated_example_root,
+                           "deepseek_v3_lite_fp8_attention_dp_gen_only",
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1595,7 +1677,7 @@ def run_disaggregated_benchmark(example_dir,
                                 skip_warmup=False):
     """Run disaggregated test with given configuration."""
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
     workers_cmd = [
         'mpirun', '--allow-run-as-root', '--oversubscribe', '-n',
@@ -1776,7 +1858,7 @@ def run_disaggregated_aiperf(config_file,
     """
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     workers_cmd = [
@@ -2302,7 +2384,7 @@ def run_disaggregated_cancel_test(example_dir,
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib"
+    run_env["UCX_TLS"] = "^ib,gdr_copy"
 
     num_ranks, config_file = get_test_config(test_desc, example_dir,
                                              os.path.dirname(__file__))

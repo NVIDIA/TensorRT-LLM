@@ -43,19 +43,20 @@ struct TargetRanksInfo
 
     // the size of the vector is equal to the mDomainPPSize. the value of the vector is the layer num should be fetched
     // from each target PP rank in domain PP.
-    std::vector<int> mPeerAttentionLayerNumInDomainPP;
+    // Used for both KV and RNN cache transfer
+    std::vector<int> mPeerLayerNumInDomainPP;
 
     int getPeerPPDomainLayerNum(int targetRankIdx) const
     {
         int ppDomainRankIdx = targetRankIdx % mDomainPPSize;
-        return mPeerAttentionLayerNumInDomainPP.at(ppDomainRankIdx);
+        return mPeerLayerNumInDomainPP.at(ppDomainRankIdx);
     }
 };
 
 TargetRanksInfo targetIRanks(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
-TargetRanksInfo TargetRanksInfoForDP(
+TargetRanksInfo targetIRanksForRnn(
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfRank);
 
 /**
@@ -104,5 +105,41 @@ void concatKvCacheV2Dispatch(std::vector<runtime::ITensor::SharedPtr> const& inp
     std::map<SizeType32, std::vector<runtime::ITensor::SharedPtr>>& outputKvCacheBlocksPerWindow,
     kv_cache::CacheState const& peerCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
     runtime::BufferManager const& bufferManager, bool isIndexerKCache = false);
-
 } // namespace tensorrt_llm::executor::kv_cache
+
+namespace tensorrt_llm::executor::rnn_cache
+{
+
+/**
+ * @brief Dispatch function to split RNN conv state across different TP configurations
+ */
+void splitRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputConvBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Dispatch function to split RNN SSM state across different TP configurations
+ */
+void splitRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSsmBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSplitBlocks, SizeType32 const slotIdx,
+    SizeType32 const maxBatchSize, size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState,
+    kv_cache::CacheState const& selfCacheState, int selfIdx, runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Dispatch function to concat RNN conv state from different TP configurations
+ */
+void concatRnnConvStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputConvBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
+    kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState, int selfIdx,
+    runtime::BufferManager const& bufferManager);
+
+/**
+ * @brief Dispatch function to concat RNN SSM state from different TP configurations
+ */
+void concatRnnSsmStateDispatch(std::vector<runtime::ITensor::SharedPtr> const& inputSplitBlocks,
+    std::vector<runtime::ITensor::SharedPtr>& outputSsmBlocks, SizeType32 slotIdx, SizeType32 maxBatchSize,
+    size_t convBytesPerLayer, kv_cache::CacheState const& destCacheState, kv_cache::CacheState const& selfCacheState,
+    int selfIdx, runtime::BufferManager const& bufferManager);
+
+} // namespace tensorrt_llm::executor::rnn_cache

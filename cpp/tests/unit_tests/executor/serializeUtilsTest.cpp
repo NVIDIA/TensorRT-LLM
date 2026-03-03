@@ -1092,7 +1092,7 @@ TEST(SerializeUtilsTest, BlockKeyWithExtras)
         h1[i] = static_cast<uint8_t>(i);
         h2[i] = static_cast<uint8_t>(255 - i);
     }
-    std::vector<MmKey> extraKeys{{h1, SizeType32{0}}, {h2, SizeType32{5}}};
+    std::vector<MmKey> extraKeys{{h1, SizeType32{0}, std::nullopt}, {h2, SizeType32{5}, std::nullopt}};
 
     VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
     std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
@@ -1101,6 +1101,144 @@ TEST(SerializeUtilsTest, BlockKeyWithExtras)
     BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
 
     testSerializeDeserialize(key);
+}
+
+TEST(SerializeUtilsTest, MmKeyWithUuid)
+{
+    using tensorrt_llm::executor::MmKey;
+
+    // Test MmKey serialization with UUID
+    std::array<uint8_t, 32> hash{};
+    for (size_t i = 0; i < hash.size(); ++i)
+    {
+        hash[i] = static_cast<uint8_t>(i * 3);
+    }
+
+    // Test with UUID
+    MmKey keyWithUuid{hash, SizeType32{42}, std::string("test-image-uuid-12345")};
+    testSerializeDeserialize(keyWithUuid);
+
+    // Test without UUID (nullopt)
+    MmKey keyNoUuid{hash, SizeType32{100}, std::nullopt};
+    testSerializeDeserialize(keyNoUuid);
+
+    // Test with empty string UUID
+    MmKey keyEmptyUuid{hash, SizeType32{0}, std::string("")};
+    testSerializeDeserialize(keyEmptyUuid);
+
+    // Test with long UUID (> 32 bytes)
+    MmKey keyLongUuid{hash, SizeType32{255}, std::string("this-is-a-very-long-uuid-that-exceeds-32-bytes-for-testing")};
+    testSerializeDeserialize(keyLongUuid);
+}
+
+TEST(SerializeUtilsTest, BlockKeyWithExtrasAndUuids)
+{
+    using namespace tensorrt_llm::batch_manager::kv_cache_manager;
+
+    // Prepare multimodal extra keys with mixed UUIDs
+    std::array<uint8_t, 32> h1{};
+    std::array<uint8_t, 32> h2{};
+    std::array<uint8_t, 32> h3{};
+    for (size_t i = 0; i < h1.size(); ++i)
+    {
+        h1[i] = static_cast<uint8_t>(i);
+        h2[i] = static_cast<uint8_t>(255 - i);
+        h3[i] = static_cast<uint8_t>(i * 2);
+    }
+
+    // Mix of UUIDs: one with UUID, one without, one with empty string
+    std::vector<MmKey> extraKeys{{h1, SizeType32{0}, std::string("sku-image-001")}, {h2, SizeType32{5}, std::nullopt},
+        {h3, SizeType32{10}, std::string("")}};
+
+    VecUniqueTokens uniqueTokens{UniqueToken{10, 100}, UniqueToken{20, 200}};
+    std::optional<LoraTaskIdType> loraTaskId = LoraTaskIdType{42};
+
+    BlockKey key(true, loraTaskId, uniqueTokens, extraKeys);
+
+    testSerializeDeserialize(key);
+}
+
+TEST(SerializeUtilsTest, MultimodalInputWithUuids)
+{
+    using tensorrt_llm::executor::MultimodalInput;
+
+    // Helper to verify MultimodalInput serialization round-trip
+    auto verifyMultimodalInput = [](MultimodalInput const& original)
+    {
+        auto size = tensorrt_llm::executor::Serialization::serializedSize(original);
+        std::ostringstream oss;
+        tensorrt_llm::executor::Serialization::serialize(original, oss);
+        EXPECT_EQ(oss.str().size(), size);
+
+        std::istringstream iss(oss.str());
+        auto deserialized = tensorrt_llm::executor::Serialization::deserializeMultimodalInput(iss);
+
+        // Verify hashes
+        auto origHashes = original.getMultimodalHashes();
+        auto deserHashes = deserialized.getMultimodalHashes();
+        EXPECT_EQ(origHashes.size(), deserHashes.size());
+        for (size_t i = 0; i < origHashes.size(); ++i)
+        {
+            EXPECT_EQ(origHashes[i], deserHashes[i]);
+        }
+
+        // Verify positions
+        auto origPositions = original.getMultimodalPositions();
+        auto deserPositions = deserialized.getMultimodalPositions();
+        EXPECT_EQ(origPositions, deserPositions);
+
+        // Verify lengths
+        auto origLengths = original.getMultimodalLengths();
+        auto deserLengths = deserialized.getMultimodalLengths();
+        EXPECT_EQ(origLengths, deserLengths);
+
+        // Verify UUIDs
+        auto origUuids = original.getMultimodalUuids();
+        auto deserUuids = deserialized.getMultimodalUuids();
+        EXPECT_EQ(origUuids.has_value(), deserUuids.has_value());
+        if (origUuids.has_value() && deserUuids.has_value())
+        {
+            EXPECT_EQ(origUuids->size(), deserUuids->size());
+            for (size_t i = 0; i < origUuids->size(); ++i)
+            {
+                EXPECT_EQ((*origUuids)[i], (*deserUuids)[i]);
+            }
+        }
+    };
+
+    // Test MultimodalInput with UUIDs
+    std::vector<std::vector<SizeType32>> hashes = {
+        {1, 2, 3, 4, 5, 6, 7, 8},        // First image hash
+        {10, 20, 30, 40, 50, 60, 70, 80} // Second image hash
+    };
+    std::vector<SizeType32> positions = {0, 100};
+    std::vector<SizeType32> lengths = {50, 75};
+
+    // Test with full UUIDs
+    std::vector<std::optional<std::string>> uuids = {std::string("image-uuid-001"), std::string("image-uuid-002")};
+    MultimodalInput inputWithUuids(hashes, positions, lengths, uuids);
+    verifyMultimodalInput(inputWithUuids);
+
+    // Test with partial UUIDs (mixed Some and None)
+    std::vector<std::optional<std::string>> partialUuids = {std::string("uuid-a"), std::nullopt};
+    MultimodalInput inputPartialUuids(hashes, positions, lengths, partialUuids);
+    verifyMultimodalInput(inputPartialUuids);
+
+    // Test without UUIDs (nullopt)
+    MultimodalInput inputNoUuids(hashes, positions, lengths, std::nullopt);
+    verifyMultimodalInput(inputNoUuids);
+
+    // Test with empty string UUID
+    std::vector<std::optional<std::string>> emptyUuids = {std::string(""), std::string("valid-uuid")};
+    MultimodalInput inputEmptyUuid(hashes, positions, lengths, emptyUuids);
+    verifyMultimodalInput(inputEmptyUuid);
+
+    // Test with long UUIDs (> 32 bytes)
+    std::vector<std::optional<std::string>> longUuids
+        = {std::string("this-is-a-very-long-uuid-string-that-exceeds-the-32-byte-limit-for-testing-purposes"),
+            std::string("short")};
+    MultimodalInput inputLongUuids(hashes, positions, lengths, longUuids);
+    verifyMultimodalInput(inputLongUuids);
 }
 
 // Connection notification tests

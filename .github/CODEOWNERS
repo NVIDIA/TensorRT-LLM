@@ -43,6 +43,11 @@
 # TensorRT-LLM Pytorch backend
 /tensorrt_llm/_torch @NVIDIA/trt-llm-torch-devs
 
+## TensorRT-LLM Pytorch - Visual Gen
+/tensorrt_llm/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
+/tests/unittest/_torch/visual_gen @NVIDIA/trt-llm-torch-visual-gen-devs
+/tests/integration/defs/examples/test_visual_gen.py @NVIDIA/trt-llm-torch-visual-gen-devs
+
 ## TensorRT-LLM Pytorch - Modules
 /tensorrt_llm/_torch/modules @NVIDIA/trt-llm-torch-modules
 

@@ -19,6 +19,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/customAllReduceUtils.h"
 #include "tensorrt_llm/common/dataType.h"
+#include "tensorrt_llm/common/nvmlWrapper.h"
 #include "tensorrt_llm/kernels/customAllReduceKernels.h"
 #include "tensorrt_llm/kernels/userbuffers/ub_interface.h"
 #include "tensorrt_llm/runtime/utils/mpiUtils.h"
@@ -601,19 +602,8 @@ bool AllreducePlugin::isCustomAllReduceSupported(int ranks_per_node) const noexc
         && (static_cast<size_t>(ranks_per_node) <= kernels::MAX_RANKS_PER_NODE) && (ranks_per_node > 0);
 }
 
-class NvmlManager
-{
-public:
-    NvmlManager()
-    {
-        NVML_CHECK(nvmlInit());
-    }
-
-    ~NvmlManager()
-    {
-        NVML_CHECK(nvmlShutdown());
-    }
-};
+using tensorrt_llm::common::NvmlManager;
+using tensorrt_llm::common::NVMLWrapper;
 
 std::set<int> getLocalGroup(std::set<int> const& group)
 {
@@ -711,6 +701,7 @@ void AllreducePlugin::setGroupTopology() noexcept
     TLLM_LOG_INFO("TP group is intra-node for rank %d", rank);
 
     NvmlManager nvmlManager;
+    auto const& nvml = nvmlManager.sharedWrapper();
     std::unordered_set<int> visitedDevice;
     mIsP2PSupported = true;
     mIsNVLINKSupported = true;
@@ -738,26 +729,26 @@ void AllreducePlugin::setGroupTopology() noexcept
             }
 
             nvmlDevice_t firstDevice;
-            NVML_CHECK(nvmlDeviceGetHandleByIndex(firstDeviceId, &firstDevice));
+            NVML_CHECK(nvml->nvmlDeviceGetHandleByIndex(firstDeviceId, &firstDevice));
 
             bool isNVLINK = false;
 
             for (unsigned int link = 0; link < NVML_NVLINK_MAX_LINKS; link++)
             {
                 nvmlPciInfo_t remotePciInfo;
-                if (nvmlDeviceGetNvLinkRemotePciInfo_v2(firstDevice, link, &remotePciInfo) != NVML_SUCCESS)
+                if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(firstDevice, link, &remotePciInfo) != NVML_SUCCESS)
                 {
                     continue;
                 }
 
                 nvmlDevice_t remoteDevice;
-                auto const result = nvmlDeviceGetHandleByPciBusId_v2(remotePciInfo.busId, &remoteDevice);
+                auto const result = nvml->nvmlDeviceGetHandleByPciBusId(remotePciInfo.busId, &remoteDevice);
 
                 if (result == NVML_SUCCESS)
                 {
                     // Two GPUs are connected directly through nvlink
                     unsigned int remoteDeviceId;
-                    NVML_CHECK(nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
+                    NVML_CHECK(nvml->nvmlDeviceGetIndex(remoteDevice, &remoteDeviceId));
 
                     if (remoteDeviceId == static_cast<unsigned int>(secondDeviceId))
                     {
@@ -770,12 +761,12 @@ void AllreducePlugin::setGroupTopology() noexcept
                     // now remotePciInfo represents the pci information of nvswitch,
                     // determine whether nvlink is supported by whether two GPUs are connected to the same nvswitch.
                     nvmlDevice_t secondDevice;
-                    NVML_CHECK(nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
+                    NVML_CHECK(nvml->nvmlDeviceGetHandleByIndex(secondDeviceId, &secondDevice));
 
                     for (unsigned int secondLink = 0; secondLink < NVML_NVLINK_MAX_LINKS; secondLink++)
                     {
                         nvmlPciInfo_t secondRemotePciInfo;
-                        if (nvmlDeviceGetNvLinkRemotePciInfo_v2(secondDevice, secondLink, &secondRemotePciInfo)
+                        if (nvml->nvmlDeviceGetNvLinkRemotePciInfo(secondDevice, secondLink, &secondRemotePciInfo)
                             != NVML_SUCCESS)
                         {
                             continue;

@@ -22,7 +22,7 @@ The guide is intended for developers and practitioners seeking high-throughput o
 
 ## MoE Backend Support Matrix
 
-There are multiple MOE backends inside TensorRT LLM, not all of them supporting every  precision on every GPUs. Here are the support matrix of the MOE backends.
+There are multiple MOE backends inside TensorRT LLM, not all of them supporting every precision on every GPU. Here is the support matrix of the MOE backends.
 
 | device | Checkpoint | Supported moe_backend |
 |----------|----------|----------|
@@ -308,7 +308,7 @@ Sample result in Blackwell:
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh` script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh

@@ -1401,7 +1401,7 @@ repos:
         args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
-        exclude: '\.(patch|md)$'
+        exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
     -   id: mixed-line-ending
         args: [--fix=lf]
@@ -1441,7 +1441,8 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
@@ -1472,3 +1473,8 @@ repos:
         entry: ./scripts/dco_check.py
         language: script
         stages: [commit-msg]
+    -   id: pinned memory policy
+        name: Disallow raw pinned-memory APIs in runtime code
+        entry: ./scripts/check_pinned_memory_usage.py
+        language: script
+        files: ^(tensorrt_llm|triton_backend)/.*\.py$

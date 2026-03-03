@@ -15,7 +15,7 @@ from tensorrt_llm._torch.attention_backend.vanilla import (
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm._torch.pyexecutor.resource_manager import (BlockManager,
                                                              KVCacheManager)
-from tensorrt_llm._utils import get_size_in_bytes
+from tensorrt_llm._utils import get_size_in_bytes, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
 from tensorrt_llm.bindings.internal.batch_manager import \
@@ -143,7 +143,7 @@ class RocketTrtllmAttentionMetadata(TrtllmAttentionMetadata):
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
         # Number of KT tokens for each sequence
@@ -594,7 +594,7 @@ class RocketVanillaAttentionMetadata(VanillaAttentionMetadata):
         self.host_kt_cache_block_offsets = torch.zeros_like(
             self.kt_cache_block_offsets,
             device='cpu',
-            pin_memory=True,
+            pin_memory=prefer_pinned(),
         )
 
     def prepare(self) -> None:

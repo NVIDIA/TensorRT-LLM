@@ -243,12 +243,6 @@ class _FlashInferMLAPlanner:
             plan_params: Parameters for planning.
         """
         # Decode qo_indptr: [0, 1, 2, ..., batch_size] (1 token per sequence)
-        batch_size = kv_page_indptr.shape[0] - 1
-        qo_indptr = torch.arange(batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32)
-
-        # Compute kv_len_arr for CUDA graph wrapper initialization
-        num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
-        kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if (
@@ -257,6 +251,14 @@ class _FlashInferMLAPlanner:
         ):
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
             # Pass the buffer tensors to the wrapper for use_cuda_graph=True
+            batch_size = kv_page_indptr.shape[0] - 1
+            qo_indptr = torch.arange(
+                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
+            )
+
+            # Compute kv_len_arr for CUDA graph wrapper initialization
+            num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
+            kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
             wrapper = self._init_decode_wrapper(
                 use_cuda_graph=True,
                 qo_indptr=qo_indptr,
@@ -276,6 +278,11 @@ class _FlashInferMLAPlanner:
 
         # Re-plan if plan_params changed
         if plan_params != self.plan_params_decode:
+            batch_size = kv_page_indptr.shape[0] - 1
+            qo_indptr = torch.arange(
+                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
+            )
+
             self._plan_mla_wrapper(
                 self.decode_wrapper,
                 qo_indptr,

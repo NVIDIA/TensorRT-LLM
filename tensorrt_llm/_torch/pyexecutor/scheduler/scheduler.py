@@ -210,17 +210,17 @@ class KVCacheV2DummyScheduler(CapacityScheduler):
             else:
                 pending_requests.append(request)
 
-        avaiable_blocks = max_blocks - reserved_blocks
+        available_blocks = max_blocks - reserved_blocks
         for request in pending_requests:
             req_state = request.state
             if len(scheduled_requests) >= self.max_num_requests:
                 break
             elif req_state == LlmRequestState.CONTEXT_INIT:
                 needed_blocks = self.kv_cache_manager.get_needed_resource_to_completion(request)
-                if needed_blocks <= avaiable_blocks:
+                if needed_blocks <= available_blocks:
                     scheduled_requests.append(request)
-                    avaiable_blocks -= needed_blocks
-                elif needed_blocks > avaiable_blocks:
+                    available_blocks -= needed_blocks
+                elif needed_blocks > available_blocks:
                     # If one requests fails to be scheduled, break
                     break
 

@@ -50,4 +50,4 @@ You can then send OpenAI-compatible requests, such as via curl or API clients, t
 
 ### Run with [`trtllm-bench`](../../source/commands/trtllm-bench.rst)
 
-Evaluate offline inference performance with multimodal inputs using the `trtllm-bench` tool. For detailed instructions, see the [benchmarking guide](../../source/performance/perf-benchmarking.md).
+Evaluate offline inference performance with multimodal inputs using the `trtllm-bench` tool. For detailed instructions, see the [benchmarking guide](../developer-guide/perf-benchmarking.md).

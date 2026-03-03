@@ -7,7 +7,7 @@ The TensorRT LLM Skywork implementation is based on the LLaMA model. The impleme
 be found in [tensorrt_llm/models/llama/model.py](../../../../tensorrt_llm/models/llama/model.py).
 The TensorRT LLM Skywork example code lies in [`examples/models/contrib/skywork`](./):
 
-* [`convert_checkpoint.py`](../llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT LLM checkpoint.
+* [`convert_checkpoint.py`](../../core/llama/convert_checkpoint.py) converts the Huggingface Model of Skywork into TensorRT LLM checkpoint.
 
 In addition, there are two shared files in the parent folder [`examples`](../../../) for inference and evaluation:
 
