@@ -52,18 +52,19 @@ def test_flashinfer_cutlass_fused_moe_jit_no_collision():
 
     device = "cuda"
     dtype = torch.bfloat16
-    M, H, N, E, top_k = 4, 64, 128, 4, 2
+    num_tokens, hidden, inter, num_experts, top_k = 128, 128, 128, 4, 2
 
-    x = torch.randn(M, H, device=device, dtype=dtype)
-    w1_w3 = torch.randn(E, 2 * N, H, device=device, dtype=dtype)
-    w2 = torch.randn(E, H, N, device=device, dtype=dtype)
+    torch.manual_seed(0)
+    x = torch.randn(num_tokens, hidden, device=device, dtype=dtype)
+    w1_w3 = torch.randn(num_experts, 2 * inter, hidden, device=device, dtype=dtype)
+    w2 = torch.randn(num_experts, hidden, inter, device=device, dtype=dtype)
 
-    logits = torch.randn(M, E, device=device, dtype=torch.float32)
+    logits = torch.randn(num_tokens, num_experts, device=device, dtype=torch.float32)
     weights, experts = torch.topk(torch.softmax(logits, -1), top_k)
     weights = weights / weights.sum(-1, keepdim=True)
 
-    fused_moe_ns.cutlass_fused_moe(
-        output=torch.empty(M, H, device=device, dtype=dtype),
+    out = fused_moe_ns.cutlass_fused_moe(
+        output=torch.empty(num_tokens, hidden, device=device, dtype=dtype),
         input=x,
         token_selected_experts=experts.to(torch.int32),
         token_final_scales=weights,
@@ -74,3 +75,6 @@ def test_flashinfer_cutlass_fused_moe_jit_no_collision():
         output_dtype=dtype,
         quant_scales=[],
     )
+
+    assert out[0].shape == (num_tokens, hidden)
+    assert not torch.isnan(out[0]).any()

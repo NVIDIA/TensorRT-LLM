@@ -94,6 +94,8 @@ l0_b200:
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_w4a8_nvfp4_fp8[enable_configurable_moe-CUTLASS]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_mxfp4_mxfp8[enable_configurable_moe-True-8-256-CUTLASS]
   - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_fp8_blockwise_deepgemm[enable_configurable_moe-dtype1-72-256-2560-DefaultMoeRoutingMethod]
+  # ------------- FlashInfer tests ---------------
+  - unittest/_torch/flashinfer/test_trtllm_flashinfer_symbol_collision.py
 - condition:
     ranges:
       system_gpu_count:
