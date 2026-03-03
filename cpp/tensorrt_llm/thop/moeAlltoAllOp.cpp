@@ -449,19 +449,11 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     {
         nvDtype = nvinfer1::DataType::kFLOAT;
     }
-    else if (scalarType == at::kFloat8_e4m3fn)
-    {
-        nvDtype = nvinfer1::DataType::kFP8;
-    }
     else
     {
         TORCH_CHECK(false, "Unsupported data type for payload");
     }
-    // fp8_combine: override to FP8 mode regardless of payload dtype (BF16 payload → FP8 NVLink → BF16 output)
-    if (fp8Combine)
-    {
-        nvDtype = nvinfer1::DataType::kFP8;
-    }
+    // fp8_combine is passed through to the kernel via params.fp8_combine; dtype is not mutated.
 
     CHECK_CPU(metainfo);
     CHECK_TYPE(metainfo, torch::kInt64);
@@ -495,8 +487,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     // Create output tensor (local on current rank), no need for initialization
     // Typically, newly allocated GPU torch tensors are at least 16-byte aligned.
     // For FP8 combine, output is always BF16 (FP8 recv buffer is accumulated to BF16)
-    auto output_options
-        = (nvDtype == nvinfer1::DataType::kFP8) ? payload.options().dtype(at::kBFloat16) : payload.options();
+    auto output_options = fp8Combine ? payload.options().dtype(at::kBFloat16) : payload.options();
     torch::Tensor output = torch::empty({localNumTokens, elementsPerToken}, output_options);
 
     // Setup combine parameters
@@ -516,6 +507,7 @@ torch::Tensor moeA2ACombineOp(torch::Tensor const& payload, int64_t localNumToke
     params.output_data = output.data_ptr();
     params.elements_per_token = static_cast<int>(elementsPerToken);
     params.dtype = nvDtype;
+    params.fp8_combine = fp8Combine;
 
     params.flag_val = reinterpret_cast<uint32_t*>(rankWorkSpacePtr + offsets[FLAG_VAL_OFFSET_INDEX]);
     params.topk_target_ranks = reinterpret_cast<int*>(rankWorkSpacePtr + offsets[TOPK_TARGET_RANKS_OFFSET_INDEX]);
