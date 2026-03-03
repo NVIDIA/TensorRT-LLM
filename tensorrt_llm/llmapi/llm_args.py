@@ -1022,7 +1022,7 @@ class Eagle3DecodingConfig(EagleDecodingConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
@@ -1245,7 +1245,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
@@ -1335,7 +1335,7 @@ class PARDDecodingConfig(DecodingBaseConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
