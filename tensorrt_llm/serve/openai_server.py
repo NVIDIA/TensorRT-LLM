@@ -1455,6 +1455,10 @@ class OpenAIServer:
             # Parse request based on content-type
             request = await self._parse_video_generation_request(raw_request)
 
+            # Resolve the video encode format (mp4/avi/auto)
+            resolved_fmt, resolved_ext = resolve_video_format(
+                request.output_format)
+
             video_id = f"video_{uuid.uuid4().hex}"
             params = parse_visual_gen_params(request, video_id, media_storage_path=str(self.media_storage_path))
             logger.info(f"Generating video: {video_id} with params: {params} and prompt: {request.prompt}")
@@ -1470,10 +1474,6 @@ class OpenAIServer:
                     err_type="InternalServerError",
                     status_code=HTTPStatus.INTERNAL_SERVER_ERROR,
                 )
-
-            # Resolve the video encode format (mp4/avi/auto)
-            resolved_fmt, resolved_ext = resolve_video_format(
-                request.output_format)
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
@@ -1623,6 +1623,10 @@ class OpenAIServer:
     ):
         """Background task to generate video and save to storage."""
         try:
+            # Resolve the video encode format (mp4/avi/auto)
+            resolved_fmt, resolved_ext = resolve_video_format(
+                request.output_format)
+
             if request.negative_prompt is not None:
                 inputs = visual_gen_inputs({"prompt": request.prompt, "negative_prompt": request.negative_prompt})
             else:
@@ -1639,10 +1643,6 @@ class OpenAIServer:
                     job.error = "Video generation failed: output.video is None"
                     await VIDEO_STORE.upsert(video_id, job)
                 return
-
-            # Resolve the video encode format (mp4/avi/auto)
-            resolved_fmt, resolved_ext = resolve_video_format(
-                request.output_format)
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,

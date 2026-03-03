@@ -466,6 +466,7 @@ def resolve_video_format(output_format: str) -> Tuple[str, str]:
 
     Raises:
         RuntimeError: If 'mp4' is requested but ffmpeg is not available.
+        ValueError: If an unsupported output format is provided.
     """
     if output_format == "mp4":
         if _check_ffmpeg_available():
@@ -478,10 +479,15 @@ def resolve_video_format(output_format: str) -> Tuple[str, str]:
         )
     elif output_format == "avi":
         return "avi", ".avi"
-    else:  # auto
+    elif output_format == "auto":
         if _check_ffmpeg_available():
             return "mp4", ".mp4"
         return "avi", ".avi"
+    else:
+        raise ValueError(
+            f"Unsupported video format: {output_format}. Please use 'auto' if you"
+            f"want to automatically choose the best format based on availability."
+        )
 
 
 def get_video_encoder() -> Optional["VideoEncoder"]:
