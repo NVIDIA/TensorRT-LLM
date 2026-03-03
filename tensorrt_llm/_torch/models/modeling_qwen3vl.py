@@ -1119,7 +1119,7 @@ class Qwen3VLModelBase(PreTrainedModel):
                 or data.get("video", {}).get("pixel_values_videos") is not None
                 # This condition corresponds to when the embeddings are already populated, as is e.g.
                 # the case in EPD disagg in the prefill worker.
-                or data.get("multimodal_embedding")
+                or data.get("multimodal_embedding") is not None
             ):
                 mm_multimodal_params.append(multimodal_param)
 
