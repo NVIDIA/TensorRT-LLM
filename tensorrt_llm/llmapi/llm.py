@@ -659,8 +659,8 @@ class BaseLLM:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
 
         Returns:
-            List[str]: A list of runtime stats as JSON strings.
-                e.g., ['{"cpuMemUsage": ..., "iter": 0, ...}', '{"cpuMemUsage": ..., "iter": 1, ...}']
+            List[dict]: A list of runtime stats as dicts.
+                e.g., [{"cpuMemUsage": ..., "iter": 0, ...}, {"cpuMemUsage": ..., "iter": 1, ...}]
         '''
         return self._executor.get_stats(timeout=timeout)
 
