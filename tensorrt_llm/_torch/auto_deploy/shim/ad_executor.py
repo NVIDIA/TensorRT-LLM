@@ -75,6 +75,51 @@ from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Walk the wrapper chain (e.g. CapturedGraph → GraphModule → ...) to the innermost model."""
+    while hasattr(model, "model") and model.model is not model:
+        model = model.model
+    return model
+
+
+@dataclass
+class RequestContext:
+    """Per-request metadata passed to model hooks for extra_args assembly."""
+
+    seq_len: int
+    input_pos: int
+    is_context: bool
+    has_multimodal: bool
+
+
+def _collect_persistent_multimodal_keys(
+    persist_keys: set,
+    ordered_requests: list,
+    extra_args: Dict[str, List[torch.Tensor]],
+) -> None:
+    """Collect persistent multimodal metadata from all requests.
+
+    Models declare which ``py_multimodal_data`` keys should persist across
+    context and generation phases via a ``persistent_multimodal_keys`` class
+    attribute.  For each declared key this function gathers the value from
+    every request (context **and** generation), zero-filling for requests
+    that lack the key.
+    """
+    for key in persist_keys:
+        per_request: List[Optional[torch.Tensor]] = []
+        ref: Optional[torch.Tensor] = None
+        for request in ordered_requests:
+            mm = request.py_multimodal_data
+            if mm is not None and key in mm:
+                per_request.append(mm[key])
+                if ref is None:
+                    ref = mm[key]
+            else:
+                per_request.append(None)
+        if ref is not None:
+            extra_args[key] = [v if v is not None else torch.zeros_like(ref) for v in per_request]
+
+
 @dataclass
 class ReportingInfo:
     print_log: bool = False
@@ -536,6 +581,9 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
+        inner = _unwrap_model(self.model)
+        self._persistent_multimodal_keys = getattr(inner, "persistent_multimodal_keys", set())
+        self._prepare_extra_args_fn = getattr(inner, "prepare_extra_args", None)
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -604,6 +652,7 @@ class ADEngine(ModelEngine):
         flat_gather_indices: List[int] = []
         mask_scatter_indices: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
+        request_contexts: List[RequestContext] = []
 
         # gather indices for logits
         logits_gather_indices: List[int] = []
@@ -659,10 +708,21 @@ class ADEngine(ModelEngine):
             slot_idx.append(_get_slot_idx(request))
             use_initial_states.append(input_pos[-1] > 0)
 
-            # store extra arguments
+            # store extra arguments (skip keys handled by persistent collection)
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
-                    extra_args[k].append(v)
+                    if k not in self._persistent_multimodal_keys:
+                        extra_args[k].append(v)
+
+            request_contexts.append(
+                RequestContext(
+                    seq_len=len(prompt_tokens),
+                    input_pos=begin_compute,
+                    is_context=True,
+                    has_multimodal=request.py_multimodal_data is not None
+                    and len(request.py_multimodal_data) > 0,
+                )
+            )
 
         def _use_overlap_scheduler(request) -> bool:
             """Check if we should use overlap scheduler behavior."""
@@ -758,6 +818,16 @@ class ADEngine(ModelEngine):
 
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
+            request_contexts.append(
+                RequestContext(
+                    seq_len=len(input_ids_for_request),
+                    input_pos=num_tokens_seen,
+                    is_context=False,
+                    has_multimodal=request.py_multimodal_data is not None
+                    and len(request.py_multimodal_data) > 0,
+                )
+            )
+
         # check for logits_gather_info
         # we only need to gather in the following situation:
         # 1. there are context requests and
@@ -776,6 +846,13 @@ class ADEngine(ModelEngine):
         num_prefill_tokens = sum(seq_len[:num_prefill_seqs])
         num_decode_seqs = len(generation_requests)
         batch_info = [num_prefill_seqs, num_prefill_tokens, num_decode_seqs]
+
+        _collect_persistent_multimodal_keys(
+            self._persistent_multimodal_keys, ordered_requests, extra_args
+        )
+
+        if self._prepare_extra_args_fn is not None:
+            extra_args = self._prepare_extra_args_fn(extra_args, request_contexts)
 
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
@@ -798,6 +875,10 @@ class ADEngine(ModelEngine):
             _mask_scatter_indices=None if new_tokens is None else mask_scatter_indices,
             _ungathered_input_ids=new_tokens.flatten() if new_tokens is not None else None,
             **extra_args,
+        )
+
+        self.cache_seq_interface.info._store_extra_arg(
+            "batch_info", [torch.tensor(batch_info, dtype=torch.int32)]
         )
 
         if spec_resource_manager is not None and isinstance(

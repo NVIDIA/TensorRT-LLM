@@ -18,12 +18,21 @@ comparison tests (reference re-implementations on the same weights):
  10. get_rope_index correctness
  11. torch.export with cos/sin extra inputs
  12. VLM wrapper text-only position_ids passthrough (2D -> 3D)
- 13. Custom export info dynamic shapes for 3D mRoPE position_ids
- 14. Standalone compute_mrope_positions (text-only, with image, matches model)
- 15. VLM wrapper decode-after-image delta application
- 16. mrope_position_deltas kwarg override
- 17. VLM wrapper Branch A (no delta without images)
- 18. Qwen3_5MoeInputProcessor adds mrope_position_deltas to multimodal_data
+ 13. Standalone compute_mrope_positions (text-only, with image, matches model)
+ 14. VLM wrapper decode-after-image delta application (request-scoped delta)
+ 15. VLM wrapper ignores delta when not passed (no cross-call leakage)
+ 16. VLM wrapper Branch A (no delta without images)
+ 17. Qwen3_5MoeInputProcessor adds mrope_position_deltas to multimodal_data
+ 18. VLM wrapper validates position_ids for text-only path
+
+Mixed batch position handling (mRoPE fix):
+ 19. persistent_multimodal_keys attribute on Qwen3_5MoeModel
+ 20. prepare_extra_args builds full 3D positions for mixed multimodal+text prefill
+ 21. prepare_extra_args is a no-op for fully text-only batches
+ 22. Input processor adds mrope_position_ids_3d alongside deltas
+ 23. Prefill-only with pre-computed 3D positions (Case 2)
+ 24. Mixed prefill+decode batch position assembly (Case 1)
+ 25. Decode-only with deltas (Case 3)
 """
 
 import pytest
@@ -43,7 +52,6 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     Qwen3_5MoeModel,
     Qwen3_5MoeSparseMoeBlock,
     Qwen3_5MoeTextConfig,
-    Qwen3_5MoeTextExportInfo,
     Qwen3_5MoeTextModel,
     Qwen3_5MoeTextRotaryEmbedding,
     Qwen3_5MoeTopKRouter,
@@ -1210,6 +1218,9 @@ def test_multimodal_forward_matches_reference():
     Tests the full pipeline: vision encoding + embedding merge + mRoPE + LM.
     Runs the same input through both the wrapper's forward() and the
     ref_multimodal_forward() that re-implements each step explicitly.
+
+    The wrapper now expects pre-computed mrope_position_ids_3d (as the input
+    processor would provide), rather than recomputing positions internally.
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
@@ -1235,11 +1246,24 @@ def test_multimodal_forward_matches_reference():
     text_after = [4, 5]
     input_ids = torch.tensor([text_before + vision_part + text_after])
 
-    # Our wrapper forward
+    # Pre-compute 3D positions (as the input processor would)
+    mrope_position_ids_3d, mrope_position_deltas = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=vc.spatial_merge_size,
+    )
+
+    # Our wrapper forward with pre-computed positions (Case 2: prefill-only)
     our_output = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
+        mrope_position_ids_3d=mrope_position_ids_3d,
+        mrope_position_deltas=mrope_position_deltas,
     )
 
     # Reference: step-by-step re-implementation
@@ -1414,58 +1438,6 @@ def test_vlm_wrapper_text_only_position_ids():
     )
 
 
-@torch.no_grad()
-def test_vlm_wrapper_position_ids_not_ignored():
-    """Verify that different position_ids produce different outputs, confirming
-    the executor's position_ids are actually used (not ignored/overwritten)."""
-    config = _make_small_composite_config()
-    torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
-    model.eval()
-
-    B, S = 1, 8
-    input_ids = torch.randint(0, 50, (B, S))
-
-    # Two different position_ids (simulating different chunk offsets)
-    pos_ids_a = torch.arange(0, S).unsqueeze(0)
-    pos_ids_b = torch.arange(100, 100 + S).unsqueeze(0)
-
-    output_a = model(input_ids=input_ids, position_ids=pos_ids_a)
-    output_b = model(input_ids=input_ids, position_ids=pos_ids_b)
-
-    assert not torch.allclose(output_a.logits, output_b.logits, atol=1e-4), (
-        "Different position_ids should produce different outputs -- "
-        "position_ids must not be ignored by the VLM wrapper"
-    )
-
-
-# =============================================================================
-# Custom Export Info Tests
-# =============================================================================
-
-
-@torch.no_grad()
-def test_custom_export_info_3d_position_ids():
-    """Verify Qwen3_5MoeTextExportInfo defines 3D position_ids dynamic shapes."""
-    from torch.export import Dim
-
-    config = _make_small_composite_config()
-    torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
-
-    export_info = Qwen3_5MoeTextExportInfo.from_autoinferred(model)
-    shapes = export_info.dynamic_shape_lookup
-
-    assert "position_ids" in shapes, "Export info should include position_ids"
-    pos_dims = shapes["position_ids"]
-    assert 1 in pos_dims and 2 in pos_dims, (
-        f"3D position_ids should have dynamic dims 1 (batch) and 2 (seq), got {pos_dims}"
-    )
-    assert 0 not in pos_dims, f"Dim 0 (=3 for mRoPE) should be static, but got dynamic: {pos_dims}"
-    assert isinstance(pos_dims[1], Dim), f"Dim 1 should be a Dim instance, got {type(pos_dims[1])}"
-    assert isinstance(pos_dims[2], Dim), f"Dim 2 should be a Dim instance, got {type(pos_dims[2])}"
-
-
 # =============================================================================
 # Standalone compute_mrope_positions Tests
 # =============================================================================
@@ -1574,8 +1546,8 @@ def test_compute_mrope_positions_matches_model_method():
 
 @torch.no_grad()
 def test_vlm_wrapper_decode_after_image_uses_delta():
-    """Branch C: after an image forward caches rope_deltas, a subsequent
-    text-only forward should adjust position_ids by the cached delta."""
+    """Branch C: text-only decode with provided mrope_position_deltas should
+    adjust position_ids by that request-scoped delta."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -1584,15 +1556,17 @@ def test_vlm_wrapper_decode_after_image_uses_delta():
     B, S = 1, 8
     input_ids = torch.randint(0, 50, (B, S))
 
-    # Simulate: rope_deltas was cached from a previous image forward
     fake_delta = torch.tensor([[-2]])
-    model.model.rope_deltas = fake_delta
 
     # Position IDs from executor (sequential, as if no image compression)
     pos_ids_executor = torch.arange(100, 100 + S).unsqueeze(0)
 
     # VLM wrapper should apply delta: pos_ids = (100-2, 101-2, ...) = (98, 99, ...)
-    output_with_delta = model(input_ids=input_ids, position_ids=pos_ids_executor)
+    output_with_delta = model(
+        input_ids=input_ids,
+        position_ids=pos_ids_executor,
+        mrope_position_deltas=fake_delta,
+    )
 
     # Reference: manually apply delta and call text model directly
     corrected_pos = pos_ids_executor + fake_delta
@@ -1608,14 +1582,13 @@ def test_vlm_wrapper_decode_after_image_uses_delta():
         ref_logits,
         rtol=1e-5,
         atol=1e-5,
-        msg="Decode after image should apply cached rope_deltas to position_ids",
+        msg="Decode after image should apply request mrope_position_deltas",
     )
 
 
 @torch.no_grad()
-def test_vlm_wrapper_mrope_deltas_kwarg_overrides_cached():
-    """When mrope_position_deltas is passed as a kwarg, it should be used
-    instead of the cached self.rope_deltas."""
+def test_vlm_wrapper_delta_is_request_scoped_no_cross_call_leakage():
+    """Applying a delta in one call must not affect later calls that omit it."""
     config = _make_small_composite_config()
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
@@ -1625,32 +1598,47 @@ def test_vlm_wrapper_mrope_deltas_kwarg_overrides_cached():
     input_ids = torch.randint(0, 50, (B, S))
     pos_ids = torch.arange(50, 50 + S).unsqueeze(0)
 
-    # Set cached delta to -3
-    model.model.rope_deltas = torch.tensor([[-3]])
-
-    # But pass a different delta via kwarg (-5)
-    kwarg_delta = torch.tensor([[-5]])
-    output = model(
+    # Apply a delta in one call
+    delta = torch.tensor([[-5]])
+    output_with_delta = model(
         input_ids=input_ids,
         position_ids=pos_ids,
-        mrope_position_deltas=kwarg_delta,
+        mrope_position_deltas=delta,
     )
 
-    # Reference uses the kwarg delta (-5)
-    corrected_pos = pos_ids + kwarg_delta
+    # Then call again without delta: should behave like plain text-only expansion
+    output_without_delta = model(input_ids=input_ids, position_ids=pos_ids)
+
+    corrected_pos = pos_ids + delta
     corrected_pos_3d = corrected_pos[None].expand(3, -1, -1)
+    plain_pos_3d = pos_ids[None].expand(3, -1, -1)
     inputs_embeds = model.model.get_input_embeddings()(input_ids)
-    text_out = model.model.language_model(
+    text_out_with_delta = model.model.language_model(
         inputs_embeds=inputs_embeds, position_ids=corrected_pos_3d
     )
-    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+    text_out_plain = model.model.language_model(
+        inputs_embeds=inputs_embeds, position_ids=plain_pos_3d
+    )
+    ref_logits_with_delta = model.lm_head(
+        text_out_with_delta.last_hidden_state.to(model.lm_head.weight.dtype)
+    ).float()
+    ref_logits_plain = model.lm_head(
+        text_out_plain.last_hidden_state.to(model.lm_head.weight.dtype)
+    ).float()
 
     torch.testing.assert_close(
-        output.logits,
-        ref_logits,
+        output_with_delta.logits,
+        ref_logits_with_delta,
         rtol=1e-5,
         atol=1e-5,
-        msg="mrope_position_deltas kwarg should override cached rope_deltas",
+        msg="Call with mrope_position_deltas should apply the request delta",
+    )
+    torch.testing.assert_close(
+        output_without_delta.logits,
+        ref_logits_plain,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Call without mrope_position_deltas must not reuse previous delta",
     )
 
 
@@ -1662,8 +1650,6 @@ def test_vlm_wrapper_no_delta_without_images():
     torch.manual_seed(42)
     model = Qwen3_5MoeForConditionalGeneration(config)
     model.eval()
-
-    assert model.model.rope_deltas is None, "rope_deltas should start as None"
 
     B, S = 1, 8
     input_ids = torch.randint(0, 50, (B, S))
@@ -1683,6 +1669,278 @@ def test_vlm_wrapper_no_delta_without_images():
         rtol=1e-5,
         atol=1e-5,
         msg="Without images, VLM wrapper should do plain 2D→3D expansion",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_requires_position_ids_for_text_only():
+    """Text-only forward must provide position_ids."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    input_ids = torch.randint(0, 50, (1, 8))
+    with pytest.raises(ValueError, match="position_ids is required"):
+        _ = model(input_ids=input_ids)
+
+
+# =============================================================================
+# Mixed Batch Position Handling Tests
+# =============================================================================
+
+
+@torch.no_grad()
+def test_persistent_multimodal_keys_attribute():
+    """Qwen3_5MoeModel should declare persistent_multimodal_keys."""
+    assert hasattr(Qwen3_5MoeModel, "persistent_multimodal_keys")
+    assert "mrope_position_deltas" in Qwen3_5MoeModel.persistent_multimodal_keys
+
+
+@torch.no_grad()
+def test_prepare_extra_args_mixed_multimodal_text_prefill():
+    """prepare_extra_args should build a complete mrope_position_ids_3d
+    covering all prefill tokens, including text-only prefill requests."""
+    from tensorrt_llm._torch.auto_deploy.shim.ad_executor import RequestContext
+
+    # Simulate a batch: 1 multimodal prefill (10 tokens), 1 text-only prefill (5 tokens),
+    # 1 decode (1 token)
+    mm_pos = torch.arange(10).unsqueeze(0).unsqueeze(0).expand(3, 1, -1) + 100
+    extra_args = {
+        "mrope_position_ids_3d": [mm_pos],
+    }
+    request_contexts = [
+        RequestContext(seq_len=10, input_pos=0, is_context=True, has_multimodal=True),
+        RequestContext(seq_len=5, input_pos=0, is_context=True, has_multimodal=False),
+        RequestContext(seq_len=1, input_pos=50, is_context=False, has_multimodal=False),
+    ]
+
+    result = Qwen3_5MoeModel.prepare_extra_args(extra_args, request_contexts)
+    merged = result["mrope_position_ids_3d"]
+
+    assert len(merged) == 1, "Should produce a single concatenated tensor"
+    merged_t = merged[0]
+    assert merged_t.shape[-1] == 15, (
+        f"Expected 15 prefill tokens (10 mm + 5 text), got {merged_t.shape[-1]}"
+    )
+
+    # First 10 tokens: multimodal positions (100..109)
+    torch.testing.assert_close(merged_t[:, :, :10], mm_pos)
+
+    # Last 5 tokens: text-only positions (0..4 replicated across all 3 dims)
+    text_pos = torch.arange(0, 5).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
+    torch.testing.assert_close(merged_t[:, :, 10:], text_pos)
+
+
+@torch.no_grad()
+def test_prepare_extra_args_all_text_prefill():
+    """prepare_extra_args with no multimodal data is a no-op (Case 3 handles it)."""
+    from tensorrt_llm._torch.auto_deploy.shim.ad_executor import RequestContext
+
+    extra_args = {}
+    request_contexts = [
+        RequestContext(seq_len=8, input_pos=0, is_context=True, has_multimodal=False),
+    ]
+
+    result = Qwen3_5MoeModel.prepare_extra_args(extra_args, request_contexts)
+    assert "mrope_position_ids_3d" not in result, (
+        "Text-only batch should not create mrope_position_ids_3d"
+    )
+
+
+@torch.no_grad()
+def test_input_processor_adds_mrope_position_ids_3d():
+    """Qwen3_5MoeInputProcessor should compute and attach mrope_position_ids_3d
+    alongside mrope_position_deltas when image_grid_thw is present."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_vision_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
+
+    text_before = [1, 2, 3]
+    vision_start = [config.vision_start_token_id]
+    img_tokens = [config.image_token_id] * num_vision_tokens
+    text_after = [4, 5, 6]
+    fake_token_ids = text_before + vision_start + img_tokens + text_after
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
+    fake_extra = {
+        "multimodal_data": {
+            "pixel_values": torch.randn(1, 3, 4, 4),
+            "image_grid_thw": image_grid_thw,
+        }
+    }
+
+    def fake_base(inputs, sampling_params):
+        return (fake_token_ids, fake_extra)
+
+    processor = Qwen3_5MoeInputProcessor(base_processor=fake_base, config=config)
+    _, extra_out = processor({"prompt": "test"}, None)
+    mm_data = extra_out["multimodal_data"]
+
+    assert "mrope_position_ids_3d" in mm_data, (
+        "InputProcessor should add mrope_position_ids_3d to multimodal_data"
+    )
+    pos_3d = mm_data["mrope_position_ids_3d"]
+    assert pos_3d.shape[0] == 3, f"Expected first dim = 3, got {pos_3d.shape[0]}"
+    assert pos_3d.shape[-1] == len(fake_token_ids), (
+        f"Expected last dim = {len(fake_token_ids)}, got {pos_3d.shape[-1]}"
+    )
+
+    # Verify it matches the standalone function
+    input_ids_t = torch.tensor([fake_token_ids], dtype=torch.long)
+    ref_pos, _ = compute_mrope_positions(
+        input_ids=input_ids_t,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    torch.testing.assert_close(pos_3d, ref_pos)
+
+
+@torch.no_grad()
+def test_vlm_wrapper_prefill_only_precomputed_positions():
+    """Case 2: prefill-only batch with pre-computed mrope_position_ids_3d should
+    use those positions directly without modification."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    B, S = 1, 8
+    input_ids = torch.randint(0, 50, (B, S))
+
+    # Simulate pre-computed 3D positions (as from input processor)
+    fake_pos_3d = torch.arange(S).unsqueeze(0).unsqueeze(0).expand(3, B, -1)
+
+    output = model(
+        input_ids=input_ids,
+        mrope_position_ids_3d=fake_pos_3d,
+    )
+
+    # Reference: directly call text model with the same 3D positions
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=fake_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Prefill-only with pre-computed 3D positions should pass them through directly",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_mixed_batch_position_assembly():
+    """Case 1: mixed prefill+decode batch with mrope_position_ids_3d + batch_info
+    should stitch pre-computed prefill positions with delta-adjusted decode positions."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    # Simulate a mixed batch: 1 prefill seq (6 tokens) + 2 decode seqs (1 token each)
+    num_prefill_seqs = 1
+    num_prefill_tokens = 6
+    num_decode_seqs = 2
+    total_tokens = num_prefill_tokens + num_decode_seqs
+
+    # Flattened input_ids: [1, total_tokens]
+    input_ids = torch.randint(0, 50, (1, total_tokens))
+
+    # Flattened position_ids: [1, total_tokens]
+    # Prefill: 0..5, Decode: 100 (seq1), 200 (seq2)
+    prefill_pos = list(range(num_prefill_tokens))
+    decode_pos = [100, 200]
+    position_ids = torch.tensor([prefill_pos + decode_pos])
+
+    # Pre-computed 3D positions for prefill (from input processor)
+    # Use distinct values per dim to verify correct stitching
+    prefill_3d = torch.stack(
+        [
+            torch.arange(num_prefill_tokens).unsqueeze(0),  # T
+            torch.arange(10, 10 + num_prefill_tokens).unsqueeze(0),  # H
+            torch.arange(20, 20 + num_prefill_tokens).unsqueeze(0),  # W
+        ]
+    )  # [3, 1, 6]
+
+    # Deltas: per-request [num_total_seqs, 1]
+    # Prefill seq delta = -3, Decode seq1 delta = -5, Decode seq2 delta = 0
+    deltas = torch.tensor([[-3], [-5], [0]])
+
+    batch_info = torch.tensor(
+        [num_prefill_seqs, num_prefill_tokens, num_decode_seqs], dtype=torch.int32
+    )
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        mrope_position_ids_3d=prefill_3d,
+        mrope_position_deltas=deltas,
+        batch_info=batch_info,
+    )
+
+    # Manually construct the expected 3D position_ids
+    # Prefill part: use prefill_3d directly
+    # Decode part: position_ids + gen_deltas (gen_deltas = deltas[num_prefill_seqs:])
+    gen_deltas = deltas[num_prefill_seqs:]  # [[-5], [0]]
+    decode_2d = position_ids[..., num_prefill_tokens:]  # [[100, 200]]
+    decode_adjusted = decode_2d + gen_deltas.T  # [[95, 200]]
+    decode_3d = decode_adjusted[None].expand(3, -1, -1)  # [3, 1, 2]
+    expected_pos_3d = torch.cat([prefill_3d, decode_3d], dim=-1)  # [3, 1, 8]
+
+    # Reference: directly call text model with expected positions
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Mixed batch should stitch prefill 3D positions with delta-adjusted decode positions",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_decode_only_with_delta():
+    """Case 3: decode-only batch with deltas (no mrope_position_ids_3d) should
+    apply delta to all positions uniformly."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    # 3 decode sequences, each with 1 token -> position_ids = [3, 1]
+    B = 3
+    input_ids = torch.randint(0, 50, (B, 1))
+    position_ids = torch.tensor([[500], [300], [100]])
+    deltas = torch.tensor([[50], [0], [0]])
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        mrope_position_deltas=deltas,
+    )
+
+    # Reference: (position_ids + deltas)[None].expand(3, ...) -> [3, 3, 1]
+    expected_pos_3d = (position_ids + deltas)[None].expand(3, -1, -1)
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Decode-only with deltas should apply delta-adjusted 3D expansion",
     )
 
 
