@@ -74,7 +74,7 @@ class GrpcRequestManager:
         prompt_adapter_request: Optional[PromptAdapterRequest] = None,
         kv_cache_retention_config: Optional[KvCacheRetentionConfig] = None,
         disaggregated_params: Optional[DisaggregatedParams] = None,
-        multimodal_images: Optional[List] = None,
+        multi_modal_data: Optional[Dict[str, Any]] = None,
     ) -> AsyncGenerator[GenerationResult, None]:
         """Submit a generation request and stream outputs.
 
@@ -87,6 +87,7 @@ class GrpcRequestManager:
             prompt_adapter_request: Optional prompt adapter request
             kv_cache_retention_config: KV cache retention config
             disaggregated_params: Disaggregated inference params
+            multi_modal_data: Multimodal data dict (e.g. {"image": [PIL images]})
 
         Yields:
             GenerationResult objects containing token IDs (text will be empty
@@ -96,8 +97,8 @@ class GrpcRequestManager:
             # Submit to LLM.generate_async which returns a GenerationResult
             # that is an async iterator
             inputs = {"prompt_token_ids": prompt_token_ids}
-            if multimodal_images:
-                inputs["multi_modal_data"] = {"image": multimodal_images}
+            if multi_modal_data:
+                inputs["multi_modal_data"] = multi_modal_data
 
             gen_result = self.llm.generate_async(
                 inputs,

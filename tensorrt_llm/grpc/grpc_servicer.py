@@ -120,16 +120,15 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 request.disaggregated_params if request.HasField("disaggregated_params") else None
             )
 
-            # Extract multimodal images if present
-            multimodal_images = None
+            # Extract multimodal data if present
+            multi_modal_data = None
             if request.HasField("multimodal_input") and request.multimodal_input.image_data:
-                multimodal_images = [
+                images = [
                     _load_and_convert_image(io.BytesIO(img_bytes))
                     for img_bytes in request.multimodal_input.image_data
                 ]
-                logger.info(
-                    f"Request {request_id}: extracted {len(multimodal_images)} multimodal images"
-                )
+                multi_modal_data = {"image": images}
+                logger.info(f"Request {request_id}: extracted {len(images)} multimodal images")
 
             # Track tokens sent per sequence index to avoid duplicates
             # TRT-LLM's token_ids_diff doesn't clear between iterations for n>1
@@ -144,7 +143,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 streaming=request.streaming,
                 lora_request=lora_request,
                 disaggregated_params=disaggregated_params,
-                multimodal_images=multimodal_images,
+                multi_modal_data=multi_modal_data,
             ):
                 # Check if client disconnected
                 if context.cancelled():
