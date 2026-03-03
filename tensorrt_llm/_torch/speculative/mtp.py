@@ -312,9 +312,12 @@ class MTPSampler(Sampler[SampleStateMTP], AsyncWorkerMixin):
             self._request_common_handling(req, next_draft_tokens_list)
 
     def sample_async(
-            self, scheduled_requests: ScheduledRequests,
-            outputs: dict[str, torch.Tensor],
-            num_context_logits_prefix_sum: list[int]) -> SampleStateMTP:
+        self,
+        scheduled_requests: ScheduledRequests,
+        outputs: dict[str, torch.Tensor],
+        num_context_logits_prefix_sum: list[int],
+        **kwargs,
+    ) -> SampleStateMTP:
         # new_tokens_device: accepted tokens, device tensor, shape: batch_size, nextn + 1
         # new_tokens_lens_device: accepted lengths, device tensor, shape: batch_size
         # next_draft_tokens_device: predicted draft tokens, device tensor, shape: batch_size, nextn
