@@ -12,10 +12,6 @@ kv_cache_config:
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
-  # text_config:
-  #   num_hidden_layers: 6
-  # vision_config:
-  #   depth: 2
 transforms:
   export_to_gm:
     num_moe_experts_for_export: 2
