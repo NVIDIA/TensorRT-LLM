@@ -34,6 +34,13 @@ using namespace cutlass;
 namespace sm120_blockscaled_gemm
 {
 
+template <typename T_offset, typename T_index>
+CUTE_HOST_DEVICE static T_offset compute_padded_offset(T_offset offset, T_index problem_idx)
+{
+    constexpr T_offset alignment = 4;
+    return (offset + problem_idx * (alignment - 1)) / alignment * alignment;
+}
+
 template <int TileM_ = 32, int TileN_ = 128, int Stages_ = 4>
 struct SM120BlockScaledBuilder
 {
@@ -328,6 +335,21 @@ struct SM120BlockScaledBuilder
         make_tensor(make_gmem_ptr(static_cast<ElementD*>(nullptr)), repeat_like(StrideD{}, int64_t(0)), StrideD{}),
         take<0, 2>(SmemLayoutD{}), EpilogueTile_MN{}));
 
+    // ====== moe store ======
+    using SmemAtomLayoutO = decltype(composition(
+        Swizzle<3, 3, 3>{}, Layout<Shape<_8, Shape<_8, _8>>, Stride<_8, Stride<_1, _64>>>{})); //  8x64
+
+    using SmemLayoutO = decltype(tile_to_shape(SmemAtomLayoutO{}, Shape<Int<kTileM>, Int<kTileN>>{}));
+
+    using SmemCopyAtomR2S = Copy_Atom<AutoVectorizingCopy, ElementD>;
+
+    // ====== store smem -> gmem ======
+    using SmemCopyAtomS2R = Copy_Atom<UniversalCopy<uint128_t>, ElementD>;
+    using GmemCopyAtomR2G = SmemCopyAtomS2R;
+
+    using TiledCopyS2G = decltype(make_tiled_copy(
+        SmemCopyAtomS2R{}, Layout<Shape<_32, _8>, Stride<_8, _1>>{}, Layout<Shape<_1, _8>>{})); // 32x64
+
     struct SharedStorageLoad : cute::aligned_struct<128, _0>
     {
         alignas(1024) cute::ArrayEngine<ElementA, cute::cosize_v<SmemLayoutA>> smem_A;
@@ -341,10 +363,21 @@ struct SM120BlockScaledBuilder
         alignas(1024) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutD>> smem_D;
     };
 
+    struct SharedStorageMoeStore : cute::aligned_struct<128, _0>
+    {
+        alignas(1024) cute::ArrayEngine<ElementD, cute::cosize_v<SmemLayoutO>> smem_O;
+    };
+
     union TensorStorage
     {
         SharedStorageLoad load;
         SharedStorageStore store;
+    };
+
+    union TensorStorageMoe
+    {
+        SharedStorageLoad load;
+        SharedStorageMoeStore store;
     };
 
     using FullBarrier = cutlass::arch::ClusterTransactionBarrier;

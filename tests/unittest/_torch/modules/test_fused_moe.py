@@ -18,7 +18,8 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
+from utils.util import (check_accuracy, getSMVersion, skip_blackwell,
+                        skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
                         skip_pre_blackwell, skip_pre_hopper)
 
@@ -1172,7 +1173,10 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     return True
 
 
-@skip_no_hopper
+@pytest.mark.skipif(
+    getSMVersion() not in (90, 120),
+    reason=
+    "This test is only supported on Hopper (SM90) and RTX PRO 6000 (SM120)")
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
     product(
@@ -1254,7 +1258,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
 
         if WeightLoadingMode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
             weights['gate_up_proj'][expert_id] = torch.cat(
-                [w3_weight_fp8, w1_weight_fp8],
+                [w1_weight_fp8, w3_weight_fp8],
                 dim=-2).transpose(0, 1).contiguous()
             weights['down_proj'][expert_id] = w2_weight_fp8.transpose(
                 0, 1).contiguous()
@@ -1282,6 +1286,7 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     )
     fused_moe.cuda()
     fused_moe.load_weights([weights])
+    fused_moe.post_load_weights()
 
     ref_fused_moe = RefGatedMLPFusedMoE(
         num_experts=NUM_EXPERTS,
@@ -1291,8 +1296,9 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
         dtype=dtype,
         model_config=ModelConfig(quant_config=quant_config),
     )
-    ref_fused_moe.load_weights([weights])
     ref_fused_moe.cuda()
+    ref_fused_moe.load_weights([weights])
+    ref_fused_moe.post_load_weights()
 
     with torch.inference_mode():
         output = fused_moe.forward(x, router_logits)
@@ -1570,9 +1576,9 @@ def run_fused_moe_nvfp4(dtype,
             swiglu_beta=swiglu_beta_tensor,
             swiglu_limit=swiglu_limit_tensor,
         )
+        fused_moe.cuda()
         fused_moe.load_weights([weights])
         fused_moe.post_load_weights()
-        fused_moe.cuda()
 
         # Evaluate the outputs on a variant sequence length to cover all possible keys in Autotuner cache
         ref_fused_moe = RefGatedMLPFusedMoE(
@@ -1586,8 +1592,8 @@ def run_fused_moe_nvfp4(dtype,
             swiglu_alpha=swiglu_alpha,
             swiglu_beta=swiglu_beta,
             swiglu_limit=swiglu_limit)
-        ref_fused_moe.load_weights([weights])
         ref_fused_moe.cuda()
+        ref_fused_moe.load_weights([weights])
 
         AutoTuner.get().clear_cache()
         with torch.inference_mode():
@@ -2875,6 +2881,11 @@ class RefGatedMLPFusedMoE(nn.Module):
 
             self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
             self.experts[expert].down_proj.load_weights(down_proj_weights)
+
+    def post_load_weights(self):
+        for expert in self.experts:
+            expert.gate_up_proj.post_load_weights()
+            expert.down_proj.post_load_weights()
 
 
 # Create a mock module with required attributes for NVFP4CutlassFusedMoEMethod.get_weights_shapes test.

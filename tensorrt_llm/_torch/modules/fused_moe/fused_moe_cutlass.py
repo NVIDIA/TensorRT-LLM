@@ -22,7 +22,8 @@ from .quantization import UnquantizedFusedMoEMethod
 
 # isort: off
 from .quantization import (
-    DeepSeekFP8BlockScalesFusedMoEMethod, FP8QDQFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethod,
+    DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm, FP8QDQFusedMoEMethod,
     MoEWeightLoadingMode, NVFP4CutlassFusedMoEMethod, UnquantizedFusedMoEMethod,
     INT8WoqPerChannelFusedMoEMethod, W4A8MXFP4FP8CutlassFusedMoEMethod,
     W4A8MXFP4MXFP8CutlassFusedMoEMethod, WFP4A16FusedMoEMethod,
@@ -514,7 +515,10 @@ class CutlassFusedMoE(MoE):
             if self.quant_config.layer_quant_mode.has_fp8_qdq():
                 return FP8QDQFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_fp8_block_scales():
-                return DeepSeekFP8BlockScalesFusedMoEMethod()
+                if get_sm_version() == 120:
+                    return DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm()
+                else:
+                    return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4CutlassFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.is_int4_weight_only_per_group(
