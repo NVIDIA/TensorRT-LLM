@@ -6,7 +6,7 @@ from typing import Set, Tuple
 import torch
 
 from ..normalization import NormType
-from .attention import AttentionType, make_attn
+from .attention import AttnBlock
 from .causal_conv_2d import make_conv2d
 from .causality_axis import CausalityAxis
 from .resnet import ResnetBlock
@@ -59,7 +59,6 @@ def build_upsampling_path(
     dropout: float,
     norm_type: NormType,
     causality_axis: CausalityAxis,
-    attn_type: AttentionType,
     attn_resolutions: Set[int],
     resamp_with_conv: bool,
     initial_block_channels: int,
@@ -88,7 +87,7 @@ def build_upsampling_path(
             block_in = block_out
             if curr_res in attn_resolutions:
                 stage.attn.append(
-                    make_attn(block_in, attn_type=attn_type, norm_type=norm_type)
+                    AttnBlock(block_in, norm_type=norm_type)
                 )
 
         if level != 0:

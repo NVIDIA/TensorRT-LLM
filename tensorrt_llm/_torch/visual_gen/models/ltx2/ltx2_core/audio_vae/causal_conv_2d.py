@@ -61,25 +61,12 @@ def make_conv2d(
     out_channels: int,
     kernel_size: int | tuple[int, int],
     stride: int = 1,
-    padding: tuple[int, int, int, int] | None = None,
     dilation: int = 1,
     groups: int = 1,
     bias: bool = True,
-    causality_axis: CausalityAxis | None = None,
-) -> torch.nn.Module:
-    if causality_axis is not None:
-        return CausalConv2d(
-            in_channels, out_channels, kernel_size, stride,
-            dilation, groups, bias, causality_axis,
-        )
-    else:
-        if padding is None:
-            padding = (
-                kernel_size // 2
-                if isinstance(kernel_size, int)
-                else tuple(k // 2 for k in kernel_size)
-            )
-        return torch.nn.Conv2d(
-            in_channels, out_channels, kernel_size, stride,
-            padding, dilation, groups, bias,
-        )
+    causality_axis: CausalityAxis = CausalityAxis.HEIGHT,
+) -> CausalConv2d:
+    return CausalConv2d(
+        in_channels, out_channels, kernel_size, stride,
+        dilation, groups, bias, causality_axis,
+    )

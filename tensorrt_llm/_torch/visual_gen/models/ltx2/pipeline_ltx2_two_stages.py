@@ -34,8 +34,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
              (with distilled sigma schedule, no guidance), then decode.
     """
 
-    @torch.no_grad()
-    def __call__(
+    @torch.inference_mode()
+    def forward(
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = None,
@@ -75,7 +75,7 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
         )
 
         # Stage 1 (i2v image is passed to the base pipeline at half resolution)
-        out = super().__call__(
+        out = super().forward(
             prompt=prompt,
             negative_prompt=negative_prompt,
             height=height_s1,

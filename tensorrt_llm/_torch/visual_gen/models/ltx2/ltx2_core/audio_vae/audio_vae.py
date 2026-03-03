@@ -10,7 +10,7 @@ import torch.nn.functional as F
 from ..patchifier import AudioPatchifier
 from ..types import AudioLatentShape
 from ..normalization import NormType, build_normalization_layer
-from .attention import AttentionType, make_attn
+from .attention import AttnBlock
 from .causal_conv_2d import make_conv2d
 from .causality_axis import CausalityAxis
 from .ops import PerChannelStatistics
@@ -27,7 +27,6 @@ def build_mid_block(
     dropout: float,
     norm_type: NormType,
     causality_axis: CausalityAxis,
-    attn_type: AttentionType,
     add_attention: bool,
 ) -> torch.nn.Module:
     mid = torch.nn.Module()
@@ -35,7 +34,7 @@ def build_mid_block(
         in_channels=channels, out_channels=channels, temb_channels=temb_channels,
         dropout=dropout, norm_type=norm_type, causality_axis=causality_axis,
     )
-    mid.attn_1 = make_attn(channels, attn_type=attn_type, norm_type=norm_type) if add_attention else torch.nn.Identity()
+    mid.attn_1 = AttnBlock(channels, norm_type=norm_type) if add_attention else torch.nn.Identity()
     mid.block_2 = ResnetBlock(
         in_channels=channels, out_channels=channels, temb_channels=temb_channels,
         dropout=dropout, norm_type=norm_type, causality_axis=causality_axis,
@@ -71,7 +70,6 @@ class AudioDecoder(torch.nn.Module):
     ) -> None:
         super().__init__()
         resamp_with_conv = True
-        attn_type = AttentionType.VANILLA
 
         self.per_channel_statistics = PerChannelStatistics(latent_channels=ch)
         self.sample_rate = sample_rate
@@ -95,7 +93,6 @@ class AudioDecoder(torch.nn.Module):
         self.channel_multipliers = ch_mult
         self.attn_resolutions = attn_resolutions
         self.causality_axis = causality_axis
-        self.attn_type = attn_type
 
         base_block_channels = ch * self.channel_multipliers[-1]
         base_resolution = resolution // (2 ** (self.num_resolutions - 1))
@@ -106,13 +103,13 @@ class AudioDecoder(torch.nn.Module):
         self.mid = build_mid_block(
             channels=base_block_channels, temb_channels=self.temb_ch, dropout=dropout,
             norm_type=self.norm_type, causality_axis=self.causality_axis,
-            attn_type=self.attn_type, add_attention=mid_block_add_attention,
+            add_attention=mid_block_add_attention,
         )
         self.up, final_block_channels = build_upsampling_path(
             ch=ch, ch_mult=ch_mult, num_resolutions=self.num_resolutions,
             num_res_blocks=num_res_blocks, resolution=resolution,
             temb_channels=self.temb_ch, dropout=dropout, norm_type=self.norm_type,
-            causality_axis=self.causality_axis, attn_type=self.attn_type,
+            causality_axis=self.causality_axis,
             attn_resolutions=attn_resolutions, resamp_with_conv=resamp_with_conv,
             initial_block_channels=base_block_channels,
         )

@@ -1,17 +1,9 @@
 # Ported from https://github.com/Lightricks/LTX-2
 # packages/ltx-core/src/ltx_core/model/audio_vae/attention.py
 
-from enum import Enum
-
 import torch
 
 from ..normalization import NormType, build_normalization_layer
-
-
-class AttentionType(Enum):
-    VANILLA = "vanilla"
-    LINEAR = "linear"
-    NONE = "none"
 
 
 class AttnBlock(torch.nn.Module):
@@ -53,21 +45,3 @@ class AttnBlock(torch.nn.Module):
         h_ = torch.bmm(v, w_).reshape(b, c, h, w).contiguous()
         h_ = self.proj_out(h_)
         return x + h_
-
-
-def make_attn(
-    in_channels: int,
-    attn_type: AttentionType = AttentionType.VANILLA,
-    norm_type: NormType = NormType.GROUP,
-) -> torch.nn.Module:
-    match attn_type:
-        case AttentionType.VANILLA:
-            return AttnBlock(in_channels, norm_type=norm_type)
-        case AttentionType.NONE:
-            return torch.nn.Identity()
-        case AttentionType.LINEAR:
-            raise NotImplementedError(
-                f"Attention type {attn_type.value} is not supported yet."
-            )
-        case _:
-            raise ValueError(f"Unknown attention type: {attn_type}")

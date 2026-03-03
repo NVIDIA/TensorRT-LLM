@@ -26,6 +26,7 @@ from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
+from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 
@@ -50,8 +51,21 @@ if TYPE_CHECKING:
 # ---------------------------------------------------------------------------
 
 
-class LTX2Attention(nn.Module):
-    """LTX-2 attention using TRT-LLM Linear, RMSNorm, and attention backend."""
+class LTX2Attention(Attention):
+    """LTX-2 attention: extends base Attention with LTX-specific RoPE, gated
+    attention, and separate K-RoPE for audio-video cross-attention.
+
+    Inherits from base Attention:
+    - Q/K/V Linear creation with quant_config propagation
+    - QK RMSNorm (norm_q / norm_k)
+    - Backend dispatch with automatic HND/NHD layout handling (_attn_impl)
+    - Output projection (to_out)
+
+    Adds LTX-2 specifics:
+    - LTX 3D RoPE (INTERLEAVED / SPLIT) with separate k_pe support
+    - Gated attention (to_gate_logits)
+    - Cross-attention with different context_dim for K/V input
+    """
 
     def __init__(
         self,
@@ -65,75 +79,73 @@ class LTX2Attention(nn.Module):
         config: Optional["DiffusionModelConfig"] = None,
         layer_idx: int = 0,
     ):
-        super().__init__()
-
         from tensorrt_llm._torch.visual_gen.config import DiffusionModelConfig
 
         config = config or DiffusionModelConfig()
 
+        # Store before super().__init__() — _init_qkv_proj needs _context_dim
+        self._context_dim = context_dim if context_dim is not None else query_dim
         self.rope_type = rope_type
-        self.heads = heads
-        self.dim_head = dim_head
-        inner_dim = dim_head * heads
-        context_dim = query_dim if context_dim is None else context_dim
-        dtype = config.torch_dtype
+        self._is_cross_attn = (self._context_dim != query_dim)
 
-        quant_config = config.quant_config
-        skip_create = config.skip_create_weights_in_init
-        force_dq = config.force_dynamic_quantization
-        mapping = getattr(config, "mapping", None)
-
-        self.to_q = Linear(
-            query_dim, inner_dim, bias=True, dtype=dtype,
-            mapping=mapping, quant_config=quant_config,
-            skip_create_weights_in_init=skip_create,
-            force_dynamic_quantization=force_dq,
-        )
-        self.to_k = Linear(
-            context_dim, inner_dim, bias=True, dtype=dtype,
-            mapping=mapping, quant_config=quant_config,
-            skip_create_weights_in_init=skip_create,
-            force_dynamic_quantization=force_dq,
-        )
-        self.to_v = Linear(
-            context_dim, inner_dim, bias=True, dtype=dtype,
-            mapping=mapping, quant_config=quant_config,
-            skip_create_weights_in_init=skip_create,
-            force_dynamic_quantization=force_dq,
+        super().__init__(
+            hidden_size=query_dim,
+            num_attention_heads=heads,
+            head_dim=dim_head,
+            qkv_mode=QKVMode.SEPARATE_QKV,
+            qk_norm=True,
+            qk_norm_mode="full",
+            eps=norm_eps,
+            bias=True,
+            config=config,
+            layer_idx=layer_idx,
         )
 
-        self.q_norm = RMSNorm(hidden_size=inner_dim, eps=norm_eps, dtype=dtype)
-        self.k_norm = RMSNorm(hidden_size=inner_dim, eps=norm_eps, dtype=dtype)
+        # Base class forces VANILLA backend for SEPARATE_QKV.
+        # For self-attention, override with the configured backend.
+        if not self._is_cross_attn:
+            backend_name = config.attention.backend
+            if backend_name != self.attn_backend:
+                self.attn_backend = backend_name
+                self.attn = create_attention(
+                    backend=backend_name,
+                    layer_idx=self.layer_idx,
+                    num_heads=self.num_attention_heads,
+                    head_dim=self.head_dim,
+                    num_kv_heads=self.num_key_value_heads,
+                    quant_config=self.quant_config,
+                    dtype=self.dtype,
+                )
 
         if apply_gated_attention:
             self.to_gate_logits = Linear(
-                query_dim, heads, bias=True, dtype=dtype,
-                mapping=mapping, quant_config=quant_config,
-                skip_create_weights_in_init=skip_create,
-                force_dynamic_quantization=force_dq,
+                query_dim, heads, bias=True, dtype=self.dtype,
+                mapping=self.mapping, quant_config=self.quant_config,
+                skip_create_weights_in_init=self.skip_create_weights_in_init,
+                force_dynamic_quantization=self.force_dynamic_quantization,
             )
         else:
             self.to_gate_logits = None
 
-        self.to_out = nn.ModuleList([
-            Linear(
-                inner_dim, query_dim, bias=True, dtype=dtype,
-                mapping=mapping, quant_config=quant_config,
-                skip_create_weights_in_init=skip_create,
-                force_dynamic_quantization=force_dq,
-            )
-        ])
-
-        is_cross_attn = (context_dim != query_dim)
-        backend_name = "VANILLA" if is_cross_attn else config.attention.backend
-        self.attn = create_attention(
-            backend=backend_name,
-            layer_idx=layer_idx,
-            num_heads=heads,
-            head_dim=dim_head,
-            num_kv_heads=heads,
-            quant_config=quant_config,
-            dtype=dtype,
+    def _init_qkv_proj(self):
+        """Override: use _context_dim for K/V input (cross-attention support)."""
+        self.to_q = Linear(
+            self.hidden_size, self.q_dim, bias=self.bias, dtype=self.dtype,
+            mapping=self.mapping, quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+        )
+        self.to_k = Linear(
+            self._context_dim, self.kv_dim, bias=self.bias, dtype=self.dtype,
+            mapping=self.mapping, quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
+        )
+        self.to_v = Linear(
+            self._context_dim, self.kv_dim, bias=self.bias, dtype=self.dtype,
+            mapping=self.mapping, quant_config=self.quant_config,
+            skip_create_weights_in_init=self.skip_create_weights_in_init,
+            force_dynamic_quantization=self.force_dynamic_quantization,
         )
 
     def forward(
@@ -153,57 +165,22 @@ class LTX2Attention(nn.Module):
             pe: (cos, sin) RoPE embeddings for Q (and K when k_pe is None).
             k_pe: Separate (cos, sin) RoPE embeddings for K (for AV cross-attn).
         """
-        q = self.to_q(x)
-        context = x if context is None else context
-        k = self.to_k(context)
-        v = self.to_v(context)
-
-        q = self.q_norm(q)
-        k = self.k_norm(k)
+        q, k, v = self.get_qkv(x, context)
+        q, k = self.apply_qk_norm(q, k)
 
         if pe is not None:
             q = apply_rotary_emb(q, pe, self.rope_type)
             k = apply_rotary_emb(k, pe if k_pe is None else k_pe, self.rope_type)
 
-        batch_size = q.shape[0]
-        seq_len = q.shape[1]
-        kv_seq_len = k.shape[1]
-
-        from tensorrt_llm._torch.visual_gen.attention_backend.interface import (
-            AttentionTensorLayout,
-        )
-
-        backend_layout = getattr(
-            self.attn, "preferred_layout", AttentionTensorLayout.NHD
-        )
-        if backend_layout == AttentionTensorLayout.HND:
-            q = q.view(batch_size, seq_len, self.heads, self.dim_head).transpose(1, 2)
-            k = k.view(batch_size, kv_seq_len, self.heads, self.dim_head).transpose(1, 2)
-            v = v.view(batch_size, kv_seq_len, self.heads, self.dim_head).transpose(1, 2)
-        else:
-            q = q.view(batch_size, seq_len, self.heads, self.dim_head)
-            k = k.view(batch_size, kv_seq_len, self.heads, self.dim_head)
-            v = v.view(batch_size, kv_seq_len, self.heads, self.dim_head)
-
-        out = self.attn.forward(
-            q=q, k=k, v=v,
-            batch_size=batch_size,
-            seq_len=seq_len,
-            seq_len_kv=kv_seq_len if kv_seq_len != seq_len else None,
-        )
-
-        if backend_layout == AttentionTensorLayout.HND:
-            out = out.transpose(1, 2).flatten(2)
-        else:
-            out = out.flatten(2)
+        out = self._attn_impl(q, k, v)
 
         if self.to_gate_logits is not None:
             gate_logits = self.to_gate_logits(x)
             b, t, _ = out.shape
-            out = out.view(b, t, self.heads, self.dim_head)
+            out = out.view(b, t, self.num_attention_heads, self.head_dim)
             gates = 2.0 * torch.sigmoid(gate_logits)
             out = out * gates.unsqueeze(-1)
-            out = out.view(b, t, self.heads * self.dim_head)
+            out = out.view(b, t, self.num_attention_heads * self.head_dim)
 
         return self.to_out[0](out)
 
@@ -937,9 +914,9 @@ class LTXModel(nn.Module):
     def load_weights(self, weights: dict) -> None:
         """Load checkpoint weights with key remapping.
 
-        Handles the FFN naming difference:
-          Checkpoint: ``ff.net.0.proj.*`` / ``ff.net.2.*``
-          Model:      ``ff.up_proj.*``     / ``ff.down_proj.*``
+        Handles naming differences between checkpoint and model:
+          FFN:    ``ff.net.0.proj.*`` / ``ff.net.2.*`` → ``ff.up_proj.*`` / ``ff.down_proj.*``
+          QKNorm: ``*.q_norm.*`` / ``*.k_norm.*``      → ``*.norm_q.*``   / ``*.norm_k.*``
         """
         remapped = {}
         for key, value in weights.items():
@@ -953,6 +930,8 @@ class LTXModel(nn.Module):
                     new_key = new_key.replace(
                         ff_prefix + "net.2.", ff_prefix + "down_proj."
                     )
+            new_key = new_key.replace(".q_norm.", ".norm_q.")
+            new_key = new_key.replace(".k_norm.", ".norm_k.")
             remapped[new_key] = value
         weights = remapped
 

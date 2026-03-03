@@ -16,8 +16,10 @@ Dynamic Quantization:
 
 import os
 import time
-from typing import TYPE_CHECKING, Optional
+from pathlib import Path
+from typing import TYPE_CHECKING, Dict, Optional
 
+import safetensors.torch
 import torch
 
 from tensorrt_llm._torch.autotuner import autotune
@@ -32,6 +34,43 @@ from .models import AutoPipeline
 
 if TYPE_CHECKING:
     from .models import BasePipeline
+
+
+def _load_LTX_2_transformer_weights(
+    checkpoint_dir: str, prefix: str,
+) -> Dict[str, torch.Tensor]:
+    """Read transformer weights from a LTX-2 specific single-safetensor checkpoint.
+
+    Scans all ``.safetensors`` files in *checkpoint_dir* for keys starting
+    with *prefix*, strips the prefix, and returns the resulting state dict.
+    """
+    d = Path(checkpoint_dir)
+    if d.is_file() and d.suffix == ".safetensors":
+        sft_paths = [str(d)]
+    else:
+        sft_paths = sorted(str(f) for f in d.glob("*.safetensors"))
+
+    if not sft_paths:
+        raise ValueError(f"No safetensors files found in {checkpoint_dir}")
+
+    weights: Dict[str, torch.Tensor] = {}
+    for path in sft_paths:
+        with safetensors.torch.safe_open(path, framework="pt") as f:
+            for key in f.keys():
+                if key.startswith(prefix):
+                    weights[key[len(prefix):]] = f.get_tensor(key)
+
+    if not weights:
+        raise ValueError(
+            f"No transformer weights found with prefix '{prefix}' "
+            f"in {sft_paths}"
+        )
+
+    logger.info(
+        f"Loaded {len(weights)} transformer weight tensors from "
+        f"LTX_2 specific checkpoint ({prefix}*)"
+    )
+    return weights
 
 
 class PipelineLoader:
@@ -183,9 +222,9 @@ class PipelineLoader:
         # =====================================================================
         # STEP 3: Load Transformer Weights
         # Two code paths:
-        #   A) Native single-safetensor (e.g. LTX-2) — the pipeline implements
-        #      ``load_native_transformer_weights`` which reads the checkpoint
-        #      file directly with model-specific prefix stripping.
+        #   A) LTX_2 specific single-safetensor — pipeline exposes a
+        #      ``TRANSFORMER_PREFIX`` class attribute; weights are read from
+        #      the checkpoint with that prefix stripped.
         #   B) Diffusers-compatible — uses the generic ``WeightLoader`` which
         #      expects a ``transformer/`` sub-directory (or ``transformer.``
         #      prefixed keys).
@@ -194,10 +233,10 @@ class PipelineLoader:
         #   - Quantized on-the-fly to FP8/NVFP4 by DynamicLinearWeightLoader
         #   - Copied into model's quantized buffers
         # =====================================================================
-        if hasattr(pipeline, "load_native_transformer_weights"):
-            # --- Path A: native single-safetensor checkpoint -----------------
-            logger.info("Loading transformer weights via native checkpoint path")
-            pipeline.load_native_transformer_weights(checkpoint_dir)
+        LTX_2_specific_prefix = getattr(pipeline, "TRANSFORMER_PREFIX", None)
+        if LTX_2_specific_prefix is not None:
+            logger.info("Loading transformer weights via LTX_2 specific checkpoint path")
+            weights = _load_LTX_2_transformer_weights(checkpoint_dir, LTX_2_specific_prefix)
         else:
             # --- Path B: diffusers-compatible (WeightLoader) -----------------
             if pipeline.transformer is None:
@@ -217,15 +256,14 @@ class PipelineLoader:
             # TODO: accelerate the cpu loading w/ multiprocessing
             weights = weight_loader.load_weights(checkpoint_dir, self.mapping)
 
-            # Load weights into pipeline
-            pipeline.load_weights(weights)
+        pipeline.load_weights(weights)
 
         # =====================================================================
         # STEP 4: Load Standard Components (VAE, TextEncoder via diffusers)
         # These are NOT quantized - loaded as-is from checkpoint
         #
         # For LTX-2, Text encoder loads from a separate path (e.g. Gemma3 directory).
-        # All other native components load from the checkpoint safetensors.
+        # All other LTX_2 specific components load from the checkpoint safetensors.
         # =====================================================================
         pipeline.load_standard_components(
             checkpoint_dir, self.device, skip_components,

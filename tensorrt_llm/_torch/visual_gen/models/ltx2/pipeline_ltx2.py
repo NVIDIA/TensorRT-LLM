@@ -152,48 +152,25 @@ class LTX2Pipeline(BasePipeline):
         return self.model_config.torch_dtype
 
     # ------------------------------------------------------------------
-    # Native transformer weight loading (single-safetensor checkpoint)
+    # Transformer weight loading
     # ------------------------------------------------------------------
 
-    _TRANSFORMER_PREFIX = "model.diffusion_model."
+    TRANSFORMER_PREFIX = "model.diffusion_model."
 
-    def load_native_transformer_weights(self, checkpoint_dir: str) -> None:
-        """Load transformer weights from a native single-safetensor checkpoint.
+    def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
+        """Load transformer weights.
 
-        The native LTX-2 checkpoint stores *all* component weights in one
-        ``.safetensors`` file.  Transformer keys are prefixed with
-        ``model.diffusion_model.`` which is stripped before handing the
-        dict to :meth:`LTXModel.load_weights` (which handles the FFN key
-        remapping ``net.0.proj → up_proj``, ``net.2 → down_proj``).
-
-        This path completely bypasses the generic diffusers-compatible
-        :class:`WeightLoader`.
+        Args:
+            weights: State dict with parameter names already stripped of
+                any checkpoint prefix (e.g. ``model.diffusion_model.``).
+                The transformer's own :meth:`load_weights` handles any
+                remaining key remapping (``net.0.proj → up_proj``, etc.).
         """
-        sft_paths = _find_safetensors_files(checkpoint_dir)
-        if not sft_paths:
-            raise ValueError(
-                f"No safetensors files found in {checkpoint_dir}"
-            )
-
-        prefix = self._TRANSFORMER_PREFIX
-        weights: Dict[str, torch.Tensor] = {}
-        for path in sft_paths:
-            with safetensors.torch.safe_open(path, framework="pt") as f:
-                for key in f.keys():
-                    if key.startswith(prefix):
-                        weights[key[len(prefix):]] = f.get_tensor(key)
-
-        if not weights:
-            raise ValueError(
-                f"No transformer weights found with prefix '{prefix}' "
-                f"in {sft_paths}"
-            )
-
-        logger.info(
-            f"Loaded {len(weights)} transformer weight tensors from "
-            f"native checkpoint ({prefix}*)"
-        )
-        self.transformer.load_weights(weights)
+        if self.transformer is not None and hasattr(self.transformer, "load_weights"):
+            logger.info("Loading transformer weights...")
+            transformer_weights = weights.get("transformer", weights)
+            self.transformer.load_weights(transformer_weights)
+            logger.info("Transformer weights loaded successfully.")
 
     @staticmethod
     def _compute_ltx2_timestep_embedding(module, timestep, guidance=None):
@@ -636,7 +613,7 @@ class LTX2Pipeline(BasePipeline):
             device=self.device, dtype=self.dtype,
         )
 
-    @torch.no_grad()
+    @torch.inference_mode()
     def _encode_image(self, image_5d: torch.Tensor) -> torch.Tensor:
         """Encode a preprocessed image tensor through the VAE encoder.
 
@@ -691,7 +668,7 @@ class LTX2Pipeline(BasePipeline):
 
     def infer(self, req):
         """Run inference with request parameters."""
-        return self.__call__(
+        return self.forward(
             prompt=req.prompt,
             negative_prompt=req.negative_prompt,
             height=req.height,
@@ -749,8 +726,8 @@ class LTX2Pipeline(BasePipeline):
         logger.info(f"Enhanced prompt: {enhanced}")
         return enhanced.strip()
 
-    @torch.no_grad()
-    def __call__(
+    @torch.inference_mode()
+    def forward(
         self,
         prompt: Union[str, List[str]],
         negative_prompt: Optional[Union[str, List[str]]] = None,
