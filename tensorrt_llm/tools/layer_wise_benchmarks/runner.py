@@ -776,12 +776,12 @@ class Runner:
             assert tokens_per_block == 64
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
-        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config)
         config = model_config.pretrained_config
         kv_cache_config = KvCacheConfig(
             max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
             enable_block_reuse=False,
         )
+        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
             "FP8": tensorrt_llm.bindings.DataType.FP8,
             "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,
