@@ -27,7 +27,7 @@ from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
+from tensorrt_llm._torch.visual_gen.teacache import CacheContext, register_extractor
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
@@ -66,6 +66,88 @@ from .ltx2_core.video_vae import (
     VideoEncoderConfigurator,
 )
 from .transformer_ltx2 import LTXModel, LTXModelType
+
+# TeaCache polynomial coefficients for LTX-2.
+# Calibrated from the LTX-Video model family (see TeaCache paper).
+# Maps raw embedding L1 distances to rescaled distances for cache decisions.
+# Coefficients are from:
+# https://huggingface.co/jbilcke-hf/LTX-Video-0.9.1-HFIE/blob/main/teacache.py#L42
+# Needs to be verified for correctness.
+LTX2_TEACACHE_COEFFICIENTS = {
+    "ltx": {
+        "ret_steps": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
+        "standard": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
+    },
+}
+
+
+class LTX2TeaCacheExtractor:
+    """Custom TeaCache extractor for LTX-2's Modality-based interface.
+
+    LTX-2's transformer takes ``(video: Modality, audio: Modality)`` rather
+    than flat ``(hidden_states, timestep, ...)`` parameters, so the generic
+    extractor cannot locate the timestep or hidden states.
+
+    Video and audio velocity outputs are concatenated along the token
+    dimension for the hook's single-tensor residual logic (both share
+    ``out_channels=128``), then split back in ``postprocess``.
+    """
+
+    _FORWARD_PARAMS = ["video", "audio", "perturbations"]
+
+    def __init__(self, timestep_embed_fn):
+        self.timestep_embed_fn = timestep_embed_fn
+        self._video_tokens = 0
+        self._audio_tokens = 0
+
+    def __call__(self, module, *args, **kwargs):
+        params = {
+            self._FORWARD_PARAMS[i]: arg
+            for i, arg in enumerate(args)
+            if i < len(self._FORWARD_PARAMS)
+        }
+        params.update(kwargs)
+
+        video = params.get("video")
+        audio = params.get("audio")
+
+        # --- timestep embedding (for cache distance) ---
+        ts = video.timesteps if video is not None else audio.timesteps
+        if ts.ndim >= 2:
+            ts = ts.amax(dim=-1)
+        t_emb = self.timestep_embed_fn(module, ts)
+
+        # --- combined hidden_states for residual computation ---
+        v_lat = video.latent if video is not None else None
+        a_lat = audio.latent if audio is not None else None
+        self._video_tokens = v_lat.shape[1] if v_lat is not None else 0
+        self._audio_tokens = a_lat.shape[1] if a_lat is not None else 0
+
+        if v_lat is not None and a_lat is not None:
+            hidden_states = torch.cat([v_lat, a_lat], dim=1)
+        else:
+            hidden_states = v_lat if v_lat is not None else a_lat
+
+        def run_blocks():
+            vel_v, vel_a = module._original_forward(**params)
+            if vel_v is not None and vel_a is not None:
+                return (torch.cat([vel_v, vel_a], dim=1),)
+            return (vel_v if vel_v is not None else vel_a,)
+
+        def postprocess(output):
+            n_v, n_a = self._video_tokens, self._audio_tokens
+            if n_v > 0 and n_a > 0 and output.shape[1] == n_v + n_a:
+                return output[:, :n_v], output[:, n_v:]
+            if n_v > 0:
+                return output, None
+            return None, output
+
+        return CacheContext(
+            modulated_input=t_emb,
+            hidden_states=hidden_states,
+            run_transformer_blocks=run_blocks,
+            postprocess=postprocess,
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -422,13 +504,11 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, derived attributes."""
         super().post_load_weights()
 
-        register_extractor_from_config(
-            ExtractorConfig(
-                model_class_name="LTXModel",
-                timestep_embed_fn=self._compute_ltx2_timestep_embedding,
-            )
+        register_extractor(
+            "LTXModel",
+            LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
         )
-        self._setup_teacache(self.transformer)
+        self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
