@@ -5926,7 +5926,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 free_gpu_memory_fraction=0.5,
             ),
             max_batch_size=4,
-            enable_attention_dp=False,
+            enable_attention_dp=True,
             cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                               enable_padding=True),
             disable_overlap_scheduler=False,
