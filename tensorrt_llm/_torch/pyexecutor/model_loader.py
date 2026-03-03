@@ -9,7 +9,7 @@ import torch
 from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
-from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, TorchLlmArgs
 from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
@@ -207,7 +207,8 @@ class ModelLoader:
                  max_num_tokens: int,
                  max_seq_len: Optional[int],
                  lora_config: Optional[LoraConfig] = None,
-                 model_weights_memory_tag: Optional[str] = None):
+                 model_weights_memory_tag: Optional[ExecutorMemoryType] = None,
+                 model_weights_restore_mode: Optional[RestoreMode] = None):
         """
         Initializes the ModelLoader.
 
@@ -221,6 +222,8 @@ class ModelLoader:
             model_weights_memory_tag: When set, parameter allocations during
                 ``load()`` are placed under a separate virtual-memory tag so
                 they can be released/materialized independently of buffers.
+            model_weights_restore_mode: RestoreMode for the model weights
+                virtual-memory scope.
         """
         self.llm_args = llm_args
         self.mapping = mapping
@@ -230,7 +233,11 @@ class ModelLoader:
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
         self.model_weights_memory_tag = model_weights_memory_tag
+        self.model_weights_restore_mode = model_weights_restore_mode
         self._weight_pool_proxy = None
+
+    def __del__(self):
+        del self._weight_pool_proxy
 
     @staticmethod
     def load_config_and_apply_defaults(
@@ -308,8 +315,9 @@ class ModelLoader:
                     # inner virtual_memory_scope.
                     _apply_to_buffers_only(model, init_meta_tensor)
 
-                    with virtual_memory_scope(self.model_weights_memory_tag,
-                                              RestoreMode.NONE) as pool:
+                    with virtual_memory_scope(
+                            self.model_weights_memory_tag,
+                            self.model_weights_restore_mode) as pool:
                         model._apply(init_meta_tensor)
                     self._weight_pool_proxy = pool
                 else:
@@ -350,8 +358,9 @@ class ModelLoader:
                         memo[t] = torch.empty_like(t, device='cuda')
                     return memo[t]
 
-                with virtual_memory_scope(self.model_weights_memory_tag,
-                                          RestoreMode.PINNED) as pool:
+                with virtual_memory_scope(
+                        self.model_weights_memory_tag,
+                        self.model_weights_restore_mode) as pool:
                     model._apply(allocate_weights_on_cuda)
                 self._weight_pool_proxy = pool
 

@@ -1,10 +1,9 @@
 import contextlib
 import functools
 from contextlib import contextmanager
-from typing import Generator, List
+from typing import Generator
 
 import torch
-from strenum import StrEnum
 
 from tensorrt_llm.bindings.internal.runtime import \
     CudaVirtualMemoryAllocatorRestoreMode as RestoreMode
@@ -111,34 +110,6 @@ def maybe_scope(
         yield from _scope(tag, mode)
     else:
         yield
-
-
-class ExecutorMemoryType(StrEnum):
-    SAMPLER = "sampler"
-    DRAFTER = "drafter"
-    GUIDED_DECODER = "guided_decoder"
-    SPEC_RESOURCES = "spec_resource_manager"
-    INIT_KV_CACHE = "_no_capture_init_kv_cache"
-    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
-    MODEL_EXTRA = "model_extra"
-    EXTRA_RESOURCES = "executor_extra"
-    KV_CACHE = "kv_cache"
-    MODEL_ENGINE_MAIN = "model"
-    MODEL_ENGINE_DRAFT = "draft_model"
-    MODEL_WEIGHTS_MAIN = "model_weights"
-    MODEL_WEIGHTS_DRAFT = "draft_model_weights"
-
-
-def verify_sleep_wakeup_tags(tags_strs: List[str]) -> List[ExecutorMemoryType]:
-    tags = []
-    for tag_str in tags_strs:
-        try:
-            tags.append(ExecutorMemoryType(tag_str))
-        except ValueError:
-            raise ValueError(
-                f"Unknown memory tag '{tag_str}'."
-                f"Valid tags are: {[t.value for t in ExecutorMemoryType]}")
-    return tags
 
 
 def release_with_tag(*tags: str) -> int:

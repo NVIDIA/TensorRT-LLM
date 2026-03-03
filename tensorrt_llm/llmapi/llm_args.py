@@ -5,6 +5,7 @@ import math
 import os
 import types
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
@@ -28,7 +29,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import _str_to_torch_dtype_dict, mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank, prefer_pinned
 
 # yapf: disable
 # isort: off
@@ -1439,6 +1440,70 @@ class RayPlacementConfig(StrictBaseModel):
                     f"got {self.per_worker_gpu_share}")
 
         return self
+
+
+class ExecutorMemoryType(StrEnum):
+    """Types of GPU memory used by executor.
+
+     These are used by the sleep/wakeup feature to target specific type of memory.
+     """
+    SAMPLER = "sampler"
+    DRAFTER = "drafter"
+    GUIDED_DECODER = "guided_decoder"
+    SPEC_RESOURCES = "spec_resource_manager"
+    INIT_KV_CACHE = "_no_capture_init_kv_cache"
+    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
+    MODEL_EXTRA = "model_extra"
+    EXTRA_RESOURCES = "executor_extra"
+    KV_CACHE = "kv_cache"
+    MODEL_ENGINE_MAIN = "model"
+    MODEL_ENGINE_DRAFT = "draft_model"
+    MODEL_WEIGHTS_MAIN = "model_weights"
+    MODEL_WEIGHTS_DRAFT = "draft_model_weights"
+
+
+def _make_defaulted_restore_modes(
+        cases: Optional[dict[str, str]] = None) -> defaultdict:
+    default = "PINNED" if prefer_pinned() else "CPU"
+
+    if cases is None:
+        cases = {
+            ExecutorMemoryType.KV_CACHE: "NONE",
+        }
+
+    return defaultdict(lambda: default, cases)
+
+
+class SleepConfig(StrictBaseModel):
+    """Configuration for the LLM sleep/wakeup feature.
+    """
+
+    restore_modes: defaultdict[ExecutorMemoryType, str] | dict[
+        str, str] = Field(
+            default_factory=_make_defaulted_restore_modes,
+            description="Per-component RestoreMode for the sleep feature. "
+            "Keys are ExecutorMemoryType values (e.g. 'model', 'kv_cache'), "
+            "values are RestoreMode names (NONE, MEMSET, CPU, PINNED). "
+            "Unlisted entries default to PINNED.")
+
+    @field_validator('restore_modes')
+    @classmethod
+    def _validate_restore_modes(cls, v):
+        if isinstance(v, defaultdict):
+            for key in v:
+                if not isinstance(key, ExecutorMemoryType):
+                    raise ValueError(
+                        f"keys must be ExecutorMemoryType, got {type(key)} for {key}"
+                    )
+            return v
+
+        valid_modes = frozenset(["NONE", "MEMSET", "CPU", "PINNED"])
+        cases = {}
+        for key, value in v.items():
+            if value not in valid_modes:
+                raise ValueError(f"invalid restore_mode: {value}")
+            cases[ExecutorMemoryType(key)] = value
+        return _make_defaulted_restore_modes(cases)
 
 
 class PybindMirror(ABC):
@@ -3172,10 +3237,10 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    enable_sleep: bool = Field(
-        default=False,
-        description=
-        "Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. "
+    sleep_config: Optional[SleepConfig] = Field(
+        default=None,
+        description="Configuration for the LLM sleep feature. "
+        "Sleep feature requires extra setup that may slow down model loading. "
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
