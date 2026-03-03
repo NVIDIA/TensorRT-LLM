@@ -1,0 +1,15 @@
+compile_backend: torch-cudagraph
+enable_chunked_prefill: true
+model_factory: AutoModelForCausalLM
+runtime: trtllm
+kv_cache_config:
+  dtype: fp8
+  free_gpu_memory_fraction: 0.9
+attn_backend: trtllm
+transforms:
+  fuse_fp8_gemms:
+    stage: post_load_fusion
+    enabled: true
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: true
