@@ -194,23 +194,30 @@ class TeaCacheConfig(BaseModel):
         return self
 
 
-class PipelineConfig(BaseModel):
-    """General pipeline configuration."""
+class TorchCompileConfig(BaseModel):
+    """Configuration for torch.compile and autotuning."""
 
     enable_torch_compile: bool = True
-    torch_compile_models: List[str] = []  # empty = auto detect transformer components
-    torch_compile_mode: Literal["default", "max-autotune", "reduce-overhead"] = "default"
     enable_fullgraph: bool = False
-    fuse_qkv: bool = True
+    enable_autotune: bool = True
+
+
+class CudaGraphConfig(BaseModel):
+    """Configuration for CUDA graph capture/replay."""
+
     enable_cuda_graph: bool = False
+
+
+class PipelineConfig(BaseModel):
+    """Model-specific pipeline configuration."""
+
+    fuse_qkv: bool = True
     enable_layerwise_nvtx_marker: bool = False
 
-    # Offloading Config
+    # Offloading
     enable_offloading: bool = False
     offload_device: Literal["cpu", "cuda"] = "cpu"
     offload_param_pin_memory: bool = True
-
-    warmup_steps: int = 1  # Number of denoising steps to run during warmup (0 to disable)
 
 
 # =============================================================================
@@ -268,6 +275,8 @@ class DiffusionArgs(BaseModel):
 
     # Sub-configs (dict input for quant_config is coerced to QuantConfig in model_validator)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
+    torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
+    cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -390,6 +399,8 @@ class DiffusionModelConfig(BaseModel):
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
+    cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
     attention: AttentionConfig = PydanticField(default_factory=AttentionConfig)
     parallel: ParallelConfig = PydanticField(default_factory=ParallelConfig)
@@ -496,12 +507,15 @@ class DiffusionModelConfig(BaseModel):
 
         Args:
             checkpoint_dir: Path to checkpoint
-            args: DiffusionArgs containing user config (quant, pipeline, attention, parallel, teacache)
+            args: DiffusionArgs containing user config
+                - (torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
 
         # Extract sub-configs from args or use defaults
+        torch_compile_cfg = args.torch_compile if args else TorchCompileConfig()
+        cuda_graph_cfg = args.cuda_graph if args else CudaGraphConfig()
         pipeline_cfg = args.pipeline if args else PipelineConfig()
         attention_cfg = args.attention if args else AttentionConfig()
         parallel_cfg = args.parallel if args else ParallelConfig()
@@ -566,6 +580,8 @@ class DiffusionModelConfig(BaseModel):
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,
             # Sub-configs from DiffusionArgs
+            torch_compile=torch_compile_cfg,
+            cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
             attention=attention_cfg,
             parallel=parallel_cfg,

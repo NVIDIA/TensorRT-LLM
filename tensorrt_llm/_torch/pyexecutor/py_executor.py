@@ -623,6 +623,7 @@ class PyExecutor:
             # Start the sampler's async worker, if it is enabled
             if (isinstance(self.sampler, AsyncWorkerMixin)
                     and self.sampler.async_worker_enabled()):
+                logger.info("Starting the async worker for sampler D2H copies")
                 self.sampler.async_worker_start()
 
     def _set_global_steady_clock_offset(self):
@@ -1368,6 +1369,9 @@ class PyExecutor:
                                 scheduled_batch, guided_decoder_failed_requests)
 
                             self._update_request_states(scheduled_batch)
+                            if not self.disable_overlap_scheduler:
+                                self._update_generation_requests_that_will_complete_next_iteration(
+                                    scheduled_batch.generation_requests)
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -2178,6 +2182,13 @@ class PyExecutor:
                 else:
                     self._enqueue_responses([])
 
+                # Call set_exclude_last_generation_logits after _process_previous_batch.
+                # If set before, the response of a request may be incorrect, as it will
+                # use the wrong indices for generation logits when streaming is enabled.
+                if can_queue:
+                    self._update_generation_requests_that_will_complete_next_iteration(
+                        scheduled_batch.generation_requests)
+
                 if can_queue:
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
@@ -2820,6 +2831,47 @@ class PyExecutor:
                 for beam in range(0, beam_width):
                     req.add_new_token(first_gen_tokens[beam], beam)
 
+                self._maybe_prepend_logprobs_and_logits(req, beam_width)
+
+    def _maybe_prepend_logprobs_and_logits(self, req, beam_width):
+        """Prepend logprobs and generation logits for first_gen_tokens
+        if transferred from prefill."""
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return
+
+        if getattr(disagg_params, 'first_gen_log_probs', None) is not None:
+            if beam_width != 1:
+                logger.warning(
+                    "Skipping first_gen_log_probs prepend for "
+                    "request %s: beam_width=%s is not supported.",
+                    req.py_request_id, beam_width)
+            else:
+                req.py_result.append_log_probs(
+                    [disagg_params.first_gen_log_probs])
+
+        if getattr(disagg_params, 'first_gen_logits', None) is not None:
+            if beam_width != 1:
+                logger.warning(
+                    "Skipping first_gen_logits prepend for "
+                    "request %s: beam_width=%s is not supported.",
+                    req.py_request_id, beam_width)
+            else:
+                device = torch.device('cuda', self.device_id)
+                for logits_tensor in disagg_params.first_gen_logits:
+                    req.py_result.append_generation_logits(
+                        logits_tensor.to(device))
+
+    def _has_prepended_logits(self, req) -> bool:
+        """Check whether the request has first-gen logits prepended from
+        prefill that need a snapshot before response creation."""
+        if not self.should_exclude_last_generation_logits:
+            return False
+        disagg_params = getattr(req, 'py_disaggregated_params', None)
+        if disagg_params is None:
+            return False
+        return getattr(disagg_params, 'first_gen_logits', None) is not None
+
     @nvtx_range("_recv_disagg_gen_cache")
     def _recv_disagg_gen_cache(self, new_gen_reqs):
 
@@ -2999,6 +3051,19 @@ class PyExecutor:
             self._handle_errors(error_msg)
             return None
 
+    def _update_generation_requests_that_will_complete_next_iteration(
+            self, generation_requests: list[LlmRequest]):
+        """ Update the generation requests that will complete next iteration.
+
+        If overlap scheduling is enabled, we need update the state of generation requests that will complete next iteration
+        and adjust the exclude_last_generation_logits flag accordingly.
+        """
+        for request in generation_requests:
+            if request.state != LlmRequestState.GENERATION_COMPLETE and request.will_complete_next_iteration(
+            ):
+                request.set_exclude_last_generation_logits(False)
+                request.state = LlmRequestState.GENERATION_TO_COMPLETE
+
     def _update_request_states_tp(self, scheduled_requests: ScheduledRequests):
         # handle potential attention dp dummy request
         if self.active_requests and self.active_requests[
@@ -3023,13 +3088,6 @@ class PyExecutor:
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
-
-        for request in scheduled_requests.generation_requests:
-            if request.state != LlmRequestState.GENERATION_COMPLETE:
-                if not self.disable_overlap_scheduler and request.will_complete_next_iteration(
-                ):
-                    request.set_exclude_last_generation_logits(False)
-                    request.state = LlmRequestState.GENERATION_TO_COMPLETE
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):
@@ -3246,7 +3304,28 @@ class PyExecutor:
                 logger.debug(
                     f'Send first token response for request {req.py_request_id}'
                 )
+                # Snapshot prepended first_gen_logits for the response:
+                #
+                # 1. generation_logits is not stored on LlmResult; every
+                #    access goes through __getattr__ -> PyResult property
+                #    -> LogitsStorage, re-reading shared mutable state.
+                # 2. All streaming responses reference the same PyResult,
+                #    so later tokens mutate what earlier responses would
+                #    read.
+                # 3. With the overlap scheduler, exclude_last_generation_logits
+                #    is True, which would hide the prepended logits since
+                #    they are the only entry at this point.
+                #
+                # WAR: read the logits now (bypassing exclusion), then set
+                # the tensor directly on LlmResult as an instance attribute.
+                # This shadows __getattr__ so the consumer always gets the
+                # correct, frozen logits.
+                has_prepended_logits = self._has_prepended_logits(req)
+                logits_snapshot = (req.py_result.get_latest_logits_unexcluded()
+                                   if has_prepended_logits else None)
                 response = req.create_response(False, self.dist.rank)
+                if logits_snapshot is not None and response is not None:
+                    response.result.generation_logits = logits_snapshot
                 new_responses.append((req.py_request_id, response))
 
         self._enqueue_responses(new_responses)
@@ -3278,14 +3357,13 @@ class PyExecutor:
                         requests=[request])
                 continue
 
-            if request.is_generation_only_request():
+            if request.is_generation_only_request() and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
-                if not request.is_finished and (
-                        request.is_disagg_generation_transmission_in_progress or
-                    (not self.disable_overlap_scheduler
-                     and request.py_decoding_iter <= 1)):
+                if request.is_disagg_generation_transmission_in_progress or (
+                        not self.disable_overlap_scheduler
+                        and request.py_decoding_iter <= 1):
                     self.perf_manager.append_step_metrics(
                         request,
                         self.iter_counter,

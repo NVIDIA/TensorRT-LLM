@@ -176,6 +176,19 @@ def maybe_pad_for_mxfp4(weight: torch.Tensor,
     return weight
 
 
+def _pad_tensor_to_shape(tensor: torch.Tensor, shape: tuple) -> torch.Tensor:
+    """Pad tensor to match target shape. Used for post-shard alignment."""
+    if tensor.numel() == 0:
+        return tensor
+    if tensor.shape == shape:
+        return tensor
+    if len(tensor.shape) == 1:
+        return F.pad(tensor, (0, shape[0] - tensor.shape[0])).contiguous()
+    row_pad = shape[0] - tensor.shape[0]
+    col_pad = shape[1] - tensor.shape[1]
+    return F.pad(tensor, (0, col_pad, 0, row_pad)).contiguous()
+
+
 def interleave_linear_and_gate(x: torch.Tensor,
                                group_size: int = 64,
                                dim: int = -1) -> torch.Tensor:
@@ -2915,6 +2928,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
                 w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
 
+    def _round_up(self, x, alignment):
+        return (x + alignment - 1) // alignment * alignment
+
     def create_weights(self, module: torch.nn.Module):
         # Here we only enable padding for hidden_size > 1024 since there are small unit tests that expect no padding.
         if module.hidden_size > 1024 and module.hidden_size % 256 != 0:
@@ -2922,6 +2938,15 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             # For now let's keep input alignment same as weight alignment. There are practical reasons that this might be a different value.
             # See the comment in MXFP4WeightTRTLLMGenFusedMoEMethod for more details.
             self.input_hidden_alignment = 256
+
+        else:
+            # Weight scales require M % 128 in get_shuffle_matrix_sf_a_row_indices.
+            # Check if intermediate_size after padding satisfies this requirement.
+            # If not, set weight_alignment to 128.
+            intermediate_size_padded = self._round_up(
+                module.intermediate_size_per_partition, self.weight_alignment)
+            if intermediate_size_padded % 128 != 0:
+                self.weight_alignment = 128
 
         super().create_weights(module, bias_dtype=torch.float32)
 
@@ -2981,6 +3006,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             dst_w3_weight.copy_(w3_weight_shard.view(dst_w3_weight.dtype))
             dst_w1_weight.copy_(w1_weight_shard.view(dst_w1_weight.dtype))
         else:
+            w1_weight_shard = _pad_tensor_to_shape(w1_weight_shard,
+                                                   dst_w3_w1_weight_gpu.shape)
             dst_w3_w1_weight_gpu.copy_(
                 w1_weight_shard.view(dst_w3_w1_weight_gpu.dtype))
 
@@ -3038,6 +3065,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         epilogue_tile_m = 128
 
         # Keep weights in device buffer
+        w2_weight_shard = _pad_tensor_to_shape(w2_weight_shard,
+                                               dst_w2_weight_gpu.shape)
         dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
                                 non_blocking=dst_on_gpu)
         # Get permuted indices
@@ -3071,7 +3100,7 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
         alignment = _get_weight_alignment(self.weight_alignment,
                                           module.scaling_vector_size,
                                           module.tp_size,
-                                          w3_weight_scale.shape[0])
+                                          w1_weight_scale.shape[0])
         w1_weight_scale = maybe_pad_for_mxfp4(
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
@@ -3113,6 +3142,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                     w1_weight_scale.view(dst_w1_weight_scale.dtype))
         else:
             # Non-gated activation (e.g., ReLU2): buffer only contains w1 scale
+            w1_weight_scale = _pad_tensor_to_shape(
+                w1_weight_scale, dst_w3_w1_weight_scale_gpu.shape)
             dst_w3_w1_weight_scale_gpu.copy_(
                 w1_weight_scale.view(dst_w3_w1_weight_scale_gpu.dtype))
 
@@ -3170,6 +3201,8 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                             TensorParallelMode.ROW,
                                             device=device)
         # Keep weights in device buffer
+        w2_weight_scale = _pad_tensor_to_shape(w2_weight_scale,
+                                               dst_w2_weight_scale_gpu.shape)
         dst_w2_weight_scale_gpu.copy_(
             w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
 

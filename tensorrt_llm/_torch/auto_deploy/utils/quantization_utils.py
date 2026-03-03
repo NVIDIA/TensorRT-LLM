@@ -118,6 +118,10 @@ def should_skip_quantization(
         if not (is_linear_op(node_or_name) or is_bmm_op(node_or_name)):
             return True
         weight_name = extract_weight_name(node_or_name)
+        # extract_weight_name can return False when weight node is not found (e.g. after
+        # PR 10718 get_weight_node uses forward mapping; some graph shapes may have no mapping).
+        if weight_name is False or not isinstance(weight_name, str):
+            return True
         modname = weight_name.rpartition(".")[0]
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
