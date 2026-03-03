@@ -528,7 +528,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for GLM-4.7-Flash variants"""
 
     MODEL_NAME = "GLM-4.7-Flash"
-    MODEL_PATH_BF16 = "/lustre/fs1/portfolios/coreai/projects/coreai_comparch_autodeploy/autodeploy_data/hf_home/hub/models--zai-org--GLM-4.7-Flash/snapshots/a9308079ef95921451a690cd2d16cb572e564642/"
+    MODEL_PATH_BF16 = hf_id_to_local_model_dir("zai-org/GLM-4.7-Flash")
     MODEL_PATH_NVFP4 = hf_id_to_local_model_dir("DeepInfra/GLM-4.7-Flash-NVFP4")
 
     # Set minimum possible seq len + small buffer, for test speed & memory usage
