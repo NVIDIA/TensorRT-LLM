@@ -149,9 +149,9 @@ LTX2 generates video **with audio** from text prompts or input images.
 It uses a Gemma3 text encoder (provided separately via `--text_encoder_path`)
 and supports BF16, FP8, and FP4 precision checkpoints.
 
-### LTX-2 Native Checkpoint Format
+### LTX-2 Specific Checkpoint Format
 
-LTX-2 native checkpoints pack all model components into a **single safetensors
+LTX-2 specific checkpoints pack all model components into a **single safetensors
 file** with prefixed tensor keys. This document describes the layout using the
 BF16 checkpoint as a reference.
 
@@ -186,9 +186,9 @@ prefix when loading (e.g., `model.diffusion_model.proj_out.weight` becomes
 **Text-to-Video (single GPU):**
 ```bash
 python visual_gen_ltx2.py \
-    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/bf16/ \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/ \
     --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
-    --prompt "A woman with long brown hair and light skin smiles" \
+    --prompt "A cute cat playing piano" \
     --height 720 --width 1280 --num_frames 121 \
     --steps 40 --guidance_scale 4.0 --seed 42 \
     --output_path output_t2v.mp4
@@ -197,10 +197,10 @@ python visual_gen_ltx2.py \
 **Image-to-Video:**
 ```bash
 python visual_gen_ltx2.py \
-    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/bf16/ \
+    --model_path ${MODEL_ROOT}/LTX-2-checkpoint/ \
     --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
-    --prompt "A fluffy white puppy running" \
-    --image /path/to/input_image.jpg \
+    --prompt "A cute cat playing piano" \
+    --image ${PROJECT_ROOT}/examples/visual_gen/cat_piano.png \
     --image_cond_strength 1.0 \
     --height 720 --width 1280 --num_frames 121 \
     --steps 40 --seed 42 \
@@ -217,7 +217,7 @@ appropriate directory:
 python visual_gen_ltx2.py \
     --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp8/ \
     --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
-    --prompt "A serene mountain landscape at sunset" \
+    --prompt "A cute cat playing piano" \
     --height 720 --width 1280 --num_frames 121 \
     --output_path output_fp8.mp4
 
@@ -225,7 +225,7 @@ python visual_gen_ltx2.py \
 python visual_gen_ltx2.py \
     --model_path ${MODEL_ROOT}/LTX-2-checkpoint/fp4/ \
     --text_encoder_path ${MODEL_ROOT}/gemma-3-12b-it \
-    --prompt "A serene mountain landscape at sunset" \
+    --prompt "A cute cat playing piano" \
     --height 512 --width 768 --num_frames 121 \
     --output_path output_fp4.mp4
 ```
