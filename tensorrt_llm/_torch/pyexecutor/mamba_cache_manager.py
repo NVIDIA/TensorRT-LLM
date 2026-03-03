@@ -170,18 +170,25 @@ class PythonMambaCacheManager(BaseResourceManager):
     class State:
         """Base state container for Mamba cache."""
         conv: torch.Tensor
+        # Represents last state, or "two back" if prev_num_accepted_tokens is > 0
         temporal: torch.Tensor
 
         def at_layer_idx(self, layer: int):
             kwargs = {}
             for k, v in vars(self).items():
-                kwargs[k] = v[layer]
+                if k == "prev_num_accepted_tokens":
+                    kwargs[k] = v
+                else:
+                    kwargs[k] = v[layer]
             return type(self)(**kwargs)
 
     @dataclass(frozen=True, kw_only=True)
     class SpeculativeState(State):
         """Speculative state with intermediate states for draft tokens."""
-        intermediate_ssm: torch.Tensor
+        # This is # of accepted tokens, not just draft, so is always at least 1 if drafting.
+        # 0 means that the temporal saved state is actually the last state, not two back.
+        prev_num_accepted_tokens: torch.Tensor
+        intermediate_ssm_update_inputs: torch.Tensor
         intermediate_conv_window: torch.Tensor
 
     def __init__(
@@ -217,12 +224,15 @@ class PythonMambaCacheManager(BaseResourceManager):
         # check that can be partitioned
         assert nheads % tp_size == 0, "nheads must be divisible by tp_size"
         assert conv_dim % tp_size == 0, "conv_dim must be divisible by tp_size"
+        assert n_groups % tp_size == 0, "n_groups must be divisible by tp_size"
 
         # partition conv_dim and nheads
         d_inner_local = d_inner // tp_size
         ng_ds_local = n_groups * d_state // tp_size
         conv_dim = conv_dim // tp_size
         nheads = nheads // tp_size
+        n_groups = n_groups // tp_size
+        d_inner = d_inner // tp_size
 
         # Per-section dims for conv_state.
         # Qwen3-Next: [Q | K | V] = [ng*ds, ng*ds, d_inner]
@@ -266,12 +276,18 @@ class PythonMambaCacheManager(BaseResourceManager):
 
         # create state container
         if speculative_num_draft_tokens is not None:
+            prev_num_accepted_tokens = torch.zeros(
+                size = (max_batch_size,),
+                dtype = int,
+                device=device,
+            )
 
-            # Cache intermediate SSM states per draft token(include new sampled token) during target model verification phase
-            intermediate_ssm_states = torch.zeros(
-                size=(num_local_layers, self.spec_state_size,
-                      speculative_num_draft_tokens + 1) + ssm_state_shape,
-                dtype=self.mamba_ssm_cache_dtype,
+            # what do we need to go to state_{i-2} to state_{i-1}?
+            # Just x (d_inner), dt (nheads), B (n_groups * dstate).
+            intermediate_ssm_update_inputs = torch.zeros(
+                size=(num_local_layers, max_batch_size,
+                      speculative_num_draft_tokens + 1, d_inner + nheads + n_groups * d_state),
+                dtype=dtype,
                 device=device,
             )
 
@@ -286,7 +302,8 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache = self.SpeculativeState(
                 conv=conv_states,
                 temporal=ssm_states,
-                intermediate_ssm=intermediate_ssm_states,
+                prev_num_accepted_tokens = prev_num_accepted_tokens,
+                intermediate_ssm_update_inputs = intermediate_ssm_update_inputs,
                 intermediate_conv_window=intermediate_conv_window_cache,
             )
 
@@ -295,7 +312,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                 f"max_mamba_cache_size: {max_batch_size}, "
                 f"conv_state size: {get_tensor_size_bytes(conv_states) / GB:.2f}GB, "
                 f"ssm_state size: {get_tensor_size_bytes(ssm_states) / GB:.2f}GB, "
-                f"intermediate_ssm_state_cache size: {get_tensor_size_bytes(intermediate_ssm_states) / GB:.2f}GB, "
+                f"prev_num_accepted_tokens_inputs size: {get_tensor_size_bytes(prev_num_accepted_tokens) / GB:.2f}GB, "
+                f"intermediate_ssm_update_inputs size: {get_tensor_size_bytes(intermediate_ssm_update_inputs) / GB:.2f}GB, "
                 f"intermediate_conv_window_cache size: {get_tensor_size_bytes(intermediate_conv_window_cache) / GB:.2f}GB"
             )
         else:
@@ -353,6 +371,8 @@ class PythonMambaCacheManager(BaseResourceManager):
                 block = self.mamba_cache_free_blocks.pop()
                 self.mamba_cache_index[r] = block
                 self.state_indices_list.append(block)
+                if isinstance(self.mamba_cache, self.SpeculativeState):
+                    self.mamba_cache.prev_num_accepted_tokens[block] = 0
         self.state_indices[:len(self.state_indices_list)].copy_(
             torch.tensor(self.state_indices_list,
                          dtype=torch.int32,
@@ -422,12 +442,12 @@ class PythonMambaCacheManager(BaseResourceManager):
         layer_offset = self.mamba_layer_offsets[layer_idx]
         return self.mamba_cache.at_layer_idx(layer_offset).temporal
 
-    def get_intermediate_ssm_states(self,
-                                    layer_idx: int) -> Optional[torch.Tensor]:
-        if not isinstance(self.mamba_cache, self.SpeculativeState):
-            return None
-        layer_offset = self.mamba_layer_offsets[layer_idx]
-        return self.mamba_cache.at_layer_idx(layer_offset).intermediate_ssm
+    # def get_intermediate_ssm_states(self,
+    #                                 layer_idx: int) -> Optional[torch.Tensor]:
+    #     if not isinstance(self.mamba_cache, self.SpeculativeState):
+    #         return None
+    #     layer_offset = self.mamba_layer_offsets[layer_idx]
+    #     return self.mamba_cache.at_layer_idx(layer_offset).intermediate_ssm
 
     def get_intermediate_conv_states(self,
                                      layer_idx: int) -> Optional[torch.Tensor]:
@@ -459,7 +479,8 @@ class PythonMambaCacheManager(BaseResourceManager):
             self.mamba_cache = self.SpeculativeState(
                 conv=torch.tensor([]),
                 temporal=torch.tensor([]),
-                intermediate_ssm=torch.tensor([]),
+                intermediate_ssm_update_inputs=([]),
+                prev_num_accepted_tokens=([]),
                 intermediate_conv_window=torch.tensor([]),
             )
         else:
@@ -480,19 +501,14 @@ class PythonMambaCacheManager(BaseResourceManager):
             num_contexts:num_contexts + num_gens] - 1
         state_indices_d = self.state_indices[num_contexts:num_contexts +
                                              num_gens]
+        # State is handled incrementally.
+        self.mamba_cache.prev_num_accepted_tokens[state_indices_d] = num_accepted_tokens[
+            num_contexts:num_contexts + num_gens]
 
+        # Conv we saved all the options, so carry them over.
         conv_states = self.mamba_cache.conv
-        ssm_states = self.mamba_cache.temporal
-
-        intermediate_state_cache = self.mamba_cache.intermediate_ssm
         intermediate_conv_window_cache = self.mamba_cache.intermediate_conv_window
-
         src_state_indices = self.intermediate_state_indices[:num_gens]
-
-        accepted_ssm_state = intermediate_state_cache[:, src_state_indices,
-                                                      num_accepted_draft_tokens]
-        ssm_states[:, state_indices_d, :] = accepted_ssm_state
-
         accepted_conv_state = intermediate_conv_window_cache[:,
                                                              src_state_indices,
                                                              num_accepted_draft_tokens]

@@ -18,6 +18,9 @@ import functools
 import torch
 from einops import rearrange, repeat
 from flashinfer.mamba import selective_state_update as selective_state_update_fi
+
+from .incremental_selective_state_update import \
+    incremental_selective_state_update as incremental_update_func_mtp
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
@@ -304,7 +307,7 @@ class Mamba2Mixer(nn.Module):
         preallocated_ssm_out = torch.empty(
             [
                 zxbcdt.shape[0],
-                (self.num_heads * self.head_dim) // self.tp_size,
+                (self.tp_nheads * self.head_dim)
             ],
             dtype=zxbcdt.dtype,
             device=zxbcdt.device,
@@ -403,6 +406,7 @@ class Mamba2Mixer(nn.Module):
 
                 def conv1d():
                     # TODO:support tree structure [TRTLLM-10320]
+                    # XXX TODO: Maybe write output to the places we will save to, to simplify incremental kernel.
                     xbc_d_processed = causal_conv1d_update_triton(
                         xbc_d_reshaped,
                         conv_states,
@@ -418,7 +422,6 @@ class Mamba2Mixer(nn.Module):
                         num_decode_tokens, -1)
 
             else:
-
                 def conv1d():
                     return causal_conv1d_update(
                         xbc_d,
@@ -471,50 +474,35 @@ class Mamba2Mixer(nn.Module):
             dt_bias = repeat(self.dt_bias, "h -> h p", p=self.head_dim)
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
-                intermediate_ssm_states = layer_cache.intermediate_ssm
-                # Build kwargs for MTP selective_state_update
-                mtp_kwargs = dict(
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_ssm_states,
-                    cache_steps=draft_token_num,
-                    intermediate_state_indices=intermediate_state_indices,
-                )
-                if self._use_stochastic_rounding:
-                    mtp_kwargs['rand_seed'] = torch.randint(0,
-                                                            2**62, (1, ),
-                                                            device=x_d.device,
-                                                            dtype=torch.int64)
-                    mtp_kwargs['philox_rounds'] = self._philox_rounds
-
-                self.selective_state_update_func(
-                    ssm_states,
+                incremental_update_func_mtp(
+                    ssm_states, # in place
+                    layer_cache.intermediate_ssm_update_inputs, # in place
+                    layer_cache.prev_num_accepted_tokens,
                     x_d.view(
                         num_decodes,
                         draft_token_num,
-                        self.num_heads // self.tp_size,
+                        self.tp_nheads,
                         self.head_dim,
                     ),
                     dt_d.view(
                         num_decodes,
                         draft_token_num,
-                        self.num_heads // self.tp_size,
+                        self.tp_nheads,
                         self.head_dim,
                     ),
                     A,
                     B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
                     C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
-                    D,
-                    **mtp_kwargs,
+                    out=preallocated_ssm_out_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.tp_nheads,
+                        self.head_dim,
+                    ),
+                    D=D,
+                    dt_bias = dt_bias,
+                    dt_softplus=self.delta_softplus,
+                    state_batch_indices=state_indices_d[:num_decodes],
                 )
             else:
                 # Build kwargs for selective_state_update
