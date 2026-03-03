@@ -810,6 +810,46 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
     def on_update_kv_lens(self):
         # After changing the kv_lens/kv_lens_cuda, we may need to update other metadatas.
         # Especially for the changes in the _preprocess_inputs() of model_engine.py.
+        #
+        # NOTE:
+        # In overlap scheduler + speculative decoding, kv_lens_cuda can be corrected at runtime
+        # (inside _preprocess_inputs) to account for variable accepted tokens. The indexer
+        # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
+        # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
+        if self.kv_cache_manager is not None and self.num_tokens > 0:
+            head_dim = self.kv_cache_manager.index_head_dim
+            tokens_per_block = self.kv_cache_manager.tokens_per_block
+            quant_block_size = self.kv_cache_manager.quant_block_size
+            scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
+            block_stride = tokens_per_block * (head_dim + scale_size)
+            scale_base_offset = tokens_per_block * head_dim
+
+            seq_lens = self.seq_lens_cuda[:self.num_seqs]
+            # Runtime cached lengths after overlap/spec-dec correction.
+            start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
+
+            # Reuse request-per-token mapping prepared in metadata.prepare().
+            # This avoids repeat_interleave in graph-capture mode.
+            req_indices = self.req_idx_per_token[:self.num_tokens].to(
+                dtype=torch.int64)
+            seq_starts = torch.cumsum(
+                seq_lens, dim=0, dtype=torch.int64) - seq_lens.to(torch.int64)
+            token_offsets = torch.arange(
+                self.num_tokens, device=seq_lens.device,
+                dtype=torch.int64) - seq_starts[req_indices]
+
+            global_positions = start_positions[req_indices] + token_offsets
+            block_indices_in_seq = global_positions // tokens_per_block
+            pos_in_blocks = global_positions % tokens_per_block
+
+            block_ids = self.indexer_k_cache_block_offsets[
+                req_indices, block_indices_in_seq].to(torch.int64)
+            self.slot_mapping_fp8[:self.num_tokens] = (
+                block_ids * block_stride + pos_in_blocks * head_dim)
+            self.slot_mapping_scale[:self.num_tokens] = (
+                block_ids * block_stride + scale_base_offset +
+                pos_in_blocks * scale_size)
+
         if self.num_generations > 0:
             torch.cumsum(
                 self.kv_lens_cuda[self.num_contexts:self.
