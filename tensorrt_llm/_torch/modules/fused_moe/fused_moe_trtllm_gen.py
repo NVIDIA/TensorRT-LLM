@@ -291,6 +291,11 @@ class TRTLLMGenFusedMoE(MoE):
             raise ValueError(f"Unsupported activation type: {activation_type}")
 
     def _check_op_backend_support(self) -> bool:
+        use_flashinfer = os.environ.get("TRTLLM_GEN_FUSED_MOE_USE_FLASHINFER",
+                                        "0")
+        if use_flashinfer != "1":
+            return False
+
         # Unsupported activation type or routing method
         if self.activation_type == ActivationType.Relu2:
             return False
