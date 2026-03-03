@@ -41,7 +41,15 @@ Replace HF ops with `torch_*` prefixed AD reference ops. **Never** use `triton_*
 2. Add import + `__all__` entry in `models/custom/__init__.py`.
 3. If config not in installed transformers, bundle config class and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`.
 
-## Phase 5 — Hierarchical Tests
+## Phase 5 — Model Input Contract
+The custom model's forward signature must follow these rules:
+
+1. **Always `input_ids`** — The top-level model always receives `input_ids`. A submodule graph may internally receive `inputs_embeds` (e.g., after the embedding layer), but the exported entry point takes token IDs.
+2. **Always `position_ids`** — Vanilla sequential `position_ids` are always provided. If the model uses a non-standard RoPE variant or custom position encoding, the model must compute it internally on top of these vanilla `position_ids`.
+3. **Multi-modal inputs** — If the model supports vision/audio/etc., those additional inputs are passed during prefill alongside `input_ids`.
+4. **No attention mask, no cache inputs, no HF-runtime features** — Do not accept `attention_mask`, `past_key_values`, `use_cache`, or similar HF-runtime arguments. AD manages masking and caching via its own transforms and runtime.
+
+## Phase 6 — Hierarchical Tests
 Create `tests/unittest/_torch/auto_deploy/unit/singlegpu/models/test_{name}_modeling.py`. Use `test_glm4_moe_lite_modeling.py` as template. **No smoke tests.** Small config (hidden=64, layers=2-3, vocab=1000). Use `pytest.skip` if HF class unavailable.
 
 **HF Reference Strategy:** Equivalence tests compare our custom implementation against the HF reference with identical weights and inputs.
@@ -55,7 +63,7 @@ Create `tests/unittest/_torch/auto_deploy/unit/singlegpu/models/test_{name}_mode
 3. **Full model equivalence** — End-to-end logits comparison. Use a small config with <10 layers that covers the essence of the architecture (e.g., at least one of each layer type).
 4. **Export test** — `torch_export_to_gm` with `Dim.DYNAMIC` for batch+seq, verify finite output, test a second shape.
 
-## Phase 6 — Independent Review (MANDATORY)
+## Phase 7 — Independent Review (MANDATORY)
 
 Invoke the `onboard-reviewer` subagent with ONLY the following information:
 - Model name
@@ -70,9 +78,9 @@ If the reviewer returns **FAIL** on any item:
 3. Invoke the reviewer again with the same minimal inputs
 4. Repeat until you get a full **PASS**
 
-Do NOT proceed to Phase 7 until the reviewer returns PASS.
+Do NOT proceed to Phase 8 until the reviewer returns PASS.
 
-## Phase 7 — Summary Report
+## Phase 8 — Summary Report
 Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified, (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took).
 
 ## Key Gotchas
