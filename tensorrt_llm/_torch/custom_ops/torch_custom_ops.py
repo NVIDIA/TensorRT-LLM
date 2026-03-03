@@ -11,6 +11,8 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
+from tensorrt_llm.quantization.utils.fp8_quantize import \
+    triton_fp8_quantize_1x128
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
@@ -1459,6 +1461,9 @@ def deep_gemm_gen_tuning_buckets(x: int):
 
 
 class fp8SwapABGemmRunner(TunableRunner):
+    TACTIC_CUDA_QUANT = 0
+    TACTIC_TRITON_QUANT = 1
+
     tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
         0, 0, deep_gemm_gen_tuning_buckets), ), )
 
@@ -1477,7 +1482,18 @@ class fp8SwapABGemmRunner(TunableRunner):
         inputs: List[torch.Tensor],
         profile: OptimizationProfile,
     ) -> List[int]:
-        return [0]
+        return [self.TACTIC_CUDA_QUANT, self.TACTIC_TRITON_QUANT]
+
+    def _quantize(self, input: torch.Tensor, tactic: int):
+        # SM100-only: CUDA kernel returns scale as [scale_k, m] (2D) on SM100,
+        # but 1D with m_padded stride on SM90
+        if tactic == self.TACTIC_TRITON_QUANT:
+            a, a_sf = triton_fp8_quantize_1x128(input, use_ue8m0=True)
+        else:
+            a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
+        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            a_sf.transpose(0, 1))
+        return a, a_sf
 
     def forward(
         self,
@@ -1485,9 +1501,7 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
-        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
-        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
-            a_sf.transpose(0, 1))
+        a, a_sf = self._quantize(input, tactic)
         output = torch.empty(
             (input.size(0), weight.size(0)),
             device=input.device,
