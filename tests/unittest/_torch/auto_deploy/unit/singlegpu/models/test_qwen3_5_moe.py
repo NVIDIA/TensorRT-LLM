@@ -25,14 +25,12 @@ comparison tests (reference re-implementations on the same weights):
  17. Qwen3_5MoeInputProcessor adds mrope_position_deltas to multimodal_data
  18. VLM wrapper validates position_ids for text-only path
 
-Mixed batch position handling (mRoPE fix):
+Mixed batch position handling (mRoPE computed in forward):
  19. persistent_multimodal_keys attribute on Qwen3_5MoeModel
- 20. prepare_extra_args builds full 3D positions for mixed multimodal+text prefill
- 21. prepare_extra_args is a no-op for fully text-only batches
- 22. Input processor adds mrope_position_ids_3d alongside deltas
- 23. Prefill-only with pre-computed 3D positions (Case 2)
- 24. Mixed prefill+decode batch position assembly (Case 1)
- 25. Decode-only with deltas (Case 3)
+ 20. Forward computes 3D positions from input_ids + image_grid_thw (prefill-only)
+ 21. Forward handles mixed prefill+decode with per-request position computation
+ 22. Forward handles mixed multimodal+text prefill requests
+ 23. Decode-only with deltas (Case 2)
 """
 
 import pytest
@@ -1216,11 +1214,8 @@ def test_multimodal_forward_matches_reference():
     """Compare multimodal wrapper forward against step-by-step HF reference.
 
     Tests the full pipeline: vision encoding + embedding merge + mRoPE + LM.
-    Runs the same input through both the wrapper's forward() and the
-    ref_multimodal_forward() that re-implements each step explicitly.
-
-    The wrapper now expects pre-computed mrope_position_ids_3d (as the input
-    processor would provide), rather than recomputing positions internally.
+    The wrapper computes 3D mRoPE positions internally from input_ids +
+    image_grid_thw, matching the reference re-implementation.
     """
     config = _make_small_composite_config()
     torch.manual_seed(42)
@@ -1246,24 +1241,11 @@ def test_multimodal_forward_matches_reference():
     text_after = [4, 5]
     input_ids = torch.tensor([text_before + vision_part + text_after])
 
-    # Pre-compute 3D positions (as the input processor would)
-    mrope_position_ids_3d, mrope_position_deltas = compute_mrope_positions(
-        input_ids=input_ids,
-        image_grid_thw=image_grid_thw,
-        video_grid_thw=None,
-        image_token_id=config.image_token_id,
-        video_token_id=config.video_token_id,
-        vision_start_token_id=config.vision_start_token_id,
-        spatial_merge_size=vc.spatial_merge_size,
-    )
-
-    # Our wrapper forward with pre-computed positions (Case 2: prefill-only)
+    # Model computes 3D positions internally from input_ids + image_grid_thw
     our_output = model(
         input_ids=input_ids,
         pixel_values=pixel_values,
         image_grid_thw=image_grid_thw,
-        mrope_position_ids_3d=mrope_position_ids_3d,
-        mrope_position_deltas=mrope_position_deltas,
     )
 
     # Reference: step-by-step re-implementation
@@ -1698,99 +1680,38 @@ def test_persistent_multimodal_keys_attribute():
 
 
 @torch.no_grad()
-def test_prepare_extra_args_mixed_multimodal_text_prefill():
-    """prepare_extra_args should build a complete mrope_position_ids_3d
-    covering all prefill tokens, including text-only prefill requests."""
-    from tensorrt_llm._torch.auto_deploy.shim.ad_executor import RequestContext
-
-    # Simulate a batch: 1 multimodal prefill (10 tokens), 1 text-only prefill (5 tokens),
-    # 1 decode (1 token)
-    mm_pos = torch.arange(10).unsqueeze(0).unsqueeze(0).expand(3, 1, -1) + 100
-    extra_args = {
-        "mrope_position_ids_3d": [mm_pos],
-    }
-    request_contexts = [
-        RequestContext(seq_len=10, input_pos=0, is_context=True, has_multimodal=True),
-        RequestContext(seq_len=5, input_pos=0, is_context=True, has_multimodal=False),
-        RequestContext(seq_len=1, input_pos=50, is_context=False, has_multimodal=False),
-    ]
-
-    result = Qwen3_5MoeModel.prepare_extra_args(extra_args, request_contexts)
-    merged = result["mrope_position_ids_3d"]
-
-    assert len(merged) == 1, "Should produce a single concatenated tensor"
-    merged_t = merged[0]
-    assert merged_t.shape[-1] == 15, (
-        f"Expected 15 prefill tokens (10 mm + 5 text), got {merged_t.shape[-1]}"
-    )
-
-    # First 10 tokens: multimodal positions (100..109)
-    torch.testing.assert_close(merged_t[:, :, :10], mm_pos)
-
-    # Last 5 tokens: text-only positions (0..4 replicated across all 3 dims)
-    text_pos = torch.arange(0, 5).unsqueeze(0).unsqueeze(0).expand(3, 1, -1)
-    torch.testing.assert_close(merged_t[:, :, 10:], text_pos)
-
-
-@torch.no_grad()
-def test_prepare_extra_args_all_text_prefill():
-    """prepare_extra_args with no multimodal data is a no-op (Case 3 handles it)."""
-    from tensorrt_llm._torch.auto_deploy.shim.ad_executor import RequestContext
-
-    extra_args = {}
-    request_contexts = [
-        RequestContext(seq_len=8, input_pos=0, is_context=True, has_multimodal=False),
-    ]
-
-    result = Qwen3_5MoeModel.prepare_extra_args(extra_args, request_contexts)
-    assert "mrope_position_ids_3d" not in result, (
-        "Text-only batch should not create mrope_position_ids_3d"
-    )
-
-
-@torch.no_grad()
-def test_input_processor_adds_mrope_position_ids_3d():
-    """Qwen3_5MoeInputProcessor should compute and attach mrope_position_ids_3d
-    alongside mrope_position_deltas when image_grid_thw is present."""
+def test_vlm_wrapper_prefill_only_with_images():
+    """Prefill-only with images: the model forward should compute 3D mRoPE
+    positions from input_ids + image_grid_thw, matching compute_mrope_positions."""
     config = _make_small_composite_config()
-    merge = config.vision_config.spatial_merge_size
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
     grid_t, grid_h, grid_w = 1, 4, 4
-    num_vision_tokens = grid_t * (grid_h // merge) * (grid_w // merge)
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
 
     text_before = [1, 2, 3]
-    vision_start = [config.vision_start_token_id]
-    img_tokens = [config.image_token_id] * num_vision_tokens
-    text_after = [4, 5, 6]
-    fake_token_ids = text_before + vision_start + img_tokens + text_after
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [4, 5]
+    input_ids = torch.tensor([text_before + vision_part + text_after])
 
-    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]])
-    fake_extra = {
-        "multimodal_data": {
-            "pixel_values": torch.randn(1, 3, 4, 4),
-            "image_grid_thw": image_grid_thw,
-        }
-    }
-
-    def fake_base(inputs, sampling_params):
-        return (fake_token_ids, fake_extra)
-
-    processor = Qwen3_5MoeInputProcessor(base_processor=fake_base, config=config)
-    _, extra_out = processor({"prompt": "test"}, None)
-    mm_data = extra_out["multimodal_data"]
-
-    assert "mrope_position_ids_3d" in mm_data, (
-        "InputProcessor should add mrope_position_ids_3d to multimodal_data"
-    )
-    pos_3d = mm_data["mrope_position_ids_3d"]
-    assert pos_3d.shape[0] == 3, f"Expected first dim = 3, got {pos_3d.shape[0]}"
-    assert pos_3d.shape[-1] == len(fake_token_ids), (
-        f"Expected last dim = {len(fake_token_ids)}, got {pos_3d.shape[-1]}"
+    output = model(
+        input_ids=input_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
     )
 
-    # Verify it matches the standalone function
-    input_ids_t = torch.tensor([fake_token_ids], dtype=torch.long)
-    ref_pos, _ = compute_mrope_positions(
-        input_ids=input_ids_t,
+    # Reference: compute 3D positions and call text model directly
+    expected_pos_3d, _ = compute_mrope_positions(
+        input_ids=input_ids,
         image_grid_thw=image_grid_thw,
         video_grid_thw=None,
         image_token_id=config.image_token_id,
@@ -1798,104 +1719,12 @@ def test_input_processor_adds_mrope_position_ids_3d():
         vision_start_token_id=config.vision_start_token_id,
         spatial_merge_size=merge,
     )
-    torch.testing.assert_close(pos_3d, ref_pos)
-
-
-@torch.no_grad()
-def test_vlm_wrapper_prefill_only_precomputed_positions():
-    """Case 2: prefill-only batch with pre-computed mrope_position_ids_3d should
-    use those positions directly without modification."""
-    config = _make_small_composite_config()
-    torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
-    model.eval()
-
-    B, S = 1, 8
-    input_ids = torch.randint(0, 50, (B, S))
-
-    # Simulate pre-computed 3D positions (as from input processor)
-    fake_pos_3d = torch.arange(S).unsqueeze(0).unsqueeze(0).expand(3, B, -1)
-
-    output = model(
-        input_ids=input_ids,
-        mrope_position_ids_3d=fake_pos_3d,
-    )
-
-    # Reference: directly call text model with the same 3D positions
     inputs_embeds = model.model.get_input_embeddings()(input_ids)
-    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=fake_pos_3d)
-    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
-
-    torch.testing.assert_close(
-        output.logits,
-        ref_logits,
-        rtol=1e-5,
-        atol=1e-5,
-        msg="Prefill-only with pre-computed 3D positions should pass them through directly",
-    )
-
-
-@torch.no_grad()
-def test_vlm_wrapper_mixed_batch_position_assembly():
-    """Case 1: mixed prefill+decode batch with mrope_position_ids_3d + batch_info
-    should stitch pre-computed prefill positions with delta-adjusted decode positions."""
-    config = _make_small_composite_config()
-    torch.manual_seed(42)
-    model = Qwen3_5MoeForConditionalGeneration(config)
-    model.eval()
-
-    # Simulate a mixed batch: 1 prefill seq (6 tokens) + 2 decode seqs (1 token each)
-    num_prefill_seqs = 1
-    num_prefill_tokens = 6
-    num_decode_seqs = 2
-    total_tokens = num_prefill_tokens + num_decode_seqs
-
-    # Flattened input_ids: [1, total_tokens]
-    input_ids = torch.randint(0, 50, (1, total_tokens))
-
-    # Flattened position_ids: [1, total_tokens]
-    # Prefill: 0..5, Decode: 100 (seq1), 200 (seq2)
-    prefill_pos = list(range(num_prefill_tokens))
-    decode_pos = [100, 200]
-    position_ids = torch.tensor([prefill_pos + decode_pos])
-
-    # Pre-computed 3D positions for prefill (from input processor)
-    # Use distinct values per dim to verify correct stitching
-    prefill_3d = torch.stack(
-        [
-            torch.arange(num_prefill_tokens).unsqueeze(0),  # T
-            torch.arange(10, 10 + num_prefill_tokens).unsqueeze(0),  # H
-            torch.arange(20, 20 + num_prefill_tokens).unsqueeze(0),  # W
-        ]
-    )  # [3, 1, 6]
-
-    # Deltas: per-request [num_total_seqs, 1]
-    # Prefill seq delta = -3, Decode seq1 delta = -5, Decode seq2 delta = 0
-    deltas = torch.tensor([[-3], [-5], [0]])
-
-    batch_info = torch.tensor(
-        [num_prefill_seqs, num_prefill_tokens, num_decode_seqs], dtype=torch.int32
-    )
-
-    output = model(
-        input_ids=input_ids,
-        position_ids=position_ids,
-        mrope_position_ids_3d=prefill_3d,
-        mrope_position_deltas=deltas,
-        batch_info=batch_info,
-    )
-
-    # Manually construct the expected 3D position_ids
-    # Prefill part: use prefill_3d directly
-    # Decode part: position_ids + gen_deltas (gen_deltas = deltas[num_prefill_seqs:])
-    gen_deltas = deltas[num_prefill_seqs:]  # [[-5], [0]]
-    decode_2d = position_ids[..., num_prefill_tokens:]  # [[100, 200]]
-    decode_adjusted = decode_2d + gen_deltas.T  # [[95, 200]]
-    decode_3d = decode_adjusted[None].expand(3, -1, -1)  # [3, 1, 2]
-    expected_pos_3d = torch.cat([prefill_3d, decode_3d], dim=-1)  # [3, 1, 8]
-
-    # Reference: directly call text model with expected positions
-    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
     text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
     ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
 
@@ -1904,7 +1733,172 @@ def test_vlm_wrapper_mixed_batch_position_assembly():
         ref_logits,
         rtol=1e-5,
         atol=1e-5,
-        msg="Mixed batch should stitch prefill 3D positions with delta-adjusted decode positions",
+        msg="Prefill-only with images should compute 3D positions internally",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_mixed_prefill_decode_with_images():
+    """Mixed prefill+decode batch with images in prefill: the model forward
+    should compute 3D positions per prefill request and stitch with decode."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+
+    # Build prefill input_ids (1 image request)
+    text_before = [1, 2, 3]
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [4, 5]
+    prefill_tokens = text_before + vision_part + text_after
+    num_prefill_tokens = len(prefill_tokens)
+
+    # 1 decode token
+    decode_token = [6]
+    all_tokens = prefill_tokens + decode_token
+
+    input_ids = torch.tensor([all_tokens])
+    prefill_pos = list(range(num_prefill_tokens))
+    decode_pos = [200]
+    position_ids = torch.tensor([prefill_pos + decode_pos])
+
+    deltas = torch.tensor([[-2], [-3]])
+    batch_info = torch.tensor([1, num_prefill_tokens, 1], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, num_prefill_tokens, num_prefill_tokens + 1], dtype=torch.int32)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        mrope_position_deltas=deltas,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    # Reference: compute prefill 3D positions, stitch with decode
+    prefill_ids = input_ids[..., :num_prefill_tokens]
+    prefill_3d, _ = compute_mrope_positions(
+        input_ids=prefill_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    gen_deltas = deltas[1:]
+    decode_2d = position_ids[..., num_prefill_tokens:]
+    decode_adjusted = decode_2d + gen_deltas.T
+    decode_3d = decode_adjusted[None].expand(3, -1, -1)
+    expected_pos_3d = torch.cat([prefill_3d, decode_3d], dim=-1)
+
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Mixed batch should compute prefill 3D positions and stitch with decode",
+    )
+
+
+@torch.no_grad()
+def test_vlm_wrapper_mixed_multimodal_text_prefill():
+    """Mixed prefill batch: 1 multimodal request + 1 text-only request.
+    The model forward should compute 3D positions for the image request
+    and trivially expand positions for the text-only request."""
+    config = _make_small_composite_config()
+    torch.manual_seed(42)
+    model = Qwen3_5MoeForConditionalGeneration(config)
+    model.eval()
+
+    vc = config.vision_config
+    merge = vc.spatial_merge_size
+    grid_t, grid_h, grid_w = 1, 4, 4
+    num_patches = grid_t * grid_h * grid_w
+    num_merged_tokens = num_patches // (merge**2)
+
+    image_grid_thw = torch.tensor([[grid_t, grid_h, grid_w]], dtype=torch.long)
+    t_ps, ps = vc.temporal_patch_size, vc.patch_size
+    pixel_values = torch.randn(num_patches, vc.in_channels * t_ps * ps * ps)
+
+    # Request 1: multimodal prefill
+    text_before = [1, 2]
+    vision_part = [config.vision_start_token_id] + [config.image_token_id] * num_merged_tokens
+    text_after = [3]
+    req1_tokens = text_before + vision_part + text_after
+    req1_len = len(req1_tokens)
+
+    # Request 2: text-only prefill
+    req2_tokens = [10, 11, 12, 13]
+
+    all_tokens = req1_tokens + req2_tokens
+    total_tokens = len(all_tokens)
+
+    input_ids = torch.tensor([all_tokens])
+    position_ids = torch.tensor([list(range(total_tokens))])
+
+    batch_info = torch.tensor([2, total_tokens, 0], dtype=torch.int32)
+    cu_seqlen = torch.tensor([0, req1_len, total_tokens], dtype=torch.int32)
+
+    output = model(
+        input_ids=input_ids,
+        position_ids=position_ids,
+        pixel_values=pixel_values,
+        image_grid_thw=image_grid_thw,
+        batch_info=batch_info,
+        cu_seqlen=cu_seqlen,
+    )
+
+    # Reference: compute expected 3D positions for both requests
+    req1_ids = input_ids[..., :req1_len]
+    req1_pos_3d, _ = compute_mrope_positions(
+        input_ids=req1_ids,
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+    req2_pos = position_ids[..., req1_len:]
+    req2_pos_3d = req2_pos[None].expand(3, -1, -1)
+    expected_pos_3d = torch.cat([req1_pos_3d, req2_pos_3d], dim=-1)
+
+    inputs_embeds = model.model.get_input_embeddings()(input_ids)
+    image_embeds = torch.cat(
+        model.model.get_image_features(pixel_values, image_grid_thw), dim=0
+    ).to(inputs_embeds.device, inputs_embeds.dtype)
+    image_mask = (input_ids == config.image_token_id).unsqueeze(-1).expand_as(inputs_embeds)
+    inputs_embeds = inputs_embeds.masked_scatter(image_mask, image_embeds)
+    text_out = model.model.language_model(inputs_embeds=inputs_embeds, position_ids=expected_pos_3d)
+    ref_logits = model.lm_head(text_out.last_hidden_state.to(model.lm_head.weight.dtype)).float()
+
+    torch.testing.assert_close(
+        output.logits,
+        ref_logits,
+        rtol=1e-5,
+        atol=1e-5,
+        msg="Mixed multimodal+text prefill should compute correct 3D positions per request",
     )
 
 

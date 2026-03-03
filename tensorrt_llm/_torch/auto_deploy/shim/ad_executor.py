@@ -82,16 +82,6 @@ def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
     return model
 
 
-@dataclass
-class RequestContext:
-    """Per-request metadata passed to model hooks for extra_args assembly."""
-
-    seq_len: int
-    input_pos: int
-    is_context: bool
-    has_multimodal: bool
-
-
 def _collect_persistent_multimodal_keys(
     persist_keys: set,
     ordered_requests: list,
@@ -583,7 +573,6 @@ class ADEngine(ModelEngine):
         self.model = get_inference_model(self.cache_seq_interface)
         inner = _unwrap_model(self.model)
         self._persistent_multimodal_keys = getattr(inner, "persistent_multimodal_keys", set())
-        self._prepare_extra_args_fn = getattr(inner, "prepare_extra_args", None)
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -652,7 +641,6 @@ class ADEngine(ModelEngine):
         flat_gather_indices: List[int] = []
         mask_scatter_indices: List[int] = []
         extra_args: Dict[str, List[torch.Tensor]] = defaultdict(list)
-        request_contexts: List[RequestContext] = []
 
         # gather indices for logits
         logits_gather_indices: List[int] = []
@@ -713,16 +701,6 @@ class ADEngine(ModelEngine):
                 for k, v in request.py_multimodal_data.items():
                     if k not in self._persistent_multimodal_keys:
                         extra_args[k].append(v)
-
-            request_contexts.append(
-                RequestContext(
-                    seq_len=len(prompt_tokens),
-                    input_pos=begin_compute,
-                    is_context=True,
-                    has_multimodal=request.py_multimodal_data is not None
-                    and len(request.py_multimodal_data) > 0,
-                )
-            )
 
         def _use_overlap_scheduler(request) -> bool:
             """Check if we should use overlap scheduler behavior."""
@@ -818,16 +796,6 @@ class ADEngine(ModelEngine):
 
             position_ids.append(list(range(input_pos[-1], seq_len_with_cache[-1])))
 
-            request_contexts.append(
-                RequestContext(
-                    seq_len=len(input_ids_for_request),
-                    input_pos=num_tokens_seen,
-                    is_context=False,
-                    has_multimodal=request.py_multimodal_data is not None
-                    and len(request.py_multimodal_data) > 0,
-                )
-            )
-
         # check for logits_gather_info
         # we only need to gather in the following situation:
         # 1. there are context requests and
@@ -850,9 +818,6 @@ class ADEngine(ModelEngine):
         _collect_persistent_multimodal_keys(
             self._persistent_multimodal_keys, ordered_requests, extra_args
         )
-
-        if self._prepare_extra_args_fn is not None:
-            extra_args = self._prepare_extra_args_fn(extra_args, request_contexts)
 
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(

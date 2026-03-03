@@ -1462,44 +1462,6 @@ class Qwen3_5MoeModel(nn.Module):
 
     persistent_multimodal_keys = {"mrope_position_deltas"}
 
-    @staticmethod
-    def prepare_extra_args(extra_args, request_contexts):
-        """Build a complete ``mrope_position_ids_3d`` covering all prefill tokens.
-
-        The executor only stores ``mrope_position_ids_3d`` for multimodal
-        prefill requests.  Text-only prefill requests in the same batch have
-        no entry, so the raw list is shorter than the total prefill token count.
-        This hook fills the gap by generating trivial 3D positions for
-        text-only prefill requests (replicate the 1D positions across all 3
-        mRoPE dimensions) and concatenating everything in request order.
-
-        For batches with no multimodal data at all, this hook is a no-op:
-        the model forward's Case 3 handles text-only / decode-only batches.
-        """
-        mm_positions = extra_args.get("mrope_position_ids_3d", [])
-        if not mm_positions:
-            return extra_args
-
-        mm_iter = iter(mm_positions)
-        prefill_3d_parts: list = []
-
-        for ctx in request_contexts:
-            if not ctx.is_context:
-                continue
-            if ctx.has_multimodal:
-                prefill_3d_parts.append(next(mm_iter))
-            else:
-                pos = torch.arange(
-                    ctx.input_pos,
-                    ctx.input_pos + ctx.seq_len,
-                    dtype=torch.long,
-                )
-                prefill_3d_parts.append(pos[None, None, :].expand(3, 1, -1))
-
-        if prefill_3d_parts:
-            extra_args["mrope_position_ids_3d"] = [torch.cat(prefill_3d_parts, dim=-1)]
-        return extra_args
-
     def __init__(self, config: Qwen3_5MoeConfig):
         super().__init__()
         self.config = config
@@ -1570,22 +1532,25 @@ class Qwen3_5MoeModel(nn.Module):
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
-        mrope_position_ids_3d: Optional[torch.Tensor] = None,
         mrope_position_deltas: Optional[torch.Tensor] = None,
         batch_info: Optional[torch.Tensor] = None,
         **kwargs,
     ) -> Qwen3_5MoeOutput:
         """Multimodal forward: vision encoding + embedding merge + mRoPE + text model.
 
-        Position assembly uses three cases based on available metadata (not on
-        vision presence):
+        3D mRoPE positions are computed per request at forward time using
+        ``cu_seqlen`` to identify request boundaries and ``image_grid_thw``
+        to derive spatial positions for multimodal requests.
 
-        1. ``mrope_position_ids_3d`` + ``batch_info`` (mixed batch): stitch
-           pre-computed 3D prefill positions with delta-adjusted decode positions.
-        2. ``mrope_position_ids_3d`` only (prefill-only with vision): use
-           pre-computed 3D positions directly.
-        3. Otherwise (decode-only or text-only): expand ``position_ids + delta``
-           to 3D where delta defaults to 0.
+        Position assembly cases:
+
+        1. Images present + ``batch_info`` (mixed or prefill-only with images):
+           iterate prefill requests via ``cu_seqlen``, call
+           ``compute_mrope_positions`` for multimodal requests and expand 2D
+           positions to 3D for text-only requests.  Decode tokens get
+           delta-adjusted 3D expansion.
+        2. Otherwise (decode-only or text-only prefill without images): expand
+           ``position_ids + delta`` to 3D where delta defaults to 0.
         """
         inputs_embeds = self.get_input_embeddings()(input_ids)
 
@@ -1612,23 +1577,29 @@ class Qwen3_5MoeModel(nn.Module):
 
         delta = mrope_position_deltas if mrope_position_deltas is not None else 0
 
-        if mrope_position_ids_3d is not None and batch_info is not None:
-            num_prefill_tokens = batch_info[1].item()
-            num_prefill_seqs = batch_info[0].item()
+        vision_grid = image_grid_thw if has_images else video_grid_thw if has_videos else None
+        cu_seqlen = kwargs.get("cu_seqlen")
 
-            prefill_pos = mrope_position_ids_3d[..., :num_prefill_tokens]
-
-            decode_pos_2d = position_ids[..., num_prefill_tokens:]
-            if isinstance(delta, torch.Tensor):
-                gen_deltas = delta[num_prefill_seqs:]
-                decode_adjusted = decode_pos_2d + gen_deltas.T
-            else:
-                decode_adjusted = decode_pos_2d + delta
-            decode_pos_3d = decode_adjusted[None].expand(3, -1, -1)
-
-            position_ids_3d = torch.cat([prefill_pos, decode_pos_3d], dim=-1)
-        elif mrope_position_ids_3d is not None:
-            position_ids_3d = mrope_position_ids_3d
+        if vision_grid is not None and batch_info is not None and cu_seqlen is not None:
+            position_ids_3d = self._build_mixed_positions(
+                input_ids,
+                position_ids,
+                delta,
+                batch_info,
+                cu_seqlen,
+                image_grid_thw if has_images else None,
+                video_grid_thw if has_videos else None,
+            )
+        elif vision_grid is not None:
+            position_ids_3d, _ = compute_mrope_positions(
+                input_ids=input_ids,
+                image_grid_thw=image_grid_thw if has_images else None,
+                video_grid_thw=video_grid_thw if has_videos else None,
+                image_token_id=self.config.image_token_id,
+                video_token_id=self.config.video_token_id,
+                vision_start_token_id=self.config.vision_start_token_id,
+                spatial_merge_size=self.config.vision_config.spatial_merge_size,
+            )
         else:
             if position_ids is None:
                 raise ValueError("position_ids is required for text-only or decode-only forward")
@@ -1639,6 +1610,80 @@ class Qwen3_5MoeModel(nn.Module):
             position_ids=position_ids_3d,
             **kwargs,
         )
+
+    def _build_mixed_positions(
+        self,
+        input_ids: torch.LongTensor,
+        position_ids: torch.LongTensor,
+        delta,
+        batch_info: torch.Tensor,
+        cu_seqlen: torch.Tensor,
+        image_grid_thw: Optional[torch.LongTensor],
+        video_grid_thw: Optional[torch.LongTensor],
+    ) -> torch.Tensor:
+        """Build 3D mRoPE positions for a batch with per-request granularity.
+
+        Iterates over prefill requests using ``cu_seqlen`` boundaries.  For
+        each request that contains vision tokens, calls
+        ``compute_mrope_positions`` with the matching ``image_grid_thw`` rows.
+        Text-only prefill requests get trivial 3D expansion.  Decode tokens
+        are delta-adjusted uniformly.
+        """
+        num_prefill_seqs = batch_info[0].item()
+        num_prefill_tokens = batch_info[1].item()
+
+        img_grid_idx = 0
+        vid_grid_idx = 0
+        prefill_3d_parts: list = []
+
+        for i in range(num_prefill_seqs):
+            start = cu_seqlen[i].item()
+            end = cu_seqlen[i + 1].item()
+            req_ids = input_ids[..., start:end]
+
+            has_img = image_grid_thw is not None and (req_ids == self.config.image_token_id).any()
+            has_vid = video_grid_thw is not None and (req_ids == self.config.video_token_id).any()
+
+            if has_img or has_vid:
+                req_img_grid = None
+                req_vid_grid = None
+                if has_img:
+                    n_img = (req_ids[0] == self.config.vision_start_token_id).sum().item()
+                    req_img_grid = image_grid_thw[img_grid_idx : img_grid_idx + n_img]
+                    img_grid_idx += n_img
+                if has_vid:
+                    n_vid = (req_ids[0] == self.config.vision_start_token_id).sum().item()
+                    req_vid_grid = video_grid_thw[vid_grid_idx : vid_grid_idx + n_vid]
+                    vid_grid_idx += n_vid
+
+                pos_3d, _ = compute_mrope_positions(
+                    input_ids=req_ids,
+                    image_grid_thw=req_img_grid,
+                    video_grid_thw=req_vid_grid,
+                    image_token_id=self.config.image_token_id,
+                    video_token_id=self.config.video_token_id,
+                    vision_start_token_id=self.config.vision_start_token_id,
+                    spatial_merge_size=self.config.vision_config.spatial_merge_size,
+                )
+                prefill_3d_parts.append(pos_3d)
+            else:
+                req_pos = position_ids[..., start:end]
+                prefill_3d_parts.append((req_pos + 0)[None].expand(3, -1, -1))
+
+        prefill_pos = torch.cat(prefill_3d_parts, dim=-1)
+
+        if num_prefill_tokens < input_ids.shape[-1]:
+            decode_pos_2d = position_ids[..., num_prefill_tokens:]
+            if isinstance(delta, torch.Tensor):
+                num_prefill_seqs_t = batch_info[0].item()
+                gen_deltas = delta[num_prefill_seqs_t:]
+                decode_adjusted = decode_pos_2d + gen_deltas.T
+            else:
+                decode_adjusted = decode_pos_2d + delta
+            decode_pos_3d = decode_adjusted[None].expand(3, -1, -1)
+            return torch.cat([prefill_pos, decode_pos_3d], dim=-1)
+
+        return prefill_pos
 
 
 class Qwen3_5MoeForConditionalGeneration(Qwen3_5MoePreTrainedModel):
@@ -1735,7 +1780,7 @@ class Qwen3_5MoeInputProcessor:
 
             if image_grid_thw is not None or video_grid_thw is not None:
                 input_ids_t = torch.tensor([token_ids], dtype=torch.long)
-                position_ids_3d, deltas = compute_mrope_positions(
+                _, deltas = compute_mrope_positions(
                     input_ids=input_ids_t,
                     image_grid_thw=image_grid_thw,
                     video_grid_thw=video_grid_thw,
@@ -1744,7 +1789,6 @@ class Qwen3_5MoeInputProcessor:
                     vision_start_token_id=self._mrope_config.vision_start_token_id,
                     spatial_merge_size=self._mrope_config.vision_config.spatial_merge_size,
                 )
-                mm_data["mrope_position_ids_3d"] = position_ids_3d
                 mm_data["mrope_position_deltas"] = deltas
 
         return token_ids, extra
