@@ -175,7 +175,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         beam_idx = DEFAULT_BEAM_IDX
 
         for req in state.requests:
-            if req.state == LlmRequestState.GENERATION_COMPLETE or req.context_remaining_length != 0:
+            if req.state == LlmRequestState.GENERATION_COMPLETE:
                 continue
             num_new_tokens = new_tokens_lens_list[req.py_seq_slot]
             for i in range(num_new_tokens):
@@ -210,14 +210,20 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         Returns:
             SampleStateSpec with device and host tensors
         """
-        requests = scheduled_requests.all_requests()
-        slots = torch.as_tensor([r.py_seq_slot for r in requests])
+        num_skip = len(scheduled_requests.context_requests_chunking)
+        finished_context_requests = scheduled_requests.context_requests_last_chunk
+        sampling_requests = finished_context_requests + scheduled_requests.generation_requests
+        num_sampling_requests = len(sampling_requests)
+
+        slots = torch.as_tensor([r.py_seq_slot for r in sampling_requests], dtype=torch.long)
         slots = slots.to(device="cuda", non_blocking=True)
 
-        o_new_tokens = outputs["new_tokens"][: len(requests)]
-        o_new_tokens_lens = outputs["new_tokens_lens"][: len(requests)]
-        o_next_draft_tokens = outputs["next_draft_tokens"][: len(requests)]
-        o_next_new_tokens = outputs["next_new_tokens"][: len(requests)]
+        o_new_tokens = outputs["new_tokens"][num_skip : num_skip + num_sampling_requests]
+        o_new_tokens_lens = outputs["new_tokens_lens"][num_skip : num_skip + num_sampling_requests]
+        o_next_draft_tokens = outputs["next_draft_tokens"][
+            num_skip : num_skip + num_sampling_requests
+        ]
+        o_next_new_tokens = outputs["next_new_tokens"][num_skip : num_skip + num_sampling_requests]
 
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
@@ -241,11 +247,11 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
 
         # Add dummy draft tokens to context requests for KV cache preparation
         if self._add_dummy_draft_tokens():
-            for request in scheduled_requests.context_requests:
+            for request in finished_context_requests:
                 request.py_draft_tokens = [1] * self.draft_len
 
         return SampleStateSpec(
-            requests=scheduled_requests.all_requests(),
+            requests=sampling_requests,
             device=device_tensors,
             host=host_tensors,
             sampler_event=sampler_event,
