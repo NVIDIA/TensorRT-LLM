@@ -2176,15 +2176,15 @@ vision = ["Pillow (>=10.0.1,<=15.0)"]
 
 [[package]]
 name = "tritonclient"
-version = "2.65.0"
+version = "2.66.0"
 description = "Python client library and utilities for communicating with Triton Inference Server"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "tritonclient-2.65.0-py3-none-any.whl", hash = "sha256:cc3e58cf24a5f53fe24066e2037756560f6fdd2743a9d19fbb641b7580a63b4f"},
-    {file = "tritonclient-2.65.0-py3-none-manylinux1_x86_64.whl", hash = "sha256:75f0ecac1cbd4a2539ef2c27c5774ebc674e679a590a4840cd3f0dd696c80a2b"},
-    {file = "tritonclient-2.65.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:10ed058d2b816a0bd48d6c62d8dcb01864a0c2cc971a31fe366d328f6e3311c2"},
+    {file = "tritonclient-2.66.0-py3-none-any.whl", hash = "sha256:7e3558a47542528a4edd2da607050e756022c6b14ea2b352a67c78f1484e698f"},
+    {file = "tritonclient-2.66.0-py3-none-manylinux1_x86_64.whl", hash = "sha256:d2c2865239017a0d15a5f34e23f093feac222e608d6182a1444354204a0833ad"},
+    {file = "tritonclient-2.66.0-py3-none-manylinux2014_aarch64.whl", hash = "sha256:ec759cd8186130be9726be2fa31bc14b1dd46daa19add770610df889aa57d0a4"},
 ]
 
 [package.dependencies]
@@ -2444,4 +2444,4 @@ testing = ["coverage[toml]", "zope.event", "zope.testing"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "0ca8bb8ddbcb5dac6b8ceae81f81849f822e07ae34a19764284fbd2b44deb8ae"
+content-hash = "3dc9bf8cacb4756bbb33f1fe602981decf1a582846fe37eac51ec42a6077f5e5"
