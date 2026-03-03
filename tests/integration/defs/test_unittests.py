@@ -136,7 +136,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
 
     command = [
         '-m', 'pytest', ignore_opt, "-vv", "--tb=short", "-rF",
-        "--timeout=2400", "--timeout-method=thread",
+        "--timeout=30", "--timeout-method=thread",
         "--periodic-junit",
         "--periodic-batch-size=1",
         "--periodic-save-unfinished-test",
