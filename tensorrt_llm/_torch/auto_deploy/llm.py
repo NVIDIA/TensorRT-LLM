@@ -69,6 +69,7 @@ class ADInputProcessor(DefaultInputProcessor):
         # for example, this might be the case when invoking AD via trtllm-serve
         elif "multi_modal_data" in inputs:
             images = inputs["multi_modal_data"]["image"]
+            do_rescale = True
             if images is not None and isinstance(images[0], torch.Tensor):
                 # The default multimodal input loader will normalize images to [0, 1] when the requested
                 # format is "pt" (pytorch tensors), but not for "pil" (PIL images).

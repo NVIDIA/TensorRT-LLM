@@ -75,6 +75,41 @@ from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 
+def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
+    """Walk the wrapper chain (e.g. CapturedGraph → GraphModule → ...) to the innermost model."""
+    while hasattr(model, "model") and model.model is not model:
+        model = model.model
+    return model
+
+
+def _collect_persistent_multimodal_keys(
+    persist_keys: set,
+    ordered_requests: list,
+    extra_args: Dict[str, List[torch.Tensor]],
+) -> None:
+    """Collect persistent multimodal metadata from all requests.
+
+    Models declare which ``py_multimodal_data`` keys should persist across
+    context and generation phases via a ``persistent_multimodal_keys`` class
+    attribute.  For each declared key this function gathers the value from
+    every request (context **and** generation), zero-filling for requests
+    that lack the key.
+    """
+    for key in persist_keys:
+        per_request: List[Optional[torch.Tensor]] = []
+        ref: Optional[torch.Tensor] = None
+        for request in ordered_requests:
+            mm = request.py_multimodal_data
+            if mm is not None and key in mm:
+                per_request.append(mm[key])
+                if ref is None:
+                    ref = mm[key]
+            else:
+                per_request.append(None)
+        if ref is not None:
+            extra_args[key] = [v if v is not None else torch.zeros_like(ref) for v in per_request]
+
+
 @dataclass
 class ReportingInfo:
     print_log: bool = False
@@ -533,6 +568,8 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
+        inner = _unwrap_model(self.model)
+        self._persistent_multimodal_keys = getattr(inner, "persistent_multimodal_keys", set())
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -622,7 +659,8 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
-                    extra_args[k].append(v)
+                    if k not in self._persistent_multimodal_keys:
+                        extra_args[k].append(v)
 
         # store num_prefill and num_prefill_tokens
         num_prefill = len(context_requests)
@@ -698,7 +736,11 @@ class ADEngine(ModelEngine):
         batch_info.extend([num_extend, num_extend_tokens])
         batch_info.extend([num_decode, num_decode_tokens])
 
-        # update the sequence info object now
+        _collect_persistent_multimodal_keys(
+            self._persistent_multimodal_keys, ordered_requests, extra_args
+        )
+
+        # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
             input_ids,
             cu_seqlen=cu_seqlen,
@@ -715,6 +757,10 @@ class ADEngine(ModelEngine):
             _gather_slot_idx=slot_gather_indices,
             _ungathered_new_lens=new_tokens_lens,
             **extra_args,
+        )
+
+        self.cache_seq_interface.info._store_extra_arg(
+            "batch_info", [torch.tensor(batch_info, dtype=torch.int32)]
         )
 
         if spec_resource_manager is not None and isinstance(
