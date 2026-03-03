@@ -720,7 +720,12 @@ class OpenAIServer:
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config, self.multimodal_server_config)
+            # Use raw messages from the request body to avoid Pydantic
+            # ValidatorIterator issues when tool_calls contain extra fields
+            # (e.g., 'name' at the top level of a tool call dict).
+            raw_body = await raw_request.json()
+            raw_messages = raw_body.get("messages", [])
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(raw_messages, self.model_config, self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -848,7 +853,11 @@ class OpenAIServer:
                 tool.model_dump() for tool in request.tools
             ]
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(request.messages, self.model_config)
+            # Use raw messages from the request body to avoid Pydantic
+            # ValidatorIterator issues when tool_calls contain extra fields.
+            raw_body = await raw_request.json()
+            raw_messages = raw_body.get("messages", [])
+            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(raw_messages, self.model_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids

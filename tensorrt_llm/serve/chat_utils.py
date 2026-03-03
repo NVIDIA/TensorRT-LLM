@@ -246,6 +246,11 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     if tool_calls is not None:
         result["tool_calls"] = []
         for item in tool_calls:
+            # Make a copy to avoid mutating the original
+            item = dict(item)
+            if "function" in item:
+                item["function"] = dict(item["function"])
+
             if content := item["function"].get("arguments"):
                 if isinstance(content, str):
                     item["function"]["arguments"] = json.loads(content)
