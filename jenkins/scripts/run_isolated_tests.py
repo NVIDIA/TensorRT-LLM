@@ -17,10 +17,38 @@ import sys
 from pathlib import Path
 
 
-def run_cmd(cmd, cwd):
+def run_cmd(cmd, cwd, env=None):
     """Run command and return (returncode, stdout, stderr)."""
-    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True)
+    proc = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True, env=env)
     return proc.returncode, proc.stdout, proc.stderr
+
+
+def parse_env_and_cmd(base_cmd):
+    """Extract environment variables from command string.
+
+    Splits base_cmd into environment variables (VAR=value) and command tokens.
+    Environment variables appear before the executable name.
+
+    Returns: (env_dict, cmd_tokens)
+        env_dict: dictionary of environment variables
+        cmd_tokens: list of command tokens starting with executable
+    """
+    tokens = shlex.split(base_cmd)
+    env_vars = {}
+    cmd_tokens = []
+
+    for token in tokens:
+        # Check if token looks like VAR=value (contains = and doesn't start with -)
+        if "=" in token and not token.startswith("-"):
+            key, value = token.split("=", 1)
+            # Check if key is a valid identifier
+            if key.isidentifier():
+                env_vars[key] = value
+                continue
+        # Once we hit a token that's not an env var, it's the start of the command
+        cmd_tokens.append(token)
+
+    return env_vars, cmd_tokens
 
 
 def main():
@@ -51,8 +79,12 @@ def main():
         print("No isolated tests to run.")
         sys.exit(0)
 
-    # Prepare base command tokens
-    base_tokens = shlex.split(base_cmd)
+    # Parse environment variables and command tokens from base_cmd
+    base_env_vars, base_tokens = parse_env_and_cmd(base_cmd)
+
+    # Prepare environment: inherit from parent, add extracted vars, set LLM_ROOT
+    run_env = os.environ.copy()
+    run_env.update(base_env_vars)
 
     defs_cwd = llm_src / "tests" / "integration" / "defs"
     defs_cwd = str(defs_cwd)
@@ -76,7 +108,7 @@ def main():
         print("Running isolated test [{}]: {}".format(i, test))
         print("Cmd:", " ".join(shlex.quote(x) for x in cmd))
 
-        rc, stdout, stderr = run_cmd(cmd, cwd=defs_cwd)
+        rc, stdout, stderr = run_cmd(cmd, cwd=defs_cwd, env=run_env)
 
         if stdout:
             print(stdout)

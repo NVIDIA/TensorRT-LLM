@@ -65,6 +65,9 @@ def collect_shard_tests(
             str(split_id),
         ]
 
+        print(f"Running command: {' '.join(cmd)}", file=sys.stderr)
+        print(f"Working directory: {llm_src / 'tests' / 'integration' / 'defs'}", file=sys.stderr)
+
         result = subprocess.run(
             cmd,
             cwd=llm_src / "tests" / "integration" / "defs",
@@ -73,6 +76,12 @@ def collect_shard_tests(
             timeout=300,
         )
 
+        print(f"Return code: {result.returncode}", file=sys.stderr)
+        if result.stdout:
+            print(f"Stdout:\n{result.stdout}", file=sys.stderr)
+        if result.stderr:
+            print(f"Stderr:\n{result.stderr}", file=sys.stderr)
+
         if result.returncode != 0:
             raise RuntimeError(f"Pytest collection failed: {result.stderr}")
 
@@ -80,12 +89,19 @@ def collect_shard_tests(
         shard_tests = []
         found_running = False
         for line in result.stdout.split("\n"):
-            if "Running" in line and "items in this shard" in line:
+            # Look for the pytest-split Running line
+            if "pytest-split] Running" in line or (
+                "Running" in line and "items in this shard" in line
+            ):
                 found_running = True
                 continue
-            if found_running and "==" in line:
+            # Stop at warnings or final summary
+            if found_running and (
+                "====" in line or "warnings summary" in line or "collected" in line
+            ):
                 break
-            if found_running and "::" in line:
+            # Extract test lines (they contain ::)
+            if found_running and "::" in line and line.strip():
                 shard_tests.append(line.strip())
 
         return shard_tests
