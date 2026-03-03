@@ -634,16 +634,16 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
     std::optional<torch::Tensor> cu_q_seqlens, std::optional<torch::Tensor> cu_kv_seqlens,
     std::optional<torch::Tensor> fmha_scheduler_counter, std::optional<torch::Tensor> mla_bmm1_scale,
     std::optional<torch::Tensor> mla_bmm2_scale, std::optional<torch::Tensor> quant_q_buffer,
-    std::optional<int64_t> sage_attn_num_elts_per_blk_q, std::optional<int64_t> sage_attn_num_elts_per_blk_k,
-    std::optional<int64_t> sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8)
+    int64_t const sage_attn_num_elts_per_blk_q, int64_t const sage_attn_num_elts_per_blk_k,
+    int64_t const sage_attn_num_elts_per_blk_v, bool sage_attn_qk_int8)
 {
     TLLM_LOG_TRACE("Attention op starts at layer %d", layer_idx);
     // Use these tensors to infer if the attention is using KV cache
     bool const use_kv_cache = kv_cache_block_offsets.has_value() && host_kv_cache_pool_pointers.has_value()
         && host_kv_cache_pool_mapping.has_value();
     // Currently, SageAttention block-size options are only consumed by the TllmGen backend path.
-    bool const use_sage_attn = sage_attn_num_elts_per_blk_q.value_or(0) > 0
-        || sage_attn_num_elts_per_blk_k.value_or(0) > 0 || sage_attn_num_elts_per_blk_v.value_or(0) > 0;
+    bool const use_sage_attn = sage_attn_num_elts_per_blk_q > 0 || sage_attn_num_elts_per_blk_k > 0
+        || sage_attn_num_elts_per_blk_v > 0;
 
     TLLM_CHECK_WITH_INFO(is_mla_enable || is_fused_qkv || use_sage_attn,
         "Context attention only allows these non-MLA cases: fused QKV; separate QKV with SageAttention");
@@ -759,9 +759,9 @@ void attention(torch::Tensor q, std::optional<torch::Tensor> k, std::optional<to
         = static_cast<float>(skip_softmax_threshold_scale_factor_prefill.value_or(0));
     op->mSkipSoftmaxThresholdScaleFactorDecode
         = static_cast<float>(skip_softmax_threshold_scale_factor_decode.value_or(0));
-    op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q.value_or(0));
-    op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k.value_or(0));
-    op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v.value_or(0));
+    op->mSageAttnNumEltsPerBlkQ = static_cast<int>(sage_attn_num_elts_per_blk_q);
+    op->mSageAttnNumEltsPerBlkK = static_cast<int>(sage_attn_num_elts_per_blk_k);
+    op->mSageAttnNumEltsPerBlkV = static_cast<int>(sage_attn_num_elts_per_blk_v);
     op->mSageAttnQkInt8 = sage_attn_qk_int8;
 #ifdef SKIP_SOFTMAX_STAT
     op->mSkipSoftmaxTotalBlocks = reinterpret_cast<uint32_t*>(skip_softmax_stat.value().data_ptr());

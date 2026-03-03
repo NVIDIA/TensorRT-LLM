@@ -391,9 +391,9 @@ class TrtllmAttentionWrapper:
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
-        sage_attn_num_elts_per_blk_q: Optional[int] = None,
-        sage_attn_num_elts_per_blk_k: Optional[int] = None,
-        sage_attn_num_elts_per_blk_v: Optional[int] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
         sage_attn_qk_int8: bool = False,
     ):
         """
@@ -621,20 +621,11 @@ class TrtllmAttentionWrapper:
                 self.kv_cache_manager,
             )
         else:
-            use_sage_attn = any(v is not None and v > 0 for v in [
-                sage_attn_num_elts_per_blk_q, sage_attn_num_elts_per_blk_k,
-                sage_attn_num_elts_per_blk_v
+            use_sage_attn = any(sf > 0 for sf in [
+                sage_attn_num_elts_per_blk_q, sage_attn_num_elts_per_blk_k, sage_attn_num_elts_per_blk_v
             ])
 
-            if use_sage_attn:
-                if is_fused_qkv:
-                    raise ValueError(
-                        "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false)."
-                    )
-                if k is None or v is None:
-                    raise ValueError(
-                        "SageAttention requires both k and v tensors to be provided."
-                    )
+            assert not use_sage_attn or not is_fused_qkv, "SageAttention requires separate q/k/v tensors (is_fused_qkv must be false)."
 
             thop.attention(
                 q,
@@ -1809,9 +1800,9 @@ class TrtllmAttention(AttentionBackend[TrtllmAttentionMetadata]):
         mla_bmm1_scale: Optional[torch.Tensor] = None,
         mla_bmm2_scale: Optional[torch.Tensor] = None,
         quant_q_buffer: Optional[torch.Tensor] = None,
-        sage_attn_num_elts_per_blk_q: Optional[int] = None,
-        sage_attn_num_elts_per_blk_k: Optional[int] = None,
-        sage_attn_num_elts_per_blk_v: Optional[int] = None,
+        sage_attn_num_elts_per_blk_q: int = 0,
+        sage_attn_num_elts_per_blk_k: int = 0,
+        sage_attn_num_elts_per_blk_v: int = 0,
         sage_attn_qk_int8: bool = False,
         **kwargs,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
