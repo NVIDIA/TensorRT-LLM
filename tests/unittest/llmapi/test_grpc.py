@@ -23,6 +23,7 @@ import pytest
 import torch
 from PIL import Image
 
+from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm.grpc import trtllm_service_pb2 as pb2
 from tensorrt_llm.grpc.grpc_request_manager import (
     GrpcRequestManager,
@@ -728,13 +729,12 @@ def grpc_vlm_service():
     Uses Qwen3-VL-8B-Instruct for vision-language model testing.
     Shared across all tests in this module.
     """
-    from tensorrt_llm._tensorrt_engine import LLM
-
     model_path = get_model_path(vlm_model_name)
     llm = LLM(
         model=model_path,
         kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.6),
         fast_build=True,
+        load_format="dummy",
     )
     tokenizer = llm.tokenizer
 
@@ -771,8 +771,9 @@ class TestGrpcMultimodalEndToEnd:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
+        request_id = "e2e-mm-single"
         request = pb2.GenerateRequest(
-            request_id="e2e-mm-single",
+            request_id=request_id,
             tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
             multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
             sampling_config=pb2.SamplingConfig(temperature=0.0),
@@ -792,7 +793,7 @@ class TestGrpcMultimodalEndToEnd:
         assert len(completes) == 1
 
         resp = completes[0]
-        assert resp.request_id == "e2e-mm-single"
+        assert resp.request_id == request_id
         assert len(resp.complete.output_token_ids) > 0
         assert resp.complete.finish_reason in ("stop", "length")
 
@@ -810,8 +811,9 @@ class TestGrpcMultimodalEndToEnd:
         with open(image_path, "rb") as f:
             image_bytes = f.read()
 
+        request_id = "e2e-mm-stream"
         request = pb2.GenerateRequest(
-            request_id="e2e-mm-stream",
+            request_id=request_id,
             tokenized=pb2.TokenizedInput(input_token_ids=prompt_token_ids),
             multimodal_input=pb2.MultimodalInput(image_data=[image_bytes]),
             sampling_config=pb2.SamplingConfig(temperature=0.0),

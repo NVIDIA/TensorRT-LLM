@@ -120,7 +120,9 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 request.disaggregated_params if request.HasField("disaggregated_params") else None
             )
 
-            # Extract multimodal data if present
+            # Extract multimodal data if present.
+            # Images arrive as raw bytes from the external router (already fetched),
+            # so we only need to decode and convert to PIL RGB here.
             multi_modal_data = None
             if request.HasField("multimodal_input") and request.multimodal_input.image_data:
                 images = [
