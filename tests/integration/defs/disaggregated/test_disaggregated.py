@@ -37,6 +37,7 @@ from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
 from test_common.perf_metrics_utils import (get_timing_metrics,
                                             validate_timing_metrics)
 
+from tensorrt_llm._utils import mpi_disabled
 from tensorrt_llm.logger import logger
 
 
@@ -560,6 +561,11 @@ def run_disaggregated_test(example_dir,
                            model_path=None,
                            cwd=None):
     """Run disaggregated test using service discovery instead of MPI."""
+
+    if mpi_disabled():
+        pytest.skip(
+            "https://nvbugs/5584607 Ray orchestrator is not supported with NIXL(DEFAULT) cache transceiver backend."
+        )
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))

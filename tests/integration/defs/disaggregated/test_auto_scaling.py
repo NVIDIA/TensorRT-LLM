@@ -11,6 +11,8 @@ from disagg_test_utils import (CHECK_STATUS_INTERVAL, request_completion,
                                wait_for_disagg_server_status,
                                wait_for_port_released)
 
+pytest_plugins = ["disagg_test_utils"]
+
 ROUTER_TYPES = ["round_robin", "load_balancing", "kv_cache_aware"]
 
 
