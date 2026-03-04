@@ -443,6 +443,21 @@ class PretrainedConfig:
             return RuntimeDefaults(**defaults)
         return defaults
 
+    @staticmethod
+    def export_runtime_defaults(defaults: Optional[RuntimeDefaults]) -> dict:
+        if defaults is None:
+            return None
+
+        result = {}
+    
+        if defaults.max_attention_window is not None:
+            result['max_attention_window'] = defaults.max_attention_window
+            
+        if defaults.sink_token_length is not None:
+            result['sink_token_length'] = defaults.sink_token_length
+
+        return result if result else None
+
     @property
     def kv_dtype(self):
         # TODO: need to align the kv dtype
@@ -475,6 +490,9 @@ class PretrainedConfig:
         output['mapping'] = self.mapping.to_dict()
         output['mapping'].pop('rank')
         output['quantization'] = self.quantization.model_dump()
+
+        if self.runtime_defaults is not None:
+            output['runtime_defaults'] = self.export_runtime_defaults(self.runtime_defaults)
 
         return output
 
