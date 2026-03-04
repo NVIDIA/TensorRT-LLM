@@ -139,7 +139,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self,
         request: LlmRequest,
         next_draft_tokens: list[list[int]],
-        runtime_draft_len: Optional[int]
+        runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
         assert not request.py_return_context_logits, (
