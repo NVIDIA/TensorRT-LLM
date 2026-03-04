@@ -1151,8 +1151,8 @@ def all_to_all_5d(
                                             group=process_group)
         out = out_flat.view_as(inp)
 
-        out = out.permute(1, 2, 0, 3, 4,
-                          5).contiguous()  # [B, S/P, P, 3, H/P, D]
+        out = out.permute(1, 2, 3, 0, 4,
+                          5).contiguous()  # [B, S/P, 3, P, H/P, D]
         gathered_heads = heads * world_size
         return out.reshape(batch, sharded_seq, qkv_count, gathered_heads,
                            head_dim)

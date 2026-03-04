@@ -23,6 +23,7 @@ try:
     from tensorrt_llm._torch.attention_backend.interface import PredefinedAttentionMask
     from tensorrt_llm._torch.distributed import all_to_all_4d, all_to_all_5d
     from tensorrt_llm._torch.visual_gen.attention_backend import UlyssesAttention, VanillaAttention
+    from tensorrt_llm._torch.visual_gen.attention_backend.interface import AttentionTensorLayout
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True
@@ -449,8 +450,38 @@ def _logic_a2a_5d_roundtrip(rank, world_size):
     torch.testing.assert_close(reconstructed, original, rtol=1e-5, atol=1e-5)
 
 
+class _FusedVanillaAttention(torch.nn.Module):
+    """Test-only backend that supports fused QKV to exercise the 5D A2A path."""
+
+    def __init__(self, num_heads: int, head_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+        self.scale = 1.0 / math.sqrt(head_dim)
+        self._preferred_layout = AttentionTensorLayout.NHD
+
+    def forward(self, q, k=None, v=None, batch_size=None, seq_len=None, **kwargs):
+        if k is None and v is None:
+            q_t, k_t, v_t = q[:, :, 0], q[:, :, 1], q[:, :, 2]
+        else:
+            q_t, k_t, v_t = q, k, v
+        q_t = q_t.transpose(1, 2)
+        k_t = k_t.transpose(1, 2)
+        v_t = v_t.transpose(1, 2)
+        out = F.scaled_dot_product_attention(q_t, k_t, v_t, scale=self.scale)
+        return out.transpose(1, 2).contiguous()
+
+    @property
+    def preferred_layout(self) -> AttentionTensorLayout:
+        return self._preferred_layout
+
+    @classmethod
+    def support_fused_qkv(cls) -> bool:
+        return True
+
+
 def _logic_ulysses_fused_vs_unfused(rank, world_size):
-    """Fused QKV A2A (fuse_qkv_a2a=True) matches unfused path."""
+    """Fused 5D A2A (auto-selected via support_fused_qkv) matches unfused 4D path."""
     batch = 2
     seq_per_rank = 8
     seq_full = seq_per_rank * world_size
@@ -468,14 +499,12 @@ def _logic_ulysses_fused_vs_unfused(rank, world_size):
     attn_unfused = UlyssesAttention(
         inner_backend=inner_unfused,
         process_group=None,
-        fuse_qkv_a2a=False,
     ).to(device)
 
-    inner_fused = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    inner_fused = _FusedVanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
     attn_fused = UlyssesAttention(
         inner_backend=inner_fused,
         process_group=None,
-        fuse_qkv_a2a=True,
     ).to(device)
 
     out_unfused = attn_unfused(q, k, v, batch_size=batch, seq_len=seq_full)
@@ -486,12 +515,12 @@ def _logic_ulysses_fused_vs_unfused(rank, world_size):
         out_unfused,
         rtol=1e-4,
         atol=1e-4,
-        msg=f"Rank {rank}: Fused QKV A2A output differs from unfused",
+        msg=f"Rank {rank}: Fused 5D A2A output differs from unfused 4D path",
     )
 
 
 def _logic_ulysses_fused_vs_standard(rank, world_size):
-    """Fused QKV A2A matches standard full-sequence attention."""
+    """Fused 5D A2A matches standard full-sequence attention."""
     batch = 2
     seq_per_rank = 8
     seq_full = seq_per_rank * world_size
@@ -509,11 +538,10 @@ def _logic_ulysses_fused_vs_standard(rank, world_size):
     k_shard = k_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
     v_shard = v_full[:, rank * seq_per_rank : (rank + 1) * seq_per_rank].contiguous()
 
-    inner = VanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
+    inner = _FusedVanillaAttention(num_heads=num_heads // world_size, head_dim=head_dim)
     attn_fused = UlyssesAttention(
         inner_backend=inner,
         process_group=None,
-        fuse_qkv_a2a=True,
     ).to(device)
 
     fused_output = attn_fused(q_shard, k_shard, v_shard, batch_size=batch, seq_len=seq_full)
@@ -532,7 +560,7 @@ def _logic_ulysses_fused_vs_standard(rank, world_size):
         expected_shard,
         rtol=1e-4,
         atol=1e-4,
-        msg=f"Rank {rank}: Fused Ulysses output differs from standard attention",
+        msg=f"Rank {rank}: Fused 5D Ulysses output differs from standard attention",
     )
 
 
@@ -647,13 +675,13 @@ class TestUlyssesAttention:
         run_test_in_distributed(world_size=2, test_fn=_logic_ulysses_invalid_heads, use_cuda=False)
 
     def test_ulysses_fused_vs_unfused(self):
-        """Test fused QKV A2A matches unfused path."""
+        """Test fused 5D A2A (auto-selected) matches unfused 4D path."""
         run_test_in_distributed(
             world_size=2, test_fn=_logic_ulysses_fused_vs_unfused, use_cuda=True
         )
 
     def test_ulysses_fused_vs_standard_attention(self):
-        """Test fused QKV A2A matches standard full-sequence attention."""
+        """Test fused 5D A2A matches standard full-sequence attention."""
         run_test_in_distributed(
             world_size=2, test_fn=_logic_ulysses_fused_vs_standard, use_cuda=True
         )
