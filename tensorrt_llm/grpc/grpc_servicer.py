@@ -485,7 +485,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             complete = trtllm_service_pb2.GenerateComplete(
                 output_token_ids=output_tokens,
                 sequence_index=completion.index,
-                finish_reason=completion.finish_reason or "stop",
+                finish_reason=completion.finish_reason or "",
                 prompt_tokens=len(prompt_token_ids),
                 completion_tokens=len(output_tokens),
                 cached_tokens=cached_tokens,
