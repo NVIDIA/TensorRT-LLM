@@ -224,7 +224,6 @@
       model: "",
       topology: "",
       islOsl: "",
-      profile: "",
       concurrency: "",
     };
 
@@ -267,13 +266,11 @@
     const selModel = mkSelect("Model", `trtllm-model-${id}`, 1);
     const selTopo = mkSelect("GPU(s)", `trtllm-topo-${id}`, 2);
     const selSeq = mkSelect("ISL / OSL", `trtllm-seq-${id}`, 3);
-    const selProf = mkSelect("Performance profile", `trtllm-prof-${id}`, 4);
-    const selConc = mkSelect("Concurrency", `trtllm-conc-${id}`, 5);
+    const selConc = mkSelect("Concurrency", `trtllm-conc-${id}`, 4);
 
     form.appendChild(selModel.wrap);
     form.appendChild(selTopo.wrap);
     form.appendChild(selSeq.wrap);
-    form.appendChild(selProf.wrap);
     form.appendChild(selConc.wrap);
 
     const output = el("div", { class: "trtllm-config-selector__output" });
@@ -411,7 +408,6 @@
           const [isl, osl] = state.islOsl.split("|");
           if (String(e.isl) !== isl || String(e.osl) !== osl) return false;
         }
-        if (!prefixOnly && state.profile && e.performance_profile !== state.profile) return false;
         if (!prefixOnly && state.concurrency && String(e.concurrency) !== state.concurrency) return false;
         return true;
       });
@@ -473,24 +469,14 @@
       if (!state.islOsl && seqOpts.length === 1) state.islOsl = seqOpts[0].value;
       setSelectOptions(selSeq.select, seqOpts, state.islOsl, "Select ISL/OSL…");
 
-      // Profile options
-      const prefEntries = filteredByState(true);
-      const profOpts = uniqBy(
-        prefEntries.map((e) => e.performance_profile),
-        (p) => p
-      )
-        .sort(sortStrings)
-        .map((p) => ({ value: p, label: p }));
-      if (state.profile && !profOpts.some((o) => o.value === state.profile)) state.profile = "";
-      if (!state.profile && profOpts.length === 1) state.profile = profOpts[0].value;
-      // Prefer Balanced if present (nicer default).
-      if (!state.profile && profOpts.some((o) => o.value === "Balanced")) state.profile = "Balanced";
-      setSelectOptions(selProf.select, profOpts, state.profile, "Select a profile…");
-
-      // Concurrency options (filtered by profile if chosen)
-      const profEntries2 = filteredByState(true).filter((e) => !state.profile || e.performance_profile === state.profile);
+      // Concurrency options (with profile labels)
+      const concEntries = filteredByState(true);
       const concOpts = uniqBy(
-        profEntries2.map((e) => ({ value: String(e.concurrency), label: String(e.concurrency), conc: e.concurrency })),
+        concEntries.map((e) => ({
+          value: String(e.concurrency),
+          label: `${e.concurrency}  \u2014  ${e.performance_profile}`,
+          conc: e.concurrency,
+        })),
         (o) => o.value
       ).sort((a, b) => sortNums(a.conc, b.conc));
       if (state.concurrency && !concOpts.some((o) => o.value === state.concurrency)) state.concurrency = "";
@@ -498,11 +484,7 @@
       setSelectOptions(selConc.select, concOpts, state.concurrency, "Select concurrency…");
 
       // Resolve final selection
-      const finalEntries = filteredByState(false).filter((e) => {
-        if (state.profile && e.performance_profile !== state.profile) return false;
-        if (state.concurrency && String(e.concurrency) !== state.concurrency) return false;
-        return true;
-      });
+      const finalEntries = filteredByState(false);
 
       const code = cmdPre.querySelector("code");
       if (finalEntries.length === 1) {
@@ -510,7 +492,7 @@
         code.textContent = formatCommand(e);
         cmdCopyBtn.disabled = !code.textContent;
         meta.textContent = "";
-        meta.appendChild(el("span", { text: "Config: " }));
+        meta.appendChild(el("span", { text: `Profile: ${e.performance_profile || "N/A"} \u00b7 Config: ` }));
         const cfgHref = e.config_github_url || e.config_raw_url || "";
         if (cfgHref) {
           meta.appendChild(
@@ -540,11 +522,9 @@
           errorBox.textContent = "No matching topologies for this model.";
         } else if (state.topology && seqOpts.length === 0) {
           errorBox.textContent = "No matching ISL/OSL options for this selection.";
-        } else if (state.islOsl && profOpts.length === 0) {
-          errorBox.textContent = "No matching performance profiles for this selection.";
-        } else if (state.profile && concOpts.length === 0) {
-          errorBox.textContent = "No matching concurrencies for this profile.";
-        } else if (state.model && state.topology && state.islOsl && state.profile && state.concurrency) {
+        } else if (state.islOsl && concOpts.length === 0) {
+          errorBox.textContent = "No matching concurrencies for this selection.";
+        } else if (state.model && state.topology && state.islOsl && state.concurrency) {
           errorBox.textContent = "Selection did not resolve to a single configuration.";
         } else {
           errorBox.textContent = "Select options above to generate a command.";
@@ -556,25 +536,17 @@
       state.model = selModel.select.value;
       state.topology = "";
       state.islOsl = "";
-      state.profile = "";
       state.concurrency = "";
       render();
     });
     selTopo.select.addEventListener("change", () => {
       state.topology = selTopo.select.value;
       state.islOsl = "";
-      state.profile = "";
       state.concurrency = "";
       render();
     });
     selSeq.select.addEventListener("change", () => {
       state.islOsl = selSeq.select.value;
-      state.profile = "";
-      state.concurrency = "";
-      render();
-    });
-    selProf.select.addEventListener("change", () => {
-      state.profile = selProf.select.value;
       state.concurrency = "";
       render();
     });
