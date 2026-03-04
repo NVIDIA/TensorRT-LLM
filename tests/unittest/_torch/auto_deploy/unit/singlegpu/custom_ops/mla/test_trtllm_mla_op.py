@@ -486,3 +486,128 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
             atol=5e-2,
             rtol=5e-2,
         )
+
+
+@pytest.mark.parametrize("num_heads", [4])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_trtllm_mla_chunked_prefill(num_heads, batch_size, dtype, device):
+    """Test chunked prefill: two prefill chunks followed by a decode step.
+
+    Simulates long prompt processing where the prompt is split into chunks.
+    The second chunk must attend to tokens cached from the first chunk.
+    If chunked prefill is broken, chunk 2 only sees its own tokens and the
+    decode output will be incorrect because the KV cache is stale.
+    """
+    qk_nope_head_dim = 128
+    qk_rope_head_dim = 64
+    kv_lora_rank = 512
+    v_head_dim = 128
+    chunk1_len = 16
+    chunk2_len = 16
+    total_prefill = chunk1_len + chunk2_len
+    page_size = _MLA_TOKENS_PER_BLOCK
+    max_seq_len = total_prefill + 8
+    max_num_pages = batch_size * (max_seq_len // page_size + 2)
+
+    all_inputs = _create_mla_inputs(
+        batch_size,
+        total_prefill + 1,  # +1 for decode step
+        num_heads,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        dtype,
+        device,
+    )
+
+    # --- Chunk 1: regular prefill (input_pos=0) ---
+    total_chunk1_tokens = batch_size * chunk1_len
+    chunk1_inputs = {
+        "q_nope": all_inputs["q_nope"][:, :chunk1_len].reshape(
+            1, total_chunk1_tokens, num_heads, qk_nope_head_dim
+        ),
+        "q_pe": all_inputs["q_pe"][:, :chunk1_len].reshape(
+            1, total_chunk1_tokens, num_heads, qk_rope_head_dim
+        ),
+        "compressed_kv": all_inputs["compressed_kv"][:, :chunk1_len].reshape(
+            1, total_chunk1_tokens, kv_lora_rank
+        ),
+        "kpe": all_inputs["kpe"][:, :chunk1_len].reshape(
+            1, total_chunk1_tokens, 1, qk_rope_head_dim
+        ),
+        "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
+    }
+
+    chunk1_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [chunk1_len] * batch_size,
+        [0] * batch_size,
+    )
+
+    _run_trtllm_mla(chunk1_inputs, chunk1_meta, kv_lora_rank)
+
+    # --- Chunk 2: chunked prefill (input_pos=chunk1_len, already has cached tokens) ---
+    total_chunk2_tokens = batch_size * chunk2_len
+    chunk2_inputs = {
+        "q_nope": all_inputs["q_nope"][:, chunk1_len:total_prefill].reshape(
+            1, total_chunk2_tokens, num_heads, qk_nope_head_dim
+        ),
+        "q_pe": all_inputs["q_pe"][:, chunk1_len:total_prefill].reshape(
+            1, total_chunk2_tokens, num_heads, qk_rope_head_dim
+        ),
+        "compressed_kv": all_inputs["compressed_kv"][:, chunk1_len:total_prefill].reshape(
+            1, total_chunk2_tokens, kv_lora_rank
+        ),
+        "kpe": all_inputs["kpe"][:, chunk1_len:total_prefill].reshape(
+            1, total_chunk2_tokens, 1, qk_rope_head_dim
+        ),
+        "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
+    }
+
+    chunk2_meta = _create_trtllm_paged_metadata(
+        batch_size,
+        max_num_pages,
+        page_size,
+        kv_lora_rank,
+        qk_rope_head_dim,
+        dtype,
+        device,
+        [chunk2_len] * batch_size,
+        [chunk1_len] * batch_size,  # input_pos > 0: chunked prefill
+    )
+    chunk2_meta["kv_cache"] = chunk1_meta["kv_cache"]
+
+    chunk2_out = _run_trtllm_mla(chunk2_inputs, chunk2_meta, kv_lora_rank)
+
+    # Reference: torch_mla on the full sequence for chunk2 query positions
+    # For chunked prefill, each query token should attend to ALL preceding tokens
+    # (from both chunk 1 and chunk 2).
+    ref_full_output = torch.ops.auto_deploy.torch_mla(
+        all_inputs["q_nope"][:, :total_prefill],
+        all_inputs["q_pe"][:, :total_prefill],
+        all_inputs["compressed_kv"][:, :total_prefill],
+        all_inputs["kpe"][:, :total_prefill],
+        all_inputs["kv_b_proj_weight"],
+        True,  # is_causal
+        None,
+        "bsnd",
+    )
+    ref_chunk2 = ref_full_output[:, chunk1_len:total_prefill]
+
+    actual_chunk2 = chunk2_out.view(batch_size, chunk2_len, num_heads, v_head_dim)
+
+    torch.testing.assert_close(
+        actual_chunk2,
+        ref_chunk2,
+        atol=5e-3,
+        rtol=5e-3,
+    )

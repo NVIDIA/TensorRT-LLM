@@ -20,3 +20,6 @@ transforms:
   multi_stream_mla_attn:
     stage: compile
     enabled: true
+  insert_cached_mla_attention:
+    stage: cache_init
+    backend: trtllm_mla
