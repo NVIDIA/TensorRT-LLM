@@ -6189,123 +6189,6 @@ TEST(KVCacheManagerReuseAccountingTest, MultipleRequestsWithSharedPrefix)
     EXPECT_EQ(remaining, (promptLength / tokensPerBlock) + (maxNewTokens / tokensPerBlock));
 }
 
-// Verify that when freeChildren evicts a block with descendants from the radix tree,
-// remove events are emitted for all descendant blocks, not just the root block.
-TEST_F(KVCacheManagerTest, KVCacheManagerEventFreeChildrenDescendants)
-{
-    // Use a small pool and small blocks so we can easily force eviction.
-    auto constexpr numLayers = 2;
-    auto constexpr numHeads = 2;
-    auto constexpr sizePerHead = 16;
-    auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 8;
-    auto constexpr blocksInSecondaryPool = 0;
-    auto constexpr maxNumSequences = 4;
-    auto constexpr maxAttentionWindow = 32;
-    auto constexpr beamWidth = 1;
-    auto constexpr dtype = nvinfer1::DataType::kHALF;
-    auto const stream = std::make_shared<tr::CudaStream>();
-    SizeType32 constexpr maxNewTokens{0};
-    tr::SamplingConfig const samplingConfig{beamWidth};
-    auto constexpr onboardBlocks = true;
-    tle::RetentionPriority constexpr lowPriority = 0;
-    tle::RetentionPriority constexpr highPriority = 80;
-
-    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
-
-    KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
-        beamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, dtype, 0, stream,
-        maxAttentionWindow, true, onboardBlocks, CacheType::kSELF, std::nullopt,
-        std::make_unique<tlk::KVCacheEventManager>(1024));
-    kvCacheManager.allocatePools(false);
-
-    // Drain the created event.
-    (void) getEvents(kvCacheManager);
-
-    // Add seq0 with tokens [0,1,2,3, 4,5,6,7, 8] → 3 blocks allocated.
-    // Use retention config: block0 (tokens 0-3) gets LOW priority,
-    // block1 (tokens 4-7) gets HIGH priority.
-    // This ensures the eviction policy returns block0 before block1,
-    // so that when block0 is evicted it still has block1 as a descendant in the radix tree.
-    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
-    auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, true);
-    llmRequest0->setKvCacheRetentionConfig(
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, lowPriority),
-                                   KvCacheRetentionConfig::TokenRangeRetentionConfig(4, std::nullopt, highPriority)},
-            highPriority));
-    kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
-
-    // storeContextBlocks stores full blocks into the radix tree.
-    // With 9 tokens and tokensPerBlock=4, usableSize=8 (last token excluded), so 2 full blocks:
-    //   radix tree: root → block0([0,1,2,3]) → block1([4,5,6,7])
-    // block2 (holding token [8]) is allocated but not stored in the tree.
-    kvCacheManager.storeContextBlocks(*llmRequest0);
-
-    // Release seq0 → releaseBlocks calls storeBlocks (which finds everything already stored),
-    // then releases blocks. block0 (low priority) goes into the priority-0 free queue,
-    // block1 (high priority) goes into the priority-80 free queue.
-    // block2 (not in radix tree, default priority from allocation) also goes to a free queue.
-    (void) kvCacheManager.removeSequence(0, llmRequest0);
-
-    // Collect stored hashes from seq0's events so we know what was in the radix tree.
-    auto seq0Events = getEvents(kvCacheManager);
-    std::set<size_t> storedHashes;
-    for (auto const& event : seq0Events)
-    {
-        if (std::holds_alternative<tle::KVCacheStoredData>(event.data))
-        {
-            auto const& storedData = std::get<tle::KVCacheStoredData>(event.data);
-            for (auto const& block : storedData.blocks)
-            {
-                storedHashes.insert(block.blockHash);
-            }
-        }
-    }
-    // We expect 2 stored block hashes (block0 and block1).
-    ASSERT_EQ(storedHashes.size(), 2) << "Expected 2 blocks stored in radix tree (block0 and block1)";
-
-    // Now add seq1 with completely different tokens → no radix tree matches,
-    // forces eviction. The eviction policy returns lowest-priority blocks first,
-    // so block0 (low priority, parent of block1 in the radix tree) is evicted first.
-    //
-    // When getFreeBlock returns block0, freeChildren(block0) is called:
-    //   - Emits enqueueRemovedEvent(block0) for block0's hash
-    //   - Calls block0->freeBlockAndAllDescendants() which recursively frees block1
-    //     from the radix tree WITHOUT emitting any event for block1
-    //
-    // Later, getFreeBlock returns block2 (not in tree, no event) and some other block.
-    // Eventually getFreeBlock returns block1 from the high-priority queue, but by then
-    // block1's prevBlock has been cleared by freeDescendantsRecursively, so
-    // blockInRadixTree(block1) returns false and no remove event is emitted.
-    //
-    // Result: block1's hash is missing from the remove events — an event consumer
-    // would not know that block1 was removed from the radix tree.
-    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108});
-    auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, true);
-    kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
-
-    auto evictionEvents = getEvents(kvCacheManager);
-
-    // Collect all block hashes that appeared in Removed events.
-    std::set<size_t> removedHashes;
-    for (auto const& event : evictionEvents)
-    {
-        if (std::holds_alternative<tle::KVCacheRemovedData>(event.data))
-        {
-            auto const& removedData = std::get<tle::KVCacheRemovedData>(event.data);
-            removedHashes.insert(removedData.blockHashes.begin(), removedData.blockHashes.end());
-        }
-    }
-
-    // Every block that was stored in the radix tree must have a corresponding remove event.
-    for (auto const& storedHash : storedHashes)
-    {
-        EXPECT_TRUE(removedHashes.count(storedHash) > 0)
-            << "Block hash " << storedHash << " was stored in the radix tree but no remove event was emitted. "
-            << "freeChildren should emit remove events for all descendants, not just the root block.";
-    }
-}
-
 // All remove events for the same window size during a single iteration must be consolidated
 // into a single KVCacheRemovedData (not emitted as separate events).
 TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
@@ -6314,7 +6197,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
     auto constexpr numHeads = 2;
     auto constexpr sizePerHead = 16;
     auto constexpr tokensPerBlock = 4;
-    auto constexpr blocksInPrimaryPool = 8;
+    // Tight pool of 4: seq0 and seq1 together use all 4 blocks, leaving none fresh for seq2.
+    // seq2 therefore must evict tree blocks to obtain its 4 needed blocks.
+    auto constexpr blocksInPrimaryPool = 4;
     auto constexpr blocksInSecondaryPool = 0;
     auto constexpr maxNumSequences = 4;
     auto constexpr maxAttentionWindow = 32;
@@ -6324,8 +6209,6 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
     SizeType32 constexpr maxNewTokens{0};
     tr::SamplingConfig const samplingConfig{beamWidth};
     auto constexpr onboardBlocks = true;
-    tle::RetentionPriority constexpr lowPriority = 0;
-    tle::RetentionPriority constexpr highPriority = 80;
 
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}}};
     KVCacheManager kvCacheManager(numLayers, numHeads, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences,
@@ -6335,28 +6218,34 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
     kvCacheManager.allocatePools(false);
     (void) getEvents(kvCacheManager);
 
-    // Store seq0: radix tree root → block0(lowPrio) → block1(highPrio).
-    // Both blocks will be evicted when seq1 forces eviction: block0 first (low priority),
-    // which also drags block1 out via freeChildren's recursive descent.
-    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8});
+    // Seq0: stores blockA([0,1,2,3]) as a leaf in the radix tree.
+    auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4});
     auto llmRequest0 = std::make_shared<LlmRequest>(0, maxNewTokens, inputTokens0, samplingConfig, true);
-    llmRequest0->setKvCacheRetentionConfig(
-        KvCacheRetentionConfig({KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, lowPriority),
-                                   KvCacheRetentionConfig::TokenRangeRetentionConfig(4, std::nullopt, highPriority)},
-            highPriority));
     kvCacheManager.addSequence(0, inputTokens0->size(), beamWidth, llmRequest0);
     kvCacheManager.storeContextBlocks(*llmRequest0);
     (void) kvCacheManager.removeSequence(0, llmRequest0);
-    (void) getEvents(kvCacheManager); // drain
 
-    // seq1 forces eviction of block0 (and silently block1 via freeChildren).
-    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108});
+    // Seq1: stores blockB([10,11,12,13]) as a separate leaf in the radix tree.
+    auto inputTokens1 = std::make_shared<VecTokens>(VecTokens{10, 11, 12, 13, 14});
     auto llmRequest1 = std::make_shared<LlmRequest>(1, maxNewTokens, inputTokens1, samplingConfig, true);
     kvCacheManager.addSequence(1, inputTokens1->size(), beamWidth, llmRequest1);
+    kvCacheManager.storeContextBlocks(*llmRequest1);
+    (void) kvCacheManager.removeSequence(1, llmRequest1);
+
+    (void) getEvents(kvCacheManager); // drain seq0/seq1 stored events
+
+    // Seq2 needs 4 blocks (15 tokens) with no radix tree match. All 4 pool blocks are in
+    // the free queue after seq0 and seq1 released them. Two of those 4 blocks (blockA and
+    // blockB) are leaves in the radix tree, so each call to freeChildren emits a remove
+    // event. Both removes accumulate into mLatestRemovedEvents[W] and are committed as
+    // one consolidated KVCacheRemovedData when flush() is called.
+    auto inputTokens2 = std::make_shared<VecTokens>(
+        VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114});
+    auto llmRequest2 = std::make_shared<LlmRequest>(2, maxNewTokens, inputTokens2, samplingConfig, true);
+    kvCacheManager.addSequence(2, inputTokens2->size(), beamWidth, llmRequest2);
 
     auto events = getEvents(kvCacheManager);
 
-    // Count how many distinct Removed events were emitted.
     SizeType32 numRemovedEvents = 0;
     SizeType32 numTotalRemovedHashes = 0;
     for (auto const& event : events)
@@ -6369,12 +6258,12 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventRemovedBatchedWithinWindow)
         }
     }
 
-    // Both block0 and block1 were evicted from the same window in the same iteration.
+    // blockA and blockB were both evicted from the same window in the same iteration.
     // They must appear in exactly one consolidated Removed event, not two separate events.
     EXPECT_EQ(numRemovedEvents, 1) << "Expected 1 consolidated Removed event for same-window evictions, got "
                                    << numRemovedEvents;
-    EXPECT_EQ(numTotalRemovedHashes, 2)
-        << "Expected 2 hashes in the Removed event (block0 and its descendant block1), got " << numTotalRemovedHashes;
+    EXPECT_EQ(numTotalRemovedHashes, 2) << "Expected 2 hashes in the Removed event (blockA and blockB), got "
+                                        << numTotalRemovedHashes;
 }
 
 // When evictions and a store happen for the same window in the same iteration, the Removed

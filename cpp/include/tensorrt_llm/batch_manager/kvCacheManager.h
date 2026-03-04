@@ -888,11 +888,8 @@ private:
         GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    //! \brief Free block and all its descendants. This makes block a claimed leaf block.
+    //! \brief Free block and all it's descendants. This makes block a claimed leaf block.
     void freeChildren(BlockPtr const& block);
-
-    //! \brief Recursively enqueue removed events for a block and all its descendants.
-    void enqueueRemovedEventsRecursively(BlockPtr const& block);
 
     //! \brief Find block least likely to be reused, free it if necessary and return.
     //! \param sequence Sequence which the free block is allocated for
