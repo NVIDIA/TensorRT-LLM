@@ -59,7 +59,6 @@ def pytest_configure(config):
         from integration.defs.trt_test_alternative import (print_info,
                                                            print_warning)
         from integration.defs.utils.periodic_junit import PeriodicJUnitXML
-        
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
