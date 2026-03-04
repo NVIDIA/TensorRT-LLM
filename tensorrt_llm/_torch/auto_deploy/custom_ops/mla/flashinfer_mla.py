@@ -546,11 +546,10 @@ def flashinfer_mla_with_cache(
         last_page_len[:num_seq],
     )
 
-    # Pre-allocate output
-    if num_prefill > 0 and num_decode > 0:
-        y = torch.empty(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
+    if out is not None:
+        y = out.view(bs, num_heads, v_head_dim)
     else:
-        y = None
+        y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
 
     # =========================================================================
     # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
@@ -682,10 +681,7 @@ def flashinfer_mla_with_cache(
                 v_prefill,
             )
 
-        if y is not None:
-            y[:num_prefill_tokens] = y_prefill
-        else:
-            y = y_prefill
+        y[:num_prefill_tokens] = y_prefill
 
     # =========================================================================
     # DECODE phase: Use BatchMLAPagedAttentionWrapper with paged compressed KV
@@ -753,26 +749,14 @@ def flashinfer_mla_with_cache(
         # y_decode: [num_decode, N, v_head_dim]
         y_decode = torch.einsum("bnk,nvk->bnv", y_decode_compressed, w_v)
 
-        if y is not None:
-            y[num_prefill_tokens:num_total_tokens] = y_decode
-        else:
-            y = y_decode
+        y[num_prefill_tokens:num_total_tokens] = y_decode
 
     if out is not None:
-        out_flat = out.view(bs, num_heads, v_head_dim)
-        out_flat[:num_total_tokens].copy_(y[:num_total_tokens])
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
         if num_total_tokens < bs:
-            out_flat[num_total_tokens:].zero_()
+            y[num_total_tokens:].zero_()
         return out.new_empty(0)
-
-    # piecewise bucket padding can make b*s > num_total_tokens.
-    # pad/truncate output to [b*s, ...] before view so padded slots are deterministic.
-    if y.shape[0] < bs:
-        y_padded = torch.zeros((bs, y.shape[1], y.shape[2]), dtype=y.dtype, device=y.device)
-        y_padded[: y.shape[0]] = y
-        y = y_padded
-    elif num_total_tokens < bs:
-        y[num_total_tokens:].zero_()
 
     return y.view(b, s, num_heads, v_head_dim)
 

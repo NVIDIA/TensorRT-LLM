@@ -131,6 +131,9 @@ def fla_cached_gated_delta_rule(
         del y_decode
 
     if out is not None:
+        # TODO: add out= support to chunk_gated_delta_rule and
+        # fused_recurrent_gated_delta_rule_update_fwd so we can write
+        # directly into the pre-allocated buffer and eliminate this copy.
         out_flat = out.view(b * s, num_heads, -1)
         out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
         if num_total_tokens < b * s:
