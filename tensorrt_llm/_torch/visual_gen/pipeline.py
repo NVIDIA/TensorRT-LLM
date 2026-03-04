@@ -481,7 +481,8 @@ class BasePipeline(nn.Module):
 
         c_start = time.time()
 
-        # All-gather primary noise
+        # All-gather primary noise (must be contiguous for NCCL)
+        noise_pred_local = noise_pred_local.contiguous()
         gather_list = [torch.empty_like(noise_pred_local) for _ in range(self.world_size)]
         dist.all_gather(gather_list, noise_pred_local)
         noise_cond = gather_list[0]
@@ -491,6 +492,7 @@ class BasePipeline(nn.Module):
         # All-gather extra stream noises
         extra_noise_preds = {}
         for name, noise_local in extra_noise_locals.items():
+            noise_local = noise_local.contiguous()
             gather_list_extra = [torch.empty_like(noise_local) for _ in range(self.world_size)]
             dist.all_gather(gather_list_extra, noise_local)
             noise_cond_extra = gather_list_extra[0]

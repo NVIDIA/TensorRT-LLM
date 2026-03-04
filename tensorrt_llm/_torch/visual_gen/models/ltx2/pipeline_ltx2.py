@@ -21,6 +21,7 @@ from typing import Any, Dict, List, Optional, Union
 
 import safetensors.torch
 import torch
+import torch.distributed as dist
 from transformers import Gemma3ForConditionalGeneration, GemmaTokenizerFast
 
 from tensorrt_llm._torch.visual_gen.config import PipelineComponent
@@ -901,6 +902,19 @@ class LTX2Pipeline(BasePipeline):
         # guidance_rescale and other existing behaviour is preserved.
         use_multi_modal_guidance = do_stg or do_modality
 
+        # CFG parallel for multi-modal guidance: each GPU handles one
+        # CFG pass (cond or uncond), results are all-gathered, then
+        # STG/modality passes run on every GPU before the guidance formula.
+        cfg_size = self.model_config.parallel.dit_cfg_size
+        ulysses_size = self.model_config.parallel.dit_ulysses_size
+        do_cfg_parallel_mm = use_multi_modal_guidance and cfg_size >= 2 and do_cfg
+        cfg_group = self.rank // ulysses_size
+        if do_cfg_parallel_mm and self.rank == 0:
+            logger.info(
+                f"CFG parallel (multi-modal guidance): cfg_size={cfg_size}, "
+                f"ulysses_size={ulysses_size}"
+            )
+
         # ---- 0. Optional prompt enhancement -----------------------------
         if enhance_prompt:
             logger.info("Enhancing prompt with Gemma3...")
@@ -1121,20 +1135,47 @@ class LTX2Pipeline(BasePipeline):
                 )
                 return dn_v, {"audio": dn_a}
 
-            # Positive (conditioned) pass
-            cond_v, cond_a = _run_transformer(
-                video_latents, audio_latents_in, timestep,
-                video_embeds, audio_embeds, connector_mask,
-            )
+            # --- CFG: conditional + unconditional passes --------------------
+            if do_cfg_parallel_mm:
+                # CFG parallel: split cond/uncond across GPUs, all-gather
+                if cfg_group == 0:
+                    local_v, local_a = _run_transformer(
+                        video_latents, audio_latents_in, timestep,
+                        video_embeds, audio_embeds, connector_mask,
+                    )
+                else:
+                    local_v, local_a = _run_transformer(
+                        video_latents, audio_latents_in, timestep,
+                        neg_video_embeds, neg_audio_embeds, neg_connector_mask,
+                    )
 
-            # CFG: negative text pass
-            uncond_v: torch.Tensor | float = 0.0
-            uncond_a: torch.Tensor | float = 0.0
-            if do_cfg and neg_video_embeds is not None:
-                uncond_v, uncond_a = _run_transformer(
+                local_v = local_v.contiguous()
+                gather_v = [torch.empty_like(local_v) for _ in range(self.world_size)]
+                dist.all_gather(gather_v, local_v)
+                cond_v = gather_v[0]
+                uncond_v = gather_v[ulysses_size]
+
+                if local_a is not None:
+                    local_a = local_a.contiguous()
+                    gather_a = [torch.empty_like(local_a) for _ in range(self.world_size)]
+                    dist.all_gather(gather_a, local_a)
+                    cond_a = gather_a[0]
+                    uncond_a = gather_a[ulysses_size]
+                else:
+                    cond_a = None
+                    uncond_a = 0.0
+            else:
+                cond_v, cond_a = _run_transformer(
                     video_latents, audio_latents_in, timestep,
-                    neg_video_embeds, neg_audio_embeds, neg_connector_mask,
+                    video_embeds, audio_embeds, connector_mask,
                 )
+                uncond_v = 0.0
+                uncond_a = 0.0
+                if do_cfg and neg_video_embeds is not None:
+                    uncond_v, uncond_a = _run_transformer(
+                        video_latents, audio_latents_in, timestep,
+                        neg_video_embeds, neg_audio_embeds, neg_connector_mask,
+                    )
 
             # STG: perturbed attention pass
             perturbed_v: torch.Tensor | float = 0.0
