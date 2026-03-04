@@ -1906,9 +1906,12 @@ public:
 
     virtual void unpinBlocksById(std::vector<KVCacheBlock::IdType> const& blockIds) = 0;
 
-    /// @brief Drop blocks from the KV cache manager.
-    /// @param targetTokens The target tokens with both prefix to keep and suffix to drop.
-    /// @param numTokensToKeep Number of tokens to keep from the end of the sequence.
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @param targetTokens The full token sequence whose cached blocks are walked.
+    /// @param numTokensToKeep Number of prefix tokens to retain. Blocks whose cumulative
+    ///        token count exceeds this threshold (and all their descendants) are released.
+    ///        Because truncation operates at block granularity, the boundary block that
+    ///        spans the threshold is preserved.
     virtual void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) = 0;
 
     //! @brief Get the retention priority of a block by its ID.
@@ -2296,9 +2299,8 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxAttentionWindow(SizeType32 inputLength, SizeType32 outputLength,
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
-    /// @brief Drop blocks from the KV cache manager.
-    /// @param targetTokens The target tokens with both prefix to keep and suffix to drop.
-    /// @param numTokensToKeep Number of tokens to keep from the end of the sequence.
+    /// @brief Release cached blocks for a token sequence beyond a given prefix length.
+    /// @copydetail BaseKVCacheManager::truncateBlocks
     void truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep) override;
 
 private:
