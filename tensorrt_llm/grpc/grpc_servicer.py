@@ -97,10 +97,11 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 proto_config=request.sampling_config,
                 output_config=request.output_config,
                 max_tokens=request.max_tokens,
-                end_id=request.end_id if request.HasField("end_id") else None,
-                pad_id=request.pad_id if request.HasField("pad_id") else None,
-                bad_words=list(request.bad_words) if request.bad_words else None,
-                stop_words=list(request.stop_words) if request.stop_words else None,
+                stop=list(request.stop) if request.stop else None,
+                stop_token_ids=list(request.stop_token_ids) if request.stop_token_ids else None,
+                ignore_eos=request.ignore_eos,
+                bad=list(request.bad) if request.bad else None,
+                bad_token_ids=list(request.bad_token_ids) if request.bad_token_ids else None,
                 guided_decoding=request.guided_decoding
                 if request.HasField("guided_decoding")
                 else None,

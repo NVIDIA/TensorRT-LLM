@@ -233,10 +233,11 @@ def create_sampling_params_from_proto(
     proto_config: pb2.SamplingConfig,
     output_config: pb2.OutputConfig,
     max_tokens: int,
-    end_id: Optional[int] = None,
-    pad_id: Optional[int] = None,
-    bad_words: Optional[List[pb2.TokenSequence]] = None,
-    stop_words: Optional[List[pb2.TokenSequence]] = None,
+    stop: Optional[List[str]] = None,
+    stop_token_ids: Optional[List[int]] = None,
+    ignore_eos: bool = False,
+    bad: Optional[List[str]] = None,
+    bad_token_ids: Optional[List[int]] = None,
     guided_decoding: Optional[pb2.GuidedDecodingParams] = None,
     embedding_bias: Optional[List[float]] = None,
 ) -> SamplingParams:
@@ -246,10 +247,11 @@ def create_sampling_params_from_proto(
         proto_config: Protobuf SamplingConfig message
         output_config: Protobuf OutputConfig message
         max_tokens: Maximum tokens to generate
-        end_id: End-of-sequence token ID
-        pad_id: Padding token ID
-        bad_words: Bad word token sequences
-        stop_words: Stop word token sequences
+        stop: Stop strings (tokenized by TRT-LLM's _setup())
+        stop_token_ids: Stop token IDs
+        ignore_eos: Whether to ignore end-of-sequence token
+        bad: Bad word strings (tokenized by TRT-LLM's _setup())
+        bad_token_ids: Bad word token IDs
         guided_decoding: Guided decoding parameters
         embedding_bias: Embedding bias tensor
 
@@ -317,13 +319,19 @@ def create_sampling_params_from_proto(
     if proto_config.HasField("no_repeat_ngram_size"):
         kwargs["no_repeat_ngram_size"] = proto_config.no_repeat_ngram_size
 
-    # End/pad tokens
-    if end_id is not None:
-        kwargs["end_id"] = end_id
-        if end_id == -1:
-            kwargs["ignore_eos"] = True
-    if pad_id is not None:
-        kwargs["pad_id"] = pad_id
+    # Stop sequences and ignore_eos (TRT-LLM's _setup() tokenizes stop strings)
+    if stop:
+        kwargs["stop"] = stop
+    if stop_token_ids:
+        kwargs["stop_token_ids"] = stop_token_ids
+    if ignore_eos:
+        kwargs["ignore_eos"] = True
+
+    # Bad words (TRT-LLM's _setup() tokenizes bad word strings)
+    if bad:
+        kwargs["bad"] = bad
+    if bad_token_ids:
+        kwargs["bad_token_ids"] = bad_token_ids
 
     # Output configuration - logprobs
     if output_config.HasField("logprobs"):
@@ -336,11 +344,6 @@ def create_sampling_params_from_proto(
         kwargs["return_generation_logits"] = True
     if output_config.exclude_input_from_output:
         kwargs["exclude_input_from_output"] = True
-
-    # Pre-tokenized stop/bad word sequences (set after construction since
-    # SamplingParams._stop_word_ids/_bad_word_ids are init=False fields)
-    stop_word_ids = [list(seq.token_ids) for seq in stop_words] if stop_words else None
-    bad_word_ids = [list(seq.token_ids) for seq in bad_words] if bad_words else None
 
     # Embedding bias
     if embedding_bias:
@@ -362,16 +365,6 @@ def create_sampling_params_from_proto(
             kwargs["guided_decoding"] = GuidedDecodingParams(grammar=guide_content)
 
     params = SamplingParams(**kwargs)
-
-    # Set pre-tokenized stop/bad word IDs directly. _get_stop_words() and
-    # _get_bad_words() only read _stop_word_ids/_bad_word_ids when self.stop
-    # /self.bad is not None, so set them to empty lists to enable that path.
-    if stop_word_ids:
-        params._stop_word_ids = stop_word_ids
-        params.stop = []
-    if bad_word_ids:
-        params._bad_word_ids = bad_word_ids
-        params.bad = []
 
     return params
 
