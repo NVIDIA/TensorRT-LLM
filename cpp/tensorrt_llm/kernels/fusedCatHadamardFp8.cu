@@ -124,7 +124,8 @@ union FP8x4
 ///   - FP8 quantizes with per-row scale (vectorized 4-byte stores).
 __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8Kernel(
     __nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe,
-    __nv_bfloat16 const* __restrict__ nope, int32_t M, int32_t pe_dim, int32_t nope_dim, bool use_ue8m0)
+    __nv_bfloat16 const* __restrict__ nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride,
+    int32_t nope_row_stride, bool use_ue8m0)
 {
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane = threadIdx.x % WARP_SIZE;
@@ -142,8 +143,8 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
     float v0, v1, v2, v3;
     {
         int base = lane * ELEMS_PER_THREAD;
-        __nv_bfloat16 const* pe_row = pe + static_cast<int64_t>(row) * pe_dim;
-        __nv_bfloat16 const* nope_row = nope + static_cast<int64_t>(row) * nope_dim;
+        __nv_bfloat16 const* pe_row = pe + static_cast<int64_t>(row) * pe_row_stride;
+        __nv_bfloat16 const* nope_row = nope + static_cast<int64_t>(row) * nope_row_stride;
 
         BF16x4 loaded;
         if (base + ELEMS_PER_THREAD <= pe_dim)
@@ -250,8 +251,8 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
 } // anonymous namespace
 
 void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe,
-    __nv_bfloat16 const* nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, bool use_ue8m0,
-    cudaStream_t stream)
+    __nv_bfloat16 const* nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride,
+    int32_t nope_row_stride, bool use_ue8m0, cudaStream_t stream)
 {
     if (M == 0)
     {
@@ -264,12 +265,17 @@ void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bf
     TLLM_CHECK_WITH_INFO((head_dim & (head_dim - 1)) == 0, "fusedCatHadamardFp8: head_dim must be power of 2");
     TLLM_CHECK_WITH_INFO(pe_dim % ELEMS_PER_THREAD == 0,
         "fusedCatHadamardFp8: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
+    TLLM_CHECK_WITH_INFO(pe_row_stride >= pe_dim, "fusedCatHadamardFp8: pe_row_stride (%d) must be >= pe_dim (%d)",
+        pe_row_stride, pe_dim);
+    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim,
+        "fusedCatHadamardFp8: nope_row_stride (%d) must be >= nope_dim (%d)", nope_row_stride, nope_dim);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     dim3 grid(num_blocks);
     dim3 block(WARP_SIZE * ROWS_PER_BLOCK); // 256 threads per block
 
-    fusedCatHadamardFp8Kernel<<<grid, block, 0, stream>>>(fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, use_ue8m0);
+    fusedCatHadamardFp8Kernel<<<grid, block, 0, stream>>>(
+        fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, use_ue8m0);
 
     TLLM_CUDA_CHECK(cudaGetLastError());
 }

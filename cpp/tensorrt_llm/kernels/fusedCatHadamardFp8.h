@@ -35,20 +35,29 @@ namespace kernels
 /// applies a Walsh-Hadamard transform with scaling factor head_dim^{-0.5},
 /// then quantizes each row to FP8 E4M3 with one scale factor per row.
 ///
-/// @param fp8_out    Output FP8 data [M, head_dim], row-major.
-/// @param scale_out  Output scales [M, 1], float32.  When use_ue8m0 is true,
-///                   the scale is stored as UE8M0 (power-of-two) in float bits.
-/// @param pe         Input PE part [M, pe_dim], BF16, row-major contiguous.
-/// @param nope       Input non-PE part [M, nope_dim], BF16, row-major contiguous.
-/// @param M          Number of rows.
-/// @param pe_dim     Dimension of PE input (must satisfy pe_dim + nope_dim == head_dim).
-/// @param nope_dim   Dimension of non-PE input.
-/// @param head_dim   Total head dimension (must be 128, power of 2).
-/// @param use_ue8m0  If true, use UE8M0 (power-of-two) scale format.
-/// @param stream     CUDA stream.
+/// Inputs need not be fully contiguous — only the innermost dimension must be
+/// contiguous (stride 1).  The row stride for each input is provided explicitly
+/// via pe_row_stride / nope_row_stride, which allows processing non-contiguous
+/// views (e.g. from torch.split()) without a prior contiguous copy.
+///
+/// @param fp8_out         Output FP8 data [M, head_dim], row-major.
+/// @param scale_out       Output scales [M, 1], float32.  When use_ue8m0 is true,
+///                        the scale is stored as UE8M0 (power-of-two) in float bits.
+/// @param pe              Input PE part, BF16. Each row has pe_dim contiguous elements.
+/// @param nope            Input non-PE part, BF16. Each row has nope_dim contiguous elements.
+/// @param M               Number of rows (product of all dims except the last).
+/// @param pe_dim          Dimension of PE input (must satisfy pe_dim + nope_dim == head_dim).
+/// @param nope_dim        Dimension of non-PE input.
+/// @param head_dim        Total head dimension (must be 128, power of 2).
+/// @param pe_row_stride   Stride (in elements) between consecutive rows of pe.
+///                        For contiguous layout this equals pe_dim; for non-contiguous
+///                        views (e.g. from torch.split) it may be larger.
+/// @param nope_row_stride Stride (in elements) between consecutive rows of nope.
+/// @param use_ue8m0       If true, use UE8M0 (power-of-two) scale format.
+/// @param stream          CUDA stream.
 void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe,
-    __nv_bfloat16 const* nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, bool use_ue8m0,
-    cudaStream_t stream = 0);
+    __nv_bfloat16 const* nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride,
+    int32_t nope_row_stride, bool use_ue8m0, cudaStream_t stream = 0);
 
 } // namespace kernels
 
