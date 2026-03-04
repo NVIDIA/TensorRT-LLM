@@ -13,6 +13,7 @@ Hierarchical test levels:
 
 import pytest
 import torch
+from _model_test_utils import assert_rmse_close
 from torch.export import Dim
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -524,9 +525,8 @@ def test_kimi_k2_moe_numerical_equivalence(B, S, dtype):
     hf_out = hf_moe(x)
     custom_out = custom_moe(x)
 
-    # Compare — fused noaux_tc routing vs Python routing, wider tolerance
-    rtol, atol = 0.05, 0.05
-    torch.testing.assert_close(custom_out, hf_out, rtol=rtol, atol=atol)
+    # Compare — torch_moe expert computation vs HF Python loop
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.02, msg="MoE: ")
 
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
@@ -591,9 +591,9 @@ def test_kimi_k2_attention_numerical_equivalence(B, S, dtype):
     # Run custom attention (takes full table + position_ids)
     custom_out = custom_attn(x, position_ids, (full_cos, full_sin))
 
-    # Compare — RoPE format conversion + fused MLA vs eager attention
-    rtol, atol = 0.02, 0.02
-    torch.testing.assert_close(custom_out, hf_out, rtol=rtol, atol=atol)
+    # Compare — RoPE format conversion + fused MLA vs eager attention.
+    # Higher tolerance due to RoPE de-interleaving + fused MLA vs eager path.
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.10, msg="Attention: ")
 
 
 # --- Level 2: Layer Equivalence ---
@@ -654,8 +654,7 @@ def test_kimi_k2_dense_layer_numerical_equivalence(B, S, dtype):
     custom_out = custom_layer(x, position_ids, (full_cos, full_sin))
 
     # Compare
-    rtol, atol = 0.05, 0.05
-    torch.testing.assert_close(custom_out, hf_out, rtol=rtol, atol=atol)
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="Dense layer: ")
 
 
 @pytest.mark.parametrize("B,S", _BATCH_AND_SEQUENCE_TEST_CASES)
@@ -714,8 +713,7 @@ def test_kimi_k2_moe_layer_numerical_equivalence(B, S, dtype):
     custom_out = custom_layer(x, position_ids, (full_cos, full_sin))
 
     # Compare — includes MoE routing differences
-    rtol, atol = 0.05, 0.05
-    torch.testing.assert_close(custom_out, hf_out, rtol=rtol, atol=atol)
+    assert_rmse_close(custom_out, hf_out, rmse_ratio_tol=0.05, msg="MoE layer: ")
 
 
 # --- Level 3: Full Model Equivalence ---
@@ -763,10 +761,4 @@ def test_kimi_k2_full_model_numerical_equivalence(B, S, dtype):
     custom_out = custom_model(input_ids=input_ids, position_ids=position_ids)
 
     # Compare logits — cast to float32 since HF may return bfloat16
-    rtol, atol = 0.05, 0.05
-    torch.testing.assert_close(
-        custom_out.logits.float(),
-        hf_out.logits.float(),
-        rtol=rtol,
-        atol=atol,
-    )
+    assert_rmse_close(custom_out.logits, hf_out.logits, rmse_ratio_tol=0.02, msg="Full model: ")

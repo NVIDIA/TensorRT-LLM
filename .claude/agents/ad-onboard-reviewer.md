@@ -63,17 +63,17 @@ Mark as N/A with justification if the model doesn't have the relevant component.
 | # | Check | How to verify |
 |---|-------|---------------|
 | F1 | Uses small config (hidden_size ~64, num_hidden_layers 2-3, vocab_size ~1000) | Read the test config creation |
-| F2 | No smoke tests — every test has meaningful assertions (`assert_close`, shape checks, finiteness checks) | Check each test for substantive assertions |
-| F3 | Do not rely on only `isnan`/`isinf` checks; include functional equivalence assertions | Check tests use `assert_close` (or equivalent) against reference outputs |
+| F2 | No smoke tests — every test has meaningful assertions (`assert_close`, `assert_rmse_close`, shape checks, finiteness checks) | Check each test for substantive assertions |
+| F3 | Do not rely on only `isnan`/`isinf` checks; include functional equivalence assertions | Check tests use `assert_close` or `assert_rmse_close` against reference outputs |
 | F4 | Test imports must be self-contained (transformers imports or copied reference classes only); no hardcoded local/temp path imports | Inspect imports and helper loaders |
 
 ### G. Test File — Hierarchical Levels
 
 | # | Check | How to verify |
 |---|-------|---------------|
-| G1 | **Block equivalence**: Tests individual blocks (MLP, Attention, MoE, Norm) comparing AD output vs HF output with `torch.testing.assert_close` | Look for per-block test functions loading same weights into both implementations |
-| G2 | **Layer equivalence**: Tests a full decoder layer (if model has heterogeneous layers like dense vs MoE, tests each type) | Look for layer-level test |
-| G3 | **Full model equivalence**: End-to-end logits comparison AD vs HF with same weights with minimum number layers. Also, need to be able to run on CPU. | Look for full model test with logits `assert_close` |
+| G1 | **Block equivalence**: Tests individual blocks (MLP, Attention, MoE, Norm) comparing AD output vs HF output. Blocks with identical math (plain MLP, Norm) should use `torch.testing.assert_close` with tight tolerance. Blocks with fused custom ops (Attention with MLA/RoPE, MoE with fused routing) must use `assert_rmse_close` from `_model_test_utils` with appropriate `rmse_ratio_tol` (attention: 0.10, MoE: 0.02). | Look for per-block test functions loading same weights into both implementations; verify correct comparison function and tolerance |
+| G2 | **Layer equivalence**: Tests a full decoder layer (if model has heterogeneous layers like dense vs MoE, tests each type). Must use `assert_rmse_close` with `rmse_ratio_tol=0.05`. | Look for layer-level test with `assert_rmse_close` |
+| G3 | **Full model equivalence**: End-to-end logits comparison AD vs HF with same weights with minimum number layers. Must use `assert_rmse_close` with `rmse_ratio_tol=0.05`. Also, need to be able to run on CPU. | Look for full model test with logits `assert_rmse_close` |
 | G4 | **Export test**: Uses `torch_export_to_gm` with `Dim.DYNAMIC` for both batch and sequence dimensions | Grep for `torch_export_to_gm` and `Dim.DYNAMIC` |
 | G6 | Export test runs a second forward with different shape to verify dynamic dims work | Look for a second input with different B, S values |
 

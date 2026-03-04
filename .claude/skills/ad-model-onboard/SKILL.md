@@ -57,15 +57,27 @@ Create `tests/unittest/_torch/auto_deploy/unit/singlegpu/models/test_{name}_mode
 - **If HF modules are NOT in the installed `transformers`**: copy the minimal module definitions from the HF `modeling_*.py` source into the test file as standalone reference classes. This keeps tests self-contained without requiring a specific `transformers` version.
 - **Weight conversion helpers**: Write test-only helpers for any weight format differences between HF and custom (e.g., RoPE de-interleaving, stacked-to-per-expert MoE weights, gate weight key remapping). For full-model tests, prefer using `load_state_dict` pre-hooks already registered on the custom model.
 
+**Numerical comparison:** For equivalence tests comparing custom ops against HF reference, use the shared `assert_rmse_close` utility from `_model_test_utils`:
+```python
+from _model_test_utils import assert_rmse_close
+```
+This computes `rmse(actual - expected) / rmse(expected)` — more robust than per-element `torch.testing.assert_close` since a few outlier elements won't fail the test. Use `torch.testing.assert_close` only for blocks with identical math (e.g., plain MLP with no custom ops).
+
+Recommended `rmse_ratio_tol` values for bfloat16:
+- **Identical math** (MLP, Norm): use `torch.testing.assert_close` with tight rtol/atol (1e-3)
+- **MoE block** (fused routing): `0.02`
+- **Decoder layer / MoE layer / full model**: `0.05`
+- **Attention**: `0.10`
+
 **Bottom-up levels (each must pass before next):**
-1. **Block equivalence** — Test MLP, Attention, MoE, Norm individually: same weights + same input → `torch.testing.assert_close`.
+1. **Block equivalence** — Test MLP, Attention, MoE, Norm individually: same weights + same input → `assert_rmse_close` (or `torch.testing.assert_close` for identical-math blocks).
 2. **Layer equivalence** — Full decoder layer. If model has heterogeneous layers (dense vs MoE, attention vs SSM), test each type separately.
 3. **Full model equivalence** — End-to-end logits comparison. Use a small config with <10 layers that covers the essence of the architecture (e.g., at least one of each layer type).
 4. **Export test** — `torch_export_to_gm` with `Dim.DYNAMIC` for batch+seq, verify finite output, test a second shape.
 
 ## Phase 7 — Independent Review (MANDATORY)
 
-Invoke the `onboard-reviewer` subagent with ONLY the following information:
+Invoke the `ad-onboard-reviewer` subagent with ONLY the following information:
 - Model name
 - Path to the model file created
 - Path to the test file created
