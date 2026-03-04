@@ -28,6 +28,7 @@ from unittest.mock import patch
 HF_ID_TO_LLM_MODELS_SUBDIR = {
     "meta-llama/Meta-Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
     "meta-llama/Llama-3.1-8B-Instruct": "llama-3.1-model/Llama-3.1-8B-Instruct",
+    "nvidia/Llama-3.1-8B-Instruct-FP8": "llama-3.1-model/Llama-3.1-8B-Instruct-FP8",
     "meta-llama/Llama-3.1-8B": "llama-3.1-model/Meta-Llama-3.1-8B",
     "TinyLlama/TinyLlama-1.1B-Chat-v1.0": "llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
     "meta-llama/Llama-4-Scout-17B-16E-Instruct": "llama4-models/Llama-4-Scout-17B-16E-Instruct",
