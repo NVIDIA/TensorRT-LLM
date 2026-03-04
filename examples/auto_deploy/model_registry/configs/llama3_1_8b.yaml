@@ -6,6 +6,8 @@ kv_cache_config:
   dtype: fp8
   free_gpu_memory_fraction: 0.9
 attn_backend: trtllm
+max_batch_size: 256
+max_seq_len: 16384
 transforms:
   fuse_fp8_gemms:
     stage: post_load_fusion

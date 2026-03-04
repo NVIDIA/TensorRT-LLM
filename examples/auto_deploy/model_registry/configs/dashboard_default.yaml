@@ -7,3 +7,7 @@ compile_backend: torch-cudagraph
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 max_seq_len: 512
+transforms:
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: true
