@@ -28,7 +28,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank
 
 # yapf: disable
 # isort: off
@@ -213,7 +213,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def supports_backend(self, backend: str) -> bool:
         """
-        Override if the speculation algorithm does not support
+        Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -237,9 +237,9 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
-        default=32, description="The window size for snap KV.")
+        default=32, description="The window size for RocketKV.")
     kernel_size: Optional[int] = Field(
-        default=63, description="The kernel size for snap KV.")
+        default=63, description="The kernel size for RocketKV.")
     topr: Optional[Union[int, float]] = Field(default=128, description="Top-r")
     topk: Optional[int] = Field(default=64, description="Top-k")
     prompt_budget: Optional[int] = Field(default=2048,
@@ -636,7 +636,7 @@ class _ModelFormatKind(Enum):
 
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
-        default=None, description="The number of drafter layers.")
+        default=None, description="The maximum number of draft tokens.")
 
     max_total_draft_tokens: Optional[int] = Field(
         default=None,
@@ -651,7 +651,7 @@ class DecodingBaseConfig(StrictBaseModel):
         validation_alias=AliasChoices("speculative_model",
                                       "speculative_model_dir"),
         description=
-        "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'),"
+        "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
     )
 
@@ -899,7 +899,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_choices(cls, v):
         if v is not None:
             logger.warning(
-                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
             )
             if not isinstance(v, list):
                 if isinstance(v, str):
@@ -914,6 +914,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
+        if not self.eagle3_one_model:
+            logger.warning(
+                "Eagle3 2-model is deprecated and will be removed in release 1.4."
+            )
+
         self.num_eagle_layers = self.max_draft_len
         self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
@@ -934,7 +939,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
             num_eagle_layers_from_choices = self.check_eagle_choices()
             if num_eagle_layers_from_choices != self.num_eagle_layers:
                 logger.warning(
-                    f"Base on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
+                    f"Based on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
                 )
                 self.num_eagle_layers = num_eagle_layers_from_choices
                 self.max_draft_len = num_eagle_layers_from_choices
@@ -1151,6 +1156,34 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class SADecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
+    the target model forward; supports CUDA graph and overlap scheduler.
+    """
+    decoding_type: Literal["SA"] = "SA"
+    max_matching_ngram_size: int = Field(
+        default=-1,
+        description="Positive value (e.g., 3): fixed-size ngram matching. "
+        "-1: longest possible match via suffix automaton. 0 is invalid.")
+
+    @model_validator(mode='after')
+    def validate_sa_config(self):
+        if self.max_matching_ngram_size == 0:
+            raise ValueError(
+                "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
+                "Got 0.")
+        if self.max_draft_len is None or self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for SA")
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
 
@@ -1201,6 +1234,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
 
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: int = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
+
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
     num_nextn_predict_layers_from_model_config: int = Field(
@@ -1232,8 +1276,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
-                "in release 1.3. After that, the flag will be removed entirely."
+                "2-model style MTP is deprecated and will be removed in release 1.4."
             )
         return self
 
@@ -1388,7 +1431,7 @@ class RayPlacementConfig(StrictBaseModel):
 
 class PybindMirror(ABC):
     ''' A class containing the utilities for mirroring Python classes to
-    pybinding classes.
+    pybind classes.
     '''
 
     @abstractmethod
@@ -1753,6 +1796,7 @@ SpeculativeConfig: TypeAlias = Annotated[
         MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
+        SADecodingConfig,
         UserProvidedDecodingConfig,
         SaveHiddenStatesDecodingConfig,
         PARDDecodingConfig,
@@ -1817,7 +1861,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     secondary_offload_min_priority: Optional[int] = Field(
         default=None,
         description=
-        "Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory."
+        "Only blocks with priority > secondary_offload_min_priority can be offloaded to secondary memory."
     )
     event_buffer_max_size: int = Field(
         default=0,
@@ -1847,8 +1891,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    dtype: str = Field(default="auto",
-                       description="The data type to use for the KV cache.")
+    dtype: str = Field(
+        default="auto",
+        description=
+        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -1893,6 +1940,65 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+
+    @field_validator('free_gpu_memory_fraction')
+    @classmethod
+    def validate_free_gpu_memory_fraction(cls, v: float):
+        """Validates that the fraction is between 0.0 and 1.0."""
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
+    @field_validator('dtype')
+    @classmethod
+    def validate_dtype(cls, v: str):
+        v = v.lower()
+        if v in ("auto", "fp8",
+                 "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+            return v
+
+        raise ValueError(
+            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
+        )
+
+    @field_validator('max_gpu_total_bytes')
+    @classmethod
+    def validate_max_gpu_total_bytes(cls, v: int):
+        if v < 0:
+            raise ValueError(
+                "kv_cache_config.max_gpu_total_bytes must be non-negative")
+        return v
+
+    @field_validator('max_attention_window')
+    @classmethod
+    def validate_max_attention_window(cls, v: Optional[List[int]]):
+        if v is None:
+            return v
+
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError(
+                "kv_cache_config.max_attention_window must be a non-empty list of positive integers"
+            )
+        for i in v:
+            if not isinstance(i, int):
+                raise ValueError(
+                    "kv_cache_config.max_attention_window must contain only integers"
+                )
+            if i <= 0:
+                raise ValueError(
+                    "kv_cache_config.max_attention_window values must be positive"
+                )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
+        return v
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -2082,16 +2188,16 @@ class BaseLlmArgs(StrictBaseModel):
 
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
-        description="The cluster parallel size for MoE models's expert weights.",
+        description="The cluster parallel size for MoE model's expert weights.",
         status="beta")
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
-        description="The tensor parallel size for MoE models's expert weights.")
+        description="The tensor parallel size for MoE model's expert weights.")
 
     moe_expert_parallel_size: Optional[int] = Field(
         default=None,
-        description="The expert parallel size for MoE models's expert weights.")
+        description="The expert parallel size for MoE model's expert weights.")
 
     enable_attention_dp: bool = Field(
         default=False,
@@ -2606,7 +2712,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE draft model must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 eagle_config = _EagleConfig(
@@ -2856,7 +2962,7 @@ class TorchLlmArgs(BaseLlmArgs):
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
-        "Threshold for Python garbage collection of generation 0 objects."
+        "Threshold for Python garbage collection of generation 0 objects. "
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
@@ -2940,7 +3046,7 @@ class TorchLlmArgs(BaseLlmArgs):
         ge=0,
         le=1,
         description=
-        "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays.",
+        "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.",
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
@@ -3033,7 +3139,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     ray_worker_extension_cls: Optional[str] = Field(
         default=None,
-        description="The full worker extension class name including module path."
+        description="The full worker extension class name including module path. "
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
@@ -3044,10 +3150,16 @@ class TorchLlmArgs(BaseLlmArgs):
         exclude=True,
         status="prototype")
 
+    ray_worker_nsight_options: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Nsight options.",
+        status="prototype",
+    )
+
     enable_sleep: bool = Field(
         default=False,
         description=
-        "Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading."
+        "Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. "
         "Only enable it if you intend to use this feature.",
         status="prototype")
 
@@ -3222,6 +3334,8 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
         elif self.kv_cache_config.dtype == 'fp8':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        elif self.kv_cache_config.dtype == 'nvfp4':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "

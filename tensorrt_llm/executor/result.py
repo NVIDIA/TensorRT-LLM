@@ -24,7 +24,6 @@ from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
 from ..llmapi.tracer import global_tracer
 from ..llmapi.utils import AsyncQueue, print_traceback_on_error
-from ..logger import logger
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
@@ -468,8 +467,9 @@ class GenerationResultBase:
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
-            # For context_only responses, carry the first gen token's logprobs
-            # so the generation_only side can prepend them.
+            # For context_only responses, carry the first gen token's
+            # logprobs and generation logits so the generation_only side
+            # can prepend them.
             if (context_phase_params is not None
                     and self._disaggregated_params is not None):
                 first_gen_lp = [
@@ -478,6 +478,14 @@ class GenerationResultBase:
                 if first_gen_lp:
                     self._disaggregated_params.first_gen_log_probs = \
                         first_gen_lp
+
+                first_gen_logits = [
+                    out.generation_logits for out in self._outputs
+                    if out.generation_logits is not None
+                ]
+                if first_gen_logits:
+                    self._disaggregated_params.first_gen_logits = \
+                        first_gen_logits
 
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
@@ -947,6 +955,7 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
+    prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -1013,8 +1022,8 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs,
-        None) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs, prompt_token_ids
+    ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs is not None and generation_logits is not None else None

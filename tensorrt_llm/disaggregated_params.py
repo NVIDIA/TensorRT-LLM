@@ -31,6 +31,8 @@ class DisaggregatedParams:
          as underlying request id.
         first_gen_log_probs (List): The logprobs for first_gen_tokens, produced during prefill.
          Each entry is a list (one per beam) of TokenLogprobs (list of dict[int, Logprob]).
+        first_gen_logits (List): The generation logits for first_gen_tokens, produced during prefill.
+         Each entry is a torch.Tensor of shape [num_tokens, vocab_size] (one per beam/sequence).
 
         multimodal_embedding_handles (List[Dict[str, Any]]): The resulting multimodal embedding handles from ViT.
         multimodal_hashes (List[List[int]]): The multimodal hashes of each multimodal item in the request.
@@ -40,6 +42,7 @@ class DisaggregatedParams:
     # P-D Disaggregated Params
     first_gen_tokens: Optional[List[int]] = None
     first_gen_log_probs: Optional[List] = None
+    first_gen_logits: Optional[List] = None
     ctx_request_id: Optional[int] = None
     opaque_state: Optional[bytes] = None
     draft_tokens: Optional[List[int]] = None

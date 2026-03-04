@@ -18,6 +18,7 @@ from typing import Callable, List
 import torch
 import torch.nn.functional as F
 
+from tensorrt_llm._torch.auto_deploy.distributed import common as dist_common
 from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm.mapping import Mapping
@@ -109,9 +110,9 @@ def _template_moe_alltoall(
     gathered_experts_list = [torch.zeros_like(selected_experts) for _ in range(mapping.moe_ep_size)]
     gathered_weights_list = [torch.zeros_like(routing_weights) for _ in range(mapping.moe_ep_size)]
 
-    torch.distributed.all_gather(gathered_x_list, x_flat, group=None)
-    torch.distributed.all_gather(gathered_experts_list, selected_experts, group=None)
-    torch.distributed.all_gather(gathered_weights_list, routing_weights, group=None)
+    dist_common.all_gather(gathered_x_list, x_flat)
+    dist_common.all_gather(gathered_experts_list, selected_experts)
+    dist_common.all_gather(gathered_weights_list, routing_weights)
 
     # Concatenate gathered tensors
     all_x = torch.cat(gathered_x_list, dim=0)
@@ -146,7 +147,7 @@ def _template_moe_alltoall(
 
     # Step 3: All-reduce to sum contributions from all ranks
     # Each rank contributes only its local experts, others contribute zeros
-    torch.distributed.all_reduce(output, op=torch.distributed.ReduceOp.SUM, group=None)
+    dist_common.all_reduce(output, op=dist_common.ReduceOp.SUM)
 
     # Step 4: Extract this rank's DP slice from the result
     # Each rank's tokens are at position [rank * padded_tokens, (rank+1) * padded_tokens)
