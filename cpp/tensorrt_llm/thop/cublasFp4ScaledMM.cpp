@@ -188,8 +188,8 @@ public:
 
         // Prepare output tensor
         std::vector<int64_t> output_size = {m, n};
-        at::Tensor out = torch_ext::allocate_output(output_size, mOutputDtype, mat1.device(),
-            static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
+        at::Tensor out = torch_ext::allocate_output(
+            output_size, mOutputDtype, mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
         // Get algorithm cache
         auto& cache = getOrCreateAlgoCache(m, k, n, mat1.device(), mat1_scale, mat2_scale);

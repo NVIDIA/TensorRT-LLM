@@ -15,7 +15,6 @@
 
 import threading
 from dataclasses import replace
-from enum import IntEnum
 from functools import lru_cache
 from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
@@ -46,11 +45,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
 
-
-class OutputBufferKind(IntEnum):
-    DEFAULT = 0
-    USERBUFFERS = 1
-    NCCL_WINDOW = 2
+from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
 # Used to WAR an issue in torch.bmm that it would break the graph when the out is not contiguous.
@@ -426,7 +421,7 @@ def fp8_rowwise_gemm(
     act_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
     group: Optional[List[int]] = None,
 ) -> torch.Tensor:
 
@@ -455,7 +450,7 @@ def _(
     act_scale: torch.Tensor,
     weight_scale: torch.Tensor,
     output_dtype: torch.dtype,
-    output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
     group: Optional[List[int]] = None,
 ) -> torch.Tensor:
     return act.new_empty((act.size(0), weight.size(0)), dtype=output_dtype)
@@ -663,7 +658,7 @@ def nvfp4_gemm_cublaslt(
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     """cuBLASLt-based NVFP4 GEMM with heuristic-based auto-tuning.
 
@@ -702,7 +697,7 @@ def _(
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -716,7 +711,7 @@ def nvfp4_gemm_cutlass(
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     """CUTLASS-based NVFP4 GEMM with auto-tuning.
 
@@ -752,7 +747,7 @@ def _(
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -933,7 +928,7 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                                            tactic=sub_tactic)
         elif backend == "cutedsl":
             to_userbuffers = self.output_buffer_kind == int(
-                OutputBufferKind.USERBUFFERS)
+                BufferKind.USERBUFFERS)
             return CuteDSLNVFP4BlackwellRunner(
                 self.output_dtype, to_userbuffers)(inputs, tactic=sub_tactic)
         else:
@@ -948,7 +943,7 @@ def nvfp4_gemm(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
-    output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
     group: Optional[List[int]] = None,
 ) -> torch.Tensor:
@@ -1045,7 +1040,7 @@ def _(
     weight_scale: torch.Tensor,
     alpha: torch.Tensor,
     output_dtype: torch.dtype,
-    output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+    output_buffer_kind: int = int(BufferKind.DEFAULT),
     allowed_backends: str = "cutlass,cublaslt,cuda_core",
     group: Optional[List[int]] = None,
 ) -> torch.Tensor:
@@ -1267,7 +1262,7 @@ def w4a8_mxfp4_fp8_gemm(
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
 
     tuner = AutoTuner.get()
@@ -1297,7 +1292,7 @@ def _(
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
         output_dtype: torch.dtype,
-        output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight.size(0)),
                              dtype=output_dtype)
@@ -1310,14 +1305,14 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
                           last_positive_power_of_2), ))
 
     def __init__(
-        self,
-        activation_dtype: torch.dtype,
-        weight_dtype: torch.dtype,
-        output_dtype: torch.dtype,
-        to_userbuffers: bool,
+            self,
+            activation_dtype: torch.dtype,
+            weight_dtype: torch.dtype,
+            output_dtype: torch.dtype,
+            output_buffer_kind: int = int(BufferKind.DEFAULT),
     ):
         self.output_dtype = output_dtype
-        self.to_userbuffers = to_userbuffers
+        self.output_buffer_kind = output_buffer_kind
         instance_key = (activation_dtype, weight_dtype)
         if instance_key not in WeightOnlyQuantGemmRunner.runner_dict:
             WeightOnlyQuantGemmRunner.runner_dict[
@@ -1329,7 +1324,7 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
     def unique_id(self):
         return (
             self.output_dtype,
-            self.to_userbuffers,
+            self.output_buffer_kind,
         )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -1347,26 +1342,26 @@ class WeightOnlyQuantGemmRunner(TunableRunner):
             weight,
             weight_scale,
             tactic,
-            self.to_userbuffers,
+            self.output_buffer_kind,
             self.output_dtype,
         )
 
 
 @torch.library.custom_op("trtllm::weight_only_quant_gemm", mutates_args=())
 def weight_only_quant_gemm(
-    activation: torch.Tensor,
-    weight: torch.Tensor,
-    weight_dtype: torch.dtype,
-    weight_scale: torch.Tensor,
-    output_dtype: torch.dtype,
-    to_userbuffers: bool = False,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        weight_dtype: torch.dtype,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
 
     tuner = AutoTuner.get()
 
     # allocate workspace for profiling
     weight_only_quant_gemm_runner = WeightOnlyQuantGemmRunner(
-        activation.dtype, weight_dtype, output_dtype, to_userbuffers)
+        activation.dtype, weight_dtype, output_dtype, output_buffer_kind)
 
     _, best_tactic = tuner.choose_one(
         "trtllm::weight_only_quant_gemm::gemm",
@@ -1381,12 +1376,12 @@ def weight_only_quant_gemm(
 
 @weight_only_quant_gemm.register_fake
 def _(
-    activation: torch.Tensor,
-    weight: torch.Tensor,
-    weight_type: torch.dtype,
-    weight_scale: torch.Tensor,
-    output_dtype: torch.dtype = None,
-    to_userbuffers: bool = False,
+        activation: torch.Tensor,
+        weight: torch.Tensor,
+        weight_type: torch.dtype,
+        weight_scale: torch.Tensor,
+        output_dtype: torch.dtype = None,
+        output_buffer_kind: int = int(BufferKind.DEFAULT),
 ) -> torch.Tensor:
     dtype = output_dtype if output_dtype is not None else activation.dtype
     return activation.new_empty((activation.size(0), weight.size(1)),

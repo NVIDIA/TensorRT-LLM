@@ -21,6 +21,7 @@
 #include <tensorrt_llm/kernels/helixAllToAll.h>
 #include <tensorrt_llm/thop/attentionOp.h>
 #include <tensorrt_llm/thop/moeAlltoAllMeta.h>
+#include <tensorrt_llm/thop/outputTensor.h>
 #include <torch/extension.h>
 
 namespace nb = nanobind;
@@ -30,6 +31,12 @@ namespace tensorrt_llm::nanobind::thop
 
 void initBindings(nb::module_& m)
 {
+    // Sync with torch_ext::BufferKind in tensorrt_llm/thop/outputTensor.h
+    nb::enum_<torch_ext::BufferKind>(m, "BufferKind")
+        .value("DEFAULT", torch_ext::BufferKind::Default)
+        .value("USERBUFFERS", torch_ext::BufferKind::Userbuffers)
+        .value("NCCL_WINDOW", torch_ext::BufferKind::NcclWindow);
+
     // Export MoE A2A constants
     for (auto const& kv : torch_ext::moe_comm::getMoeA2AMetaInfoIndexPairs())
     {

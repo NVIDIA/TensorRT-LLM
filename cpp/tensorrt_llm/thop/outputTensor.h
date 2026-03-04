@@ -32,7 +32,7 @@ namespace torch_ext
 
 using CreateTensorFn = std::function<at::Tensor(at::IntArrayRef shape, at::ScalarType dtype, c10::Device device)>;
 
-enum class OutputBufferKind : int
+enum class BufferKind : int
 {
     Default = 0,
     Userbuffers = 1,
@@ -40,12 +40,12 @@ enum class OutputBufferKind : int
 };
 
 inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::ScalarType dtype, c10::Device device,
-    OutputBufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    BufferKind output_buffer_kind, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     at::Tensor result;
     switch (output_buffer_kind)
     {
-    case OutputBufferKind::NcclWindow:
+    case BufferKind::NcclWindow:
 #if ENABLE_MULTI_DEVICE
         if (group.has_value() && group->size() > 0)
         {
@@ -85,8 +85,8 @@ inline at::Tensor allocate_output(std::vector<int64_t> const& output_size, at::S
             "[allocate_output] NCCL window requested but multi-device is disabled; fallback to default output buffer");
 #endif // ENABLE_MULTI_DEVICE
         break;
-    case OutputBufferKind::Userbuffers: result = torch_ext::create_userbuffers_tensor(output_size, dtype).first; break;
-    case OutputBufferKind::Default:
+    case BufferKind::Userbuffers: result = torch_ext::create_userbuffers_tensor(output_size, dtype).first; break;
+    case BufferKind::Default:
     default: result = at::detail::empty_cuda(output_size, dtype, device, std::nullopt); break;
     }
     if (!result.defined())

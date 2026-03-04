@@ -42,7 +42,7 @@ public:
     explicit WeightOnlyQuantGemmRunner(at::ScalarType activation_dtype, at::ScalarType weight_dtype);
 
     at::Tensor runGemm(at::Tensor const& mat_a, at::Tensor const& mat_b, at::Tensor const& weight_scales,
-        int64_t config_idx, bool to_userbuffers, std::optional<c10::ScalarType> out_dtype);
+        int64_t config_idx, int64_t output_buffer_kind, std::optional<c10::ScalarType> out_dtype);
 
     int64_t getNumConfigs() const;
 

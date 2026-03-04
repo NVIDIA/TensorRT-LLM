@@ -13,7 +13,7 @@ from torch import nn
 from torch.nn.parameter import Parameter
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-from tensorrt_llm._torch.custom_ops.torch_custom_ops import OutputBufferKind
+from tensorrt_llm._torch.custom_ops.torch_custom_ops import BufferKind
 from tensorrt_llm._torch.peft.lora.layer import LoraLayer
 from tensorrt_llm._utils import is_device_integrated, mpi_disabled
 from tensorrt_llm.bindings import ipc_nvls_supported
@@ -473,7 +473,7 @@ class UnquantizedLinearMethod(LinearMethodBase):
               module: Linear,
               input: torch.Tensor,
               bias: Optional[torch.Tensor],
-              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
               group: Optional[List[int]] = None):
         if module.use_custom_cublas_mm:
             output = torch.ops.trtllm.cublas_mm(input,
@@ -606,7 +606,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
               module: Linear,
               input: torch.Tensor,
               bias: Optional[torch.Tensor],
-              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
               group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         # GEMM ops require 2D matrices
@@ -629,8 +629,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         else:
             qinput = input
 
-        if output_buffer_kind == int(
-                OutputBufferKind.NCCL_WINDOW) and group is None:
+        if output_buffer_kind == int(BufferKind.NCCL_WINDOW) and group is None:
             group = module.mapping.tp_group if module.mapping is not None else None
 
         # This op does not support bias now.
@@ -672,7 +671,7 @@ class FP8QDQLinearMethod(UnquantizedLinearMethod):
         return self.apply(module,
                           input,
                           bias,
-                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
                           group=group)
 
     def load_kv_scales(self, weights: List[Dict]):
@@ -937,7 +936,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
               module: Linear,
               input: torch.Tensor,
               bias: Optional[torch.Tensor],
-              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
               group: Optional[List[int]] = None):
         # FP8 tensor inputs are from attention. Directly use ones as scale.
         if input.dtype == torch.float8_e4m3fn:
@@ -951,8 +950,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
                 input)
 
         # This op does not support bias now.
-        if output_buffer_kind == int(
-                OutputBufferKind.NCCL_WINDOW) and group is None:
+        if output_buffer_kind == int(BufferKind.NCCL_WINDOW) and group is None:
             group = module.mapping.tp_group if module.mapping is not None else None
 
         output = torch.ops.trtllm.fp8_rowwise_gemm(
@@ -978,7 +976,7 @@ class FP8RowwiseLinearMethod(UnquantizedLinearMethod):
         return self.apply(module,
                           input,
                           bias,
-                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
                           group=group)
 
     def _get_scale_name(self, weights: List[Dict]):
@@ -1360,7 +1358,7 @@ class NVFP4LinearMethod(LinearMethodBase):
               module: Linear,
               input: torch.Tensor,
               bias: Optional[torch.Tensor],
-              output_buffer_kind: int = int(OutputBufferKind.DEFAULT),
+              output_buffer_kind: int = int(BufferKind.DEFAULT),
               group: Optional[List[int]] = None):
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden).
         # GEMM requires 2D. Only plain tensors support for now, skip for
@@ -1376,8 +1374,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         # Use unified interface - supports CUTLASS, cuBLASLt, CuteDSL
         # Convert list to comma-separated string for torch.compile compatibility
         allowed_backends_str = ','.join(module.nvfp4_allowed_backends)
-        if output_buffer_kind == int(
-                OutputBufferKind.NCCL_WINDOW) and group is None:
+        if output_buffer_kind == int(BufferKind.NCCL_WINDOW) and group is None:
             group = module.mapping.tp_group if module.mapping is not None else None
         output = torch.ops.trtllm.nvfp4_gemm(
             act_fp4,
@@ -1406,7 +1403,7 @@ class NVFP4LinearMethod(LinearMethodBase):
         return self.apply(module,
                           input,
                           bias,
-                          output_buffer_kind=int(OutputBufferKind.NCCL_WINDOW),
+                          output_buffer_kind=int(BufferKind.NCCL_WINDOW),
                           group=group)
 
     def apply_linear_allreduce(self, module: Linear, input: torch.Tensor,
