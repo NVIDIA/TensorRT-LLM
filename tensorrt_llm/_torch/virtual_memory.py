@@ -69,23 +69,28 @@ def _scope(
         parent_ctx, _ = _pool_stack[-1]
         parent_ctx.__exit__(None, None, None)
 
-    stream = torch.cuda.current_stream()
-    push_virtual_memory_allocator(tag, mode, stream.cuda_stream)
-
-    proxy = _MultiPoolProxy()
-    pool = torch.cuda.MemPool(_get_torch_pluggable_virtual_memory_allocator())
-    pool_ctx = torch.cuda.use_mem_pool(pool)
-    pool_ctx.__enter__()
-    proxy._add(pool)
-    _pool_stack.append((pool_ctx, proxy))
-
+    pushed_allocator = False
+    child_pushed = False
     try:
+        stream = torch.cuda.current_stream()
+        push_virtual_memory_allocator(tag, mode, stream.cuda_stream)
+        pushed_allocator = True
+
+        proxy = _MultiPoolProxy()
+        pool = torch.cuda.MemPool(
+            _get_torch_pluggable_virtual_memory_allocator())
+        pool_ctx = torch.cuda.use_mem_pool(pool)
+        pool_ctx.__enter__()
+        proxy._add(pool)
+        _pool_stack.append((pool_ctx, proxy))
+        child_pushed = True
         yield proxy
     finally:
-        current_ctx, _ = _pool_stack[-1]
-        current_ctx.__exit__(None, None, None)
-        _pool_stack.pop()
-        pop_virtual_memory_allocator()
+        if child_pushed:
+            current_ctx, _ = _pool_stack.pop()
+            current_ctx.__exit__(None, None, None)
+        if pushed_allocator:
+            pop_virtual_memory_allocator()
 
         if _pool_stack:
             new_pool = torch.cuda.MemPool(
