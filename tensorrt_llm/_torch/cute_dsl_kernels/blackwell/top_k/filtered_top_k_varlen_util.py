@@ -54,6 +54,7 @@ class FilteredTopKKernelVarlen:
         self.top_k = top_k
         self.num_copy_bits = num_copy_bits
 
+        # Note: now we only support top_k <= 2048, we could change the code here to support larger top_k.
         self.filtered_topk_max_k = 2048
         # 8 bits for radix-based filter.
         self.radix = 256

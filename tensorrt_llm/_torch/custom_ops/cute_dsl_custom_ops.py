@@ -2873,6 +2873,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
             num_rows, num_cols = input_values.shape
 
+            # 148 is the number of SMs in Blackwell GPU.
+            # TODO: replace with api query sm count.
             large_occupancy = num_rows > 148
             load_balance = False
 

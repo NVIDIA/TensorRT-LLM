@@ -95,6 +95,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.num_ctas_per_row = num_ctas_per_row
 
         if cutlass.const_expr(large_occupancy):
+            # tuned value, could be tuned further.
             # reduce the smem usage and improve occupancy.
             if self.max_num_cols >= 262144:
                 self.filtered_topk_smem_input_size = 4096
