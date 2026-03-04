@@ -64,6 +64,7 @@ init_ubuntu() {
   apt remove -y ibverbs-providers libibverbs1
   apt-get --reinstall install -y libibverbs-dev
   apt-get install -y --no-install-recommends \
+    autossh \
     ccache \
     gdb \
     git-lfs \
@@ -76,9 +77,13 @@ init_ubuntu() {
     libstdc++-14-dev \
     libnuma1 \
     libnuma-dev \
+    openssh-client \
+    openssh-server \
     python3-dev \
     python3-pip \
     python-is-python3 \
+    rsync \
+    sshpass \
     wget \
     pigz \
     libzmq3-dev
@@ -151,10 +156,15 @@ install_gcctoolset_rockylinux() {
     libffi-devel \
     -y
   dnf install \
+    autossh \
     openmpi \
     openmpi-devel \
+    openssh-clients \
+    openssh-server \
     pigz \
     rdma-core-devel \
+    rsync \
+    sshpass \
     zeromq-devel \
     -y
   echo "source scl_source enable gcc-toolset-11" >> "${ENV}"
