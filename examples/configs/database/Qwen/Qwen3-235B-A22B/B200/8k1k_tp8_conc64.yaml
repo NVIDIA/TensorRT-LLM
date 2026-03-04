@@ -1,0 +1,20 @@
+cuda_graph_config:
+  enable_padding: true
+  max_batch_size: 256
+dtype: bfloat16
+enable_attention_dp: true
+enable_chunked_prefill: true
+kv_cache_config:
+  dtype: fp8
+max_num_tokens: 4096
+moe_config:
+  backend: TRTLLM
+moe_expert_parallel_size: 8
+stream_interval: 10
+tensor_parallel_size: 8
+torch_compile_config:
+  enable_fullgraph: true
+  enable_inductor: false
+  enable_piecewise_cuda_graph: true
+  enable_userbuffers: true
+trust_remote_code: true
