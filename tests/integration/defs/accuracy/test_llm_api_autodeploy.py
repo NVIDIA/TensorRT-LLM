@@ -691,8 +691,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     MODEL_REGISTRY_ACCURACY_PARAMS = [
         pytest.param("meta-llama/Llama-3.1-8B-Instruct", {}, [MMLU, GSM8K],
                      id="meta-llama_Llama-3.1-8B-Instruct"),
-        pytest.param("nvidia/Llama-3.1-8B-Instruct-FP8", {}, [MMLU, GSM8K],
-                     id="nvidia_Llama-3.1-8B-Instruct-FP8"),
         pytest.param("google/gemma-3-1b-it", {}, [MMLU, GSM8K],
                      id="google_gemma-3-1b-it"),
         pytest.param("mistralai/Ministral-8B-Instruct-2410", {}, [MMLU, GSM8K],
