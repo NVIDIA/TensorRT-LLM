@@ -28,11 +28,21 @@ def test_trust_remote_code_tokenizer_pickle_roundtrip_multinode():
         eos_token_id = 151643
         all_special_tokens = []
 
+    # Put the class in a proper submodule so standard pickle can serialize it by
+    # reference on "rank-0" (where the module exists), exactly as HF does when
+    # trust_remote_code downloads custom tokenizer code.
+    # Both __module__ and __qualname__ must be set: pickle checks __qualname__
+    # first and refuses to serialize if it sees "<locals>" in the name.
+    fake_sub = types.ModuleType("transformers_modules.kimi_k2.tokenization_kimi")
     KimiK2Tokenizer.__module__ = "transformers_modules.kimi_k2.tokenization_kimi"
+    KimiK2Tokenizer.__qualname__ = "KimiK2Tokenizer"
+    fake_sub.KimiK2Tokenizer = KimiK2Tokenizer
     fake_tm.KimiK2Tokenizer = KimiK2Tokenizer
 
-    # Rank-0: dynamic module present, load tokenizer via the user-facing API.
+    # Rank-0: both modules present — standard pickle would succeed here but
+    # serialize the class by reference (module path only, no class definition).
     sys.modules["transformers_modules"] = fake_tm
+    sys.modules["transformers_modules.kimi_k2.tokenization_kimi"] = fake_sub
     try:
         with mock.patch(
             "tensorrt_llm.tokenizer.tokenizer.AutoTokenizer.from_pretrained",
@@ -43,6 +53,7 @@ def test_trust_remote_code_tokenizer_pickle_roundtrip_multinode():
         data = pickle.dumps(tok)
     finally:
         sys.modules.pop("transformers_modules", None)
+        sys.modules.pop("transformers_modules.kimi_k2.tokenization_kimi", None)
 
     # Worker node: module is gone, but cloudpickle embedded the class definition.
     restored = pickle.loads(data)  # nosec B301
