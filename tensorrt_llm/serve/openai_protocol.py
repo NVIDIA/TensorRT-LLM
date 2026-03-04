@@ -1379,6 +1379,14 @@ class VideoGenerationRequest(OpenAIBaseModel):
         description="Text describing what to avoid in the generated video.")
     seed: Optional[int] = Field(default=None,
                                 description="Random seed for reproducibility.")
+    output_format: Literal["mp4", "avi", "auto"] = Field(
+        default="auto",
+        description=(
+            "Video encode format. "
+            "'mp4' for H.264 encoding (requires ffmpeg installed on server), "
+            "'avi' for MJPEG encoding (always available, no audio support), "
+            "'auto' to use best available (H.264 if ffmpeg installed, "
+            "otherwise MJPEG)."))
 
     @field_validator("size")
     @classmethod
