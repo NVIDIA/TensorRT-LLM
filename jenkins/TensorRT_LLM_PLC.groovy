@@ -249,10 +249,12 @@ pipeline {
     }
 
     triggers {
-        parameterizedCron('''
+        // Schedule is only active when running from the official pipeline folder.
+        // Jobs in other folders (e.g. personal/dev pipelines) will have no cron trigger.
+        parameterizedCron(env.JOB_NAME.startsWith('LLM/helpers/') ? '''
             H 2 * * * %branchName=main;repoUrlKey=tensorrt_llm_github
             H 3 * * * %branchName=release/1.2;repoUrlKey=tensorrt_llm_github
-        ''')
+        ''' : '')
     }
     stages {
         stage("Prepare Environment"){
