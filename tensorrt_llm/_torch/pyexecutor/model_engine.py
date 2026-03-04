@@ -362,7 +362,7 @@ class PyTorchModelEngine(ModelEngine):
         # 3) The model configuration is not loaded until the model engine
         # is initialized.
         #
-        # NOTE: This can simplified by decoupling the model config loading and
+        # NOTE: This can be simplified by decoupling the model config loading and
         # the model engine.
         self.attn_metadata = None
         self.iter_states = {}
@@ -904,8 +904,8 @@ class PyTorchModelEngine(ModelEngine):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # When using piecewise cuda graph, the logits may suffer severe memory faction problem.
-        # When the num of requests is growing, the block allocated by torch cannot be reused.
+        # When using piecewise cuda graph, the logits may suffer severe memory fragmentation problem.
+        # As the number of requests grows, the blocks allocated by torch cannot be reused.
         # So after piecewise cuda graph capture, a request with most requests is triggered to make
         # sure that large enough blocks are allocated and can be correctly reused.
         for num_tokens in piecewise_cuda_graph_num_tokens:
@@ -1389,14 +1389,14 @@ class PyTorchModelEngine(ModelEngine):
 
     def get_max_num_sequences(self) -> int:
         """
-        Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
+        Return the maximum number of sequences that the model supports. PyExecutor needs this to compute max_num_active_requests
         """
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
-        Make some changes to the device inputs and avoid block the async data transfer
+        Make some changes to the device inputs and avoid blocking the async data transfer
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -1554,7 +1554,7 @@ class PyTorchModelEngine(ModelEngine):
                 return padded_num_tokens, True, None
             else:
                 logger.debug(
-                    f"Picewise cudagraph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
+                    f"Piecewise CUDA graph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
                 )
                 return total_num_tokens, False, None
 
