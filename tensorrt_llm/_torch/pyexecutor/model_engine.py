@@ -347,16 +347,15 @@ class PyTorchModelEngine(ModelEngine):
             self.without_logits = self.spec_config.spec_dec_mode.without_logits(
             ) or self.model_is_wrapped
             self.max_draft_len = spec_config.max_draft_len
+            # Mutable per-iteration draft length. Updated at each iteration if dynamic draft length is enabled;
+            # Otherwise stays at max_draft_len.
+            self.runtime_draft_len = spec_config.max_draft_len
             self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
+
         else:
             self.without_logits = False
             self.max_draft_len = 0
             self.max_total_draft_tokens = 0
-
-        # Mutable per-iteration draft length. Updated at the start of each
-        # forward() call when dynamic draft length is enabled; otherwise stays
-        # at max_draft_len.
-        self.runtime_draft_len = self.max_draft_len
 
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
 

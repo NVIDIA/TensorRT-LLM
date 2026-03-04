@@ -1637,6 +1637,9 @@ class PyExecutor:
         When dynamic draft length is not enabled, runtime_draft_len is simply
         set to max_draft_len (the static maximum).
         """
+        if not hasattr(self.model_engine, 'max_draft_len'):
+            return
+
         if (self.model_engine.spec_config is not None
                 and self.model_engine.spec_config.draft_len_schedule is not None
                 and self.model_engine.spec_config.spec_dec_mode.

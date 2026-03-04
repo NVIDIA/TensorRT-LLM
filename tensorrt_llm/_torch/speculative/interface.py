@@ -574,7 +574,11 @@ class SpecWorkerBase(nn.Module, ABC):
             accepted_tokens: [batch_size, runtime_draft_len + 1] - Accepted tokens (padded)
             num_accepted_tokens: [batch_size] - Number of accepted tokens per request
         """
-        runtime_draft_len = spec_metadata.runtime_draft_len
+        # Derive draft length from the actual draft_tokens shape rather than
+        # spec_metadata.runtime_draft_len, because they can differ: PARD sets
+        # runtime_draft_len = 2K-1 for input sizing but only passes K draft
+        # tokens for acceptance;
+        runtime_draft_len = draft_tokens.shape[-1]
         num_gens = batch_size - num_contexts
 
         if logits.dim() == 1:
