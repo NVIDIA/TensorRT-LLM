@@ -37,16 +37,28 @@ def parse_env_and_cmd(base_cmd):
     env_vars = {}
     cmd_tokens = []
 
-    for token in tokens:
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+
         # Check if token looks like VAR=value (contains = and doesn't start with -)
         if "=" in token and not token.startswith("-"):
             key, value = token.split("=", 1)
             # Check if key is a valid identifier
             if key.isidentifier():
                 env_vars[key] = value
+                i += 1
                 continue
-        # Once we hit a token that's not an env var, it's the start of the command
+
+        # Process '-o' / '--override-ini'
+        if token in ("-o", "--override-ini") and i + 1 < len(tokens):
+            value = tokens[i + 1]
+            cmd_tokens.extend([token, value])
+            i += 2
+            continue
+
         cmd_tokens.append(token)
+        i += 1
 
     return env_vars, cmd_tokens
 
