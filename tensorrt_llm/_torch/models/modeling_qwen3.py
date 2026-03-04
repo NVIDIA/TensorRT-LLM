@@ -10,7 +10,7 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import AllReduceParams
+from ..distributed import AllReduceParams, cp_allgather
 from ..model_config import ModelConfig
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
@@ -159,12 +159,13 @@ class Qwen3DecoderLayer(DecoderLayer):
                 hidden_states, residual)
 
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            residual=residual,
             mrope_config=mrope_config,
             **kwargs,
         )
@@ -198,6 +199,7 @@ class Qwen3Model(DecoderModel):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__(model_config)
         config = self.model_config
+        self.mapping_with_cp = mapping_with_cp
 
         self.embed_tokens = Embedding(
             config.pretrained_config.vocab_size,
@@ -256,6 +258,15 @@ class Qwen3Model(DecoderModel):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
+
+        if (self.mapping_with_cp is not None
+                and self.mapping_with_cp.has_cp_helix()
+                and self.mapping_with_cp.enable_attention_dp):
+            hidden_states = cp_allgather(hidden_states,
+                                         self.mapping_with_cp,
+                                         dim=0)
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
+
         return hidden_states
 
 
