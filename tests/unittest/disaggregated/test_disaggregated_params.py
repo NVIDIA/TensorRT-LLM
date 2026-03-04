@@ -55,14 +55,14 @@ def test_to_disaggregated_params():
         request_type="context_only",
         first_gen_tokens=[1, 2],
         ctx_dp_rank=5,
-        ctx_info_endpoint=["tcp://10.0.0.1:5000"],
+        ctx_info_endpoint="tcp://10.0.0.1:5000",
     )
     openai_params = to_disaggregated_params(llm_params)
 
     assert openai_params.request_type == "context_only"
     assert openai_params.first_gen_tokens == [1, 2]
     assert openai_params.ctx_dp_rank == 5
-    assert openai_params.ctx_info_endpoint == ["tcp://10.0.0.1:5000"]
+    assert openai_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
 
 
 def test_to_llm_disaggregated_params():
