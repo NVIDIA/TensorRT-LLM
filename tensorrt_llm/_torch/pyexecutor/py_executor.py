@@ -132,7 +132,7 @@ class BatchStatePP(BatchState):
 
 class AsyncTransferManager:
     """
-    Handle asynchronous transfer or KV cache after a request has completed.
+    Handle asynchronous transfer of KV cache after a request has completed.
     When running with both the KV cache transceiver and the KV cache connector, we must ensure that BOTH transfers (if any) are completed before we can release the KV cache blocks.
     The AsyncTransferManager has a few key responsibilities:
     1. Track requests in transfer.
@@ -171,7 +171,7 @@ class AsyncTransferManager:
         # Mapping of request id to the LlmRequest
         self._requests_in_transfer: Dict[int, LlmRequest] = dict()
 
-        # Mapping of request id to the the request metadata
+        # Mapping of request id to the request metadata
         self._request_transfer_metadata: Dict[
             int, self.RequestTransferMetadata] = dict()
 
@@ -463,12 +463,12 @@ class PyExecutor:
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
-        # sample_async is called twice before the first call to update_requests:
-        # - 1st time as a context request that handles on the 1st generated token
-        # - 2nd time as a generation request that handles on the 2nd generated token.
+        # _sample_async is called twice before the first call to update_requests:
+        # - 1st time as a context request that operates on the 1st generated token
+        # - 2nd time as a generation request that operates on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async, every update_request doesn't handle the newest token, but one
+        # _sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
@@ -648,7 +648,7 @@ class PyExecutor:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
     def enqueue_requests(
@@ -672,7 +672,7 @@ class PyExecutor:
         timeout: Optional[datetime.timedelta] = None,
     ) -> Union[List[List[LlmResponse]], List[LlmResponse]]:
         """
-        Await for ready responses
+        Await ready responses
         Args:
             id (Optional[Union[List[int], int]]): Request id
             timeout (Optional[datetime.timedelta]): The maximum time to wait for new responses
@@ -1317,8 +1317,8 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
@@ -1621,7 +1621,7 @@ class PyExecutor:
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
-        # 1 for dummy request, 1 for the to complete but haven't updated request.
+        # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
@@ -2092,8 +2092,8 @@ class PyExecutor:
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
@@ -2735,7 +2735,7 @@ class PyExecutor:
     def _check_disagg_ctx_schedulable_status(self,
                                              new_requests: List[LlmRequest]):
         """
-        In context-first mode, context requests are scheduable immediately,
+        In context-first mode, context requests are schedulable immediately,
         otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
         """
         if not self.kv_cache_transceiver:
@@ -3482,10 +3482,10 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
-    def _terminate_requests(self, requests_to_pause):
+    def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
-        #       Currently, self.inflight_req_ids is not.
-        for req in requests_to_pause:
+        #       Currently, self.inflight_req_ids is not updated.
+        for req in requests_to_terminate:
             self._terminate_request(req)
 
     def _pause_requests(self, requests_to_pause):
