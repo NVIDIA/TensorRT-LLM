@@ -1,6 +1,11 @@
 #!/bin/bash
 set -ex
 
+GITHUB_URL="https://github.com"
+if [ -n "${GITHUB_MIRROR}" ]; then
+    GITHUB_URL=${GITHUB_MIRROR}
+fi
+
 MOONCAKE_VERSION="v0.3.7.post2"
 MOONCAKE_REPO="https://github.com/kvcache-ai/Mooncake.git"
 MOONCAKE_INSTALL_PATH="/usr/local/Mooncake"
@@ -27,8 +32,12 @@ apt-get install -y --no-install-recommends \
 
 mkdir -p /third-party-source
 
-git clone --depth 1 https://github.com/alibaba/yalantinglibs.git
-tar -czf /third-party-source/yalantinglibs.tar.gz yalantinglibs
+YALANTINGLIBS_VERSION="0.5.5"
+curl -L ${GITHUB_URL}/alibaba/yalantinglibs/archive/refs/tags/${YALANTINGLIBS_VERSION}.tar.gz -o yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz
+tar -xzf yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz
+# Auto-detect extracted directory name
+YALANTINGLIBS_DIR=$(tar -tzf yalantinglibs-${YALANTINGLIBS_VERSION}.tar.gz | head -1 | cut -f1 -d"/")
+mv ${YALANTINGLIBS_DIR} yalantinglibs
 cd yalantinglibs
 mkdir build && cd build
 cmake .. -DBUILD_EXAMPLES=OFF -DBUILD_BENCHMARK=OFF -DBUILD_UNIT_TESTS=OFF
@@ -41,6 +50,7 @@ git clone --depth 1 -b ${MOONCAKE_VERSION} ${MOONCAKE_REPO}
 tar -czf /third-party-source/Mooncake-${MOONCAKE_VERSION}.tar.gz Mooncake
 cd Mooncake
 git submodule update --init --recursive --depth 1
+
 mkdir build && cd build
 cmake .. -DUSE_CUDA=ON -DBUILD_SHARED_LIBS=ON -DBUILD_UNIT_TESTS=OFF -DBUILD_EXAMPLES=OFF \
     -DCMAKE_INSTALL_PREFIX=${MOONCAKE_INSTALL_PATH}
