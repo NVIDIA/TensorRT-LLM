@@ -166,7 +166,7 @@ class KvCacheCreator:
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
             f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f", temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
+            f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
         )
         return int(available_kv_mem)
 
