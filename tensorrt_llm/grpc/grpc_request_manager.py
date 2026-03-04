@@ -363,12 +363,15 @@ def create_sampling_params_from_proto(
 
     params = SamplingParams(**kwargs)
 
-    # Set pre-tokenized stop/bad word IDs directly (these come pre-tokenized
-    # from the router, so we bypass the tokenizer-based setup path)
+    # Set pre-tokenized stop/bad word IDs directly. _get_stop_words() and
+    # _get_bad_words() only read _stop_word_ids/_bad_word_ids when self.stop
+    # /self.bad is not None, so set them to empty lists to enable that path.
     if stop_word_ids:
         params._stop_word_ids = stop_word_ids
+        params.stop = []
     if bad_word_ids:
         params._bad_word_ids = bad_word_ids
+        params.bad = []
 
     return params
 
