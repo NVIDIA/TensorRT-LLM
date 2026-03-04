@@ -849,9 +849,12 @@ public:
     //!          of the request's context are already cached.
     //! \param uniqueTokens The unique tokens representing the request's context.
     //! \param llmRequest The request to check for reusable blocks.
+    //! \param onlyAllocated If true, only count blocks that have active references (already allocated
+    //!        to another sequence). Free cached blocks are excluded because they are already counted
+    //!        in the eviction policy's free count.
     //! \return The number of full blocks that can be reused.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     [[nodiscard]] runtime::BufferManager const& getBufferManager() const
     {
@@ -1154,7 +1157,7 @@ public:
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     //! \details WILL NOT WORK FOR VARIABLE WINDOW ATTENTION.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const;
 
     //! \brief Bring block from primary to secondary memory for window size.
     //! \details Does nothing if block is already in primary memory.
@@ -1563,7 +1566,9 @@ public:
     /// @param llmRequest Optional request to use for KV cache lookup.
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    virtual void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    /// @return True if the sequence was added, False if the sequence was not added because it was already in the
+    /// manager.
+    virtual bool addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt)
         = 0;
 
@@ -1615,9 +1620,10 @@ public:
     //!          of the request's context are already cached.
     //! \param uniqueTokens The unique tokens representing the request's context.
     //! \param llmRequest The request to check for reusable blocks.
+    //! \param onlyAllocated If true, only count blocks that have active references.
     //! \return The number of full blocks that can be reused.
     [[nodiscard]] virtual SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const
         = 0;
 
     //! \brief Store full context blocks contributed by llmRequest.
@@ -1913,7 +1919,9 @@ public:
     /// @param llmRequest Optional request to use for KV cache lookup.
     /// @details If llmRequest is supplied and KV cache reuse is enabled, try to recover KV cache blocks for
     /// inputLength - 1 tokens and populate prepopulatedPromptLen.
-    void addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    /// @return True if the sequence was added, False if the sequence was not added because it was already in the
+    /// manager.
+    bool addSequence(LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         OptionalRef<LlmRequest> llmRequest = std::nullopt) override;
 
     [[nodiscard]] std::optional<KVCacheBlock::IdType> removeSequence(LlmRequest::RequestIdType requestId,
@@ -1992,7 +2000,7 @@ public:
 
     //! \brief Count the number of full blocks that can be reused from the KV cache for a given request.
     [[nodiscard]] SizeType32 countReusableBlocks(
-        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const override;
+        VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated = false) const override;
 
     //! \brief Store full context blocks contributed by llmRequest.
     //! \details These blocks become reusable from next step.

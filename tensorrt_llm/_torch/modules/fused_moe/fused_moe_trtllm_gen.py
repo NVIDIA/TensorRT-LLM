@@ -87,7 +87,7 @@ class TRTLLMGenFusedMoE(MoE):
         QuantAlgo.W4A8_MXFP4_MXFP8,
     }
 
-    # Quantization algorithms that support gptoss_style
+    # Quantization algorithms that support swiglu_gptoss_style
     _GPTOSS_SUPPORTED_ALGOS = {
         QuantAlgo.NVFP4,
         QuantAlgo.W4A16_MXFP4,
@@ -100,7 +100,7 @@ class TRTLLMGenFusedMoE(MoE):
         cls,
         quant_algo: Optional[QuantAlgo],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if TRTLLMGenFusedMoE can implement the given quantization algorithm.
@@ -119,7 +119,7 @@ class TRTLLMGenFusedMoE(MoE):
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation input data type. Only bfloat16 is supported.
                 See: forward_impl() assert x.dtype == torch.bfloat16 (line 722).
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
                 Only supported for nvfp4 and mxfp4 variants.
 
         Returns:
@@ -151,10 +151,10 @@ class TRTLLMGenFusedMoE(MoE):
             return _warn_and_return(
                 f"TRTLLMGenFusedMoE does not support quant_algo={quant_algo}")
 
-        # Check gptoss_style support: only supported for nvfp4 and mxfp4 variants
-        if gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
+        # Check swiglu_gptoss_style support: only supported for nvfp4 and mxfp4 variants
+        if swiglu_gptoss_style and quant_algo not in cls._GPTOSS_SUPPORTED_ALGOS:
             return _warn_and_return(
-                f"TRTLLMGenFusedMoE supports gptoss_style (bias/swiglu) only for nvfp4 and mxfp4 variants, "
+                f"TRTLLMGenFusedMoE supports swiglu_gptoss_style (bias/swiglu) only for nvfp4 and mxfp4 variants, "
                 f"got quant_algo={quant_algo}")
 
         return True, None

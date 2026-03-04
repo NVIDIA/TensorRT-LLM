@@ -81,8 +81,6 @@ class DeepEP(Communication):
         """
         Check if DeepEP is supported on the current platform
         """
-        if os.environ.get("TRTLLM_CAN_USE_DEEP_EP", "0") != "1":
-            return False
         return deep_ep_installed
 
     @staticmethod
@@ -144,6 +142,13 @@ class DeepEP(Communication):
         DeepEP dispatch
         """
         all_rank_max_num_tokens = max(all_rank_num_tokens)
+
+        # DeepEP C++ kernel requires topk_weights (token_final_scales) to be float32,
+        # but downstream backends (e.g. TRTLLM) may require the original dtype.
+        # Convert to float32 for dispatch, then restore afterward.
+        original_scales_dtype = token_final_scales.dtype if token_final_scales is not None else None
+        if token_final_scales is not None and token_final_scales.dtype != torch.float32:
+            token_final_scales = token_final_scales.to(torch.float32)
 
         if not self.supports_post_quant_dispatch():
             # Pre-quant dispatch (unquantized data)
@@ -214,6 +219,14 @@ class DeepEP(Communication):
                 "deep_ep_handle": deep_ep_handle,
                 "padded": padded,
             }
+
+        # Restore token_final_scales to original dtype for downstream consumers
+        if (
+            token_final_scales is not None
+            and original_scales_dtype is not None
+            and token_final_scales.dtype != original_scales_dtype
+        ):
+            token_final_scales = token_final_scales.to(original_scales_dtype)
 
         return hidden_states, hidden_states_sf, token_selected_slots, token_final_scales
 

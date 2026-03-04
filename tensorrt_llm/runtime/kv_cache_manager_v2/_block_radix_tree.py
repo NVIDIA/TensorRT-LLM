@@ -59,12 +59,11 @@ class Hasher:
         elif type(data) is bytes:
             self._hasher.update(data)
         else:
-            assert isinstance(data, Sequence)
-            for item in data:
+            for item in data:  # type: ignore
                 assert (
                     NDEBUG or (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
                 )
-                self._hasher.update(item.to_bytes(8, "little") if isinstance(item, int) else item)
+                self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
         return self
 
     @property
@@ -154,7 +153,7 @@ def find_best_partial_match_in_next_nodes(
     If no child matches any tokens, returns (None, 0).
     """
     if len(block.next) >= 32:
-        # TODO: build a database to accelerate partial matching. （TRTLLM-7784）
+        # TODO: build a database to accelerate partial matching. (TRTLLM-7784)
         # For now, it might be too slow to iterate over all children, so let's just skip.
         return None, 0
     best_block = None

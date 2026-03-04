@@ -413,11 +413,18 @@ def extract_weight_nodes(node: Node) -> WeightNodes:
 
 
 def get_weight_node(node: Node) -> Node:
-    """Get the primary weight node for a compute node."""
+    """Get the primary weight node for a compute node.
+
+    When the node itself is a bias get_attr node (i.e. extract_weight_nodes
+    puts it into .biases rather than .weights), return the bias node so that
+    num_users_of_weight_node gives the correct user count instead of 0.
+    """
     weight_nodes = extract_weight_nodes(node)
-    if len(weight_nodes.weights) == 0:
-        raise ValueError(f"Node {node.name} has no weight")
-    return weight_nodes.weights[0].node
+    if len(weight_nodes.weights) > 0:
+        return weight_nodes.weights[0].node
+    if len(weight_nodes.biases) > 0:
+        return weight_nodes.biases[0].node
+    raise ValueError(f"Node {node.name} has no weight or bias")
 
 
 def num_users_of_weight_node(node: Node) -> int:
@@ -1448,3 +1455,47 @@ def draw_graph(gm: GraphModule, filename: str):
     drawer = FxGraphDrawer(gm, filename)
     with open(f"{filename}.svg", "wb") as f:
         f.write(drawer.get_dot_graph().create_svg())
+
+
+def sync_weight_meta_dtype(gm: GraphModule) -> int:
+    """Sync .meta['val'] dtype with actual state_dict dtype for weight nodes.
+
+    During graph tracing, .meta['val'] is set with the dtype at tracing time.
+    However, quantization transforms may change the actual weight dtype (e.g., FP16 -> FP8)
+    without updating .meta['val']. This causes ONNX export to see incorrect dtypes.
+
+    This function iterates through all get_attr nodes and updates their .meta['val']
+    to match the actual tensor dtype from the GraphModule's state.
+
+    Args:
+        gm: The GraphModule containing weights to sync.
+
+    Returns:
+        Number of weight meta dtypes that were synced.
+    """
+    num_synced = 0
+    for node in gm.graph.nodes:
+        if node.op == "get_attr":
+            try:
+                # Traverse the attribute path to get the actual tensor
+                target_path = str(node.target)
+                obj = gm
+                for attr in target_path.split("."):
+                    obj = getattr(obj, attr)
+
+                # Update .meta["val"] if dtype differs
+                if isinstance(obj, torch.Tensor) and "val" in node.meta:
+                    old_val = node.meta["val"]
+                    if hasattr(old_val, "dtype") and old_val.dtype != obj.dtype:
+                        # Create new meta tensor with correct dtype
+                        node.meta["val"] = torch.empty(
+                            obj.shape, dtype=obj.dtype, device=old_val.device
+                        )
+                        ad_logger.debug(
+                            f"Synced {node.target} meta dtype: {old_val.dtype} -> {obj.dtype}"
+                        )
+                        num_synced += 1
+            except (AttributeError, RuntimeError):
+                pass  # Skip if attribute not found
+
+    return num_synced

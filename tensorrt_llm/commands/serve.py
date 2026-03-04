@@ -147,6 +147,7 @@ def get_llm_args(
         moe_expert_parallel_size: Optional[int] = None,
         gpus_per_node: Optional[int] = None,
         free_gpu_memory_fraction: float = 0.9,
+        kv_cache_dtype: str = "auto",
         num_postprocess_workers: int = 0,
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
@@ -186,8 +187,9 @@ def get_llm_args(
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
-        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction)
-        if free_gpu_memory_fraction != kv_cache_default_fraction else None,
+        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
+                      dtype=kv_cache_dtype) if free_gpu_memory_fraction
+        != kv_cache_default_fraction or kv_cache_dtype != "auto" else None,
         "cp_config":
         cp_config,
         "build_config":
@@ -255,10 +257,11 @@ def launch_server(
         metadata_server_cfg: Optional[MetadataServerConfig] = None,
         server_role: Optional[ServerRole] = None,
         disagg_cluster_config: Optional[DisaggClusterConfig] = None,
-        multimodal_server_config: Optional[MultimodalServerConfig] = None):
+        multimodal_server_config: Optional[MultimodalServerConfig] = None,
+        served_model_name: Optional[str] = None):
 
     backend = llm_args["backend"]
-    model = llm_args["model"]
+    model = served_model_name or llm_args["model"]
     addr_info = socket.getaddrinfo(host, port, socket.AF_UNSPEC,
                                    socket.SOCK_STREAM)
     address_family = socket.AF_INET6 if all(
@@ -306,7 +309,10 @@ def launch_server(
         asyncio.run(server(host, port, sockets=[s]))
 
 
-def launch_grpc_server(host: str, port: int, llm_args: dict):
+def launch_grpc_server(host: str,
+                       port: int,
+                       llm_args: dict,
+                       served_model_name: Optional[str] = None):
     """
     Launch a gRPC server for TensorRT-LLM.
 
@@ -317,6 +323,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
         host: Host to bind to
         port: Port to bind to
         llm_args: Arguments for LLM initialization (from get_llm_args)
+        served_model_name: Custom model name for API responses (defaults to model path)
     """
     import grpc
 
@@ -334,7 +341,7 @@ def launch_grpc_server(host: str, port: int, llm_args: dict):
         logger.info("Initializing TensorRT-LLM gRPC server...")
 
         backend = llm_args.get("backend")
-        model_path = llm_args.get("model", "")
+        model_path = served_model_name or llm_args.get("model", "")
 
         if backend == "pytorch":
             llm_args.pop("build_config", None)
@@ -618,6 +625,14 @@ class ChoiceWithAlias(click.Choice):
               help=help_info_with_stability_tag(
                   "Free GPU memory fraction reserved for KV Cache, "
                   "after allocating model weights and buffers.", "beta"))
+@click.option(
+    "--kv_cache_dtype",
+    type=click.Choice(("auto", "fp8", "nvfp4")),
+    default="auto",
+    help=help_info_with_stability_tag(
+        "KV cache quantization dtype for PyTorch backend. "
+        "'auto' uses checkpoint/model metadata; explicit values force override.",
+        "prototype"))
 @click.option("--num_postprocess_workers",
               type=int,
               default=0,
@@ -712,6 +727,14 @@ class ChoiceWithAlias(click.Choice):
     default=False,
     help="Run gRPC server instead of OpenAI HTTP server. "
     "gRPC server accepts pre-tokenized requests and returns raw token IDs.")
+@click.option(
+    "--served_model_name",
+    type=str,
+    default=None,
+    help=help_info_with_stability_tag(
+        "The model name used in the API. If not specified, the model path is "
+        "used as the model name. This is useful when the model path is long or "
+        "when you want to expose a custom name to clients.", "prototype"))
 @click.option("--extra_visual_gen_options",
               type=str,
               default=None,
@@ -725,16 +748,17 @@ def serve(
         tensor_parallel_size: int, pipeline_parallel_size: int,
         context_parallel_size: int, moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, num_postprocess_workers: int,
-        trust_remote_code: bool, revision: Optional[str],
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
+        free_gpu_memory_fraction: float, kv_cache_dtype: str,
+        num_postprocess_workers: int, trust_remote_code: bool,
+        revision: Optional[str], extra_llm_api_options: Optional[str],
+        reasoning_parser: Optional[str], tool_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
         custom_module_dirs: list[Path], chat_template: Optional[str],
-        grpc: bool, extra_visual_gen_options: Optional[str]):
+        grpc: bool, served_model_name: Optional[str],
+        extra_visual_gen_options: Optional[str]):
     """Running an OpenAI API compatible server
 
     MODEL: model name | HF checkpoint path | TensorRT engine path
@@ -767,6 +791,7 @@ def serve(
             moe_cluster_parallel_size=moe_cluster_parallel_size,
             gpus_per_node=gpus_per_node,
             free_gpu_memory_fraction=free_gpu_memory_fraction,
+            kv_cache_dtype=kv_cache_dtype,
             num_postprocess_workers=num_postprocess_workers,
             trust_remote_code=trust_remote_code,
             revision=revision,
@@ -832,12 +857,22 @@ def serve(
                         f"Argument '{name}' is not supported when running in gRPC mode. "
                         f"The gRPC server is designed for use with external routers that handle "
                         f"these features (e.g., tool parsing, chat templates).")
-            launch_grpc_server(host, port, llm_args)
+            launch_grpc_server(host,
+                               port,
+                               llm_args,
+                               served_model_name=served_model_name)
         else:
             # Default: launch OpenAI HTTP server
-            launch_server(host, port, llm_args, tool_parser, chat_template,
-                          metadata_server_cfg, server_role,
-                          disagg_cluster_config, multimodal_server_config)
+            launch_server(host,
+                          port,
+                          llm_args,
+                          tool_parser,
+                          chat_template,
+                          metadata_server_cfg,
+                          server_role,
+                          disagg_cluster_config,
+                          multimodal_server_config,
+                          served_model_name=served_model_name)
 
     def _serve_visual_gen():
         visual_gen_config = {

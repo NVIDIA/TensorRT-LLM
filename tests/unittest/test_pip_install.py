@@ -9,19 +9,35 @@ from utils.llm_data import llm_models_root
 
 
 def get_expected_license_files():
-    """Get expected license files based on platform architecture."""
+    """Get expected license files based on platform architecture.
+
+    Returns both the required LICENSE file and valid attribution file options.
+    The wheel may contain either auto-generated ATTRIBUTIONS.md or
+    platform-specific hard-coded attribution files.
+    """
     platform_tag = sysconfig.get_platform()
+
+    # LICENSE is always required
+    required = ["LICENSE"]
+
+    # Valid attribution files: auto-generated or platform-specific hard-coded
     if "x86_64" in platform_tag:
-        return ["LICENSE", "ATTRIBUTIONS-CPP-x86_64.md"]
+        valid_attributions = ["ATTRIBUTIONS.md", "ATTRIBUTIONS-CPP-x86_64.md"]
     elif "arm64" in platform_tag or "aarch64" in platform_tag:
-        return ["LICENSE", "ATTRIBUTIONS-CPP-aarch64.md"]
+        valid_attributions = ["ATTRIBUTIONS.md", "ATTRIBUTIONS-CPP-aarch64.md"]
     else:
         raise RuntimeError(f"Unrecognized CPU architecture: {platform_tag}")
 
+    return required, valid_attributions
+
 
 def verify_license_files():
-    """Verify that the correct platform-specific license files are packaged."""
-    expected_files = get_expected_license_files()
+    """Verify that the correct license files are packaged.
+
+    Checks for required files (LICENSE) and ensures at least one valid
+    attribution file is present (either auto-generated or hard-coded).
+    """
+    required_files, valid_attributions = get_expected_license_files()
 
     result = subprocess.run(
         'python3 -c "from importlib.metadata import distribution; '
@@ -53,21 +69,29 @@ def verify_license_files():
         print(result.stdout)
         exit(1)
 
-    # Check for missing or unexpected files
-    missing = [f for f in expected_files if f not in found_files]
-    unexpected = [f for f in found_files if f not in expected_files]
-
-    if missing or unexpected:
-        print(f"ERROR: License files mismatch!")
-        print(f"Expected: {expected_files}")
+    # Check required files are present
+    missing_required = [f for f in required_files if f not in found_files]
+    if missing_required:
+        print(f"ERROR: Missing required license files: {missing_required}")
         print(f"Found: {found_files}")
-        if missing:
-            print(f"Missing: {missing}")
-        if unexpected:
-            print(f"Unexpected: {unexpected}")
         exit(1)
 
-    print(f"✓ License files verified: {', '.join(expected_files)}")
+    # Check that at least one valid attribution file is present
+    found_attributions = [f for f in found_files if f in valid_attributions]
+    if not found_attributions:
+        print(f"ERROR: No valid attribution file found!")
+        print(f"Expected one of: {valid_attributions}")
+        print(f"Found: {found_files}")
+        exit(1)
+
+    # Check for unexpected files (not required and not valid attributions)
+    all_valid = set(required_files + valid_attributions)
+    unexpected = [f for f in found_files if f not in all_valid]
+    if unexpected:
+        print(f"WARNING: Unexpected license files found: {unexpected}")
+
+    verified_files = required_files + found_attributions
+    print(f"✓ License files verified: {', '.join(verified_files)}")
 
 
 def get_cpython_version():

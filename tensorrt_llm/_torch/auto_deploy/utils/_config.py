@@ -41,7 +41,8 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
                 "specify the `yaml_default` field in your pydantic model instead."
             )
 
-    def _read_files(self, files: PathType | None) -> dict[str, Any]:
+    def _read_files(self, files: PathType | None, **kwargs: Any) -> dict[str, Any]:
+        """Read and deep-merge YAML files. Accepts deep_merge kwarg for parent API compatibility."""
         if files is None:
             return {}
         if isinstance(files, (str, os.PathLike)):

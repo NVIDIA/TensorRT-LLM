@@ -18,12 +18,13 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils._graph import lint, recompile
+from tensorrt_llm._torch.auto_deploy.utils.mapping_utils import deserialize_mapping
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm.functional import AllReduceStrategy
 
 
 def _run_ep_shard_job(
-    num_experts: int, rank: int, world_size: int, enable_attention_dp: bool
+    num_experts: int, enable_attention_dp: bool, rank: int, world_size: int
 ) -> None:
     device = "cuda"
     hidden_size = 32
@@ -68,7 +69,13 @@ def _run_ep_shard_job(
             moe_nodes = [n for n in gm.graph.nodes if is_op(n, torch.ops.auto_deploy.torch_moe)]
             assert len(moe_nodes) == 1, f"Expected 1 MoE node, got {len(moe_nodes)}"
             moe_node = moe_nodes[0]
-            return moe_node.kwargs["enable_alltoall"] == (world_size > 1)
+            print(f"\nMoE node {moe_node.name}, kwargs: {moe_node.kwargs}\n\n")
+            assert "mapping_config" in moe_node.kwargs, (
+                f"Mapping config not found in MoE node {moe_node.name}"
+            )
+            # deserialize the mapping config string to dict
+            mapping_config = deserialize_mapping(moe_node.kwargs["mapping_config"])
+            return mapping_config.enable_attention_dp
     else:
 
         def transform_check(gm):
@@ -76,6 +83,9 @@ def _run_ep_shard_job(
                 is_op(n, torch.ops.auto_deploy.torch_dist_all_reduce) for n in gm.graph.nodes
             ) == (world_size > 1)
 
+    # NOTE: we need to skip output assert when enable_attention_dp is True because
+    # a single rank does not contain the full output (lack of final collective),
+    # so the output will be inherently incomplete w.r.t to the single node.
     run_test_transformed_gm(
         model,
         x,
@@ -83,6 +93,7 @@ def _run_ep_shard_job(
         check_transformed_graph=transform_check,
         _get_expected_num_params=partial(_get_expected_num_params, rank, world_size),
         test_load_hook=False,
+        skip_output_assert=enable_attention_dp,
     )
 
 
