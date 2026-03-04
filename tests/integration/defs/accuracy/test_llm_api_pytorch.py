@@ -1474,10 +1474,10 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
-    @parametrize_with_ids("mtp_nextn", [0, 2])
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
     @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
                           [(False, False, False), (True, True, True)])
-    @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
     def test_bfloat16_python_scheduler(self, mtp_nextn, attention_dp,
                                        cuda_graph, overlap_scheduler,
                                        enable_chunked_prefill):
