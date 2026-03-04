@@ -1,5 +1,15 @@
-import pytest
+import random
+import time
+import uuid
 
+import pytest
+import torch
+
+import tensorrt_llm
+import tensorrt_llm.bindings
+import tensorrt_llm.bindings.executor as trtllm
+import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
+from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
     KVSlice,
     LayerRange,
@@ -7,6 +17,12 @@ from tensorrt_llm._torch.disaggregation.base.kv_transfer import (
     SessionStatus,
     TokenRange,
 )
+from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
+from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
+from tensorrt_llm.bindings import DataType
+from tensorrt_llm.logger import logger
 
 
 def test_token_range_valid():
@@ -91,25 +107,6 @@ def test_session_state_construction():
     state2 = SessionState(status=SessionStatus.COMPLETED, finished_tasks=[1, 2, 3])
     assert state2.status == SessionStatus.COMPLETED
     assert state2.finished_tasks == [1, 2, 3]
-import random
-import time
-import uuid
-
-import pytest
-import torch
-
-import tensorrt_llm
-import tensorrt_llm.bindings
-import tensorrt_llm.bindings.executor as trtllm
-import tensorrt_llm.tensorrt_llm_transfer_agent_binding  # TODO: remove it.  # noqa: F401
-from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
-from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
-from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer
-from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
-from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
-from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm.bindings import DataType
-from tensorrt_llm.logger import logger
 
 
 def create_transfer_worker_setup(
