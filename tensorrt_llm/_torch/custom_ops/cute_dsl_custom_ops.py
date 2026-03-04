@@ -2865,6 +2865,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 - Uses current CUDA stream for asynchronous execution
                 - Occupancy is automatically optimized for batch_size > 148
             """
+            torch_dtype = input_values.dtype
             torch_dtype_to_cutlass_dtype = {
                 torch.float16: cutlass.Float16,
                 torch.bfloat16: cutlass.BFloat16,
