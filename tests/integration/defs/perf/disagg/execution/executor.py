@@ -728,12 +728,26 @@ class JobManager:
             result["error"] = error_msg
             return result
 
+        # Pre-read bench log to extract failed request count (reused below)
+        with open(bench_log, encoding="utf-8", errors="replace") as f:
+            bench_content = f.read()
+        failed_requests = 0
+        total_requests = 0
+        failed_match = re.search(r"Total failed requests:\s+(\d+)", bench_content)
+        total_match = re.search(r"Total requests:\s+(\d+)", bench_content)
+        if failed_match and total_match:
+            failed_requests = int(failed_match.group(1))
+            total_requests = int(total_match.group(1))
+
         # Parse metrics and save to CSV
         log_parser = LogParser(benchmark_type, config, metrics_config, result_dir)
         parse_result = log_parser.parse(model_name, timestamps=timestamps, test_name=test_name)
 
         if not parse_result["status"]:
-            result["error"] = "Failed to parse benchmark logs"
+            error_msg = "Failed to parse benchmark logs"
+            if failed_requests > 0:
+                error_msg += f" ({failed_requests}/{total_requests} requests failed)"
+            result["error"] = error_msg
             return result
 
         # Check if df is None
@@ -753,6 +767,15 @@ class JobManager:
 
         result["success"] = True
         result["status"] = "SUCCESS"
+
+        # Override success if any requests failed (metrics still saved for analysis)
+        if failed_requests > 0:
+            error_msg = f"Benchmark had {failed_requests}/{total_requests} failed requests"
+            logger.error(error_msg)
+            result["success"] = False
+            result["status"] = "FAILED"
+            result["error"] = error_msg
+
         return result
 
     @staticmethod
