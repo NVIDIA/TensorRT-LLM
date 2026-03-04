@@ -282,6 +282,57 @@ public:
         }
     }
 
+    //! \brief Get the parent node of this node.
+    //! \return Shared pointer to parent node, or nullptr if this is the root.
+    [[nodiscard]] NodePtr getParentNode() const
+    {
+        return mPrevNode.lock();
+    }
+
+    //! \brief Check if this node has any children.
+    //! \return true if this node has at least one child node.
+    [[nodiscard]] bool hasChildren() const
+    {
+        return !mNextNodes.empty();
+    }
+
+    //! \brief Get all (key, value) pairs for direct child nodes that have a value for vkey.
+    //! \param vkey Value key to look up in each child.
+    //! \return Vector of (NodeKey, Value) pairs for children that have a value for vkey.
+    [[nodiscard]] std::vector<std::pair<NodeKey, Value>> getChildKeyValues(ValueKey const& vkey) const
+    {
+        std::vector<std::pair<NodeKey, Value>> results;
+        for (auto const& [childKey, childNode] : mNextNodes)
+        {
+            auto optVal = childNode->getValue(vkey);
+            if (optVal.has_value())
+            {
+                results.emplace_back(childKey, optVal.value());
+            }
+        }
+        return results;
+    }
+
+    //! \brief Find an existing child node by key, or insert a new one.
+    //! \details If a child with \p key already exists it is returned unchanged.
+    //! Otherwise a new child is created, linked to \p self as its parent, inserted into
+    //! mNextNodes and returned. The caller is responsible for providing \p self as the
+    //! shared_ptr that owns *this (i.e. the caller's NodePtr).
+    //! \param key Key of the child to find or create.
+    //! \param self shared_ptr to *this node (used as the parent pointer for a new child).
+    //! \return NodePtr to the (existing or newly created) child node.
+    [[nodiscard]] NodePtr findOrInsertChild(NodeKey const& key, NodePtr const& self)
+    {
+        auto existing = findMatchingNode(key);
+        if (existing.has_value())
+        {
+            return existing.value().node;
+        }
+        auto newNode = std::make_shared<Node>(key, const_cast<NodePtr&>(self));
+        [[maybe_unused]] auto const overwritten = insertNode(key, newNode);
+        return newNode;
+    }
+
     //! \brief Find all partially matching nodes
     //! \param key The key we're matching.
     //! \return vector of matching nodes, sorted in descending order of number of matched tokens.
@@ -414,6 +465,13 @@ public:
     Trie()
         : mRoot{std::make_shared<_Node>()}
     {
+    }
+
+    //! \brief Get the root node of the trie.
+    //! \return Shared pointer to the root node.
+    [[nodiscard]] NodePtr getRoot() const
+    {
+        return mRoot;
     }
 
     //! \brief Insert nodes for new prefix, or return existing nodes.
