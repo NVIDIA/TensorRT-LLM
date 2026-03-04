@@ -13,6 +13,7 @@ from _graph_test_helpers import run_sharding_pattern_detection_test, run_test_tr
 from _model_test_utils import FakeFP8Linear
 
 import tensorrt_llm._torch.auto_deploy.distributed.common as dist_common
+from tensorrt_llm._torch.auto_deploy.custom_ops.quantization.quant import _pad_nvfp4_weight
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_nemotron_h import NemotronHMamba2Mixer
 from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
@@ -24,6 +25,10 @@ from tensorrt_llm._torch.auto_deploy.transform.library.sharding import (
 )
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_linear_op, is_op, is_weight_node
+from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
+    modelopt_fp4_scale_to_cutlass_fp4_scale,
+)
 from tensorrt_llm.functional import AllReduceStrategy
 
 
@@ -1169,3 +1174,54 @@ def test_unfused_delta_fused_weight_correctness(world_size: int):
         msg="After reloading original state dict, in_proj_qkv weight does not match "
         "expected fused slice. The load hook may not be applying fused slicing correctly.",
     )
+
+
+@pytest.mark.parametrize(
+    "n, k",
+    [
+        (144, 128),  # n%32=16, k%32=0: column-sharding misalignment (e.g. MoE experts)
+        (128, 144),  # n%32=0, k%32=16: row-sharding misalignment (e.g. shared expert down_proj)
+        (144, 176),  # both misaligned
+    ],
+)
+def test_pad_nvfp4_weight_scale_roundtrip(n, k):
+    """Verify _pad_nvfp4_weight preserves cutlass-format weight scales through padding.
+
+    After TP sharding, weight_scale is in cutlass format (swizzled/padded via
+    modelopt_fp4_scale_to_cutlass_fp4_scale). The _pad_nvfp4_weight function pads
+    weight/scale/alpha so dimensions become multiples of 32 for nvfp4_gemm.
+
+    A previous bug treated the cutlass-format (swizzled) scale buffer as row-major
+    data when reshaping for padding, silently corrupting scale values and causing
+    accuracy degradation proportional to world_size.
+    """
+    block_size = 16
+    device = "cuda"
+
+    torch.manual_seed(42)
+    modelopt_scale = torch.rand(n, k // block_size, device=device).to(torch.float8_e4m3fn)
+    cutlass_scale = modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale)
+
+    weight_fp4 = torch.randint(0, 256, (n, k // 2), dtype=torch.uint8, device=device)
+    alpha = torch.ones(n, device=device)
+
+    _, padded_scale, _, n_padded, k_padded = _pad_nvfp4_weight(
+        weight_fp4, cutlass_scale, alpha, n, k
+    )
+
+    padded_modelopt = cutlass_fp4_scale_to_modelopt_fp4_scale(padded_scale, (n_padded, k_padded))
+    recovered = padded_modelopt[:n, : k // block_size]
+
+    torch.testing.assert_close(
+        recovered.float(),
+        modelopt_scale.float(),
+        msg="Scale values were corrupted during padding. "
+        "_pad_nvfp4_weight may be treating cutlass-format (swizzled) data as row-major.",
+    )
+
+    if n_padded > n:
+        pad_region_n = padded_modelopt[n:, : k // block_size]
+        assert (pad_region_n.float() == 0).all(), "n-padding region should be zero"
+    if k_padded > k:
+        pad_region_k = padded_modelopt[:n, k // block_size :]
+        assert (pad_region_k.float() == 0).all(), "k-padding region should be zero"

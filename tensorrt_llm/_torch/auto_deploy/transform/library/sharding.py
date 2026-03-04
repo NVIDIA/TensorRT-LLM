@@ -16,7 +16,6 @@ Our sharding algorithm for tensor parallelism (TP) is based on the following ste
        happens automatically via the checkpoint loading hook added in step 2c.
 """
 
-import math
 import operator
 import re
 from abc import ABC, abstractmethod
@@ -334,9 +333,11 @@ class WeightShardingInfo(ShardingTransformInfo):
         node: Node,
         weight_key: str,
         weight_new_shape: torch.Size,
+        weight_original_shape: torch.Size,
         dim: int,
         rank: int,
         world_size: int,
+        min_local_shape: int = 1,
     ) -> None:
         """Quantization callback. Default does nothing for non-quantized models."""
         return None
@@ -409,7 +410,9 @@ class QuantizationShardingMixin(ABC):
         dim: int,
         rank: int,
         world_size: int,
-        weight_shape: torch.Size,
+        min_local_shape: int,
+        weight_new_shape: torch.Size,
+        weight_original_shape: torch.Size,
         **scales: torch.Tensor,
     ) -> Dict[str, torch.Tensor]:
         return {k: v for k, v in scales.items() if isinstance(v, torch.Tensor)}
@@ -420,10 +423,11 @@ class QuantizationShardingMixin(ABC):
         prefix,
         *args,
         weight_name: str,
-        weight_shape: torch.Size,
+        weight_original_shape: torch.Size,
         dim: int,
         rank: int,
         world_size: int,
+        min_local_shape: int = 1,
     ) -> None:
         return
 
@@ -434,15 +438,24 @@ class QuantizationShardingMixin(ABC):
         node: Node,
         weight_key: str,
         weight_new_shape: torch.Size,
+        weight_original_shape: torch.Size,
         dim: int,
         rank: int,
         world_size: int,
+        min_local_shape: int = 1,
     ) -> None:
         scales = {}
         for scale_name in self.scale_names():
             scales[scale_name] = submod.get_buffer(scale_name)
-        scales["weight_shape"] = weight_new_shape
-        sharded_scales = self.shard_scales(dim, rank, world_size, **scales)
+        sharded_scales = self.shard_scales(
+            dim,
+            rank,
+            world_size,
+            min_local_shape,
+            weight_new_shape=weight_new_shape,
+            weight_original_shape=weight_original_shape,
+            **scales,
+        )
         for k, v in sharded_scales.items():
             submod.register_buffer(k, v)
 
@@ -450,10 +463,11 @@ class QuantizationShardingMixin(ABC):
             partial(
                 self.shard_load_hook,
                 weight_name=weight_key,
-                weight_shape=weight_new_shape,
+                weight_original_shape=weight_original_shape,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
+                min_local_shape=min_local_shape,
             )
         )
 
@@ -469,7 +483,9 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         dim: int,
         rank: int,
         world_size: int,
-        weight_shape: torch.Size,
+        min_local_shape: int,
+        weight_new_shape: torch.Size,
+        weight_original_shape: torch.Size,
         *,
         input_scale: torch.Tensor,
         weight_scale: torch.Tensor,
@@ -485,25 +501,45 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         prefix,
         *args,
         weight_name: str,
-        weight_shape: torch.Size,
+        weight_original_shape: torch.Size,
         dim: int,
         rank: int,
         world_size: int,
+        min_local_shape: int = 1,
     ) -> None:
         return
 
 
-def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
-    # assert weight_scale.dim() == 1
-    weight_shape_original = list(sharded_uint8_weight_shape)
-    weight_shape_original[dim] = weight_shape_original[dim] * world_size
-    weight_shape_original[-1] *= 2
+def _shard_fp4_weight_scale(
+    weight_scale,
+    original_uint8_weight_shape,
+    dim,
+    rank,
+    world_size,
+    min_local_shape=1,
+    fused_weight_dims=None,
+):
+    # Convert original uint8 shape to element shape (FP4 packs 2 elements per byte)
+    weight_shape_elements = list(original_uint8_weight_shape)
+    weight_shape_elements[-1] *= 2
     modelopt_weight_scale = cutlass_fp4_scale_to_modelopt_fp4_scale(
-        weight_scale, tuple(weight_shape_original)
+        weight_scale, tuple(weight_shape_elements)
     )
-    return modelopt_fp4_scale_to_cutlass_fp4_scale(
-        modelopt_weight_scale.tensor_split(world_size, dim=dim)[rank]
-    )
+    if fused_weight_dims is not None:
+        # Fused weights (e.g. Mamba in_proj) are split per-component then sharded.
+        # The scale must follow the same per-component splitting to stay aligned.
+        sharded_scale = torch.cat(
+            [
+                _split_tensor_for_tp(chunk, dim, rank, world_size, min_local_shape)
+                for chunk in torch.split(modelopt_weight_scale, list(fused_weight_dims), dim=dim)
+            ],
+            dim=dim,
+        )
+    else:
+        sharded_scale = _split_tensor_for_tp(
+            modelopt_weight_scale, dim, rank, world_size, min_local_shape
+        )
+    return modelopt_fp4_scale_to_cutlass_fp4_scale(sharded_scale)
 
 
 class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
@@ -517,7 +553,9 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         dim: int,
         rank: int,
         world_size: int,
-        weight_shape: torch.Size,
+        min_local_shape: int,
+        weight_new_shape: torch.Size,
+        weight_original_shape: torch.Size,
         *,
         weight_scale: torch.Tensor,
         alpha: torch.Tensor,
@@ -527,7 +565,13 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
             "alpha": alpha,
             "input_scale": input_scale,
             "weight_scale": _shard_fp4_weight_scale(
-                weight_scale, weight_shape, dim, rank, world_size
+                weight_scale,
+                weight_original_shape,
+                dim,
+                rank,
+                world_size,
+                min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
             ),
         }
 
@@ -537,15 +581,22 @@ class FP4WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         prefix,
         *args,
         weight_name: str,
-        weight_shape: torch.Size,
+        weight_original_shape: torch.Size,
         dim: int,
         rank: int,
         world_size: int,
+        min_local_shape: int = 1,
     ) -> None:
         key = weight_name + "_scale"
         if key in state_dict:
             state_dict[key] = _shard_fp4_weight_scale(
-                state_dict[key], weight_shape, dim, rank, world_size
+                state_dict[key],
+                weight_original_shape,
+                dim,
+                rank,
+                world_size,
+                min_local_shape,
+                fused_weight_dims=self.fused_weight_dims,
             )
 
 
@@ -1238,6 +1289,38 @@ def _resolve_tp_cls_from_node(node: Node):
 ########################################################
 #  Sharding transform functions
 ########################################################
+
+
+def _split_tensor_for_tp(
+    t: torch.Tensor,
+    dim: int,
+    rank: int,
+    world_size: int,
+    min_local_shape: int = 1,
+) -> torch.Tensor:
+    """Split a tensor for tensor-parallelism, respecting min_local_shape.
+
+    When world_size exceeds the maximum number of even splits (e.g. GQA with
+    num_kv_heads < world_size), multiple ranks share the same shard.
+    """
+    max_split_size = t.shape[dim] // min_local_shape
+    if world_size > max_split_size:
+        # TODO: support remainder case (world_size % max_split_size != 0).
+        # Currently the downstream view/split/slice fixups in _process_column_sharding
+        # assume even division by world_size, so uneven grouping would produce wrong shapes.
+        assert world_size % max_split_size == 0, (
+            f"world_size ({world_size}) must be divisible by max_split_size ({max_split_size}). "
+            f"GQA with num_kv_heads not dividing world_size is not supported."
+        )
+        num_groups = world_size // max_split_size
+        ad_logger.debug(
+            f"World size {world_size} is greater than the max split size {max_split_size}. "
+            f"Splitting tensor to {num_groups} chunks"
+        )
+        return torch.tensor_split(t, max_split_size, dim=dim)[rank // num_groups]
+    return torch.tensor_split(t, world_size, dim=dim)[rank]
+
+
 def shard_weight_tensor(
     gm: GraphModule,
     weight_tensor: torch.Tensor,
@@ -1268,40 +1351,30 @@ def shard_weight_tensor(
         Tuple of (sharded_tensor, sharded_shape)
     """
 
-    def split_tensor(
-        t: torch.Tensor,
-        d: int = dim,
-        r: int = rank,
-        ws: int = world_size,
-        min_d_shape: int = min_local_shape,
-    ) -> torch.Tensor:
-        # The local tensor shape has to be divisible by min_d_shape
-        max_split_size = t.shape[d] // min_d_shape
-        if ws > max_split_size:
-            num_groups = math.ceil(ws / max_split_size)
-            ad_logger.debug(
-                f"World size {ws} is greater than the max split size {max_split_size}. "
-                + f"Splitting tensor to {num_groups} chunks"
-            )
-            return torch.tensor_split(t, max_split_size, dim=d)[r // num_groups]
-        return torch.tensor_split(t, ws, dim=d)[r]
-
     # Handle fused weights
     if fused_weight_dims is not None:
 
-        def split_fused_tensor(
+        def f_split(
             t: torch.Tensor,
             fused_dims: list = fused_weight_dims,
             d: int = dim,
         ) -> torch.Tensor:
             return torch.cat(
-                [split_tensor(w) for w in torch.split(t, fused_dims, dim=d)],
+                [
+                    _split_tensor_for_tp(w, dim, rank, world_size, min_local_shape)
+                    for w in torch.split(t, fused_dims, dim=d)
+                ],
                 dim=d,
             )
 
-        f_split = split_fused_tensor
     else:
-        f_split = split_tensor
+        f_split = partial(
+            _split_tensor_for_tp,
+            dim=dim,
+            rank=rank,
+            world_size=world_size,
+            min_local_shape=min_local_shape,
+        )
 
     sharded_weight = f_split(weight_tensor)
     sharded_shape = sharded_weight.shape
@@ -1334,7 +1407,9 @@ def _shard_parameter_node(
     min_local_shape: int = 1,
     fused_weight_dims: Optional[tuple] = None,
     quantization_cb: Optional[
-        Callable[[GraphModule, nn.Module, Node, str, torch.Size, int, int, int], None]
+        Callable[
+            [GraphModule, nn.Module, Node, str, torch.Size, torch.Size, int, int, int, int], None
+        ]
     ] = None,
 ) -> None:
     """Replace the node with parametrized weight tensor with a new node that accepts sharded weights.
@@ -1384,9 +1459,11 @@ def _shard_parameter_node(
                 node=node,
                 weight_key=weight_node.node_key,
                 weight_new_shape=weight_new_shape,
+                weight_original_shape=weight_node.tensor.shape,
                 dim=dim,
                 rank=rank,
                 world_size=world_size,
+                min_local_shape=min_local_shape,
             )
 
     for bias_node in weight_nodes.biases:
