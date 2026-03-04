@@ -318,6 +318,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
+        FilteredTopKKernelVarlenDecode
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -2789,16 +2791,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
-
-    # ========================================================================
-    # CuTE DSL Top-K Operations
-    # ========================================================================
-
-    import cutlass
-    import cutlass.cute as cute
-
-    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
-        FilteredTopKKernelVarlenDecode
 
     class CuteDSLTopKDecodeSingleCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (single CTA version)."""
