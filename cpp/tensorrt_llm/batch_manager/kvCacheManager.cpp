@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
+#include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -94,7 +95,8 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mMemoryPoolBlockIndex{blockIdx}
     , mRefCount(0)
     , mSchedulingRefCount(0)
-    , mPrevBlock(nullptr)
+    , mLookupNode{nullptr}
+    , mWindowSize{-1}
     , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
@@ -116,7 +118,51 @@ KVCacheBlock::IdType KVCacheBlock::getBlockId() const
 
 NextBlockMap KVCacheBlock::getNextBlocks() const
 {
-    return mNextBlocks;
+    if (!mLookupNode)
+    {
+        return {};
+    }
+    NextBlockMap result;
+    for (auto const& [key, block] : mLookupNode->getChildKeyValues(mWindowSize))
+    {
+        result.emplace(key, block);
+    }
+    return result;
+}
+
+void KVCacheBlock::attachToLookupNode(
+    radix_block_tree::LookupNodePtr node, int windowSize, std::shared_ptr<KVCacheBlock> self)
+{
+    // Detach from any previous node first
+    if (mLookupNode)
+    {
+        [[maybe_unused]] auto const wasCleared = mLookupNode->clearValue(mWindowSize);
+    }
+    mLookupNode = node;
+    mWindowSize = windowSize;
+    [[maybe_unused]] auto const wasSet = node->setValue(windowSize, std::move(self), /*overwrite=*/false);
+}
+
+void KVCacheBlock::detachFromLookupNode()
+{
+    if (!mLookupNode)
+    {
+        return;
+    }
+    // clearValue triggers the cascade-prune up through empty ancestor nodes automatically
+    [[maybe_unused]] auto const wasCleared = mLookupNode->clearValue(mWindowSize);
+    mLookupNode = nullptr;
+    mWindowSize = -1;
+}
+
+void KVCacheBlock::setAsRoot(
+    radix_block_tree::LookupNodePtr rootNode, int windowSize, std::shared_ptr<KVCacheBlock> self)
+{
+    mLookupNode = rootNode;
+    mWindowSize = windowSize;
+    // Store the root block itself in the root node so that direct children can find it
+    // via getPrevBlock() (root->getParentNode() returns nullptr, so the chain stops here).
+    [[maybe_unused]] auto const wasSet = rootNode->setValue(windowSize, std::move(self), /*overwrite=*/true);
 }
 
 tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
@@ -164,8 +210,11 @@ bool KVCacheBlock::hasRefs() const
 
 bool KVCacheBlock::isShared() const
 {
-    // block is considered shared if ready for reuse
-    return mRefCount > 1 || mPrevBlock != nullptr;
+    // Block is considered shared if it has multiple references or is registered in the
+    // lookup tree (i.e., it is cached for reuse by future requests).
+    // Note: mCachedBlocksRoot also has mLookupNode set (via setAsRoot), but it is never
+    // placed in the eviction queue so this condition does not affect eviction logic for it.
+    return mRefCount > 1 || mLookupNode != nullptr;
 }
 
 bool KVCacheBlock::hasSchedulingRefs() const
@@ -234,14 +283,20 @@ VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
     return mBlockKey.uniqueTokens;
 }
 
-BlockPtr const& KVCacheBlock::getPrevBlock() const
+BlockPtr KVCacheBlock::getPrevBlock() const
 {
-    return mPrevBlock;
-}
-
-void KVCacheBlock::setPrevBlock(BlockPtr prevBlock)
-{
-    mPrevBlock = std::move(prevBlock);
+    if (!mLookupNode)
+    {
+        return nullptr;
+    }
+    auto parentNode = mLookupNode->getParentNode();
+    if (!parentNode)
+    {
+        // This block is the root (no parent node), so it has no parent block.
+        return nullptr;
+    }
+    auto optBlock = parentNode->getValue(mWindowSize);
+    return optBlock.value_or(nullptr);
 }
 
 BlockPtr const& KVCacheBlock::getPrevBlockInSeq() const
@@ -256,94 +311,103 @@ void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
 
 void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
-    if (mNextBlocks.find(blockKey) == mNextBlocks.end())
+    if (!mLookupNode)
     {
-        mNextBlocks[blockKey] = std::move(block);
+        return;
+    }
+    // Find existing child node or create a new one, then wire the block into it.
+    auto childNode = mLookupNode->findOrInsertChild(blockKey, mLookupNode);
+    // Only attach if there is no block already stored for this window size (matches old
+    // behaviour: addNextBlock was a no-op when the key already existed in mNextBlocks).
+    auto existing = childNode->getValue(mWindowSize);
+    if (!existing.has_value())
+    {
+        block->attachToLookupNode(childNode, mWindowSize, block);
     }
 }
 
 std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
     BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
-
-    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
+    if (!mLookupNode || blockKey.uniqueTokens.empty())
     {
         return {false, 0, nullptr};
     }
-    auto itr = mNextBlocks.find(blockKey);
-    if (itr == mNextBlocks.end())
+
+    // Exact match
+    auto exactMatch = mLookupNode->findMatchingNode(blockKey);
+    if (exactMatch.has_value())
     {
-        if (enablePartialReuse)
+        auto optBlock = exactMatch->node->getValue(mWindowSize);
+        if (optBlock.has_value() && *optBlock)
         {
-            SizeType32 bestNumMatched{0};
-            BlockPtr bestBlock{nullptr};
-            for (auto const& [key, block] : mNextBlocks)
-            {
-                if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
-                {
-                    SizeType32 numMatched = key.numMatchingTokens(blockKey);
-                    if (numMatched > bestNumMatched)
-                    {
-                        bestNumMatched = numMatched;
-                        bestBlock = block;
-                    }
-                }
-            }
-            if (bestNumMatched > 0)
-            {
-                return {true, bestNumMatched, bestBlock};
-            }
+            auto block = *optBlock;
+            return {!block->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), block};
         }
         return {false, 0, nullptr};
     }
-    auto block = itr->second;
-    return {!block->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), block};
+
+    // Partial match (sorted longest-first by findPartiallyMatchingNodes)
+    if (enablePartialReuse)
+    {
+        auto partialMatches = mLookupNode->findPartiallyMatchingNodes(blockKey);
+        for (auto const& match : partialMatches)
+        {
+            auto optBlock = match.node->getValue(mWindowSize);
+            if (!optBlock.has_value() || !(*optBlock))
+            {
+                continue;
+            }
+            auto block = *optBlock;
+            if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
+            {
+                return {true, static_cast<SizeType32>(match.key.uniqueTokens.size()), block};
+            }
+        }
+    }
+
+    return {false, 0, nullptr};
 }
 
 void KVCacheBlock::freeLeafBlock()
 {
     // assure that this is a leaf block
     TLLM_CHECK(isLeaf());
-
-    // free from previous block
-    if (mPrevBlock != nullptr)
-    {
-        mPrevBlock->removeNextBlock(mBlockKey);
-        mPrevBlock = nullptr;
-    }
+    // Detach from the lookup tree; cascade pruning removes empty ancestor nodes.
+    detachFromLookupNode();
 }
 
 void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
-    mNextBlocks.erase(blockKey);
+    if (mLookupNode)
+    {
+        // clearNode removes the child entry and fires cascade pruning upward if the child
+        // node becomes empty after the removal.
+        [[maybe_unused]] auto const wasCleared = mLookupNode->clearNode(blockKey);
+    }
 }
 
 void KVCacheBlock::freeDescendantsRecursively()
 {
-    bool hasChildren = !mNextBlocks.empty();
-    if (hasChildren)
+    if (mLookupNode && mLookupNode->hasChildren())
     {
-        for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
+        // Collect child blocks before recursing (iterating while mutating is unsafe).
+        auto childKeyValues = mLookupNode->getChildKeyValues(mWindowSize);
+        for (auto const& [childKey, childBlock] : childKeyValues)
         {
-            it->second->freeDescendantsRecursively();
-            TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", it->second->getBlockId());
-            it = mNextBlocks.erase(it);
+            TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", childBlock->getBlockId());
+            childBlock->freeDescendantsRecursively();
         }
     }
-    mPrevBlock = nullptr;
+    // Detach self from the lookup tree (cascade prune fires upward).
+    detachFromLookupNode();
 }
 
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
-    // free from previous block
-    if (mPrevBlock != nullptr)
-    {
-        mPrevBlock->removeNextBlock(mBlockKey);
-        mPrevBlock = nullptr;
-    }
+    // Recurse into descendants first, then detach self.
+    // detachFromLookupNode() inside freeDescendantsRecursively() handles the parent-link
+    // removal via cascade pruning, so no separate removeNextBlock call is needed.
     freeDescendantsRecursively();
 }
 
@@ -354,7 +418,7 @@ bool KVCacheBlock::isFull() const
 
 bool KVCacheBlock::isLeaf() const
 {
-    return mNextBlocks.empty();
+    return !mLookupNode || !mLookupNode->hasChildren();
 }
 
 // This function calculates the number of block a layer should have, given
@@ -619,6 +683,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     {
         mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool}, mWindowSize);
     }
+
+    // Wire the dummy root block into the per-manager lookup tree so that direct children
+    // can navigate to it via getPrevBlock() and blockInRadixTree() returns true for them.
+    mCachedBlocksRoot->setAsRoot(mLookupTree.getRoot(), mWindowSize, mCachedBlocksRoot);
 }
 
 WindowBlockManager::~WindowBlockManager()
@@ -1534,7 +1602,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     block->getPrevBlock()->removeNextBlock(block->getBlockKey());
                 }
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
-                block->setPrevBlock(searchRoot);
                 block->setPrevBlockInSeq(searchRoot);
                 searchRoot->addNextBlock(blockKey, block);
 

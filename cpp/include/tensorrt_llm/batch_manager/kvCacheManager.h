@@ -21,6 +21,7 @@
 #include "tensorrt_llm/batch_manager/kvCacheEventManager.h"
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
+#include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -189,6 +190,30 @@ public:
 
     [[nodiscard]] NextBlockMap getNextBlocks() const;
 
+    //! \brief Wire this block into the shared lookup tree at the given node and window size.
+    //! \details If the block is already attached to a different node, the old attachment is
+    //! cleared first (its value slot is erased and cascade pruning fires upward). Then the
+    //! block is stored as the value for \p windowSize in \p node.
+    //! \param node    The lookup-tree node to attach to.
+    //! \param windowSize Value key identifying this block's slot within the node.
+    //! \param self    shared_ptr to this block (passed in by the caller who already holds it).
+    void attachToLookupNode(radix_block_tree::LookupNodePtr node, int windowSize, std::shared_ptr<KVCacheBlock> self);
+
+    //! \brief Detach this block from the lookup tree.
+    //! \details Clears the block's value slot in its current node and resets mLookupNode /
+    //! mWindowSize to their null states. The Node's cascade-prune logic then removes empty
+    //! ancestor nodes automatically.
+    void detachFromLookupNode();
+
+    //! \brief Initialise a dummy root block's lookup-node link.
+    //! \details Stores \p self as the value for \p windowSize in \p rootNode so that
+    //! direct children can retrieve the root block via getPrevBlock(). Must be called once
+    //! after constructing the mCachedBlocksRoot block.
+    //! \param rootNode  Root node of the per-manager UnifiedBlockTree.
+    //! \param windowSize Window size associated with this WindowBlockManager.
+    //! \param self      shared_ptr to this (the root) block.
+    void setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize, std::shared_ptr<KVCacheBlock> self);
+
     [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
     [[nodiscard]] bool isPrimary() const;
@@ -211,9 +236,11 @@ public:
 
     [[nodiscard]] VecUniqueTokens const& getUniqueTokens() const;
 
-    BlockPtr const& getPrevBlock() const;
-
-    void setPrevBlock(BlockPtr prevBlock);
+    //! \brief Return the parent block in the lookup tree.
+    //! \details Navigates via mLookupNode->getParentNode()->getValue(mWindowSize).
+    //! Returns nullptr when the block is not in the tree or is a direct child of the root.
+    //! NOTE: return type is by value (not const&) because the result is computed on the fly.
+    [[nodiscard]] BlockPtr getPrevBlock() const;
 
     BlockPtr const& getPrevBlockInSeq() const;
 
@@ -277,17 +304,19 @@ private:
     // Number of references to the block
     SizeType32 mSchedulingRefCount;
 
-    // Key of this block in mNextBlocks map in block pointed to by mPrevBlock
+    // Key of this block in the lookup tree (the token prefix it represents)
     BlockKey mBlockKey;
 
-    // Previous block in reuse tree, or nullptr if not reusing
-    BlockPtr mPrevBlock;
+    // Pointer to this block's node in the shared UnifiedBlockTree.
+    // nullptr when the block is not cached for reuse.
+    radix_block_tree::LookupNodePtr mLookupNode;
 
-    // Previous block in sequence, == nullptr for first block, == mPrevBlock if reusing and not first
+    // Window size slot this block occupies in mLookupNode->mValue.
+    // -1 when mLookupNode is nullptr.
+    int mWindowSize;
+
+    // Previous block in sequence, == nullptr for first block
     BlockPtr mPrevBlockInSeq;
-
-    // Next block(s) in sequence(s)
-    NextBlockMap mNextBlocks;
 
     // Iterator pointing to this block in mFreeBlocks.
     std::optional<FreeBlocksQueue::iterator> mFreeBlockIterator;
@@ -303,9 +332,6 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
-
-    // Mutex for the next blocks
-    mutable std::mutex mNextBlocksMutex;
 };
 
 class GenerationRequest
@@ -869,8 +895,12 @@ public:
     void resetReuseState()
     {
         std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+        // Create a fresh lookup tree; the old one is released once all blocks drop their
+        // LookupNodePtr references (no manual cleanup required).
+        mLookupTree = radix_block_tree::UnifiedBlockTree();
         mCachedBlocksRoot
             = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
+        mCachedBlocksRoot->setAsRoot(mLookupTree.getRoot(), mWindowSize, mCachedBlocksRoot);
     }
 
 private:
@@ -937,6 +967,9 @@ private:
     bool mIsSWA;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
+    // Per-manager radix lookup tree. mCachedBlocksRoot->mLookupNode points to its root.
+    // In PR B this will be promoted to a shared tree owned by BlockManager.
+    radix_block_tree::UnifiedBlockTree mLookupTree;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
