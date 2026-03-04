@@ -303,6 +303,13 @@ def _run_finegrained_moe_with_alltoall_blackwell(
 
     local_expert_offset = mapping.moe_ep_rank * local_num_experts
 
+    # TODO: pass act_type once FP8BlockScaleMoERunner C++ supports it.
+    # Currently defaults to SwiGlu; non-gated MLPs (Relu2) will be incorrect.
+    assert is_gated_mlp, (
+        "fp8_block_scale_moe_runner does not support act_type yet; "
+        "only gated MLP (SwiGlu) is supported on the Blackwell alltoall path"
+    )
+
     moe_out = torch.ops.trtllm.fp8_block_scale_moe_runner(
         None,  # routing_logits
         None,  # routing_bias
@@ -795,6 +802,13 @@ def trtllm_quant_finegrained_fp8_moe_fused(
     # routing weights for remote experts are zeroed, all_reduce is added after this op
     if is_sm_100f():
         # --- Blackwell (SM100+) Path ---
+        # TODO: pass act_type once FP8BlockScaleMoERunner C++ supports it.
+        # Currently defaults to SwiGlu; non-gated MLPs (Relu2) will be incorrect.
+        assert is_gated_mlp, (
+            "fp8_block_scale_moe_runner does not support act_type yet; "
+            "only gated MLP (SwiGlu) is supported on the Blackwell EP all-reduce path"
+        )
+
         x_fp8, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x2d)
 
         num_experts = fc1_expert_weights.shape[0]

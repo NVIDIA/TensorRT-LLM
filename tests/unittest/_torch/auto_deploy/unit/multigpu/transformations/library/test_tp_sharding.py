@@ -507,13 +507,11 @@ def _run_sharding_execution_job(
         )
         # update the tp_plan in predefined_config to force simple sharding of the single linear layer
         predefined_config = {"tp_plan": {"*": "gather"}}
-    elif model_cls == HFFP8MLP:
-        # HFFP8MLP needs features divisible by 128 (block size)
-        model = model_cls(128, 128, bias=bias).to("cuda")
     elif model_cls == FineGrainedFP8MLP:
         # FineGrainedFP8MLP needs features divisible by 128 (block size)
         num_features = 128
         model = model_cls(num_features, num_features, bias=bias).to("cuda")
+        predefined_config = {"tp_plan": {"linear1": "colwise", "linear2": "rowwise"}}
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -623,6 +621,10 @@ def _run_sharding_execution_job(
         weight_sizes_valid = verify_local_weight_sizes(gm)
         return has_expected_dist_ops and weight_sizes_valid
 
+    # FineGrainedFP8 shard_load_hook always shards scales from the full state dict,
+    # so skip the round-trip load hook test (loading from already-sharded state dict).
+    test_load = model_cls != FineGrainedFP8MLP
+
     run_test_transformed_gm(
         model,
         x,
@@ -630,6 +632,8 @@ def _run_sharding_execution_job(
         check_transformed_graph=combined_graph_check,
         _get_expected_num_params=_get_expected_num_params,
         skip_output_assert=skip_output_assert,
+        test_load_hook=test_load,
+        strict_loading=test_load,
     )
 
 
@@ -730,6 +734,7 @@ def _run_pattern_detection_job(
         # FineGrainedFP8MLP needs features divisible by 128 (block size)
         num_features = 128
         model = model_cls(num_features, num_features, bias=bias).to("cuda")
+        predefined_config = {"tp_plan": {"linear1": "colwise", "linear2": "rowwise"}}
     else:
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
@@ -998,26 +1003,6 @@ def _run_pattern_detection_job(
                                 fused_weight_dims=fused_weight_dims,
                             )
                         )
-        elif model_cls == HFFP8MLP:
-            for node in gm.graph.nodes:
-                if is_op(node, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear):
-                    # linear1 should be sharded on dim=0, add_dist=False, min_local_shape=1
-                    # linear2 should be sharded on dim=1, add_dist=True, min_local_shape=1
-                    if "linear1" in node.args[1].name:
-                        dim = SplitDimension.COLUMN
-                        dist_op = None
-                    else:
-                        dim = SplitDimension.ROW
-                        dist_op = "all_reduce"
-                    expected_transformations.append(
-                        FineGrainedFP8WeightShardingInfo(
-                            target_node=node.name,
-                            split_dim=dim,
-                            config=config,
-                            dist_op=dist_op,
-                            min_local_shape=1,
-                        )
-                    )
         elif model_cls == FineGrainedFP8MLP:
             for node in gm.graph.nodes:
                 if is_op(node, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear):
