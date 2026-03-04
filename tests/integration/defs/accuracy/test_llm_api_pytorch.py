@@ -57,8 +57,8 @@ from tensorrt_llm.llmapi import (
     AutoDecodingConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
     NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SamplingParams, SchedulerConfig, SkipSoftmaxAttentionConfig,
-    TorchCompileConfig)
+    SADecodingConfig, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -370,6 +370,32 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
+    @skip_pre_hopper
+    def test_suffix_automaton(self):
+        max_bs = 16
+
+        pytorch_config = dict(
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(
+                batch_sizes=[i for i in range(1, max_bs + 1)]),
+        )
+
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.8)
+
+        spec_config = SADecodingConfig(
+            max_draft_len=4,
+            max_matching_ngram_size=-1,  # longest match via suffix automaton
+        )
+
+        with LLM(model=self.MODEL_PATH,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config,
+                 max_batch_size=max_bs) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
     @skip_pre_blackwell
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("attn_backend", ["TRTLLM"])
@@ -391,6 +417,20 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_blackwell
+    def test_nvfp4_kv_override(self):
+        """Load an FP8 checkpoint and force NVFP4 KV cache via dtype override."""
+        model_path = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct-FP8"
+        pytorch_config = dict(
+            attn_backend="TRTLLM",
+            kv_cache_config=KvCacheConfig(dtype="nvfp4"),
+        )
+        with LLM(model_path, **pytorch_config) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.FP8
+            assert llm.args.quant_config.kv_cache_quant_algo == QuantAlgo.NVFP4
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
 
@@ -1479,6 +1519,26 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    def test_bfloat16_mtp_sa(self):
+        """Accuracy test for MTP + Suffix Automaton (MTP+SA) speculative decoding."""
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
+                                       use_sa_spec=True)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 max_num_tokens=8192,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("torch_compile", [False, True])
@@ -3489,6 +3549,40 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
                 token_ids = output.outputs[0].token_ids
                 assert len(token_ids) > 0
                 assert not all(tid == 0 for tid in token_ids)
+
+
+@pytest.mark.timeout(10800)
+@pytest.mark.skip_less_device_memory(100000)
+class TestKimiK25(LlmapiAccuracyTestHarness):
+
+    @skip_pre_blackwell
+    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_device_memory(120000)
+    @pytest.mark.parametrize(
+        "ep_size,attention_dp",
+        [(1, False), (1, True), (8, False), (8, True)],
+        ids=["tp8", "tp8_attn_dp", "ep8", "dep8"],
+    )
+    def test_nvfp4(self, ep_size, attention_dp):
+        model_name = "moonshotai/Kimi-K2.5"
+        model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        with LLM(model_path,
+                 tensor_parallel_size=8,
+                 max_batch_size=16,
+                 pipeline_parallel_size=1,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 enable_attention_dp=attention_dp,
+                 trust_remote_code=True,
+                 speculative_config=None) as llm:
+            assert llm.args.quant_config.quant_algo == QuantAlgo.NVFP4
+
+            task = MMLU(model_name)
+            task.evaluate(llm)
+            task = GSM8K(model_name)
+            task.evaluate(llm)
 
 
 class TestMinitron4BBaseInstruct(LlmapiAccuracyTestHarness):

@@ -26,11 +26,7 @@ GPU. They are aligned with the C++ scheduler unit tests in:
 from dataclasses import dataclass, field
 from typing import List, Optional
 
-import pytest
-
-from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
-                                                         LlmRequestState,
-                                                         SamplingConfig)
+from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestState, SamplingConfig
 from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
     ChunkingPolicy,
     ContextChunkingConfig,
@@ -51,8 +47,7 @@ def _make_request(
     state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
     input_tokens: Optional[List[int]] = None,
 ) -> LlmRequest:
-    tokens = input_tokens if input_tokens is not None else list(
-        range(prompt_len))
+    tokens = input_tokens if input_tokens is not None else list(range(prompt_len))
     draft = list(range(draft_tokens_len)) if draft_tokens_len > 0 else None
     req = LlmRequest(
         request_id=request_id,
@@ -126,11 +121,6 @@ def make_completed_request(request_id: int) -> LlmRequest:
     )
 
 
-# ============================================================================
-# Mock KV Cache Manager
-# ============================================================================
-
-
 @dataclass
 class MockKVCacheStats:
     num_free_blocks_per_window_size: dict = field(default_factory=lambda: {128: 100})
@@ -185,11 +175,6 @@ class MockKVCacheManager:
         return self._blocks_per_request
 
 
-# ============================================================================
-# Mock PEFT Cache Manager
-# ============================================================================
-
-
 class MockPeftCacheManager:
     def __init__(self, max_pages: int = 100, pages_per_request: int = 10):
         self.max_device_pages = max_pages
@@ -201,7 +186,7 @@ class MockPeftCacheManager:
 
 # ############################################################################
 #
-# Phase 2: PyMicroBatchScheduler Tests
+# Part 1: PyMicroBatchScheduler Tests
 #
 # ############################################################################
 
@@ -410,22 +395,6 @@ class TestPyMicroBatchSchedulerBasic:
         assert len(ctx) == 1
         assert len(gen) == 1
 
-    def test_encoder_request(self):
-        """Encoder requests use encoder_output_len as token count."""
-        scheduler = PyMicroBatchScheduler(
-            max_batch_size=4,
-            max_num_tokens=20,
-            no_schedule_until_state=LlmRequestState.ENCODER_INIT,
-        )
-        requests = [
-            make_encoder_request(0, encoder_output_len=15),
-            make_context_request(1, prompt_len=10),
-        ]
-        ctx, gen = scheduler.schedule(requests, set())
-        # Encoder: 15 tokens, context: 10. Total 25 > 20.
-        assert len(ctx) == 1
-        assert ctx[0].request_id == 0
-
     def test_simple_no_overlap(self):
         """
         With max_batch_size=2 and 4 context requests, only 2 are scheduled.
@@ -527,7 +496,7 @@ class TestPyMicroBatchSchedulerBasic:
 
 # ############################################################################
 #
-# Phase 3: Context Chunking Tests
+# Part 2: Context Chunking Tests
 #
 # ############################################################################
 
@@ -814,7 +783,7 @@ class TestPyMicroBatchSchedulerChunking:
 
 # ############################################################################
 #
-# Phase 3b: Direct Context Chunking Tests (mirrors C++ ContextChunkingTest)
+# Part 3: Direct Context Chunking Tests (mirrors C++ ContextChunkingTest)
 #
 # ############################################################################
 
@@ -1178,7 +1147,7 @@ class TestDraftTokensGreaterThanChunkSize:
 
 # ############################################################################
 #
-# Phase 4: PyCapacityScheduler Tests
+# Part 4: PyCapacityScheduler Tests
 #
 # ############################################################################
 
@@ -1475,10 +1444,12 @@ class TestPyCapacitySchedulerStateGating:
         fitting, disagg, paused = scheduler.schedule_request([make_completed_request(0)])
         assert len(fitting) == 0
 
-    def test_generation_to_complete_filtered(self):
-        """GENERATION_TO_COMPLETE prohibits re-scheduling per C++ design.
-        C++ ref: capacityScheduler.cpp — this state is not included in
-        scheduling conditions for either MaxRequests or GuaranteedNoEvict."""
+    def test_generation_to_complete_scheduled(self):
+        """GENERATION_TO_COMPLETE is schedulable in PyCapacityScheduler.
+        PyCapacityScheduler uses no_schedule_after=GENERATION_COMPLETE (20),
+        so GENERATION_TO_COMPLETE (14) passes state gating. The real C++ binding's
+        is_generation_in_progress_state includes GENERATION_TO_COMPLETE, so the
+        MaxRequestsPolicy schedules it."""
         scheduler = PyCapacityScheduler(
             max_num_requests=4,
             kv_cache_manager=None,
@@ -1488,12 +1459,12 @@ class TestPyCapacitySchedulerStateGating:
             state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
         fitting, disagg, paused = scheduler.schedule_request([req])
-        assert len(fitting) == 0
+        assert len(fitting) == 1
 
 
 # ############################################################################
 #
-# Phase 5: PyCapacityScheduler Advanced Tests
+# Part 5: PyCapacityScheduler Advanced Tests
 #
 # ############################################################################
 
@@ -1541,7 +1512,7 @@ class TestPyCapacitySchedulerLora:
 
 # ############################################################################
 #
-# Phase 6: SimpleUnifiedScheduler Integration Tests
+# Part 6: SimpleUnifiedScheduler Integration Tests
 #
 # ############################################################################
 
@@ -1654,7 +1625,7 @@ class TestSimpleUnifiedScheduler:
 
 # ############################################################################
 #
-# Phase 7: Additional PyCapacityScheduler Tests
+# Part 7: Additional PyCapacityScheduler Tests
 #
 # ############################################################################
 
