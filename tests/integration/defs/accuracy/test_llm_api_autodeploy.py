@@ -26,7 +26,8 @@ from tensorrt_llm.quantization import QuantAlgo
 from tensorrt_llm.sampling_params import SamplingParams
 
 from ..conftest import get_device_count, llm_models_root
-from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
+from .accuracy_core import (GSM8K, MMLU, MMMU, CnnDailymail,
+                            LlmapiAccuracyTestHarness)
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
@@ -688,6 +689,7 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
 
     def get_default_kwargs(self):
         return {
+            "model_factory": "Qwen3_5MoeForConditionalGeneration",
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
             "enable_chunked_prefill": True,
@@ -708,6 +710,19 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
                 "export_to_gm": {
                     "num_moe_experts_for_export": 2,
                 },
+                "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    "sharding_source": ['manual'],
+                    "manual_config": {
+                        "tp_plan": {
+                            "in_proj_qkv": "delta",
+                            "q_proj": "colwise",
+                            "k_proj": "colwise",
+                            "v_proj": "colwise",
+                            "o_proj": "rowwise",
+                        },
+                    },
+                },
             },
         }
 
@@ -719,8 +734,8 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
                               n=beam_width,
                               use_beam_search=beam_width > 1)
 
-    @pytest.mark.skip_less_device_memory(80000)
-    @pytest.mark.parametrize("world_size", [8])
+    @pytest.mark.skip_less_device_memory(30000)
+    @pytest.mark.parametrize("world_size", [2])
     def test_bf16(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
@@ -826,3 +841,86 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, sampling_params=sampling_params)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+class TestQwen3_5_35B_MoE(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Qwen3.5-35B-A3B via AutoDeploy.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    Configuration derived from examples/auto_deploy/model_registry/configs/qwen3.5_moe_35b.yaml.
+    """
+
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN,
+                      MMMU.MAX_INPUT_LEN + MMMU.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self):
+        return {
+            "model_factory": "Qwen3_5MoeForConditionalGeneration",
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 16,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16],
+            "kv_cache_config": {
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.5,
+                "tokens_per_block": 64,
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+                "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    "sharding_source": ['manual'],
+                    "manual_config": {
+                        "tp_plan": {
+                            "in_proj_qkv": "delta",
+                            "q_proj": "colwise",
+                            "k_proj": "colwise",
+                            "v_proj": "colwise",
+                            "o_proj": "rowwise",
+                        },
+                    },
+                },
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(60000)
+    @pytest.mark.parametrize("world_size", [2])
+    def test_bf16(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = MMMU(self.MODEL_NAME)
+            task.EVALUATE_KWARGS = {
+                "model_type": "qwen3_vl",
+                "is_force_single_image": False
+            }
+            task.evaluate(llm)
