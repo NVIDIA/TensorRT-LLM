@@ -1769,7 +1769,11 @@ class AllReduceRunner(TunableRunner):
                                                 do_preparation=True)
             return input
         if tactic == -1:
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape,
+            # so we fall back to plain NCCL instead of NCCL_SYMMETRIC.
+            # NCCL_SYMMETRIC requires ncclMemAlloc which can fail asymmetrically
+            # across ranks under OOM, causing a deadlock at ncclCommWindowRegister.
+            tactic = AllReduceStrategy.NCCL.value
 
         return torch.ops.trtllm.allreduce(
             input,
