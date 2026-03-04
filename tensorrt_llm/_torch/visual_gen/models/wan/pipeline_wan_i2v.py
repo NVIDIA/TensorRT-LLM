@@ -100,7 +100,7 @@ class WanImageToVideoPipeline(BasePipeline):
     def common_warmup_shapes(self) -> list:
         """Return list of common warmup shapes for the pipeline."""
         return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
-    
+
     @property
     def vae_adapter_class(self) -> Type[WanParallelVAEAdapter]:
         return WanParallelVAEAdapter

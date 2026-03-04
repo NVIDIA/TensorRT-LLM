@@ -16,8 +16,8 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
-from .vae import WanParallelVAEAdapter
 from .transformer_wan import WanTransformer3DModel
+from .vae import WanParallelVAEAdapter
 
 # Supported Wan T2V models:
 # - Wan2.1-T2V-14B: Single-stage text-to-video (14B parameters)
@@ -111,7 +111,7 @@ class WanPipeline(BasePipeline):
     def common_warmup_shapes(self) -> list:
         """Return list of common warmup shapes for the pipeline."""
         return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
-    
+
     @property
     def vae_adapter_class(self) -> Type[WanParallelVAEAdapter]:
         return WanParallelVAEAdapter

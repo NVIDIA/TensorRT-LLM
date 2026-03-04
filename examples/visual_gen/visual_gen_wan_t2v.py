@@ -127,9 +127,7 @@ def parse_args():
         "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
         "2 CFG groups × 2 Ulysses ranks = 4 GPUs total.",
     )
-    parser.add_argument(
-        "--disable_parallel_vae", action="store_true", help="Disable parallel VAE"
-    )
+    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
     # CUDA graph
     parser.add_argument(
