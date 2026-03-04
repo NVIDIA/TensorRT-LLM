@@ -2041,35 +2041,26 @@ class KVCacheManagerV2(BaseResourceManager):
         return None
 
     def _try_evict_request_for_capacity(
-            self, current_req: LlmRequest,
-            new_generation_batch: List[LlmRequest],
-            new_context_batch: Optional[List[LlmRequest]],
-            context_requests: List[LlmRequest],
+            self, current_req: LlmRequest, context_requests: List[LlmRequest],
             generation_requests: List[LlmRequest],
             evicted_requests: List[LlmRequest]) -> Optional[LlmRequest]:
         """
         Try to evict requests to make room for capacity allocation.
 
         Based on LIFO (Last In First Out) eviction strategy:
-        - Try to evict from new_generation_batch first (most recent)
-        - If no candidate found, try from all scheduled requests (updated lists)
+        - Try to evict from all active generation requests first (LIFO order)
+        - If no candidate found, try from context requests
 
         Returns:
             Evicted request or None
         """
-        # Try to evict from new_generation_batch first (LIFO)
+        # Try to evict from all active generation requests (LIFO - reverse order)
         evicted_request = self._try_evict_from_list(
-            reversed(new_generation_batch), current_req, evicted_requests)
+            reversed(generation_requests), current_req, evicted_requests)
 
         if evicted_request is None:
-            # If no candidate in generation batch, try all scheduled requests
-            # Use updated lists (new_context_batch) if available, otherwise use original lists
-            if new_context_batch is not None:
-                all_scheduled_requests = new_context_batch + new_generation_batch
-            else:
-                all_scheduled_requests = context_requests + generation_requests
-
-            evicted_request = self._try_evict_from_list(all_scheduled_requests,
+            # If no candidate in generation requests, try context requests
+            evicted_request = self._try_evict_from_list(context_requests,
                                                         current_req,
                                                         evicted_requests)
 
@@ -2135,8 +2126,8 @@ class KVCacheManagerV2(BaseResourceManager):
                         break
                     else:
                         evicted = self._try_evict_request_for_capacity(
-                            req, new_generation_batch, None, context_requests,
-                            generation_requests, evicted_requests)
+                            req, context_requests, generation_requests,
+                            evicted_requests)
                         if evicted is None:
                             # No more requests to evict
                             break
@@ -2146,6 +2137,9 @@ class KVCacheManagerV2(BaseResourceManager):
 
                 if not capacity_increased:
                     # Could not increase capacity even after evicting all possible requests
+                    # Suspend the KV cache and report this request as evicted
+                    kv_cache.suspend()
+                    evicted_requests.append(req)
                     continue
 
             # Allocate KV Cache for context requests
