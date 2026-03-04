@@ -740,6 +740,11 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
                                    expert_first_token_offset_tensor,
                                    token_to_expert_map)
 
+        topk = self.routing_method.top_k
+        if token_selected_experts is not None:
+            # For the deepgemmlowlatency, the topk has been viewed into 1
+            topk = token_selected_experts.shape[-1]
+
         final_hidden_states = torch.ops.trtllm.moe_finalize_scale_op(
             permuted_data_tensor,
             None,  # biases
@@ -752,7 +757,7 @@ class DeepGemmFusedMoE(CutlassFusedMoE):
             x.shape[0],  # num_rows
             x.shape[1],  # (possibly padded) hidden_size
             self.unpadded_hidden_size,  # original hidden size
-            self.routing_method.top_k,
+            topk,
             self.expert_size_per_partition,  # num_experts_per_node
             self.tp_size,
             self.tp_rank,

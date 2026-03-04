@@ -325,6 +325,11 @@ class ModelLoader:
             prequantized (bool): Whether the checkpoint is pre-quantized.
         """
         quant_config = self.llm_args.quant_config
+        kv_cache_dtype = self.llm_args.kv_cache_config.dtype
+        explicit_kv_cache_quant_algo = {
+            "fp8": QuantAlgo.FP8,
+            "nvfp4": QuantAlgo.NVFP4,
+        }.get(kv_cache_dtype)
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -359,7 +364,13 @@ class ModelLoader:
                 "kv_cache_quant_algo", None)
             if hf_kv_cache_quant_algo is not None:
                 hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if quant_config.kv_cache_quant_algo is None:
+                if explicit_kv_cache_quant_algo is not None:
+                    if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                        logger.warning(
+                            f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                        )
+                    quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+                elif quant_config.kv_cache_quant_algo is None:
                     logger.info(
                         f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
                     )

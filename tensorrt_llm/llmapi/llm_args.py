@@ -28,7 +28,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank
 
 # yapf: disable
 # isort: off
@@ -772,6 +772,11 @@ class DecodingBaseConfig(StrictBaseModel):
     def is_linear_tree(self) -> bool:
         return self.max_draft_len == self.max_total_draft_tokens
 
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """Total tokens per gen request in one spec dec iteration (including golden token)."""
+        return 1 + self.max_total_draft_tokens
+
 
 class KvCacheConnectorConfig(StrictBaseModel):
     """
@@ -1146,6 +1151,34 @@ class NGramDecodingConfig(DecodingBaseConfig):
         return backend == "pytorch"
 
 
+class SADecodingConfig(DecodingBaseConfig):
+    """
+    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).
+
+    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside
+    the target model forward; supports CUDA graph and overlap scheduler.
+    """
+    decoding_type: Literal["SA"] = "SA"
+    max_matching_ngram_size: int = Field(
+        default=-1,
+        description="Positive value (e.g., 3): fixed-size ngram matching. "
+        "-1: longest possible match via suffix automaton. 0 is invalid.")
+
+    @model_validator(mode='after')
+    def validate_sa_config(self):
+        if self.max_matching_ngram_size == 0:
+            raise ValueError(
+                "max_matching_ngram_size must be > 0 (fixed ngram) or -1 (longest match). "
+                "Got 0.")
+        if self.max_draft_len is None or self.max_draft_len <= 0:
+            raise ValueError("max_draft_len must be > 0 for SA")
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
 
@@ -1195,6 +1228,17 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description=
         "When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model."
     )
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: int = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -1250,6 +1294,49 @@ class MTPDecodingConfig(DecodingBaseConfig):
         elif self.num_nextn_predict_layers_from_model_config == 1 and not self.use_mtp_vanilla and not self.mtp_eagle_one_model:
             return TorchSpeculativeDecodingMode.MTP_EAGLE
         return TorchSpeculativeDecodingMode.MTP
+
+
+class PARDDecodingConfig(DecodingBaseConfig):
+    """Configuration for PARD (Parallel Draft) speculative decoding.
+
+    PARD is a target-independent speculative decoding method that uses
+    mask tokens to predict multiple draft tokens in parallel within a
+    single forward pass.
+
+    Key features:
+    - Target-independent: doesn't use target model hidden states
+    - Parallel prediction: all K draft tokens in one forward pass
+    - Shared mask token: uses the same mask_token_id across all positions
+
+    Reference: https://arxiv.org/pdf/2504.18583
+    """
+    mask_token_id: Optional[int] = Field(
+        default=None,
+        description=
+        "The token ID used as a mask token for parallel draft prediction. "
+        "If None, it will be read from the draft model config (typically vocab_size)."
+    )
+
+    decoding_type: Literal["PARD"] = "PARD"
+
+    @model_validator(mode="after")
+    def set_max_total_draft_tokens(self):
+        self.max_total_draft_tokens = self.max_draft_len
+        return self
+
+    @property
+    def tokens_per_gen_step(self) -> int:
+        """PARD needs 2K tokens per gen request: K+1 accepted + K-1 masks."""
+        return 2 * self.max_draft_len
+
+    def supports_backend(self, backend: str) -> bool:
+        return backend == "pytorch"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        return TorchSpeculativeDecodingMode.PARD
 
 
 class AutoDecodingConfig(DecodingBaseConfig):
@@ -1705,8 +1792,10 @@ SpeculativeConfig: TypeAlias = Annotated[
         MedusaDecodingConfig,
         MTPDecodingConfig,
         NGramDecodingConfig,
+        SADecodingConfig,
         UserProvidedDecodingConfig,
         SaveHiddenStatesDecodingConfig,
+        PARDDecodingConfig,
         AutoDecodingConfig,
     ],
     Field(discriminator="decoding_type"),
@@ -1798,8 +1887,11 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
-    dtype: str = Field(default="auto",
-                       description="The data type to use for the KV cache.")
+    dtype: str = Field(
+        default="auto",
+        description=
+        "The data type to use for the KV cache. Use 'auto' to follow checkpoint metadata, otherwise force the specified dtype."
+    )
 
     # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
     mamba_ssm_cache_dtype: Literal[
@@ -1844,6 +1936,65 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             attention_dp_events_gather_period_ms=self.
             attention_dp_events_gather_period_ms,
             max_gpu_total_bytes=self.max_gpu_total_bytes)
+
+    @field_validator('free_gpu_memory_fraction')
+    @classmethod
+    def validate_free_gpu_memory_fraction(cls, v: float):
+        """Validates that the fraction is between 0.0 and 1.0."""
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1"
+            )
+        return v
+
+    @field_validator('dtype')
+    @classmethod
+    def validate_dtype(cls, v: str):
+        v = v.lower()
+        if v in ("auto", "fp8",
+                 "nvfp4") or v in _str_to_torch_dtype_dict.keys():
+            return v
+
+        raise ValueError(
+            'kv_cache_config.dtype must be one of "auto", "fp8", "nvfp4", or valid torch.dtype string'
+        )
+
+    @field_validator('max_gpu_total_bytes')
+    @classmethod
+    def validate_max_gpu_total_bytes(cls, v: int):
+        if v < 0:
+            raise ValueError(
+                "kv_cache_config.max_gpu_total_bytes must be non-negative")
+        return v
+
+    @field_validator('max_attention_window')
+    @classmethod
+    def validate_max_attention_window(cls, v: Optional[List[int]]):
+        if v is None:
+            return v
+
+        if not isinstance(v, list) or len(v) == 0:
+            raise ValueError(
+                "kv_cache_config.max_attention_window must be a non-empty list of positive integers"
+            )
+        for i in v:
+            if not isinstance(i, int):
+                raise ValueError(
+                    "kv_cache_config.max_attention_window must contain only integers"
+                )
+            if i <= 0:
+                raise ValueError(
+                    "kv_cache_config.max_attention_window values must be positive"
+                )
+        return v
+
+    @field_validator('max_util_for_resume')
+    @classmethod
+    def validate_max_util_for_resume(cls, v: float):
+        if not 0 <= v <= 1:
+            raise ValueError(
+                "kv_cache_config.max_util_for_resume must be between 0 and 1")
+        return v
 
 
 @PybindMirror.mirror_pybind_fields(_ExtendedRuntimePerfKnobConfig)
@@ -2569,6 +2720,10 @@ class TrtLlmArgs(BaseLlmArgs):
                 self.decoding_config = DecodingConfig(
                     decoding_mode=DecodingMode.Eagle(),
                     eagle_config=eagle_config)
+            elif isinstance(self.speculative_config, PARDDecodingConfig):
+                raise ValueError(
+                    "speculative_config.decoding_type 'PARD' is only supported on the PyTorch backend."
+                )
             else:
                 raise ValueError(
                     f"Unrecognized speculative config type {type(self.speculative_config)}"
@@ -2991,6 +3146,12 @@ class TorchLlmArgs(BaseLlmArgs):
         exclude=True,
         status="prototype")
 
+    ray_worker_nsight_options: Optional[dict[str, str]] = Field(
+        default=None,
+        description="Nsight options.",
+        status="prototype",
+    )
+
     enable_sleep: bool = Field(
         default=False,
         description=
@@ -3099,6 +3260,9 @@ class TorchLlmArgs(BaseLlmArgs):
                     exclude={"decoding_type"})
                 self.speculative_config = Eagle3DecodingConfig(**eagle_data)
 
+            if isinstance(self.speculative_config, PARDDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0, "PARD max_draft_len must be > 0"
+
             if isinstance(self.speculative_config,
                           SaveHiddenStatesDecodingConfig):
                 logger.warning(
@@ -3166,6 +3330,8 @@ class TorchLlmArgs(BaseLlmArgs):
             return self
         elif self.kv_cache_config.dtype == 'fp8':
             self.quant_config.kv_cache_quant_algo = QuantAlgo.FP8
+        elif self.kv_cache_config.dtype == 'nvfp4':
+            self.quant_config.kv_cache_quant_algo = QuantAlgo.NVFP4
         else:
             logger.warning(
                 f"Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of {self.kv_cache_config.dtype}, "

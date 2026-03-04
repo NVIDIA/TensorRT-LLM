@@ -155,15 +155,16 @@ def generateLockFiles(llmRepo, branchName)
     }
 }
 
-def sonar_scan()
+def sonarScan()
 {
     container("cpu") {
         def sonarScannerCliVer = "8.0.0.6341"
         sh "wget https://repo1.maven.org/maven2/org/sonarsource/scanner/cli/sonar-scanner-cli/${sonarScannerCliVer}/sonar-scanner-cli-${sonarScannerCliVer}.zip"
         sh "unzip sonar-scanner-cli-${sonarScannerCliVer}.zip"
-        sh "mv sonar-scanner-${sonarScannerCliVer} ./sonar-scanner"
+        sh "mv sonar-scanner-${sonarScannerCliVer} ../sonar-scanner"
+        sh "rm sonar-scanner-cli-${sonarScannerCliVer}.zip"
         withSonarQubeEnv() {
-          sh "./sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
+          sh "../sonar-scanner/bin/sonar-scanner -Dsonar.projectKey=GPUSW_TensorRT-LLM-Team_TensorRT-LLM_tensorrt-llm -Dsonar.sources=. -Dsonar.branch.name=${params.branchName}"
         }
     }
 }
@@ -187,20 +188,19 @@ def pulseScan(llmRepo, branchName) {
             docker.withRegistry("https://${DEFAULT_GIT_URL}:5005") {
                 docker.image("pstooling/pulse-group/pulse-open-source-scanner/pulse-oss-cli:stable")
                   .inside("--user 0 --privileged -v /var/run/docker.sock:/var/run/docker.sock") {
+                    def versionMatcher = branchName =~ /^release\/(\d+\.\d+)$/
+                    def version = versionMatcher ? "${versionMatcher[0][1]}.0" : branchName
                     withEnv([
                         "PULSE_NSPECT_ID=NSPECT-95LK-6FZF",
                         "PULSE_BEARER_TOKEN=${token}",
                         "PULSE_REPO_URL=${llmRepo}",
                         "PULSE_REPO_BRANCH=${(params.repoUrlKey == "github_fork") ? "" : branchName}",
                         "PULSE_SCAN_PROJECT=TRT-LLM",
-                        "PULSE_SCAN_PROJECT_VERSION=${branchName.replace("release/", "")}",
-                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json"
+                        "PULSE_SCAN_PROJECT_VERSION=${version}",
+                        "PULSE_SCAN_VULNERABILITY_REPORT=nspect_scan_report.json",
+                        "PULSE_SCAN_OVERRIDE=false"
                     ]) {
-                        if (params.repoUrlKey == "github_fork") {
-                            sh 'pulse scan --no-fail --sbom .'
-                        } else {
-                            sh 'pulse scan --no-fail --sbom --override .'
-                        }
+                        sh 'pulse scan --no-fail --sbom .'
                     }
                   }
             }
@@ -208,21 +208,8 @@ def pulseScan(llmRepo, branchName) {
     }
     container("cpu") {
         sh "cat nspect_scan_report.json"
-        sh "cat sbom.cdx.json"
-        sh """
-            SBOM_ZIP="./sbom.zip"
-            if [ -f "\$SBOM_ZIP" ]; then
-                EXTRACTED_FOLDER=\$(unzip -Z1 "\$SBOM_ZIP" | head -1 | cut -d/ -f1)
-                JSON_FILE=\$(find "\$EXTRACTED_FOLDER" -type f -name "*.json" | head -n 1)
-                if [ -n "\$JSON_FILE" ]; then
-                    cat "\$JSON_FILE"
-                else
-                    echo "No JSON file found in SBOM archive"
-                fi
-            else
-                echo "SBOM zip does not exist"
-            fi
-        """
+        sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
+        sh "cat sbom_toupload.json"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
@@ -296,7 +283,7 @@ pipeline {
                     steps
                     {
                         script {
-                            sonar_scan()
+                            sonarScan()
                         }
                     }
                 }
