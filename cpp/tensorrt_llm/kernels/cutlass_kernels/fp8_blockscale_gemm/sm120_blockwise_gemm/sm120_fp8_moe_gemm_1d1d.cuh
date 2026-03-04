@@ -68,125 +68,117 @@ __global__ void scale_1x128_kernel_sm120(OutputType* __restrict__ fp8_output, in
     int const warp_id = threadIdx.x >> 5;
     int const lane_id = threadIdx.x & 31;
 
-    // Work assignment: each warp handles one token (global token index)
     const int64_t k_block_idx = blockIdx.x;
-    const int64_t token_idx = static_cast<int64_t>(blockIdx.y) * WarpsPerBlock + warp_id;
+    const int64_t grid_stride = static_cast<int64_t>(gridDim.y) * WarpsPerBlock;
 
-    // Boundary check for token (entire warp exits together)
-    if (token_idx >= token_num)
-        return;
-
-    // Binary search to find expert_idx: token_offset[expert_idx] <= token_idx < token_offset[expert_idx + 1]
-    int64_t expert_idx = 0;
+    for (int64_t token_idx = static_cast<int64_t>(blockIdx.y) * WarpsPerBlock + warp_id; token_idx < token_num;
+         token_idx += grid_stride)
     {
-        int left = 0;
-        int right = num_experts - 1;
-        while (left < right)
+
+        // Binary search to find expert_idx: token_offset[expert_idx] <= token_idx < token_offset[expert_idx + 1]
+        int64_t expert_idx = 0;
         {
-            int mid = (left + right + 1) >> 1;
-            if (smem_token_offset[mid] <= token_idx)
+            int left = 0;
+            int right = num_experts - 1;
+            while (left < right)
             {
-                left = mid;
+                int mid = (left + right + 1) >> 1;
+                if (smem_token_offset[mid] <= token_idx)
+                {
+                    left = mid;
+                }
+                else
+                {
+                    right = mid - 1;
+                }
             }
-            else
-            {
-                right = mid - 1;
-            }
+            expert_idx = left;
         }
-        expert_idx = left;
-    }
 
-    // Local token index within this expert
-    const int64_t local_token_idx = token_idx - smem_token_offset[expert_idx];
+        // Local token index within this expert
+        const int64_t local_token_idx = token_idx - smem_token_offset[expert_idx];
 
-    // Check if this thread's data is within k bounds
-    int const k_offset = (k_block_idx * 512 + lane_id * 16);
+        // Check if this thread's data is within k bounds
+        int const k_offset = (k_block_idx * 512 + lane_id * 16);
 
-    // 1. Load 16 BF16 elements per thread (512 per warp)
-    auto const cur_input_ptr = reinterpret_cast<double4 const*>(input + token_idx * size_k + k_offset);
+        // 1. Load 16 BF16 elements per thread (512 per warp)
+        auto const cur_input_ptr = reinterpret_cast<double4 const*>(input + token_idx * size_k + k_offset);
 
-    constexpr int kLoadNumElems = sizeof(double4) / sizeof(InputType); // 16 for BF16
+        constexpr int kLoadNumElems = sizeof(double4) / sizeof(InputType); // 16 for BF16
 
-    union LoadTrick
-    {
-        double4 pack;
-        InputType v[kLoadNumElems];
-    };
+        union LoadTrick
+        {
+            double4 pack;
+            InputType v[kLoadNumElems];
+        };
 
-    LoadTrick load_trick;
+        LoadTrick load_trick;
 
-    // Conditional load: zero-fill if out of bounds
-    load_trick.pack = k_offset < size_k ? cur_input_ptr[0] : double4{};
+        // Conditional load: zero-fill if out of bounds
+        load_trick.pack = k_offset < size_k ? cur_input_ptr[0] : double4{};
 
-    // 2.1 Find max abs element in 16 elements per thread
-    InputType max_elem = InputType(0.0f);
+        // 2.1 Find max abs element in 16 elements per thread
+        InputType max_elem = InputType(0.0f);
 #pragma unroll
-    for (int i = 0; i < kLoadNumElems; i++)
-    {
-        max_elem = __hmax(max_elem, __habs(load_trick.v[i]));
-    }
+        for (int i = 0; i < kLoadNumElems; i++)
+        {
+            max_elem = __hmax(max_elem, __habs(load_trick.v[i]));
+        }
 
-    // 2.2 Find max in 8-lane group (128 elements = 1 quantization block)
-    float amax = float(max_elem);
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 4, 8));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 2, 8));
-    amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 1, 8));
-    // Ensure amax >= eps for numerical stability
-    amax = fmaxf(amax, 1e-10f);
+        // 2.2 Find max in 8-lane group (128 elements = 1 quantization block)
+        float amax = float(max_elem);
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 4, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 2, 8));
+        amax = fmaxf(amax, __shfl_xor_sync(0xFFFFFFFF, amax, 1, 8));
+        amax = fmaxf(amax, 1e-10f);
 
-    // 3. Compute UE8M0 scale and quant_scale (optimized with rcp.approx and exp2f_rcp)
-    // dequant_scale = amax / 448 = amax * rcp(448)
-    float dequant_scale_raw = amax * reciprocal_approximate_ftz(448.0f);
-    __nv_fp8_e8m0 ue8m0_scale;
-    ue8m0_scale.__x = __nv_cvt_float_to_e8m0(dequant_scale_raw, __NV_SATFINITE, cudaRoundPosInf);
-    // quant_scale = 2^(127 - ue8m0_exp)
-    float quant_scale = exp2f_rcp(ue8m0_scale.__x);
+        // 3. Compute UE8M0 scale and quant_scale
+        float dequant_scale_raw = amax * reciprocal_approximate_ftz(448.0f);
+        __nv_fp8_e8m0 ue8m0_scale;
+        ue8m0_scale.__x = __nv_cvt_float_to_e8m0(dequant_scale_raw, __NV_SATFINITE, cudaRoundPosInf);
+        float quant_scale = exp2f_rcp(ue8m0_scale.__x);
 
-    // 4.1 Quantize and store FP8 output
-    constexpr int kStoreNumElems = sizeof(float4) / sizeof(OutputType); // 16 for FP8
+        // 4.1 Quantize and store FP8 output
+        constexpr int kStoreNumElems = sizeof(float4) / sizeof(OutputType); // 16 for FP8
 
-    union StoreTrick
-    {
-        float4 pack;
-        OutputType v[kStoreNumElems];
-    };
+        union StoreTrick
+        {
+            float4 pack;
+            OutputType v[kStoreNumElems];
+        };
 
-    StoreTrick store_trick;
-    store_trick.pack = float4{};
+        StoreTrick store_trick;
+        store_trick.pack = float4{};
 
 #pragma unroll
-    for (int i = 0; i < kStoreNumElems; i++)
-    {
-        store_trick.v[i] = OutputType(float(load_trick.v[i]) * quant_scale);
-    }
+        for (int i = 0; i < kStoreNumElems; i++)
+        {
+            store_trick.v[i] = OutputType(float(load_trick.v[i]) * quant_scale);
+        }
 
-    auto cur_output_ptr = reinterpret_cast<float4*>(fp8_output + token_idx * size_k + k_offset);
+        auto cur_output_ptr = reinterpret_cast<float4*>(fp8_output + token_idx * size_k + k_offset);
 
-    // Only store if within k bounds
-    if (k_offset < size_k)
-    {
-        cur_output_ptr[0] = store_trick.pack;
-    }
+        if (k_offset < size_k)
+        {
+            cur_output_ptr[0] = store_trick.pack;
+        }
 
-    // 4.2 Pack scales from lane 0, 8, 16, 24 and store
-    // Use warp-level shuffle (within each warp independently)
-    uint32_t s0 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 0);
-    uint32_t s1 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 8);
-    uint32_t s2 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 16);
-    uint32_t s3 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 24);
+        // 4.2 Pack scales from lane 0, 8, 16, 24 and store
+        uint32_t s0 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 0);
+        uint32_t s1 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 8);
+        uint32_t s2 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 16);
+        uint32_t s3 = __shfl_sync(0xFFFFFFFF, (uint32_t) ue8m0_scale.__x, 24);
 
-    // scale_output shape: [batch, num_k_blocks, m_padded]
+        if (lane_id == 0)
+        {
+            uint32_t packed_scale = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
 
-    if (lane_id == 0)
-    {
-        uint32_t packed_scale = s0 | (s1 << 8) | (s2 << 16) | (s3 << 24);
+            const int64_t scale_padded_offset
+                = compute_padded_offset(static_cast<int64_t>(smem_token_offset[expert_idx]), expert_idx);
 
-        // Compute padded offset for this expert's scale storage
-        const int64_t scale_padded_offset
-            = compute_padded_offset(static_cast<int64_t>(smem_token_offset[expert_idx]), expert_idx);
-
-        auto cur_scale_ptr = scale_output + k_block_idx * scale_leading_dim + scale_padded_offset;
-        *reinterpret_cast<uint32_t*>(&cur_scale_ptr[local_token_idx]) = packed_scale;
+            auto cur_scale_ptr = scale_output + k_block_idx * scale_leading_dim + scale_padded_offset;
+            *reinterpret_cast<uint32_t*>(&cur_scale_ptr[local_token_idx]) = packed_scale;
+        }
     }
 }
 

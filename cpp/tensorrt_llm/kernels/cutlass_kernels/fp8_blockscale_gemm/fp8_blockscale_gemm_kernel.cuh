@@ -960,9 +960,14 @@ void fp8_grouped_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, 
         {
             constexpr int WarpsPerBlock = 4;
             int num_k_blocks = div_up(shape_k, 512);
-            int num_token_blocks = div_up(max_shape_m, static_cast<int64_t>(WarpsPerBlock));
+            int64_t num_token_blocks = div_up(max_shape_m, static_cast<int64_t>(WarpsPerBlock));
             int64_t scale_leading_dim = sm120_blockscaled_gemm::compute_padded_offset(max_shape_m, num_problems);
-            dim3 grid(num_k_blocks, num_token_blocks);
+
+            constexpr int kBlocksPerSM = 8;
+            int64_t max_blocks = static_cast<int64_t>(kNumDeviceSMs) * kBlocksPerSM;
+            int num_blocks_y = static_cast<int>(std::min(num_token_blocks, max_blocks));
+
+            dim3 grid(num_k_blocks, num_blocks_y);
             dim3 block(WarpsPerBlock * 32);
             int smem_size = (num_problems + 1) * sizeof(int64_t);
             auto scale_kernel
