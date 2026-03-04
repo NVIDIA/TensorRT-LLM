@@ -1,3 +1,5 @@
+from unittest.mock import MagicMock
+
 import pytest
 
 from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer, AuxBufferMeta
@@ -80,3 +82,30 @@ def test_aux_buffer_meta_property():
     # Verify sizes are positive
     assert all(s > 0 for s in meta.size)
     assert all(s > 0 for s in meta.item_sizes)
+
+
+def test_fill_slot_get_slot_tokens_round_trip():
+    """fill_slot then get_slot_tokens returns the same token data."""
+    buf = AuxBuffer(max_slot_num=4, beam_width=2, max_draft_len=4, device="cpu")
+    slot = buf.alloc_slot()
+
+    mock_request = MagicMock()
+    mock_request.get_last_tokens.return_value = [42, 7]
+    mock_request.py_draft_tokens = [10, 20, 30]
+
+    buf.fill_slot(slot, mock_request)
+    first_tokens, draft_tokens = buf.get_slot_tokens(slot)
+
+    assert first_tokens == [42, 7]
+    assert draft_tokens == [10, 20, 30]
+
+
+def test_fill_slot_unallocated_raises():
+    """fill_slot on an unallocated slot raises ValueError."""
+    buf = AuxBuffer(max_slot_num=4, beam_width=2, max_draft_len=4, device="cpu")
+    mock_request = MagicMock()
+    mock_request.get_last_tokens.return_value = [1]
+    mock_request.py_draft_tokens = []
+
+    with pytest.raises(ValueError, match="not currently allocated"):
+        buf.fill_slot(0, mock_request)

@@ -54,6 +54,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self.device_id} in PyNativeCacheTransceiver")
 
+        # does most the work
         self.transfer_worker = TransferWorker(
             kv_cache_manager=kv_cache_manager,
             mapping=mapping,
@@ -102,14 +103,22 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
         return KVSlice(is_last_slice=True, block_ids=block_ids)
 
+    # starts background transfer to send this request's KV cache to the gen server, attaches ContextPhaseParams metadata
     def respond_and_send_async(self, req: LlmRequest):
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
+
+        # create tx session and add to dict for status checks
         send_session = self.transfer_worker.create_tx_session(req)
         self.send_sessions[req.request_id] = send_session
+
+        # stores block ids, not raw data
         kv_slice = self._create_kv_slice(req)
+
+        # sending actual kv data
         send_task_id = send_session.send(kv_slice)
         self.send_task_ids[req.request_id] = send_task_id
 
+        # contains metadata about itself so the gen server can see
         req.context_phase_params = ContextPhaseParams(
             first_gen_tokens=[],
             req_id=req.request_id,
@@ -125,10 +134,14 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
     def request_and_receive_sync(self, req: LlmRequest):
         raise NotImplementedError("request_and_receive_sync is not implemented")
 
+    # starts background listener to receive KV cache from the ctx server into this request's pre-allocated blocks.
     def request_and_receive_async(self, req: LlmRequest):
         req.state = LlmRequestState.DISAGG_GENERATION_TRANS_IN_PROGRESS
+
+        # create rx session for receiving blocks
         recv_session = self.transfer_worker.create_rx_session(req)
         self.recv_sessions[req.request_id] = recv_session
+
         kv_slice = self._create_kv_slice(req)
         recv_task_id = recv_session.receive(kv_slice)
         self.recv_task_ids[req.request_id] = recv_task_id

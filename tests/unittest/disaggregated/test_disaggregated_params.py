@@ -1,5 +1,7 @@
 from unittest.mock import MagicMock, patch
 
+import pytest
+
 from tensorrt_llm.disaggregated_params import DisaggregatedParams
 
 
@@ -77,3 +79,57 @@ def test_to_llm_disaggregated_params():
     assert llm_params.request_type == "generation_only"
     assert llm_params.ctx_dp_rank == 2
     assert llm_params.ctx_info_endpoint == "tcp://10.0.0.1:5000"
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_context_phase_params_disagg_wins(mock_tllme):
+    """disagg_request_id takes priority over ctx_request_id."""
+    mock_tllme.ContextPhaseParams.return_value = MagicMock()
+
+    params = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[1],
+        ctx_request_id=200,
+        disagg_request_id=100,
+    )
+    params.get_context_phase_params()
+
+    # The second arg to ContextPhaseParams should be 100 (disagg), not 200 (ctx)
+    call_args = mock_tllme.ContextPhaseParams.call_args
+    assert call_args[0][1] == 100
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_context_phase_params_falls_back_to_ctx(mock_tllme):
+    """When disagg_request_id is None, ctx_request_id is used."""
+    mock_tllme.ContextPhaseParams.return_value = MagicMock()
+
+    params = DisaggregatedParams(
+        request_type="context_only",
+        first_gen_tokens=[1],
+        ctx_request_id=200,
+    )
+    params.get_context_phase_params()
+
+    call_args = mock_tllme.ContextPhaseParams.call_args
+    assert call_args[0][1] == 200
+
+
+@patch("tensorrt_llm.disaggregated_params.tllme")
+def test_get_request_type_valid(mock_tllme):
+    """get_request_type returns the correct enum for all 3 valid strings."""
+    mock_tllme.RequestType.REQUEST_TYPE_CONTEXT_ONLY = "CTX"
+    mock_tllme.RequestType.REQUEST_TYPE_GENERATION_ONLY = "GEN"
+    mock_tllme.RequestType.REQUEST_TYPE_CONTEXT_AND_GENERATION = "CTX_GEN"
+
+    assert DisaggregatedParams(request_type="context_only").get_request_type() == "CTX"
+    assert DisaggregatedParams(request_type="generation_only").get_request_type() == "GEN"
+    assert (
+        DisaggregatedParams(request_type="context_and_generation").get_request_type() == "CTX_GEN"
+    )
+
+
+def test_get_request_type_invalid():
+    """Invalid request_type raises ValueError at construction time."""
+    with pytest.raises(ValueError, match="Unknown request type"):
+        DisaggregatedParams(request_type="invalid_type")
