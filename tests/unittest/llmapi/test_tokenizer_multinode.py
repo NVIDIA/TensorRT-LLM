@@ -41,6 +41,11 @@ def test_trust_remote_code_tokenizer_pickle_roundtrip_multinode():
 
     # Rank-0: both modules present — standard pickle would succeed here but
     # serialize the class by reference (module path only, no class definition).
+    # Save prior values so the finally block can restore them instead of
+    # unconditionally deleting, avoiding cross-test sys.modules contamination.
+    _SENTINEL = object()
+    prev_tm = sys.modules.get("transformers_modules", _SENTINEL)
+    prev_sub = sys.modules.get("transformers_modules.kimi_k2.tokenization_kimi", _SENTINEL)
     sys.modules["transformers_modules"] = fake_tm
     sys.modules["transformers_modules.kimi_k2.tokenization_kimi"] = fake_sub
     try:
@@ -52,8 +57,14 @@ def test_trust_remote_code_tokenizer_pickle_roundtrip_multinode():
         assert tok is not None
         data = pickle.dumps(tok)
     finally:
-        sys.modules.pop("transformers_modules", None)
-        sys.modules.pop("transformers_modules.kimi_k2.tokenization_kimi", None)
+        if prev_tm is _SENTINEL:
+            sys.modules.pop("transformers_modules", None)
+        else:
+            sys.modules["transformers_modules"] = prev_tm
+        if prev_sub is _SENTINEL:
+            sys.modules.pop("transformers_modules.kimi_k2.tokenization_kimi", None)
+        else:
+            sys.modules["transformers_modules.kimi_k2.tokenization_kimi"] = prev_sub
 
     # Worker node: module is gone, but cloudpickle embedded the class definition.
     restored = pickle.loads(data)  # nosec B301
