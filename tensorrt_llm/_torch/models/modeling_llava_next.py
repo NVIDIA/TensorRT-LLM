@@ -85,7 +85,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def dtype(self) -> torch.dtype:
         return self._dtype
 
-    def get_dummy_text(self, mm_counts: Dict[str, int]) -> str:
+    def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
         """
         Return minimal placeholder text for tokenized + MM path.
         """
@@ -97,11 +97,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def _expand_image_placeholders_in_token_ids(
         self,
         prompt_token_ids: List[int],
-        num_mm_tokens_per_image: List[int],
+        num_mm_tokens_per_placeholder: List[int],
     ) -> Tuple[List[int], List[int], List[int]]:
         """
         Shared logic: replace each image placeholder token in prompt_token_ids
-        with placeholder_id repeated num_mm_tokens_per_image[i] times.
+        with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
 
         Returns:
             (expanded_ids, mm_token_length, mm_token_offsets)
@@ -115,11 +115,11 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         image_idx = 0
         for tok in prompt_token_ids:
             if tok == image_token_id:
-                if image_idx >= len(num_mm_tokens_per_image):
+                if image_idx >= len(num_mm_tokens_per_placeholder):
                     raise ValueError(
                         "More image placeholder tokens in prompt than "
-                        "num_mm_tokens_per_image entries")
-                n = num_mm_tokens_per_image[image_idx]
+                        "num_mm_tokens_per_placeholder entries")
+                n = num_mm_tokens_per_placeholder[image_idx]
                 mm_token_offsets.append(len(expanded))
                 expanded.extend([placeholder_id] * n)
                 mm_token_length.append(n)
@@ -127,9 +127,9 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
             else:
                 expanded.append(tok)
 
-        if image_idx != len(num_mm_tokens_per_image):
+        if image_idx != len(num_mm_tokens_per_placeholder):
             raise ValueError(
-                f"Expected {len(num_mm_tokens_per_image)} image placeholders, "
+                f"Expected {len(num_mm_tokens_per_placeholder)} image placeholders, "
                 f"found {image_idx}. Ensure the prompt contains the model image "
                 f"placeholder (token id {image_token_id}).")
         return expanded, mm_token_length, mm_token_offsets
@@ -137,7 +137,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
     def expand_prompt_token_ids_for_mm(
         self,
         prompt_token_ids: List[int],
-        num_mm_tokens_per_image: List[int],
+        num_mm_tokens_per_placeholder: List[int],
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> List[int]:
         """
@@ -147,7 +147,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         hf_processor_mm_kwargs is optional; LLaVA does not use it for expansion.
         """
         expanded, _, _ = self._expand_image_placeholders_in_token_ids(
-            prompt_token_ids, num_mm_tokens_per_image)
+            prompt_token_ids, num_mm_tokens_per_placeholder)
         return expanded
 
     def _postprocess(
@@ -280,7 +280,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 f"mm_token_length[-1] + mm_token_offsets[-1] "
                 f"({mm_token_length[-1] + mm_token_offsets[-1]}) should be less "
                 f"than or equal to final_length ({final_length})")
-        logger.info(f"expanded_ids: {expanded_ids}")
+
         return expanded_ids, mm_token_length, mm_token_offsets
 
     def attach_multimodal_embeddings(
