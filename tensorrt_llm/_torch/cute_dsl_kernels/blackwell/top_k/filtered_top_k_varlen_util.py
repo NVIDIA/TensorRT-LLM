@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -22,7 +22,7 @@ from cutlass.utils.distributed import atomicAdd
 from .block_scan import block_prefix_sum_kernel, fence_acq_rel_cta
 
 """
-top-k varlen utils. reused by prefill and decode.
+top-k varlen utils. could be used by prefill and decode phase.
 """
 
 
@@ -88,9 +88,6 @@ class FilteredTopKKernelVarlen:
             self.enable_gmem_store = True
         else:
             self.enable_gmem_store = False
-        print(f"self.filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
-        print(f"self.max_num_cols: {self.max_num_cols}")
-        print(f"enable_gmem_store: {self.enable_gmem_store}")
 
         self.return_val = return_val
 
@@ -1021,14 +1018,10 @@ class FilteredTopKKernelVarlen:
         val_layout = cute.make_layout((1, self.vec_size))
         tiled_copy = cute.make_tiled_copy_tv(copy_atom, thr_layout, val_layout)
 
-        print(f"max_num_cols: {self.max_num_cols}")
-        print(f"tiler_mn: {tiler_mn}")
         return (
             copy_atom,
             tiled_copy,
             tiler_mn,
-            # aligned_size,
-            # left_size,
         )
 
     @cute.jit
@@ -1087,7 +1080,7 @@ def create_random_logits(
         Tensor of shape (num_rows, max_row_length) with random values and -inf padding
     """
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(1111)
+    torch.cuda.manual_seed(seed)
     num_rows = row_starts.shape[0]
     max_len = int(row_ends.max().item())
     if pad_to_vec_size:

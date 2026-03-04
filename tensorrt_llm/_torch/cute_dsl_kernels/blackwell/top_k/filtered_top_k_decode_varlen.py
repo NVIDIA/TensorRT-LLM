@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION. All rights reserved.
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -94,7 +94,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.merge_blocks = merge_blocks
         self.num_ctas_per_row = num_ctas_per_row
 
-        print(f"large_occupancy: {large_occupancy}")
         if cutlass.const_expr(large_occupancy):
             # reduce the smem usage and improve occupancy.
             if self.max_num_cols >= 262144:
@@ -119,14 +118,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
 
             # set the number of threads per cta to 512.
             self.num_threads_per_cta = 512
-
-            print(f"return_val: {return_val}")
-            print(f"limin: max_num_cols: {self.max_num_cols}")
-            print(f"limin: num_threads_per_cta: {self.num_threads_per_cta}")
-            print(
-                f"limin: filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}",
-            )
-            print(f"limin: enable_gmem_store: {self.enable_gmem_store}")
 
     @cute.jit
     def run_kernel(
@@ -455,7 +446,7 @@ def cute_dsl_topk_wrapper(
     num_rows, num_cols = input_values.shape
 
     large_occupancy = num_rows > 148
-    print(f"large_occupancy: {large_occupancy}, return_val: {return_val}")
+    assert not load_balance
 
     # Note: don't forget num_cols, which means the maximum columns.
     key = (
@@ -580,12 +571,11 @@ def cute_dsl_topk_multi_cta_wrapper(
     num_rows, num_cols = input_values.shape
 
     large_occupancy = num_rows > 148
-    print(f"large_occupancy: {large_occupancy}, return_val: {return_val}")
+    assert not load_balance
 
     # Note: don't forget num_cols, which means the maximum columns.
     enable_multi_cta = True
     num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
-    print(f"num_ctas_per_row: {num_ctas_per_row}")
     key = (
         dtype,
         num_cols,
@@ -831,7 +821,7 @@ def run_filtered_topk_decode(
 
     seed = 1111
     torch.manual_seed(seed)
-    torch.cuda.manual_seed(1111)
+    torch.cuda.manual_seed(seed)
 
     torch_stream = torch.cuda.Stream()
     current_stream = cuda.CUstream(torch_stream.cuda_stream)
