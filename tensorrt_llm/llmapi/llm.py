@@ -490,8 +490,9 @@ class BaseLLM:
         multimodal_params = None
         prompt = None
 
+        logger.info(f"is_mm_disagg: {is_mm_disagg}")
         if is_mm_disagg:
-            logger.info(f"[preprocess] is_mm_disagg: {is_mm_disagg}")
+            logger.info(f"[INSIDE IF] is_mm_disagg: {is_mm_disagg}")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
@@ -499,9 +500,6 @@ class BaseLLM:
             mm_handles = disaggregated_params.multimodal_embedding_handles
             prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
                 inputs["prompt_token_ids"], mm_handles)
-            logger.info(
-                f"After returning from get_prompt_token_ids: {prompt_token_ids}"
-            )
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -526,19 +524,33 @@ class BaseLLM:
                     multimodal_input=multimodal_input,
                     multimodal_data=multimodal_data,
                 )
+        elif ("prompt_token_ids" in inputs
+              and inputs.get("multi_modal_data") is None
+              and inputs.get("multi_modal_embeddings") is None):
+            prompt_token_ids = inputs['prompt_token_ids']
+            query_token_ids = inputs.get("query_token_ids", None)
+            multimodal_data = {}
+            # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
+            if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
+                # PyTorchModelEngine assumes both are present when using mrope.
+                if disaggregated_params.mrope_position_deltas_handle is None:
+                    raise RuntimeError(
+                        "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
+                        "be provided, or both `None`.")
+                mrope_config = {}
+                mrope_config[
+                    "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
+                mrope_config[
+                    "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
+                multimodal_data["mrope_config"] = mrope_config
+            if multimodal_data:
+                multimodal_params = MultimodalParams(
+                    multimodal_data=multimodal_data)
         elif "prompt" in inputs or ("prompt_token_ids" in inputs and
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
-            # _mm_data = inputs.get('multi_modal_data')
-            # _has_mm_data = (_mm_data is not None and
-            #                 (not isinstance(_mm_data, dict) or len(_mm_data) > 0))
-            # _mm_emb = inputs.get('multi_modal_embeddings')
-            # _has_mm_emb = (_mm_emb is not None and
-            #                (not isinstance(_mm_emb, dict) or len(_mm_emb) > 0))
-            if 'multi_modal_data' in inputs:  #and _has_mm_data:
-                logger.info(
-                    f"[preprocess] multi_modal_data: {inputs['multi_modal_data']}"
-                )
+            logger.info(f"inputs: {inputs}")
+            if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
                 # In the future, we should refactor this to:
@@ -549,11 +561,12 @@ class BaseLLM:
                 with nvtx_range_debug("input_processor_with_hash"):
                     prompt_token_ids, extra_processed_inputs = input_processor_with_hash(
                         inputs, sampling_params)
-            elif 'multi_modal_embeddings' in inputs:  #and _has_mm_emb:
-                logger.info(
-                    f"[preprocess] multi_modal_embeddings: {inputs['multi_modal_embeddings']}"
-                )
+            elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
+                if isinstance(mm_embedding_info, dict):
+                    logger.info(
+                        f"mm_embedding_info is a dict: {mm_embedding_info}")
+                logger.info(f"mm_embedding_info: {type(mm_embedding_info)}")
                 prompt_token_ids, extra_processed_inputs = cast(
                     BaseMultimodalInputProcessor,
                     self.input_processor).attach_multimodal_embeddings(
@@ -594,26 +607,6 @@ class BaseLLM:
                                 mrope_position_ids)
                             disaggregated_params.mrope_position_deltas_handle = (
                                 mrope_position_deltas)
-        elif "prompt_token_ids" in inputs:
-            prompt_token_ids = inputs['prompt_token_ids']
-            query_token_ids = inputs.get("query_token_ids", None)
-            multimodal_data = {}
-            # NOTE: when running in `generation_only` for disagg, this is the code path we expect to hit.
-            if disaggregated_params is not None and disaggregated_params.mrope_position_ids_handle is not None:
-                # PyTorchModelEngine assumes both are present when using mrope.
-                if disaggregated_params.mrope_position_deltas_handle is None:
-                    raise RuntimeError(
-                        "`mrope_position_ids_handle` and `mrope_position_deltas_handle` must both "
-                        "be provided, or both `None`.")
-                mrope_config = {}
-                mrope_config[
-                    "mrope_position_ids"] = disaggregated_params.mrope_position_ids_handle
-                mrope_config[
-                    "mrope_position_deltas"] = disaggregated_params.mrope_position_deltas_handle
-                multimodal_data["mrope_config"] = mrope_config
-            if multimodal_data:
-                multimodal_params = MultimodalParams(
-                    multimodal_data=multimodal_data)
         else:
             raise TypeError(
                 f"The inputs must be type str or list of int, but got {type(inputs)}"
