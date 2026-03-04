@@ -60,7 +60,7 @@ class TRTLLMEvalBase(TemplateLM):
         max_context_length: Optional[int] = None,
         moe_expert_parallel_size: Optional[int] = None,
         moe_backend: Optional[str] = "TRTLLM",
-        enable_chunked_prefill: bool = False,
+        enable_chunked_prefill: bool = True,
         max_num_tokens: Optional[int] = None,
         **kwargs,
     ):
