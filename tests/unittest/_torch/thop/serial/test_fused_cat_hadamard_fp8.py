@@ -215,3 +215,86 @@ def test_fused_cat_hadamard_fp8_noncontiguous_input(M):
     assert rel_err.mean().item() < 0.05, (
         f"Non-contiguous input: mean relative error too high: {rel_err.mean().item():.4f}"
     )
+
+
+@pytest.mark.parametrize("M", [1, 16, 64])
+@pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
+@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
+@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
+def test_fused_cat_hadamard_fp8_3d_input(M, n_heads):
+    """Test with 3D inputs matching Q path: [M, n_heads, dim] from split.
+
+    In the DSA indexer, Q tensors are [M, n_heads, head_dim] split into
+    [M, n_heads, pe_dim] and [M, n_heads, nope_dim]. The kernel should handle
+    these 3D non-contiguous views directly without needing reshape.
+    """
+    pe_dim, nope_dim = 64, 64
+    head_dim = pe_dim + nope_dim
+    device = torch.device("cuda")
+
+    torch.manual_seed(42)
+    # Simulate q.view(-1, n_heads, head_dim).split([pe_dim, nope_dim], dim=-1)
+    q = torch.randn(M, n_heads, head_dim, dtype=torch.bfloat16, device=device)
+    pe, nope = q.split([pe_dim, nope_dim], dim=-1)
+
+    assert pe.shape == (M, n_heads, pe_dim)
+    assert nope.shape == (M, n_heads, nope_dim)
+    assert not nope.is_contiguous()
+
+    # Fused kernel with 3D input (no reshape)
+    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_hadamard_fp8(pe, nope, True)
+
+    # Expected M for kernel: M * n_heads
+    total_rows = M * n_heads
+    assert fused_fp8.shape == (total_rows, head_dim)
+    assert fused_scale.shape == (total_rows, 1)
+
+    # Reference with explicit reshape (old behavior)
+    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(
+        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=True
+    )
+
+    fused_deq = fused_fp8.float() * fused_scale
+    ref_deq = ref_fp8.float() * ref_scale
+    rel_err = (fused_deq - ref_deq).abs() / ref_deq.abs().clamp(min=1e-6)
+    assert rel_err.mean().item() < 0.05, (
+        f"3D input: mean relative error too high: {rel_err.mean().item():.4f}"
+    )
+
+
+@pytest.mark.parametrize("M", [1, 16])
+@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
+@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
+@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
+def test_fused_cat_hadamard_fp8_mixed_contiguity(M):
+    """Test where pe is contiguous but nope is non-contiguous.
+
+    This matches the non-flashinfer Q path where pe comes from rotary_emb
+    (contiguous) but nope remains the non-contiguous split view.
+    """
+    pe_dim, nope_dim, n_heads = 64, 64, 64
+    head_dim = pe_dim + nope_dim
+    device = torch.device("cuda")
+
+    torch.manual_seed(42)
+    # pe is contiguous (simulates post-RoPE output)
+    pe = torch.randn(M, n_heads, pe_dim, dtype=torch.bfloat16, device=device)
+    # nope is non-contiguous (from split on [M, n_heads, head_dim])
+    full = torch.randn(M, n_heads, head_dim, dtype=torch.bfloat16, device=device)
+    _, nope = full.split([pe_dim, nope_dim], dim=-1)
+
+    assert pe.is_contiguous()
+    assert not nope.is_contiguous()
+
+    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_hadamard_fp8(pe, nope, True)
+    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(
+        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=True
+    )
+
+    fused_deq = fused_fp8.float() * fused_scale
+    ref_deq = ref_fp8.float() * ref_scale
+    rel_err = (fused_deq - ref_deq).abs() / ref_deq.abs().clamp(min=1e-6)
+    assert rel_err.mean().item() < 0.05, (
+        f"Mixed contiguity: mean relative error too high: {rel_err.mean().item():.4f}"
+    )

@@ -1572,11 +1572,11 @@ class Indexer(nn.Module):
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
         if _HAS_FUSED_CAT_HADAMARD_FP8:
-            # Fused path: cat + hadamard + fp8_quantize in one kernel
+            # Fused path: cat + hadamard + fp8_quantize in one kernel.
+            # The kernel accepts non-contiguous inputs (stride(-1)==1 required)
+            # and computes M as numel/size(-1), so no reshape needed.
             fp8_out, scale = torch.ops.trtllm.fused_cat_hadamard_fp8(
-                qk_pe.reshape(-1, self.rope_dim),
-                qk_nope.reshape(-1, self.head_dim - self.rope_dim),
-                self.scale_fmt == "ue8m0")
+                qk_pe, qk_nope, self.scale_fmt == "ue8m0")
             return fp8_out, scale
         # Fallback: sequential cat → hadamard → fp8_quantize
         q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
