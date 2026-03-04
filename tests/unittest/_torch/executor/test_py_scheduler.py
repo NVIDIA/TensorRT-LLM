@@ -16,246 +16,113 @@
 Unit tests for Python scheduler implementations (PyMicroBatchScheduler,
 PyCapacityScheduler, SimpleUnifiedScheduler).
 
-These tests validate the pure-Python scheduler logic using mock objects,
-without requiring GPU or real KV cache managers. They are aligned with
-the C++ scheduler unit tests in:
+These tests validate the pure-Python scheduler logic using real LlmRequest
+objects (from C++ bindings) and mock KV cache managers, without requiring
+GPU. They are aligned with the C++ scheduler unit tests in:
   - cpp/tests/unit_tests/batch_manager/microBatchSchedulerTest.cpp
   - cpp/tests/unit_tests/batch_manager/capacitySchedulerTest.cpp
 """
 
 from dataclasses import dataclass, field
-from enum import IntEnum
 from typing import List, Optional
 
 import pytest
 
-# ---------------------------------------------------------------------------
-# Mock LlmRequestState — mirrors the C++ enum values exactly.
-# We define our own so these tests don't depend on the C++ bindings at import
-# time, making them runnable in environments where bindings aren't built.
-# ---------------------------------------------------------------------------
-
-
-# Try to import the real scheduler classes. If the bindings are not available
-# (e.g. no CUDA environment), the entire module is skipped.
-try:
-    from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
-    from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
-        ChunkingPolicy,
-        ContextChunkingConfig,
-        PyCapacityScheduler,
-        PyMicroBatchScheduler,
-        SimpleUnifiedScheduler,
-    )
-    from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
-
-    SCHEDULER_AVAILABLE = True
-except ImportError:
-    SCHEDULER_AVAILABLE = False
-
-
-# MockLlmRequestState uses the REAL enum values from C++ bindings.
-# These values are NOT sequential (e.g., CONTEXT_INIT=10, not 2).
-# We derive them from the real LlmRequestState when available.
-if SCHEDULER_AVAILABLE:
-
-    class MockLlmRequestState(IntEnum):
-        UNKNOWN = LlmRequestState.UNKNOWN.value
-        ENCODER_INIT = LlmRequestState.ENCODER_INIT.value
-        CONTEXT_INIT = LlmRequestState.CONTEXT_INIT.value
-        GENERATION_IN_PROGRESS = LlmRequestState.GENERATION_IN_PROGRESS.value
-        GENERATION_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE.value
-        GENERATION_COMPLETE = LlmRequestState.GENERATION_COMPLETE.value
-        DISAGG_GENERATION_INIT = LlmRequestState.DISAGG_GENERATION_INIT.value
-
-else:
-
-    class MockLlmRequestState(IntEnum):
-        UNKNOWN = 0
-        ENCODER_INIT = 1
-        CONTEXT_INIT = 10
-        GENERATION_IN_PROGRESS = 13
-        GENERATION_TO_COMPLETE = 14
-        GENERATION_COMPLETE = 20
-        DISAGG_GENERATION_INIT = 8
-
-
-pytestmark = pytest.mark.skipif(
-    not SCHEDULER_AVAILABLE,
-    reason="tensorrt_llm scheduler not importable (missing bindings or CUDA)",
+from tensorrt_llm._torch.pyexecutor.llm_request import (LlmRequest,
+                                                         LlmRequestState,
+                                                         SamplingConfig)
+from tensorrt_llm._torch.pyexecutor.scheduler.scheduler import (
+    ChunkingPolicy,
+    ContextChunkingConfig,
+    PyCapacityScheduler,
+    PyMicroBatchScheduler,
+    SimpleUnifiedScheduler,
 )
-
-# ============================================================================
-# Mock infrastructure
-# ============================================================================
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
 
 
-@dataclass
-class MockLlmRequest:
-    """
-    Minimal mock of LlmRequest that exposes exactly the attributes/methods
-    the Python scheduler accesses. Attribute names match the real binding API.
-    """
-
-    request_id: int
-    _state: int = MockLlmRequestState.CONTEXT_INIT
-    prompt_len: int = 10
-    _context_current_position: int = 0
-    _context_chunk_size: int = 0
-    beam_width: int = 1
-    _draft_tokens_len: int = 0
-    encoder_output_len: int = 0
-    lora_task_id: Optional[int] = None
-    py_request_id: int = 0  # Used by MaxUtilization's scheduling_remove_sequence
-    _input_tokens: Optional[List[int]] = None
-
-    def __post_init__(self):
-        self.py_request_id = self.request_id
-
-    # --- State properties ---
-    @property
-    def state(self):
-        return LlmRequestState(self._state) if SCHEDULER_AVAILABLE else self._state
-
-    @state.setter
-    def state(self, value):
-        self._state = int(value)
-
-    @property
-    def state_value(self) -> int:
-        return self._state
-
-    @property
-    def is_context_init_state(self) -> bool:
-        return self._state == MockLlmRequestState.CONTEXT_INIT
-
-    @property
-    def is_generation_in_progress_state(self) -> bool:
-        return self._state == MockLlmRequestState.GENERATION_IN_PROGRESS
-
-    @property
-    def is_encoder_init_state(self) -> bool:
-        return self._state == MockLlmRequestState.ENCODER_INIT
-
-    @property
-    def is_disagg_generation_init_state(self) -> bool:
-        return self._state == MockLlmRequestState.DISAGG_GENERATION_INIT
-
-    @property
-    def is_generation_to_complete_state(self) -> bool:
-        return self._state == MockLlmRequestState.GENERATION_TO_COMPLETE
-
-    # --- Context chunking properties ---
-    @property
-    def context_remaining_length(self) -> int:
-        return self.prompt_len - self._context_current_position
-
-    @property
-    def context_chunk_size(self) -> int:
-        return self._context_chunk_size
-
-    @context_chunk_size.setter
-    def context_chunk_size(self, value: int):
-        # Clamp to context_remaining_length, matching C++ behavior
-        self._context_chunk_size = min(value, self.context_remaining_length)
-
-    @property
-    def is_first_context_chunk(self) -> bool:
-        return self._context_current_position == 0
-
-    @property
-    def is_last_context_chunk(self) -> bool:
-        return self._context_chunk_size >= self.context_remaining_length
-
-    # --- Token / draft properties ---
-    def get_num_tokens(self, beam: int) -> int:
-        """For context requests, returns prompt_len (matching C++ getNumTokens)."""
-        return self.prompt_len
-
-    @property
-    def num_draft_tokens(self) -> int:
-        return self._draft_tokens_len
-
-    @property
-    def has_draft_tokens(self) -> bool:
-        return self._draft_tokens_len > 0
-
-    @property
-    def draft_tokens(self) -> list:
-        return [0] * self._draft_tokens_len
-
-    def get_beam_width_by_iter(self, for_next_iteration: bool = False) -> int:
-        return self.beam_width
-
-    def discard_draft_tokens(self, n: int):
-        self._draft_tokens_len = max(0, self._draft_tokens_len - n)
-
-    # --- Methods used by capacity scheduler ---
-    def get_unique_tokens(self, beam: int):
-        return self._input_tokens
-
-    def get_encoder_unique_tokens(self):
-        return None
-
-    def move_to_next_context_chunk(self):
-        """Simulate moving to the next context chunk."""
-        self._context_current_position += self._context_chunk_size
-        self._context_chunk_size = 0
+def _make_request(
+    request_id: int,
+    prompt_len: int = 10,
+    beam_width: int = 1,
+    draft_tokens_len: int = 0,
+    encoder_output_len: int = 0,
+    lora_task_id: Optional[int] = None,
+    state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+    input_tokens: Optional[List[int]] = None,
+) -> LlmRequest:
+    tokens = input_tokens if input_tokens is not None else list(
+        range(prompt_len))
+    draft = list(range(draft_tokens_len)) if draft_tokens_len > 0 else None
+    req = LlmRequest(
+        request_id=request_id,
+        max_new_tokens=10,
+        input_tokens=tokens,
+        sampling_config=SamplingConfig(beam_width),
+        is_streaming=False,
+        draft_tokens=draft,
+        lora_task_id=lora_task_id,
+        encoder_output_len=encoder_output_len if encoder_output_len > 0 else None,
+    )
+    req.state = state
+    return req
 
 
-# Helper to create requests in specific states
 def make_context_request(
     request_id: int,
     prompt_len: int = 10,
     beam_width: int = 1,
     draft_tokens_len: int = 0,
     context_position: int = 0,
-) -> MockLlmRequest:
-    return MockLlmRequest(
+) -> LlmRequest:
+    req = _make_request(
         request_id=request_id,
-        _state=MockLlmRequestState.CONTEXT_INIT,
         prompt_len=prompt_len,
-        _context_current_position=context_position,
         beam_width=beam_width,
-        _draft_tokens_len=draft_tokens_len,
+        draft_tokens_len=draft_tokens_len,
+        state=LlmRequestState.CONTEXT_INIT,
     )
+    if context_position > 0:
+        req.context_chunk_size = context_position
+        req.move_to_next_context_chunk()
+    return req
 
 
 def make_generation_request(
     request_id: int,
     beam_width: int = 1,
     draft_tokens_len: int = 0,
-) -> MockLlmRequest:
-    return MockLlmRequest(
+) -> LlmRequest:
+    return _make_request(
         request_id=request_id,
-        _state=MockLlmRequestState.GENERATION_IN_PROGRESS,
         beam_width=beam_width,
-        _draft_tokens_len=draft_tokens_len,
+        draft_tokens_len=draft_tokens_len,
+        state=LlmRequestState.GENERATION_IN_PROGRESS,
     )
 
 
 def make_encoder_request(
     request_id: int,
     encoder_output_len: int = 10,
-) -> MockLlmRequest:
-    return MockLlmRequest(
+) -> LlmRequest:
+    return _make_request(
         request_id=request_id,
-        _state=MockLlmRequestState.ENCODER_INIT,
         encoder_output_len=encoder_output_len,
+        state=LlmRequestState.ENCODER_INIT,
     )
 
 
-def make_disagg_gen_init_request(request_id: int) -> MockLlmRequest:
-    return MockLlmRequest(
+def make_disagg_gen_init_request(request_id: int) -> LlmRequest:
+    return _make_request(
         request_id=request_id,
-        _state=MockLlmRequestState.DISAGG_GENERATION_INIT,
+        state=LlmRequestState.DISAGG_GENERATION_INIT,
     )
 
 
-def make_completed_request(request_id: int) -> MockLlmRequest:
-    return MockLlmRequest(
+def make_completed_request(request_id: int) -> LlmRequest:
+    return _make_request(
         request_id=request_id,
-        _state=MockLlmRequestState.GENERATION_COMPLETE,
+        state=LlmRequestState.GENERATION_COMPLETE,
     )
 
 
@@ -935,12 +802,9 @@ class TestPyMicroBatchSchedulerChunking:
         C++ ref: sortRequests in inflightBatchingUtils.cpp
         """
         scheduler = PyMicroBatchScheduler(max_batch_size=4, max_num_tokens=None)
-        r0 = make_generation_request(0)
-        r0.lora_task_id = 5
-        r1 = make_generation_request(1)
-        r1.lora_task_id = None
-        r2 = make_generation_request(2)
-        r2.lora_task_id = 3
+        r0 = _make_request(0, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=5)
+        r1 = _make_request(1, state=LlmRequestState.GENERATION_IN_PROGRESS)
+        r2 = _make_request(2, state=LlmRequestState.GENERATION_IN_PROGRESS, lora_task_id=3)
         ctx, gen = scheduler.schedule([r0, r1, r2], set())
         # None < any value, so order should be: r1(None), r2(3), r0(5)
         assert gen[0].request_id == 1
@@ -970,14 +834,14 @@ def _run_context_chunking_test(
     Helper that mirrors the C++ ContextChunkingTest fixture.
 
     For each policy (EQUAL_PROGRESS and FCFS), it:
-    1. Creates MockLlmRequests with given context_lengths and optional draft_lengths.
+    1. Creates LlmRequests with given context_lengths and optional draft_lengths.
     2. Creates a PyMicroBatchScheduler with the right ContextChunkingConfig.
     3. If max_context_length is set, overrides scheduler.max_context_length.
     4. For each iteration (each element in positions list):
        a. Filters requests where context_remaining_length > 0.
        b. Calls scheduler._set_ctx_requests_chunk_size(active_reqs, ctx_tokens_capacity).
        c. For each active req, calls req.move_to_next_context_chunk().
-       d. Verifies _context_current_position matches expected positions for ALL requests.
+       d. Verifies context position matches expected positions for ALL requests.
     5. After all iterations, verifies final draft_lengths if specified.
     """
     policies_and_data = [
@@ -990,13 +854,10 @@ def _run_context_chunking_test(
         requests = []
         for i, ctx_len in enumerate(context_lengths):
             dl = draft_lengths[i] if draft_lengths else 0
-            req = MockLlmRequest(
+            req = make_context_request(
                 request_id=i,
-                _state=MockLlmRequestState.CONTEXT_INIT,
                 prompt_len=ctx_len,
-                _context_current_position=0,
-                _context_chunk_size=0,
-                _draft_tokens_len=dl,
+                draft_tokens_len=dl,
             )
             requests.append(req)
 
@@ -1024,20 +885,20 @@ def _run_context_chunking_test(
 
             # Verify positions for ALL requests (including completed ones)
             for req_idx, req in enumerate(requests):
-                assert req._context_current_position == expected_positions[req_idx], (
+                assert req.context_current_position == expected_positions[req_idx], (
                     f"Policy {policy.name}, iteration {iteration_idx}, "
                     f"request {req_idx}: expected position "
                     f"{expected_positions[req_idx]}, got "
-                    f"{req._context_current_position}"
+                    f"{req.context_current_position}"
                 )
 
         # Verify final draft lengths if specified
         if final_draft_lens is not None:
             for req_idx, req in enumerate(requests):
-                assert req._draft_tokens_len == final_draft_lens[req_idx], (
+                assert req.num_draft_tokens == final_draft_lens[req_idx], (
                     f"Policy {policy.name}, request {req_idx}: "
                     f"expected draft_len {final_draft_lens[req_idx]}, "
-                    f"got {req._draft_tokens_len}"
+                    f"got {req.num_draft_tokens}"
                 )
 
 
@@ -1601,7 +1462,7 @@ class TestPyCapacitySchedulerStateGating:
             max_num_requests=4,
             kv_cache_manager=None,
         )
-        req = MockLlmRequest(request_id=0, _state=MockLlmRequestState.UNKNOWN)
+        req = _make_request(request_id=0, state=LlmRequestState.UNKNOWN)
         fitting, disagg, paused = scheduler.schedule_request([req])
         assert len(fitting) == 0
 
@@ -1622,9 +1483,9 @@ class TestPyCapacitySchedulerStateGating:
             max_num_requests=4,
             kv_cache_manager=None,
         )
-        req = MockLlmRequest(
+        req = _make_request(
             request_id=0,
-            _state=MockLlmRequestState.GENERATION_TO_COMPLETE,
+            state=LlmRequestState.GENERATION_TO_COMPLETE,
         )
         fitting, disagg, paused = scheduler.schedule_request([req])
         assert len(fitting) == 0
@@ -1653,10 +1514,8 @@ class TestPyCapacitySchedulerLora:
             peft_cache_manager=peft,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
-        r0 = make_context_request(0)
-        r0.lora_task_id = 1
-        r1 = make_context_request(1)
-        r1.lora_task_id = 1  # same task — no extra pages needed
+        r0 = _make_request(0, lora_task_id=1)
+        r1 = _make_request(1, lora_task_id=1)  # same task — no extra pages needed
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) == 2
 
@@ -1673,10 +1532,8 @@ class TestPyCapacitySchedulerLora:
             peft_cache_manager=peft,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
-        r0 = make_context_request(0)
-        r0.lora_task_id = 1
-        r1 = make_context_request(1)
-        r1.lora_task_id = 2  # different task — needs 10 more pages
+        r0 = _make_request(0, lora_task_id=1)
+        r1 = _make_request(1, lora_task_id=2)  # different task — needs 10 more pages
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         # First task: 10 pages, second task: 10 pages, total 20 > 15
         assert len(fitting) == 1
@@ -1889,9 +1746,9 @@ class TestPyCapacitySchedulerChunked:
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         r0 = make_context_request(0, prompt_len=50, context_position=0)
-        r0._context_chunk_size = 20
+        r0.context_chunk_size = 20
         r1 = make_context_request(1, prompt_len=50, context_position=0)
-        r1._context_chunk_size = 20
+        r1.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) == 2
 
@@ -1904,9 +1761,9 @@ class TestPyCapacitySchedulerChunked:
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         r0 = make_context_request(0, prompt_len=30)
-        r0._context_chunk_size = 20
+        r0.context_chunk_size = 20
         r1 = make_context_request(1, prompt_len=30)
-        r1._context_chunk_size = 20
+        r1.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) == 1
 
@@ -1919,9 +1776,9 @@ class TestPyCapacitySchedulerChunked:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         r0 = make_context_request(0, prompt_len=30)
-        r0._context_chunk_size = 20
+        r0.context_chunk_size = 20
         r1 = make_context_request(1, prompt_len=30)
-        r1._context_chunk_size = 20
+        r1.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         # At least one should be scheduled
         assert len(fitting) >= 1
@@ -1935,9 +1792,9 @@ class TestPyCapacitySchedulerChunked:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         r0 = make_context_request(0, prompt_len=70)
-        r0._context_chunk_size = 40
+        r0.context_chunk_size = 40
         r1 = make_context_request(1, prompt_len=70)
-        r1._context_chunk_size = 40
+        r1.context_chunk_size = 40
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) == 1
 
@@ -2009,9 +1866,9 @@ class TestPyCapacitySchedulerDynamicAddition:
         )
         r0 = make_generation_request(0)
         r1 = make_context_request(1, prompt_len=30)
-        r1._context_chunk_size = 20
+        r1.context_chunk_size = 20
         r2 = make_context_request(2, prompt_len=30)
-        r2._context_chunk_size = 20
+        r2.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
         assert len(fitting) >= 1
 
@@ -2068,12 +1925,9 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         tokens = list(range(21))
-        r0 = make_context_request(0, prompt_len=21)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=21)
-        r1._input_tokens = tokens
-        r2 = make_context_request(2, prompt_len=21)
-        r2._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=21, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=21, input_tokens=tokens)
+        r2 = _make_request(2, prompt_len=21, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2])
         # With reuse enabled, beneficial_to_skip may delay r1 and r2
         assert len(fitting) >= 1
@@ -2087,12 +1941,10 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         tokens = list(range(50))
-        r0 = make_context_request(0, prompt_len=50)
-        r0._input_tokens = tokens
-        r0._context_chunk_size = 20
-        r1 = make_context_request(1, prompt_len=50)
-        r1._input_tokens = tokens
-        r1._context_chunk_size = 20
+        r0 = _make_request(0, prompt_len=50, input_tokens=tokens)
+        r0.context_chunk_size = 20
+        r1 = _make_request(1, prompt_len=50, input_tokens=tokens)
+        r1.context_chunk_size = 20
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2104,16 +1956,11 @@ class TestPyCapacitySchedulerKVCacheReuse:
             kv_cache_manager=kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
-        r0 = make_context_request(0, prompt_len=11)
-        r0._input_tokens = [x + 1 for x in range(11)]  # unique
-        r1 = make_context_request(1, prompt_len=21)
-        r1._input_tokens = [x + 2 for x in range(21)]  # unique
-        r2 = make_context_request(2, prompt_len=11)
-        r2._input_tokens = list(range(11))
-        r3 = make_context_request(3, prompt_len=21)
-        r3._input_tokens = list(range(21))  # first 11 shared
-        r4 = make_context_request(4, prompt_len=31)
-        r4._input_tokens = list(range(31))  # first 11 shared
+        r0 = _make_request(0, prompt_len=11, input_tokens=[x + 1 for x in range(11)])
+        r1 = _make_request(1, prompt_len=21, input_tokens=[x + 2 for x in range(21)])
+        r2 = _make_request(2, prompt_len=11, input_tokens=list(range(11)))
+        r3 = _make_request(3, prompt_len=21, input_tokens=list(range(21)))
+        r4 = _make_request(4, prompt_len=31, input_tokens=list(range(31)))
         fitting, disagg, paused = scheduler.schedule_request([r0, r1, r2, r3, r4])
         assert len(fitting) >= 1
 
@@ -2126,10 +1973,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
         tokens = list(range(20))
-        r0 = make_context_request(0, prompt_len=20)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=20)
-        r1._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2143,10 +1988,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
         )
         tokens0 = list(range(30))
         tokens1 = list(range(20)) + [999] * 10
-        r0 = make_context_request(0, prompt_len=30)
-        r0._input_tokens = tokens0
-        r1 = make_context_request(1, prompt_len=30)
-        r1._input_tokens = tokens1
+        r0 = _make_request(0, prompt_len=30, input_tokens=tokens0)
+        r1 = _make_request(1, prompt_len=30, input_tokens=tokens1)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2158,10 +2001,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             kv_cache_manager=kv,
             scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
         )
-        r0 = make_context_request(0, prompt_len=20)
-        r0._input_tokens = [100] * 20
-        r1 = make_context_request(1, prompt_len=20)
-        r1._input_tokens = [200] * 20
+        r0 = _make_request(0, prompt_len=20, input_tokens=[100] * 20)
+        r1 = _make_request(1, prompt_len=20, input_tokens=[200] * 20)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         # Different prompts: no reuse, both scheduled
         assert len(fitting) == 2
@@ -2175,10 +2016,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         tokens = list(range(20))
-        r0 = make_context_request(0, prompt_len=20)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=20)
-        r1._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2191,10 +2030,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         tokens = list(range(30))
-        r0 = make_context_request(0, prompt_len=30)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=30)
-        r1._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=30, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=30, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2207,10 +2044,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         tokens = list(range(20))
-        r0 = make_context_request(0, prompt_len=20)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=20)
-        r1._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2223,10 +2058,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         tokens = list(range(20))
-        r0 = make_context_request(0, prompt_len=20)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=20)
-        r1._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         assert len(fitting) >= 1
 
@@ -2239,10 +2072,8 @@ class TestPyCapacitySchedulerKVCacheReuse:
             scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
         )
         tokens = list(range(20))
-        r0 = make_context_request(0, prompt_len=20)
-        r0._input_tokens = tokens
-        r1 = make_context_request(1, prompt_len=20)
-        r1._input_tokens = tokens
+        r0 = _make_request(0, prompt_len=20, input_tokens=tokens)
+        r1 = _make_request(1, prompt_len=20, input_tokens=tokens)
         fitting, disagg, paused = scheduler.schedule_request([r0, r1])
         # No reuse: both scheduled together
         assert len(fitting) == 2
