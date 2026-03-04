@@ -119,14 +119,14 @@ class MTPSpecMetadata(SpecMetadata):
     mtp_hidden_states_manager: Optional[MTPHiddenStatesManager] = None
     # The slot ids for each request.
     slot_ids: Optional[torch.Tensor] = None
-    # The index of the batche inputs
+    # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
     # The number of sequences for speculative model/layer of different rank
     _all_rank_num_seqs: Optional[List[int]] = None
     # This is used for attention dp in the MTP Eagle worker. The numbers of input
     # tokens varies between the 1st draft forward and subsequent ones. To support
     # CUDA graph, we use this tensor to store the number of input tokens for the
-    # subsequence draft forward.
+    # subsequent draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
     # Optional suffix automaton manager for MTP+SA speculative decoding
     sa_manager: Optional[SuffixAutomatonManager] = None
@@ -173,7 +173,7 @@ class MTPSpecMetadata(SpecMetadata):
     def prepare(self):
         assert self.request_ids is not None
         num_seqs = len(self.request_ids)
-        # update batch indeices
+        # update batch indices
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
                                      device='cpu',
@@ -310,7 +310,7 @@ class MTPWorker(SpecWorkerBase):
                 - hidden states: H_A, H_B, H_C, H_D
             Draft model:
                 MTP1:
-                    # For context request, prompt[1:] + new generated goloden token is the input.
+                    # For context request, prompt[1:] + new generated golden token is the input.
                     - input tokens: BCDE
                     - input hidden states: H_A, H_B, H_C, H_D
                     # '()' means historical KV cache
@@ -527,14 +527,14 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata: AttentionMetadata,
     ):
         '''
-        Update the past hidden states and past tokens in spec_metadata base on
+        Update the past hidden states and past tokens in spec_metadata based on
         the newly accepted tokens and historical hidden states.
-        These past hidden states and past tokens will be use in MTP module.
+        These past hidden states and past tokens will be used in MTP module.
 
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flattened.
 
             hidden_states: torch.Tensor
                 [num_tokens, hidden_size]
@@ -692,7 +692,7 @@ class MTPWorker(SpecWorkerBase):
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flattened.
 
             logits: torch.Tensor
                 [num_tokens, vocab_size]
@@ -897,17 +897,17 @@ class MTPWorker(SpecWorkerBase):
         attn_metadata: AttentionMetadata,
     ):
         '''
-        Parepare the input of the draft model.
+        Prepare the input of the draft model.
 
         Args:
             input_ids: torch.IntTensor
                 [num_tokens]
-                The input ids of all requests. Flatten.
+                The input ids of all requests. Flattened.
                 num_tokens = sum(all prompts) + num_generation * (mtp_num_modules + 1)
 
             position_ids: torch.IntTensor
                 [1][num_tokens]
-                The position id of all requests. Flatten.
+                The position id of all requests. Flattened.
 
             hidden_states: torch.Tensor
                 [num_tokens, hidden_size]
@@ -930,12 +930,12 @@ class MTPWorker(SpecWorkerBase):
         Returns: draft_inputs
             input_ids: torch.Tensor
                 [num_tokens]
-                The new input ids of all requests. Flatten.
+                The new input ids of all requests. Flattened.
                 num_tokens = sum(all prompts) + num_generation * (mtp_num_modules)
 
             position_ids: torch.Tensor
-                [1][[num_tokens]]
-                The new position ids of all requests. Flatten.
+                [1, num_tokens]
+                The new position ids of all requests. Flattened.
                 Directly use the input position ids.
 
             hidden_states: torch.Tensor
@@ -1253,7 +1253,7 @@ class MTPEagleWorker(MTPWorker):
                             -1, hidden_states_gathered.shape[-1])
                     else:
                         raise ValueError(
-                            f"In MTPEagleWorker.forward(), token_count < max_num_requests, which is not supported"
+                            "In MTPEagleWorker.forward(), token_count > max_num_requests, which is not supported"
                         )
                     logits = draft_model.mtp_layers[0].shared_head(
                         padded_hidden_states, draft_model.lm_head,
@@ -1284,7 +1284,7 @@ class MTPEagleWorker(MTPWorker):
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
-                    # cannot run generation if their is no kv cache
+                    # cannot run generation if there is no kv cache
                     has_kv_cache = inputs[
                         "attn_metadata"].kv_cache_manager is not None
                     if has_kv_cache:

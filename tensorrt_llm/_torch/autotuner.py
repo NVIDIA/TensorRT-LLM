@@ -201,7 +201,7 @@ class TunableRunner(ABC):
 
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
-            * when the autotuner cannot find a valid tactic in it's cache.
+            * when the autotuner cannot find a valid tactic in its cache.
             * in eager mode, w/o autotunning the custom op should have at least one kernel, which makes the autotuning
               process an optional process, such that user can opt out.
 
