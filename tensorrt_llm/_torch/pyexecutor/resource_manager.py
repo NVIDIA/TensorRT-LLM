@@ -2145,7 +2145,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # Allocate KV Cache for context requests
             new_context_batch: List[LlmRequest] = []
             for req in context_requests:
-                beam_width = req.sampling_config.beam_width
+                assert req.sampling_config.beam_width == 1, "Currently, KVCacheManagerV2 only supports beam width 1"
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
                     raise RuntimeError(
@@ -2163,7 +2163,6 @@ class KVCacheManagerV2(BaseResourceManager):
                                 req.py_request_id, req.lora_task_id,
                                 req.get_tokens(0)[:-1]
                                 if self.enable_block_reuse else None)
-                            assert beam_width == 1, "Currently, KVCacheManagerV2 only supports beam width 1"
                         if not self.enable_block_reuse:
                             assert kv_cache.num_committed_tokens == 0
                             kv_cache.stop_committing()
