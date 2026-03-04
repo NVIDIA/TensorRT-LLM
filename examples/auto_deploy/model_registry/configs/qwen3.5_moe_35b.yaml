@@ -5,7 +5,7 @@ max_num_tokens: 4096
 max_batch_size: 512
 world_size: 2
 enable_chunked_prefill: true
-model_factory: AutoModelForCausalLM
+model_factory: Qwen3_5MoeForConditionalGeneration
 kv_cache_config:
   enable_block_reuse: false
   free_gpu_memory_fraction: 0.95
@@ -17,6 +17,8 @@ model_kwargs:
   # vision_config:
   #   depth: 2
 transforms:
+  export_to_gm:
+    num_moe_experts_for_export: 2
   detect_sharding:
     sharding_dims: ['tp','ep', 'bmm']
     # use only manual config for TP sharding
