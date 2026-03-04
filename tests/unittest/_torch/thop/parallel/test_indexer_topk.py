@@ -5,6 +5,9 @@ from utils.util import getSMVersion, skip_pre_hopper
 # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
 
+# Import CuTE DSL utils
+from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for indexer_topk tests", allow_module_level=True)
 
@@ -260,3 +263,86 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
     assert compare_top_k_results(
         logits, indices, torch_indices, row_starts, row_ends, index_topk
     ), "CUDA top_k_per_row results don't match torch.topk"
+
+
+# ============================================================================
+# CuTE DSL Top-K Tests
+# ============================================================================
+
+
+def skip_if_no_cute_dsl():
+    """Skip test if CuTE DSL is not available."""
+    if not IS_CUTLASS_DSL_AVAILABLE:
+        pytest.skip("CuTE DSL not available")
+
+
+def skip_if_not_blackwell():
+    """Skip test if not running on Blackwell architecture."""
+    sm = getSMVersion()
+    if sm < 100:
+        pytest.skip("CuTE DSL top-k kernel requires Blackwell (SM100+)")
+
+
+@pytest.mark.parametrize("batch_size", [1, 4, 64])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype):
+    skip_if_no_cute_dsl()
+    skip_if_not_blackwell()
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Set input data (same structure as test_indexer_topk_decode)
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+
+    # Create logits with the specified dtype
+    logits = create_random_logits(row_starts, row_ends, dtype, 42)
+
+    # Run CuTE DSL implementation
+    # result = cute_dsl_topk_wrapper(
+    #     input_values=logits,
+    #     seq_lens=seq_lens,
+    #     top_k=index_topk,
+    #     next_n=next_n,
+    #     return_val=return_val,
+    #     load_balance=False,
+    #     num_copy_bits=256,
+    # )
+    # # Extract indices from result
+    # # The wrapper returns (indices, values) if return_val=True
+    # if isinstance(result, tuple):
+    #     cute_indices, _ = result
+    # else:
+    #     cute_indices = result
+
+    result = torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
+        input_values=logits, seq_lens=seq_lens, top_k=index_topk, next_n=next_n, num_copy_bits=256
+    )
+    cute_indices = result
+
+    torch.cuda.synchronize()
+
+    # Run reference implementation
+    max_row_len = row_ends.max().item()
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
+    mask_lo = torch_indices >= 0
+    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
+    mask = mask_lo & mask_hi
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+
+    # Convert cute_indices to int32 for comparison
+    cute_indices_int32 = cute_indices.to(torch.int32)
+
+    # Compare results
+    assert compare_top_k_results(
+        logits, cute_indices_int32, torch_indices, row_starts, row_ends, index_topk
+    ), "CuTE DSL top-k results don't match torch.topk"

@@ -2789,3 +2789,229 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+
+    # ========================================================================
+    # CuTE DSL Top-K Operations
+    # ========================================================================
+
+    import cutlass
+    import cutlass.cute as cute
+
+    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
+        FilteredTopKKernelVarlenDecode
+
+    class CuteDSLTopKDecodeSingleCTARunner:
+        """Runner for CuTE DSL Top-K decode kernel (single CTA version)."""
+        kernel_cache = dict()
+
+        def __init__(self):
+            pass
+
+        def forward(
+            self,
+            input_values: torch.Tensor,
+            seq_lens: torch.Tensor,
+            top_k: int,
+            next_n: int,
+            return_val: bool = True,
+            num_copy_bits: int = 256,
+        ):
+            torch_dtype = input_values.dtype
+            torch_dtype_to_cutlass_dtype = {
+                torch.float16: cutlass.Float16,
+                torch.bfloat16: cutlass.BFloat16,
+                torch.float32: cutlass.Float32,
+            }
+            dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
+            num_rows, num_cols = input_values.shape
+
+            large_occupancy = num_rows > 148
+            load_balance = False
+
+            # Compilation key
+            key = (
+                dtype,
+                num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+            )
+
+            if key not in self.__class__.kernel_cache:
+                # Create fake tensors for compilation
+                n = cute.sym_int()
+                n_div_32 = cute.sym_int(divisibility=32)
+                input_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32)
+                buffer_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32,
+                    (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                    stride_order=(2, 1, 0),
+                    assumed_align=32,
+                )
+                seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32,
+                    (n, ),
+                    stride_order=(0, ),
+                )
+                output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32,
+                    (n, top_k),
+                    stride_order=(1, 0),
+                )
+                if return_val:
+                    output_values_fake = cute.runtime.make_fake_compact_tensor(
+                        dtype,
+                        (n, top_k),
+                        stride_order=(1, 0),
+                    )
+                else:
+                    output_values_fake = None
+                fake_stream = cute.runtime.make_fake_stream()
+
+                filtered_topk_func = FilteredTopKKernelVarlenDecode(
+                    dtype,
+                    num_cols,
+                    top_k,
+                    next_n,
+                    num_copy_bits=num_copy_bits,
+                    return_val=return_val,
+                    large_occupancy=large_occupancy,
+                )
+
+                # Compile the kernel
+                compiled_kernel = cute.compile(
+                    filtered_topk_func,
+                    input_fake,
+                    None,  # indices_fake
+                    buffer_fake,
+                    None,  # g_global_counter_fake
+                    seqlen_fake,
+                    output_indices_fake,
+                    output_values_fake,
+                    stream=fake_stream,
+                    enable_persistent_dymamic_scheduling=load_balance,
+                    min_blocks_per_mp=1,
+                )
+                self.__class__.kernel_cache[key] = compiled_kernel
+            else:
+                compiled_kernel = self.__class__.kernel_cache[key]
+
+            # Prepare output tensors
+            output_indices_torch = torch.empty(num_rows,
+                                               top_k,
+                                               dtype=torch.int32,
+                                               device="cuda")
+            if return_val:
+                output_values_torch = torch.empty(num_rows,
+                                                  top_k,
+                                                  dtype=torch_dtype,
+                                                  device="cuda")
+            else:
+                output_values_torch = None
+
+            # Prepare buffer
+            if dtype == cutlass.Float32:
+                buffer_numbers = 2
+            else:
+                buffer_numbers = 1
+            buffer_torch = torch.empty(num_rows,
+                                       buffer_numbers,
+                                       num_cols,
+                                       dtype=torch.int32,
+                                       device="cuda")
+
+            # Get current CUDA stream
+            torch_stream = torch.cuda.current_stream()
+            current_stream = cuda.CUstream(torch_stream.cuda_stream)
+
+            # Execute kernel
+            compiled_kernel(
+                input_values,
+                None,  # indices
+                buffer_torch,
+                None,  # g_global_counter_torch
+                seq_lens,
+                output_indices_torch,
+                output_values_torch,
+                current_stream,
+            )
+
+            return output_indices_torch, output_values_torch
+
+    @torch.library.custom_op("trtllm::cute_dsl_topk_decode_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_topk_decode_blackwell(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+    ) -> torch.Tensor:
+        """CuteDSL-based Top-K selection optimized for Blackwell decode phase.
+
+        Args:
+            input_values: Input logits tensor [batch_size * next_n, vocab_size]
+            seq_lens: Sequence lengths for each batch [batch_size]
+            top_k: Number of top elements to select (max 2048)
+            next_n: Number of candidates per sequence (for speculative decoding)
+            num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+
+        Returns:
+            indices: Top-k indices [batch_size * next_n, top_k]
+
+        Note:
+            This function requires Blackwell architecture (SM100+) and CuTE DSL support.
+            Maximum supported top_k is 2048.
+        """
+        # Validate SM version
+        sm_version = get_sm_version()
+        if sm_version < 100:
+            raise ValueError(
+                f"CuTE DSL top-k requires Blackwell (SM100+), but got SM {sm_version}. "
+            )
+
+        # Validate inputs
+        if top_k > 2048:
+            raise ValueError(
+                f"CuTE DSL top-k supports max top_k=2048, but got {top_k}")
+
+        if input_values.dim() != 2:
+            raise ValueError(
+                f"input_values must be 2D [num_rows, vocab_size], got shape {input_values.shape}"
+            )
+
+        if seq_lens.dim() != 1:
+            raise ValueError(
+                f"seq_lens must be 1D [batch_size], got shape {seq_lens.shape}")
+
+        # Use the Runner class
+        runner = CuteDSLTopKDecodeSingleCTARunner()
+        indices, _ = runner.forward(
+            input_values=input_values,
+            seq_lens=seq_lens,
+            top_k=top_k,
+            next_n=next_n,
+            return_val=False,  # Only return indices
+            num_copy_bits=num_copy_bits,
+        )
+        return indices
+
+    @torch.library.register_fake("trtllm::cute_dsl_topk_decode_blackwell")
+    def _(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+    ):
+        num_rows = input_values.shape[0]
+        input_values.dtype
+
+        # Create output tensors matching the custom op return signature: (values, indices)
+        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+        return indices
