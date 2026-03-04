@@ -216,7 +216,8 @@ def pulseScan(llmRepo, branchName) {
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
             withEnv([
-                "TRTLLM_ES_URL=${ELASTICSEARCH_URL}"
+                "TRTLLM_ES_URL=${ELASTICSEARCH_URL}",
+                "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
                 "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
             ]) {
                 sh """
