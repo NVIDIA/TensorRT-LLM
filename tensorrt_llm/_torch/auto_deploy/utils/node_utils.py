@@ -545,7 +545,16 @@ def get_shared_input_scale_for_fp8_linears(
         ]
         if not isinstance(scale, Node):
             return [], None
-        if scale is not first_scale and scale.target != first_scale.target:
+        if scale is first_scale:
+            continue
+
+        # Allow equivalent scale nodes only when both are stable get_attr reads
+        # of the same module attribute.
+        if not (
+            first_scale.op == "get_attr"
+            and scale.op == "get_attr"
+            and scale.target == first_scale.target
+        ):
             return [], None
 
     return fp8_linear_nodes, first_scale

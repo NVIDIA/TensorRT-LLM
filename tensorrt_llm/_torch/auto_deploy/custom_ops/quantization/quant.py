@@ -243,6 +243,8 @@ def trtllm_fp8_prequant_linear_fake(
 ) -> torch.Tensor:
     assert input_scale is not None
     output_dtype = _resolve_out_dtype_or_raise(out_dtype)
+    if bias is not None:
+        output_dtype = torch.promote_types(output_dtype, bias.dtype)
     n = weight_fp8.shape[0]
     out_shape = (*input_fp8.shape[:-1], n)
     return torch.empty(out_shape, dtype=output_dtype, device=input_fp8.device)

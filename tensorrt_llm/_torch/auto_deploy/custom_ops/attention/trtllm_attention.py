@@ -640,13 +640,12 @@ class TrtllmAttention(AttentionDescriptor):
         if traversal_ok and fp8_users and len(fp8_users) == len(terminal_users):
             # trtllm_quant_fp8_linear needs explicit out_dtype when input is already FP8
             # and bias is absent.
-            out_dtype_str = None
+            out_dtype_str = "bfloat16"
             val = source_attn_node.meta.get("val")
             if hasattr(val, "dtype"):
                 out_dtype_str = str(val.dtype).replace("torch.", "")
-            if out_dtype_str is not None:
-                for user in fp8_users:
-                    set_op_args(user, out_dtype=out_dtype_str)
+            for user in fp8_users:
+                set_op_args(user, out_dtype=out_dtype_str)
             if first_scale is not None:
                 # Ensure graph topological order: first_scale is often first created
                 # at the downstream linear, so move it before attention if needed.
