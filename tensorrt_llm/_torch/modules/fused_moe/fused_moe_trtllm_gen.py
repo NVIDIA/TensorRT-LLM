@@ -283,6 +283,8 @@ class TRTLLMGenFusedMoE(MoE):
             return 0
         elif activation_type == ActivationType.Relu2:
             return 1
+        elif activation_type == ActivationType.Silu:
+            return 2
         else:
             raise ValueError(f"Unsupported activation type: {activation_type}")
 
@@ -340,8 +342,9 @@ class TRTLLMGenFusedMoE(MoE):
                 return DeepSeekFP8BlockScalesFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_nvfp4():
                 return NVFP4TRTLLMGenFusedMoEMethod(
-                ) if self.swiglu_alpha is not None or self.activation_type == ActivationType.Relu2 else NVFP4TRTLLMGenFusedMoEBaseMethod(
-                )
+                ) if self.swiglu_alpha is not None or self.activation_type in [
+                    ActivationType.Relu2, ActivationType.Silu
+                ] else NVFP4TRTLLMGenFusedMoEBaseMethod()
             elif self.quant_config.layer_quant_mode.has_w4a16_mxfp4():
                 return W4A16MXFP4TRTLLMGenFusedMoEMethod()
             elif self.quant_config.layer_quant_mode.has_w4a8_nvfp4_fp8():
@@ -570,7 +573,9 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
             )
         elif self.has_nvfp4:
-            factor = 1 if self.activation_type == ActivationType.Relu2 else 2
+            factor = 1 if self.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+            ] else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
             act_type = self._to_trtllm_gen_activation_type(self.activation_type)

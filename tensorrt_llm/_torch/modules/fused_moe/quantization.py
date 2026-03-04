@@ -2826,10 +2826,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # last step: load fc31_scale_c
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
-        # For non-gated activations (Relu2), scale_c_fc1 is just the input scale
+        # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
         from ...utils import ActivationType
-        if hasattr(module, 'activation_type'
-                   ) and module.activation_type == ActivationType.Relu2:
+        if hasattr(module, 'activation_type') and module.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+        ]:
             # For Relu2: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
                 module.expert_size_per_partition),

@@ -1477,7 +1477,8 @@ class OpenAIServer:
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
+                output_path=self.media_storage_path /
+                f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
@@ -1646,7 +1647,8 @@ class OpenAIServer:
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
+                output_path=self.media_storage_path /
+                f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,

@@ -236,11 +236,11 @@ def trtllm_moe_fused(
             )
     else:
         # For non-gated MLP with ReLU^2
-        if act_fn == ActivationType.Relu2:
-            activation_type = ActivationType.Relu2
+        if act_fn in [ActivationType.Relu2, ActivationType.Silu]:
+            activation_type = act_fn
         else:
             raise ValueError(
-                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2'."
+                f"Unsupported activation '{ActivationType(act_fn).name}' for mlp. Use 'relu2' or 'silu'."
             )
 
     mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
@@ -293,10 +293,10 @@ def trtllm_moe_fused_fake(
 
 def _validate_mlp_style_and_act_fn(is_gated_mlp: bool, act_fn: int) -> None:
     assert (is_gated_mlp and act_fn in [ActivationType.Silu, ActivationType.Swiglu]) or (
-        not is_gated_mlp and act_fn == ActivationType.Relu2
+        not is_gated_mlp and act_fn in [ActivationType.Relu2, ActivationType.Silu]
     ), (
         f"Unsupported combination: is_gated_mlp='{is_gated_mlp}', act_fn='{act_fn}'. "
-        f"Supported combinations: gated mlp with silu or mlp with relu2."
+        f"Supported combinations: gated mlp with silu or mlp with relu2 or silu."
     )
 
 
@@ -340,7 +340,7 @@ def trtllm_quant_fp8_moe_fused(
         fc2_act_scale_reciprocal: FC2 activation scale reciprocal (scalar)
         fc2_dequant_scale: FC2 dequant scale [E]
         is_gated_mlp: True for gated_mlp, False for mlp
-        act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 for mlp
+        act_fn: ActivationType.Silu for gated_mlp, ActivationType.Relu2 or ActivationType.Silu for mlp
 
     Returns:
         Output tensor of shape (B, H) or (B, S, H)
@@ -481,7 +481,7 @@ def trtllm_quant_nvfp4_moe_fused(
         fc1_alpha: FC1 dequant scales = 1.0 / (fc1_act_global_scale * fc1_weight_global_scale)
         fc2_alpha: FC2 dequant scales = 1.0 / (fc2_act_global_scale * fc2_weight_global_scale)
         mlp_style: "gated_mlp" or "mlp"
-        act_fn: "silu" for gated_mlp, "relu2" for mlp
+        act_fn: "silu" for gated_mlp, "relu2" or "silu" for mlp
     """
 
     # Validate block scale tensors are 3D (padding requirements handled below)
