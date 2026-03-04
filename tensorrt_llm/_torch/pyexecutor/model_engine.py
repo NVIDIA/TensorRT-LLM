@@ -676,13 +676,18 @@ class PyTorchModelEngine(ModelEngine):
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-        if not self.is_draft_model and not self.mapping.has_cp_helix():
-            # Run extra general warmup to warmup memory pool before running real requests.
+        if not self.is_draft_model and not self.mapping.has_cp_helix(
+        ) and self.guided_decoder is None:
+            # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
             self._general_warmup(resource_manager, reverse=True)
 
     def _general_warmup(self,
                         resource_manager: ResourceManager,
                         reverse: bool = False):
+        """
+        A General warmup to warmup with several different requests.
+        It is used to warmup torch.compile path and warmup memory pool before running real requests.
+        """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
