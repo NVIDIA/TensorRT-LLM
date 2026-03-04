@@ -826,14 +826,23 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
 
 void WindowBlockManager::freeChildren(BlockPtr const& block)
 {
-    // Tell event manager we are freeing block
+    // Tell event manager we are freeing block and all its descendants
     if (mEventManager && blockInRadixTree(block))
     {
-        mEventManager->enqueueRemovedEvent(block, mWindowSize);
+        enqueueRemovedEventsRecursively(block);
     }
 
-    // Free block and all it's descendants from radix tree
+    // Free block and all its descendants from radix tree
     block->freeBlockAndAllDescendants();
+}
+
+void WindowBlockManager::enqueueRemovedEventsRecursively(BlockPtr const& block)
+{
+    for (auto const& [key, child] : block->getNextBlocks())
+    {
+        enqueueRemovedEventsRecursively(child);
+    }
+    mEventManager->enqueueRemovedEvent(block, mWindowSize);
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
