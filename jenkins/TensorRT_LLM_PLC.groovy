@@ -211,14 +211,20 @@ def pulseScan(llmRepo, branchName) {
         sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
         sh "cat sbom_toupload.json"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
+            def ELASTICSEARCH_URL = "http://nvdataflow.nvidia.com/dataflow2/swdl-tensorrt/posting"
+            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-trtllm-plc"
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
-            sh """
-                export TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}
-                python3 -m venv venv
-                venv/bin/pip install requests
-                venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
-            """
+            withEnv([
+                "TRTLLM_ES_URL=${ELASTICSEARCH_URL}"
+                "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
+            ]) {
+                sh """
+                    python3 -m venv venv
+                    venv/bin/pip install requests
+                    venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
+                """
+            }
         }
     }
 }
