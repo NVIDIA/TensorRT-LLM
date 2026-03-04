@@ -6,10 +6,11 @@
   - [NIXL Backend Configuration](#nixl-backend-configuration)
   - [Overlap Optimization](#Overlap-Optimization)
   - [Cache Layout Transformation](#Cache-Layout-Transformation)
-  - [Unique Global Request ID](`#Unique-Global-Request-ID`)
+  - [Unique Global Request ID](#Unique-Global-Request-ID)
 - [Usage](#Usage)
   - [Dynamo](#Dynamo)
   - [trtllm-serve](#trtllm-serve)
+  - [Multiple Instances](#multiple-instances)
 - [Environment Variables](#Environment-Variables)
 - [Troubleshooting and FAQ](#Troubleshooting-and-FAQ)
 
@@ -40,7 +41,7 @@ In aggregated LLM serving, both the context and generation phases share the same
 
 Disaggregated serving resolves these challenges by decoupling the two phases, allowing each to run on separate GPU pools and using different parallelism strategies. This separation removes the interference between context and generation phases, as shown in Figure 2, and enables independent optimization of TTFT and TPOT. Although disaggregation incurs overhead for transferring the KV cache blocks from context to generation GPUs, the advantages can be substantial—particularly for workloads with long input sequences and moderate output lengths where interference is most severe.
 
-You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rational and design considerations of disaggregated serving.
+You can also refer to [this paper](https://arxiv.org/pdf/2506.05508) for more details about the rationale and design considerations of disaggregated serving.
 
 ## KV Cache Exchange
 
@@ -154,7 +155,7 @@ Note: NIXL supports multiple underlying backends configured via the `TRTLLM_NIXL
 
 `max_tokens_in_buffer` defines the buffer size for kvCache transfers, it is recommended to set this value greater than or equal to the maximum ISL (Input Sequence Length) of all requests for optimal performance.
 
-For example, you could launch two context servers and one generation servers as follows:
+For example, you could launch two context servers and one generation server as follows:
 
 ```
 
@@ -199,7 +200,7 @@ generation_servers:
 When routing requests to the context servers, the disaggregated server will mark the requests as "context-only" to skip the generation phase. Similarly,
 when routing requests to the generation servers, the disaggregated server will mark the requests as "generation-only" to skip the context phase.
 
-Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI compatible endpoint. For example,  you can send requests to the disaggregated server using curl:
+Clients can then send requests to the disaggregated server at `localhost:8000`, which is an OpenAI-compatible endpoint. For example, you can send requests to the disaggregated server using curl:
 ```bash
 curl http://localhost:8000/v1/completions \
     -H "Content-Type: application/json" \
@@ -214,6 +215,23 @@ curl http://localhost:8000/v1/completions \
 #### Launching disaggregated servers on SLURM clusters
 
 Please refer to [Disaggregated Inference Benchmark Scripts](../../../examples/disaggregated/slurm).
+
+### Multiple Instances
+
+To increase maximum concurrency without more GPU nodes, you can deploy multiple disaggregated server instances across different nodes, while each instance manages the same context/generation servers. This is helpful when one disaggregated server becomes a performance bottleneck or runs out of ephemeral ports.
+
+Example (two-node deployment):
+
+- **Node A**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-a:8000`
+- **Node B**
+  - Context servers: `node-a:8001`
+  - Generation servers: `node-b:8002`
+  - Disaggregated orchestrator endpoint: `node-b:8000`
+- **Client entrypoint**
+  - Send requests or use a load balancer forwarding to `node-a:8000` and `node-b:8000`
 
 ## Environment Variables
 
@@ -242,7 +260,7 @@ There are some other useful environment variables that may help when encounterin
 
 * `NCCL_GRAPH_MIXING_SUPPORT`: With the default value `1`, the CUDA driver may create too many CUDA streams while working with one CUDA graph, leading to performance drop. Setting it to `0` will reduce the number of CUDA streams, but please make sure there are no other NCCL ops outside the one CUDA graph, otherwise it's unsafe.
 
-* ``UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
+* `UCX_MAX_RNDV_RAILS`: With the default value 2, UCX attempts to use two InfiniBand (IB) NIC devices per GPU for Rendezvous (RNDV) transfers. When both the context and generation instances enable tensor- and expert-parallel (TEP), multiple TP ranks may transfer KV cache concurrently. Because each TP rank can use up to two NIC devices, some NIC devices can be shared across GPUs, causing contention and reduced throughput. Setting UCX_MAX_RNDV_RAILS=1 can reduce contention in this case.
 
 ## Troubleshooting and FAQ
 
@@ -250,7 +268,7 @@ There are some other useful environment variables that may help when encounterin
 
 *Q. What are the limitations of disaggregated serving in TRT-LLM?*
 
-A. Currently, only decoder-only models and beam width of 1  are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
+A. Currently, only decoder-only models and beam width of 1 are supported. Also the KV cache at each layer of the model is required to be homogeneous, with the same data type and the same number of attention heads.
 
 *Q. When using the TRT backend, is the engine used for disaggregated serving different from other engines?*
 

@@ -3,7 +3,7 @@ compile_backend: torch-cudagraph
 max_batch_size: 384
 max_seq_len: 65536 # tunable
 enable_chunked_prefill: true
-attn_backend: flashinfer
+attn_backend: trtllm
 model_factory: AutoModelForCausalLM
 skip_loading_weights: false
 cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384]
@@ -37,7 +37,7 @@ transforms:
         "fc2_latent_proj": "gather"
   multi_stream_moe:
     stage: compile
-    enabled: false
+    enabled: true
   gather_logits_before_lm_head:
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
     enabled: true

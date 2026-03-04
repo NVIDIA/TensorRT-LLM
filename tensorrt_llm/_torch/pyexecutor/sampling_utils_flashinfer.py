@@ -30,6 +30,7 @@ if sys.version_info[:2] >= (3, 12):
 else:
     from typing_extensions import override
 
+from ..._utils import prefer_pinned
 from ..flashinfer_utils import get_env_enable_pdl
 from .sampling_utils import (
     GREEDY,
@@ -91,7 +92,7 @@ class _StrategyImpls:
 
         @staticmethod
         def _make_tensor(data: list, dtype: torch.dtype, device: torch.device) -> torch.Tensor:
-            return torch.tensor(data, dtype=dtype, pin_memory=True).to(
+            return torch.tensor(data, dtype=dtype, pin_memory=prefer_pinned()).to(
                 device=device, non_blocking=True
             )
 
@@ -611,6 +612,9 @@ class _StrategyImpls:
             generator: Optional[torch.Generator] = None,
             group_metadata: StrategyMetadata | None = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            # NB: Gumbel-max trick sampling used by flashinfer.sampling.sampling_from_logits
+            #     is numerically tricky and was not observed to provide a performance advantage
+            #     (cf. https://nvbugs/5791242).
             new_tokens, _ = self._sample_with_probs(
                 logits,
                 group_logit_indices=group_logit_indices,
@@ -619,21 +623,6 @@ class _StrategyImpls:
                 temperature=self._temperature,
                 generator=generator,
             )
-            # FIXME: https://nvbugs/5791242
-            # logits = self._prepare_logits_with_temperature(
-            #    logits, group_logit_indices, self._temperature
-            # )
-            # new_tokens = flashinfer.sampling.sampling_from_logits(
-            #    logits,
-            #    # NB: Leveraging 'indices' would require applying temperature+softmax before batching,
-            #    #     because 'flashinfer.sampling.softmax' has no 'indices' argument; but that would
-            #    #     compute unnecessarily softmax also for situations allowing
-            #    #     flashinfer.sampling...._sampling_from_logits.
-            #    # indices=group_logit_indices,
-            #    deterministic=True,
-            #    generator=generator,
-            #    check_nan=self._flashinfer_check_nans(logits),
-            # )
             return new_tokens, None
 
     class BeamSearchSampleOnly(BeamSearchMixin, StrategyImplSampleOnly):

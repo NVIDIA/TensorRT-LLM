@@ -22,6 +22,7 @@
 #include "tensorrt_llm/runtime/modelConfig.h"
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <variant>
 #include <vector>
@@ -108,7 +109,8 @@ public:
     [[nodiscard]] bool operator==(kv_cache::CacheState const& other) const noexcept
     {
         return mModelConfig == other.mModelConfig && mParallelConfig == other.mParallelConfig
-            && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType;
+            && mAttentionConfig == other.mAttentionConfig && mDataType == other.mDataType
+            && mRnnCacheState == other.mRnnCacheState;
     }
 
     struct ModelConfig
@@ -165,6 +167,41 @@ public:
         int mKvFactor;
     };
 
+    struct RnnModelConfig
+    {
+        SizeType32 mDState;      // SSM state dimension
+        SizeType32 mDConv;       // Conv state dimension (convKernel - 1)
+        SizeType32 mHiddenSize;  // Hidden dimension
+        SizeType32 mHeadDim;     // Head dimension (0 for Mamba1, >0 for Mamba2)
+        SizeType32 mConvDimSize; // Conv dimension size
+        SizeType32 mNGroups;     // Number of groups (for Mamba2)
+        SizeType32 mNumLayers;   // Number of layers
+        SizeType32 mNumHeads;    // Number of heads
+
+        [[nodiscard]] bool operator==(RnnModelConfig const& other) const noexcept
+        {
+            return mDState == other.mDState && mDConv == other.mDConv && mHiddenSize == other.mHiddenSize
+                && mHeadDim == other.mHeadDim && mConvDimSize == other.mConvDimSize && mNGroups == other.mNGroups
+                && mNumLayers == other.mNumLayers && mNumHeads == other.mNumHeads;
+        }
+    };
+
+    /// @brief Groups all RNN/Mamba cache configuration within CacheState.
+    struct RnnCacheState
+    {
+        RnnModelConfig mModelConfig;
+        /// Number of RNN layers per pipeline parallelism rank.
+        std::vector<SizeType32> mLayerNumPerPP;
+        nvinfer1::DataType mConvStateDataType;
+        nvinfer1::DataType mSsmStateDataType;
+
+        [[nodiscard]] bool operator==(RnnCacheState const& other) const noexcept
+        {
+            return mModelConfig == other.mModelConfig && mLayerNumPerPP == other.mLayerNumPerPP
+                && mConvStateDataType == other.mConvStateDataType && mSsmStateDataType == other.mSsmStateDataType;
+        }
+    };
+
     [[nodiscard]] ModelConfig const& getModelConfig() const
     {
         return mModelConfig;
@@ -210,6 +247,43 @@ public:
         return mIndexerKCacheQuantBlockSize;
     }
 
+    // =========================================================================
+    // RNN/Mamba cache state (optional, present only for hybrid models)
+    // =========================================================================
+
+    [[nodiscard]] bool hasRnnConfig() const noexcept
+    {
+        return mRnnCacheState.has_value();
+    }
+
+    void setRnnConfig(RnnModelConfig rnnModelConfig, std::vector<SizeType32> rnnLayerNumPerPP,
+        nvinfer1::DataType convStateDataType, nvinfer1::DataType ssmStateDataType)
+    {
+        mRnnCacheState = RnnCacheState{
+            std::move(rnnModelConfig), std::move(rnnLayerNumPerPP), convStateDataType, ssmStateDataType};
+    }
+
+    [[nodiscard]] RnnCacheState const& getRnnCacheState() const
+    {
+        TLLM_CHECK(mRnnCacheState.has_value());
+        return mRnnCacheState.value();
+    }
+
+    [[nodiscard]] RnnModelConfig const& getRnnModelConfig() const
+    {
+        return getRnnCacheState().mModelConfig;
+    }
+
+    [[nodiscard]] nvinfer1::DataType getConvStateDataType() const
+    {
+        return getRnnCacheState().mConvStateDataType;
+    }
+
+    [[nodiscard]] nvinfer1::DataType getSsmStateDataType() const
+    {
+        return getRnnCacheState().mSsmStateDataType;
+    }
+
     [[nodiscard]] std::string toString() const
     {
         std::stringstream sstring;
@@ -234,6 +308,21 @@ public:
         sstring << "hasIndexerKCache:" << mHasIndexerKCache << "\n";
         sstring << "indexerDimPerHead:" << mIndexerDimPerHead << "\n";
         sstring << "indexerKCacheQuantBlockSize:" << mIndexerKCacheQuantBlockSize << "\n";
+        if (mRnnCacheState.has_value())
+        {
+            auto const& rnn = mRnnCacheState.value();
+            sstring << "RnnCacheState:\n";
+            sstring << "  dState:" << rnn.mModelConfig.mDState << "\n";
+            sstring << "  dConv:" << rnn.mModelConfig.mDConv << "\n";
+            sstring << "  hiddenSize:" << rnn.mModelConfig.mHiddenSize << "\n";
+            sstring << "  headDim:" << rnn.mModelConfig.mHeadDim << "\n";
+            sstring << "  convDimSize:" << rnn.mModelConfig.mConvDimSize << "\n";
+            sstring << "  nGroups:" << rnn.mModelConfig.mNGroups << "\n";
+            sstring << "  numLayers:" << rnn.mModelConfig.mNumLayers << "\n";
+            sstring << "  numHeads:" << rnn.mModelConfig.mNumHeads << "\n";
+            sstring << "  convStateDataType:" << static_cast<int32_t>(rnn.mConvStateDataType) << "\n";
+            sstring << "  ssmStateDataType:" << static_cast<int32_t>(rnn.mSsmStateDataType) << "\n";
+        }
         return sstring.str();
     }
 
@@ -248,6 +337,8 @@ private:
     bool mHasIndexerKCache{false};
     SizeType32 mIndexerDimPerHead{0};
     SizeType32 mIndexerKCacheQuantBlockSize{128};
+    // RNN/Mamba cache state (optional, for hybrid models)
+    std::optional<RnnCacheState> mRnnCacheState;
 };
 
 struct MpiState
@@ -453,6 +544,12 @@ public:
     [[nodiscard]] std::optional<kv_cache::CommState> const& getCommState() const noexcept
     {
         return mCommState;
+    }
+
+    /// @brief Check if the cache state has RNN configuration.
+    [[nodiscard]] bool hasRnnCacheState() const noexcept
+    {
+        return mCacheState.has_value() && mCacheState->hasRnnConfig();
     }
 
     [[nodiscard]] bool operator==(DataTransceiverState const& other) const noexcept

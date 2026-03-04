@@ -50,7 +50,8 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather,
+                           cp_allgather)
 from ..model_config import ModelConfig
 from ..modules.attention import MLA
 from ..modules.decoder_layer import DecoderLayer
@@ -718,7 +719,7 @@ class DeepseekV3Attention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
                          num_key_value_heads=config.num_key_value_heads,
@@ -766,7 +767,7 @@ class DeepseekV32Attention(MLA):
         reduce_output: bool = True,
     ):
         config = model_config.pretrained_config
-        predicted_tokens_per_seq = model_config.spec_config.max_total_draft_tokens + 1 if model_config.spec_config is not None else 1
+        predicted_tokens_per_seq = model_config.spec_config.tokens_per_gen_step if model_config.spec_config is not None else 1
 
         super().__init__(hidden_size=config.hidden_size,
                          num_attention_heads=config.num_attention_heads,
@@ -968,10 +969,19 @@ class Deepseekv3MoE(nn.Module):
 
         self.mapping = model_config.mapping
 
-        # FIXME: incompatible with mixed quantization mode (including excluding modules from quantization)
+        shared_quant_config = self._get_shared_experts_quant_config(
+            model_config, layer_idx)
+        shared_model_config = model_config
+        if shared_quant_config is not model_config.quant_config:
+            shared_model_config = copy.copy(model_config)
+            shared_model_config.quant_config = shared_quant_config
+
+        # For shared experts, use the block size implied by their quant config.
         block_size = 1
-        if model_config.quant_config and model_config.quant_config.group_size is not None:
-            block_size = model_config.quant_config.group_size
+        if (shared_quant_config is not None
+                and shared_quant_config.quant_algo is not None
+                and shared_quant_config.group_size is not None):
+            block_size = shared_quant_config.group_size
 
         shared_tp_size, self.shared_output_scale = self._compute_shared_expert_tp_size(
             shared_expert_intermediate_size, block_size)
@@ -981,11 +991,14 @@ class Deepseekv3MoE(nn.Module):
             intermediate_size=shared_expert_intermediate_size,
             bias=False,
             dtype=dtype,
-            config=model_config,
+            config=shared_model_config,
             overridden_tp_size=shared_tp_size,
             reduce_output=False,
             use_cute_dsl_blockscaling_mm=self.use_cute_dsl_blockscaling_mm,
         )
+        self.shared_experts_use_fp4 = (
+            shared_quant_config is not None
+            and shared_quant_config.layer_quant_mode.has_nvfp4())
 
         self.allreduce = None
         if not self.use_dp and self.mapping.tp_size > 1:
@@ -1071,6 +1084,39 @@ class Deepseekv3MoE(nn.Module):
             device=device,
             dtype=self.dtype)
 
+    @staticmethod
+    def _get_shared_experts_quant_config(model_config,
+                                         layer_idx: int) -> QuantConfig:
+        # Prefer explicit per-layer quant config if provided.
+        if getattr(model_config, "quant_config_dict", None) is not None:
+            base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+            qcfg = model_config.quant_config_dict.get(base_name, None)
+            if qcfg is not None:
+                return qcfg
+            for name, qcfg in model_config.quant_config_dict.items():
+                if name.startswith(base_name + "."):
+                    return qcfg
+
+        quant_config = model_config.quant_config
+        if quant_config is None or quant_config.exclude_modules is None:
+            return quant_config
+
+        base_name = f"model.layers.{layer_idx}.mlp.shared_experts"
+        candidates = [
+            base_name,
+            f"{base_name}.gate_up_proj",
+            f"{base_name}.down_proj",
+            f"{base_name}.gate_proj",
+            f"{base_name}.up_proj",
+        ]
+        if any(
+                quant_config.is_module_excluded_from_quantization(name)
+                for name in candidates):
+            return QuantConfig(
+                quant_algo=None,
+                kv_cache_quant_algo=quant_config.kv_cache_quant_algo)
+        return quant_config
+
     def compute_routed_output(self, hidden_states, hidden_states_fp4,
                               all_rank_num_tokens, do_finalize):
         # max-throughput
@@ -1123,9 +1169,11 @@ class Deepseekv3MoE(nn.Module):
             assert not self.use_dp
 
         def _compute_shared_output():
-            shared_output = self.shared_experts(
-                hidden_states_fp4
-                if hidden_states_fp4 is not None else hidden_states)
+            shared_input = (hidden_states_fp4 if
+                            (hidden_states_fp4 is not None
+                             and self.shared_experts_use_fp4) else
+                            hidden_states)
+            shared_output = self.shared_experts(shared_input)
             if self.shared_output_scale is not None:
                 shared_output *= self.shared_output_scale
             return shared_output
@@ -1368,12 +1416,13 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
+            residual=residual,
             **kwargs,
         )
         if isinstance(self.mlp, Deepseekv3MoE):
@@ -1635,12 +1684,13 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states = self.self_attn(
+        hidden_states, residual = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
+            residual=residual,
             **kwargs,
         )
 
@@ -1697,6 +1747,7 @@ class DeepseekV3Model(DecoderModel):
         config = model_config.pretrained_config
         self.vocab_size = config.vocab_size
         self.num_hidden_layers = config.num_hidden_layers
+        self.mapping_with_cp = mapping_with_cp
         aux_stream_list = [torch.cuda.Stream() for _ in range(4)]
         self.aux_stream_dict = {
             AuxStreamType.Attention: aux_stream_list[0],
@@ -1752,6 +1803,17 @@ class DeepseekV3Model(DecoderModel):
                 residual=residual,
                 spec_metadata=spec_metadata,
             )
+
+        # With CP helix, the last layer's reduce-scatter leaves each rank
+        # with only its chunk of tokens.  AllGather restores the full token
+        # count so the LM head (and norm) see every token.
+        if (self.mapping_with_cp is not None
+                and self.mapping_with_cp.has_cp_helix()
+                and self.mapping_with_cp.enable_attention_dp):
+            hidden_states = cp_allgather(hidden_states,
+                                         self.mapping_with_cp,
+                                         dim=0)
+            hidden_states = hidden_states[:attn_metadata.num_tokens]
 
         return hidden_states
 
@@ -1840,16 +1902,18 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
         input_ids: torch.IntTensor = None,
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
-        spec_metadata: Optional[SpecMetadata] = None,
         return_context_logits: bool = False,
+        spec_metadata: Optional[SpecMetadata] = None,
+        resource_manager=None,
         **kwargs,
     ) -> torch.Tensor:
         return super().forward(attn_metadata=attn_metadata,
                                input_ids=input_ids,
                                position_ids=position_ids,
                                inputs_embeds=inputs_embeds,
-                               spec_metadata=spec_metadata,
                                return_context_logits=return_context_logits,
+                               spec_metadata=spec_metadata,
+                               resource_manager=resource_manager,
                                **kwargs)
 
     def load_weights(self, weights: ConsumableWeightsDict):
@@ -1864,3 +1928,47 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             else:
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
+
+
+@register_auto_model("KimiK25ForConditionalGeneration")
+class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
+    """Kimi-K2.5 multimodal model (text-only path).
+
+    Extracts the DeepSeek-V3 text backbone from the composite config
+    and strips the ``language_model.`` weight prefix so that the
+    standard DeepseekV3ForCausalLM loading path works unchanged.
+
+    NOTE: Kimi-K2.5's text backbone sets ``num_nextn_predict_layers = 0``,
+    so MTP-based speculative decoding is not applicable to this model.
+    """
+
+    _LANG_PREFIX = "language_model."
+
+    def __init__(self, model_config: ModelConfig[PretrainedConfig]):
+        model_config = copy.copy(model_config)
+        assert hasattr(model_config.pretrained_config, 'text_config'), \
+            "Kimi K2.5 config must have text_config"
+        model_config._frozen = False
+        model_config.pretrained_config = model_config.pretrained_config.text_config
+        if model_config.quant_config.exclude_modules:
+            model_config.quant_config = copy.copy(model_config.quant_config)
+            p = self._LANG_PREFIX
+            mapped = []
+            for m in model_config.quant_config.exclude_modules:
+                if m.startswith(p):
+                    rest = m[len(p):]
+                    if rest.startswith('layers.'):
+                        rest = 'model.' + rest
+                    mapped.append(rest)
+                else:
+                    mapped.append(m)
+            model_config.quant_config.exclude_modules = mapped
+        model_config._frozen = True
+        super().__init__(model_config)
+
+    def load_weights(self, weights: ConsumableWeightsDict):
+        has_prefix = any(k.startswith("language_model.") for k in weights)
+        if has_prefix:
+            weights = filter_weights("language_model", weights)
+            weights = ConsumableWeightsDict(weights)
+        super().load_weights(weights)

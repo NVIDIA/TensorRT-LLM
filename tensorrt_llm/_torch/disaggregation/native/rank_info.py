@@ -3,7 +3,7 @@ from typing import List, Optional
 
 import msgpack
 
-from tensorrt_llm._torch.disaggregation.native.region.aux import AuxBufferMeta
+from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBufferMeta
 
 
 @dataclass

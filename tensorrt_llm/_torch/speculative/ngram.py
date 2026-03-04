@@ -51,7 +51,7 @@ class NGramPoolManager(BaseResourceManager):
 
     def __init__(self, spec_config: "NGramDecodingConfig",
                  max_num_requests: int):
-        self.max_total_draft_tokens = spec_config.max_total_draft_tokens
+        self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         self.max_matching_ngram_size = spec_config.max_matching_ngram_size
         self.is_keep_all = spec_config.is_keep_all
         self.is_use_oldest = spec_config.is_use_oldest  # TODO: remove this if updating strategy is supported
@@ -169,14 +169,14 @@ class NGramDrafter(Drafter):
     ):
         super().__init__(
             max_draft_len=spec_config.max_draft_len,
-            max_total_draft_tokens=spec_config.max_total_draft_tokens,
+            max_total_draft_tokens=spec_config.tokens_per_gen_step - 1,
             max_concurrency=spec_config.max_concurrency,
             draft_len_schedule=spec_config.draft_len_schedule)
         assert ngram_pool_manager is not None, "NGram needs a resource manager to maintain the pool."
         self.spec_resource_manager = ngram_pool_manager
         self.spec_config = spec_config
         self.max_draft_len = spec_config.max_draft_len
-        self.max_total_draft_tokens = spec_config.max_total_draft_tokens
+        self.max_total_draft_tokens = spec_config.tokens_per_gen_step - 1
         assert self.max_draft_len == self.max_total_draft_tokens, "NGram only supports linear tree."
 
     def prepare_draft_tokens(

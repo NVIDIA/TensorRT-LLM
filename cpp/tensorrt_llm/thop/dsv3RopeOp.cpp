@@ -125,7 +125,7 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     torch::optional<torch::Tensor> kv_scale_orig_quant, // [1] q,k quant scale
     torch::optional<torch::Tensor> kv_scale_quant_orig, // [1] bmm quant scale
     torch::optional<torch::Tensor> out_scale,           // [1] output quant scale
-    std::optional<torch::Tensor> block_ids_per_seq, std::vector<std::optional<torch::Tensor>> mla_tensor_params,
+    std::optional<torch::Tensor> block_ids_per_seq, std::vector<std::optional<torch::Tensor>> helix_tensor_params,
     int64_t const predicted_tokens_per_seq, int64_t const layer_idx, int64_t const num_heads,
     int64_t const num_kv_heads, int64_t const head_size,
 
@@ -136,8 +136,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     TLLM_CHECK_WITH_INFO(
         head_size == kv_lora_rank + qk_rope_head_dim, "head_size must = kv_lora_rank + qk_rope_head_dim");
     TLLM_CHECK_WITH_INFO(num_kv_heads == 1, "num_kv_heads must = 1");
-    TORCH_CHECK(mla_tensor_params.size() == 2,
-        "Expecting 2 tensors for custom MLA tensor params: helix_position_offsets and helix_is_inactive_rank.");
+    TORCH_CHECK(helix_tensor_params.size() == 2,
+        "Expecting 2 tensors for helix_tensor_params: helix_position_offsets and helix_is_inactive_rank.");
 
     auto stream = at::cuda::getCurrentCUDAStream(fused_q.get_device());
     auto const kv_cache_quant_mode = tc::QuantMode(uint32_t(quant_mode));
@@ -155,8 +155,8 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
     int32_t const num_generations = num_seqs - num_contexts;
     int32_t const num_gen_tokens = num_tokens;
     int32_t const seq_offset = num_contexts;
-    auto& mla_helix_position_offsets = mla_tensor_params[0];
-    auto& mla_helix_is_inactive_rank = mla_tensor_params[1];
+    auto const& helix_position_offsets = helix_tensor_params[0];
+    auto const& helix_is_inactive_rank = helix_tensor_params[1];
     int32_t const layer_num = host_kv_cache_pool_mapping.value().size(0);
 
     tk::MlaMetaParams mla_meta_params = {static_cast<int>(q_lora_rank), static_cast<int>(kv_lora_rank),
@@ -164,9 +164,9 @@ void MLARopeGeneration(torch::Tensor fused_q, // [tokens, num_heads, (nope_dim +
         static_cast<int>(predicted_tokens_per_seq), static_cast<int>(layer_num)};
 
     int32_t const* helix_position_offsets_ptr
-        = mla_helix_position_offsets.has_value() ? mla_helix_position_offsets->data_ptr<int32_t>() : nullptr;
+        = helix_position_offsets.has_value() ? helix_position_offsets->data_ptr<int32_t>() : nullptr;
     bool const* helix_is_inactive_rank_ptr
-        = mla_helix_is_inactive_rank.has_value() ? mla_helix_is_inactive_rank->data_ptr<bool>() : nullptr;
+        = helix_is_inactive_rank.has_value() ? helix_is_inactive_rank->data_ptr<bool>() : nullptr;
 
     int* cu_q_seqlens_ptr = reinterpret_cast<int*>(cu_q_seqlens.data_ptr());
     int* cu_kv_seqlens_ptr = reinterpret_cast<int*>(cu_kv_seqlens.data_ptr());
@@ -336,7 +336,7 @@ TORCH_LIBRARY_FRAGMENT(trtllm, m)
         ", Tensor? kv_scale_quant_orig"
         ", Tensor? out_scale"
         ", Tensor? block_ids_per_seq"
-        ", Tensor?[] mla_tensor_params"
+        ", Tensor?[] helix_tensor_params"
         ", int predicted_tokens_per_seq"
         ", int layer_idx"
         ", int num_heads"
