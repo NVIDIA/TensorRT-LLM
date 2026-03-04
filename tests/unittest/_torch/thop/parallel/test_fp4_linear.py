@@ -469,7 +469,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                                                  weight_scale=w_sf_block,
                                                  alpha=alpha_tensor,
                                                  output_dtype=dtype,
-                                                 to_userbuffers=False,
+                                                 output_buffer_kind=0,
                                                  allowed_backends='cutlass')
 
     # Test auto backend selection with autotuning
@@ -481,7 +481,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
             weight_scale=w_sf_block,
             alpha=alpha_tensor,
             output_dtype=dtype,
-            to_userbuffers=False,
+            output_buffer_kind=0,
             allowed_backends='cutlass,cublaslt,cuda_core,cutedsl')
 
     AutoTuner.get().print_profiling_cache()
@@ -509,7 +509,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
             weight_scale=w_sf_block,
             alpha=alpha_tensor,
             output_dtype=dtype,
-            to_userbuffers=False,
+            output_buffer_kind=0,
             allowed_backends='cutlass,cublaslt,cuda_core,cutedsl')
 
     outer_tactics_list = list(outer_capture)
@@ -609,7 +609,7 @@ def test_nvfp4_gemm_unified_all_tactics(dtype, mnk):
                 weight_scale=w_sf_block,
                 alpha=alpha_tensor,
                 output_dtype=dtype,
-                to_userbuffers=False,
+                output_buffer_kind=0,
                 allowed_backends='cuda_core')
 
             torch.testing.assert_close(output_cuda_core,
@@ -724,7 +724,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
                                                  weight_scale=w_sf_block,
                                                  alpha=alpha_tensor,
                                                  output_dtype=dtype,
-                                                 to_userbuffers=False,
+                                                 output_buffer_kind=0,
                                                  allowed_backends='cutlass')
 
         # Test CUDA Core backend
@@ -735,7 +735,7 @@ def test_fp4_linear_cuda_core(dtype, mnk):
             weight_scale=w_sf_block,
             alpha=alpha_tensor,
             output_dtype=dtype,
-            to_userbuffers=False,
+            output_buffer_kind=0,
             allowed_backends='cuda_core')
 
     # Compare results

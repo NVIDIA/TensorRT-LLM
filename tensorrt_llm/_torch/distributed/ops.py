@@ -749,6 +749,38 @@ class AllReduce(nn.Module):
                     )
                     self.mnnvl_allreduce = None
 
+    def uses_nccl_window(self) -> bool:
+        """Return True if this allreduce uses an NCCL window (NCCL_SYMMETRIC, NCCL, or AUTO)."""
+        return self.strategy in (AllReduceStrategy.NCCL_SYMMETRIC,
+                                 AllReduceStrategy.NCCL, AllReduceStrategy.AUTO)
+
+    def get_nccl_window_for_shape(
+        self,
+        shape: Tuple[int, ...],
+        all_reduce_params: Optional[AllReduceParams] = None,
+        like_tensor: Optional[torch.Tensor] = None,
+    ) -> Optional[torch.Tensor]:
+        """Return a pre-allocated NCCL window tensor of the given shape for use as
+        allreduce input, so the producer can write directly into it (no extra copy).
+        Returns None if window is not applicable (e.g. MPI disabled, strategy not NCCL).
+        """
+        if self.mapping.tp_size <= 1 or self._disable_mpi:
+            return None
+        if like_tensor is None:
+            return None
+        if not self.uses_nccl_window():
+            return None
+        shape_list = list(shape)
+        try:
+            window_tensor, is_valid = torch.ops.trtllm.create_nccl_window_tensor(
+                like_tensor, self.mapping.tp_group, shape_list)
+            if (bool(is_valid) and window_tensor is not None
+                    and window_tensor.numel() > 0):
+                return window_tensor
+        except Exception:
+            pass
+        return None
+
     def forward(
         self,
         input: torch.Tensor,

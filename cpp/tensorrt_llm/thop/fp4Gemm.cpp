@@ -17,6 +17,7 @@
 #include "cutlass_extensions/gemm_configs.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/kernels/quantization.h"
+#include "tensorrt_llm/thop/outputTensor.h"
 #include "tensorrt_llm/thop/thUtils.h"
 #include "tensorrt_llm/thop/userbuffersTensor.h"
 #if defined(USING_OSS_CUTLASS_FP4_GEMM)
@@ -32,7 +33,6 @@
 #include <cuda_fp16.h>
 
 #include <cstdint>
-#include <functional>
 #include <type_traits>
 #include <vector>
 
@@ -130,8 +130,8 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 // Only W4A4_NVFP4 and W4A8_MXFP4_FP8 are currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, FP4GemmType fp4GemmType,
-    std::optional<c10::ScalarType> out_dtype, bool to_userbuffers = false,
-    tkc::CutlassGemmConfig const* maybe_config = nullptr)
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind, tkc::CutlassGemmConfig const* maybe_config,
+    c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
@@ -194,15 +194,8 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         "out_dtype must be one of fp16/bf16/fp32. It defaults to fp16.");
 
     std::vector<int64_t> out_shape = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
-    at::Tensor out;
-    if (to_userbuffers)
-    {
-        out = torch_ext::create_userbuffers_tensor(out_shape, out_dtype.value()).first;
-    }
-    else
-    {
-        out = at::detail::empty_cuda(out_shape, out_dtype.value(), mat1.device(), std::nullopt);
-    }
+    at::Tensor out = torch_ext::allocate_output(out_shape, out_dtype.value(), mat1.device(),
+        static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
@@ -228,8 +221,8 @@ at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor co
     // The functional version of this op does not do any profiling; use the profiler class below instead for
     // better performance.
     // Note that we can still add a heuristic here.
-    return fp4_bmm_impl(
-        mat1, mat2, mat1Scale, mat2Scale, globalScale, static_cast<FP4GemmType>(fp4GemmType), out_dtype);
+    return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, static_cast<FP4GemmType>(fp4GemmType), out_dtype,
+        static_cast<int>(torch_ext::OutputBufferKind::Default), nullptr);
 }
 
 class FP4GemmRunner : public torch::CustomClassHolder
@@ -282,7 +275,8 @@ public:
     }
 
     at::Tensor runGemm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
-        at::Tensor const& mat2Scale, at::Tensor const& globalScale, bool to_userbuffers, int64_t configIdx) const
+        at::Tensor const& mat2Scale, at::Tensor const& globalScale, int64_t output_buffer_kind, int64_t configIdx,
+        c10::optional<torch::List<int64_t>> group = c10::nullopt) const
     {
         tkc::CutlassGemmConfig const* config = nullptr;
         if (configIdx != -1)
@@ -290,8 +284,8 @@ public:
             TORCH_CHECK(configIdx >= 0 && configIdx < getNumConfigs());
             config = &mConfigs.at(configIdx);
         }
-        return fp4_bmm_impl(
-            mat1, mat2, mat1Scale, mat2Scale, globalScale, mfp4GemmType, mOutputDtype, to_userbuffers, config);
+        return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, mfp4GemmType, mOutputDtype,
+            output_buffer_kind, config, group);
     }
 
     at::ScalarType getOutputDtype() const

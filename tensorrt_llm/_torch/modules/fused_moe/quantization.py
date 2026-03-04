@@ -36,7 +36,7 @@ from tensorrt_llm.quantization.utils.fp8_utils import (
 
 from ...utils import (replace_parameter_and_save_metadata, swizzle_sf,
                       unswizzle_sf)
-from ..linear import TensorParallelMode, load_weight_shard
+from ..linear_common import TensorParallelMode, load_weight_shard
 from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
 
@@ -2205,7 +2205,7 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if has_pre_quant_scale:
-            from ..linear import TensorParallelMode, load_weight_shard
+            from ..linear_common import TensorParallelMode, load_weight_shard
 
             device = module.fc31_act_scale.device
             # Load fc31 (w3/w1) pre_quant_scales
