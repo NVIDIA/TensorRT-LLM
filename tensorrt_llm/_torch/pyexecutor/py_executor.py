@@ -45,7 +45,7 @@ from ..models.modeling_llama import Llama4ForConditionalGeneration
 from ..models.modeling_utils import DecoderModelForCausalLM
 from ..modules.decoder_layer import DecoderLayer
 from ..speculative.drafter import Drafter
-from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.speculation_gate import SpeculationGate
 from .executor_request_queue import ExecutorRequestQueue, RequestQueueItem
 from .guided_decoder import GuidedDecoder
@@ -132,7 +132,7 @@ class BatchStatePP(BatchState):
 
 class AsyncTransferManager:
     """
-    Handle asynchronous transfer or KV cache after a request has completed.
+    Handle asynchronous transfer of KV cache after a request has completed.
     When running with both the KV cache transceiver and the KV cache connector, we must ensure that BOTH transfers (if any) are completed before we can release the KV cache blocks.
     The AsyncTransferManager has a few key responsibilities:
     1. Track requests in transfer.
@@ -171,7 +171,7 @@ class AsyncTransferManager:
         # Mapping of request id to the LlmRequest
         self._requests_in_transfer: Dict[int, LlmRequest] = dict()
 
-        # Mapping of request id to the the request metadata
+        # Mapping of request id to the request metadata
         self._request_transfer_metadata: Dict[
             int, self.RequestTransferMetadata] = dict()
 
@@ -463,12 +463,12 @@ class PyExecutor:
             batch_wait_timeout_ms=self.batch_wait_timeout_ms,
         )
         # When overlap scheduler is enabled then when starting to handle a new prompt,
-        # sample_async is called twice before the first call to update_requests:
-        # - 1st time as a context request that handles on the 1st generated token
-        # - 2nd time as a generation request that handles on the 2nd generated token.
+        # _sample_async is called twice before the first call to update_requests:
+        # - 1st time as a context request that operates on the 1st generated token
+        # - 2nd time as a generation request that operates on the 2nd generated token.
         # and only after these two calls the sampler's update_request method is called.
         # So in a sampler that works by the expected flow of handling the logits in
-        # sample_async, every update_request doesn't handle the newest token, but one
+        # _sample_async, every update_request doesn't handle the newest token, but one
         # before it. Since all these calls work on the same request object, then its
         # logits storage contains the logits of both the token update_requests should work
         # on, and also its next token. Thus, excluding the last generation logits from any
@@ -648,7 +648,7 @@ class PyExecutor:
     def __enter__(self):
         return self
 
-    def __exit__(self):
+    def __exit__(self, exc_type, exc_val, exc_tb):
         self.shutdown()
 
     def enqueue_requests(
@@ -672,7 +672,7 @@ class PyExecutor:
         timeout: Optional[datetime.timedelta] = None,
     ) -> Union[List[List[LlmResponse]], List[LlmResponse]]:
         """
-        Await for ready responses
+        Await ready responses
         Args:
             id (Optional[Union[List[int], int]]): Request id
             timeout (Optional[datetime.timedelta]): The maximum time to wait for new responses
@@ -718,6 +718,20 @@ class PyExecutor:
             self.executed_batch_queue.put(None)
             self.broadcast_sample_state_handler.join()
         self.worker_started = False
+        # Release CUDA graphs before resource managers free their GPU memory.
+        # Resource managers (e.g. SuffixAutomatonManager) allocate GPU workspace
+        # that is referenced by raw pointers inside captured CUDA graphs.  If
+        # the workspace is freed first (and returned to the driver via
+        # empty_cache), the subsequent CUDA graph teardown can trigger a
+        # device-wide cudaErrorIllegalAddress when the driver touches metadata
+        # for the now-freed memory regions.
+        for engine in (self.model_engine, self.draft_model_engine):
+            if engine is not None and hasattr(engine, '_release_cuda_graphs'):
+                engine._release_cuda_graphs()
+        # Ensure graph destruction has fully completed on device before
+        # resource managers start freeing GPU-backed workspaces.
+        if torch.cuda.is_available():
+            torch.cuda.synchronize()
         for manager in self.resource_manager.resource_managers.values():
             if manager:
                 manager.shutdown()
@@ -1303,8 +1317,8 @@ class PyExecutor:
 
                     self.resource_manager.prepare_resources(scheduled_batch)
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
@@ -1607,7 +1621,7 @@ class PyExecutor:
 
         # can_queue_this_rank is for case that the batch is not empty on this rank, but empty on other ranks
         # For bs == 1, we cannot pad dummy request to make the batch non-empty since it will cause the batch size to be 2.
-        # 1 for dummy request, 1 for the to complete but haven't updated request.
+        # 1 for dummy request, 1 for the yet-to-complete but not-yet-updated request.
         if self.enable_attention_dp:
             tp_batch_sizes = self.dist.tp_allgather(scheduled_batch.batch_size)
             can_queue = 0 not in tp_batch_sizes
@@ -2078,8 +2092,8 @@ class PyExecutor:
                 should_process_previous_batch = can_queue or not can_queue_this_rank
                 if can_queue:
 
-                    # The generation requests that are do not have batch_idx,
-                    # needs to be in front of the batch due to the assumptions
+                    # The generation requests that do not have batch_idx
+                    # need to be in front of the batch due to the assumptions
                     # made in model_engine.py::_forward_step. This is only important
                     # for disaggregated serving. For non-disaggregated serving,
                     # the generation requests always have batch_idx.
@@ -2139,9 +2153,6 @@ class PyExecutor:
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
 
-                    self.perf_manager.compute_batch_gpu_times(
-                        self.previous_batch.all_requests)
-
                     self._send_kv_async(self.previous_batch.all_requests)
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
@@ -2163,11 +2174,6 @@ class PyExecutor:
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
-                    self.perf_manager.save_timing_to_requests(
-                        scheduled_batch.all_requests(), gpu_forward_start,
-                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
-                        fwd_timing.end_time, sample_timing.start_time,
-                        sample_timing.end_time)
                     assert sample_state is not None, "Sampling failed"
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -2179,6 +2185,8 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
+                    self.perf_manager.compute_batch_gpu_times(
+                        self.previous_batch.all_requests)
                 else:
                     self._enqueue_responses([])
 
@@ -2190,6 +2198,11 @@ class PyExecutor:
                         scheduled_batch.generation_requests)
 
                 if can_queue:
+                    self.perf_manager.save_timing_to_requests(
+                        scheduled_batch.all_requests(), gpu_forward_start,
+                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                        fwd_timing.end_time, sample_timing.start_time,
+                        sample_timing.end_time)
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
@@ -2216,7 +2229,7 @@ class PyExecutor:
         self, scheduled_batch: ScheduledRequests,
         target_outputs: SampleStateTensors,
         target_inputs: Optional[SampleStateTensors]
-    ) -> Tuple[SampleStateTensorsMTP, Optional[torch.Tensor]]:
+    ) -> Tuple[SampleStateTensorsSpec, Optional[torch.Tensor]]:
         """
         Prepare target device inputs after computing draft token acceptance.
 
@@ -2232,13 +2245,13 @@ class PyExecutor:
             target_inputs: Contains next_draft_tokens [batch_size, max_draft_len]
         Returns:
             Tuple of:
-            - SampleStateTensorsMTP with new_tokens set to accepted tokens,
+            - SampleStateTensorsSpec with new_tokens set to accepted tokens,
               new_tokens_lens and next_draft_tokens set to None
             - num_accepted_tokens: [batch_size] tensor with acceptance counts per request,
               or None if no draft tokens
         """
         has_draft_tokens = target_inputs is not None and isinstance(
-            target_inputs, SampleStateTensorsMTP
+            target_inputs, SampleStateTensorsSpec
         ) and target_inputs.next_draft_tokens is not None
         target_tokens = target_outputs.new_tokens  # [max_draft_len + 1, batch_size, beam_width] or [1, batch_size, beam_width]
         new_tokens = torch.zeros_like(target_tokens)
@@ -2286,9 +2299,9 @@ class PyExecutor:
             batch_indices = torch.arange(batch_size, device=device)
             new_tokens[0, :, 0] = target_tokens[0, batch_indices]
 
-        # Create the updated SampleStateTensorsMTP
+        # Create the updated SampleStateTensorsSpec
         # new_tokens_lens and next_draft_tokens are left as None
-        result_tensors = SampleStateTensorsMTP(
+        result_tensors = SampleStateTensorsSpec(
             new_tokens=new_tokens,
             log_probs=target_outputs.log_probs,
             new_tokens_lens=None,
@@ -2721,7 +2734,7 @@ class PyExecutor:
     def _check_disagg_ctx_schedulable_status(self,
                                              new_requests: List[LlmRequest]):
         """
-        In context-first mode, context requests are scheduable immediately,
+        In context-first mode, context requests are schedulable immediately,
         otherwise, we need to check if context requests are ready to be scheduled by querying kv cache transceiver
         """
         if not self.kv_cache_transceiver:
@@ -3468,10 +3481,10 @@ class PyExecutor:
             self.responses.pop(id)
             return response
 
-    def _terminate_requests(self, requests_to_pause):
+    def _terminate_requests(self, requests_to_terminate):
         # todo: support work with self.inflight_req_ids.
-        #       Currently, self.inflight_req_ids is not.
-        for req in requests_to_pause:
+        #       Currently, self.inflight_req_ids is not updated.
+        for req in requests_to_terminate:
             self._terminate_request(req)
 
     def _pause_requests(self, requests_to_pause):
@@ -3520,7 +3533,7 @@ class PyExecutor:
 
     def _handle_speculative_decoding(
         self, scheduled_batch, previous_tensors, target_inputs
-    ) -> Tuple[Optional[SampleStateTensorsMTP], Optional[torch.Tensor]]:
+    ) -> Tuple[Optional[SampleStateTensorsSpec], Optional[torch.Tensor]]:
         with request_context(is_draft=self.draft_model_engine is not None,
                              scheduled_requests=scheduled_batch):
             target_outputs = self.previous_batch.sample_state and self.previous_batch.sample_state.device
