@@ -1035,7 +1035,9 @@ class HuggingFaceDataset(BenchmarkDataset):
             split=self.dataset_split,
             streaming=True,
         )
-        self.data = self.data.shuffle(seed=self.random_seed)
+        # Long data collections dataset do not shuffle
+        if "Long-Data-Collections" not in self.dataset_path:
+            self.data = self.data.shuffle(seed=self.random_seed)
 
 
 # -----------------------------------------------------------------------------
@@ -1202,6 +1204,69 @@ class InstructCoderDataset(HuggingFaceDataset):
         # Create samples
         sampled_requests = []
         for prompt, prompt_len in zip(prompts, prompt_lengths):
+            sampled_requests.append(
+                SampleRequest(
+                    prompt=prompt,
+                    prompt_len=prompt_len,
+                    expected_output_len=output_len,
+                ))
+        self.maybe_oversample_requests(sampled_requests, num_requests)
+        return sampled_requests
+
+
+# -----------------------------------------------------------------------------
+# Long Data Collection Dataset Implementation
+# -----------------------------------------------------------------------------
+
+
+class LongDataCollectionsDataset(HuggingFaceDataset):
+    """
+    Long Data Collections Dataset.
+    https://huggingface.co/datasets/togethercomputer/Long-Data-Collections
+
+    Long Data Collections Dataset is a compilation of long context datasets,
+    specifically designed for tasks requiring extensive comprehension and
+    inference from large text inputs.
+
+    """
+
+    DEFAULT_OUTPUT_LEN = 128
+    SUPPORTED_DATASET_PATHS = {
+        "togethercomputer/Long-Data-Collections",
+    }
+
+    def sample(self,
+               tokenizer: PreTrainedTokenizerBase,
+               num_requests: int,
+               output_len: Optional[int] = None,
+               **kwargs) -> list:
+        output_len = (output_len
+                      if output_len is not None else self.DEFAULT_OUTPUT_LEN)
+        input_len = kwargs.get('input_len', None)
+        sampled_requests = []
+        for item in self.data:
+            if len(sampled_requests) >= num_requests:
+                break
+            # Some items only have 'text', it may also acceptable.
+            # But now we only use the samples that have 'prompt' item.
+            if 'prompt' not in item.keys():
+                continue
+
+            prompt = item['prompt']
+            original_prompt_ids = tokenizer(prompt).input_ids
+            prompt_len = len(original_prompt_ids)
+            if input_len is not None and prompt_len < input_len:
+                continue
+            if input_len is not None and prompt_len >= input_len:
+                # Clamp the prompt
+                start_offset = 0
+                if original_prompt_ids[0] == tokenizer.bos_token_id:
+                    start_offset = 1  # Skip the bos_token
+                clamped_prompt_ids = original_prompt_ids[
+                    start_offset:start_offset + input_len - 1]
+                prompt = tokenizer.decode(clamped_prompt_ids)
+                prompt_len = len(clamped_prompt_ids)
+
             sampled_requests.append(
                 SampleRequest(
                     prompt=prompt,
