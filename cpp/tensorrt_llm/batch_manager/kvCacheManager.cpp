@@ -267,7 +267,6 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mRefCount(0)
     , mSchedulingRefCount(0)
     , mPrevBlock(nullptr)
-    , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
     , mDurationMs{std::nullopt}
@@ -493,22 +492,27 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
     mNextBlocks.erase(blockKey);
 }
 
-void KVCacheBlock::freeDescendantsRecursively()
+void KVCacheBlock::freeDescendantsRecursively(std::shared_ptr<BaseEvictionPolicy> evictionPolicy)
 {
     bool hasChildren = !mNextBlocks.empty();
     if (hasChildren)
     {
         for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
         {
-            it->second->freeDescendantsRecursively();
+            it->second->freeDescendantsRecursively(evictionPolicy);
             TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", it->second->getBlockId());
+            // Release block if it has no references and has not been released already.
+            if (!it->second->hasRefs() && !evictionPolicy->blockAlreadyReleased(it->second))
+            {
+                evictionPolicy->releaseBlock(it->second);
+            }
             it = mNextBlocks.erase(it);
         }
     }
     mPrevBlock = nullptr;
 }
 
-void KVCacheBlock::freeBlockAndAllDescendants()
+void KVCacheBlock::freeBlockAndAllDescendants(std::shared_ptr<BaseEvictionPolicy> evictionPolicy)
 {
     // free from previous block
     if (mPrevBlock != nullptr)
@@ -516,7 +520,7 @@ void KVCacheBlock::freeBlockAndAllDescendants()
         mPrevBlock->removeNextBlock(mBlockKey);
         mPrevBlock = nullptr;
     }
-    freeDescendantsRecursively();
+    freeDescendantsRecursively(evictionPolicy);
 }
 
 bool KVCacheBlock::isFull() const
@@ -1005,7 +1009,7 @@ void WindowBlockManager::freeChildren(BlockPtr const& block)
     }
 
     // Free block and all it's descendants from radix tree
-    block->freeBlockAndAllDescendants();
+    block->freeBlockAndAllDescendants(mEvictionPolicy);
 }
 
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
