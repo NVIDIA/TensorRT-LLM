@@ -3905,23 +3905,24 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @parametrize_with_ids(
-        "eagle3_one_model,enable_chunked_prefill,max_concurrency,draft_len_schedule",
+        "eagle3_one_model,enable_chunked_prefill,max_concurrency,enable_draft_len_schedule",
         [
             # Base coverage: eagle3_one_model x enable_chunked_prefill.
-            (True, True, None, None),
-            (True, False, None, None),
-            (False, True, None, None),
-            (False, False, None, None),
+            (True, True, None, False),
+            (True, False, None, False),
+            (False, True, None, False),
+            (False, False, None, False),
             # Test max_concurrency control and draft_len_schedule.
-            (True, False, None, {
-                50: 4,
-                200: 3,
-                350: 2
-            }),
-            (True, False, 100, None),
+            (True, False, None, True),
+            (True, False, 100, False),
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
-                    max_concurrency, draft_len_schedule):
+                    max_concurrency, enable_draft_len_schedule):
+        draft_len_schedule = {
+            50: 4,
+            200: 3,
+            350: 2
+        } if enable_draft_len_schedule else None
         max_draft_len = 4
         cuda_graph_config = CudaGraphConfig(
             max_batch_size=500
