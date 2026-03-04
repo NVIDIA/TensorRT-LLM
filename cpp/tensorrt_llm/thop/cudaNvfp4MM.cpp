@@ -120,7 +120,7 @@ Tensor cuda_core_nvfp4_gemm(Tensor const& mat_a, Tensor const& mat_b, Tensor con
     std::vector<int64_t> output_size = {mat_a.sizes()[0], mat_b.sizes()[0]};
 
     Tensor out = torch_ext::allocate_output(
-        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
+        output_size, out_dtype_, mat_a.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
 
     return cuda_core_nvfp4_gemm_out(mat_a, mat_b, scale_a, scale_b, alpha, bias, out);
 }

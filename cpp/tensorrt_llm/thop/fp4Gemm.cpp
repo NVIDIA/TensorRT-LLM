@@ -196,8 +196,8 @@ at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tens
         "out_dtype must be one of fp16/bf16/fp32. It defaults to fp16.");
 
     std::vector<int64_t> out_shape = mat1.dim() == 2 ? std::vector<int64_t>{m, n} : std::vector<int64_t>{b, m, n};
-    at::Tensor out = torch_ext::allocate_output(out_shape, out_dtype.value(), mat1.device(),
-        static_cast<torch_ext::OutputBufferKind>(output_buffer_kind), group);
+    at::Tensor out = torch_ext::allocate_output(
+        out_shape, out_dtype.value(), mat1.device(), static_cast<torch_ext::BufferKind>(output_buffer_kind), group);
     switch (out_dtype.value())
     {
     case at::ScalarType::Half:
@@ -224,7 +224,7 @@ at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor co
     // better performance.
     // Note that we can still add a heuristic here.
     return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, static_cast<FP4GemmType>(fp4GemmType), out_dtype,
-        static_cast<int>(torch_ext::OutputBufferKind::Default), nullptr);
+        static_cast<int>(torch_ext::BufferKind::Default), nullptr);
 }
 
 class FP4GemmRunner : public torch::CustomClassHolder
