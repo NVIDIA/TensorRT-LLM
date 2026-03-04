@@ -7,7 +7,7 @@ import threading
 import time
 import traceback
 from collections.abc import Callable
-from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import Future, ThreadPoolExecutor, as_completed
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple, TypeVar
 
 import zmq
@@ -170,8 +170,14 @@ class MpiPoolSession(MpiSession):
     def _start_mpi_pool(self):
         assert not self.mpi_pool, 'MPI session already started'
 
+        env = {
+            key: value
+            for key, value in os.environ.items()
+            if key.startswith("TRTLLM") or key.startswith("TLLM")
+        }
         self.mpi_pool = MPIPoolExecutor(max_workers=self.n_workers,
-                                        path=sys.path)
+                                        path=sys.path,
+                                        env=env)
 
     def __del__(self):
         self.shutdown_abort()
@@ -469,13 +475,28 @@ class RemoteMpiCommSessionServer():
                 logger_debug(
                     f"RemoteMpiCommSessionServer waiting for {len(pending_futures)} pending futures to complete\n",
                     "grey")
-                for future in pending_futures:
+                n_failed = 0
+                first_exc = None
+                # Use as_completed so that failures are logged as soon as
+                # they occur rather than blocking behind a stuck future.
+                for future in as_completed(pending_futures):
                     try:
                         future.result()  # Wait for completion
                     except Exception as e:
+                        n_failed += 1
+                        if first_exc is None:
+                            first_exc = e
                         print_colored(
-                            f"RemoteMpiCommSessionServer future failed with exception: {e}\n",
-                            "red")
+                            f"RemoteMpiCommSessionServer: MPI worker future "
+                            f"failed: {type(e).__name__}: {e}\n", "red")
+                        if n_failed == len(pending_futures):
+                            # All workers failed — no point waiting further.
+                            break
+                if n_failed:
+                    logger.error(
+                        f"RemoteMpiCommSessionServer: {n_failed}/"
+                        f"{len(pending_futures)} MPI worker(s) failed. "
+                        f"First error: {first_exc}")
                 pending_futures.clear()
                 logger_debug(
                     "RemoteMpiCommSessionServer all pending futures completed\n",

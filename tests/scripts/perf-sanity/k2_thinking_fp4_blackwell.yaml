@@ -2,6 +2,8 @@ metadata:
   model_name: k2_thinking_fp4
   supported_gpus:
   - B200
+hardware:
+  gpus_per_node: 8
 server_configs:
   # 8k1k configs - TEP8 with TRTLLM
   - name: "k2_thinking_fp4_tep8_8k1k"

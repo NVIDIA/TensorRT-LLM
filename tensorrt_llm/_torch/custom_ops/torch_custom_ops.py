@@ -1,11 +1,11 @@
+import threading
 from functools import lru_cache
-from typing import List, Mapping, Optional, Tuple, Union
+from typing import ClassVar, List, Mapping, Optional, Tuple, Union
 
 import torch
 import triton  # type: ignore[import]
 
 import tensorrt_llm.quantization.utils.fp4_utils as fp4_utils
-import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
 from tensorrt_llm import deep_gemm
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
@@ -1485,7 +1485,9 @@ class fp8SwapABGemmRunner(TunableRunner):
         tactic: int = -1,
     ) -> torch.Tensor:
         input, weight, weight_scale = inputs
-        a, a_sf = fp8_utils.per_token_quant_and_transform(input)
+        a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
+        a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
+            a_sf.transpose(0, 1))
         output = torch.empty(
             (input.size(0), weight.size(0)),
             device=input.device,
@@ -1655,6 +1657,8 @@ def _(
 
 
 class AllReduceRunner(TunableRunner):
+    _prealloc_lock: ClassVar[threading.Lock] = threading.Lock()
+    _prealloc_done: ClassVar[set] = set()
     tuning_config = TuningConfig(
         dynamic_tensor_specs=(DynamicTensorSpec(
             0, 0, get_last_power_of_2_num_tokens_buckets(8192),
@@ -1682,6 +1686,42 @@ class AllReduceRunner(TunableRunner):
             self.tp_size,
             self.op,
         )
+
+    @classmethod
+    def _maybe_preallocate_buffers(cls,
+                                   input_tensor: torch.Tensor,
+                                   group: List[int],
+                                   do_preparation: bool = False) -> None:
+        if not do_preparation:
+            return
+        if not hasattr(torch.ops.trtllm, "preallocate_nccl_window_buffer"):
+            return
+        if input_tensor.numel() == 0 or input_tensor.size(0) == 0:
+            return
+        if hasattr(torch.cuda, "is_current_stream_capturing"):
+            try:
+                if torch.cuda.is_current_stream_capturing():
+                    return
+            except (RuntimeError, AssertionError):
+                # If capture status can't be queried, avoid prealloc to be safe.
+                return
+
+        num_tokens = int(input_tensor.size(0))
+        if num_tokens <= 0:
+            return
+        group_key = tuple(group)
+        cache_key = (group_key, num_tokens)
+        with cls._prealloc_lock:
+            if cache_key in cls._prealloc_done:
+                return
+            cls._prealloc_done.add(cache_key)
+
+        logger.debug(
+            "[tunable_allreduce] Pre-allocating NCCL window buffers: "
+            "tokens=%d group=%s", num_tokens, list(group))
+        prealloc_input = input_tensor
+        torch.ops.trtllm.preallocate_nccl_window_buffer(prealloc_input, group,
+                                                        2)
 
     def get_valid_tactics(
         self,
@@ -1715,8 +1755,19 @@ class AllReduceRunner(TunableRunner):
         self,
         inputs: List[torch.Tensor],
         tactic: int = -1,
+        do_preparation: bool = False,
+        **kwargs,
     ) -> torch.Tensor:
         input, residual, norm_weight, scale, bias, workspace = inputs
+        if do_preparation:
+            valid_tactics = self.get_valid_tactics(inputs,
+                                                   OptimizationProfile(),
+                                                   **kwargs)
+            if AllReduceStrategy.NCCL_SYMMETRIC.value in valid_tactics:
+                self._maybe_preallocate_buffers(input,
+                                                self.group,
+                                                do_preparation=True)
+            return input
         if tactic == -1:
             tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
 
@@ -1733,6 +1784,15 @@ class AllReduceRunner(TunableRunner):
             self.eps,
             self.trigger_completion_at_end,
         )
+
+
+@torch.library.register_fake("trtllm::preallocate_nccl_window_buffer")
+def _(
+    input: torch.Tensor,
+    group: List[int],
+    count: int,
+) -> None:
+    return None
 
 
 @torch.library.custom_op("trtllm::tunable_allreduce", mutates_args=())
@@ -1963,3 +2023,142 @@ def _(
 ) -> torch.Tensor:
     return act_fp4.new_empty((act_fp4.size(0), weight_fp4.size(0)),
                              dtype=output_dtype)
+
+
+class QuantizeE4M3PerTensorRunner(TunableRunner):
+    """
+    Runner for FP8 E4M3 per-tensor quantization with auto-tuning between backends.
+
+    Supports two backends:
+    - "trtllm": TensorRT-LLM's native implementation
+    - "te": Transformer Engine's implementation
+    """
+
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(
+            0, -2, get_last_power_of_2_num_tokens_buckets,
+            last_positive_power_of_2), ),
+        tune_max_num_tokens=8192,
+    )
+
+    # Lazy init for TE to avoid import errors if not installed
+    _te_available = None
+    _te_quantizer = None
+
+    def __init__(self):
+        super().__init__()
+
+    @classmethod
+    def _check_te_available(cls):
+        """Check if Transformer Engine is available (cached)."""
+        if cls._te_available is None:
+            try:
+                import transformer_engine_torch as tex
+                from transformer_engine.pytorch.tensor.float8_tensor import \
+                    Float8CurrentScalingQuantizer
+                cls._te_available = True
+                # Initialize quantizer once
+                cls._te_quantizer = Float8CurrentScalingQuantizer(
+                    fp8_dtype=tex.DType.kFloat8E4M3, device="cuda")
+            except ImportError:
+                cls._te_available = False
+                logger.warning(
+                    "Transformer Engine not available. Only TRTLLM backend will be used for FP8 quantization."
+                )
+        return cls._te_available
+
+    def get_valid_tactics(self, inputs: List[torch.Tensor],
+                          profile: OptimizationProfile, **kwargs) -> List[int]:
+        """Return list of available backend indices."""
+        tactics = ["trtllm"]
+
+        if self._check_te_available():
+            tactics.append("te")
+
+        return tactics
+
+    def forward(self,
+                inputs: List[torch.Tensor],
+                tactic: str = "trtllm") -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Forward pass with backend selection.
+
+        Args:
+            inputs: [input_tensor]
+            tactic: "trtllm" or "te"
+
+        Returns:
+            (quantized_tensor, scale)
+        """
+        input_tensor = inputs[0]
+
+        # Call the appropriate backend
+        if tactic == "te":
+            return self._quantize_te(input_tensor)
+        else:
+            return self._quantize_trtllm(input_tensor)
+
+    def _quantize_trtllm(
+            self, input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """TensorRT-LLM backend."""
+        return torch.ops.tensorrt_llm.quantize_e4m3_per_tensor(input)
+
+    def _quantize_te(self,
+                     input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Transformer Engine backend."""
+        # Ensure TE is initialized
+        if not self._check_te_available():
+            raise RuntimeError("Transformer Engine is not available")
+
+        # Use cached quantizer
+        fp8_tensor = self.__class__._te_quantizer.quantize(input)
+
+        # Extract data and scale from TE's Float8Tensor
+        # TE stores data as uint8, need to view as float8_e4m3fn
+        quantized_data = fp8_tensor._data.view(torch.float8_e4m3fn)
+
+        scale_shape = [1] * input.dim()
+        scale = fp8_tensor._scale_inv.to(input.dtype).reshape(scale_shape)
+
+        return quantized_data, scale
+
+
+@torch.library.custom_op("trtllm::quantize_e4m3_per_tensor", mutates_args=())
+def quantize_e4m3_per_tensor(
+    input: torch.Tensor, ) -> Tuple[torch.Tensor, torch.Tensor]:
+    """
+    FP8 E4M3 per-tensor quantization with automatic backend selection.
+
+    Args:
+        input: Input tensor to quantize
+
+    Returns:
+        (quantized_tensor, scale): Quantized FP8 tensor and per-tensor scale
+
+    Note:
+        - AutoTuner will profile all backends and select the faster one
+        - Results are cached per input shape for zero-overhead selection
+        - Must be called within autotune() context for initial profiling
+    """
+    tuner = AutoTuner.get()
+
+    quantize_runner = QuantizeE4M3PerTensorRunner()
+
+    _, best_tactic = tuner.choose_one(
+        "trtllm::quantize_e4m3_per_tensor",
+        [quantize_runner],
+        QuantizeE4M3PerTensorRunner.tuning_config,
+        [input],
+    )
+
+    return quantize_runner(inputs=[input], tactic=best_tactic)
+
+
+@quantize_e4m3_per_tensor.register_fake
+def _(input: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fake implementation for torch.compile."""
+    scale_shape = [1] * input.dim()
+    return (
+        input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
+        input.new_empty(scale_shape, dtype=input.dtype),
+    )

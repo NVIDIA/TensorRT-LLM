@@ -151,7 +151,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - Add KV events support for sliding window attention
   - Add TRTLLM MoE nvfp4 cubins for mid-high concurrency; attention_dp for TRTLLM MoE
   - Add Piecewise CUDA Graph support for MLA
-  - Support mutliCtasKvMode for high-throughput MLA kernels
+  - Support multiCtasKvMode for high-throughput MLA kernels
   - Enable kvcache to be reused during request generation
   - Add ADP schedule balance optimization
   - Add chunked prefill support for MLA (Blackwell)
@@ -238,7 +238,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - **BREAKING CHANGE** Rename mixed_sampler to enable_mixed_sampler
 - **BREAKING CHANGE** Rename LLM.autotuner_enabled to enable_autotuner
 - Add back allreduce_strategy parameter into TorchLlmArgs
-- Add LLmArgs option to force using dynamic quantization
+- Add LlmArgs option to force using dynamic quantization
 - Change default LoRA cache sizes and change peft_cache_config cache size fields to take effect when not explicitly set in lora_config
 - Remove deprecated LoRA LLM args, that are already specified in lora_config
 - Add request_perf_metrics to LLMAPI
@@ -379,7 +379,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 
 ### Key Features and Enhancements
 - **Model Support**
-  - Added Qwen3 support.Refer to “Qwen3” section in `examples/models/core/qwen/README.md`.
+  - Added Qwen3 support. Refer to “Qwen3” section in `examples/models/core/qwen/README.md`.
   - Added HyperCLOVAX-SEED-Vision support in PyTorch flow. Refer to `examples/models/contrib/hyperclovax/README.md`
   - Added Dynasor-CoT in scaffolding examples. Refer to `examples/scaffolding/contrib/Dynasor/README.md`
   - Added Mistral Small 3.1 24B VLM support in TRT workflow
@@ -428,11 +428,11 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - The dependent NCCL version is maintained at 2.25.1
 - Open-sourced XQA kernels
 - Dependent datasets version was upgraded to 3.1.0
-- Migrate Triton Backend to TensorRT LLM repo to TensorRT LLM submodule
+- Migrate Triton Backend from TensorRT LLM repo to TensorRT LLM submodule
 - Downgrade gcc toolset version from 13 to 11
 
 ### API Changes
-- [Breaking Change]:Enable scheduling overlap by default
+- [BREAKING CHANGE] Enable scheduling overlap by default
 - Remove deprecated GptSession/V1 from TRT workflow
 - Set _AutoDeployLlmArgs as primary config object
 - Allow overriding CLI arguments with YAML file in trtllm-serve
@@ -442,7 +442,6 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### Fixed Issues
 - Fix hang bug when context server doesn't have enough capacity for KV Cache (#3095)
 - Fix C++ decoder synchronization in PyTorch (#3106)
-- Fix bug of create cuda stream as default parameter which will be initialized during importing (#3764)
 - Fix bug related to creating CUDA stream as default parameter, which will be initialized during importing (#3764)
 - Fix attention DP bug on Qwen3 MoE model (#4141)
 - Fix illegal memory access when running LLaMA 4 with CUDA Graph enabled (#4101)
@@ -543,7 +542,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - Enhanced the integrated robustness of scaffolding via `init.py`.
 
 ### API Changes
-  - Exposed `kc_cache_retention_config` from C++ `executor` API to the LLM API.
+  - Exposed `kv_cache_retention_config` from C++ `executor` API to the LLM API.
   - Moved `BuildConfig` arguments to `LlmArgs`.
   - Removed speculative decoding parameters from stateful decoders.
   - Exposed `DecoderState` via bindings and integrated it in decoder.
@@ -558,7 +557,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - Fixed a bug when loading an engine using LoRA through the LLM API. (#2782)
   - Fixed incorrect batch slot usage in `addCumLogProbs` kernel. Thanks to the contribution from @aotman in #2787.
   - Fixed incorrect output for Llama-3.2-11B-Vision-Instruct. (#2796)
-  - Removed the necessary of `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm`.
+  - Removed the necessity of `--extra-index-url https://pypi.nvidia.com` when running `pip install tensorrt-llm`.
 
 ### Infrastructure Changes
   - The dependent NVIDIA ModelOpt version is updated to 0.27.
@@ -703,7 +702,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - Updated to ModelOpt v0.21 for Linux platform, while v0.17 is still used on Windows platform.
 
 ### Known Issues
-  - There is a known AllReduce performance issue on AMD-based CPU platforms on NCCL 2.23.4, which can be workarounded by `export NCCL_P2P_LEVEL=SYS`.
+  - There is a known AllReduce performance issue on AMD-based CPU platforms on NCCL 2.23.4, which can be worked around by `export NCCL_P2P_LEVEL=SYS`.
 
 ## TensorRT-LLM Release 0.15.0
 
@@ -750,7 +749,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - Added support for Llama 3.2 and llama 3.2-Vision model. Refer to `examples/mllama/README.md` for more details on the llama 3.2-Vision model.
   - Added support for Deepseek-v2. Refer to `examples/deepseek_v2/README.md`.
   - Added support for Cohere Command R models. Refer to `examples/commandr/README.md`.
-  - Added support for Falcon 2,  refer to `examples/falcon/README.md`, thanks to the contribution from @puneeshkhanna in #1926.
+  - Added support for Falcon 2, refer to `examples/falcon/README.md`, thanks to the contribution from @puneeshkhanna in #1926.
   - Added support for InternVL2. Refer to `examples/multimodal/README.md`.
   - Added support for Qwen2-0.5B and Qwen2.5-1.5B model. (#2388)
   - Added support for Minitron. Refer to `examples/nemotron`.
@@ -760,7 +759,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### Fixed Issues
   - Fixed a slice error in forward function. (#1480)
   - Fixed an issue that appears when building BERT. (#2373)
-  - Fixed an issue that model is not loaded when building BERT. (2379)
+  - Fixed an issue that model is not loaded when building BERT. (#2379)
   - Fixed the broken executor examples. (#2294)
   - Fixed the issue that the kernel `moeTopK()` cannot find the correct expert when the number of experts is not a power of two. Thanks @dongjiyingdjy for reporting this bug.
   - Fixed an assertion failure on `crossKvCacheFraction`. (#2419)
@@ -808,7 +807,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 ### Fixed Issues
   - Fixed a typo in `tensorrt_llm/models/model_weights_loader.py`, thanks to the contribution from @wangkuiyi in #2152.
   - Fixed duplicated import module in `tensorrt_llm/runtime/generation.py`, thanks to the contribution from @lkm2835 in #2182.
-  - Enabled `share_embedding` for the models that have no `lm_head` in legacy  checkpoint conversion path, thanks to the contribution from @lkm2835 in #2232.
+  - Enabled `share_embedding` for the models that have no `lm_head` in legacy checkpoint conversion path, thanks to the contribution from @lkm2835 in #2232.
   - Fixed `kv_cache_type` issue in the Python benchmark, thanks to the contribution from @qingquansong in #2219.
   - Fixed an issue with SmoothQuant calibration with custom datasets. Thanks to the contribution by @Bhuvanesh09 in #2243.
   - Fixed an issue surrounding `trtllm-build --fast-build` with fake or random weights. Thanks to @ZJLi2013 for flagging it in #2135.
@@ -907,7 +906,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - [BREAKING CHANGE] The `use_custom_all_reduce` argument is removed from `trtllm-build`.
   - [BREAKING CHANGE] The `multi_block_mode` argument is moved from build stage (`trtllm-build` and builder API) to the runtime.
   - [BREAKING CHANGE] The build time argument `context_fmha_fp32_acc` is moved to runtime for decoder models.
-  - [BREAKING CHANGE] The arguments `tp_size`, `pp_size` and `cp_size` is removed from `trtllm-build` command.
+  - [BREAKING CHANGE] The arguments `tp_size`, `pp_size` and `cp_size` are removed from `trtllm-build` command.
   - The C++ batch manager API is deprecated in favor of the C++ `executor` API, and it will be removed in a future release of TensorRT-LLM.
   - Added a version API to the C++ library, a `cpp/include/tensorrt_llm/executor/version.h` file is going to be generated.
 
@@ -986,7 +985,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
   - Removed `attention_qk_half_accumulation` argument from `trtllm-build` command.
   - Removed `use_context_fmha_for_generation` argument from `trtllm-build` command.
   - Removed `strongly_typed` argument from `trtllm-build` command.
-  - The default value of `max_seq_len` reads from the HuggingFace mode config now.
+  - The default value of `max_seq_len` reads from the HuggingFace model config now.
 - C++ runtime
   - [BREAKING CHANGE] Renamed `free_gpu_memory_fraction` in `ModelRunnerCpp` to `kv_cache_free_gpu_memory_fraction`.
   - [BREAKING CHANGE] Refactored `GptManager` API
@@ -1024,7 +1023,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Supported Jais, see `examples/jais/README.md`.
 - Supported DiT, see `examples/dit/README.md`.
 - Supported VILA 1.5.
-- Supported Video NeVA, see `Video NeVA`section in `examples/multimodal/README.md`.
+- Supported Video NeVA, see `Video NeVA` section in `examples/multimodal/README.md`.
 - Supported Grok-1, see `examples/grok/README.md`.
 - Supported Qwen1.5-110B with FP8 PTQ.
 - Supported Phi-3 small model with block sparse attention.
@@ -1138,7 +1137,7 @@ TensorRT LLM 1.0 brings 2 major changes: the PyTorch-based architecture is now s
 - Support RecurrentGemma
 
 ### Fixed Issues
-- - Fixed some unexpected behaviors in beam search and early stopping, so that the outputs are more accurate.
+- Fixed some unexpected behaviors in beam search and early stopping, so that the outputs are more accurate.
 - Fixed segmentation fault with pipeline parallelism and `gather_all_token_logits`. (#1284)
 - Removed the unnecessary check in XQA to fix code Llama 70b Triton crashes. (#1256)
 - Fixed an unsupported ScalarType issue for BF16 LoRA. (https://github.com/triton-inference-server/tensorrtllm_backend/issues/403)

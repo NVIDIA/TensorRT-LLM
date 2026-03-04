@@ -2,6 +2,7 @@
 
 import atexit
 import os
+import socket
 import sys
 from typing import Callable, List, Optional, Tuple
 
@@ -14,6 +15,8 @@ from tensorrt_llm._utils import get_free_port
 from ..utils.logger import ad_logger
 
 # TODO: check to what extend we can reuse _torch/distributed.py
+
+_MASTER_ADDR = "127.0.0.1"
 
 
 class _DistGroup:
@@ -85,16 +88,16 @@ def initialize_or_skip(
     rank: int = 0,
     world_size: int = 1,
     port: Optional[int] = None,
-    shared_port: Optional["mp.Value"] = None,
-    port_ready_barrier: Optional["mp.Barrier"] = None,
+    port_recv_conn=None,
+    port_send_conns=None,
 ) -> Tuple[int, int]:
     if not dist.is_initialized():
         return initialize(
             rank=rank,
             world_size=world_size,
             port=port,
-            shared_port=shared_port,
-            port_ready_barrier=port_ready_barrier,
+            port_recv_conn=port_recv_conn,
+            port_send_conns=port_send_conns,
         )
     return get_rank(), get_world_size()
 
@@ -124,37 +127,28 @@ def _set_distributed_env_vars(local_rank: int, world_size: int, port: int) -> No
     """Set environment variables required by NCCL's env:// init method."""
     os.environ["RANK"] = str(local_rank)
     os.environ["WORLD_SIZE"] = str(world_size)
-    os.environ["MASTER_ADDR"] = "127.0.0.1"
+    os.environ["MASTER_ADDR"] = _MASTER_ADDR
     os.environ["MASTER_PORT"] = str(port)
     os.environ["LOCAL_RANK"] = str(local_rank)
 
 
-def _try_init_process_group(local_rank: int, world_size: int, port: int) -> bool:
-    """Attempt to initialize process group. Returns True on success, False on EADDRINUSE."""
-    _set_distributed_env_vars(local_rank, world_size, port)
-
+def _is_port_available(port: int) -> bool:
+    """Lightweight check: try to bind to the port and release immediately."""
     try:
-        dist.init_process_group(
-            "nccl",
-            world_size=world_size,
-            rank=local_rank,
-            device_id=torch.device(local_rank),
-        )
-        return True
-    except Exception as e:
-        # Check if this is a port-in-use error (only rank 0 binds, so only rank 0 can get this)
-        if "EADDRINUSE" in str(e) or "address already in use" in str(e).lower():
-            ad_logger.warning(f"Port {port} already in use, will retry with new port")
-            return False
-        raise
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+            s.bind((_MASTER_ADDR, port))
+            return True
+    except OSError:
+        return False
 
 
 def initialize(
     rank: int = 0,
     world_size: int = 1,
     port: Optional[int] = None,
-    shared_port: Optional["mp.Value"] = None,
-    port_ready_barrier: Optional["mp.Barrier"] = None,
+    port_recv_conn=None,
+    port_send_conns=None,
     max_retries: int = 5,
 ) -> Tuple[int, int]:
     """Initialize distributed process group.
@@ -163,8 +157,8 @@ def initialize(
         rank: Process rank (ignored for OMPI/torchelastic).
         world_size: Total number of processes (ignored for OMPI/torchelastic).
         port: Initial port to try. If None, a free port will be selected.
-        shared_port: Optional mp.Value for rank 0 to share the final port with other ranks.
-        port_ready_barrier: Optional mp.Barrier to synchronize port selection.
+        port_recv_conn: Pipe read-end for this rank to receive the resolved port from rank 0.
+        port_send_conns: List of Pipe write-ends for rank 0 to broadcast the port.
         max_retries: Maximum number of port retry attempts for rank 0.
     """
     if is_ompi():
@@ -189,65 +183,57 @@ def initialize(
     # Necessary to assign a device to each rank.
     torch.cuda.set_device(local_rank)
 
-    # If we have shared port synchronization (multiprocess spawn mode)
-    if shared_port is not None and port_ready_barrier is not None:
-        if local_rank == 0:
-            # Rank 0: try ports until one works, then share with other ranks
-            init_success = False
-            init_error = None
-            try:
-                for attempt in range(max_retries):
-                    ad_logger.info(
-                        f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=} (attempt {attempt + 1})"
-                    )
-                    if _try_init_process_group(local_rank, world_size, port):
-                        # Success! Share the working port with other ranks
-                        shared_port.value = port
-                        init_success = True
-                        break
-                    else:
-                        # Port was taken, try a new one
-                        port = get_free_port()
-                else:
-                    # All retries exhausted
-                    init_error = RuntimeError(
-                        f"Failed to find available port after {max_retries} attempts"
-                    )
-            except Exception as e:
-                # Catch any unexpected error so we can still signal other ranks
-                init_error = e
-            finally:
-                # ALWAYS signal other ranks, even on error, to prevent deadlock
-                if not init_success:
-                    shared_port.value = -1
-                port_ready_barrier.wait()
+    # Pipe-based port synchronization (multiprocess spawn mode).
+    # Port resolution MUST happen before init_process_group because that call
+    # is collective — all ranks must participate simultaneously.  Rank 0 does a
+    # lightweight socket-bind check (not a full init) to find a usable port,
+    # broadcasts it through the pipes, and then ALL ranks call
+    # init_process_group together.
+    if port_send_conns is not None:
+        assert local_rank == 0, "port_send_conns should only be provided to rank 0"
+        port_ok = False
+        init_error = None
+        try:
+            for attempt in range(max_retries):
+                ad_logger.info(
+                    f"Checking port for: {lib=}, {local_rank=}, {world_size=}, {port=} (attempt {attempt + 1})"
+                )
+                if _is_port_available(port):
+                    port_ok = True
+                    break
+                ad_logger.warning(f"Port {port} already in use, will retry with new port")
+                port = get_free_port()
+            else:
+                init_error = RuntimeError(
+                    f"Failed to find available port after {max_retries} attempts"
+                )
+        except Exception as e:
+            init_error = e
+        finally:
+            # ALWAYS broadcast to other ranks, even on error, to prevent deadlock
+            final_port = port if port_ok else -1
+            for conn in port_send_conns:
+                conn.send(final_port)
+                conn.close()
 
-            if init_error is not None:
-                raise init_error
-        else:
-            # Other ranks: wait for rank 0 to find a working port
-            port_ready_barrier.wait()
-            port = shared_port.value
-            if port == -1:
-                raise RuntimeError("Rank 0 failed to initialize, cannot proceed")
-            ad_logger.info(f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=}")
-            _set_distributed_env_vars(local_rank, world_size, port)
-            dist.init_process_group(
-                "nccl",
-                world_size=world_size,
-                rank=local_rank,
-                device_id=torch.device(local_rank),
-            )
-    else:
-        # Original path: no retry mechanism (OMPI, torchelastic, or single process)
-        ad_logger.info(f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=}")
-        _set_distributed_env_vars(local_rank, world_size, port)
-        dist.init_process_group(
-            "nccl",
-            world_size=world_size,
-            rank=local_rank,
-            device_id=torch.device(local_rank),
-        )
+        if init_error is not None:
+            raise init_error
+    elif port_recv_conn is not None:
+        # Non-rank-0: wait for rank 0 to broadcast the working port
+        port = port_recv_conn.recv()
+        port_recv_conn.close()
+        if port == -1:
+            raise RuntimeError("Rank 0 failed to initialize, cannot proceed")
+
+    # All paths converge here: initialize the process group collectively
+    ad_logger.info(f"Initializing for: {lib=}, {local_rank=}, {world_size=}, {port=}")
+    _set_distributed_env_vars(local_rank, world_size, port)
+    dist.init_process_group(
+        "nccl",
+        world_size=world_size,
+        rank=local_rank,
+        device_id=torch.device(local_rank),
+    )
 
     # Register cleanup function to be called at exit
     atexit.register(cleanup)
@@ -259,11 +245,11 @@ def initialize(
 
 
 def init_and_run_process(
-    job, rank, size, port, shared_port=None, port_ready_barrier=None, **kwargs
+    job, rank, size, port, port_recv_conn=None, port_send_conns=None, **kwargs
 ):
     try:
         initialize_or_skip(
-            rank, size, port, shared_port=shared_port, port_ready_barrier=port_ready_barrier
+            rank, size, port, port_recv_conn=port_recv_conn, port_send_conns=port_send_conns
         )
         job(rank, size, **kwargs)
     except Exception as e:
@@ -318,11 +304,17 @@ def _start_multiprocess_job(
     ctx = mp.get_context("spawn")
     processes: List[mp.Process] = []
 
-    # Create shared state for port synchronization with retry mechanism:
-    # - shared_port: rank 0 writes the final working port here
-    # - port_ready_barrier: all ranks wait here until rank 0 has bound successfully
-    shared_port = ctx.Value("i", port)  # 'i' = signed int
-    port_ready_barrier = ctx.Barrier(size)
+    # Create pipes for port synchronization with retry mechanism.
+    # Pipes use sockets (not POSIX named semaphores like Value/Barrier),
+    # so they work reliably on all filesystems including network mounts.
+    # Rank 0 finds a working port and sends it through each pipe;
+    # other ranks block on recv() until rank 0 is ready.
+    port_recv_conns = []
+    port_send_conns = []
+    for _ in range(size - 1):
+        recv_conn, send_conn = ctx.Pipe(duplex=False)
+        port_recv_conns.append(recv_conn)
+        port_send_conns.append(send_conn)
 
     for rank in range(size):
         if input_queues:
@@ -330,10 +322,15 @@ def _start_multiprocess_job(
         if output_queue:
             kwargs["output_queue"] = output_queue if rank == 0 else None
 
+        rank_kwargs = {
+            **kwargs,
+            "port_recv_conn": port_recv_conns[rank - 1] if rank > 0 else None,
+            "port_send_conns": port_send_conns if rank == 0 else None,
+        }
         p = ctx.Process(
             target=init_and_run_process,
             args=(job, rank, size, port),
-            kwargs={**kwargs, "shared_port": shared_port, "port_ready_barrier": port_ready_barrier},
+            kwargs=rank_kwargs,
             daemon=True,
         )
         p.start()
@@ -350,9 +347,11 @@ def _join_multiprocess_job(processes):
     for p in processes:
         p.join()
 
-        # Ensure that all processes have exited successfully
-        if isinstance(p, mp.Process):
-            assert not p.exitcode, f"Process {p.pid} exited with code {p.exitcode}"
+        # Ensure that all processes have exited successfully.
+        # Check exitcode via hasattr rather than isinstance(p, mp.Process), because
+        # spawn-context processes (SpawnProcess) don't inherit from mp.Process.
+        if hasattr(p, "exitcode"):
+            assert p.exitcode == 0, f"Process {p.pid} exited with code {p.exitcode}"
 
 
 def spawn_multiprocess_job(job: Callable[[int, int], None], size: Optional[int] = None):

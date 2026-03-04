@@ -14,7 +14,7 @@ Solution: try running build script with `--clean`, or try running `rm -r build c
 
 ## Debug on Unit Tests
 
-Here is an example to print the values of the MLP output tensor in the a unit test ([full example](../../../tests/test_debugging_api.py)).
+Here is an example to print the values of the MLP output tensor in a unit test ([full example](../../../../tests/unittest/others/test_debugging_api.py)).
 
 1. Register the intermediate tensors as the network outputs with `register_network_output` API.
 
@@ -180,7 +180,7 @@ If problems come from plugins, try setting the environment variable `CUDA_LAUNCH
 
 If problems come from runtime-shape of the input tensors, double-check the shape (rank and length of each rank) and location (CPU / GPU) of input tensors for the engine obey the build-time setting.
 
-For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users' rewrting), too large or too small input shape, etc..
+For example, one possible reason of getting the error information like below is, we use mismatched configuration between engine building and running, including code change (update of repo or users' rewriting), too large or too small input shape, etc..
 
 ```txt
 unexpected shape for input 'XXX' for model 'YYY'. Expected [-1,-1,-1], got [8,16]. NOTE: Setting a non-zero max_batch_size in the model config requires a batch dimension to be prepended to each input shape. If you want to specify the full shape including the batch dim in your input dims config, try setting max_batch_size to zero. See the model configuration docs for more info on max_batch_size.

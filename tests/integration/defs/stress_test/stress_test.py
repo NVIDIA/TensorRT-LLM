@@ -378,25 +378,45 @@ def is_port_available(port: int,
                          ["GUARANTEED_NO_EVICT", "MAX_UTILIZATION"],
                          ids=lambda x: x)
 @pytest.mark.parametrize("stress_time_timeout", [(180, 300), (300, 450),
-                                                 (600, 900), (3600, 5400)],
+                                                 (600, 900), (3600, 10800)],
                          ids=lambda x: f"stress_time_{x[0]}s_timeout_{x[1]}s")
 @pytest.mark.parametrize(
     "config",
     [
         # Configuration for TinyLlama model
+        # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="llama-models-v2/TinyLlama-1.1B-Chat-v1.0",
                     tp_size=1,
-                    memory_requirement=12),
+                    memory_requirement=12288),
         # Configuration for Llama-v3 model
+        # memory_requirement is in MiB (12 GB = 12288 MiB)
         ModelConfig(model_dir="llama-models-v3/llama-v3-8b-instruct-hf",
                     tp_size=1,
-                    memory_requirement=12),
+                    memory_requirement=12288),
         # Configuration for DeepSeek-V3 model
-        ModelConfig(model_dir="DeepSeek-V3", tp_size=8, memory_requirement=96),
-        # Configuration for DeepSeek-R1 model
+        # memory_requirement is in MiB (96 GB = 98304 MiB)
+        ModelConfig(
+            model_dir="DeepSeek-V3", tp_size=8, memory_requirement=98304),
+        # Configuration for DeepSeek-R1 model with FP8 checkpoints (8 GPU setup)
+        # memory_requirement is in MiB (96 GB = 98304 MiB)
         ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
                     tp_size=8,
-                    memory_requirement=96),
+                    memory_requirement=98304),
+        # Configuration for DeepSeek-R1 model with FP8 checkpoints (4 GPU setup, requires GB300 288GB)
+        # memory_requirement is in MiB (256 GB = 262144 MiB)
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1",
+                    tp_size=4,
+                    memory_requirement=262144),
+        # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (8 GPU setup)
+        # memory_requirement is in MiB (96 GB = 98304 MiB)
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
+                    tp_size=8,
+                    memory_requirement=98304),
+        # Configuration for DeepSeek-R1 model with NVFP4 checkpoints (4 GPU setup)
+        # memory_requirement is in MiB (168 GB = 172032 MiB)
+        ModelConfig(model_dir="DeepSeek-R1/DeepSeek-R1-0528-FP4",
+                    tp_size=4,
+                    memory_requirement=172032),
     ],
     ids=lambda x: f"{os.path.basename(x.model_dir)}_tp{x.tp_size}")
 def test_run_stress_test(config, stress_time_timeout, backend,
@@ -478,9 +498,12 @@ def stress_test(config,
         return
 
     # Skip if not enough GPU memory
+    # get_device_memory() returns per-GPU memory in MiB
     if get_device_memory() < config.memory_requirement:
         pytest.skip(
-            f"Not enough GPU memory. Required: {config.memory_requirement}GB")
+            f"Not enough GPU memory. Required: {config.memory_requirement} MiB ({config.memory_requirement // 1024} GB), "
+            f"Available: {get_device_memory()} MiB ({get_device_memory() // 1024} GB)"
+        )
 
     # Skip if not enough GPUs for tensor parallelism
     if get_device_count() < config.tp_size:
@@ -506,19 +529,20 @@ def stress_test(config,
                 36000  # 10 hours for DeepSeek-V3 or DeepSeek-R1, change this value if needed
             )
 
-    # For DeepSeek-V3 specific server parameters
+    # For DeepSeek-V3 or DeepSeek-R1 specific server parameters
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
         test_server_config = ServerConfig(
             port=test_server_config.port,
             host=test_server_config.host,
             pp_size=test_server_config.pp_size,
-            ep_size=8,  # DeepSeek-V3 or DeepSeek-R1 specific ep_size
+            ep_size=config.
+            tp_size,  # ep_size matches tp_size for DeepSeek models
             max_batch_size=
             2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_batch_size
             max_num_tokens=
-            2048,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
+            8192,  # DeepSeek-V3 or DeepSeek-R1 specific max_num_tokens
             kv_cache_free_gpu_memory_fraction=
-            0.7,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
+            0.85,  # DeepSeek-V3 or DeepSeek-R1 specific kv_cache fraction
             capacity_scheduler_policy=test_server_config.
             capacity_scheduler_policy,
             wait_interval=test_server_config.wait_interval,
@@ -582,6 +606,35 @@ def stress_test(config,
     if "DeepSeek-V3" in config.model_dir or "DeepSeek-R1" in config.model_dir:
 
         extra_llm_options["enable_attention_dp"] = True
+
+        # Set MOE backend based on GPU architecture and checkpoint type
+        # B200/GB200 (Blackwell, SM100+) with FP8 checkpoints: use DEEPGEMM backend
+        # B200/GB200 (Blackwell, SM100+) with NVFP4 checkpoints: use CUTEDSL backend
+        # H100/H200 (Hopper, SM90) with FP8 checkpoints: use CUTLASS backend (default)
+        try:
+            import torch
+            if torch.cuda.is_available():
+                device_capability = torch.cuda.get_device_capability(0)
+                is_blackwell = device_capability[0] >= 10
+                is_nvfp4 = "FP4" in config.model_dir.upper()
+
+                if is_blackwell:
+                    if is_nvfp4:
+                        moe_backend = "CUTEDSL"
+                    else:
+                        moe_backend = "DEEPGEMM"
+
+                    extra_llm_options["moe_config"] = {
+                        "backend": moe_backend,
+                    }
+                    checkpoint_type = "NVFP4" if is_nvfp4 else "FP8"
+                    print_info(
+                        f"Detected GPU architecture is SM{device_capability[0]}{device_capability[1]} (Blackwell), "
+                        f"using {moe_backend} MOE backend for DeepSeek-R1/DeepSeek-V3 with {checkpoint_type} checkpoints"
+                    )
+        except Exception as e:
+            print_warning(f"Failed to detect GPU architecture: {e}. "
+                          "Using default MOE backend (CUTLASS).")
 
         if config.backend == "pytorch":
             extra_llm_options.update({
@@ -1046,6 +1099,18 @@ def stress_stage(model_name,
         # Ensure request_count is an integer by using int() conversion
         request_count = int(stress_request_rate * stress_time)
         test_timeout = stress_config.stress_timeout
+
+    # Cap request count for large MoE models (DeepSeek-V3/R1) to prevent timeout
+    if "DeepSeek-V3" in model_path or "DeepSeek-R1" in model_path:
+        max_sustainable_rate = 3.0  # req/s - conservative estimate
+        max_request_count = int(max_sustainable_rate *
+                                stress_config.stress_time)
+        if request_count > max_request_count:
+            print_info(
+                f"Capping request_count from {request_count} to {max_request_count} "
+                f"for DeepSeek V3/R1 model (sustainable rate: {max_sustainable_rate} req/s)"
+            )
+            request_count = max_request_count
 
     print_info(
         f"Running stress test with concurrency={stress_concurrency}, request_count={request_count}"

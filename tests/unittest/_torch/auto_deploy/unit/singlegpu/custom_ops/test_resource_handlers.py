@@ -49,8 +49,8 @@ def test_paged_handler_allocate_with_blocks(kv_layout):
     tokens_per_block = 32
     seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=tokens_per_block)
     seq_info.to("cuda")
-    # Set up num_blocks via estimate_cache_loc_capacity
-    seq_info.estimate_cache_loc_capacity(num_blocks=10)
+    # Set up num_blocks via update_cache_information
+    seq_info.update_cache_information(num_blocks=10)
 
     tensor = handler.allocate(seq_info)
 

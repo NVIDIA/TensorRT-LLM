@@ -6,7 +6,7 @@ import time
 import weakref
 from dataclasses import asdict, dataclass, field, is_dataclass
 from pathlib import Path
-from typing import Any, Callable, List, Optional, Tuple, Union
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import torch
 import transformers
@@ -18,7 +18,7 @@ from .._utils import (global_mpi_rank, local_mpi_rank, mpi_barrier,
 # yapf: disable
 from ..bindings.executor import (BatchingType, CapacitySchedulerPolicy,
                                  ContextChunkingPolicy, ExecutorConfig,
-                                 KvCacheRetentionConfig, SchedulerConfig)
+                                 KvCacheRetentionConfig)
 # yapf: enable
 from ..builder import BuildConfig, Engine, build
 from ..llmapi.llm_args import TrtLlmArgs
@@ -29,14 +29,16 @@ from ..models.modeling_utils import PretrainedConfig, QuantAlgo, QuantConfig
 from ..module import Module
 from .build_cache import (BuildCache, BuildCacheConfig, CachedStage,
                           get_build_cache_config_from_env)
+# yapf: disable
 from .llm_args import (CalibConfig, CudaGraphConfig, DraftTargetDecodingConfig,
                        Eagle3DecodingConfig, EagleDecodingConfig, KvCacheConfig,
                        LlmArgs, LookaheadDecodingConfig, MedusaDecodingConfig,
-                       MTPDecodingConfig, NGramDecodingConfig,
-                       UserProvidedDecodingConfig, _ModelFormatKind,
-                       _ModelWrapper, _ParallelConfig,
+                       MTPDecodingConfig, NGramDecodingConfig, SchedulerConfig,
+                       TorchLlmArgs, UserProvidedDecodingConfig,
+                       _ModelFormatKind, _ModelWrapper, _ParallelConfig,
                        update_llm_args_with_extra_dict,
                        update_llm_args_with_extra_options)
+# yapf: enable
 from .mpi_session import MPINodeState, MpiSession
 from .tokenizer import TransformersTokenizer, load_hf_tokenizer
 # TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
@@ -323,6 +325,11 @@ class ModelLoader:
             prequantized (bool): Whether the checkpoint is pre-quantized.
         """
         quant_config = self.llm_args.quant_config
+        kv_cache_dtype = self.llm_args.kv_cache_config.dtype
+        explicit_kv_cache_quant_algo = {
+            "fp8": QuantAlgo.FP8,
+            "nvfp4": QuantAlgo.NVFP4,
+        }.get(kv_cache_dtype)
 
         hf_quant_config_path = f"{self._model_dir}/hf_quant_config.json"
         if os.path.exists(hf_quant_config_path):
@@ -357,7 +364,13 @@ class ModelLoader:
                 "kv_cache_quant_algo", None)
             if hf_kv_cache_quant_algo is not None:
                 hf_kv_cache_quant_algo = QuantAlgo(hf_kv_cache_quant_algo)
-                if quant_config.kv_cache_quant_algo is None:
+                if explicit_kv_cache_quant_algo is not None:
+                    if explicit_kv_cache_quant_algo != hf_kv_cache_quant_algo:
+                        logger.warning(
+                            f"Overriding checkpoint kv_cache_quant_algo={hf_kv_cache_quant_algo} with explicit kv_cache_config.dtype={kv_cache_dtype}."
+                        )
+                    quant_config.kv_cache_quant_algo = explicit_kv_cache_quant_algo
+                elif quant_config.kv_cache_quant_algo is None:
                     logger.info(
                         f"Setting kv_cache_quant_algo={hf_kv_cache_quant_algo} form HF quant config."
                     )
@@ -509,7 +522,7 @@ class ModelLoader:
                     dtype=self.llm_args.dtype,
                     mapping=self.mapping,
                     quant_config=self.llm_args.quant_config,
-                    **self.llm_args.calib_config.to_dict(),
+                    **self.llm_args.calib_config.model_dump(),
                     trust_remote_code=self.llm_args.trust_remote_code,
                 )
             if self.llm_args.parallel_config.is_multi_gpu:
@@ -548,6 +561,7 @@ class ModelLoader:
         assert architecture in MODEL_MAP, \
             f"Unsupported model architecture: {architecture}"
         model_cls = MODEL_MAP[architecture]
+
         if self.llm_args.load_format == 'dummy':
             self.model = model_cls(self.pretrained_config)
         else:
@@ -985,4 +999,65 @@ __all__ = [
     'Eagle3DecodingConfig',
     'update_llm_args_with_extra_dict',
     'update_llm_args_with_extra_options',
+    'apply_model_defaults_to_llm_args',
 ]
+
+
+def _deep_merge(base: Dict[str, Any], *overlays: Dict[str,
+                                                      Any]) -> Dict[str, Any]:
+    """Deep merge multiple dictionaries with right-side precedence."""
+    result = base.copy()
+
+    for overlay in overlays:
+        if not overlay:
+            continue
+
+        for key, value in overlay.items():
+            if key in result and isinstance(result[key], dict) and isinstance(
+                    value, dict):
+                result[key] = _deep_merge(result[key], value)
+            else:
+                result[key] = value
+
+    return result
+
+
+def apply_model_defaults_to_llm_args(
+        llm_args: 'TorchLlmArgs',
+        model_defaults_dict: Dict[str, Any]) -> Dict[str, Any]:
+    """Apply model defaults to a Pydantic LlmArgs instance.
+
+    Returns the defaults that were actually applied.
+    """
+    if not model_defaults_dict:
+        return {}
+
+    user_overrides = llm_args.model_dump(exclude_unset=True)
+    base_state = llm_args.model_dump()
+    merged_state = _deep_merge(base_state, model_defaults_dict, user_overrides)
+
+    new_args = llm_args.__class__(**merged_state)
+
+    for field_name in llm_args.model_fields:
+        setattr(llm_args, field_name, getattr(new_args, field_name))
+
+    def _compute_applied(defaults: Dict[str, Any],
+                         overrides: Dict[str, Any]) -> Dict[str, Any]:
+        """Recursively compute applied defaults."""
+        applied = {}
+        for key, default_value in defaults.items():
+            if isinstance(default_value, dict):
+                user_override = overrides.get(key, {})
+                if isinstance(user_override, dict):
+                    nested_applied = _compute_applied(default_value,
+                                                      user_override)
+                    if nested_applied:
+                        applied[key] = nested_applied
+                elif key not in overrides:
+                    applied[key] = default_value
+            else:
+                if key not in overrides:
+                    applied[key] = default_value
+        return applied
+
+    return _compute_applied(model_defaults_dict, user_overrides)
