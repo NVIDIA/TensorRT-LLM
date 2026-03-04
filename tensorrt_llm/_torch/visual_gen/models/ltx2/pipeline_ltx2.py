@@ -978,6 +978,8 @@ class LTX2Pipeline(BasePipeline):
             hop_length=getattr(self, "audio_hop_length", 160),
         )
 
+        self.transformer.configure_audio_ulysses(audio_shape.frames)
+
         # ---- 4. Generate initial noise / image conditioning ---------------
         latents = torch.randn(
             video_shape.to_torch_shape(),
