@@ -20,10 +20,12 @@ def test_fmha():
         # SM70 is deprecated in TRTLLM, so we don't need to test it
         all_archs = [80, 86, 89, 90, 100, 120]
 
+        # TODO Find a way to get this programmatically
+        # Filter out the architectures that are tested explicitly to not double up
+        tested_archs = [80, 86, 89, 90]
+
         # Select the family we belong to (e.g. 103 -> 100)
         test_arch = max(filter(lambda x: x <= test_arch, all_archs))
-
-        build_only_on_archs = filter(lambda x: x != test_arch, all_archs)
 
         env = os.environ.copy()
         env.update({
@@ -45,10 +47,14 @@ def test_fmha():
             build_run("python3 setup.py", env=env)
             build_run("make -j 16", env=env)
 
-        # As part of the test we should compile all the architectures, even the ones we dont have executors for
-        for arch in build_only_on_archs:
-            build_arch(arch)
+        # As part of the A100 test we compile all the architectures we dont have executors for, even if we dont run them
+        if test_arch == 80:
+            build_only_on_archs = set(all_archs) - set(tested_archs)
 
+            for arch in build_only_on_archs:
+                build_arch(arch)
+
+        # Run the test of our current architecture
         build_arch(test_arch)
         build_run("pytest fmha_test.py", env=env)
 
