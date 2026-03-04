@@ -316,7 +316,7 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
 
 def generate_pytest_command(
-    llm_src, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+    test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
 ):
     """Generate pytest command and test list."""
     # Generate test list content based on runtime_mode and benchmark_mode
@@ -340,7 +340,7 @@ def generate_pytest_command(
 
     pytest_command = (
         f"pytest -v -s "
-        f"--test-prefix={llm_src}/tests/integration/defs "
+        f"--test-prefix={test_prefix} "
         f"--test-list={test_list_path} "
         f"--output-dir={work_dir} "
         f"-o junit_logging=out-err"
@@ -402,6 +402,7 @@ def main():
         choices=["source", "wheel"],
         help="Installation mode: source (pip install -e ., default) or wheel (pip install *.whl)",
     )
+    parser.add_argument("--test-prefix", default="", help="Test prefix")
 
     args = parser.parse_args()
 
@@ -459,6 +460,8 @@ def main():
         work_dir = os.path.join(llm_src, "jenkins", "scripts", "perf", "local", timestamp)
     os.makedirs(work_dir, exist_ok=True)
 
+    test_prefix = args.test_prefix if args.test_prefix else f"{llm_src}/tests/integration/defs"
+
     # Determine paths
     launch_sh = args.launch_sh if args.launch_sh else os.path.join(work_dir, "slurm_launch.sh")
     run_sh = (
@@ -500,7 +503,7 @@ def main():
 
     # Generate pytest command
     pytest_command, test_list_content, test_list_path = generate_pytest_command(
-        llm_src, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
+        test_prefix, work_dir, config_file_base_name, select_pattern, runtime_mode, benchmark_mode
     )
 
     # Write test list file
