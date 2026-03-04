@@ -1216,6 +1216,15 @@ public:
         return mWindowBlockManagers.begin()->first;
     }
 
+    [[nodiscard]] SizeType32 getLastWindowSize() const
+    {
+        if (mWindowBlockManagers.empty())
+        {
+            return 0;
+        }
+        return mWindowBlockManagers.rbegin()->first;
+    }
+
     [[nodiscard]] SizeType32 getNumAllocNewBlocks() const
     {
         return sumWindows([](auto const& manager) { return manager.getNumAllocNewBlocks(); });
