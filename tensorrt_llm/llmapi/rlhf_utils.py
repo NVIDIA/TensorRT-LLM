@@ -1,9 +1,9 @@
 import base64
-import pickle  # nosec B403
 from typing import Optional
 
 import torch
 
+from tensorrt_llm import serialization
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import MoeLoadBalancer
 from tensorrt_llm._torch.utils import get_device_uuid
@@ -62,8 +62,35 @@ class WorkerExtension:
                 serialized_handles = ipc_handles[device_uuid]
                 if isinstance(serialized_handles, str):
                     # Data is base64-encoded pickled bytes - deserialize it
+                    # using restricted unpickler from tensorrt_llm.serialization
                     logger.info("Deserializing base64-encoded weight handles")
-                    all_handles = pickle.loads(base64.b64decode(serialized_handles))  # nosec B301
+                    decoded_data = base64.b64decode(serialized_handles)
+                    # Allow basic builtins and all torch modules
+                    approved_imports = {
+                        "builtins": [
+                            "list",
+                            "tuple",
+                            "str",
+                            "int",
+                            "float",
+                            "bool",
+                            "bytes",
+                            "dict",
+                            "NoneType",
+                            "type",
+                        ],
+                    }
+                    all_handles = serialization.loads(
+                        decoded_data,
+                        approved_imports=approved_imports,
+                        approved_module_patterns=[r"^torch.*"],
+                    )
+
+                    # Verify the result is a list as expected
+                    if not isinstance(all_handles, list):
+                        raise ValueError(
+                            f"Deserialized data must be a list, got {type(all_handles).__name__} instead"
+                        )
                 else:
                     # Data is already in the correct format (backward compatibility)
                     all_handles = serialized_handles
