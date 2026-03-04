@@ -2149,10 +2149,13 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
+    // When num_layers < len(maxAttentionWindowVec), not all window sizes in the
+    // repeating pattern are used. Update mMaxAttentionWindow to the actual
+    // maximum window size that has been allocated in the block manager.
+    mMaxAttentionWindow = mBlockManager.getLastWindowSize();
+
     TLLM_CHECK_WITH_INFO(mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0,
         "[kv cache manager] streamLLM is not supported at the moment");
-    TLLM_CHECK_DEBUG(std::find(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end(), mMaxAttentionWindow)
-        != maxAttentionWindowVec.end());
     // The sink tokens are stored in blocks separate from other tokens.
     // If the last block of sink tokens is only partially filled,
     // we fill that block with a "bubble" to reach the number of tokens per block.
