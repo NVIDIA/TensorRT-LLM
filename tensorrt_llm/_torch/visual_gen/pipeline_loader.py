@@ -14,13 +14,12 @@ Dynamic Quantization:
   - Quantized weights are copied into model buffers
 """
 
-import contextlib
 import os
 from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from tensorrt_llm._torch.autotuner import DynamicTensorSpec, TuningConfig, autotune
+from tensorrt_llm._torch.autotuner import autotune
 from tensorrt_llm._torch.models.modeling_utils import MetaInitMode
 from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
@@ -32,51 +31,6 @@ from .models import AutoPipeline
 
 if TYPE_CHECKING:
     from .models import BasePipeline
-
-
-@contextlib.contextmanager
-def _diffusion_tuning_config():
-    """Override autotuner bucket generation for diffusion models.
-
-    Diffusion models have fixed M dimensions (determined by resolution and
-    frame count), so the LLM-oriented M-bucket sweep for DeepGemm JIT warmup
-    is unnecessary. This patches GEMM runners to use gen_tuning_buckets=()
-    so only actual M values from warmup shapes are profiled.
-
-    The quant kernel runner (Fp8QuantKernelRunner) already uses empty buckets
-    and is unaffected.
-
-    Also enables tune_on_miss so unseen shapes at inference are auto-tuned
-    on-the-fly (like torch.compile recompilation).
-    """
-    from tensorrt_llm._torch.autotuner import AutoTuner, TunableRunner
-
-    runners_to_patch = [
-        cls
-        for cls in TunableRunner.__subclasses__()
-        if hasattr(cls, "tuning_config")
-        and cls.tuning_config is not None
-        and cls.tuning_config.dynamic_tensor_specs
-    ]
-
-    for cls in runners_to_patch:
-        old_cfg = cls.tuning_config
-        new_specs = tuple(
-            DynamicTensorSpec(s.input_idx, s.dim_idx, (), s.map_to_tuning_buckets)
-            for s in old_cfg.dynamic_tensor_specs
-        )
-        cls.tuning_config = TuningConfig(
-            dynamic_tensor_specs=new_specs,
-            constraint_specs=old_cfg.constraint_specs,
-            tune_max_num_tokens=old_cfg.tune_max_num_tokens,
-            inputs_pre_hook=old_cfg.inputs_pre_hook,
-            use_cold_l2_cache=old_cfg.use_cold_l2_cache,
-            use_cuda_graph=old_cfg.use_cuda_graph,
-            distributed_tuning_strategy=old_cfg.distributed_tuning_strategy,
-        )
-
-    AutoTuner.get().tune_on_miss = True
-    yield
 
 
 class PipelineLoader:
@@ -263,9 +217,9 @@ class PipelineLoader:
 
         if not skip_warmup:
             if config.torch_compile.enable_autotune:
-                with (
-                    _diffusion_tuning_config(),
-                    autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")),
+                with autotune(
+                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
+                    skip_dynamic_tuning_buckets=True,
                 ):
                     pipeline.warmup()
             else:

@@ -255,12 +255,18 @@ class TunableRunner(ABC):
 
 
 @contextlib.contextmanager
-def autotune(tune_mode: bool = True, cache_path: str = None):
+def autotune(tune_mode: bool = True,
+             cache_path: str = None,
+             skip_dynamic_tuning_buckets: bool = False):
     """Context manager for autotuning with distributed support.
 
     Args:
         tune_mode: Whether to enable tuning mode
         cache_path: Path to save/load cache files
+        skip_dynamic_tuning_buckets: When True, suppress bucket generation in
+            _optimization_profiles() so only actual input shapes from warmup
+            are profiled. Useful for workloads (e.g. diffusion) where the
+            LLM-oriented M-bucket sweep is unnecessary.
     """
     autotuner = AutoTuner.get()
     rank = autotuner.mapping.rank
@@ -277,7 +283,9 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
 
     # record the old tuning mode
     old_mode = autotuner.is_tuning_mode
+    old_skip = autotuner.skip_dynamic_tuning_buckets
     autotuner.is_tuning_mode = tune_required
+    autotuner.skip_dynamic_tuning_buckets = skip_dynamic_tuning_buckets
     autotune_enabled = tune_required and not old_mode
 
     if autotune_enabled:
@@ -287,6 +295,7 @@ def autotune(tune_mode: bool = True, cache_path: str = None):
         yield
     finally:
         autotuner.is_tuning_mode = old_mode
+        autotuner.skip_dynamic_tuning_buckets = old_skip
         if autotune_enabled:
             logger.info("[Autotuner] Autotuning process ends")
 
@@ -726,7 +735,7 @@ class AutoTuner:
         self.stream_delay_micro_secs = stream_delay_micro_secs
         self.profiling_cache = AutoTunerProfilingCache()
         self.is_tuning_mode = False
-        self.tune_on_miss = False
+        self.skip_dynamic_tuning_buckets = False
 
         # Timing backend: globaltimer kernel vs cuda events.
         # TLLM_PROFILING_TIMER env var overrides auto-detection:
@@ -935,15 +944,9 @@ class AutoTuner:
 
         # Early return if it's not tuning, use cache found one or fallback one
         if not self.is_tuning_mode:
-            if not is_cache_hit and self.tune_on_miss:
-                self.is_tuning_mode = True
-                try:
-                    return self.choose_one(custom_op, runners, tuning_config,
-                                           inputs, **kwargs)
-                finally:
-                    self.is_tuning_mode = False
-
             best_runner = runners[best_runner_id]
+            # TODO: check the stored runner and tactic can implement this shape here
+            # Log the cache miss. Expect no cache miss in inference.
             if not is_cache_hit:
                 logger.warning_once(
                     f"[AutoTuner] {custom_op} using the fallback tactic, due to cache miss on input shapes={input_shapes}",
@@ -1298,7 +1301,9 @@ class AutoTuner:
         for spec in tuning_config.dynamic_tensor_specs:
             assert callable(spec.gen_tuning_buckets) or isinstance(spec.gen_tuning_buckets, (list, tuple)), \
                 "The given dynamic dimension must provide a opt value generation function or a list of opt values"
-            if callable(spec.gen_tuning_buckets):
+            if self.skip_dynamic_tuning_buckets:
+                opt_shapes = ()
+            elif callable(spec.gen_tuning_buckets):
                 if tuning_config.tune_max_num_tokens is None:
                     # Use the current input size as the opt value
                     opt_shapes = spec.gen_tuning_buckets(
