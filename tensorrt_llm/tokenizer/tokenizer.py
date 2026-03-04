@@ -38,7 +38,8 @@ class TransformersTokenizer(TokenizerBase):
 
     def __init__(self, tokenizer):
         self.tokenizer = tokenizer
-        self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
+        if hasattr(self.tokenizer, "all_special_tokens"):
+            self._all_special_tokens_set = set(self.tokenizer.all_special_tokens)
 
     def __reduce__(self):
         # In multi-node scenarios, AutoTokenizer.from_pretrained with
