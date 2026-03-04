@@ -77,9 +77,9 @@ class CutlassFusedMoE(MoE):
             "sm_constraint": ("min", 89),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
-        # FP8_BLOCK_SCALES: SM == 90 only
+        # FP8_BLOCK_SCALES: SM in {90, 120}
         QuantAlgo.FP8_BLOCK_SCALES: {
-            "sm_constraint": ("exact", 90),
+            "sm_constraint": ("in", {90, 120}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float32},
         },
         # NVFP4: SM in {100, 103}
@@ -130,7 +130,7 @@ class CutlassFusedMoE(MoE):
         CutlassFusedMoE supports:
         - Unquantized (FP16/BF16): SM >= 80
         - FP8 per-tensor (QDQ): SM >= 89
-        - FP8_BLOCK_SCALES: SM == 90 only
+        - FP8_BLOCK_SCALES: SM in {90, 120}
         - NVFP4: SM in {100, 103}
         - W4A8_AWQ: SM in {89, 90} only
         - W8A16: SM >= 80
