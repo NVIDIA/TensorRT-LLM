@@ -98,6 +98,20 @@ __device__ __forceinline__ float warpReduceMax(float val)
     return val;
 }
 
+/// Helper union for vectorized BF16 loads (4 BF16 values = 8 bytes).
+union BF16x4
+{
+    int2 vec;
+    __nv_bfloat162 bf16x2[2];
+};
+
+/// Helper union for vectorized FP8 stores (4 FP8 values = 4 bytes).
+union FP8x4
+{
+    uint32_t u32;
+    __nv_fp8_e4m3 fp8[4];
+};
+
 /// Fused kernel: cat + Hadamard transform + FP8 quantization.
 ///
 /// Grid: (ceil(M / ROWS_PER_BLOCK),)
@@ -105,12 +119,12 @@ __device__ __forceinline__ float warpReduceMax(float val)
 ///
 /// Each warp handles one row. Within a warp:
 ///   - Thread t handles elements [4t, 4t+1, 4t+2, 4t+3] of the 128-dim row.
-///   - Loads from pe or nope based on element index.
+///   - Loads from pe or nope based on element index (vectorized 8-byte loads).
 ///   - Performs 7-stage Walsh-Hadamard butterfly (stages 0-1 local, stages 2-6 via shfl_xor).
-///   - FP8 quantizes with per-row scale.
-__global__ void fusedCatHadamardFp8Kernel(__nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out,
-    __nv_bfloat16 const* __restrict__ pe, __nv_bfloat16 const* __restrict__ nope, int32_t M, int32_t pe_dim,
-    int32_t nope_dim, bool use_ue8m0)
+///   - FP8 quantizes with per-row scale (vectorized 4-byte stores).
+__global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8Kernel(
+    __nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe,
+    __nv_bfloat16 const* __restrict__ nope, int32_t M, int32_t pe_dim, int32_t nope_dim, bool use_ue8m0)
 {
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane = threadIdx.x % WARP_SIZE;
@@ -121,31 +135,42 @@ __global__ void fusedCatHadamardFp8Kernel(__nv_fp8_e4m3* __restrict__ fp8_out, f
         return;
     }
 
-    // ---- Stage 1: Load + Concat ----
+    // ---- Stage 1: Load + Concat (vectorized 8-byte loads) ----
     // Thread t handles elements [4t, 4t+1, 4t+2, 4t+3].
-    // Element i: if i < pe_dim, load from pe; otherwise load from nope[i - pe_dim].
+    // When pe_dim is a multiple of ELEMS_PER_THREAD (true for DSV3.2: pe_dim=64),
+    // each thread's 4 elements are entirely from pe or entirely from nope.
     float v0, v1, v2, v3;
     {
         int base = lane * ELEMS_PER_THREAD;
         __nv_bfloat16 const* pe_row = pe + static_cast<int64_t>(row) * pe_dim;
         __nv_bfloat16 const* nope_row = nope + static_cast<int64_t>(row) * nope_dim;
 
-        auto load_elem = [&](int idx) -> float
+        BF16x4 loaded;
+        if (base + ELEMS_PER_THREAD <= pe_dim)
         {
-            if (idx < pe_dim)
-            {
-                return __bfloat162float(pe_row[idx]);
-            }
-            else
-            {
-                return __bfloat162float(nope_row[idx - pe_dim]);
-            }
-        };
+            // All 4 elements from pe — single 8-byte load
+            loaded.vec = *reinterpret_cast<int2 const*>(pe_row + base);
+        }
+        else if (base >= pe_dim)
+        {
+            // All 4 elements from nope — single 8-byte load
+            loaded.vec = *reinterpret_cast<int2 const*>(nope_row + (base - pe_dim));
+        }
+        else
+        {
+            // Straddling boundary — scalar fallback (rare: only when pe_dim % 4 != 0)
+            auto load_scalar
+                = [&](int idx) -> __nv_bfloat16 { return (idx < pe_dim) ? pe_row[idx] : nope_row[idx - pe_dim]; };
+            loaded.bf16x2[0] = __halves2bfloat162(load_scalar(base + 0), load_scalar(base + 1));
+            loaded.bf16x2[1] = __halves2bfloat162(load_scalar(base + 2), load_scalar(base + 3));
+        }
 
-        v0 = load_elem(base + 0);
-        v1 = load_elem(base + 1);
-        v2 = load_elem(base + 2);
-        v3 = load_elem(base + 3);
+        float2 f0 = __bfloat1622float2(loaded.bf16x2[0]);
+        float2 f1 = __bfloat1622float2(loaded.bf16x2[1]);
+        v0 = f0.x;
+        v1 = f0.y;
+        v2 = f1.x;
+        v3 = f1.y;
     }
 
     // ---- Stage 2: Walsh-Hadamard Transform (7 stages for dim=128) ----
@@ -205,17 +230,15 @@ __global__ void fusedCatHadamardFp8Kernel(__nv_fp8_e4m3* __restrict__ fp8_out, f
         return __nv_fp8_e4m3(scaled);
     };
 
-    __nv_fp8_e4m3 q0 = quantize(v0);
-    __nv_fp8_e4m3 q1 = quantize(v1);
-    __nv_fp8_e4m3 q2 = quantize(v2);
-    __nv_fp8_e4m3 q3 = quantize(v3);
+    // ---- Stage 4: Store (vectorized 4-byte FP8 store) ----
+    FP8x4 packed;
+    packed.fp8[0] = quantize(v0);
+    packed.fp8[1] = quantize(v1);
+    packed.fp8[2] = quantize(v2);
+    packed.fp8[3] = quantize(v3);
 
-    // ---- Stage 4: Store ----
     int base_out = row * HEAD_DIM + lane * ELEMS_PER_THREAD;
-    fp8_out[base_out + 0] = q0;
-    fp8_out[base_out + 1] = q1;
-    fp8_out[base_out + 2] = q2;
-    fp8_out[base_out + 3] = q3;
+    *reinterpret_cast<uint32_t*>(fp8_out + base_out) = packed.u32;
 
     // Only lane 0 writes the scale for this row
     if (lane == 0)
@@ -239,6 +262,8 @@ void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bf
     TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim,
         "fusedCatHadamardFp8: pe_dim (%d) + nope_dim (%d) != head_dim (%d)", pe_dim, nope_dim, head_dim);
     TLLM_CHECK_WITH_INFO((head_dim & (head_dim - 1)) == 0, "fusedCatHadamardFp8: head_dim must be power of 2");
+    TLLM_CHECK_WITH_INFO(pe_dim % ELEMS_PER_THREAD == 0,
+        "fusedCatHadamardFp8: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     dim3 grid(num_blocks);
