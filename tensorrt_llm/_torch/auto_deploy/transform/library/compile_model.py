@@ -89,48 +89,12 @@ class CompileModel(BaseTransform):
             cm.info.set_generate_only_batch(bs)
             return (), cm.named_args
 
-        def _get_mixed_args_kwargs(num_tokens: int) -> ArgsKwargs:
-            """Generate synthetic mixed-batch args for piecewise CG capture.
-
-            Creates a mixed batch with at least 1 prefill + 1 decode to exercise
-            both code paths in dynamic ops (attention, SSM). The static CUDA
-            graph segments are agnostic to the prefill/decode split -- they only
-            see total_num_tokens.
-
-            Each prefill sequence is capped to max_seq_len so that its page
-            indices stay within block_offsets capacity, matching what the
-            executor would produce at runtime. When num_tokens exceeds what a
-            single prefill can hold, multiple prefill sequences are created.
-            """
-            assert num_tokens >= 3, (
-                f"Piecewise bucket {num_tokens} too small for mixed batch. "
-                f"Minimum is 3 (1 prefill seq with len>=2 + 1 decode seq)."
-            )
-            max_seq = cm.info.max_seq_len
-            max_batch = cm.info.max_batch_size
-
-            input_ids = []
-            remaining = num_tokens - 1
-            while remaining > 0 and len(input_ids) < max_batch - 1:
-                seq_len = min(remaining, max_seq)
-                input_ids.append([1] * seq_len)
-                remaining -= seq_len
-            input_ids.append([1])
-
-            assert remaining == 0, (
-                f"Piecewise bucket {num_tokens} exceeds batch capacity "
-                f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode). "
-                f"Increase max_seq_len or max_batch_size."
-            )
-
-            cm.info.set_example_sequence(input_ids=input_ids)
-            return (), cm.named_args
-
         extra_kwargs = {}
         config_overrides = {}
 
         if self.config.piecewise_enabled:
-            extra_kwargs["get_mixed_args_kwargs_for_compile"] = _get_mixed_args_kwargs
+            extra_kwargs["piecewise_seq_info"] = cm.info
+            extra_kwargs["piecewise_named_args_fn"] = lambda: cm.named_args
 
             # Auto-generate piecewise_num_tokens if not explicitly specified
             if self.config.piecewise_num_tokens is None:

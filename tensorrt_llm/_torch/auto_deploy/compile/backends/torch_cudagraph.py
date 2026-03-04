@@ -474,6 +474,63 @@ class DualModeCapturedGraph(nn.Module):
         return self.piecewise.original_model(*args, **kwargs)
 
 
+def _setup_piecewise_mixed_batch(seq_info: Any, num_tokens: int) -> None:
+    """Set up SequenceInfo for a mixed-batch with the given total num_tokens.
+
+    Creates a mixed batch with at least 1 prefill + 1 decode to exercise both
+    code paths in dynamic ops (attention, SSM). Each prefill sequence is capped
+    to max_seq_len so page indices stay within block_offsets capacity.
+
+    Args:
+        seq_info: SequenceInfo object (duck-typed: needs max_seq_len, max_batch_size,
+            tokens_per_block, and nest_sequences method).
+        num_tokens: Total number of tokens for this piecewise bucket.
+    """
+    assert num_tokens >= 3, (
+        f"Piecewise bucket {num_tokens} too small for mixed batch. "
+        f"Minimum is 3 (1 prefill seq with len>=2 + 1 decode seq)."
+    )
+    max_seq = seq_info.max_seq_len
+    max_batch = seq_info.max_batch_size
+
+    seq_lens: List[int] = []
+    remaining = num_tokens - 1
+    while remaining > 0 and len(seq_lens) < max_batch - 1:
+        sl = min(remaining, max_seq)
+        seq_lens.append(sl)
+        remaining -= sl
+    seq_lens.append(1)  # decode token
+
+    assert remaining == 0, (
+        f"Piecewise bucket {num_tokens} exceeds batch capacity "
+        f"({max_batch - 1} seqs * {max_seq} tokens + 1 decode). "
+        f"Increase max_seq_len or max_batch_size."
+    )
+
+    bs = len(seq_lens)
+    input_ids_flat = torch.ones(sum(seq_lens), dtype=torch.int)
+
+    cu_seqlen = torch.zeros(bs + 1, dtype=torch.int)
+    for i, sl in enumerate(seq_lens):
+        cu_seqlen[i + 1] = cu_seqlen[i] + sl
+
+    tpb = seq_info.tokens_per_block
+    cu_num_pages = torch.zeros(bs + 1, dtype=torch.int)
+    for i, sl in enumerate(seq_lens):
+        cu_num_pages[i + 1] = cu_num_pages[i] + (sl + tpb - 1) // tpb
+    cache_loc = torch.arange(cu_num_pages[-1].item())
+    slot_idx = torch.arange(bs)
+
+    seq_info.nest_sequences(
+        input_ids=input_ids_flat,
+        cu_seqlen=cu_seqlen,
+        input_pos=0,
+        cache_loc=cache_loc,
+        cu_num_pages=cu_num_pages,
+        slot_idx=slot_idx,
+    )
+
+
 @CompileBackendRegistry.register("torch-cudagraph")
 class TorchCudagraphCompiler(CompilerBackend):
     """Compiler that uses CUDA graphs.
@@ -491,7 +548,8 @@ class TorchCudagraphCompiler(CompilerBackend):
         get_args_kwargs_for_compile: GetArgsKwargsForBatchSize = None,
         piecewise_enabled: bool = False,
         piecewise_num_tokens: Optional[List[int]] = None,
-        get_mixed_args_kwargs_for_compile: Optional[Callable[[int], Any]] = None,
+        piecewise_seq_info: Any = None,
+        piecewise_named_args_fn: Optional[Callable[[], Dict[str, Any]]] = None,
         **kwargs_for_init,
     ):
         super().__init__(*args_for_init, **kwargs_for_init)
@@ -500,7 +558,8 @@ class TorchCudagraphCompiler(CompilerBackend):
         self.get_args_kwargs_for_compile = get_args_kwargs_for_compile
         self.piecewise_enabled = piecewise_enabled
         self.piecewise_num_tokens = piecewise_num_tokens or []
-        self.get_mixed_args_kwargs_for_compile = get_mixed_args_kwargs_for_compile
+        self.piecewise_seq_info = piecewise_seq_info
+        self.piecewise_named_args_fn = piecewise_named_args_fn
 
     @torch.inference_mode()
     def compile(self) -> nn.Module:
@@ -527,8 +586,17 @@ class TorchCudagraphCompiler(CompilerBackend):
             )
             piecewise.prepare()
 
-            if self.get_mixed_args_kwargs_for_compile is not None and self.piecewise_num_tokens:
-                piecewise.warmup_and_capture(self.get_mixed_args_kwargs_for_compile)
+            if (
+                self.piecewise_seq_info is not None
+                and self.piecewise_named_args_fn is not None
+                and self.piecewise_num_tokens
+            ):
+
+                def get_mixed_args_kwargs(num_tokens: int):
+                    _setup_piecewise_mixed_batch(self.piecewise_seq_info, num_tokens)
+                    return (), self.piecewise_named_args_fn()
+
+                piecewise.warmup_and_capture(get_mixed_args_kwargs)
 
         if piecewise is not None:
             return DualModeCapturedGraph(monolithic, piecewise)
