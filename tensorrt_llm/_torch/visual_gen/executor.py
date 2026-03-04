@@ -9,7 +9,7 @@ import torch
 import torch.distributed as dist
 import zmq
 
-from tensorrt_llm._torch.visual_gen.config import DiffusionArgs
+from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 from tensorrt_llm.executor.ipc import ZeroMqQueue
@@ -68,17 +68,15 @@ class DiffusionExecutor:
 
     def __init__(
         self,
-        model_path: str,
         request_queue_addr: str,
         response_queue_addr: str,
         device_id: int,
-        diffusion_config: Optional[dict] = None,
+        diffusion_args: "VisualGenArgs",
     ):
-        self.model_path = model_path
         self.request_queue_addr = request_queue_addr
         self.response_queue_addr = response_queue_addr
         self.device_id = device_id
-        self.diffusion_config = diffusion_config
+        self.diffusion_args = diffusion_args
 
         self.pipeline = None  # initialized in _load_pipeline
         self.requests_ipc = None
@@ -126,27 +124,15 @@ class DiffusionExecutor:
     def _load_pipeline(self):
         """
         Load pipeline using proper flow:
-        DiffusionArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
+        VisualGenArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
         """
         logger.info(f"Worker {self.device_id}: Loading pipeline")
 
         try:
-            # Convert diffusion_config dict to DiffusionArgs
-            config_dict = self.diffusion_config.copy()
-            config_dict["checkpoint_path"] = self.model_path
-            config_dict["device"] = f"cuda:{self.device_id}"
+            args = self.diffusion_args.model_copy(update={"device": f"cuda:{self.device_id}"})
 
-            # Create DiffusionArgs from dict (handles nested configs)
-            args = DiffusionArgs.from_dict(config_dict)
-
-            # Use PipelineLoader for proper pipeline creation flow:
-            # PipelineLoader.load() internally:
-            #   1. Creates DiffusionModelConfig.from_pretrained()
-            #   2. Creates pipeline via AutoPipeline.from_config()
-            #   3. Loads weights with quantization support
-            #   4. Calls post_load_weights()
             loader = PipelineLoader(args)
-            self.pipeline = loader.load()
+            self.pipeline = loader.load(skip_warmup=args.skip_warmup)
 
         except Exception as e:
             logger.error(f"Worker {self.device_id}: Failed to load pipeline: {e}")
@@ -215,19 +201,25 @@ def run_diffusion_worker(
     world_size: int,
     master_addr: str,
     master_port: int,
-    model_path: str,
     request_queue_addr: str,
     response_queue_addr: str,
-    diffusion_config: Optional[dict] = None,
+    diffusion_args: "VisualGenArgs",
+    log_level: str = "info",
 ):
     """Entry point for worker process."""
     try:
+        # Set log level before any other work so loading logs are visible
+        logger.set_level(log_level)
+
         # Setup distributed env — use PyTorch distributed, not MPI
         os.environ["TLLM_DISABLE_MPI"] = "1"
         os.environ["MASTER_ADDR"] = master_addr
         os.environ["MASTER_PORT"] = str(master_port)
         os.environ["RANK"] = str(rank)
         os.environ["WORLD_SIZE"] = str(world_size)
+
+        # Runtime check: parallel config vs actual world size
+        diffusion_args.parallel.validate_world_size(world_size)
 
         # Calculate device_id before init_process_group
         device_id = rank % torch.cuda.device_count() if torch.cuda.is_available() else 0
@@ -243,11 +235,10 @@ def run_diffusion_worker(
         )
 
         executor = DiffusionExecutor(
-            model_path=model_path,
             request_queue_addr=request_queue_addr,
             response_queue_addr=response_queue_addr,
             device_id=device_id,
-            diffusion_config=diffusion_config,
+            diffusion_args=diffusion_args,
         )
         executor.serve_forever()
         if executor.pipeline is not None:
