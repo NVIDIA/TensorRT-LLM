@@ -38,6 +38,17 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
+      - name: Get changed files
+        id: changed-files
+        run: |
+          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BASE=$(git merge-base HEAD^ HEAD 2>/dev/null || echo "HEAD^")
+          fi
+          git diff --name-only $BASE ${{ github.sha }} > changed_files.txt
+          echo "count=$(wc -l < changed_files.txt)" >> $GITHUB_OUTPUT
+
       - name: Run pre-commit checks
         run: |
-          python3 -u scripts/release_check.py
+          python3 -u scripts/release_check.py --files-from changed_files.txt
