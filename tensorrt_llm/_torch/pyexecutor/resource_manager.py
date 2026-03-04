@@ -1632,8 +1632,8 @@ class KVCacheManagerV2(BaseResourceManager):
         if kv_cache_config.max_tokens is not None:
             quota_from_max_tokens = int(
                 math.ceil(
-                    self._get_cache_quota(kv_cache_config.max_tokens) /
-                    kv_cache_config.max_util_for_resume))
+                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
+                    / kv_cache_config.max_util_for_resume))
             quota = min(quota, quota_from_max_tokens)
             logger.info(
                 f"max_tokens {kv_cache_config.max_tokens} is provided. Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. New quota is {quota / (1 << 30)}GiB"
@@ -1729,7 +1729,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
-    def _get_cache_quota(self, max_tokens: int) -> int:
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
