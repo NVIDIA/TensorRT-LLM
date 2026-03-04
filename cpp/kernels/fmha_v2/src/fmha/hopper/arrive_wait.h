@@ -73,7 +73,16 @@ inline __device__ void named_barrier_arrive(uint32_t BARRIER_ID, uint32_t NUM_TH
 {
     if (NUM_THREADS > 1)
     {
+        // Note: bar.arrive is an alias of barrier.arrive.aligned
         asm volatile("bar.arrive %0, %1;" : : "r"(BARRIER_ID), "r"(NUM_THREADS));
+    }
+}
+
+inline __device__ void named_barrier_arrive_unaligned(uint32_t BARRIER_ID, uint32_t NUM_THREADS)
+{
+    if (NUM_THREADS > 1)
+    {
+        asm volatile("barrier.arrive %0, %1;" : : "r"(BARRIER_ID), "r"(NUM_THREADS));
     }
 }
 
@@ -81,7 +90,16 @@ inline __device__ void named_barrier_wait(uint32_t BARRIER_ID, uint32_t NUM_THRE
 {
     if (NUM_THREADS > 1)
     {
+        // Note: bar.sync is an alias of barrier.sync.aligned
         asm volatile("bar.sync %0, %1;" ::"r"(BARRIER_ID), "r"(NUM_THREADS));
+    }
+}
+
+inline __device__ void named_barrier_wait_unaligned(uint32_t BARRIER_ID, uint32_t NUM_THREADS)
+{
+    if (NUM_THREADS > 1)
+    {
+        asm volatile("barrier.sync %0, %1;" ::"r"(BARRIER_ID), "r"(NUM_THREADS));
     }
 }
 
