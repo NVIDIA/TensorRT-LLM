@@ -40,14 +40,18 @@ jobs:
 
       - name: Get changed files
         id: changed-files
+        if: github.event_name == 'pull_request'
+        uses: tj-actions/changed-files@v45
+        with:
+          use_rest_api: true  # use GitHub API so base commit need not be in local repo
+
+      - name: Write changed files list
         run: |
-          if [ -n "${{ github.event.pull_request.base.sha }}" ]; then
-            BASE="${{ github.event.pull_request.base.sha }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "${{ steps.changed-files.outputs.all_modified_files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
           else
-            BASE=$(git merge-base HEAD^ HEAD 2>/dev/null || echo "HEAD^")
+            touch changed_files.txt
           fi
-          git diff --name-only $BASE ${{ github.sha }} > changed_files.txt
-          echo "count=$(wc -l < changed_files.txt)" >> $GITHUB_OUTPUT
 
       - name: Run pre-commit checks
         run: |
