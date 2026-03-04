@@ -44,6 +44,66 @@ class NemotronHHfWeightMapper(HfWeightMapper):
         d_state = config.ssm_state_size
         nheads = config.mamba_num_heads
 
+        # First pass: Expand batched expert weights into individual expert weights
+        # New checkpoint format stores experts as 3D tensors: (num_experts, out_dim, in_dim)
+        # We need to split them into individual expert weights for TRTLLM processing
+        expanded_weights = {}
+        for name, weight in weights.items():
+            # Detect batched expert format: "mixer.experts.up_proj" or "mixer.experts.down_proj"
+            # (without expert index like ".0.", ".1.", etc.)
+            # Also handle weight_scale, input_scale, etc. for quantized models
+            import re
+            if re.match(
+                    r'.*\.mixer\.experts\.(up_proj|down_proj)(?:\.weight|\.weight_scale|\.weight_scale_2|\.input_scale)?$',
+                    name):
+                # This is batched expert weight (3D tensor) or scale (could be scalar or tensor)
+                if weight.ndim == 3:
+                    # 3D tensor: expand into individual expert weights
+                    num_experts = weight.shape[0]
+                    for expert_idx in range(num_experts):
+                        # Create key with expert index
+                        # New format: mixer.experts.up_proj -> mixer.experts.0.up_proj.weight
+                        # Handle both with and without .weight suffix
+                        if name.endswith('.weight') or name.endswith(
+                                '.weight_scale') or name.endswith(
+                                    '.weight_scale_2') or name.endswith(
+                                        '.input_scale'):
+                            expert_key = name.replace(
+                                '.experts.', f'.experts.{expert_idx}.')
+                        else:
+                            expert_key = name.replace(
+                                '.experts.',
+                                f'.experts.{expert_idx}.') + '.weight'
+                        # Extract individual expert weight
+                        expanded_weights[expert_key] = weight[expert_idx]
+                elif weight.ndim == 0 or weight.ndim == 1:
+                    # Scalar or 1D (e.g., scale factors) - replicate for all experts
+                    # Need to determine number of experts from config
+                    num_experts = config.n_routed_experts
+                    for expert_idx in range(num_experts):
+                        if name.endswith('.weight') or name.endswith(
+                                '.weight_scale') or name.endswith(
+                                    '.weight_scale_2') or name.endswith(
+                                        '.input_scale'):
+                            expert_key = name.replace(
+                                '.experts.', f'.experts.{expert_idx}.')
+                        else:
+                            expert_key = name.replace(
+                                '.experts.',
+                                f'.experts.{expert_idx}.') + '.weight'
+                        expanded_weights[expert_key] = weight
+                else:
+                    # 2D tensor, keep as is (shouldn't happen for batched format)
+                    logger.warning(
+                        f"Unexpected 2D tensor for batched expert weight: {name}, shape: {weight.shape}"
+                    )
+                    expanded_weights[name] = weight
+            else:
+                expanded_weights[name] = weight
+
+        # Use expanded weights for processing
+        weights = expanded_weights
+
         new_weights = {}
         for name, _ in weights.items():
             key = name
