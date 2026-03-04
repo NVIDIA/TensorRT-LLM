@@ -31,12 +31,12 @@ Phase semantics:
   3. REPLAY: Replay the captured CUDA graph.  The DynamicOpWrapper retrieves the
      pre-allocated output buffer via get_dynamic_out_buf().
 
-MetadataStabilizer: wraps metadata-prep dynamic ops whose outputs flow into
+MetadataWrapper: wraps metadata-prep dynamic ops whose outputs flow into
   subsequent CUDA-graph-captured static segments.  These ops (e.g.
   mamba_ssm_prepare_metadata) run eagerly every time and allocate fresh output
   tensors.  After torch.cuda.empty_cache() between capture and runtime, the
   allocator hands out different addresses, breaking the CUDA graph's recorded
-  pointers.  The stabilizer clones outputs during capture and copy_()s new data
+  pointers.  The wrapper clones outputs during capture and copy_()s new data
   into those stable buffers on replay, preserving addresses at negligible cost
   (metadata tensors are tiny, e.g. two int32 [1024] ≈ 8 KB).
 
@@ -79,7 +79,7 @@ class SegmentEntry:
     input_addresses: List[Optional[int]] = field(default_factory=list)
 
 
-class MetadataStabilizer(nn.Module):
+class MetadataWrapper(nn.Module):
     """Wraps a metadata-prep dynamic op to give its outputs stable addresses.
 
     Metadata-prep ops (e.g. mamba_ssm_prepare_metadata) run eagerly and return
@@ -306,3 +306,33 @@ class ADPiecewiseRunner(nn.Module):
     @graph_pool.setter
     def graph_pool(self, pool):
         self._graph_pool = pool
+
+
+class DynamicOpWrapper(nn.Module):
+    """Wraps a non-inplace dynamic op to pass out= from the preceding runner's graph pool.
+
+    During warmup, forwards without out= (normal allocation).
+    During capture/replay, retrieves the pre-allocated buffer from the linked
+    ADPiecewiseRunner and passes it as the ``out`` kwarg.
+    """
+
+    def __init__(self, submodule: nn.Module, preceding_runner: ADPiecewiseRunner):
+        super().__init__()
+        self.submodule = submodule
+        self.preceding_runner = preceding_runner
+
+    def forward(self, *args, **kwargs) -> Any:
+        phase = ADPiecewiseRunner._current_phase
+        if phase == "warmup":
+            return self.submodule(*args, **kwargs)
+
+        nt = ADPiecewiseRunner._current_num_tokens
+        if nt is not None:
+            out_buf = self.preceding_runner.get_dynamic_out_buf(nt)
+            assert out_buf is not None, (
+                f"DynamicOpWrapper: no pre-allocated out buffer for nt={nt}. "
+                f"Shape discovery may have failed — downstream static runners "
+                f"require stable output addresses."
+            )
+            kwargs["out"] = out_buf
+        return self.submodule(*args, **kwargs)

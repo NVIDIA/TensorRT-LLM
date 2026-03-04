@@ -11,7 +11,6 @@ When piecewise_enabled=True, a DualModeCapturedGraph is returned that dispatches
 
 import copy  # noqa: I001
 import gc
-import operator
 from typing import Any, Callable, Dict, List, Optional, Set, Tuple
 
 import torch
@@ -27,58 +26,15 @@ from ...utils.cuda_graph import CudaGraphWarmUpPhase
 from ...utils.cuda_mem_tracker import get_mem_info
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
-from ..piecewise_runner import ADPiecewiseRunner, MetadataStabilizer, OutputInfo
+from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
 from ..piecewise_utils import (
     SplitInfo,
-    _CACHED_CONV_OPS,
-    _METADATA_PREP_OPS,
     is_dynamic_cached_op,
+    is_metadata_prep,
+    needs_out_buffer,
     split_graph_at_dynamic_ops,
+    submod_has_cuda_ops,
 )
-
-
-# Trivial FX ops that are metadata-only or typically no-ops — used to identify
-# static segments with no meaningful GPU compute (e.g., between adjacent dynamic ops).
-# NOTE: reshape, contiguous, and to *can* launch kernels in edge cases (non-contiguous
-# tensors, dtype/device casts), but in practice these appear only as lightweight
-# plumbing in empty partitions.
-_TRIVIAL_CALL_FUNCTIONS = {operator.getitem, getattr}
-_TRIVIAL_CALL_METHODS = {
-    "view",
-    "reshape",
-    "contiguous",
-    "permute",
-    "transpose",
-    "unsqueeze",
-    "squeeze",
-    "expand",
-    "size",
-    "dim",
-    "to",
-}
-
-
-def _submod_has_cuda_ops(submod: nn.Module) -> bool:
-    """Check if a submodule has ops beyond those in _TRIVIAL_CALL_FUNCTIONS/METHODS."""
-    if not isinstance(submod, GraphModule):
-        return True  # Conservative: non-FX modules assumed to have GPU ops
-
-    for node in submod.graph.nodes:
-        if node.op == "call_module":
-            # nn.Module calls (Linear, LayerNorm, etc.) launch CUDA kernels
-            return True
-        if node.op == "call_function":
-            if node.target in _TRIVIAL_CALL_FUNCTIONS:
-                continue
-            # Any non-trivial call_function is potentially a CUDA op
-            return True
-        if node.op == "call_method":
-            if node.target in _TRIVIAL_CALL_METHODS:
-                continue
-            # Non-trivial method call — could launch a kernel
-            return True
-
-    return False
 
 
 def _args_kwargs_flatten_spec(in_spec: TreeSpec, *args, **kwargs) -> List[Any]:
@@ -93,48 +49,6 @@ def _args_kwargs_flatten(*args, **kwargs) -> Tuple[List[Any], TreeSpec]:
     return tree_flatten(all_args)
 
 
-_SKIP_OUT_DYNAMIC_OPS: Set[str] = set(_CACHED_CONV_OPS) | set(_METADATA_PREP_OPS)
-
-
-def _needs_out_buffer(submod: nn.Module) -> bool:
-    """Return True if this dynamic submodule produces a NEW output tensor.
-
-    Conv ops are already inplace (mutate input, return None).
-    Metadata prep ops are handled by MetadataStabilizer (stable output addresses).
-    Both are skipped — only attention/SSM/delta/logits ops need out= buffers.
-    """
-    if not isinstance(submod, GraphModule):
-        return True
-
-    for node in submod.graph.nodes:
-        if node.op == "call_function" and is_dynamic_cached_op(node):
-            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
-            for skip_op in _SKIP_OUT_DYNAMIC_OPS:
-                if skip_op in op_name:
-                    return False
-                base_name = skip_op.split("::")[-1] if "::" in skip_op else skip_op
-                if base_name in op_name:
-                    return False
-    return True
-
-
-def _is_metadata_prep(submod: nn.Module) -> bool:
-    """Return True if this dynamic submodule contains a metadata-prep op."""
-    if not isinstance(submod, GraphModule):
-        return False
-
-    for node in submod.graph.nodes:
-        if node.op == "call_function" and is_dynamic_cached_op(node):
-            op_name = node.target.name() if hasattr(node.target, "name") else str(node.target)
-            for prep_op in _METADATA_PREP_OPS:
-                if prep_op in op_name:
-                    return True
-                base_name = prep_op.split("::")[-1] if "::" in prep_op else prep_op
-                if base_name in op_name:
-                    return True
-    return False
-
-
 def _coalesce_output(
     op_result: Optional[torch.Tensor], out: Optional[torch.Tensor]
 ) -> torch.Tensor:
@@ -142,7 +56,7 @@ def _coalesce_output(
     return out if out is not None else op_result
 
 
-def _inject_out_param(submod: GraphModule) -> bool:
+def _inject_out_param(submod: GraphModule) -> None:
     """Rewrite a dynamic submodule's FX graph to accept and forward an ``out`` kwarg.
 
     Adds an ``out`` placeholder (default ``None``) and wires it as a kwarg to
@@ -150,8 +64,6 @@ def _inject_out_param(submod: GraphModule) -> bool:
     return a tensor that aliases an input, the op returns a 0-element dummy
     tensor when ``out`` is provided.  A ``_coalesce_output`` node is inserted
     after the op call to select ``out`` (the mutated buffer) over the dummy.
-
-    Returns True if the graph was successfully rewritten.
     """
     graph = submod.graph
 
@@ -162,8 +74,9 @@ def _inject_out_param(submod: GraphModule) -> bool:
         else:
             break
 
-    if last_placeholder is None:
-        return False
+    assert last_placeholder is not None, (
+        "_inject_out_param: no placeholder nodes found — dynamic partition should have inputs"
+    )
 
     target_node = None
     for node in graph.nodes:
@@ -171,8 +84,9 @@ def _inject_out_param(submod: GraphModule) -> bool:
             target_node = node
             break
 
-    if target_node is None:
-        return False
+    assert target_node is not None, (
+        "_inject_out_param: no dynamic cached op found — partition was classified as dynamic"
+    )
 
     with graph.inserting_after(last_placeholder):
         out_placeholder = graph.placeholder("out", default_value=None)
@@ -186,41 +100,9 @@ def _inject_out_param(submod: GraphModule) -> bool:
         if user is not coalesce_node:
             user.replace_input_with(target_node, coalesce_node)
 
+    # Validate graph structure, then regenerate forward() from the modified graph
     graph.lint()
     submod.recompile()
-    return True
-
-
-class DynamicOpWrapper(nn.Module):
-    """Wraps a non-inplace dynamic op to pass out= from the preceding runner's graph pool.
-
-    During warmup, forwards without out= (normal allocation).
-    During capture/replay, retrieves the pre-allocated buffer from the linked
-    ADPiecewiseRunner and passes it as the ``out`` kwarg.
-    """
-
-    def __init__(self, submodule: nn.Module, preceding_runner: ADPiecewiseRunner):
-        super().__init__()
-        self.submodule = submodule
-        self.preceding_runner = preceding_runner
-
-    def forward(self, *args, **kwargs) -> Any:
-        phase = ADPiecewiseRunner._current_phase
-        if phase == "warmup":
-            return self.submodule(*args, **kwargs)
-
-        nt = ADPiecewiseRunner._current_num_tokens
-        if nt is not None:
-            out_buf = self.preceding_runner.get_dynamic_out_buf(nt)
-            if out_buf is not None:
-                kwargs["out"] = out_buf
-            else:
-                ad_logger.warning(
-                    "DynamicOpWrapper: no pre-allocated out buffer for nt=%d, "
-                    "falling back to internal allocation (shape discovery may have failed)",
-                    nt,
-                )
-        return self.submodule(*args, **kwargs)
 
 
 class CapturedGraph(nn.Module):
@@ -370,9 +252,9 @@ class PiecewiseCapturedGraph(nn.Module):
     Static segments are wrapped in ADPiecewiseRunner for CUDA graph capture.
     Non-inplace dynamic ops are wrapped in DynamicOpWrapper, which passes a
     pre-allocated output buffer (out=) from the preceding static runner's graph pool.
-    Metadata-prep ops are wrapped in MetadataStabilizer to keep their output
+    Metadata-prep ops are wrapped in MetadataWrapper to keep their output
     addresses stable across capture and replay (prevents CUDA graph crashes).
-    Inplace dynamic ops (conv) run eagerly without wrapping.
+    Inplace dynamic ops (see _INPLACE_DYNAMIC_OPS) run eagerly without wrapping.
     """
 
     def __init__(
@@ -444,7 +326,7 @@ class PiecewiseCapturedGraph(nn.Module):
                 continue
             original_submod = getattr(self.split_gm, submod_name)
 
-            if not _submod_has_cuda_ops(original_submod):
+            if not submod_has_cuda_ops(original_submod):
                 ad_logger.info(
                     "PiecewiseCapturedGraph: skipping %s (no CUDA ops, will run eagerly)",
                     submod_name,
@@ -461,9 +343,9 @@ class PiecewiseCapturedGraph(nn.Module):
             num_wrapped_static += 1
 
         # Phase 2: wrap dynamic ops.
-        # - Metadata-prep ops → MetadataStabilizer (stable output addresses)
+        # - Metadata-prep ops → MetadataWrapper (stable output addresses)
         # - Attention/SSM/delta/logits → DynamicOpWrapper (out= pre-alloc)
-        # - Conv ops → left unwrapped (already inplace)
+        # - Inplace ops (e.g. conv) → left unwrapped (mutate input, return None)
         # Iterate over all actual submod indices in order (not range(N), because
         # indices are partition IDs that may have gaps from empty partitions).
         dynamic_set = set(self.split_info.dynamic_submod_indices)
@@ -471,7 +353,7 @@ class PiecewiseCapturedGraph(nn.Module):
             self.split_info.static_submod_indices + self.split_info.dynamic_submod_indices
         )
         current_static_runner: Optional[ADPiecewiseRunner] = None
-        num_stabilized = 0
+        num_metadata_wrapped = 0
         for idx in all_submod_indices:
             if idx in runner_by_idx:
                 current_static_runner = runner_by_idx[idx]
@@ -481,33 +363,24 @@ class PiecewiseCapturedGraph(nn.Module):
                     continue
                 submod = getattr(self.split_gm, submod_name)
 
-                if not _needs_out_buffer(submod):
-                    if _is_metadata_prep(submod):
-                        stabilizer = MetadataStabilizer(submod)
-                        setattr(self.split_gm, submod_name, stabilizer)
-                        num_stabilized += 1
+                if not needs_out_buffer(submod):
+                    if is_metadata_prep(submod):
+                        wrapper = MetadataWrapper(submod)
+                        setattr(self.split_gm, submod_name, wrapper)
+                        num_metadata_wrapped += 1
                         ad_logger.info(
                             "PiecewiseCapturedGraph: wrapped %s in "
-                            "MetadataStabilizer (stable output addresses)",
+                            "MetadataWrapper (stable output addresses)",
                             submod_name,
                         )
                     continue
 
-                if current_static_runner is None:
-                    ad_logger.warning(
-                        "Dynamic %s has no preceding static runner, skipping out= wrapping",
-                        submod_name,
-                    )
-                    continue
+                assert current_static_runner is not None, (
+                    f"Dynamic {submod_name} has no preceding static runner — "
+                    f"cannot allocate out= buffer for stable output addresses"
+                )
 
-                if isinstance(submod, GraphModule) and not _inject_out_param(submod):
-                    ad_logger.warning(
-                        "Dynamic %s: failed to inject out= param into FX graph, "
-                        "skipping out= wrapping",
-                        submod_name,
-                    )
-                    continue
-
+                _inject_out_param(submod)
                 wrapper = DynamicOpWrapper(submod, preceding_runner=current_static_runner)
                 setattr(self.split_gm, submod_name, wrapper)
                 self._wrapped_dynamic_indices.add(idx)
@@ -517,16 +390,19 @@ class PiecewiseCapturedGraph(nn.Module):
         ad_logger.info(
             "PiecewiseCapturedGraph: prepared with %d submodules "
             "(%d static runners, %d trivial skipped, %d dynamic wrapped, "
-            "%d metadata stabilized, %d dynamic eager), piecewise_num_tokens=%s",
+            "%d metadata wrapped, %d dynamic eager), piecewise_num_tokens=%s",
             self.split_info.num_submodules,
             num_wrapped_static,
             num_skipped_static,
             num_wrapped_dynamic,
-            num_stabilized,
-            len(self.split_info.dynamic_submod_indices) - num_wrapped_dynamic - num_stabilized,
+            num_metadata_wrapped,
+            len(self.split_info.dynamic_submod_indices)
+            - num_wrapped_dynamic
+            - num_metadata_wrapped,
             self.piecewise_num_tokens,
         )
 
+    # TODO(nvchenghaoz): Memory logging below (_fmt_mem, _install_mem_hooks), remove for PR
     @staticmethod
     def _fmt_mem(label: str) -> str:
         """Format a one-line memory summary for debug logging."""
@@ -591,10 +467,11 @@ class PiecewiseCapturedGraph(nn.Module):
                 h = wrapper.submodule.register_forward_hook(_make_shape_hook(idx))
                 hooks.append(h)
 
-        self.split_gm(*args, **kwargs)
-
-        for h in hooks:
-            h.remove()
+        try:
+            self.split_gm(*args, **kwargs)
+        finally:
+            for h in hooks:
+                h.remove()
 
         return discovered
 
@@ -604,19 +481,12 @@ class PiecewiseCapturedGraph(nn.Module):
             wrapper = getattr(self.split_gm, f"submod_{dynamic_idx}")
             if isinstance(wrapper, DynamicOpWrapper):
                 wrapper.preceding_runner.set_dynamic_out_info(info)
-                ad_logger.debug(
-                    "Runner before dynamic submod_%d will allocate out buffer %s %s",
-                    dynamic_idx,
-                    list(info.shape),
-                    info.dtype,
-                )
 
         missing = self._wrapped_dynamic_indices - set(discovered.keys())
-        if missing:
-            ad_logger.warning(
-                "Shape discovery did not capture outputs for dynamic submods: %s",
-                sorted(missing),
-            )
+        assert not missing, (
+            f"Shape discovery did not capture outputs for dynamic submods: {sorted(missing)}. "
+            f"Cannot pre-allocate out= buffers — downstream static runners require stable addresses."
+        )
 
     def warmup_and_capture(
         self,
