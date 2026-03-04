@@ -351,11 +351,15 @@ class ModelLoader:
 
                 _apply_to_buffers_only(model, copy_buffer_to_cuda)
 
+                initialized_weights = load_format not in (LoadFormat.AUTO, LoadFormat.DUMMY)
+
                 def allocate_weights_on_cuda(t: torch.Tensor):
                     if t not in memo:
                         # Reallocate inside the scope,
                         # even if the weight is already on CUDA
                         memo[t] = torch.empty_like(t, device='cuda')
+                        if initialized_weights:
+                            memo[t].copy_(t)
                     return memo[t]
 
                 with virtual_memory_scope(
