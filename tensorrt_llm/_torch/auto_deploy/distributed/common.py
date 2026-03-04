@@ -1,11 +1,9 @@
 """Common utilities for distributed inference."""
 
 import atexit
-import faulthandler
 import os
 import socket
 import sys
-import traceback
 from typing import Callable, List, Optional, Tuple
 
 import torch
@@ -135,10 +133,13 @@ def _set_distributed_env_vars(local_rank: int, world_size: int, port: int) -> No
 
 
 def _is_port_available(port: int) -> bool:
-    """Lightweight check: try to bind to the port and release immediately."""
+    """Lightweight check: try to bind to the port and release immediately.
+
+    Does NOT set SO_REUSEADDR so that ports in TIME_WAIT (from recently
+    terminated processes) are correctly rejected.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((_MASTER_ADDR, port))
             return True
     except OSError:
@@ -249,25 +250,12 @@ def initialize(
 def init_and_run_process(
     job, rank, size, port, port_recv_conn=None, port_send_conns=None, **kwargs
 ):
-    # Enable faulthandler so segfaults / NCCL crashes produce a traceback
-    faulthandler.enable(file=sys.stderr, all_threads=True)
-
     try:
         initialize_or_skip(
             rank, size, port, port_recv_conn=port_recv_conn, port_send_conns=port_send_conns
         )
         job(rank, size, **kwargs)
     except Exception as e:
-        # Print full traceback to stderr so it is visible even in child processes
-        # where the parent only sees the exit code.
-        print(
-            f"\n{'=' * 60}\nERROR in rank {rank} (world_size={size}):\n{'=' * 60}",
-            file=sys.stderr,
-            flush=True,
-        )
-        traceback.print_exc(file=sys.stderr)
-        sys.stderr.flush()
-
         # Close the input and output queues to parent process can exit.
         for q in ["input_queue", "output_queue"]:
             if q in kwargs and kwargs[q] is not None:
@@ -359,25 +347,14 @@ def _join_multiprocess_job(processes):
         ad_logger.warning("No valid processes")
         return
 
-    failed = []
-    for i, p in enumerate(processes):
+    for p in processes:
         p.join()
 
         # Ensure that all processes have exited successfully.
         # Check exitcode via hasattr rather than isinstance(p, mp.Process), because
         # spawn-context processes (SpawnProcess) don't inherit from mp.Process.
-        if hasattr(p, "exitcode") and p.exitcode != 0:
-            exit_reason = "signal " + str(-p.exitcode) if p.exitcode < 0 else str(p.exitcode)
-            failed.append((i, p.pid, exit_reason))
-
-    if failed:
-        details = "; ".join(
-            f"rank {rank} (pid {pid}): exit {reason}" for rank, pid, reason in failed
-        )
-        raise RuntimeError(
-            f"{len(failed)}/{len(processes)} worker(s) failed: {details}. "
-            "Check stderr above for full tracebacks from child processes."
-        )
+        if hasattr(p, "exitcode"):
+            assert p.exitcode == 0, f"Process {p.pid} exited with code {p.exitcode}"
 
 
 def spawn_multiprocess_job(job: Callable[[int, int], None], size: Optional[int] = None):
