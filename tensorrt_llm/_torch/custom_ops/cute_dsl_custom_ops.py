@@ -2808,7 +2808,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = True,
             num_copy_bits: int = 256,
         ):
-            torch_dtype = input_values.dtype
             torch_dtype_to_cutlass_dtype = {
                 torch.float16: cutlass.Float16,
                 torch.bfloat16: cutlass.BFloat16,
@@ -2965,12 +2964,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if sm_version < 100:
             raise ValueError(
                 f"CuTE DSL top-k requires Blackwell (SM100+), but got SM {sm_version}. "
-            )
+                "Use standard top-k implementation for older architectures.")
 
         # Validate inputs
-        if top_k > 2048:
+        if top_k <= 0 or top_k > 2048:
             raise ValueError(
-                f"CuTE DSL top-k supports max top_k=2048, but got {top_k}")
+                f"top_k must be in range [1, 2048], got {top_k}. "
+                "Maximum supported top_k is 2048 for Blackwell architecture.")
+
+        if next_n <= 0:
+            raise ValueError(f"next_n must be positive, got {next_n}")
+
+        if num_copy_bits not in [128, 256]:
+            raise ValueError(
+                f"num_copy_bits must be 128 or 256, got {num_copy_bits}")
 
         if input_values.dim() != 2:
             raise ValueError(
@@ -2980,6 +2987,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         if seq_lens.dim() != 1:
             raise ValueError(
                 f"seq_lens must be 1D [batch_size], got shape {seq_lens.shape}")
+
+        supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+        if input_values.dtype not in supported_dtypes:
+            raise ValueError(f"Unsupported dtype {input_values.dtype}. "
+                             f"Supported dtypes: {supported_dtypes}")
 
         # Use the Runner class
         runner = CuteDSLTopKDecodeSingleCTARunner()
