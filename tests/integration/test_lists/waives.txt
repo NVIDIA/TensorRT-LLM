@@ -352,3 +352,4 @@ full:DGX_H100/unittest/_torch/auto_deploy/unit/multigpu/transformations/library/
 accuracy/test_llm_api_pytorch.py::TestLlama3_1_8B_Instruct_RocketKV::test_auto_dtype SKIP (https://nvbugs/5948493)
 DGX_H200-8_GPUs-PyTorch-Post-Merge-1/accuracy/test_disaggregated_serving.py::TestLlama3_1_8BInstruct::test_ctx_pp_gen_tp_asymmetric[MMLU-gen_tp=2-ctx_pp=4] SKIP (https://nvbugs/5948684)
 RTXPro6000D-4_GPUs-PyTorch-Post-Merge-2/accuracy/test_llm_api_pytorch.py::TestQwen3_235B_A22B::test_nvfp4_4gpus[latency_moe_cutlass] SKIP (https://nvbugs/5948709)
+unittest/_torch/modeling -k "modeling_siglip" SKIP (https://nvbugs/5941242)
