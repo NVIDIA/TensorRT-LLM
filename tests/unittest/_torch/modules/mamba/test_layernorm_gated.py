@@ -93,76 +93,6 @@ def reference_rmsnorm_gated(
             return weight * x_norm
 
 
-def quantize_to_fp4_e2m1(
-    tensor: torch.Tensor, group_size: int
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize tensor to FP4 E2M1 format with group-wise scaling."""
-    device = tensor.device
-    input_shape = tensor.shape
-    hidden_size = input_shape[-1]
-    batch_shape = input_shape[:-1]
-    num_groups = hidden_size // group_size
-
-    e2m1_values = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        dtype=torch.float32,
-        device=device,
-    )
-
-    tensor_grouped = tensor.reshape(*batch_shape, num_groups, group_size)
-    group_max = tensor_grouped.abs().max(dim=-1, keepdim=True)[0]
-    scaling_factors = group_max.clamp(min=1e-8)
-    tensor_normalized = tensor_grouped / scaling_factors
-
-    tensor_normalized_flat = tensor_normalized.reshape(-1, 1)
-    e2m1_values_expanded = e2m1_values.unsqueeze(0)
-    distances = (tensor_normalized_flat - e2m1_values_expanded).abs()
-    indices = distances.argmin(dim=1)
-
-    indices = indices.reshape(*batch_shape, num_groups, group_size)
-    indices = indices.reshape(*batch_shape, hidden_size)
-
-    indices_uint8 = indices.to(torch.uint8)
-    low_nibbles = indices_uint8[:, 0::2]
-    high_nibbles = indices_uint8[:, 1::2]
-    packed = low_nibbles | (high_nibbles << 4)
-
-    scaling_factors = scaling_factors.reshape(*batch_shape, num_groups)
-    return packed, scaling_factors
-
-
-def unpack_and_scale_fp4(
-    fp4_packed: torch.Tensor, scaling_factors: torch.Tensor, target_shape: tuple, group_size: int
-) -> torch.Tensor:
-    """Unpack FP4 values and apply scaling to get float values."""
-    device = fp4_packed.device
-
-    e2m1_lut = torch.tensor(
-        [0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0, -0.0, -0.5, -1.0, -1.5, -2.0, -3.0, -4.0, -6.0],
-        dtype=torch.float32,
-        device=device,
-    )
-
-    fp4_uint8 = fp4_packed.view(torch.uint8)
-    low_nibble = fp4_uint8 & 0x0F
-    high_nibble = (fp4_uint8 >> 4) & 0x0F
-
-    unpacked = torch.stack([low_nibble, high_nibble], dim=-1)
-    unpacked = unpacked.reshape(*target_shape)
-    values = e2m1_lut[unpacked.long()]
-
-    hidden_size = target_shape[-1]
-    num_groups = hidden_size // group_size
-    batch_shape = target_shape[:-1]
-
-    values = values.reshape(*batch_shape, num_groups, group_size)
-    sf = scaling_factors.reshape(*batch_shape, num_groups, 1)
-    values = values * sf
-    values = values.reshape(*target_shape)
-
-    return values
-
-
 @skip_no_cuda
 class TestRMSNormBasic:
     def test_basic_rmsnorm(self):
@@ -259,7 +189,7 @@ class TestRMSNormNVFP4:
             .to(device)
             .to(dtype)
         )
-        norm.nvfp4_scale = torch.randn(hidden_size, device=device, dtype=torch.float32)
+        norm.nvfp4_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
 
         x = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
         z = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
@@ -284,7 +214,7 @@ class TestRMSNormNVFP4:
             .to(device)
             .to(dtype)
         )
-        norm.nvfp4_scale = torch.randn(hidden_size, device=device, dtype=torch.float32)
+        norm.nvfp4_scale = torch.randn(1, device=device, dtype=torch.float32).abs()
         x = torch.randn(batch_size, hidden_size, device=device, dtype=dtype)
         output = norm(x)
 

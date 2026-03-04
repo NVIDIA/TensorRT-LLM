@@ -49,27 +49,19 @@ namespace kernels
 
 // Constants for FP4 quantization
 static constexpr int ELTS_PER_THREAD = 8;
-static constexpr int SF_VEC_SIZE = 16;
+static constexpr int SF_VEC_SIZE = FP4_BLOCK_SIZE;
 static constexpr int NUM_THREADS_PER_SF = SF_VEC_SIZE / ELTS_PER_THREAD; // 2
 
-// Fast approximate reciprocal with flush-to-zero (matches quantization.cuh)
-__device__ __forceinline__ float rcp_approx_ftz(float a)
-{
-    float b;
-    asm volatile("rcp.approx.ftz.f32 %0, %1;\n" : "=f"(b) : "f"(a));
-    return b;
-}
-
-// Sigmoid using fast math with rcp_approx_ftz
+// Sigmoid using fast math with reciprocal_approximate_ftz from quantization.cuh
 __device__ __forceinline__ float fast_sigmoid(float x)
 {
-    return rcp_approx_ftz(1.0f + __expf(-x));
+    return reciprocal_approximate_ftz(1.0f + __expf(-x));
 }
 
 // SiLU gating: x * z * sigmoid(z)
 __device__ __forceinline__ float fast_gated_silu(float x, float z)
 {
-    return x * z * rcp_approx_ftz(1.0f + __expf(-z));
+    return x * z * reciprocal_approximate_ftz(1.0f + __expf(-z));
 }
 
 /*
@@ -98,7 +90,7 @@ __device__ __forceinline__ uint32_t cvt_float_to_fp4_inline(float* vals, // 8 fl
 
     // Compute scale factor: SF = SFScaleVal * (max / 6.0)
     // where 6.0 is the max representable value in e2m1 format
-    float sfValue = sfScaleVal * (localMax * rcp_approx_ftz(6.0f));
+    float sfValue = sfScaleVal * (localMax * reciprocal_approximate_ftz(FP4_E2M1_MAX));
 
     // Convert to E4M3 and back to get quantized scale
     __nv_fp8_e4m3 sfFp8 = __nv_fp8_e4m3(sfValue);
@@ -107,7 +99,8 @@ __device__ __forceinline__ uint32_t cvt_float_to_fp4_inline(float* vals, // 8 fl
 
     // Compute output scale for quantization
     // outputScale = sfScaleVal / sfValueQuant
-    float outputScale = (localMax != 0.0f) ? rcp_approx_ftz(sfValueQuant * rcp_approx_ftz(sfScaleVal)) : 0.0f;
+    float outputScale
+        = (localMax != 0.0f) ? reciprocal_approximate_ftz(sfValueQuant * reciprocal_approximate_ftz(sfScaleVal)) : 0.0f;
 
     // Write scale factor
     if (sfOutPtr)
@@ -157,6 +150,7 @@ __launch_bounds__(BLOCK_SIZE, 4)
         float const* __restrict__ sf_scale, int M, int N, int zRowStride, int groupSize, float eps)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(BLOCK_SIZE / 32 <= 32, "Block-level reduction requires numWarps <= 32");
     using T2 = typename packed_as<T, 2>::type;
 
     static constexpr int ELEMS_PER_THREAD = GROUP_SIZE / BLOCK_SIZE;
@@ -310,6 +304,7 @@ __launch_bounds__(BLOCK_SIZE, 8)
         int zRowStride, int groupSize, float eps)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(BLOCK_SIZE / 32 <= 32, "Block-level reduction requires numWarps <= 32");
     using T2 = typename packed_as<T, 2>::type;
 
     int const row = blockIdx.x;
@@ -477,6 +472,7 @@ __launch_bounds__(BLOCK_SIZE, 4)
         int zRowStride, float eps)
 {
 #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+    static_assert(BLOCK_SIZE / 32 <= 32, "Block-level reduction requires numWarps <= 32");
     using T2 = typename packed_as<T, 2>::type;
 
     int const tid = threadIdx.x;

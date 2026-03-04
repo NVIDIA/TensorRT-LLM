@@ -45,17 +45,19 @@ std::tuple<at::Tensor, at::Tensor> fused_gated_rmsnorm_quant(at::Tensor const& x
     CHECK_TH_CUDA(z);
     // z can be non-contiguous (column slice) but must have contiguous inner dim
     TORCH_CHECK(z.stride(-1) == 1, "z must have contiguous inner dimension (stride[-1] == 1)");
+    // Kernel performs uint4 (16-byte) vectorized loads on z rows.
+    // For bf16/fp16 (2 bytes), row stride must be a multiple of 8 elements to guarantee alignment.
+    TORCH_CHECK(z.stride(0) % 8 == 0,
+        "z row stride must be a multiple of 8 for vectorized uint4 loads, got stride(0)=", z.stride(0));
     CHECK_TH_CUDA(weight);
     CHECK_CONTIGUOUS(weight);
 
     // Check GPU architecture - kernel requires SM100+ (Blackwell)
-    auto const device = x.get_device();
-    cudaDeviceProp props;
-    AT_CUDA_CHECK(cudaGetDeviceProperties(&props, device));
-    TORCH_CHECK(props.major >= 10,
+    static int const smVersion = tensorrt_llm::common::getSMVersion();
+    TORCH_CHECK(smVersion >= 100,
         "fused_gated_rmsnorm_quant requires SM100 (Blackwell) or newer GPU architecture. "
         "Current device: sm_",
-        props.major, props.minor);
+        smVersion);
 
     auto const& inputShape = x.sizes();
     auto const rank = inputShape.size();
@@ -72,6 +74,10 @@ std::tuple<at::Tensor, at::Tensor> fused_gated_rmsnorm_quant(at::Tensor const& x
     TORCH_CHECK(weight.sizes()[0] == N, "Weight size must match hidden dimension N.");
     TORCH_CHECK(N % group_size == 0, "Hidden dimension N must be divisible by group_size.");
     TORCH_CHECK(group_size >= 256 && group_size <= 8192, "group_size must be between 256 and 8192.");
+    // group_size must be a multiple of 256 so that numVecs (= group_size / 8) is a multiple of 32,
+    // ensuring full-warp participation in cvt_warp_fp16_to_fp4's __shfl_xor_sync(0xffffffff, ...).
+    TORCH_CHECK(group_size % 256 == 0,
+        "group_size must be a multiple of 256 for safe warp shuffles, got group_size=", group_size);
     TORCH_CHECK(N % 16 == 0, "Hidden dimension N must be divisible by 16 for FP4 quantization.");
 
     // Validate sf_scale if provided
@@ -100,7 +106,7 @@ std::tuple<at::Tensor, at::Tensor> fused_gated_rmsnorm_quant(at::Tensor const& x
     // Get number of SMs
     static int const multiProcessorCount = tensorrt_llm::common::getMultiProcessorCount();
 
-    auto stream = at::cuda::getCurrentCUDAStream(device);
+    auto stream = at::cuda::getCurrentCUDAStream(x.get_device());
 
 #define LAUNCH_FUSED_GATED_RMSNORM_QUANT(T)                                                                            \
     do                                                                                                                 \
