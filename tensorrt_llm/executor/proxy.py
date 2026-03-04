@@ -4,7 +4,7 @@ import json
 import os
 import threading
 import weakref
-from typing import Dict, List, Literal, Optional, Union
+from typing import Dict, List, Literal, Optional
 
 import torch
 import zmq

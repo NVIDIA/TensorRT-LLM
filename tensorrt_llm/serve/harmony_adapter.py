@@ -25,7 +25,8 @@ from .openai_protocol import (ChatCompletionMessageParam,
                               ChatCompletionStreamResponse,
                               ChatCompletionToolsParam, ChatMessage,
                               CompletionTokensDetails, DeltaFunctionCall,
-                              DeltaMessage, DeltaToolCall, UsageInfo, to_disaggregated_params)
+                              DeltaMessage, DeltaToolCall, UsageInfo,
+                              to_disaggregated_params)
 
 # yapf: enable
 

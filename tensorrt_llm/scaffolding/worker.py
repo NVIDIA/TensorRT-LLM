@@ -6,8 +6,8 @@ from abc import ABC
 from enum import Enum
 from typing import Callable, List, Optional
 
+import httpx
 import openai
-import requests
 from transformers import AutoTokenizer
 
 from tensorrt_llm import LLM
@@ -109,11 +109,12 @@ class OpenaiWorker(Worker):
             kv_cache_hint_params.update(
                 extra_body)  # Spread extra_body contents
 
-            return requests.post(
-                url,
-                json=kv_cache_hint_params,
-                headers=headers,
-            )
+            async with httpx.AsyncClient() as client:
+                return await client.post(
+                    url,
+                    json=kv_cache_hint_params,
+                    headers=headers,
+                )
 
         async_client.create_kv_cache_hint = types.MethodType(
             send_kv_cache_hint, async_client)

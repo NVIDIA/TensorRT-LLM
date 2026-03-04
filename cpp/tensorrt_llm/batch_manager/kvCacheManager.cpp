@@ -852,11 +852,14 @@ void WindowBlockManager::releaseChildren(BlockPtr const& block, bool toFront)
     }
     freeLeafBlock(block);
 
-    // Release block to free queue if no refs
     if (!block->hasRefs())
     {
         mEvictionPolicy->claimBlock(block, executor::KvCacheRetentionConfig::kMinRetentionPriority, std::nullopt);
         mEvictionPolicy->releaseBlock(block, toFront);
+    }
+    else
+    {
+        block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
     }
 }
 
@@ -1344,17 +1347,8 @@ void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetToken
         {
             if (numMatchedTokens > numTokensToKeep)
             {
-                matchingBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
                 releaseChildren(matchingBlock);
                 break;
-            }
-
-            if (mEventManager)
-            {
-                mEventManager->enqueueUpdatedEvent(tle::KVCacheUpdatedData(matchingBlock->getHash())
-                                                       .priorityUpdated(matchingBlock->getPriority(),
-                                                           executor::KvCacheRetentionConfig::kMinRetentionPriority),
-                    mWindowSize);
             }
 
             numMatchedTokens += numMatched > 0 ? numMatched : blockKey.uniqueTokens.size();
