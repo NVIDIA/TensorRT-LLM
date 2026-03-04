@@ -2153,9 +2153,6 @@ class PyExecutor:
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._update_requests(self.previous_batch.sample_state)
 
-                    self.perf_manager.compute_batch_gpu_times(
-                        self.previous_batch.all_requests)
-
                     self._send_kv_async(self.previous_batch.all_requests)
 
                 if self.drafter is not None and self.use_spec_decode and should_process_previous_batch:
@@ -2177,11 +2174,6 @@ class PyExecutor:
                         sample_state = self._sample_async(
                             scheduled_batch, batch_outputs)
 
-                    self.perf_manager.save_timing_to_requests(
-                        scheduled_batch.all_requests(), gpu_forward_start,
-                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
-                        fwd_timing.end_time, sample_timing.start_time,
-                        sample_timing.end_time)
                     assert sample_state is not None, "Sampling failed"
 
                     # Handle guided decoder errors after _sample_async to avoid state conflicts.
@@ -2193,6 +2185,8 @@ class PyExecutor:
 
                 if self.previous_batch is not None and should_process_previous_batch:
                     self._process_previous_batch()
+                    self.perf_manager.compute_batch_gpu_times(
+                        self.previous_batch.all_requests)
                 else:
                     self._enqueue_responses([])
 
@@ -2204,6 +2198,11 @@ class PyExecutor:
                         scheduled_batch.generation_requests)
 
                 if can_queue:
+                    self.perf_manager.save_timing_to_requests(
+                        scheduled_batch.all_requests(), gpu_forward_start,
+                        gpu_forward_end, gpu_sample_end, fwd_timing.start_time,
+                        fwd_timing.end_time, sample_timing.start_time,
+                        sample_timing.end_time)
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
                             'num_ctx_tokens']
