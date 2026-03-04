@@ -9,8 +9,9 @@ from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Annotated, Any, Dict, List, Literal, Optional, Set, Tuple,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List,
+                    Literal, Optional, Set, Tuple, Type, TypeAlias, TypeVar,
+                    Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -64,6 +65,12 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.virtual_memory import \
+        RestoreMode as _VirtualMemoryRestoreMode
+else:
+    _VirtualMemoryRestoreMode = Enum
 
 
 def Field(default: Any = ...,
@@ -1462,48 +1469,97 @@ class ExecutorMemoryType(StrEnum):
     MODEL_WEIGHTS_DRAFT = "draft_model_weights"
 
 
-def _make_defaulted_restore_modes(
-        cases: Optional[dict[str, str]] = None) -> defaultdict:
-    default = "PINNED" if prefer_pinned() else "CPU"
-
-    if cases is None:
-        cases = {
-            ExecutorMemoryType.KV_CACHE: "NONE",
-        }
-
-    return defaultdict(lambda: default, cases)
-
-
 class SleepConfig(StrictBaseModel):
     """Configuration for the LLM sleep/wakeup feature.
     """
 
-    restore_modes: defaultdict[ExecutorMemoryType, str] | dict[
-        str, str] = Field(
-            default_factory=_make_defaulted_restore_modes,
+    restore_modes: dict[
+        ExecutorMemoryType, Literal["NONE", "MEMSET", "CPU", "PINNED"]
+        | _VirtualMemoryRestoreMode] = Field(
+            default_factory=lambda: SleepConfig._make_defaulted_restore_modes(),
             description="Per-component RestoreMode for the sleep feature. "
             "Keys are ExecutorMemoryType values (e.g. 'model', 'kv_cache'), "
-            "values are RestoreMode names (NONE, MEMSET, CPU, PINNED). "
-            "Unlisted entries default to PINNED.")
+            "values can be RestoreMode names (NONE, MEMSET, CPU, PINNED) or "
+            "RestoreMode enum values. "
+            "Unlisted entries default to the suitable mode selected between "
+            "PINNED and CPU.")
 
-    @field_validator('restore_modes')
+    DEFAULT_RESTORE_MODES: ClassVar[dict[str, str]] = {
+        ExecutorMemoryType.KV_CACHE: "NONE",
+    }
+
+    @staticmethod
+    def _normalize_restore_mode(
+            value: str | _VirtualMemoryRestoreMode
+    ) -> _VirtualMemoryRestoreMode:
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        if isinstance(value, RestoreMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return RestoreMode[value]
+            except KeyError as e:
+                valid = ", ".join(mode.name for mode in RestoreMode)
+                raise ValueError(
+                    f"invalid restore_mode: {value}. Expected one of: {valid}"
+                ) from e
+        raise ValueError(f"invalid restore_mode type: {type(value).__name__}")
+
+    @staticmethod
+    def _normalize_executor_memory_type(
+            key: ExecutorMemoryType | str) -> ExecutorMemoryType:
+        if isinstance(key, ExecutorMemoryType):
+            return key
+        if isinstance(key, str):
+            try:
+                return ExecutorMemoryType(key)
+            except ValueError as e:
+                valid = ", ".join(member.value for member in ExecutorMemoryType)
+                raise ValueError(
+                    f"invalid executor memory type: {key}. Expected one of: {valid}"
+                ) from e
+        raise ValueError(
+            f"executor memory type must be ExecutorMemoryType or str, got {type(key).__name__}"
+        )
+
+    @classmethod
+    def _make_defaulted_restore_modes(
+        cls,
+        cases: Optional[dict[ExecutorMemoryType,
+                             str | _VirtualMemoryRestoreMode]] = None,
+        *,
+        default_mode: Optional[_VirtualMemoryRestoreMode] = None
+    ) -> defaultdict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        default_mode: _VirtualMemoryRestoreMode = default_mode or (
+            RestoreMode.PINNED if prefer_pinned() else RestoreMode.CPU)
+
+        if cases is None:
+            cases = cls.DEFAULT_RESTORE_MODES
+        normalized_cases = {
+            cls._normalize_executor_memory_type(key):
+            cls._normalize_restore_mode(value)
+            for key, value in cases.items()
+        }
+        return defaultdict(lambda: default_mode, normalized_cases)
+
+    @field_validator('restore_modes', mode='plain')
     @classmethod
     def _validate_restore_modes(cls, v):
-        if isinstance(v, defaultdict):
-            for key in v:
-                if not isinstance(key, ExecutorMemoryType):
-                    raise ValueError(
-                        f"keys must be ExecutorMemoryType, got {type(key)} for {key}"
-                    )
-            return v
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"restore_modes must be dict, got {type(v).__name__}")
 
-        valid_modes = frozenset(["NONE", "MEMSET", "CPU", "PINNED"])
-        cases = {}
-        for key, value in v.items():
-            if value not in valid_modes:
-                raise ValueError(f"invalid restore_mode: {value}")
-            cases[ExecutorMemoryType(key)] = value
-        return _make_defaulted_restore_modes(cases)
+        default_mode = None
+        if isinstance(v, defaultdict) and v.default_factory is not None:
+            try:
+                default_mode = cls._normalize_restore_mode(v.default_factory())
+            except Exception as e:
+                raise ValueError(
+                    "restore_modes defaultdict default_factory must return a valid RestoreMode"
+                ) from e
+
+        return cls._make_defaulted_restore_modes(v, default_mode=default_mode)
 
 
 class PybindMirror(ABC):

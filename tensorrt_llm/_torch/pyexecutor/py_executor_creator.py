@@ -32,7 +32,6 @@ from ..attention_backend.trtllm import TrtllmAttention
 from ..distributed import Distributed
 from ..speculative import (get_num_extra_kv_tokens, get_spec_drafter,
                            get_spec_resource_manager)
-from ..virtual_memory import RestoreMode
 from ..virtual_memory import scope as virtual_memory_scope
 from ._util import (KvCacheCreator, _adjust_torch_mem_fraction,
                     create_py_executor_instance, instantiate_sampler, is_mla,
@@ -387,7 +386,7 @@ def create_py_executor(
             if not enable_sleep or stage.startswith("_no_capture"):
                 yield
             else:
-                restore_mode = RestoreMode[sleep_config.restore_modes[stage]]
+                restore_mode = sleep_config.restore_modes[current_stage]
                 with virtual_memory_scope(stage, restore_mode) as memory_pool:
                     if stage in vm_pools:
                         del vm_pools[stage]
@@ -399,8 +398,8 @@ def create_py_executor(
         model_weights_restore_mode = None
         if enable_sleep:
             model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_MAIN
-            model_weights_restore_mode = RestoreMode[sleep_config.restore_modes[
-                ExecutorMemoryType.MODEL_WEIGHTS_MAIN]]
+            model_weights_restore_mode = sleep_config.restore_modes[
+                ExecutorMemoryType.MODEL_WEIGHTS_MAIN]
 
         model_engine = PyTorchModelEngine(
             model_path=checkpoint_dir,
@@ -468,9 +467,8 @@ def create_py_executor(
             model_weights_restore_mode = None
             if enable_sleep:
                 model_weights_memory_tag = ExecutorMemoryType.MODEL_WEIGHTS_DRAFT
-                model_weights_restore_mode = RestoreMode[
-                    sleep_config.restore_modes[
-                        ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]]
+                model_weights_restore_mode = sleep_config.restore_modes[
+                    ExecutorMemoryType.MODEL_WEIGHTS_DRAFT]
 
             draft_model_engine = PyTorchModelEngine(
                 model_path=spec_config.speculative_model,
