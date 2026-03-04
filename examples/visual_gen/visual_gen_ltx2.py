@@ -140,7 +140,12 @@ def parse_args():
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
 
-    # torch compile
+    # CUDA graph
+    parser.add_argument(
+        "--enable_cudagraph", action="store_true", help="Enable CudaGraph acceleration"
+    )
+
+    # torch.compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
     )
@@ -149,30 +154,20 @@ def parse_args():
         type=str,
         nargs="+",
         default=[],
-        help="Torch compile models (empty = auto detect transformer components)",
-    )
-    parser.add_argument(
-        "--torch_compile_mode",
-        type=str,
-        default="default",
-        choices=["default", "max-autotune", "reduce-overhead"],
-        help="Torch compile mode",
+        help="Components to torch.compile (empty = auto detect transformer components)",
     )
     parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
     )
 
-    # Warmup
+    # Autotune
     parser.add_argument(
-        "--warmup_steps",
-        type=int,
-        default=1,
-        help="Warmup steps. Useful for performance benchmarking.",
+        "--disable_autotune", action="store_true", help="Disable autotuning during warmup"
     )
 
-    # Layerwise nvtx marker
+    # Debug / profiling
     parser.add_argument(
-        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise nvtx marker"
+        "--enable_layerwise_nvtx_marker", action="store_true", help="Enable layerwise NVTX markers"
     )
 
     # Dynamic quantization
@@ -195,15 +190,6 @@ def parse_args():
         choices=["VANILLA", "TRTLLM"],
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
-    )
-
-    # Output format
-    parser.add_argument(
-        "--output_type",
-        type=str,
-        default="np",
-        choices=["np", "pil", "latent"],
-        help="Output type: 'np' for numpy arrays, 'pil' for PIL images, 'latent' for raw latents",
     )
 
     return parser.parse_args()
@@ -239,12 +225,16 @@ def main():
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "pipeline": {
+        "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,
             "torch_compile_models": args.torch_compile_models,
-            "torch_compile_mode": args.torch_compile_mode,
             "enable_fullgraph": args.enable_fullgraph,
-            "warmup_steps": args.warmup_steps,
+            "enable_autotune": not args.disable_autotune,
+        },
+        "cuda_graph": {
+            "enable_cuda_graph": args.enable_cudagraph,
+        },
+        "pipeline": {
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
     }
@@ -290,7 +280,6 @@ def main():
             num_frames=args.num_frames,
             frame_rate=args.frame_rate,
             guidance_rescale=args.guidance_rescale,
-            output_type=args.output_type,
             input_reference=args.image,
             image_cond_strength=args.image_cond_strength,
             stg_scale=args.stg_scale,
