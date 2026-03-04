@@ -16,61 +16,47 @@
 import torch
 
 
-@torch.library.custom_op("auto_deploy::gather_logits_before_lm_head", mutates_args=())
-def gather_logits_before_lm_head(
+@torch.library.custom_op("auto_deploy::gather_tokens", mutates_args=())
+def gather_tokens(
     hidden_states: torch.Tensor,
-    logits_gather_indices: torch.Tensor,  # long tensor
-    logits_gather_info_host: torch.Tensor,  # int tensor
+    token_gather_indices: torch.Tensor,  # long tensor
+    tokens_gather_info_host: torch.Tensor,  # int tensor
 ) -> torch.Tensor:
-    """Gather hidden states using logits_gather_indices before LM head.
+    """Gather hidden states using token_gather_indices before LM head.
 
     Args:
-        hidden_states: Hidden states tensor in one of the supported layouts:
-            - [b, 1, hidden]
-            - [1, s_total, hidden]
-            - [tokens, hidden]
-        logits_gather_indices: indices for gathering logits.
-        logits_gather_info_host: info for gathering logits.
+        hidden_states: Hidden states tensor of shape [batch_size, 1, *other_dims] or
+            [1, total_token_length, *other_dims]
+        token_gather_indices: indices for gathering logits.
+        tokens_gather_info_host: info for gathering logits.
     Returns:
         Gathered and flattened hidden states [num_gathered_tokens, hidden]
     """
-    # Normalize to [tokens, hidden] for gather.
-    # NOTE: 2D [tokens, hidden] is already canonical and must not be squeezed on dim 0.
-    if hidden_states.dim() == 3:
-        input_was_3d = True
-        is_decode_only = hidden_states.shape[1] == 1
-        if is_decode_only:
-            # [b, 1, hidden] -> [b, hidden]
-            hidden_states = hidden_states.squeeze(1)
-        else:
-            # [1, s_total, hidden] -> [s_total, hidden]
-            hidden_states = hidden_states.squeeze(0)
-    elif hidden_states.dim() == 2:
-        input_was_3d = False
-        is_decode_only = False
-    else:
-        raise AssertionError(
-            "gather_logits_before_lm_head expects 2D/3D hidden states, "
-            f"got shape={tuple(hidden_states.shape)}"
-        )
+    # final shape is [total_tokens, *other_dims]
+    bsz, sl, *other_dims = hidden_states.shape
+    assert bsz == 1 or sl == 1, "expected batch size or sequence length to be 1"
+    hidden_states = hidden_states.view(bsz * sl, *other_dims)
 
     # info object
-    num_tokens_to_gather, gather_required = logits_gather_info_host.tolist()
+    num_tokens_to_gather, gather_required = tokens_gather_info_host.tolist()
 
     if gather_required:
-        out = hidden_states.index_select(0, logits_gather_indices[:num_tokens_to_gather])
+        out = hidden_states.index_select(0, token_gather_indices[:num_tokens_to_gather])
+        num_tokens_final = num_tokens_to_gather
     else:
         out = hidden_states.clone(memory_format=torch.contiguous_format)
-    if input_was_3d:
-        out = out.unsqueeze(1 if is_decode_only else 0)
-    return out
+        num_tokens_final = bsz * sl
+    if bsz == 1:
+        return out.view(1, num_tokens_final, *other_dims)
+    else:
+        return out.view(num_tokens_final, 1, *other_dims)
 
 
-@gather_logits_before_lm_head.register_fake
-def gather_logits_before_lm_head_fake(
+@gather_tokens.register_fake
+def gather_tokens_fake(
     hidden_states: torch.Tensor,
-    logits_gather_indices: torch.Tensor,
-    logits_gather_info_host: torch.Tensor,
+    token_gather_indices: torch.Tensor,
+    tokens_gather_info_host: torch.Tensor,
 ) -> torch.Tensor:
     # NOTE: shape is not correct in fake mode
     # see https://github.com/NVIDIA/TensorRT-LLM/issues/9878
