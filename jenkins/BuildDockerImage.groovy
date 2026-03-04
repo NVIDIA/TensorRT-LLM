@@ -699,39 +699,41 @@ pipeline {
             }
             steps {
                 script {
-                    container("python3") {
-                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
-                        trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
-                        def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
-                        def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
-                        if (override_commit) {
-                            echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
+                    catchError(buildResult: 'FAILURE', stageResult: 'FAILURE') {
+                        container("python3") {
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade pip")
+                            trtllm_utils.llmExecStepWithRetry(this, script: "pip3 install --upgrade requests")
+                            def nspect_commit = "4cb9c0c42d44ebeeba1e40d2c3eb6aab6fb90173"
+                            def override_commit = env."NSPECT_OVERRIDE_${nspect_commit}"
+                            if (override_commit) {
+                                echo "Overriding nspect_commit with value from environment variable \$NSPECT_OVERRIDE_${nspect_commit}: ${override_commit}"
                             nspect_commit = override_commit
-                        }
-                        withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
-                            trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
-                        }
-                        def nspect_env = params.nspect_env ? params.nspect_env : "prod"
-                        def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
-                        def cmd = """./nspect/nspect.py \
-                            --env ${nspect_env} \
-                            --nspect_id ${params.nspect_id} \
-                            --program_version_name '${program_version_name}' \
-                            """
-                        if (params.register_images) {
-                            cmd += "--register "
-                        }
-                        if (params.osrb_ticket) {
-                            cmd += "--osrb_ticket ${params.osrb_ticket} "
-                        }
-                        if (params.wait_success_seconds) {
-                            cmd += "--check_launch_api "
-                            cmd += "--wait_success ${params.wait_success_seconds} "
-                        }
-                        cmd += "--image "
-                        cmd += imageKeyToTag.values().join(" ")
-                        withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
-                            trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 6, shortCommondRunTimeMax: 7200)
+                            }
+                            withCredentials([string(credentialsId: "TRTLLM_NSPECT_REPO", variable: "NSPECT_REPO")]) {
+                                trtllm_utils.checkoutSource("${NSPECT_REPO}", nspect_commit, "nspect")
+                            }
+                            def nspect_env = params.nspect_env ? params.nspect_env : "prod"
+                            def program_version_name = params.program_version_name ? params.program_version_name : "PostMerge"
+                            def cmd = """./nspect/nspect.py \
+                                --env ${nspect_env} \
+                                --nspect_id ${params.nspect_id} \
+                                --program_version_name '${program_version_name}' \
+                                """
+                            if (params.register_images) {
+                                cmd += "--register "
+                            }
+                            if (params.osrb_ticket) {
+                                cmd += "--osrb_ticket ${params.osrb_ticket} "
+                            }
+                            if (params.wait_success_seconds) {
+                                cmd += "--check_launch_api "
+                                cmd += "--wait_success ${params.wait_success_seconds} "
+                            }
+                            cmd += "--image "
+                            cmd += imageKeyToTag.values().join(" ")
+                            withCredentials([usernamePassword(credentialsId: "NSPECT_CLIENT-${nspect_env}", usernameVariable: 'NSPECT_CLIENT_ID', passwordVariable: 'NSPECT_CLIENT_SECRET')]) {
+                                trtllm_utils.llmExecStepWithRetry(this, script: cmd, sleepInSecs: 600, numRetries: 0, shortCommondRunTimeMax: 7200)
+                            }
                         }
                     }
                 }
