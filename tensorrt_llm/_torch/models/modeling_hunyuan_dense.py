@@ -1,6 +1,10 @@
-from typing import Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Dict, List, Optional, Union
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 from torch import nn
 from tqdm import tqdm
 from transformers import PretrainedConfig
@@ -617,6 +621,30 @@ class HunYuanModel(DecoderModel):
 class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                                                         HunYuanPretrainedConfig]
                                 ):
+
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        """Model-specific defaults for HunyuanDense.
+
+        Conditionally disables block reuse and chunked prefill when the
+        model uses hybrid Mamba mode, due to SSM/hybrid architecture
+        constraints.
+        """
+        import json
+        from pathlib import Path
+
+        config_path = Path(str(llm_args.model)) / "config.json"
+        if config_path.is_file():
+            with open(config_path) as f:
+                hf_config = json.load(f)
+            if hf_config.get("mamba", False):
+                return {
+                    "kv_cache_config": {
+                        "enable_block_reuse": False
+                    },
+                    "enable_chunked_prefill": False,
+                }
+        return {}
 
     def __init__(self, model_config: ModelConfig[HunYuanPretrainedConfig]):
         super().__init__(HunYuanModel(model_config),

@@ -23,10 +23,10 @@
 python3 examples/llm-api/quickstart_multimodal.py --model_dir nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 --disable_kv_cache_reuse --max_batch_size 128 --trust_remote_code
 ```
 
- * Image modality input with chunked_prefill:
+ * Image modality input with chunked_prefill (enabled by default):
 
 ```bash
-python3 examples/llm-api/quickstart_multimodal.py --model_dir nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 --disable_kv_cache_reuse --max_batch_size 128 --trust_remote_code --enable_chunked_prefill --max_num_tokens=256
+python3 examples/llm-api/quickstart_multimodal.py --model_dir nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-BF16 --disable_kv_cache_reuse --max_batch_size 128 --trust_remote_code --max_num_tokens=256
 ```
 
  * Video modality input:

@@ -264,8 +264,12 @@ class Gemma3ForCausalLM(DecoderModelForCausalLM[Gemma3TextModel,
 
     @classmethod
     def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
-        """Gemma3 image tokens require bidirectional attention,
-        which is incompatible with chunked prefill."""
+        """Model-specific defaults for Gemma3.
+
+        Disables chunked prefill because Gemma3 image tokens require
+        bidirectional attention, which is incompatible with chunked
+        prefill.
+        """
         return {"enable_chunked_prefill": False}
 
     def __init__(
