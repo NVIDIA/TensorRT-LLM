@@ -267,7 +267,7 @@ def buildImage(config, imageKeyToTag)
         customImageWithTag = "${NGC_IMAGE_NAME}:${customTag}"
     }
 
-    args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/github-go-remote"
+    args += " GITHUB_MIRROR=https://urm.nvidia.com/artifactory/vcs-remote"
 
     stage (config.stageName) {
         // Step 1: Clone TRT-LLM source codes
