@@ -175,3 +175,43 @@ def test_fused_cat_hadamard_fp8_zero_input():
 
     # All values should be zero
     assert (fp8_out.float() == 0).all(), "Expected all zero FP8 output for zero input"
+
+
+@pytest.mark.parametrize("M", [64, 1024])
+@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
+@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
+@pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
+def test_fused_cat_hadamard_fp8_noncontiguous_input(M):
+    """Test with non-contiguous inputs (simulates torch.split in DSA indexer).
+
+    In the real DSA forward path, pe/nope come from torch.split() on a
+    [M, head_dim] tensor, producing non-contiguous views with stride
+    [head_dim, 1] instead of [pe_dim, 1]. The thop must handle this.
+    """
+    pe_dim, nope_dim = 64, 64
+    head_dim = pe_dim + nope_dim
+    device = torch.device("cuda")
+
+    torch.manual_seed(42)
+    combined = torch.randn(M, head_dim, dtype=torch.bfloat16, device=device)
+    pe, nope = combined.split([pe_dim, nope_dim], dim=-1)
+
+    # Verify inputs are indeed non-contiguous
+    assert not pe.is_contiguous(), "pe should be non-contiguous from split"
+    assert not nope.is_contiguous(), "nope should be non-contiguous from split"
+
+    # Fused kernel should handle non-contiguous inputs
+    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_hadamard_fp8(pe, nope, True)
+
+    # Reference with contiguous copies
+    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(
+        pe.contiguous(), nope.contiguous(), use_ue8m0=True
+    )
+
+    # Compare dequantized outputs
+    fused_deq = fused_fp8.float() * fused_scale
+    ref_deq = ref_fp8.float() * ref_scale
+    rel_err = (fused_deq - ref_deq).abs() / ref_deq.abs().clamp(min=1e-6)
+    assert rel_err.mean().item() < 0.05, (
+        f"Non-contiguous input: mean relative error too high: {rel_err.mean().item():.4f}"
+    )

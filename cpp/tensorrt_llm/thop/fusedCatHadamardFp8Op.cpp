@@ -28,8 +28,6 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_hadamard_fp8(at::Tensor const& pe, 
 {
     CHECK_TH_CUDA(pe);
     CHECK_TH_CUDA(nope);
-    CHECK_CONTIGUOUS(pe);
-    CHECK_CONTIGUOUS(nope);
 
     TORCH_CHECK(pe.scalar_type() == at::ScalarType::BFloat16, "pe must be BF16, got ", pe.scalar_type());
     TORCH_CHECK(nope.scalar_type() == at::ScalarType::BFloat16, "nope must be BF16, got ", nope.scalar_type());
@@ -38,9 +36,14 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_hadamard_fp8(at::Tensor const& pe, 
     TORCH_CHECK(pe.size(0) == nope.size(0), "pe and nope must have same M dimension. pe: ", pe.size(0),
         ", nope: ", nope.size(0));
 
-    auto const M = static_cast<int32_t>(pe.size(0));
-    auto const pe_dim = static_cast<int32_t>(pe.size(1));
-    auto const nope_dim = static_cast<int32_t>(nope.size(1));
+    // Make inputs contiguous — callers may pass non-contiguous views from torch.split().
+    // contiguous() is a no-op when already contiguous.
+    auto pe_c = pe.contiguous();
+    auto nope_c = nope.contiguous();
+
+    auto const M = static_cast<int32_t>(pe_c.size(0));
+    auto const pe_dim = static_cast<int32_t>(pe_c.size(1));
+    auto const nope_dim = static_cast<int32_t>(nope_c.size(1));
     auto const head_dim = pe_dim + nope_dim;
 
     TORCH_CHECK(head_dim == 128, "head_dim (pe_dim + nope_dim) must be 128, got ", head_dim);
@@ -51,11 +54,11 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_hadamard_fp8(at::Tensor const& pe, 
     at::Tensor scale_out
         = at::detail::empty_cuda({M, 1}, at::ScalarType::Float, pe.device(), /* stride */ std::nullopt);
 
-    auto stream = at::cuda::getCurrentCUDAStream(pe.get_device());
+    auto stream = at::cuda::getCurrentCUDAStream(pe_c.get_device());
 
     tensorrt_llm::kernels::invokeFusedCatHadamardFp8(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
-        reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()),
-        reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()), M, pe_dim, nope_dim, head_dim, use_ue8m0, stream);
+        reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(pe_c.data_ptr()),
+        reinterpret_cast<__nv_bfloat16 const*>(nope_c.data_ptr()), M, pe_dim, nope_dim, head_dim, use_ue8m0, stream);
 
     return {fp8_out, scale_out};
 }
