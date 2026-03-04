@@ -290,8 +290,8 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
                         <summary>{test_name}<span class="test-rerun-sig">{test_rerun_sig}</span><span class="test-time">{test_time}</span></summary>
                         <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in failure.get('message', '').splitlines(True))}</pre>
                         <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (failure.text or '').splitlines(True))}</pre>
-                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_out.text or '').splitlines(True))}</pre>
-                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_err.text or '').splitlines(True))}</pre>
+                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_out.text if system_out is not None else '').splitlines(True))}</pre>
+                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_err.text if system_err is not None else '').splitlines(True))}</pre>
                     </details>
                 """
             elif status == "error":
@@ -303,8 +303,8 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
                         <summary>{test_name}<span class="test-rerun-sig">{test_rerun_sig}</span><span class="test-time">{test_time}</span></summary>
                         <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in error.get('message', '').splitlines(True))}</pre>
                         <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (error.text or '').splitlines(True))}</pre>
-                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_out.text or '').splitlines(True))}</pre>
-                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_err.text or '').splitlines(True))}</pre>
+                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_out.text if system_out is not None else '').splitlines(True))}</pre>
+                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_err.text if system_err is not None else '').splitlines(True))}</pre>
                     </details>
                 """
             elif status == "skipped":
@@ -322,8 +322,8 @@ def xml_to_html(xml_filename, html_filename, sort_by_name=False):
                 details = f"""
                     <details class="test-details">
                         <summary>{test_name}<span class="test-rerun-sig">{test_rerun_sig}</span><span class="test-time">{test_time}</span></summary>
-                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_out.text or '').splitlines(True))}</pre>
-                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_err.text or '').splitlines(True))}</pre>
+                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_out.text if system_out is not None else '').splitlines(True))}</pre>
+                        <pre>{''.join(f'<span>{escape_html(line)}</span>' for line in (system_err.text if system_err is not None else '').splitlines(True))}</pre>
                     </details>
                 """
 
