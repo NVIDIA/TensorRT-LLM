@@ -88,13 +88,15 @@ class LogParser(object):
             log_content = log_file.read()
 
         # Extract failed/total request counts from log (for executor to mark failed cases)
+        # Use findall + last match to handle multi-concurrency logs correctly
         failed_requests = 0
         total_requests = 0
-        failed_match = re.search(r"Total failed requests:\s+(\d+)", log_content)
-        total_match = re.search(r"Total requests:\s+(\d+)", log_content)
-        if failed_match and total_match:
-            failed_requests = int(failed_match.group(1))
-            total_requests = int(total_match.group(1))
+        failed_matches = re.findall(r"Total failed requests:\s*(\d+)", log_content)
+        total_matches = re.findall(r"Total requests:\s*(\d+)", log_content)
+        if failed_matches:
+            failed_requests = int(failed_matches[-1])
+        if total_matches:
+            total_requests = int(total_matches[-1])
 
         # Use metrics_config for extraction
         raw_results = self._extract_log(
