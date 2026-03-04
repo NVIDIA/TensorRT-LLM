@@ -50,10 +50,9 @@ from tensorrt_llm.quantization.mode import QuantAlgo
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
-                           MoEAllReduce, MoEAllReduceParams, allgather,
-                           cp_allgather)
+                           MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import MLA
+from ..modules.attention import MLA, maybe_cp_allgather, maybe_slice_for_cp
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
@@ -1177,6 +1176,8 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                  mapping_with_cp: Optional[Mapping] = None):
         super().__init__()
         self.model_config = model_config
+        self.layer_idx = layer_idx
+        self.mapping_with_cp = mapping_with_cp
         self.config = model_config.pretrained_config
         config = self.config
 
@@ -1369,15 +1370,17 @@ class DeepseekV3DecoderLayer(DecoderLayer):
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
         # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
-            residual=residual,
             **kwargs,
         )
+        if self.mapping_with_cp is not None:
+            residual = maybe_slice_for_cp(residual, attn_metadata,
+                                          self.mapping_with_cp, self.layer_idx)
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1637,15 +1640,17 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
         hidden_states = self.input_layernorm(hidden_states)
 
         # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not (self.disable_attn_allreduce)),
-            residual=residual,
             **kwargs,
         )
+        if self.mapping_with_cp is not None:
+            residual = maybe_slice_for_cp(residual, attn_metadata,
+                                          self.mapping_with_cp, self.layer_idx)
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1757,17 +1762,8 @@ class DeepseekV3Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
-        # With CP helix, the last layer's reduce-scatter leaves each rank
-        # with only its chunk of tokens.  AllGather restores the full token
-        # count so the LM head (and norm) see every token.
-        if (self.mapping_with_cp is not None
-                and self.mapping_with_cp.has_cp_helix()
-                and self.mapping_with_cp.enable_attention_dp):
-            hidden_states = cp_allgather(hidden_states,
-                                         self.mapping_with_cp,
-                                         dim=0)
-            hidden_states = hidden_states[:attn_metadata.num_tokens]
-
+        hidden_states = maybe_cp_allgather(hidden_states, attn_metadata,
+                                           self.mapping_with_cp)
         return hidden_states
 
 

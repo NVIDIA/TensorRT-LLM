@@ -10,8 +10,9 @@ from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
-from ..distributed import AllReduceParams, cp_allgather
+from ..distributed import AllReduceParams
 from ..model_config import ModelConfig
+from ..modules.attention import maybe_cp_allgather, maybe_slice_for_cp
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.gated_mlp import GatedMLP
@@ -95,6 +96,7 @@ class Qwen3DecoderLayer(DecoderLayer):
         self.layer_idx = layer_idx
         config = model_config.pretrained_config
         self.mapping = model_config.mapping
+        self.mapping_with_cp = mapping_with_cp
         self.enable_attention_dp = self.mapping.enable_attention_dp
 
         # When enable_attention_dp is True, TP reduction is skipped since each DP rank
@@ -159,16 +161,18 @@ class Qwen3DecoderLayer(DecoderLayer):
                 hidden_states, residual)
 
         # Self Attention
-        hidden_states, residual = self.self_attn(
+        hidden_states = self.self_attn(
             position_ids=position_ids,
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
-            residual=residual,
             mrope_config=mrope_config,
             **kwargs,
         )
+        if self.mapping_with_cp is not None:
+            residual = maybe_slice_for_cp(residual, attn_metadata,
+                                          self.mapping_with_cp, self.layer_idx)
 
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
@@ -258,15 +262,8 @@ class Qwen3Model(DecoderModel):
             )
 
         hidden_states, _ = self.norm(hidden_states, residual)
-
-        if (self.mapping_with_cp is not None
-                and self.mapping_with_cp.has_cp_helix()
-                and self.mapping_with_cp.enable_attention_dp):
-            hidden_states = cp_allgather(hidden_states,
-                                         self.mapping_with_cp,
-                                         dim=0)
-            hidden_states = hidden_states[:attn_metadata.num_tokens]
-
+        hidden_states = maybe_cp_allgather(hidden_states, attn_metadata,
+                                           self.mapping_with_cp)
         return hidden_states
 
 

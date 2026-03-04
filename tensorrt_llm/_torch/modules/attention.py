@@ -224,15 +224,6 @@ def _helix_cp_pad(tensor: torch.Tensor, num_tokens: int,
     return tensor, chunk_size
 
 
-def _helix_cp_slice(tensor: torch.Tensor, attn_metadata: AttentionMetadata,
-                    mapping: Mapping) -> torch.Tensor:
-    """Slice a tensor to this CP rank's chunk, matching post-RS size."""
-    tensor, chunk_size = _helix_cp_pad(tensor, attn_metadata.num_tokens,
-                                       mapping.cp_size)
-    start = mapping.cp_rank * chunk_size
-    return tensor[start:start + chunk_size]
-
-
 def _helix_cp_allgather_input(hidden_states: torch.Tensor,
                               attn_metadata: AttentionMetadata,
                               mapping: Mapping, layer_idx: int) -> torch.Tensor:
@@ -253,12 +244,11 @@ def _helix_cp_output_projection(
     attn_output: torch.Tensor,
     attn_metadata: AttentionMetadata,
     all_reduce_params: Optional[AllReduceParams],
-    residual: Optional[torch.Tensor],
     mapping: Mapping,
     mapping_o: Mapping,
     layer_idx: int,
     lora_params: Optional[dict] = None,
-) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+) -> torch.Tensor:
     """Apply output projection with reduce-scatter when Helix CP+DP is active.
 
     Reduce-scatter sums partial sums across the CP group and scatters the
@@ -275,16 +265,61 @@ def _helix_cp_output_projection(
         attn_output, _ = _helix_cp_pad(attn_output, attn_metadata.num_tokens,
                                        mapping.cp_size)
         attn_output = reducescatter(attn_output, mapping_o, dim=0)
-
-        if (layer_idx == 0 and residual is not None and residual is not ...):
-            residual = _helix_cp_slice(residual, attn_metadata, mapping)
     else:
         attn_output = o_proj(attn_output,
                              all_reduce_params=all_reduce_params,
                              lora_params=lora_params,
                              layer_idx=layer_idx)
 
-    return attn_output, residual
+    return attn_output
+
+
+def maybe_slice_for_cp(tensor: torch.Tensor, attn_metadata: AttentionMetadata,
+                       mapping: Mapping, layer_idx: int) -> torch.Tensor:
+    """Slice a tensor to this CP rank's chunk after reduce-scatter.
+
+    For the first decoder layer, the residual comes from the embedding and
+    has not been through a prior reduce-scatter.  This function slices it
+    so it aligns with the reduce-scattered attention output.  For
+    subsequent layers the residual already has the correct size, so this
+    is a no-op.
+
+    Call this in the decoder layer on the residual *after* the attention
+    forward, so that Attention/MLA forward signatures stay unchanged.
+    """
+    if (mapping.has_cp_helix() and mapping.enable_attention_dp
+            and layer_idx == 0):
+        num_tokens = attn_metadata.num_tokens
+        chunk_size = math.ceil(num_tokens / mapping.cp_size)
+        padded_size = chunk_size * mapping.cp_size
+        if num_tokens < padded_size:
+            tensor = torch.nn.functional.pad(
+                tensor, (0, 0, 0, padded_size - num_tokens),
+                mode="constant",
+                value=0)
+        start = mapping.cp_rank * chunk_size
+        tensor = tensor[start:start + chunk_size]
+    return tensor
+
+
+def maybe_cp_allgather(hidden_states: torch.Tensor,
+                       attn_metadata: AttentionMetadata,
+                       mapping_with_cp: Optional[Mapping]) -> torch.Tensor:
+    """Restore full token count after the last layer's reduce-scatter.
+
+    With Helix CP + Attention DP, each decoder layer's reduce-scatter
+    leaves each CP rank with only its chunk of tokens.  This function
+    performs an AllGather across the CP group so that the LM head (and
+    final norm) see every token.
+
+    Should be called at the end of the model's ``forward()`` method,
+    after the decoder layer loop.
+    """
+    if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
+            and mapping_with_cp.enable_attention_dp):
+        hidden_states = cp_allgather(hidden_states, mapping_with_cp, dim=0)
+        hidden_states = hidden_states[:attn_metadata.num_tokens]
+    return hidden_states
 
 
 class Attention(nn.Module):
@@ -795,9 +830,8 @@ class Attention(nn.Module):
         attention_window_size: Optional[int] = None,
         attention_mask_data: Optional[torch.Tensor] = None,
         attention_sinks: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = None,
         **kwargs,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, Optional[torch.Tensor]]]:
+    ) -> torch.Tensor:
         """
         Forward pass for the Attention module.
 
@@ -811,12 +845,8 @@ class Attention(nn.Module):
             lora_params (Optional[dict]): The LoRA parameters.
             attention_window_size (Optional[int]): The attention window size.
             attention_mask_data (Optional[torch.Tensor]): The attention mask data.
-            residual (Optional[torch.Tensor]): The residual tensor. When
-                provided, the output projection uses reduce-scatter (if
-                applicable) and the method returns (attn_output, residual).
         Returns:
-            torch.Tensor or (torch.Tensor, torch.Tensor): The output tensor,
-                or a tuple of (output, residual) when residual is provided.
+            torch.Tensor: The output tensor.
         """
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
@@ -867,17 +897,11 @@ class Attention(nn.Module):
             gate = torch.sigmoid(gate)
             attn_output = attn_output * gate
 
-        if residual is not None:
-            attn_output, residual = _helix_cp_output_projection(
-                self.o_proj, attn_output, attn_metadata, all_reduce_params,
-                residual, self.mapping, self.mapping_o, self.layer_idx,
-                lora_params)
-            return attn_output, residual
-
-        attn_output = self.o_proj(attn_output,
-                                  all_reduce_params=all_reduce_params,
-                                  lora_params=lora_params,
-                                  layer_idx=self.layer_idx)
+        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
+                                                  attn_metadata,
+                                                  all_reduce_params,
+                                                  self.mapping, self.mapping_o,
+                                                  self.layer_idx, lora_params)
         return attn_output
 
     def apply_rope(self, q: torch.Tensor, k: Optional[torch.Tensor],
@@ -2569,8 +2593,7 @@ class MLA(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         latent_cache_gen: Optional[torch.Tensor] = None,
-        residual: Optional[torch.Tensor] = ...,
-    ) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    ) -> torch.Tensor:
 
         hidden_states = _helix_cp_allgather_input(hidden_states, attn_metadata,
                                                   self.mapping, self.layer_idx)
@@ -2594,12 +2617,12 @@ class MLA(nn.Module):
                               output=attn_output,
                               latent_cache_gen=latent_cache_gen)
 
-        attn_output, residual = _helix_cp_output_projection(
-            self.o_proj, attn_output, attn_metadata, all_reduce_params,
-            residual, self.mapping, self.mapping_o, self.layer_idx)
-        if residual is ...:
-            return attn_output
-        return attn_output, residual
+        attn_output = _helix_cp_output_projection(self.o_proj, attn_output,
+                                                  attn_metadata,
+                                                  all_reduce_params,
+                                                  self.mapping, self.mapping_o,
+                                                  self.layer_idx)
+        return attn_output
 
     def resmooth_parameters(self,
                             module_weight,
