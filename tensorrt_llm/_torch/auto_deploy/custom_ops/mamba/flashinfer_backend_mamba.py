@@ -53,6 +53,7 @@ def _flashinfer_cached_ssm(
     time_step_limit: List[float],
     chunk_size: int,
 ) -> torch.Tensor:
+    slot_idx = slot_idx.to(torch.int32)
     b, s, num_heads, head_dim, bs, hs_flat, B_flat, C_flat, dt_flat = _flatten_ssm_inputs(
         hidden_states, B, C, dt
     )
@@ -124,7 +125,6 @@ def _flashinfer_cached_ssm(
 
         import flashinfer
 
-        slot_idx_decode_i32 = slot_idx_decode.to(torch.int32)
         y_decode = flashinfer.mamba.selective_state_update(
             ssm_state_cache,
             x_decode,
@@ -136,7 +136,7 @@ def _flashinfer_cached_ssm(
             z=None,
             dt_bias=dt_bias_hp,
             dt_softplus=True,
-            state_batch_indices=slot_idx_decode_i32,
+            state_batch_indices=slot_idx_decode,
         )
         preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
     if num_total_tokens > 0:

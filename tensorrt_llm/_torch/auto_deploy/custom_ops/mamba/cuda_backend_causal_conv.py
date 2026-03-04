@@ -77,6 +77,10 @@ def _cuda_cached_causal_conv1d(
     bs = b * s
     inp_flat = input.reshape(bs, *input.shape[2:])  # [total_s, C_in]
 
+    # Convert slot_idx to int32 once: CUDA kernels require int32 indices. Doing this at
+    # function entry avoids a duplicate dtype-copy CUDA kernel for mixed prefill+decode batches.
+    slot_idx_i32 = slot_idx.to(torch.int32)
+
     # Prepare weight as [dim, width] (depthwise)
     if weight.ndim == 3:
         assert weight.shape[-2] == 1
@@ -95,7 +99,7 @@ def _cuda_cached_causal_conv1d(
             w2d,
             bias,
             query_start_loc=cu_seqlen[: num_prefill + 1],
-            cache_indices=slot_idx[:num_prefill].to(torch.int32),
+            cache_indices=slot_idx_i32[:num_prefill],
             has_initial_state=use_initial_states[:num_prefill],
             conv_states=conv_state_cache,
             activation=activation,
@@ -115,7 +119,7 @@ def _cuda_cached_causal_conv1d(
             bias,
             activation=activation,
             cache_seqlens=None,
-            conv_state_indices=slot_idx[num_prefill:num_seq].to(torch.int32),
+            conv_state_indices=slot_idx_i32[num_prefill:num_seq],
             pad_slot_id=PAD_SLOT_ID,
         )
 
