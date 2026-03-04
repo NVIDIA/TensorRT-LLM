@@ -864,7 +864,8 @@ class Indexer(nn.Module):
                  sparse_attention_config: "SparseAttentionConfig",
                  dtype: Optional[torch.dtype],
                  layer_idx: int = 0,
-                 aux_stream: Optional[torch.cuda.Stream] = None):
+                 aux_stream: Optional[torch.cuda.Stream] = None,
+                 indexer_rope_interleave: bool = False):
         super().__init__()
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
@@ -903,8 +904,7 @@ class Indexer(nn.Module):
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
-            # RoPE in indexer is not interleaved
-            is_neox=True,
+            is_neox=not indexer_rope_interleave,
         )
 
         self.softmax_scale = self.head_dim**-0.5
@@ -1622,6 +1622,7 @@ class DSATrtllmAttention(TrtllmAttention):
             sparse_attention_config: Optional["SparseAttentionConfig"] = None,
             dtype: Optional[torch.dtype] = None,
             aux_stream: Optional[torch.cuda.Stream] = None,
+            indexer_rope_interleave: bool = False,
             **kwargs):
         if sparse_attention_config is None:
             raise ValueError(
@@ -1645,7 +1646,7 @@ class DSATrtllmAttention(TrtllmAttention):
         self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
                                skip_create_weights_in_init,
                                sparse_attention_config, dtype, layer_idx,
-                               aux_stream)
+                               aux_stream, indexer_rope_interleave)
 
     def sparse_attn_predict(
         self,
