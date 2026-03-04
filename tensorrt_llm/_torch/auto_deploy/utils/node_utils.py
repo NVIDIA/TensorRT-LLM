@@ -858,6 +858,8 @@ def get_all_layer_subgraphs(gm: GraphModule) -> tuple[List[LayerSubgraph], set[N
             shape = get_weight_shape(lin_node)
             if shape is not None:
                 lin_node.meta["lin_node_shape"] = shape
+            else:
+                lin_node.meta["lin_node_shape"] = None
 
     # Find the embedding size from the first linear node
     embd = get_weight_shape(linear_nodes[0], dim=-1)
@@ -1234,7 +1236,7 @@ def get_layer_after_linear_node(
 
     def boundary_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
-            if is_any_lin_op(node):
+            if is_any_lin_op(node) and node.meta["lin_node_shape"] is not None:
                 return node.meta["lin_node_shape"][dim] == embd
             return (
                 is_any_moe_op(node)
@@ -1251,7 +1253,7 @@ def get_layer_after_linear_node(
 
     def filter_condition(node: Node, dim: int) -> bool:
         if match_on_shapes:
-            if is_any_lin_op(node):
+            if is_any_lin_op(node) and node.meta["lin_node_shape"] is not None:
                 return node.meta["lin_node_shape"][dim] == embd
             return False
         else:
