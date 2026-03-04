@@ -2,6 +2,7 @@ import copy
 import inspect
 import os
 import traceback
+import warnings
 from typing import Callable, Optional, Tuple
 
 import torch
@@ -299,67 +300,49 @@ class ModelLoader:
                 config_copy = copy.deepcopy(config)
                 with MetaInitMode():
                     model = AutoModelForCausalLM.from_config(config_copy)
-
-                memo = dict()
-
-                def init_meta_tensor(t: torch.Tensor):
-                    if t.device != torch.device('meta'):
-                        return t
-                    if t not in memo:
-                        memo[t] = torch.empty_like(t, device='cuda')
-                    return memo[t]
-
-                if self.model_weights_memory_tag is not None:
-                    # Allocate buffers to the outer virtual_memory_scope,
-                    # but parameters (weights) to the dedicated
-                    # inner virtual_memory_scope.
-                    _apply_to_buffers_only(model, init_meta_tensor)
-
-                    with virtual_memory_scope(
-                            self.model_weights_memory_tag,
-                            self.model_weights_restore_mode) as pool:
-                        model._apply(init_meta_tensor)
-                    self._weight_pool_proxy = pool
-                else:
-                    model._apply(init_meta_tensor)
                 config = config_copy
-
+                is_meta_init = True
             except Exception:
                 logger.info(
                     f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
                 )
                 model = AutoModelForCausalLM.from_config(config)
-            finally:
-                if 'memo' in locals():
-                    del memo
+                is_meta_init = False
 
-            if self.model_weights_memory_tag is not None \
-                    and self._weight_pool_proxy is None:
+            memo = dict()
+
+            if self.model_weights_memory_tag is not None:
                 # Allocate buffers to the outer virtual_memory_scope,
-                # but parameters (weights) to the dedicated
-                # inner virtual_memory_scope.
-                memo = dict()
+                # but parameters (weights) to the dedicated inner virtual_memory_scope.
 
-                def copy_buffer_to_cuda(t: torch.Tensor):
+                def allocate_buffer_on_cuda(t: torch.Tensor):
                     if t not in memo:
-                        # Copy if not on CUDA.
-                        # Add to memo so model._apply later skips buffers.
-                        cuda_t = t.cuda()
+                        if t.device == torch.device('meta'):
+                            cuda_t = torch.empty_like(t, device='cuda')
+                        else:
+                            cuda_t = t.cuda()
                         memo[t] = cuda_t
                         memo[cuda_t] = cuda_t
                     return memo[t]
 
-                _apply_to_buffers_only(model, copy_buffer_to_cuda)
+                _apply_to_buffers_only(model, allocate_buffer_on_cuda)
 
-                initialized_weights = load_format not in (LoadFormat.AUTO, LoadFormat.DUMMY)
+                need_initialized_weights = load_format not in (LoadFormat.AUTO,
+                                                               LoadFormat.DUMMY)
 
                 def allocate_weights_on_cuda(t: torch.Tensor):
                     if t not in memo:
-                        # Reallocate inside the scope,
-                        # even if the weight is already on CUDA
-                        memo[t] = torch.empty_like(t, device='cuda')
-                        if initialized_weights:
-                            memo[t].copy_(t)
+                        cuda_t = torch.empty_like(t, device='cuda')
+                        if t.device != torch.device('meta') and (
+                                need_initialized_weights or is_meta_init):
+                            if t.is_cuda:
+                                warnings.warn(
+                                    f"A weight tensor of shape {t.shape} is already allocated on CUDA device before the weight allocation stage. "
+                                    f"This will cause extra CUDA memory usage in the 'model_engine' scope."
+                                )
+                            cuda_t.copy_(t)
+                        memo[t] = cuda_t
+                        memo[cuda_t] = cuda_t
                     return memo[t]
 
                 with virtual_memory_scope(
@@ -367,10 +350,20 @@ class ModelLoader:
                         self.model_weights_restore_mode) as pool:
                     model._apply(allocate_weights_on_cuda)
                 self._weight_pool_proxy = pool
-
-                del memo
             else:
+
+                def init_meta_tensor(t: torch.Tensor):
+                    if t.device != torch.device('meta'):
+                        return t
+
+                    if t not in memo:
+                        memo[t] = torch.empty_like(t, device='cuda')
+                    return memo[t]
+
+                model._apply(init_meta_tensor)
                 model.to("cuda")
+
+            del memo
 
             rank_model_storage = get_rank_model_storage(model)
             logger.info(
