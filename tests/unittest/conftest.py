@@ -54,13 +54,12 @@ def pytest_configure(config):
     # Register PeriodicJUnitXML when invoked from integration test_unittests.py
     periodic = config.getoption("--periodic-junit", default=False)
     periodic_junit_xmlpath = config.getoption("--periodic-junit-xmlpath",
-                                             default=None)
+                                              default=None)
     if periodic and periodic_junit_xmlpath:
+        from integration.defs.trt_test_alternative import (print_info,
+                                                           print_warning)
         from integration.defs.utils.periodic_junit import PeriodicJUnitXML
-        from integration.defs.trt_test_alternative import (
-            print_info,
-            print_warning,
-        )
+        
         periodic_interval = config.getoption("--periodic-interval")
         periodic_batch_size = config.getoption("--periodic-batch-size")
         periodic_save_unfinished_test = config.getoption(
@@ -72,7 +71,10 @@ def pytest_configure(config):
             xmlpath=periodic_junit_xmlpath,
             interval=periodic_interval,
             batch_size=periodic_batch_size,
-            logger={'info': print_info, 'warning': print_warning},
+            logger={
+                'info': print_info,
+                'warning': print_warning
+            },
             save_unfinished_test=periodic_save_unfinished_test,
         )
         reporter.pytest_configure(config)
@@ -154,33 +156,38 @@ def pytest_addoption(parser):
         "--periodic-junit",
         action="store_true",
         default=False,
-        help="Enable periodic JUnit XML reporter. Only used when invoked from integration test_unittests.",
+        help=
+        "Enable periodic JUnit XML reporter. Only used when invoked from integration test_unittests.",
     )
     parser.addoption(
         "--periodic-interval",
         action="store",
         type=int,
         default=18000,
-        help="Time interval in seconds between periodic saves. Only used with --periodic-junit.",
+        help=
+        "Time interval in seconds between periodic saves. Only used with --periodic-junit.",
     )
     parser.addoption(
         "--periodic-batch-size",
         action="store",
         type=int,
         default=10,
-        help="Number of completed tests before triggering a periodic save. Only used with --periodic-junit.",
+        help=
+        "Number of completed tests before triggering a periodic save. Only used with --periodic-junit.",
     )
     parser.addoption(
         "--periodic-junit-xmlpath",
         action="store",
         default=None,
-        help="Path to the output XML file for periodic JUnit XML reporter. Only used with --periodic-junit.",
+        help=
+        "Path to the output XML file for periodic JUnit XML reporter. Only used with --periodic-junit.",
     )
     parser.addoption(
         "--periodic-save-unfinished-test",
         action="store_true",
         default=False,
-        help="Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
+        help=
+        "Save unfinished test name to unfinished_test.txt. Only used with --periodic-junit.",
     )
 
 
