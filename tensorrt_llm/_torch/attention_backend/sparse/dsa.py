@@ -1,4 +1,5 @@
 import math
+import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, List, Optional, Tuple, Union
 
@@ -45,6 +46,20 @@ try:
 except ImportError:
     hadamard_transform = None
     HAS_FAST_HADAMARD = False
+
+# Check for fused cat+hadamard+fp8 kernel availability.
+# Env var TRTLLM_DSA_FUSED_PREP: "1" to enable (default), "0" to disable.
+_FUSED_PREP_ENV = os.environ.get("TRTLLM_DSA_FUSED_PREP", "1")
+_USE_FUSED_PREP = _FUSED_PREP_ENV == "1"
+
+# Verify the fused op is registered; fall back gracefully if not available.
+_HAS_FUSED_CAT_HADAMARD_FP8 = False
+if _USE_FUSED_PREP:
+    try:
+        torch.ops.trtllm.fused_cat_hadamard_fp8  # noqa: B018
+        _HAS_FUSED_CAT_HADAMARD_FP8 = True
+    except (AttributeError, RuntimeError):
+        _HAS_FUSED_CAT_HADAMARD_FP8 = False
 
 
 def _unravel_indices(flat_indices: torch.Tensor,
@@ -1548,6 +1563,14 @@ class Indexer(nn.Module):
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
+        if _HAS_FUSED_CAT_HADAMARD_FP8:
+            # Fused path: cat + hadamard + fp8_quantize in one kernel
+            fp8_out, scale = torch.ops.trtllm.fused_cat_hadamard_fp8(
+                qk_pe.reshape(-1, self.rope_dim),
+                qk_nope.reshape(-1, self.head_dim - self.rope_dim),
+                self.scale_fmt == "ue8m0")
+            return fp8_out, scale
+        # Fallback: sequential cat → hadamard → fp8_quantize
         q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
         q_or_k = rotate_activation(q_or_k)
         q_or_k = q_or_k.view(-1, self.head_dim)
