@@ -411,7 +411,7 @@ public:
         = ValueMatches<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
     using ValueMatchesPtr = std::shared_ptr<_ValueMatches>;
 
-    explicit Trie()
+    Trie()
         : mRoot{std::make_shared<_Node>()}
     {
     }

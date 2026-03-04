@@ -167,14 +167,6 @@ TEST_F(RadixTreeTest, StringSetInsertAndContains)
     }
     EXPECT_EQ(stringSet.countNumberOfNodes(), 44);
 
-    auto edges = stringSet.getEdges();
-    for (auto const& edge : edges)
-    {
-        std::string str(edge.begin(), edge.end());
-        printf("edge :: %s\n", str.c_str());
-    }
-    printf("stringSet has %d nodes\n", stringSet.countNumberOfNodes());
-
     EXPECT_TRUE(stringSet.contains("This is string 1, yeah"));
     EXPECT_TRUE(stringSet.contains("This is string 2, yeah"));
     EXPECT_TRUE(stringSet.contains("This is a loaf of bread"));

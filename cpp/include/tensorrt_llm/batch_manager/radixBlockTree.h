@@ -16,6 +16,7 @@
 
 #pragma once
 
+#include "tensorrt_llm/batch_manager/blockKey.h"
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/templatedTrie.h"
 
