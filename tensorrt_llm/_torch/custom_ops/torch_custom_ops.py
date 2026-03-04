@@ -11,8 +11,7 @@ from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import AllReduceFusionOp, AllReduceStrategy
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
-from tensorrt_llm.quantization.utils.fp8_quantize import \
-    triton_fp8_quantize_1x128
+from tensorrt_llm.quantization.utils import fp8_quantize
 
 from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
                          DynamicTensorSpec, OptimizationProfile, TunableRunner,
@@ -1464,7 +1463,7 @@ def _fp8_quantize_1x128_ue8m0(input: torch.Tensor, tactic: int):
     """Dispatch FP8 1x128 quantization to CUDA or Triton kernel."""
     TACTIC_TRITON = 1
     if tactic == TACTIC_TRITON:
-        a, a_sf = triton_fp8_quantize_1x128(input, use_ue8m0=True)
+        a, a_sf = fp8_quantize.triton_fp8_quantize_1x128(input, use_ue8m0=True)
     else:
         a, a_sf = torch.ops.trtllm.fp8_quantize_1x128(input, use_ue8m0=True)
     a_sf = deep_gemm.get_mn_major_tma_aligned_packed_ue8m0_tensor(
