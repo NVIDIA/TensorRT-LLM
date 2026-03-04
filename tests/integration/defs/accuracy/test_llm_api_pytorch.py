@@ -4567,7 +4567,7 @@ class TestPhi4MM(LlmapiAccuracyTestHarness):
 
     @skip_pre_hopper
     def test_fp8(self):
-        pytest.skip("Skip due to OOM")
+        pytest.skip("Skip due to unknown reason")
         model_path = f"{self.MODEL_PATH}-FP8"
         with LLM(model_path, max_seq_len=4096) as llm:
             task = MMLU(self.MODEL_NAME)

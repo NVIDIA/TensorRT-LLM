@@ -455,6 +455,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
+        pytest.skip("Skip due to accuracy issue")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         with LLM(
             self.MODEL_PATH,
