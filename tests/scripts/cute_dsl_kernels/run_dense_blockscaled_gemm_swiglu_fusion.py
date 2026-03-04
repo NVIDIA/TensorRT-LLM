@@ -335,6 +335,7 @@ def run(
 
     def create_sf_layout_tensor(batch, mn, nk, sf_vec_size):
         """Create a scale factor layout tensor (for SFC verification)."""
+
         def ceil_div(a, b):
             return (a + b - 1) // b
 
@@ -440,13 +441,25 @@ def run(
         # Execute kernel once for reference checking
         if generate_sfc:
             compiled_gemm(
-                a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor,
-                alpha, current_stream, sfc_tensor, norm_const_tensor,
+                a_tensor,
+                b_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                c_tensor,
+                alpha,
+                current_stream,
+                sfc_tensor,
+                norm_const_tensor,
             )
         else:
             compiled_gemm(
-                a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor,
-                alpha, current_stream,
+                a_tensor,
+                b_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                c_tensor,
+                alpha,
+                current_stream,
             )
 
         torch.cuda.synchronize()
@@ -568,9 +581,7 @@ def run(
             ).permute(1, 2, 0)
             ref_ = from_dlpack(ref_, assumed_align=16).mark_layout_dynamic(leading_dim=1)
             ref_.element_type = c_dtype
-            ref_device = (
-                ref_after_swiglu.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
-            )
+            ref_device = ref_after_swiglu.permute(2, 0, 1).contiguous().permute(1, 2, 0).cuda()
             ref_tensor = from_dlpack(ref_device, assumed_align=16).mark_layout_dynamic(
                 leading_dim=1
             )
@@ -616,13 +627,25 @@ def run(
             norm_const_torch = torch.tensor([1.0], dtype=torch.float32).cuda()
             norm_const_tensor = from_dlpack(norm_const_torch)
             return cute.testing.JitArguments(
-                a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor,
-                alpha, current_stream, sfc_tensor, norm_const_tensor,
+                a_tensor,
+                b_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                c_tensor,
+                alpha,
+                current_stream,
+                sfc_tensor,
+                norm_const_tensor,
             )
         else:
             return cute.testing.JitArguments(
-                a_tensor, b_tensor, sfa_tensor, sfb_tensor, c_tensor,
-                alpha, current_stream,
+                a_tensor,
+                b_tensor,
+                sfa_tensor,
+                sfb_tensor,
+                c_tensor,
+                alpha,
+                current_stream,
             )
 
     workspace_count = 1
