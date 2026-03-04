@@ -2793,7 +2793,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
 
     class CuteDSLTopKDecodeSingleCTARunner:
-        """Runner for CuTE DSL Top-K decode kernel (single CTA version)."""
+        """Runner for CuTE DSL Top-K decode kernel (single CTA version).
+
+        This runner manages compilation and execution of the filtered top-k kernel
+        optimized for Blackwell architecture using CuTE DSL. It implements a
+        radix-based filtering algorithm for efficient top-k selection.
+
+        The runner caches compiled kernels based on configuration (dtype, shape, top_k)
+        to avoid redundant recompilation. Cache is shared across all instances.
+
+        Attributes:
+            kernel_cache: Class-level dict mapping configuration tuples to compiled kernels.
+                         Keys are (dtype, num_cols, top_k, next_n, return_val, num_copy_bits,
+                         load_balance, large_occupancy).
+
+        Note:
+            - Requires Blackwell architecture (SM100+)
+            - Maximum tested top_k is 2048 (see kernel documentation for larger values)
+            - Supports fp16, bf16, and fp32 dtypes
+            - Automatically selects occupancy optimization based on batch size
+        """
         kernel_cache = dict()
 
         def __init__(self):
@@ -2808,6 +2827,44 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = True,
             num_copy_bits: int = 256,
         ):
+            """Execute filtered top-k selection on input logits.
+
+            This method compiles (if not cached) and executes the CuTE DSL top-k kernel.
+            It selects the top_k largest values per row using a radix-based filtering
+            algorithm optimized for Blackwell architecture.
+
+            Args:
+                input_values: Input logits tensor [batch_size * next_n, vocab_size].
+                             Must be 2D with dtype in {float16, bfloat16, float32}.
+                seq_lens: Sequence lengths for each batch [batch_size].
+                         Must be 1D int32 tensor. Used to determine valid range per row.
+                top_k: Number of top elements to select per row (1 to 2048).
+                      Must be divisible by vectorization width.
+                next_n: Number of candidates per sequence (for speculative decoding).
+                       Must be positive integer. Total rows = batch_size * next_n.
+                return_val: If True, return both indices and values.
+                           If False, return only indices (values will be None).
+                           Setting to False saves memory and computation.
+                num_copy_bits: Vectorization width for memory copy (128 or 256).
+                              Higher values may improve bandwidth utilization.
+
+            Returns:
+                tuple: (indices, values) where:
+                    - indices: Top-k indices [batch_size * next_n, top_k], int32.
+                              Values are relative to start of each row.
+                    - values: Top-k values [batch_size * next_n, top_k] if return_val=True,
+                             else None. Sorted in descending order per row.
+
+            Raises:
+                ValueError: If inputs have invalid shape, dtype, or parameter values.
+                KeyError: If unsupported dtype is provided.
+
+            Note:
+                - Kernel is compiled on first use for each unique configuration
+                - Compilation cache grows unbounded (consider clearing periodically)
+                - Uses current CUDA stream for asynchronous execution
+                - Occupancy is automatically optimized for batch_size > 148
+            """
             torch_dtype_to_cutlass_dtype = {
                 torch.float16: cutlass.Float16,
                 torch.bfloat16: cutlass.BFloat16,
