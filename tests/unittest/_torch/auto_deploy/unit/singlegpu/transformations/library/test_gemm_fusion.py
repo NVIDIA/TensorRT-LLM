@@ -264,6 +264,7 @@ def test_fusion(get_model: Callable[[], TestModel], dtype: str):
             },
             "fuse_fp8_gemms": {
                 "stage": "post_load_fusion",
+                "post_recompile_forward": True,
             },
         },
     )(None, gm)
