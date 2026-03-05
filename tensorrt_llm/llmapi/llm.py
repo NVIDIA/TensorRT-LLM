@@ -490,9 +490,7 @@ class BaseLLM:
         multimodal_params = None
         prompt = None
 
-        logger.info(f"is_mm_disagg: {is_mm_disagg}")
         if is_mm_disagg:
-            logger.info(f"[INSIDE IF] is_mm_disagg: {is_mm_disagg}")
             if not getattr(self.input_processor, "support_mm_disagg", False):
                 raise ValueError(
                     "Multimodal disaggregated inference is not supported for this model"
@@ -549,7 +547,6 @@ class BaseLLM:
         elif "prompt" in inputs or ("prompt_token_ids" in inputs and
                                     (("multi_modal_data" in inputs
                                       or "multi_modal_embeddings" in inputs))):
-            logger.info(f"inputs: {inputs}")
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
@@ -563,10 +560,6 @@ class BaseLLM:
                         inputs, sampling_params)
             elif 'multi_modal_embeddings' in inputs:
                 mm_embedding_info = inputs['multi_modal_embeddings']
-                if isinstance(mm_embedding_info, dict):
-                    logger.info(
-                        f"mm_embedding_info is a dict: {mm_embedding_info}")
-                logger.info(f"mm_embedding_info: {type(mm_embedding_info)}")
                 prompt_token_ids, extra_processed_inputs = cast(
                     BaseMultimodalInputProcessor,
                     self.input_processor).attach_multimodal_embeddings(
