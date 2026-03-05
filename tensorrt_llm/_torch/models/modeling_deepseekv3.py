@@ -52,7 +52,8 @@ from ..attention_backend.interface import PositionalEmbeddingParams, RopeParams
 from ..distributed import (AllReduce, AllReduceFusionOp, AllReduceParams,
                            MoEAllReduce, MoEAllReduceParams, allgather)
 from ..model_config import ModelConfig
-from ..modules.attention import MLA, maybe_cp_allgather, maybe_slice_for_cp
+from ..modules.attention import (MLA, maybe_allgather_for_helix_cp,
+                                 maybe_slice_for_helix_cp)
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.fused_moe import (DeepSeekV3MoeRoutingMethod, MoE,
@@ -1301,7 +1302,6 @@ class DeepseekV3DecoderLayer(DecoderLayer):
         self.post_attention_layernorm = RMSNorm(hidden_size=config.hidden_size,
                                                 eps=config.rms_norm_eps,
                                                 dtype=config.torch_dtype)
-        self.layer_idx = layer_idx
         self.next_layer_layernorm: RMSNorm = None
 
     def _get_decoder_layer_quant_config(
@@ -1378,9 +1378,9 @@ class DeepseekV3DecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        if self.mapping_with_cp is not None:
-            residual = maybe_slice_for_cp(residual, attn_metadata,
-                                          self.mapping_with_cp, self.layer_idx)
+        residual = maybe_slice_for_helix_cp(residual, attn_metadata,
+                                            self.mapping_with_cp,
+                                            self.layer_idx)
         if isinstance(self.mlp, Deepseekv3MoE):
             if spec_metadata is not None and spec_metadata.is_layer_capture(
                     self.layer_idx):
@@ -1648,9 +1648,6 @@ class DeepseekV3MTP(DeepseekV3DecoderLayer):
                 enable_allreduce=not (self.disable_attn_allreduce)),
             **kwargs,
         )
-        if self.mapping_with_cp is not None:
-            residual = maybe_slice_for_cp(residual, attn_metadata,
-                                          self.mapping_with_cp, self.layer_idx)
 
         # MTP Layer Must have sparse MOE
         if self.fusion_config.PRE_MOE_FUSION:
@@ -1762,8 +1759,9 @@ class DeepseekV3Model(DecoderModel):
                 spec_metadata=spec_metadata,
             )
 
-        hidden_states = maybe_cp_allgather(hidden_states, attn_metadata,
-                                           self.mapping_with_cp)
+        hidden_states = maybe_allgather_for_helix_cp(hidden_states,
+                                                     attn_metadata,
+                                                     self.mapping_with_cp)
         return hidden_states
 
 

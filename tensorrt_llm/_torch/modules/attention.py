@@ -240,7 +240,7 @@ def _helix_cp_allgather_input(hidden_states: torch.Tensor,
 
 
 def _helix_cp_output_projection(
-    o_proj: "Linear",
+    o_proj: Linear,
     attn_output: torch.Tensor,
     attn_metadata: AttentionMetadata,
     all_reduce_params: Optional[AllReduceParams],
@@ -274,8 +274,10 @@ def _helix_cp_output_projection(
     return attn_output
 
 
-def maybe_slice_for_cp(tensor: torch.Tensor, attn_metadata: AttentionMetadata,
-                       mapping: Mapping, layer_idx: int) -> torch.Tensor:
+def maybe_slice_for_helix_cp(tensor: torch.Tensor,
+                             attn_metadata: AttentionMetadata,
+                             mapping_with_cp: Optional[Mapping],
+                             layer_idx: int) -> torch.Tensor:
     """Slice a tensor to this CP rank's chunk after reduce-scatter.
 
     For the first decoder layer, the residual comes from the embedding and
@@ -287,24 +289,18 @@ def maybe_slice_for_cp(tensor: torch.Tensor, attn_metadata: AttentionMetadata,
     Call this in the decoder layer on the residual *after* the attention
     forward, so that Attention/MLA forward signatures stay unchanged.
     """
-    if (mapping.has_cp_helix() and mapping.enable_attention_dp
-            and layer_idx == 0):
-        num_tokens = attn_metadata.num_tokens
-        chunk_size = math.ceil(num_tokens / mapping.cp_size)
-        padded_size = chunk_size * mapping.cp_size
-        if num_tokens < padded_size:
-            tensor = torch.nn.functional.pad(
-                tensor, (0, 0, 0, padded_size - num_tokens),
-                mode="constant",
-                value=0)
-        start = mapping.cp_rank * chunk_size
+    if (mapping_with_cp is not None and mapping_with_cp.has_cp_helix()
+            and mapping_with_cp.enable_attention_dp and layer_idx == 0):
+        tensor, chunk_size = _helix_cp_pad(tensor, attn_metadata.num_tokens,
+                                           mapping_with_cp.cp_size)
+        start = mapping_with_cp.cp_rank * chunk_size
         tensor = tensor[start:start + chunk_size]
     return tensor
 
 
-def maybe_cp_allgather(hidden_states: torch.Tensor,
-                       attn_metadata: AttentionMetadata,
-                       mapping_with_cp: Optional[Mapping]) -> torch.Tensor:
+def maybe_allgather_for_helix_cp(
+        hidden_states: torch.Tensor, attn_metadata: AttentionMetadata,
+        mapping_with_cp: Optional[Mapping]) -> torch.Tensor:
     """Restore full token count after the last layer's reduce-scatter.
 
     With Helix CP + Attention DP, each decoder layer's reduce-scatter
