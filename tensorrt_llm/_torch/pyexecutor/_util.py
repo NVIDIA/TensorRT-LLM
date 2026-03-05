@@ -874,6 +874,18 @@ def _create_kv_cache_manager(
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+            # For hybrid models, hybrid_layer_mask is always passed as
+            # layer_mask to KVCacheManager, which means get_pp_layers
+            # sees a non-None layer_mask and won't auto-add spec layers.
+            # We must extend the masks here to include MTP spec layers
+            # (attention-only, no Mamba states) so they get KV cache entries.
+            if spec_config is not None:
+                from ..speculative.utils import get_num_spec_layers
+                num_spec_layers = get_num_spec_layers(spec_config)
+                if num_spec_layers > 0:
+                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    mamba_layer_mask.extend([False] * num_spec_layers)
+                    num_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,

@@ -1309,6 +1309,9 @@ class MTPEagleWorker(MTPWorker):
                     # update metadata
                     # some attention metadata needs to be updated when changing seq_lens/kv_lens
                     attn_metadata.update_for_spec_dec()
+                    # Disable spec-dec mode for subsequent iterations (i>0)
+                    # as draft model only infer 1 token for the subsequent inference.
+                    attn_metadata.use_spec_decoding = False
                 elif hasattr(attn_metadata, 'kv_lens_cuda'):
 
                     @torch.compile(options={"max-autotune": True})
@@ -1328,6 +1331,7 @@ class MTPEagleWorker(MTPWorker):
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
+        attn_metadata.use_spec_decoding = True
 
         next_draft_tokens, next_new_tokens = self._prepare_next_tokens(
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,
