@@ -214,7 +214,6 @@ def build_diffusion_config(args):
             "teacache_thresh": args.teacache_thresh,
         },
         "parallel": {
-            "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
         "torch_compile": {
@@ -239,12 +238,11 @@ def build_diffusion_config(args):
 def main():
     args = parse_args()
 
-    n_workers = args.cfg_size * args.ulysses_size
+    n_workers = args.ulysses_size
     diffusion_config = build_diffusion_config(args)
 
     logger.info(
-        f"Initializing VisualGen: world_size={n_workers} "
-        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
+        f"Initializing VisualGen: world_size={n_workers} (ulysses_size={args.ulysses_size})"
     )
     visual_gen = VisualGen(
         model_path=args.model_path,
