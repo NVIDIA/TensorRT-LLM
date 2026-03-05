@@ -37,16 +37,6 @@ pip install git+https://github.com/huggingface/diffusers.git
 pip install av
 ```
 
-**Optional: Flash Attention V4 (Blackwell GPUs / sm100)**
-
-Flash Attention V4 (FA4) provides higher speedup on Blackwell GPUs (sm100). If you want to enable it, we recommend using this version which has been validated by us:
-
-```bash
-git clone https://github.com/Dao-AILab/flash-attention.git tensorrt_llm/_torch/visual_gen/3rdparty/flash-attention
-cd tensorrt_llm/_torch/visual_gen/3rdparty/flash-attention && git checkout ea8f73506369d7cdd498396474107a978858138c && cd -
-export PYTHONPATH=$PYTHONPATH:${PROJECT_PATH}/3rdparty/flash-attention/
-```
-
 ### Python API
 
 The example scripts under `examples/visual_gen/` demonstrate direct Python usage. For Wan2.1 text-to-video generation:

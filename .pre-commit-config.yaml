@@ -1442,7 +1442,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
         exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4

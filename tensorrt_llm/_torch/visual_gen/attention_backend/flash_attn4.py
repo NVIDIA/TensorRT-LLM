@@ -15,11 +15,17 @@
 """
 Flash Attention 4 Backend for Visual Generation Models
 
-Uses flash_attn.cute.interface._flash_attn_fwd for optimized attention.
+Uses Flash Attention 4 with the CUTE JIT kernel.
 Expects NHD layout ([B, S, H, D]) and supports float16/bfloat16.
+
+Cute kernel source: tensorrt_llm/_torch/visual_gen/jit_kernels/flash_attention/cute/
+(https://github.com/Dao-AILab/flash-attention/tree/main/flash_attn/cute
+at commit ea8f73506369d7cdd498396474107a978858138c)
 """
 
 import math
+import pathlib
+import sys
 from typing import Optional
 
 import torch
@@ -28,10 +34,18 @@ import torch.nn as nn
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionTensorLayout
 
+_fa_path = str(pathlib.Path(__file__).parents[1] / "jit_kernels" / "flash_attention")
+if _fa_path not in sys.path:
+    sys.path.insert(0, _fa_path)
+
+_flash_attn_fwd_import_error = None
 try:
-    from flash_attn.cute.interface import _flash_attn_fwd
-except Exception:
+    from tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.interface import (
+        _flash_attn_fwd,
+    )
+except (ImportError, OSError) as e:
     _flash_attn_fwd = None
+    _flash_attn_fwd_import_error = e
 
 
 class FlashAttn4Attention(nn.Module):
@@ -119,9 +133,8 @@ class FlashAttn4Attention(nn.Module):
         """
         if _flash_attn_fwd is None:
             raise ImportError(
-                "FlashAttention 4 is not available. "
-                "Clone the source and export PYTHONPATH as described in the prerequisites."
-            )
+                f"FlashAttention 4 is not available. Import error: {_flash_attn_fwd_import_error}"
+            ) from _flash_attn_fwd_import_error
 
         is_causal = attention_mask == PredefinedAttentionMask.CAUSAL
 

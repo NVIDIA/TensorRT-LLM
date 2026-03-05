@@ -19,6 +19,9 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # Flash Attention 4 availability
 # ============================================================================
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    _flash_attn_fwd_import_error as _fa4_import_error,
+)
 from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 
 # Import new integrated versions
@@ -27,7 +30,7 @@ from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode,
 _flash_attn4_available = _fa4_fwd is not None
 requires_flash_attn4 = pytest.mark.skipif(
     not _flash_attn4_available,
-    reason="FlashAttention 4 not installed",
+    reason=f"FlashAttention 4 not available: {_fa4_import_error}",
 )
 
 # ============================================================================
@@ -206,7 +209,14 @@ def generate_rope_embeddings(
 # ============================================================================
 # Test functions
 # ============================================================================
-@pytest.mark.parametrize("attn_backend", ["VANILLA", "TRTLLM", "FA4"])
+@pytest.mark.parametrize(
+    "attn_backend",
+    [
+        "VANILLA",
+        "TRTLLM",
+        pytest.param("FA4", marks=requires_flash_attn4),
+    ],
+)
 def test_self_attention_equivalence(attn_backend: str):
     """Test that integrated self-attention produces same output as naive."""
     print("\n" + "=" * 60)
