@@ -63,7 +63,7 @@ class DeepSeekV32Parser(BaseToolParser):
 
     needs_raw_special_tokens = True
 
-    _eos_token = "<｜end▁of▁sentence｜>"
+    _eos_token = "<｜end▁of▁sentence｜>"  # nosec B105
 
     def __init__(self):
         super().__init__()
