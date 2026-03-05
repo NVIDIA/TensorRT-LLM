@@ -915,5 +915,4 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
-    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
