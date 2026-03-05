@@ -278,7 +278,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationWithRenormal
 TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelization)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/1000,
-        /*numExperts=*/128, /*topK=*/8,
+        /*numExperts=*/512, /*topK=*/10,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/8,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false,
@@ -344,7 +344,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationTop4)
 TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationLargeN)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/4,
-        /*numExperts=*/512, /*topK=*/10,
+        /*numExperts=*/2048, /*topK=*/32,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
@@ -355,7 +355,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, BlockLevelParallelizationLargeN)
 TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationLargeN)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/100,
-        /*numExperts=*/512, /*topK=*/10,
+        /*numExperts=*/2048, /*topK=*/32,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
@@ -366,7 +366,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, ClusterLevelParallelizationLargeN)
 TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationLargeN)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/1000,
-        /*numExperts=*/512, /*topK=*/10,
+        /*numExperts=*/2048, /*topK=*/32,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/false, /*hasInvalidTopKInput=*/false,
@@ -377,7 +377,7 @@ TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationLargeN)
 TYPED_TEST(RoutingRenormalizeKernelTest, DeviceLevelParallelizationLargeNWithInvalidTopKInput)
 {
     RoutingKernelTestParam param(RoutingMethodType::Renormalize, /*numTokens=*/1000,
-        /*numExperts=*/512, /*topK=*/10,
+        /*numExperts=*/2048, /*topK=*/32,
         /*expertParallelization=*/1, /*expertParallelizationId=*/0, /*tileTokensDim=*/256,
         /*paddingLog2=*/3, /*localExpertsStrideLog2=*/0,
         /*usePdl=*/true, /*getExpWeights=*/true, /*useTopKAsInput=*/true, /*hasInvalidTopKInput=*/true,
