@@ -16,7 +16,7 @@
 """Definition of the quant module that can be used for PTQ."""
 
 import warnings
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 from flashinfer import bmm_fp8
@@ -337,6 +337,76 @@ def fp4_linear_fake(
     alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_fused_relu2_quant_nvfp4", mutates_args=())
+def trtllm_fused_relu2_quant_nvfp4(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    sf_vec_size: int = TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Fuse ReLU2 activation and NVFP4 quantization using TRT-LLM kernel."""
+    input_shape = input.shape
+    input_2d = input.reshape(-1, input_shape[-1]).contiguous()
+    fp4_out, sf_out = torch.ops.trtllm.fused_relu2_quantize(input_2d, input_scale, sf_vec_size)
+    fp4_out = fp4_out.reshape(*input_shape[:-1], fp4_out.shape[-1])
+    return fp4_out, sf_out
+
+
+@trtllm_fused_relu2_quant_nvfp4.register_fake
+def trtllm_fused_relu2_quant_nvfp4_fake(
+    input: torch.Tensor,
+    input_scale: torch.Tensor,
+    sf_vec_size: int = TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del input_scale
+    input_shape = input.shape
+    m = int(input.numel() // input_shape[-1])
+    n = input_shape[-1]
+    fp4_shape = (*input_shape[:-1], n // TRTLLM_NVFP4_PACKING_FACTOR)
+    sf_size = ((m + TRTLLM_NVFP4_ROW_SIZE - 1) // TRTLLM_NVFP4_ROW_SIZE) * TRTLLM_NVFP4_ROW_SIZE
+    sf_size *= (n // sf_vec_size + TRTLLM_NVFP4_COLUMN_SIZE - 1) // TRTLLM_NVFP4_COLUMN_SIZE
+    sf_size *= TRTLLM_NVFP4_COLUMN_SIZE
+    return input.new_empty(fp4_shape, dtype=torch.uint8), input.new_empty(
+        (sf_size,), dtype=torch.uint8
+    )
+
+
+@torch.library.custom_op("auto_deploy::trtllm_nvfp4_prequant_linear", mutates_args=())
+def trtllm_nvfp4_prequant_linear(
+    input_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run NVFP4 GEMM when activations are already quantized."""
+    input_shape = input_fp4.shape
+    input_fp4_2d = input_fp4.reshape(-1, input_fp4.shape[-1]).contiguous()
+    output = torch.ops.trtllm.nvfp4_gemm(
+        input_fp4_2d, weight_fp4, input_sf, weight_scale, alpha, out_dtype
+    )
+    if bias is not None:
+        output = output + bias
+    return output.reshape(*input_shape[:-1], output.shape[-1])
+
+
+@trtllm_nvfp4_prequant_linear.register_fake
+def trtllm_nvfp4_prequant_linear_fake(
+    input_fp4: torch.Tensor,
+    weight_fp4: torch.Tensor,
+    input_sf: torch.Tensor,
+    weight_scale: torch.Tensor,
+    alpha: torch.Tensor,
+    bias: Optional[torch.Tensor] = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    del input_sf, weight_scale, alpha
+    out_features = weight_fp4.shape[0]
+    output_shape = (*input_fp4.shape[:-1], out_features)
+    return input_fp4.new_empty(output_shape, dtype=out_dtype)
 
 
 def is_column_major(tensor):
