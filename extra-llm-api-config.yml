@@ -1,0 +1,8 @@
+kv_cache_config:
+  enable_block_reuse: false
+  mamba_ssm_cache_dtype: float16
+moe_config:
+   backend: TRTLLM
+cuda_graph_config:
+    enable_padding: true
+    batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]

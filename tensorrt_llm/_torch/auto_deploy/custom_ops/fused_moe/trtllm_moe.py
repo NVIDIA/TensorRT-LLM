@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -42,20 +42,6 @@ def _check_moe_alltoall(mapping_config: str, max_num_tokens: int) -> Tuple[Mappi
     if enable_alltoall and max_num_tokens <= 0:
         raise ValueError("max_num_tokens must be > 0 when enable_alltoall is True")
     return mapping, enable_alltoall
-
-
-def _nvfp4_quantize_scale_from_act_global(act_global_scale: torch.Tensor) -> torch.Tensor:
-    """Convert act_global_scale to the scalar scale expected by fp4_quantize.
-
-    The module path uses fc31_input_scale = 1/max(per-expert w1 input scales) for
-    fp4_quantize. When act_global_scale is per-expert [E], we use 1/max to match.
-    When it is already a scalar, we pass it through.
-    Must be capture-safe: no .item() or CPU-GPU sync.
-    """
-    if act_global_scale.numel() > 1:
-        inv_max = (1.0 / act_global_scale.max()).to(torch.float32)
-        return inv_max.reshape(1)
-    return act_global_scale.flatten()[:1].to(torch.float32).clone()
 
 
 def _run_moe_with_alltoall(
@@ -600,126 +586,76 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     fc1_scale_c: torch.Tensor,
     fc1_alpha: torch.Tensor,
     fc2_alpha: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    intermediate_size: int,
-    hidden_size: int,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
-    """TensorRT-LLM TRTLLM-Gen NVFP4 MoE for SM100+ (Blackwell).
-
-    This uses the optimized fp4_block_scale_moe_runner kernel which is specifically
-    designed for SM100/SM103 architectures. It differs from the Cutlass-based
-    trtllm_quant_nvfp4_moe_fused in that:
-    - It requires shuffled weight format
-    - It supports additional gpt-oss style parameters (bias, alpha, beta, limit)
-
-    Computes (per expert):
-        For gated_mlp:
-            y = (act(x @ w1.T) * (x @ w3.T)) @ w2.T  # act := SiLU
-        For mlp:
-            y = act(x @ w1.T) @ w2.T                 # act := ReLU^2
-
-    Parameters:
-        x: BF16 input tensor of shape (B, H) or (B, S, H)
-        selected_experts: Pre-computed expert indices (B*S, TOP_K)
-        routing_weights: Pre-computed routing weights (B*S, TOP_K)
-        fc1_expert_weights_fp4: Shuffled FP4 FC1 weights [E, 2*I, H/2] for gated_mlp
-        fc2_expert_weights_fp4: Shuffled FP4 FC2 weights [E, H, I/2]
-        fc1_weight_blockscale_fp8: Block scales for FC1 weights
-        fc2_weight_blockscale_fp8: Block scales for FC2 weights
-        fc1_act_global_scale: Global scale for FC1 activations
-        fc1_scale_c: Scale for FC1 output quantization
-        fc1_alpha: FC1 dequant scale
-        fc2_alpha: FC2 dequant scale
-        num_experts: Total number of experts
-        top_k: Number of experts per token
-        intermediate_size: MLP intermediate dimension (padded)
-        hidden_size: Original hidden size (before padding)
-        is_gated_mlp: True for gated_mlp (SwiGLU), False for mlp (ReLU2)
-        act_fn: Activation function type
-
-    Returns:
-        Output tensor of shape (B, H) or (B, S, H)
-    """
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
 
-    # Store original shape
+    if mapping_config:
+        raise ValueError("trtllm_nvfp4_trtllm_gen_moe_fused does not support mapping_config yet.")
+
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])
-
-    # Determine activation type for the kernel
-    # 0 = Swiglu, 1 = Relu2
-    act_type = 0 if is_gated_mlp else 1
-
-    # Pad input if necessary (hidden_size must match weight dimension)
-    padded_hidden_size = fc1_expert_weights_fp4.shape[-1] * 2  # *2 because FP4 is packed
-    if x2d.shape[-1] < padded_hidden_size:
-        x2d = torch.nn.functional.pad(x2d, (0, padded_hidden_size - x2d.shape[-1]))
-
-    # Quantize input to FP4
-    hidden_states_fp4, hidden_states_scale = torch.ops.trtllm.fp4_quantize(
+    # The fusion transform can pad K for kernel alignment. Match _torch TRTLLM-Gen path:
+    # pad activations to gemm1 K, quantize, then slice output back to original hidden size.
+    expected_hidden = int(fc1_expert_weights_fp4.shape[-1] * 2)
+    pad_size = expected_hidden - int(x2d.shape[-1])
+    if pad_size > 0:
+        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
+    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
         x2d, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
     )
 
-    # Get number of local experts (for single GPU, this equals num_experts)
-    local_num_experts = fc1_expert_weights_fp4.shape[0]
-    local_expert_offset = 0
+    if act_fn in (ActivationType.Silu, ActivationType.Swiglu):
+        act_type = 0
+    elif act_fn == ActivationType.Relu2:
+        act_type = 1
+    else:
+        raise ValueError(f"Unsupported activation '{ActivationType(act_fn).name}' for TRTLLM-Gen.")
 
-    # Routing parameters - use DeepSeekV3 routing with n_group=1 for external routing
-    # This is the ONLY routing method that supports top_k > 10 (Nemotron Super v3 uses top_k=22)
-    # When n_group=1, topk_group=1, it behaves like standard routing but supports higher top_k
-    # Note: Nemotron uses routed_scaling_factor=5.0 in its router (noaux_tc_op)
-    # The routing weights should already have this scaling applied, so we don't pass it here
-    routing_method_type = int(RoutingMethodType.DeepSeekV3)  # = 2
-    n_group = 1
-    topk_group = 1
-    routed_scaling_factor = 1.0  # Nemotron Super v3 uses routed_scaling_factor=5.0
+    top_k = int(routing_weights.shape[-1])
+    num_experts = int(fc1_expert_weights_fp4.shape[0])
+    factor = 1 if act_type == 1 else 2
+    intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
+    routing_method_type = int(RoutingMethodType.DeepSeekV3)
 
-    # Prepare topk tensors for external routing
-    topk_ids = selected_experts.to(torch.int32)
-    topk_weights = routing_weights.to(torch.bfloat16)
-
-    # Call the TRTLLM-Gen kernel with external routing
     outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
-        None,  # routing_logits (None for external routing)
-        None,  # routing_bias (optional, for DeepSeek-V3)
-        hidden_states_fp4,  # hidden_states (FP4 quantized)
-        hidden_states_scale.view(torch.float8_e4m3fn),  # hidden_states_scale
-        fc1_expert_weights_fp4,  # gemm1_weights
-        fc1_weight_blockscale_fp8.view(torch.float8_e4m3fn),  # gemm1_weights_scale
-        None,  # gemm1_bias
-        None,  # gemm1_alpha (swiglu alpha)
-        None,  # gemm1_beta (swiglu beta)
-        None,  # gemm1_clamp_limit
-        fc2_expert_weights_fp4,  # gemm2_weights
-        fc2_weight_blockscale_fp8.view(torch.float8_e4m3fn),  # gemm2_weights_scale
-        None,  # gemm2_bias
-        fc1_scale_c,  # output1_scale_scalar
-        fc1_alpha,  # output1_scale_gate_scalar
-        fc2_alpha,  # output2_scale_scalar
-        num_experts,  # num_experts
-        top_k,  # top_k
-        n_group,  # n_group
-        topk_group,  # topk_group
-        intermediate_size,  # intermediate_size
-        local_expert_offset,  # local_expert_offset
-        local_num_experts,  # local_num_experts
-        routed_scaling_factor,  # routed_scaling_factor
-        routing_method_type,  # routing_method_type
-        True,  # do_finalize
-        act_type,  # act_type (0=Swiglu, 1=Relu2)
-        topk_weights,  # topk_weights (external routing)
-        topk_ids,  # topk_ids (external routing)
+        None,
+        None,
+        x_q_fp4,
+        x_sf.view(torch.float8_e4m3fn),
+        fc1_expert_weights_fp4,
+        fc1_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        fc2_expert_weights_fp4,
+        fc2_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        fc1_scale_c,
+        fc1_alpha,
+        fc2_alpha,
+        num_experts,
+        top_k,
+        1,
+        1,
+        intermediate_size,
+        0,
+        num_experts,
+        1.0,
+        routing_method_type,
+        do_finalize=True,
+        act_type=act_type,
+        topk_weights=routing_weights.to(torch.bfloat16),
+        topk_ids=selected_experts.to(torch.int32),
     )
-
     final_hidden_states = outputs[0]
-
-    # Slice output if it was padded
-    if final_hidden_states.shape[1] > hidden_size:
-        final_hidden_states = final_hidden_states[:, :hidden_size].contiguous()
-
+    if final_hidden_states.shape[1] > x_shape[-1]:
+        final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
     return final_hidden_states.view(x_shape)
 
 
@@ -736,12 +672,10 @@ def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
     fc1_scale_c: torch.Tensor,
     fc1_alpha: torch.Tensor,
     fc2_alpha: torch.Tensor,
-    num_experts: int,
-    top_k: int,
-    intermediate_size: int,
-    hidden_size: int,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
-    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
