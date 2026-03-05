@@ -606,9 +606,9 @@ class KvCacheCreator:
         target_pretrained_config = self._model_engine.model.model_config.pretrained_config
         target_num_layers = target_pretrained_config.num_hidden_layers
 
-        # PARD: draft is a separate model, layers start from 0.
+        # PARD, External Drafter: draft is a separate model, layers start from 0.
         # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
-        if self._speculative_config.spec_dec_mode.is_pard():
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
             num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_draft_layers
         else:
@@ -874,6 +874,18 @@ def _create_kv_cache_manager(
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+            # For hybrid models, hybrid_layer_mask is always passed as
+            # layer_mask to KVCacheManager, which means get_pp_layers
+            # sees a non-None layer_mask and won't auto-add spec layers.
+            # We must extend the masks here to include MTP spec layers
+            # (attention-only, no Mamba states) so they get KV cache entries.
+            if spec_config is not None:
+                from ..speculative.utils import get_num_spec_layers
+                num_spec_layers = get_num_spec_layers(spec_config)
+                if num_spec_layers > 0:
+                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    mamba_layer_mask.extend([False] * num_spec_layers)
+                    num_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
