@@ -1302,19 +1302,21 @@ class SimpleUnifiedScheduler(RequestScheduler):
     1. Single-pass fused scheduling (performance):
        Capacity and token-budget checks run in one loop via TokenBudgetTracker,
        instead of capacity first then microbatch second. This eliminates one
-       full iteration over fitting_requests and avoids wasted KV-block
-       accounting on requests that would exceed the token budget. Inflight
-       and beam-width-mismatch skips still follow the same bookkeeping
-       semantics as the C++ capacity path.
+       full iteration over fitting_requests and reduces scheduler-side KV
+       bookkeeping (reserve/check/decrement) on requests that would be dropped
+       by the token budget. Fused one-pass does not change final KV allocation
+       semantics (prepare_resources runs on the final batch only), but reduces
+       host overhead and unnecessary bookkeeping. Inflight and beam-width-
+       mismatch skips still follow the same semantics as the C++ capacity path.
 
     2. MaxUtilization produces fewer pauses:
        When token budget is exhausted, the fused path stops the capacity
        loop early (token failure returns None, not False, so pause/backtrack
        is not triggered). In SimpleScheduler, capacity evaluates ALL requests
        first (potentially pausing some to make room), then microbatch drops
-       the ones exceeding token budget — meaning those pauses were wasted
-       (they freed KV blocks for requests that got dropped anyway). The fused
-       path avoids this: fewer pauses, equivalent or better batch utilization.
+       the ones exceeding token budget — meaning those pauses were wasted.
+       The fused path avoids unnecessary pause/backtrack work when token
+       budget is the bottleneck.
 
     3. num_fitting_requests counts requests passing both capacity AND token
        budget (via TokenBudgetTracker._num_fitting), not just capacity-fitting.
