@@ -72,7 +72,7 @@ dependencies = [
     "blobfile (>=3.2.0,<4.0.0)",
     "openai-harmony (==0.0.4)",
     "nvidia-cutlass-dsl (==4.3.4)",
-    "plotly (>=6.5.2,<7.0.0)",
+    "plotly (>=6.6.0,<7.0.0)",
     "numexpr (<2.14.0)",
     "partial-json-parser (>=0.2.1.1.post7,<0.3.0.0)",
     "torch-c-dlpack-ext (==0.1.3)",

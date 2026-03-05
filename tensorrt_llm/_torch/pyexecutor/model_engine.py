@@ -3,6 +3,7 @@ import contextlib
 import functools
 import gc
 import inspect
+import itertools
 import math
 import os
 import weakref
@@ -53,7 +54,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
-from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
@@ -361,7 +362,7 @@ class PyTorchModelEngine(ModelEngine):
         # 3) The model configuration is not loaded until the model engine
         # is initialized.
         #
-        # NOTE: This can simplified by decoupling the model config loading and
+        # NOTE: This can be simplified by decoupling the model config loading and
         # the model engine.
         self.attn_metadata = None
         self.iter_states = {}
@@ -903,8 +904,8 @@ class PyTorchModelEngine(ModelEngine):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # When using piecewise cuda graph, the logits may suffer severe memory faction problem.
-        # When the num of requests is growing, the block allocated by torch cannot be reused.
+        # When using piecewise cuda graph, the logits may suffer severe memory fragmentation problem.
+        # As the number of requests grows, the blocks allocated by torch cannot be reused.
         # So after piecewise cuda graph capture, a request with most requests is triggered to make
         # sure that large enough blocks are allocated and can be correctly reused.
         for num_tokens in piecewise_cuda_graph_num_tokens:
@@ -1266,7 +1267,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
-                is_draft_model=self.is_draft_model)
+                is_draft_model=self.is_draft_model,
+                max_seq_len=self.max_seq_len)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -1276,7 +1278,8 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
-            is_draft_model=self.is_draft_model)
+            is_draft_model=self.is_draft_model,
+            max_seq_len=self.max_seq_len)
         return self.spec_metadata
 
     def __del__(self) -> None:
@@ -1380,18 +1383,20 @@ class PyTorchModelEngine(ModelEngine):
         self._init_max_num_tokens()
 
     def _release_cuda_graphs(self):
-        self.cuda_graph_runner.clear()
+        if hasattr(self,
+                   'cuda_graph_runner') and self.cuda_graph_runner is not None:
+            self.cuda_graph_runner.clear()
 
     def get_max_num_sequences(self) -> int:
         """
-        Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
+        Return the maximum number of sequences that the model supports. PyExecutor needs this to compute max_num_active_requests
         """
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
-        Make some changes to the device inputs and avoid block the async data transfer
+        Make some changes to the device inputs and avoid blocking the async data transfer
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -1549,7 +1554,7 @@ class PyTorchModelEngine(ModelEngine):
                 return padded_num_tokens, True, None
             else:
                 logger.debug(
-                    f"Picewise cudagraph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
+                    f"Piecewise CUDA graph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
                 )
                 return total_num_tokens, False, None
 
@@ -2062,8 +2067,8 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP.
-            if isinstance(new_tensors_device, SampleStateTensorsMTP):
+            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsSpec.
+            if isinstance(new_tensors_device, SampleStateTensorsSpec):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
@@ -3450,6 +3455,22 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
+
+        # Initialize SA state for new requests (MTP+SA path)
+        use_sa_spec = (self.spec_config is not None
+                       and getattr(self.spec_config, 'use_sa_spec', False))
+        if (use_sa_spec and spec_metadata is not None
+                and hasattr(spec_metadata, 'sa_manager')
+                and spec_metadata.sa_manager is not None
+                and self.mapping.is_last_pp_rank()):
+            sa_manager = spec_metadata.sa_manager
+            for request in itertools.chain(
+                    scheduled_requests.context_requests,
+                    scheduled_requests.generation_requests):
+                if request.py_request_id not in sa_manager._initialized_requests:
+                    sa_manager.add_request(request.py_request_id,
+                                           request.get_tokens(0))
+                    sa_manager._initialized_requests.add(request.py_request_id)
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,

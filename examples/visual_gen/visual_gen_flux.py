@@ -161,13 +161,6 @@ def parse_args():
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
     )
     parser.add_argument(
-        "--torch_compile_models",
-        type=str,
-        nargs="+",
-        default=[],
-        help="Components to torch.compile (empty = auto detect transformer components)",
-    )
-    parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
     )
 
@@ -227,7 +220,6 @@ def build_diffusion_config(args):
         },
         "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,
-            "torch_compile_models": args.torch_compile_models,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
