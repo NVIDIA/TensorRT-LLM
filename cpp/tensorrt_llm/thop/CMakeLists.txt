@@ -44,7 +44,7 @@ add_library(
   attentionOp.cpp
   causalConv1dOp.cpp
   convertSpecDecodingMaskToPackedMaskOp.cpp
-  cuteDslMoeUtilsOp.cpp
+  
   cutlassScaledMM.cpp
   cublasScaledMM.cpp
   cublasFp4ScaledMM.cpp
@@ -75,17 +75,17 @@ add_library(
   llama4MinLatency.cpp
   logitsBitmaskOp.cpp
   mambaConv1dOp.cpp
-  moeOp.cpp
-  moeUtilOp.cpp
-  moeCommOp.cpp
-  moeAlltoAllOp.cpp
-  moeLoadBalanceOp.cpp
-  moeAlignOp.cpp
-  mxFp4BlockScaleMoe.cpp
-  mxFp8Quantize.cpp
-  fp8BlockScaleMoe.cpp
-  fp8PerTensorScaleMoe.cpp
-  fp4BlockScaleMoe.cpp
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
+  
   noAuxTcOp.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
@@ -95,7 +95,7 @@ add_library(
   reducescatterOp.cpp
   relativeAttentionBiasOp.cpp
   dsv3RouterGemmOp.cpp
-  customMoeRoutingOp.cpp
+  
   selectiveScanOp.cpp
   userbuffersFinalizeOp.cpp
   userbuffersTensor.cpp
@@ -107,7 +107,19 @@ add_library(
   finegrained_mixed_dtype_gemm_thop.cpp
   tinygemm2.cpp
   dsv3RopeOp.cpp
-  fusedGemmAllreduceOp.cpp)
+  fusedGemmAllreduceOp.cpp
+  moeCommOp.cpp
+  moeOp.cpp
+  moeUtilOp.cpp
+  moeAlltoAllOp.cpp
+  moeAlignOp.cpp
+  moeLoadBalanceOp.cpp
+  customMoeRoutingOp.cpp
+  fp8BlockScaleMoe.cpp
+  fp8PerTensorScaleMoe.cpp
+  fp4BlockScaleMoe.cpp
+  cuteDslMoeUtilsOp.cpp
+  mxFp8Quantize.cpp)
 set_property(TARGET th_common PROPERTY POSITION_INDEPENDENT_CODE ON)
 target_link_libraries(
   th_common PRIVATE ${TORCH_LIBRARIES} th_utils ${Python3_LIBRARIES}
