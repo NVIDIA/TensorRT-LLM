@@ -23,7 +23,7 @@ import torch.multiprocessing as mp
 try:
     from diffusers.models.autoencoders.autoencoder_kl_wan import AutoencoderKLWan
 
-    from tensorrt_llm._torch.visual_gen.models.wan.vae import WanParallelVAEAdapter
+    from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import WanParallelVAEAdapter
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True

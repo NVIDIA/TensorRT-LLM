@@ -18,6 +18,8 @@ from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_ex
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
+from .parallel_vae import WanParallelVAEAdapter
+
 # Supported Wan I2V 14B models:
 # - Wan2.1-I2V-14B-480P: Single-stage image-to-video
 # - Wan2.1-I2V-14B-720P: Single-stage image-to-video
@@ -26,7 +28,6 @@ from tensorrt_llm.logger import logger
 # Import shared coefficients from T2V pipeline
 from .pipeline_wan import WAN_TEACACHE_COEFFICIENTS
 from .transformer_wan import WanTransformer3DModel
-from .vae import WanParallelVAEAdapter
 
 # Use same coefficients
 WAN_I2V_TEACACHE_COEFFICIENTS = WAN_TEACACHE_COEFFICIENTS

@@ -11,7 +11,7 @@ from tensorrt_llm.mapping import Mapping
 
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
-from .modules.parallel_vae import BaseParallelVAEAdapter
+from .modules.vae import BaseParallelVAEAdapter
 from .parallelism import setup_parallel_vae
 from .teacache import TeaCacheBackend
 

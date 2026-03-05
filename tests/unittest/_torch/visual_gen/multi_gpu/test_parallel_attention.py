@@ -21,7 +21,7 @@ import torch.multiprocessing as mp
 try:
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock
 
-    from tensorrt_llm._torch.visual_gen.modules.attention import ParallelVaeAttentionBlock
+    from tensorrt_llm._torch.visual_gen.modules.vae import ParallelVaeAttentionBlock
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True

@@ -22,8 +22,8 @@ import torch.nn as nn
 try:
     from diffusers.models.autoencoders.autoencoder_kl_wan import WanCausalConv3d
 
-    from tensorrt_llm._torch.visual_gen.models.wan.vae import WanCausalConvHalo
-    from tensorrt_llm._torch.visual_gen.modules.conv import (
+    from tensorrt_llm._torch.visual_gen.models.wan.parallel_vae import WanCausalConvHalo
+    from tensorrt_llm._torch.visual_gen.modules.vae import (
         HaloExchangeConv,
         HaloExchangeConv2dStride2,
     )

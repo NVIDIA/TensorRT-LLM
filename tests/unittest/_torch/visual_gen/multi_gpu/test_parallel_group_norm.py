@@ -20,7 +20,7 @@ import torch.multiprocessing as mp
 import torch.nn as nn
 
 try:
-    from tensorrt_llm._torch.visual_gen.modules.norm import GroupNormParallel
+    from tensorrt_llm._torch.visual_gen.modules.vae import GroupNormParallel
     from tensorrt_llm._utils import get_free_port
 
     MODULES_AVAILABLE = True

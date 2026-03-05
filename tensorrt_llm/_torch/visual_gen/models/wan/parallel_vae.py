@@ -3,9 +3,12 @@ from typing import Literal
 import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, WanCausalConv3d
 
-from tensorrt_llm._torch.visual_gen.modules.attention import ParallelVaeAttentionBlock
-from tensorrt_llm._torch.visual_gen.modules.conv import HaloExchangeConv, HaloExchangeConv2dStride2
-from tensorrt_llm._torch.visual_gen.modules.parallel_vae import BaseParallelVAEAdapter
+from tensorrt_llm._torch.visual_gen.modules.vae import (
+    BaseParallelVAEAdapter,
+    HaloExchangeConv,
+    HaloExchangeConv2dStride2,
+    ParallelVaeAttentionBlock,
+)
 from tensorrt_llm._torch.visual_gen.utils import as_tuple
 
 
