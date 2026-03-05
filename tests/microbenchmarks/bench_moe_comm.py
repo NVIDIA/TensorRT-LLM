@@ -42,6 +42,7 @@ python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --profile deepseek_v3
 from __future__ import annotations
 
 import argparse
+import ctypes
 import json
 import os
 import pickle
@@ -315,27 +316,27 @@ def _time_dispatch_and_combine(
                 )
 
     _sync()
-
     # if mpi_rank() == 0:
     #     print("########################################################")
     #     print(prof.key_averages())
     #     print("########################################################")
+    return _parse_profiler_events(list(prof.events()))
 
-    # ------------------------------------------------------------------
-    # Categorize GPU kernels by enclosing record_function scope
-    # ("dispatch" or "combine").
-    #
-    # Each record_function marker produces both a CPU event and a CUDA
-    # range event.  We collect the GPU-side "dispatch"/"combine" ranges
-    # and check whether each GPU kernel's start/stop timestamp falls inside
-    # one of them (GPU time-range containment).
-    # ------------------------------------------------------------------
-    events_list = list(prof.events())
+
+def _parse_profiler_events(
+    events_list: list,
+) -> Tuple[List[float], List[float], Dict[str, Any]]:
+    """Parse Kineto profiler events into per-iteration times and kernel breakdown.
+
+    Expects the profiler to have been run with record_function("dispatch") and
+    record_function("combine") wrapping each operation (works for both eager
+    kernels and CUDA graph replays).
+    """
     # if mpi_rank() == 0:
-    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
     #     for evt in events_list:
     #         print(evt)
-    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
+    #     print("++++++++++++++++++++++++++++++++++++++++++++++++++++++++")
 
     def _is_gpu_event(evt) -> bool:
         return getattr(evt, "device_type", None) == DeviceType.CUDA
@@ -449,6 +450,145 @@ def _time_dispatch_and_combine(
         "other_kernels": other_kernels,
     }
 
+    return dispatch_times_us, combine_times_us, detailed_stats
+
+
+def _time_dispatch_and_combine_cuda_graph(
+    backend: Communication,
+    *,
+    hidden_states: torch.Tensor,
+    hidden_states_sf: Optional[torch.Tensor],
+    token_selected_slots: torch.Tensor,
+    token_final_scales: Optional[torch.Tensor],
+    all_rank_num_tokens: List[int],
+    hidden_size: int,
+    warmup: int,
+    iters: int,
+    flush_l2: bool = True,
+) -> Tuple[List[float], List[float], Dict[str, Any]]:
+    """Time dispatch and combine using an unrolled CUDA graph + embedded CUDA events.
+
+    Order:
+      1. One eager dispatch+combine to discover recv shape → allocate static_moe_out → sync.
+      2. Capture a single big graph with `iters` iterations unrolled.
+         Each iteration: d_starts[i].record → dispatch → d_ends[i].record
+                         → zero_ → c_starts[i].record → combine → c_ends[i].record
+      3. Warmup: `warmup` eager iterations (no graph).
+      4. Timed: one big_graph.replay() → GPU runs all iters back-to-back with zero CPU overhead.
+      5. Sync, read per-iter timings from events.
+      6. Profiler pass (two small graphs) for kernel breakdown.
+
+    No L2 flush between iterations inside the graph; consecutive iters share cache state,
+    which matches real inference behaviour.
+
+    Returns same types as _time_dispatch_and_combine.
+    """
+    device = hidden_states.device
+    max_tokens = max(all_rank_num_tokens)
+
+    l2_buffer = None
+    if flush_l2:
+        l2_size = torch.cuda.get_device_properties(device).L2_cache_size
+        l2_flush_size = (l2_size * 2) // 4
+        l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
+
+    def _l2_flush():
+        if l2_buffer is not None:
+            l2_buffer.zero_()
+
+    # ---- 1. Shape discovery: one eager run ----
+    recv_hidden_states, _, _, _ = backend.dispatch(
+        hidden_states,
+        hidden_states_sf,
+        token_selected_slots,
+        token_final_scales,
+        all_rank_num_tokens,
+    )
+    static_moe_out = torch.zeros(
+        (recv_hidden_states.shape[0], hidden_size),
+        dtype=torch.bfloat16,
+        device=device,
+    )
+    backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
+    torch.cuda.synchronize()
+
+    # ---- 2. Capture big graph (iters iterations unrolled) ----
+    # cudaEventRecordExternal (0x1, CUDA 11.2+) makes events recorded inside a
+    # CUDA graph queryable via elapsed_time() after replay. Without this flag,
+    # graph-internal events raise cudaErrorInvalidValue on elapsed_time().
+    _cudart = ctypes.CDLL("libcudart.so")
+    _cudart.cudaEventRecordWithFlags.restype = ctypes.c_int
+    _cudart.cudaEventRecordWithFlags.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint]
+    _CUDA_EVENT_RECORD_EXTERNAL = 0x1
+
+    def _record_external(event: torch.cuda.Event) -> None:
+        stream = torch.cuda.current_stream()
+        ret = _cudart.cudaEventRecordWithFlags(
+            event.cuda_event, stream.cuda_stream, _CUDA_EVENT_RECORD_EXTERNAL
+        )
+        if ret != 0:
+            raise RuntimeError(f"cudaEventRecordWithFlags failed with code {ret}")
+
+    d_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    d_ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    c_starts = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+    c_ends = [torch.cuda.Event(enable_timing=True) for _ in range(iters)]
+
+    # Force lazy CUDA event creation — cuda_event handle is null until first record().
+    for evt in d_starts + d_ends + c_starts + c_ends:
+        evt.record()
+    torch.cuda.synchronize()
+
+    big_graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(big_graph):
+        for i in range(iters):
+            if l2_buffer is not None:
+                l2_buffer.zero_()
+            _record_external(d_starts[i])
+            backend.dispatch(
+                hidden_states,
+                hidden_states_sf,
+                token_selected_slots,
+                token_final_scales,
+                all_rank_num_tokens,
+            )
+            _record_external(d_ends[i])
+            static_moe_out.zero_()
+            _record_external(c_starts[i])
+            backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
+            _record_external(c_ends[i])
+
+    # ---- 3. Warmup: eager iterations ----
+    for _ in range(warmup):
+        _l2_flush()
+        backend.dispatch(
+            hidden_states,
+            hidden_states_sf,
+            token_selected_slots,
+            token_final_scales,
+            all_rank_num_tokens,
+        )
+        static_moe_out.zero_()
+        backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
+
+    # ---- 4. Timed replay + kernel breakdown in one pass ----
+    with torch.profiler.profile(
+        activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
+        record_shapes=False,
+        with_stack=False,
+    ) as prof:
+        _sync()
+        big_graph.replay()
+    torch.cuda.synchronize()
+
+    dispatch_times_us = [d_starts[i].elapsed_time(d_ends[i]) * 1e3 for i in range(iters)]
+    combine_times_us = [c_starts[i].elapsed_time(c_ends[i]) * 1e3 for i in range(iters)]
+
+    # if mpi_rank() == 0:
+    #     print("########################################################")
+    #     print(prof.key_averages())
+    #     print("########################################################")
+    _, _, detailed_stats = _parse_profiler_events(list(prof.events()))
     return dispatch_times_us, combine_times_us, detailed_stats
 
 
@@ -589,6 +729,15 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Use deterministic balanced router assignments to avoid communication load imbalance.",
     )
+    parser.add_argument(
+        "--cuda_graph",
+        action="store_true",
+        help=(
+            "Capture dispatch and combine into CUDA graphs. "
+            "Uses CUDA events for more accurate per-iteration timing (lower CPU overhead than Kineto ranges). "
+            "Compatible with --kernel_breakdown: individual kernels remain visible inside graph replays via CUPTI, but can only be categorized as 'other_kernels'."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -723,6 +872,7 @@ def _run_benchmark_worker_under_current_mpi(
         "max_num_tokens_per_rank": max_num_tokens_per_rank,
         "random_seed": int(args.random_seed),
         "device_count": torch.cuda.device_count(),
+        "cuda_graph": bool(args.cuda_graph),
     }
     if rank == 0:
         print(json.dumps(benchmark_metadata, indent=2), flush=True)
@@ -808,9 +958,13 @@ def _run_benchmark_worker_under_current_mpi(
                 )
             )
 
-            # Time dispatch and combine with Kineto
-            dispatch_times_us, combine_times_us, detailed_stats = _time_dispatch_and_combine(
-                backend,
+            # Time dispatch and combine
+            _time_fn = (
+                _time_dispatch_and_combine_cuda_graph
+                if args.cuda_graph
+                else _time_dispatch_and_combine
+            )
+            time_fn_kwargs: Dict[str, Any] = dict(
                 hidden_states=hidden_states,
                 hidden_states_sf=hidden_states_sf,
                 token_selected_slots=token_selected_slots,
@@ -820,6 +974,9 @@ def _run_benchmark_worker_under_current_mpi(
                 warmup=int(args.warmup),
                 iters=int(args.iters),
                 flush_l2=True,
+            )
+            dispatch_times_us, combine_times_us, detailed_stats = _time_fn(
+                backend, **time_fn_kwargs
             )
 
             iter_stats = bool(args.iter_stats)
@@ -836,6 +993,10 @@ def _run_benchmark_worker_under_current_mpi(
 
             # Add kernel breakdown if requested and available
             if args.kernel_breakdown and detailed_stats is not None:
+                if args.cuda_graph and mpi_rank() == 0:
+                    print(
+                        "NOTE: --cuda_graph: all kernels are reported under 'other_kernels' (no dispatch/combine categorization)."
+                    )
                 categories = ("dispatch_kernels", "combine_kernels", "other_kernels")
 
                 # Collect once per rank to avoid desynchronizing MPI collectives when
