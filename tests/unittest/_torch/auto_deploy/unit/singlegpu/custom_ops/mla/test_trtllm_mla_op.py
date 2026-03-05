@@ -483,8 +483,8 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
         torch.testing.assert_close(
             trtllm_decode_out.view(batch_size, 1, num_heads, v_head_dim),
             ref_output,
-            atol=5e-2,
-            rtol=5e-2,
+            atol=2e-2,
+            rtol=2e-2,
         )
 
 

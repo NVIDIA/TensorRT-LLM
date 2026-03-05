@@ -714,9 +714,10 @@ def trtllm_mla_with_cache(
 
     # thop.attention applies q_scaling / sqrt(head_size) internally, where
     # head_size = gen_head_size = kv_lora_rank + qk_rope_head_dim.
-    # For MLA decode with weight absorption, the standard backend also uses
-    # q_scaling=1.0, giving effective scale = 1/sqrt(gen_head_size).
-    thop_q_scaling = 1.0
+    # The correct MLA scale is 1/sqrt(qk_head_dim), so we compensate:
+    #   q_scaling / sqrt(gen_head_size) = 1/sqrt(qk_head_dim)
+    #   => q_scaling = sqrt(gen_head_size / qk_head_dim)
+    thop_q_scaling = math.sqrt(gen_head_size / qk_head_dim)
 
     def _make_decode_shared():
         return (
