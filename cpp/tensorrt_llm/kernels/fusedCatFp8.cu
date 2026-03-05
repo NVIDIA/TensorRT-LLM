@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "fusedCatHadamardFp8.h"
+#include "fusedCatFp8.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -175,25 +175,25 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(_
 
 } // anonymous namespace
 
-void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe,
-    __nv_bfloat16 const* nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride,
-    int32_t nope_row_stride, bool use_ue8m0, cudaStream_t stream)
+void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe, __nv_bfloat16 const* nope,
+    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride,
+    bool use_ue8m0, cudaStream_t stream)
 {
     if (M == 0)
     {
         return;
     }
 
-    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatHadamardFp8: head_dim must be 128, got %d", head_dim);
-    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim,
-        "fusedCatHadamardFp8: pe_dim (%d) + nope_dim (%d) != head_dim (%d)", pe_dim, nope_dim, head_dim);
-    TLLM_CHECK_WITH_INFO((head_dim & (head_dim - 1)) == 0, "fusedCatHadamardFp8: head_dim must be power of 2");
+    TLLM_CHECK_WITH_INFO(head_dim == HEAD_DIM, "fusedCatFp8: head_dim must be 128, got %d", head_dim);
+    TLLM_CHECK_WITH_INFO(pe_dim + nope_dim == head_dim, "fusedCatFp8: pe_dim (%d) + nope_dim (%d) != head_dim (%d)",
+        pe_dim, nope_dim, head_dim);
+    TLLM_CHECK_WITH_INFO((head_dim & (head_dim - 1)) == 0, "fusedCatFp8: head_dim must be power of 2");
     TLLM_CHECK_WITH_INFO(pe_dim % ELEMS_PER_THREAD == 0,
-        "fusedCatHadamardFp8: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
-    TLLM_CHECK_WITH_INFO(pe_row_stride >= pe_dim, "fusedCatHadamardFp8: pe_row_stride (%d) must be >= pe_dim (%d)",
-        pe_row_stride, pe_dim);
-    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim,
-        "fusedCatHadamardFp8: nope_row_stride (%d) must be >= nope_dim (%d)", nope_row_stride, nope_dim);
+        "fusedCatFp8: pe_dim (%d) must be a multiple of %d for vectorized access", pe_dim, ELEMS_PER_THREAD);
+    TLLM_CHECK_WITH_INFO(
+        pe_row_stride >= pe_dim, "fusedCatFp8: pe_row_stride (%d) must be >= pe_dim (%d)", pe_row_stride, pe_dim);
+    TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp8: nope_row_stride (%d) must be >= nope_dim (%d)",
+        nope_row_stride, nope_dim);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     dim3 grid(num_blocks);

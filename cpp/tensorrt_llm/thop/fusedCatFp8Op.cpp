@@ -14,7 +14,7 @@
  * limitations under the License.
  */
 
-#include "tensorrt_llm/kernels/fusedCatHadamardFp8.h"
+#include "tensorrt_llm/kernels/fusedCatFp8.h"
 #include "tensorrt_llm/thop/thUtils.h"
 
 #include <ATen/cuda/EmptyTensor.h>
@@ -24,7 +24,7 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-std::tuple<at::Tensor, at::Tensor> fused_cat_hadamard_fp8(at::Tensor const& pe, at::Tensor const& nope, bool use_ue8m0)
+std::tuple<at::Tensor, at::Tensor> fused_cat_fp8(at::Tensor const& pe, at::Tensor const& nope, bool use_ue8m0)
 {
     CHECK_TH_CUDA(pe);
     CHECK_TH_CUDA(nope);
@@ -64,7 +64,7 @@ std::tuple<at::Tensor, at::Tensor> fused_cat_hadamard_fp8(at::Tensor const& pe, 
 
     auto stream = at::cuda::getCurrentCUDAStream(pe.get_device());
 
-    tensorrt_llm::kernels::invokeFusedCatHadamardFp8(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
+    tensorrt_llm::kernels::invokeFusedCatFp8(reinterpret_cast<__nv_fp8_e4m3*>(fp8_out.data_ptr()),
         reinterpret_cast<float*>(scale_out.data_ptr()), reinterpret_cast<__nv_bfloat16 const*>(pe.data_ptr()),
         reinterpret_cast<__nv_bfloat16 const*>(nope.data_ptr()), M, pe_dim, nope_dim, head_dim, pe_row_stride,
         nope_row_stride, use_ue8m0, stream);
@@ -78,10 +78,10 @@ TRTLLM_NAMESPACE_END
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
-    m.def("fused_cat_hadamard_fp8(Tensor pe, Tensor nope, bool use_ue8m0=False) -> (Tensor, Tensor)");
+    m.def("fused_cat_fp8(Tensor pe, Tensor nope, bool use_ue8m0=False) -> (Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)
 {
-    m.impl("fused_cat_hadamard_fp8", &tensorrt_llm::torch_ext::fused_cat_hadamard_fp8);
+    m.impl("fused_cat_fp8", &tensorrt_llm::torch_ext::fused_cat_fp8);
 }
