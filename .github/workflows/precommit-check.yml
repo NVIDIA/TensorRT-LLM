@@ -53,7 +53,6 @@ jobs:
             touch changed_files.txt
           fi
 
-
       - name: Run pre-commit checks
         run: |
           python3 -u scripts/release_check.py --files-from changed_files.txt
