@@ -738,6 +738,12 @@ def parse_args() -> argparse.Namespace:
             "Compatible with --kernel_breakdown: individual kernels remain visible inside graph replays via CUPTI, but can only be categorized as 'other_kernels'."
         ),
     )
+    parser.add_argument(
+        "--pdl",
+        action="store_true",
+        default=False,
+        help="Enable Programmatic Dependent Launch (sets TRTLLM_ENABLE_PDL=1).",
+    )
     return parser.parse_args()
 
 
@@ -810,6 +816,7 @@ def _resolve_profile_args(args: argparse.Namespace) -> Tuple[int, int, int, int,
 
 _WORKER_ENV = {
     "TRTLLM_CAN_USE_DEEP_EP": "1",
+    "TRTLLM_ENABLE_PDL": "0",
 }
 
 
@@ -873,6 +880,7 @@ def _run_benchmark_worker_under_current_mpi(
         "random_seed": int(args.random_seed),
         "device_count": torch.cuda.device_count(),
         "cuda_graph": bool(args.cuda_graph),
+        "pdl": bool(args.pdl),
     }
     if rank == 0:
         print(json.dumps(benchmark_metadata, indent=2), flush=True)
@@ -1139,8 +1147,11 @@ def main() -> None:
             flush=True,
         )
 
+    worker_env = dict(_WORKER_ENV)
+    worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
+
     args_blob = cloudpickle.dumps(args)
-    executor = MPIPoolExecutor(max_workers=ep_size, env=_WORKER_ENV)
+    executor = MPIPoolExecutor(max_workers=ep_size, env=worker_env)
     try:
         # Map the same args to all workers; each worker uses its own mpi_rank() and participates
         # in collectives within its spawned MPI world.
