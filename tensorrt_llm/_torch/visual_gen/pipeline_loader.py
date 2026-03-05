@@ -282,10 +282,15 @@ class PipelineLoader:
         # For LTX-2, Text encoder loads from a separate path (e.g. Gemma3 directory).
         # All other LTX_2 specific components load from the checkpoint safetensors.
         # =====================================================================
-        pipeline.load_standard_components(
-            checkpoint_dir, self.device, skip_components,
-            text_encoder_path=text_encoder_path,
-        )
+        if LTX_2_specific_prefix is not None:
+            pipeline.load_standard_components(
+                checkpoint_dir, self.device, skip_components,
+                text_encoder_path=text_encoder_path,
+            )
+        else:
+            pipeline.load_standard_components(
+                checkpoint_dir, self.device, skip_components,
+            )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
