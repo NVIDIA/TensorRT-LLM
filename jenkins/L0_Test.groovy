@@ -772,12 +772,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             def resourcePathNode = "/tmp"
             def llmSrcNode = "${resourcePathNode}/TensorRT-LLM/src"
             def llmSrcLocal = "${llmPath}/TensorRT-LLM/src"
-            def scriptRunLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_run.sh"
-            def scriptRunPathNode = "${jobWorkspace}/${jobUID}-slurm_run.sh"
-            def scriptInstallLocalPath = "${llmSrcLocal}/jenkins/scripts/slurm_install.sh"
-            def scriptInstallPathNode = "${jobWorkspace}/${jobUID}-slurm_install.sh"
-            def scriptBashUtilsLocalPath = "${llmSrcLocal}/jenkins/scripts/bash_utils.sh"
-            def scriptBashUtilsPathNode = "${jobWorkspace}/${jobUID}-bash_utils.sh"
+            def scriptsDirLocal = "${llmSrcLocal}/jenkins/scripts"
+            def scriptsDirNode = "${jobWorkspace}/jenkins/scripts"
+            def scriptRunPathNode = "${scriptsDirNode}/slurm_run.sh"
+            def scriptInstallPathNode = "${scriptsDirNode}/slurm_install.sh"
+            def scriptBashUtilsPathNode = "${scriptsDirNode}/bash_utils.sh"
             def testListPathNode = "${jobWorkspace}/${testList}.txt"
             def waivesListPathNode = "${jobWorkspace}/waives.txt"
             def slurmJobLogPath = "${jobWorkspace}/job-output.log"
@@ -794,35 +793,25 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 // Create Job Workspace folder in Frontend Node
                 Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${jobWorkspace}\""), numRetries: 3)
 
+                // Create jenkins/scripts directory structure for mounting
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"mkdir -p ${scriptsDirNode}\""), numRetries: 3)
+
                 // Download and Unzip Tar File
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && wget -nv ${llmTarfile}")
                 sh "cd ${llmPath} && tar -zxf ${BUILD_CONFIGS[config][TARNAME]}"
 
-                Utils.exec(pipeline, script: "echo \"Script for Slurm srun job to submit: \" && cat ${scriptRunLocalPath}")
+                // Copy entire jenkins/scripts directory to target node
                 Utils.copyFileToRemoteHost(
                     pipeline,
                     remote,
-                    scriptRunLocalPath,
-                    scriptRunPathNode,
+                    scriptsDirLocal,
+                    scriptsDirNode,
                     true
                 )
 
-                Utils.exec(pipeline, script: "echo \"Script to install TensorRT LLM dependencies: \" && cat ${scriptInstallLocalPath}")
-                Utils.copyFileToRemoteHost(
-                    pipeline,
-                    remote,
-                    scriptInstallLocalPath,
-                    scriptInstallPathNode,
-                    true
-                )
-                Utils.exec(pipeline, script: "echo \"Script for Bash utilities: \" && cat ${scriptBashUtilsLocalPath}")
-                Utils.copyFileToRemoteHost(
-                    pipeline,
-                    remote,
-                    scriptBashUtilsLocalPath,
-                    scriptBashUtilsPathNode,
-                    true
-                )
+                // Display the scripts that were copied
+                Utils.exec(pipeline, script: "echo \"Scripts copied to ${scriptsDirNode}\"")
+                Utils.exec(pipeline, script: Utils.sshUserCmd(remote, "\"ls -lh ${scriptsDirNode}/\""))
 
                 // Generate Test List and Upload to Frontend Node
                 def makoArgs = getMakoArgsFromStageName(stageName, true)
