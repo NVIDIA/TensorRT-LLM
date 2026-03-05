@@ -213,7 +213,7 @@ class BaseSparseAttentionConfig(StrictBaseModel):
 
     def supports_backend(self, backend: str) -> bool:
         """
-        Override if the speculation algorithm does not support
+        Override if the sparse attention algorithm does not support
         a subset of the possible backends.
         """
         return True
@@ -237,9 +237,9 @@ class RocketSparseAttentionConfig(BaseSparseAttentionConfig):
     """
     algorithm: Literal["rocket"] = "rocket"
     window_size: Optional[int] = Field(
-        default=32, description="The window size for snap KV.")
+        default=32, description="The window size for RocketKV.")
     kernel_size: Optional[int] = Field(
-        default=63, description="The kernel size for snap KV.")
+        default=63, description="The kernel size for RocketKV.")
     topr: Optional[Union[int, float]] = Field(default=128, description="Top-r")
     topk: Optional[int] = Field(default=64, description="Top-k")
     prompt_budget: Optional[int] = Field(default=2048,
@@ -636,7 +636,7 @@ class _ModelFormatKind(Enum):
 
 class DecodingBaseConfig(StrictBaseModel):
     max_draft_len: Optional[NonNegativeInt] = Field(
-        default=None, description="The number of drafter layers.")
+        default=None, description="The maximum number of draft tokens.")
 
     max_total_draft_tokens: Optional[int] = Field(
         default=None,
@@ -651,7 +651,7 @@ class DecodingBaseConfig(StrictBaseModel):
         validation_alias=AliasChoices("speculative_model",
                                       "speculative_model_dir"),
         description=
-        "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'),"
+        "The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. 'yuhuili/EAGLE3-LLaMA3.1-Instruct-8B'), "
         "which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory."
     )
 
@@ -899,7 +899,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_choices(cls, v):
         if v is not None:
             logger.warning(
-                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
             )
             if not isinstance(v, list):
                 if isinstance(v, str):
@@ -914,6 +914,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
+        if not self.eagle3_one_model:
+            logger.warning(
+                "Eagle3 2-model is deprecated and will be removed in release 1.4."
+            )
+
         self.num_eagle_layers = self.max_draft_len
         self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
@@ -934,7 +939,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
             num_eagle_layers_from_choices = self.check_eagle_choices()
             if num_eagle_layers_from_choices != self.num_eagle_layers:
                 logger.warning(
-                    f"Base on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
+                    f"Based on the input choices, reset the num_eagle_layers(max_draft_len) from {self.num_eagle_layers} to {num_eagle_layers_from_choices}"
                 )
                 self.num_eagle_layers = num_eagle_layers_from_choices
                 self.max_draft_len = num_eagle_layers_from_choices
@@ -1271,8 +1276,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
-                "in release 1.3. After that, the flag will be removed entirely."
+                "2-model style MTP is deprecated and will be removed in release 1.4."
             )
         return self
 
@@ -1427,7 +1431,7 @@ class RayPlacementConfig(StrictBaseModel):
 
 class PybindMirror(ABC):
     ''' A class containing the utilities for mirroring Python classes to
-    pybinding classes.
+    pybind classes.
     '''
 
     @abstractmethod
@@ -1857,7 +1861,7 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
     secondary_offload_min_priority: Optional[int] = Field(
         default=None,
         description=
-        "Only blocks with priority > mSecondaryOfflineMinPriority can be offloaded to secondary memory."
+        "Only blocks with priority > secondary_offload_min_priority can be offloaded to secondary memory."
     )
     event_buffer_max_size: int = Field(
         default=0,
@@ -2184,16 +2188,16 @@ class BaseLlmArgs(StrictBaseModel):
 
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
-        description="The cluster parallel size for MoE models's expert weights.",
+        description="The cluster parallel size for MoE model's expert weights.",
         status="beta")
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
-        description="The tensor parallel size for MoE models's expert weights.")
+        description="The tensor parallel size for MoE model's expert weights.")
 
     moe_expert_parallel_size: Optional[int] = Field(
         default=None,
-        description="The expert parallel size for MoE models's expert weights.")
+        description="The expert parallel size for MoE model's expert weights.")
 
     enable_attention_dp: bool = Field(
         default=False,
@@ -2708,7 +2712,7 @@ class TrtLlmArgs(BaseLlmArgs):
 
             elif isinstance(self.speculative_config, EagleDecodingConfig):
                 assert self.speculative_config.max_draft_len > 0
-                assert self.speculative_config.speculative_model is not None, "EAGLE3 draft model must be specified."
+                assert self.speculative_config.speculative_model is not None, "EAGLE draft model must be specified."
                 self.build_config.max_draft_len = self.speculative_config.max_draft_len
                 self.build_config.speculative_decoding_mode = SpeculativeDecodingMode.EAGLE
                 eagle_config = _EagleConfig(
@@ -2958,7 +2962,7 @@ class TorchLlmArgs(BaseLlmArgs):
     garbage_collection_gen0_threshold: int = Field(
         default=20000,
         description=
-        "Threshold for Python garbage collection of generation 0 objects."
+        "Threshold for Python garbage collection of generation 0 objects. "
         "Lower values trigger more frequent garbage collection.",
         status="beta")
 
@@ -3042,7 +3046,7 @@ class TorchLlmArgs(BaseLlmArgs):
         ge=0,
         le=1,
         description=
-        "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays.",
+        "Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.",
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
@@ -3135,7 +3139,7 @@ class TorchLlmArgs(BaseLlmArgs):
 
     ray_worker_extension_cls: Optional[str] = Field(
         default=None,
-        description="The full worker extension class name including module path."
+        description="The full worker extension class name including module path. "
         "Allows users to extend the functions of the RayGPUWorker class.",
         status="prototype")
 
@@ -3155,7 +3159,7 @@ class TorchLlmArgs(BaseLlmArgs):
     enable_sleep: bool = Field(
         default=False,
         description=
-        "Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading."
+        "Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. "
         "Only enable it if you intend to use this feature.",
         status="prototype")
 

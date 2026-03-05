@@ -811,7 +811,7 @@ class Attention(nn.Module):
 
     def apply_qk_norm(self, q, k):
         raise NotImplementedError(
-            f"QK norm is not implemented for {self.__class__.__name__}."
+            f"QK norm is not implemented for {self.__class__.__name__}. "
             "Please override the `apply_qk_norm` method in the subclass.")
 
 
@@ -959,7 +959,7 @@ class MLA(nn.Module):
                 self)
             self.register_to_config = True
 
-        # only support one kind of sparse attention, dsa now.
+        # Currently only DSA sparse attention is supported.
         if config is not None and config.sparse_attention_config is not None and config.sparse_attention_config.algorithm == "dsa":
             self.is_dsa = True
         else:
@@ -982,7 +982,7 @@ class MLA(nn.Module):
             dp_size = tp_size
             tp_size = 1
         if self.mapping.has_cp_ulysses():
-            raise NotImplementedError("MLA doesn't support CP Ulyssees yet")
+            raise NotImplementedError("MLA doesn't support CP Ulysses yet")
         if self.mapping.cp_size > 1:
             assert self.mapping.has_cp_helix(
             ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
@@ -1360,13 +1360,13 @@ class MLA(nn.Module):
                      output: torch.Tensor,
                      latent_cache_gen: Optional[torch.Tensor] = None) -> None:
         """
-        Forward pass for the MLA module.
+        Forward pass for the MLA module. Writes result into output tensor in-place.
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-            output (torch.Tensor): Pre-allocated output tensor, written in-place.
+            output (torch.Tensor): The output tensor to write results into.
             latent_cache_gen (Optional[torch.Tensor]): The latent cache used in generation.
         """
         # split q, k, v into context and gen batches
@@ -1464,12 +1464,13 @@ class MLA(nn.Module):
                               output: torch.Tensor) -> None:
         """
         Forward pass for the MLA module with DSA (always in MQA mode).
+        Writes result into output tensor in-place.
 
         Args:
             position_ids (Optional[torch.IntTensor]): The position IDs.
             hidden_states (torch.Tensor): The hidden states.
             attn_metadata (AttentionMetadata): The attention metadata.
-            output (torch.Tensor): Pre-allocated output tensor, written in-place.
+            output (torch.Tensor): The output tensor to write results into.
         """
         assert self.mqa is not None, "DSA is only supported in MQA mode"
         # split q, k, v into context and gen batches
@@ -1800,7 +1801,7 @@ class MLA(nn.Module):
         # currently we assume that the chunk size is the same as the max_num_tokens
         chunked_loop_num = attn_metadata.chunked_loop_num
 
-        # [toal_token_q, num_heads, 2] -> [toal_token_q, num_heads] float2
+        # [total_token_q, num_heads, 2] -> [total_token_q, num_heads] float2
         self.softmax_stats_tensor = torch.empty(
             (attn_metadata.num_ctx_tokens, self.num_heads_tp, 2),
             dtype=torch.float,

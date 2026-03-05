@@ -201,7 +201,7 @@ class TunableRunner(ABC):
 
         tactic==-1 has special meaning, means the fallback kernel which should be able to implement any shapes
         This fallback tactic is needed for 2 reasons:
-            * when the autotuner cannot find a valid tactic in it's cache.
+            * when the autotuner cannot find a valid tactic in its cache.
             * in eager mode, w/o autotunning the custom op should have at least one kernel, which makes the autotuning
               process an optional process, such that user can opt out.
 
@@ -1437,10 +1437,10 @@ class AutoTuner:
         # during the tuning process. This can by controlled in the preparation phase by the runner.
         # It must not use all zero tensors. Otherwise the timing results become unreliable.
         if dtype == torch.float4_e2m1fn_x2:
-            return torch.randint(-5, 5, shapes,
-                                 device=device).to(torch.uint8).view(dtype)
+            return (torch.rand(shapes, device=device) * 10 - 5).to(
+                torch.uint8).view(dtype)
         else:
-            return torch.randint(-5, 5, shapes, device=device).to(dtype)
+            return (torch.rand(shapes, device=device) * 10 - 5).to(dtype)
 
     def _prepare_input_tensors(
             self, profile: OptimizationProfile,
