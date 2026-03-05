@@ -3420,7 +3420,7 @@ class PyExecutor:
                     f"context_phase_params={request.context_phase_params}, "
                     f"is_disagg_context_transmission_state={request.is_disagg_context_transmission_state}, "
                     f"num_tokens={len(_all_tokens)}, last_token_id={_gen_token}, "
-                    f"finish_reasons={request.finish_reasons}")
+                    f"finish_reasons={request.finish_by_reason}")
             if request.py_decoding_iter == 1 or request.is_finished or \
                     request.py_decoding_iter % self.stream_interval == 0:
                 response = request.create_response(False, self.dist.rank)

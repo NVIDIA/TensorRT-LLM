@@ -1324,9 +1324,10 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
     def test_auto_dtype_with_helix(self, comms_medium, cuda_graph_config,
                                    gen_pp, gen_tp, gen_cp, enable_attention_dp):
         use_nccl_for_alltoall = comms_medium == "nccl"
+        fifo_version = 2
         gen_ep = gen_tp * gen_cp
         kv_cache_config = {
-            "free_gpu_memory_fraction": 0.7,
+            "free_gpu_memory_fraction": 0.5,
             "enable_block_reuse": False,
             "enable_partial_reuse": False,
             "tokens_per_block": 32,
@@ -1336,7 +1337,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
             "pipeline_parallel_size": 1,
             "tensor_parallel_size": 4,
             "context_parallel_size": 1,
-            "moe_expert_parallel_size": 4,
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
             "enable_chunked_prefill": False,
@@ -1349,9 +1349,6 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                 "backend": "TRTLLM",
                 "max_num_tokens": 16384,
             },
-            "max_batch_size": 24,
-            "enable_attention_dp": False,
-            "enable_autotuner": False,
         }
         gen_server_config = {
             "tensor_parallel_size": gen_tp,
@@ -1362,6 +1359,7 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                 "cp_type": "HELIX",
                 "tokens_per_block": 32,
                 "use_nccl_for_alltoall": use_nccl_for_alltoall,
+                "fifo_version": fifo_version,
             },
             "disable_overlap_scheduler": True,
             "kv_cache_config": kv_cache_config,
@@ -1375,10 +1373,7 @@ class TestDeepSeekV32Exp(LlmapiAccuracyTestHarness):
                 "backend": "TRTLLM",
                 "max_num_tokens": 16384,
             },
-            "max_batch_size": 128,
-            "max_num_tokens": 128,
             "enable_attention_dp": enable_attention_dp,
-            "enable_autotuner": False,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
