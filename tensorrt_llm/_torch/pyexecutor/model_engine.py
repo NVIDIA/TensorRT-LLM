@@ -355,6 +355,7 @@ class PyTorchModelEngine(ModelEngine):
         else:
             self.without_logits = False
             self.max_draft_len = 0
+            self.runtime_draft_len = 0
             self.max_total_draft_tokens = 0
 
         self.guided_decoder: Optional[CapturableGuidedDecoder] = None
