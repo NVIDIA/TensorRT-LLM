@@ -26,7 +26,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
-from tensorrt_llm.bench.benchmark.utils.energy_monitor import EnergyMonitor
+from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -174,10 +174,10 @@ class OpenAIServer:
                 try:
                     world_size = self.generator.args.parallel_config.world_size
                     self.energy_monitor = EnergyMonitor(world_size)
-                    self.energy_monitor.__enter__()
-                    logger.info("Started GPU energy monitoring")
+                    logger.info("Initialized GPU energy monitoring")
                 except Exception as e:
-                    logger.warning(f"Failed to start energy monitoring: {e}")
+                    logger.warning(
+                        f"Failed to initialize GPU energy monitoring: {e}")
                     self.energy_monitor = None
 
             # Start background iteration stats collector if metrics are enabled
@@ -206,9 +206,6 @@ class OpenAIServer:
                 logger.info(f"trtllm/{self.generator.llm_id} is unregistered")
             if self.disagg_cluster_worker:
                 await self.disagg_cluster_worker.deregister_worker()
-            if self.energy_monitor is not None:
-                self.energy_monitor.__exit__(None, None, None)
-                logger.info("Stopped GPU energy monitoring")
             self.generator.shutdown()
 
         self.app = FastAPI(lifespan=lifespan)
@@ -576,20 +573,18 @@ class OpenAIServer:
 
     async def get_energy_metrics(self) -> JSONResponse:
         if self.energy_monitor is None:
-            return JSONResponse(content={
-                "error": "Energy monitoring is not available"
-            },
-                                status_code=503)
+            return JSONResponse(
+                content={"error": "Energy monitoring is not available"},
+                status_code=503)
         total_energy = self.energy_monitor.get_current_energy()
         if total_energy is None:
-            return JSONResponse(content={
-                "error": "Failed to read GPU energy"
-            },
+            return JSONResponse(content={"error": "Failed to read GPU energy"},
                                 status_code=503)
-        return JSONResponse(content={
-            "total_energy_j": round(total_energy, 4),
-            "query_time": time.perf_counter(),
-        })
+        return JSONResponse(
+            content={
+                "total_energy_j": round(total_energy, 4),
+                "query_time": time.perf_counter(),
+            })
 
     async def set_steady_clock_offset(
             self, offset: Annotated[float, Body(embed=True)]) -> Response:
