@@ -20,7 +20,7 @@ from .ltx2_core.audio_vae import decode_audio
 from .ltx2_core.modality import Modality
 from .ltx2_core.patchifier import get_pixel_coords
 from .ltx2_core.types import VIDEO_SCALE_FACTORS, VideoLatentShape, VideoPixelShape
-from .pipeline_ltx2 import LTX2Pipeline
+from .pipeline_ltx2 import LTX2Pipeline, _assert_resolution
 
 STAGE_2_DISTILLED_SIGMA_VALUES = [0.909375, 0.725, 0.421875, 0.0]
 
@@ -67,6 +67,8 @@ class LTX2TwoStagesPipeline(LTX2Pipeline):
                  denoising steps with the distilled sigma schedule,
                  then decode.
         """
+        if image is not None:
+            _assert_resolution(height, width, is_two_stage=True)
         pipeline_start = time.time()
         height_s1 = height // 2
         width_s1 = width // 2

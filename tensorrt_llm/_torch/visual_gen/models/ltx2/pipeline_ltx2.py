@@ -68,6 +68,23 @@ from .ltx2_core.video_vae import (
 )
 from .transformer_ltx2 import LTXModel, LTXModelType
 
+
+def _assert_resolution(height: int, width: int, *, is_two_stage: bool) -> None:
+    """Validate that height/width are divisible by the VAE spatial scale factor.
+
+    Two-stage pipelines run stage 1 at half resolution, so the full resolution
+    must be divisible by 64 (32 * 2).  One-stage pipelines require divisibility
+    by 32.
+    """
+    divisor = 64 if is_two_stage else 32
+    if height % divisor != 0 or width % divisor != 0:
+        raise ValueError(
+            f"Resolution ({height}x{width}) is not divisible by {divisor}. "
+            f"For {'two-stage' if is_two_stage else 'one-stage'} pipelines, "
+            f"height and width must be multiples of {divisor}."
+        )
+
+
 # TeaCache polynomial coefficients for LTX-2.
 # Calibrated from the LTX-Video model family (see TeaCache paper).
 # Maps raw embedding L1 distances to rescaled distances for cache decisions.
@@ -871,6 +888,8 @@ class LTX2Pipeline(BasePipeline):
             image_cond_strength: Conditioning strength for the image
                 (``1.0`` = fully conditioned first frame).
         """
+        if image is not None:
+            _assert_resolution(height, width, is_two_stage=False)
         pipeline_start = time.time()
         generator = torch.Generator(device=self.device).manual_seed(seed)
 

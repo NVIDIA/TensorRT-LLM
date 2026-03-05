@@ -89,7 +89,7 @@ class LTX2Attention(Attention):
         # Store before super().__init__() — _init_qkv_proj needs _context_dim
         self._context_dim = context_dim if context_dim is not None else query_dim
         self.rope_type = rope_type
-        self._is_cross_attn = (self._context_dim != query_dim)
+        self._is_cross_attn = context_dim is not None
 
         super().__init__(
             hidden_size=query_dim,
@@ -127,6 +127,10 @@ class LTX2Attention(Attention):
 
             if backend_name != self.attn_backend or ulysses_size > 1:
                 self.attn_backend = backend_name
+                # Base class registered a VanillaAttention (nn.Module) for
+                # SEPARATE_QKV.  De-register it before replacing with a
+                # backend that may not be an nn.Module (e.g. TrtllmAttention).
+                self._modules.pop("attn", None)
                 self.attn = create_attention(
                     backend=backend_name,
                     layer_idx=self.layer_idx,
