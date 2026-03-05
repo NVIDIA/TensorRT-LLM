@@ -94,7 +94,7 @@ def _create_small_vae(device):
     """Create a small AutoencoderKLWan with random weights for testing.
 
     Config: base_dim=32, z_dim=4, 2 resolution levels, 1 res block,
-    attention at scale 1.0, no temporal downsampling.
+    no attention, no temporal downsampling.
     Spatial compression = 2x (one downsample/upsample).
     """
     vae = (
@@ -103,7 +103,7 @@ def _create_small_vae(device):
             z_dim=4,
             dim_mult=[1, 2],
             num_res_blocks=1,
-            attn_scales=[1.0],
+            attn_scales=[],
             temperal_downsample=[False],
         )
         .to(device)

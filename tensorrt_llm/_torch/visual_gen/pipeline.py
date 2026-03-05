@@ -12,7 +12,7 @@ from tensorrt_llm.mapping import Mapping
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
 from .modules.parallel_vae import BaseParallelVAEAdapter
-from .parallelism import setup_vae_parallelism
+from .parallelism import setup_parallel_vae
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -184,7 +184,7 @@ class BasePipeline(nn.Module):
         self.cache_backend.enable(model)
 
     def setup_parallel_vae(self):
-        if self.model_config.parallel.disable_parallel_vae:
+        if not self.model_config.parallel.enable_parallel_vae:
             return
         if not dist.is_initialized() or dist.get_world_size() <= 1:
             return
@@ -193,10 +193,13 @@ class BasePipeline(nn.Module):
 
         adapter_cls = self.vae_adapter_class
         if adapter_cls is None:
-            logger.warning(f"Parallel VAE not supported for {self.__class__.__name__}")
+            logger.warning(
+                f"Parallel VAE not supported for {self.__class__.__name__}. "
+                "Implement vae_adapter_class in your pipeline to enable parallel VAE."
+            )
             return
 
-        vae_rank, vae_world_size, adj_groups = setup_vae_parallelism(self.model_config)
+        vae_rank, vae_world_size, adj_groups = setup_parallel_vae(self.model_config)
         adapter_cls(
             self.vae,
             self.model_config.parallel.parallel_vae_split_dim,

@@ -100,7 +100,7 @@ def setup_sequence_parallelism(
     return True, ulysses_size, ulysses_pg, ulysses_rank
 
 
-def setup_vae_parallelism(
+def setup_parallel_vae(
     model_config: DiffusionModelConfig,
 ) -> Tuple[int, int, List[dist.ProcessGroup]]:
     """Create process groups for parallel VAE decoding.

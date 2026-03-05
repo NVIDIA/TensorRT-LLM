@@ -327,7 +327,9 @@ class ParallelVaeAttentionBlock(torch.nn.Module):
         dist.all_gather(gathered_tensors, hidden_states.contiguous())
         combined_tensor = torch.cat(gathered_tensors, dim=self.chunk_dim)
 
-        forward_output = self.module(combined_tensor, *args, **kwargs)
+        # Not passing additional args/kwargs to the module since it's not expected to be used.
+        # Revisit this if we need to pass additional args/kwargs.
+        forward_output = self.module(combined_tensor)
 
         chunk_sizes = [t.size(self.chunk_dim) for t in gathered_tensors]
 

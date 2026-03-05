@@ -85,7 +85,7 @@ class ParallelConfig(BaseModel):
            GPU 4-7: CFG group 1 (negative), Ulysses parallel
     """
 
-    disable_parallel_vae: bool = False
+    enable_parallel_vae: bool = True
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism

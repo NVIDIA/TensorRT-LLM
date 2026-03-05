@@ -181,7 +181,7 @@ def main():
         "parallel": {
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
-            "disable_parallel_vae": args.disable_parallel_vae,
+            "enable_parallel_vae": not args.disable_parallel_vae,
         },
         "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,

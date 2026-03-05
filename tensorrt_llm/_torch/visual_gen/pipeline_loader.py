@@ -203,7 +203,7 @@ class PipelineLoader:
         # =====================================================================
         pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
 
-        if not config.parallel.disable_parallel_vae:
+        if config.parallel.enable_parallel_vae:
             pipeline.setup_parallel_vae()
 
         # =====================================================================
