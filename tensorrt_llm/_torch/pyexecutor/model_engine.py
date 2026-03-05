@@ -945,8 +945,8 @@ class PyTorchModelEngine(ModelEngine):
                         batch, draft_len > 0, resource_manager)
                     self.runtime_draft_len = draft_len
                     self.forward(batch,
-                                    new_tensors_device=None,
-                                    resource_manager=resource_manager)
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
                     torch.cuda.synchronize()
         # Set the value back to the original value after cuda graph warmups are complete
         self.enable_spec_decode = self.is_spec_decode
