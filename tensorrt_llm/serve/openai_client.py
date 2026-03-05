@@ -1,4 +1,4 @@
-# Copyright (c) 2025, NVIDIA CORPORATION.
+# Copyright (c) 2026, NVIDIA CORPORATION.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -121,9 +121,7 @@ class OpenAIHttpClient(OpenAIClient):
         if server is None:
             server, _ = await self._router.get_next_server(request)
         url = f"http://{server}/{endpoint}"
-        logger.debug(
-            f"Sending {self._role} request {request.disaggregated_params.ctx_request_id} to {url}"
-        )
+        logger.debug(f"Sending {self._role} request {request.disaggregated_params} to {url}")
         try:
             self._metrics_collector.total_requests.inc()
             resp_generator = self._post_with_retry(server, url, request, hooks)
@@ -282,7 +280,12 @@ class OpenAIHttpClient(OpenAIClient):
         await self._session.close()
 
     async def check_ready(self) -> Tuple[List[str], List[str]]:
-        return await OpenAIHttpClient.check_ready_for_servers(self._session, self._router.servers)
+        ready_servers, unready_servers = await OpenAIHttpClient.check_ready_for_servers(
+            self._session, self._router.servers
+        )
+        if ready_servers:
+            await self._router.prepare_servers(ready_servers)
+        return ready_servers, unready_servers
 
     @staticmethod
     async def check_ready_for_servers(

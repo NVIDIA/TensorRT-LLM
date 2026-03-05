@@ -83,9 +83,15 @@ class OpenAIDisaggregatedService(OpenAIService):
             case "generation_first":
                 self._send_disagg_request = self._send_disagg_request_gen_first
                 self._schedule_style = DisaggScheduleStyle.GENERATION_FIRST
+                logger.info(
+                    f"Using generation first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
             case _:
                 self._send_disagg_request = self._send_disagg_request_ctx_first
                 self._schedule_style = DisaggScheduleStyle.CONTEXT_FIRST
+                logger.info(
+                    f"Using context first disagg schedule style, schedule_style: {self._config.schedule_style}"
+                )
 
     async def openai_completion(
         self, request: UCompletionRequest, hooks: Optional[ResponseHooks] = None
@@ -161,11 +167,12 @@ class OpenAIDisaggregatedService(OpenAIService):
         ctx_request = request.model_copy(
             update={
                 "disaggregated_params": DisaggregatedParams(
-                    request_type="context_only", disagg_request_id=disagg_request_id
+                    request_type="context_only",
+                    disagg_request_id=disagg_request_id,
+                    schedule_style=self._schedule_style,
                 ),
                 "stream": False,
                 "stream_options": None,
-                "schedule_style": self._schedule_style,
             }
         )
         return ctx_request
@@ -180,6 +187,7 @@ class OpenAIDisaggregatedService(OpenAIService):
         if ctx_response:
             request.disaggregated_params = ctx_response.choices[0].disaggregated_params
             request.disaggregated_params.request_type = "generation_only"
+            request.disaggregated_params.schedule_style = self._schedule_style
             # Replace the string prompt with prompt_tokens_ids
             if isinstance(request, CompletionRequest):
                 request.prompt = ctx_response.prompt_token_ids

@@ -8,6 +8,7 @@ import torch
 import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
+from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
@@ -15,6 +16,7 @@ from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
 from tensorrt_llm.bindings import LlmRequestState
 from tensorrt_llm.bindings.executor import ContextPhaseParams
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
 from tensorrt_llm.llmapi.llm_args import CacheTransceiverConfig
 from tensorrt_llm.mapping import Mapping
 
@@ -54,11 +56,20 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.device_id = torch.cuda.current_device()
         logger.info(f"device_id: {self.device_id} in PyNativeCacheTransceiver")
 
+        # Aux payload carries first-gen and draft tokens in generation-first flow.
+        self.aux_buffer = AuxBuffer(
+            max_slot_num=max(1, int(self.kv_cache_manager.max_batch_size)),
+            beam_width=max(1, int(getattr(self.kv_cache_manager, "max_beam_width", 1))),
+            max_draft_len=max(0, int(getattr(self.kv_cache_manager, "max_draft_len", 0))),
+            device="cpu",
+        )
+
         self.transfer_worker = TransferWorker(
             kv_cache_manager=kv_cache_manager,
             mapping=mapping,
             device_id=self.device_id,
             instance_name=instance_name,
+            aux_buffer=self.aux_buffer,
         )
 
         self.context_info_endpoint = None
@@ -88,7 +99,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             endpoints=ctx_server_endpoints, layer_num_per_pp=layer_num_per_pp
         )
 
-        logger.info(f" transfer worker  ctx_server_endpoints: {ctx_server_endpoints}")
+        logger.info(f"transfer worker  ctx_server_endpoints: {ctx_server_endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self.context_info_endpoint: {self.context_info_endpoint}")
         self.send_sessions = {}  # request_id to send_session
@@ -102,12 +113,27 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
         return KVSlice(is_last_slice=True, block_ids=block_ids)
 
+    @staticmethod
+    def _need_aux_transfer(req: LlmRequest) -> bool:
+        params = req.py_disaggregated_params
+        return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+
     def respond_and_send_async(self, req: LlmRequest):
+        if req.request_id not in self.send_sessions:
+            send_session = self.transfer_worker.create_tx_session(req)
+            self.send_sessions[req.request_id] = send_session
+        else:
+            send_session = self.send_sessions[req.request_id]
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        send_session = self.transfer_worker.create_tx_session(req)
-        self.send_sessions[req.request_id] = send_session
         kv_slice = self._create_kv_slice(req)
         send_task_id = send_session.send(kv_slice)
+        if self._need_aux_transfer(req):
+            send_session.send_aux()
+        if (
+            req.py_disaggregated_params
+            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        ):
+            send_session.dispatch_req()
         self.send_task_ids[req.request_id] = send_task_id
 
         req.context_phase_params = ContextPhaseParams(
@@ -133,7 +159,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         recv_task_id = recv_session.receive(kv_slice)
         self.recv_task_ids[req.request_id] = recv_task_id
         self.recv_req_id_to_request[req.request_id] = req
-        return
 
     def check_context_transfer_status(self, at_least_request_num: int, mark_complete: bool = False):
         block_all = at_least_request_num is None
@@ -148,6 +173,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif session.state.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
+
         if self.ctx_need_tp_sync:
             sync_request_ids = self.dist.tp_allgather(local_sync_request_ids)
         else:
@@ -188,8 +214,10 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                     f"Request {request_id} timed out waiting for context KV cache transfer after",
                     f"{self.sender_future_timeout_ms} milliseconds.",
                 )
-            except Exception:
+            except Exception as e:
                 failed_request_ids.append(request_id)
+                logger.error(f"Request {request_id} failed with exception: {e}")
+
         for request_id in completed_request_ids + failed_request_ids:
             if request_id in completed_request_ids:
                 if mark_complete:
@@ -213,11 +241,20 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
-            if session.state.status == SessionStatus.TRANSFERRED:
+            req = self.recv_req_id_to_request[request_id]
+            need_aux_transfer = self._need_aux_transfer(req)
+            session_status = session.state.status
+            if need_aux_transfer:
+                if session_status == SessionStatus.AUX_TRANSFERRED:
+                    local_completed_request_ids.append(request_id)
+                elif session_status == SessionStatus.ERROR:
+                    local_failed_request_ids.append(request_id)
+            elif session_status == SessionStatus.TRANSFERRED:
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == SessionStatus.ERROR:
+            elif session_status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
+
         if self.gen_need_sync:
             sync_request_ids = self.gen_sync_allgather_fun(local_sync_request_ids)
         else:
@@ -246,17 +283,15 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         completed_request_ids = []
         failed_request_ids = []
         for request_id in to_complete_request_ids:
-            future = self.recv_sessions[request_id]._kv_tasks[self.recv_task_ids[request_id]].future
-            try:
-                sync_status = future.result()
-                if sync_status == "SUCCESS":
-                    completed_request_ids.append(request_id)
-                else:
-                    failed_request_ids.append(request_id)
-            except Exception:
+            recv_task_id = self.recv_task_ids[request_id]
+            recv_session = self.recv_sessions[request_id]
+            req = self.recv_req_id_to_request[request_id]
+            if recv_session.wait_complete(recv_task_id, wait_aux=self._need_aux_transfer(req)):
+                completed_request_ids.append(request_id)
+            else:
                 failed_request_ids.append(request_id)
+
         for request_id in completed_request_ids + failed_request_ids:
-            future = self.recv_sessions[request_id]._kv_tasks[self.recv_task_ids[request_id]].future
             if request_id in completed_request_ids:
                 self.recv_req_id_to_request[
                     request_id
@@ -278,10 +313,36 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         # self.transfer_worker.cancel_request(req)
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
-        raise NotImplementedError("get_disaggregated_params is not implemented")
+        # Keep this aligned with fields populated in respond_and_send_async().
+        # These values are server-level metadata used to seed generation-first
+        # requests before context-phase response data arrives.
+        return {
+            "ctx_dp_rank": self.dp_rank,
+            "ctx_info_endpoint": self.context_info_endpoint,
+        }
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        raise NotImplementedError("prepare_context_requests is not implemented")
+        # Create session for new generation-first requests
+        # Context request may arrive before or after the kvcache request.
+        # If peer request data is available, the context request should be set to CONTEXT_INIT.
+        # Otherwise, the context request should be set to DISAGG_CONTEXT_TRANS_IN_PROGRESS.
+        for req in requests:
+            if req.request_id not in self.send_sessions:
+                send_session = self.transfer_worker.create_tx_session(req)
+                self.send_sessions[req.request_id] = send_session
+                req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+            else:
+                send_session = self.send_sessions[req.request_id]
+            # If kv ReqInfo arrives before the context request, the session is incomplete,
+            # set the request to the session
+            if send_session.request is None:
+                send_session.set_request(req)
+            # When the session is ready, set the context request state to CONTEXT_INIT to allow scheduler to it
+            if (
+                send_session.state.status == SessionStatus.READY
+                and req.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+            ):
+                req.state = LlmRequestState.CONTEXT_INIT
 
     def _check_compatible(self):
         if self.mapping.cp_size != 1:

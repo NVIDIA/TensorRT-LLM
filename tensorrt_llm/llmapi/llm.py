@@ -150,7 +150,7 @@ class BaseLLM:
         self._executor_cls = kwargs.pop("executor_cls", GenerationExecutor)
         self._orchestrator_type = kwargs.get("orchestrator_type", None)
         self._llm_id = None
-        self._disaggregated_params = {}
+        self._disaggregated_params = None
 
         log_level = logger.level
         logger.set_level("info")  # force display the backend

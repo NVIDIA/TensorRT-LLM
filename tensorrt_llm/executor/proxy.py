@@ -387,6 +387,19 @@ class GenerationExecutorProxy(GenerationExecutor):
         stats = self.rpc_client.fetch_stats_wait_async(timeout=timeout).remote()
         return [json.loads(s) if isinstance(s, str) else s for s in stats]
 
+    def get_disaggregated_params(self) -> dict:
+        """Get disaggregated params from worker runtime via RPC."""
+        if self.rpc_client is None:
+            logger.warning(
+                "RPC client not initialized, cannot get disaggregated params")
+            return {}
+        try:
+            params = self.rpc_client.get_disaggregated_params().remote()
+            return params if isinstance(params, dict) else {}
+        except Exception as e:
+            logger.warning(f"Error fetching disaggregated params via RPC: {e}")
+            return {}
+
     def aget_stats(self, timeout: float) -> IterationResult:
         """Get iteration statistics from the runtime via RPC (async).
 
