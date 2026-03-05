@@ -1584,9 +1584,10 @@ class NVFP4LinearMethod(LinearMethodBase):
 
         # Interleave in 64-row groups (only the first n rows)
         ws_top = ws_swapped[:n]  # [n, sf_k]
-        ws_top_interleaved = ws_top.view(
-            2, n // (group_size * 2), group_size,
-            sf_k).transpose(0, 1).contiguous().view(n, sf_k)
+        ws_top_interleaved = ws_top.view(2, n // (group_size * 2), group_size,
+                                         sf_k).transpose(0,
+                                                         1).contiguous().view(
+                                                             n, sf_k)
         ws_swapped[:n] = ws_top_interleaved
 
         # Re-swizzle to 1D

@@ -156,8 +156,7 @@ class GatedMLP(nn.Module):
         - gate_up_proj uses NVFP4 quantization
         - gate_up_proj has no bias (bias not supported in fused kernel)
         """
-        return (self.use_cute_dsl_blockscaling_mm
-                and self.activation == F.silu
+        return (self.use_cute_dsl_blockscaling_mm and self.activation == F.silu
                 and self.gate_up_proj.has_nvfp4
                 and not self.gate_up_proj.has_bias)
 
@@ -195,8 +194,7 @@ class GatedMLP(nn.Module):
 
         # Handle multi-dimensional inputs (e.g., 3D: batch, seq, hidden)
         original_shape = None
-        if not isinstance(x,
-                          (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
+        if not isinstance(x, (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
             original_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
 
@@ -240,8 +238,7 @@ class GatedMLP(nn.Module):
 
         # Handle multi-dimensional inputs
         original_shape = None
-        if not isinstance(x,
-                          (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
+        if not isinstance(x, (tuple, Fp4QuantizedTensor)) and x.dim() > 2:
             original_shape = x.shape
             x = x.reshape(-1, x.shape[-1])
 
@@ -257,8 +254,7 @@ class GatedMLP(nn.Module):
             global_sf)
 
         if original_shape is not None:
-            fp4_out = fp4_out.reshape(*original_shape[:-1],
-                                      fp4_out.shape[-1])
+            fp4_out = fp4_out.reshape(*original_shape[:-1], fp4_out.shape[-1])
 
         return Fp4QuantizedTensor(fp4_out, out_sf)
 
@@ -279,7 +275,8 @@ class GatedMLP(nn.Module):
             if isinstance(x, (tuple, Fp4QuantizedTensor)):
                 m = x[0].shape[0] if isinstance(x, tuple) else x.shape[0]
             else:
-                m = x.reshape(-1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
+                m = x.reshape(
+                    -1, x.shape[-1]).shape[0] if x.dim() > 2 else x.shape[0]
             if m >= GatedMLP._FP4OUT_MIN_M:
                 h2 = self._fused_gate_up_swiglu_fp4out(x)
             else:

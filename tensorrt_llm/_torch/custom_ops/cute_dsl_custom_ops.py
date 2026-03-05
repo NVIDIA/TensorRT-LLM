@@ -824,9 +824,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             distributed_tuning_strategy=DistributedTuningStrategy.PARALLEL,
         )
 
-        def __init__(self,
-                     output_dtype: torch.dtype,
-                     use_tvm_ffi: bool = True):
+        def __init__(self, output_dtype: torch.dtype, use_tvm_ffi: bool = True):
             super().__init__()
 
             if output_dtype != torch.bfloat16:
@@ -1361,13 +1359,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             if a_sf_tensor.numel() != expected_a_sf_size:
                 raise ValueError(
                     f"CuteDSL SwiGLU FP4Out: act scale factor size mismatch. "
-                    f"Expected {expected_a_sf_size}, got {a_sf_tensor.numel()}"
-                )
+                    f"Expected {expected_a_sf_size}, got {a_sf_tensor.numel()}")
             if b_sf_tensor.numel() != expected_b_sf_size:
                 raise ValueError(
                     f"CuteDSL SwiGLU FP4Out: weight scale factor size mismatch. "
-                    f"Expected {expected_b_sf_size}, got {b_sf_tensor.numel()}"
-                )
+                    f"Expected {expected_b_sf_size}, got {b_sf_tensor.numel()}")
 
             a_sf_tensor = a_sf_tensor.reshape(sf_m * sf_k)
             b_sf_tensor = b_sf_tensor.reshape(sf_n * sf_k)
