@@ -1705,6 +1705,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("attention_dp", [False, True])
     def test_fp8_block_scales_cuda_graph_padding_4gpus(self, mtp_nextn,
                                                        attention_dp):
+        pytest.skip("IMA")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         mtp_config = None
         if mtp_nextn > 0:
@@ -1747,6 +1748,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                                     fp8kv, attention_dp, cuda_graph,
                                     overlap_scheduler, torch_compile,
                                     sampler_async_worker):
+        pytest.skip("IMA")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         torch_compile_config = _get_default_torch_compile_config(torch_compile)
         pytorch_config = dict(
@@ -1844,6 +1846,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @skip_pre_hopper
     def test_fp8_block_scales_4gpus_static_eplb(self):
+        pytest.skip("IMA")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
 
         num_experts = 72

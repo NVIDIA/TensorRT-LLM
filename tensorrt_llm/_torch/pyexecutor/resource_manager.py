@@ -2413,6 +2413,9 @@ class KVCacheManagerV2(BaseResourceManager):
                                                  memoryview(buffer.numpy()))
         return kv_cache
 
+    def reset_reuse_state(self):
+        self.impl.clear_reusable_blocks()
+
 
 class SlotManager:
 
