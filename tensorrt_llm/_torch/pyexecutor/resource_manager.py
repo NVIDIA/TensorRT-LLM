@@ -582,21 +582,34 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
+            context_batch = scheduled_batch.context_requests
+            generation_batch = scheduled_batch.generation_requests
+
+            # Cache instance attributes as locals for hot loops
+            impl = self.impl
+            mapping = self.mapping
+            kv_connector_manager = self.kv_connector_manager
+
             # wait for all pending work to finish before launching offload/onboarding/partial copy
-            self.impl.sync_transfer_manager_with_buffer_manager()
+            impl.sync_transfer_manager_with_buffer_manager()
+
+            # Hoist loop-invariant checks
+            cp_config = mapping.cp_config
+            is_cp_star = 'cp_type' in cp_config and CpType.STAR == cp_config[
+                'cp_type']
+            num_extra_kv_tokens = self.num_extra_kv_tokens
 
             # allocate KV Cache
-            for req in scheduled_batch.context_requests:
+            for req in context_batch:
                 req_beam_width = req.sampling_config.beam_width
-                if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
-                        'cp_type']:
+                if is_cp_star:
                     if req.ctx_iters == 0:
                         seq_len = sum(
                             len(ctx_block) for ctx_block in req.ctx_blocks)
-                        self.impl.add_sequence(
+                        impl.add_sequence(
                             req.py_request_id,
-                            seq_len + (len(req.query_id) if self.mapping.cp_rank
-                                       == self.mapping.cp_size - 1 else 0),
+                            seq_len + (len(req.query_id) if mapping.cp_rank
+                                       == mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
                     # Chunked prefill may schedule the same request across multiple
@@ -604,39 +617,53 @@ class KVCacheManager(BaseResourceManager):
                     if not req.is_first_context_chunk:
                         continue
 
-                    if self.impl.add_sequence(req.py_request_id, req.prompt_len,
-                                              req_beam_width, req):
-                        for _ in range(self.num_extra_kv_tokens):
-                            self.impl.add_token(req.py_request_id)
-                        for _ in range(get_draft_token_length(req)):
-                            self.impl.add_token(req.py_request_id)
+                    if impl.add_sequence(req.py_request_id, req.prompt_len,
+                                         req_beam_width, req):
+                        for _ in range(num_extra_kv_tokens):
+                            impl.add_token(req.py_request_id)
+                        draft_tokens = req.py_draft_tokens
+                        if draft_tokens:
+                            for _ in range(len(draft_tokens)):
+                                impl.add_token(req.py_request_id)
 
-                        if self.kv_connector_manager is not None:
+                        if kv_connector_manager is not None:
                             block_ids = self.get_cache_indices(req)
-                            self.kv_connector_manager.update_state_after_alloc(
+                            kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
             # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
             scheduled_batch.reset_context_requests()
 
-            for req in scheduled_batch.generation_requests:
-                if self.mapping.has_cp_helix():
+            if mapping.has_cp_helix():
+                tokens_per_block = self.tokens_per_block
+                cp_size = mapping.cp_size
+                cp_rank = mapping.cp_rank
+                for req in generation_batch:
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -
-                                       1) // self.tokens_per_block
-                    if decode_block_id % self.mapping.cp_size == self.mapping.cp_rank:
+                                       1) // tokens_per_block
+                    if decode_block_id % cp_size == cp_rank:
                         req.py_helix_is_inactive_rank = False
                         req.seqlen_this_rank_cp += 1
                     else:
                         req.py_helix_is_inactive_rank = True
                         # Skip allocating KV cache at decode for inactive helix ranks.
                         continue
-                self.impl.add_token(req.py_request_id)
-                for _ in range(get_draft_token_length(req)):
-                    self.impl.add_token(req.py_request_id)
+                    impl.add_token(req.py_request_id)
+                    draft_tokens = req.py_draft_tokens
+                    if draft_tokens:
+                        for _ in range(len(draft_tokens)):
+                            impl.add_token(req.py_request_id)
+            else:
+                for req in generation_batch:
+                    impl.add_token(req.py_request_id)
+                    draft_tokens = req.py_draft_tokens
+                    if draft_tokens:
+                        for _ in range(len(draft_tokens)):
+                            impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
-            self.impl.refresh_blocks()
+            impl.refresh_blocks()
 
     def add_dummy_requests(
         self,
