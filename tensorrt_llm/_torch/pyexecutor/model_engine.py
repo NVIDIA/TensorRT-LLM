@@ -3,7 +3,6 @@ import contextlib
 import functools
 import gc
 import inspect
-import itertools
 import math
 import os
 import weakref
@@ -3472,9 +3471,7 @@ class PyTorchModelEngine(ModelEngine):
                 else:
                     sa_manager = getattr(spec_rm, 'sa_manager', None)
             if sa_manager is not None:
-                for request in itertools.chain(
-                        scheduled_requests.context_requests,
-                        scheduled_requests.generation_requests):
+                for request in scheduled_requests.all_requests():
                     if request.py_request_id not in sa_manager._initialized_requests:
                         sa_manager.add_request(request.py_request_id,
                                                request.get_tokens(0))
