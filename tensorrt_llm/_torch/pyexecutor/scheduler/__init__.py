@@ -38,6 +38,7 @@ from .scheduler import (
     SimpleScheduler,
     SimpleUnifiedScheduler,
 )
+from .scheduler_v2 import KVCacheV2Scheduler
 
 # Re-export from waiting_queue.py
 from .waiting_queue import FCFSWaitingQueue, WaitingQueue, create_waiting_queue
@@ -48,6 +49,7 @@ __all__ = [
     "BindMicroBatchScheduler",
     "CapacityScheduler",
     "KVCacheV2DummyScheduler",
+    "KVCacheV2Scheduler",
     "MicroBatchScheduler",
     "PyCapacityScheduler",
     "PyMicroBatchScheduler",
