@@ -252,6 +252,33 @@ class BMMDynamicModel(nn.Module):
         return torch.bmm(x, dynamic_weights)
 
 
+def assert_rmse_close(
+    actual: torch.Tensor,
+    expected: torch.Tensor,
+    rmse_ratio_tol: float,
+    msg: str = "",
+) -> None:
+    """Assert that the RMSE between two tensors is small relative to the reference signal.
+
+    Computes: rmse(actual - expected) / rmse(expected)
+    This is more robust than per-element rtol/atol checks since a few outlier
+    elements won't fail the test if the overall signal is faithfully reproduced.
+
+    Recommended tolerances for bfloat16 custom-op equivalence tests:
+        - Attention (fused MLA + RoPE de-interleaving): 0.10
+        - Decoder layer / MoE layer / full model:      0.05
+        - MoE block (fused routing):                   0.02
+    """
+    diff = actual.float() - expected.float()
+    rmse_diff = torch.sqrt(torch.mean(diff**2))
+    rmse_ref = torch.sqrt(torch.mean(expected.float() ** 2))
+    ratio = (rmse_diff / rmse_ref).item()
+    assert ratio < rmse_ratio_tol, (
+        f"{msg}RMSE ratio {ratio:.6f} exceeds tolerance {rmse_ratio_tol}. "
+        f"(rmse_diff={rmse_diff.item():.6f}, rmse_ref={rmse_ref.item():.6f})"
+    )
+
+
 FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 
 
