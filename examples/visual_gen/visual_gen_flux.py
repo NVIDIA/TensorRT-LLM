@@ -27,10 +27,10 @@ Batch mode (generates multiple images from a prompts file):
         --prompts_file prompts.txt --output_dir results/fp8/ \
         --linear_type trtllm-fp8-per-tensor
 
-    # Multi-GPU with CFG + Ulysses parallelism
+    # Multi-GPU with Ulysses parallelism
     python visual_gen_flux.py --model_path black-forest-labs/FLUX.1-dev \
         --prompts_file prompts.txt --output_dir results/ \
-        --cfg_size 2 --ulysses_size 2
+        --ulysses_size 2
 """
 
 import argparse
@@ -147,6 +147,11 @@ def parse_args():
         help="Attention backend (VANILLA: PyTorch SDPA, TRTLLM: optimized kernels). "
         "Note: TRTLLM automatically falls back to VANILLA for cross-attention.",
     )
+    parser.add_argument(
+        "--disable_fuse_qk_norm_rope",
+        action="store_true",
+        help="Disable fused DiT QK Norm + RoPE CUDA kernel (enabled by default)",
+    )
 
     # Parallelism
     parser.add_argument(
@@ -214,6 +219,7 @@ def build_diffusion_config(args):
         "revision": args.revision,
         "attention": {
             "backend": args.attention_backend,
+            "fuse_qk_norm_rope": not args.disable_fuse_qk_norm_rope,
         },
         "teacache": {
             "enable_teacache": args.enable_teacache,
