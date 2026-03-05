@@ -284,6 +284,8 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("sampler_async_worker", [True, False])
     def test_eagle3(self, overlap_scheduler, eagle3_one_model,
                     sampler_async_worker):
+        if not eagle3_one_model:
+            pytest.skip("v2 does not support two model")
         pytorch_config = dict(
             max_batch_size=
             1,  # add max_batch_size to avoid error in overlap scheduler
@@ -715,6 +717,8 @@ class TestLlama3_3_70BInstruct(LlmapiAccuracyTestHarness):
     @parametrize_with_ids("torch_compile", [False, True])
     @parametrize_with_ids("eagle3_one_model", [True, False])
     def test_fp8_eagle3_tp8(self, eagle3_one_model, torch_compile):
+        if not eagle3_one_model:
+            pytest.skip("v2 does not support two model")
         model_path = f"{llm_models_root()}/modelopt-hf-model-hub/Llama-3.3-70B-Instruct-fp8"
         eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.3-Instruct-70B"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
@@ -3097,6 +3101,7 @@ class TestGLM4_6(LlmapiAccuracyTestHarness):
         ids=["2model", "2model_trtllm"])
     def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
                                chunked_prefill, max_batch_size, moe_backend):
+        pytest.skip("v2 does not support two model")
         model_path = f"{llm_models_root()}/glm-4.6-fp4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
@@ -3202,7 +3207,7 @@ class TestGLM4_5Air(LlmapiAccuracyTestHarness):
         ids=["2model", "2model_trtllm"])
     def test_nvfp4_2_model_mtp(self, tp_size, cuda_graph, overlap_scheduler,
                                chunked_prefill, max_batch_size, moe_backend):
-
+        pytest.skip("v2 does not support two model")
         model_path = f"{llm_models_root()}/glm-4.5-air-fp4"
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70)
         pytorch_config = dict(
@@ -5038,6 +5043,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("one_model", [True, False],
                              ids=["one_model", "two_model"])
     def test_eagle3_vswa_reuse_4gpus(self, one_model, mocker):
+        if not one_model:
+            pytest.skip("v2 does not support two model")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5103,6 +5110,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("one_model", [True, False],
                              ids=["one_model", "two_model"])
     def test_eagle3_guided_decoding_4gpus(self, one_model, mocker):
+        if not one_model:
+            pytest.skip("v2 does not support two model")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
@@ -5156,6 +5165,8 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                              ids=["cutlass", "trtllm", "triton"])
     def test_eagle3_2gpus(self, moe_backend, one_model, overlap_scheduler,
                           mocker):
+        if not one_model:
+            pytest.skip("v2 does not support two model")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
