@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -1775,7 +1775,16 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
 
 [[nodiscard]] SizeType32 WindowBlockManager::getNumFreeBlocks() const noexcept
 {
-    return mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
+    auto const numFree = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
+    if (numFree > getMaxNumBlocks())
+    {
+        TLLM_LOG_WARNING(
+            "%s::getNumFreeBlocks - primary free block count (%d) exceeds total block count (%d). "
+            "This indicates a block accounting inconsistency, likely caused by block pool swaps "
+            "during offload/onboard operations. numPrimaryBlocks=%d, numSecondaryBlocks=%d",
+            mLogPrefix.c_str(), numFree, getMaxNumBlocks(), mNumPrimaryBlocks, mNumSecondaryBlocks);
+    }
+    return numFree;
 }
 
 std::deque<tle::KVCacheEvent> BlockManager::getLatestEvents(std::optional<std::chrono::milliseconds> timeout) const
