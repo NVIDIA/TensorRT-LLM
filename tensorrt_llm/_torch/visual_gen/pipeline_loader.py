@@ -232,6 +232,7 @@ class PipelineLoader:
                 marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 
         logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
+        logger.info(f"Attention backend: {config.attention.backend}")
         return pipeline
 
     def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
