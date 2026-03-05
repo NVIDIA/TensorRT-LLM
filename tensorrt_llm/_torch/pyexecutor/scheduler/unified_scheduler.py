@@ -1,0 +1,1731 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+import dataclasses
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from enum import Enum
+from typing import TYPE_CHECKING, List, Optional, Set
+
+from strenum import StrEnum
+
+from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
+from tensorrt_llm.logger import logger
+
+from ..llm_request import LlmRequest, LlmRequestState
+from ..request_utils import (
+    RequestValidator,
+    ValidationFailure,
+    balance_adp_requests,
+    check_batch_waiting,
+    check_disagg_ctx_schedulable,
+    create_adp_dummy_request,
+    get_from_waiting_queue,
+    merge_requests,
+    prepare_draft_requests,
+)
+from .adp_router import ADPRouter
+from .scheduler import RequestList, RequestScheduler, ScheduledRequests, SchedulerOutput
+from .waiting_queue import WaitingQueue
+
+if TYPE_CHECKING:
+    from ...speculative.drafter import Drafter
+
+
+class ChunkingPolicy(Enum):
+    EQUAL_PROGRESS = 1
+    FIRST_COME_FIRST_SERVED = 2
+
+
+@dataclasses.dataclass
+class ContextChunkingConfig:
+    chunking_policy: ChunkingPolicy
+    chunk_unit_size: int
+
+
+class TokenBudgetTracker:
+    """Fused capacity + microbatch token budget tracker.
+
+    Integrates token-budget checks, request type classification, context
+    chunking, and sorting into the capacity policy loop — replacing the
+    old two-pass (capacity → microbatch) pipeline with a single pass.
+
+    Provides type-specialized methods for hot paths:
+    - try_add_generation(): fast path for generation requests (no type checks)
+    - try_add_context(): fast path for context requests (no beam/gen checks)
+    - try_add(): generic path for mixed/unknown request types
+    """
+
+    __slots__ = [
+        "max_batch_size",
+        "max_num_tokens",
+        "max_context_length",
+        "_has_token_limit",
+        "ctx_chunk_config",
+        "_inflight_ids",
+        "_batch_num_tokens",
+        "_scheduled_req_size",
+        "_scheduled_beam_width",
+        "_context_requests",
+        "_generation_requests",
+        "_contexts_to_be_chunked",
+        "_num_chunked_tokens",
+        "_all_context_requests_fit",
+        "_num_fitting",
+        "batch_full",
+    ]
+
+    # Cache state values once at class level to avoid repeated .value access
+    _CONTEXT_INIT_VALUE = LlmRequestState.CONTEXT_INIT.value
+    _ENCODER_INIT_VALUE = LlmRequestState.ENCODER_INIT.value
+    _GEN_IN_PROGRESS_VALUE = LlmRequestState.GENERATION_IN_PROGRESS.value
+    _NO_SCHEDULE_UNTIL_VALUE = LlmRequestState.CONTEXT_INIT.value
+    _NO_SCHEDULE_AFTER_VALUE = LlmRequestState.GENERATION_TO_COMPLETE.value
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_num_tokens: Optional[int],
+        ctx_chunk_config: Optional[ContextChunkingConfig],
+        inflight_request_ids: object = None,
+    ):
+        self.max_batch_size = max_batch_size
+        self.max_num_tokens = max_num_tokens
+        self.max_context_length = max_num_tokens
+        self._has_token_limit = max_num_tokens is not None
+        self.ctx_chunk_config = ctx_chunk_config
+        # Accepts set[int] or C++ ReqIdsSet — only `in` operator is used.
+        self._inflight_ids = inflight_request_ids
+        self._batch_num_tokens = 0
+        self._scheduled_req_size = 0
+        self._scheduled_beam_width = 0
+        self._context_requests: RequestList = []
+        self._generation_requests: RequestList = []
+        self._contexts_to_be_chunked: RequestList = []
+        self._num_chunked_tokens = 0
+        self._all_context_requests_fit = True
+        self._num_fitting = 0
+        self.batch_full = False
+
+    def try_add(self, req: LlmRequest) -> bool:
+        """Try to add a request to the batch. Returns False if token budget exceeded."""
+        # Skip if in flight
+        if self._inflight_ids is not None and req.request_id in self._inflight_ids:
+            return True  # don't reject, just skip token accounting
+
+        # Disagg gen init requests bypass token accounting — they are
+        # classified separately by the capacity policy.
+        if req.is_disagg_generation_init_state:
+            return True
+
+        req_state_value = req.state_value
+
+        # Skip if not in schedulable state range
+        if not (
+            req_state_value >= self._NO_SCHEDULE_UNTIL_VALUE
+            and req_state_value < self._NO_SCHEDULE_AFTER_VALUE
+        ):
+            return True  # don't reject from capacity, just skip
+
+        req_num_tokens = 0
+
+        # --- Encoder ---
+        if req_state_value == self._ENCODER_INIT_VALUE:
+            req_num_tokens = req.encoder_output_len
+            if self.max_context_length is not None:
+                assert req_num_tokens <= self.max_context_length, (
+                    f"The number of encoder tokens ({req_num_tokens}) exceeds "
+                    f"the limit value ({self.max_context_length})"
+                )
+            if self._has_token_limit and (
+                self._batch_num_tokens + req_num_tokens > self.max_num_tokens
+            ):
+                return False
+            self._context_requests.append(req)
+            self._batch_num_tokens += req_num_tokens
+
+        # --- Context ---
+        elif req_state_value == self._CONTEXT_INIT_VALUE:
+            if not self.ctx_chunk_config:
+                base_tokens = req.get_num_tokens(0)
+                draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
+                req_num_tokens = base_tokens + draft_tokens
+                if self.max_context_length is not None:
+                    assert req_num_tokens <= self.max_context_length, (
+                        f"Context tokens ({req_num_tokens}) exceeds "
+                        f"limit ({self.max_context_length})"
+                    )
+                if self._has_token_limit and (
+                    self._batch_num_tokens + req_num_tokens > self.max_num_tokens
+                ):
+                    return False
+                self._context_requests.append(req)
+                self._batch_num_tokens += req_num_tokens
+            else:
+                # Chunking: tentative schedule (finalized later)
+                req.context_chunk_size = req.context_remaining_length
+                draft_tokens = (
+                    req.num_draft_tokens
+                    if (req.is_last_context_chunk and req.has_draft_tokens)
+                    else 0
+                )
+                req_num_tokens = req.context_chunk_size + draft_tokens
+                if self.max_context_length is not None:
+                    if self.max_context_length < req_num_tokens:
+                        req_num_tokens = self.max_context_length
+                        self._all_context_requests_fit = False
+                self._contexts_to_be_chunked.append(req)
+                self._num_chunked_tokens += req_num_tokens
+
+        # --- Generation ---
+        else:
+            beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
+            req_num_tokens = beam_width + req.num_draft_tokens
+            if self._has_token_limit and (
+                self._batch_num_tokens + req_num_tokens > self.max_num_tokens
+            ):
+                return False
+            # Beam width consistency
+            if self._scheduled_beam_width == 0:
+                self._scheduled_beam_width = beam_width
+            elif self._scheduled_beam_width != beam_width:
+                return True  # skip this request, don't reject from capacity
+            self._generation_requests.append(req)
+            self._batch_num_tokens += req_num_tokens
+
+        self._scheduled_req_size += 1
+        self._num_fitting += 1
+        if self._scheduled_req_size >= self.max_batch_size:
+            self.batch_full = True
+        return True
+
+    def try_add_generation(self, req: LlmRequest) -> int:
+        """Fast path for generation-in-progress requests.
+
+        Returns:
+            1: accepted, continue scheduling
+            0: rejected (token budget exceeded)
+           -1: accepted but batch is full (stop scheduling)
+        """
+        if self._inflight_ids is not None and req.request_id in self._inflight_ids:
+            return 1  # skip token accounting for inflight requests
+        beam_width = req.get_beam_width_by_iter(for_next_iteration=False)
+        req_num_tokens = beam_width + req.num_draft_tokens
+        if self._has_token_limit and (
+            self._batch_num_tokens + req_num_tokens > self.max_num_tokens
+        ):
+            return 0
+        # Beam width consistency
+        if self._scheduled_beam_width == 0:
+            self._scheduled_beam_width = beam_width
+        elif self._scheduled_beam_width != beam_width:
+            return 1  # skip, don't reject from capacity
+        self._generation_requests.append(req)
+        self._batch_num_tokens += req_num_tokens
+        self._scheduled_req_size += 1
+        self._num_fitting += 1
+        if self._scheduled_req_size >= self.max_batch_size:
+            self.batch_full = True
+            return -1
+        return 1
+
+    def try_add_context(self, req: LlmRequest) -> bool:
+        """Fast path for context-init requests.
+
+        Skips state-range, encoder, generation, and beam checks.
+        Called from the second pass of capacity policies where requests
+        are known to be context_init or disagg_generation_init.
+        """
+        if self._inflight_ids is not None and req.request_id in self._inflight_ids:
+            return True  # skip token accounting for inflight requests
+        if req.is_disagg_generation_init_state:
+            return True  # classified separately by the capacity policy
+
+        if not self.ctx_chunk_config:
+            base_tokens = req.get_num_tokens(0)
+            draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
+            req_num_tokens = base_tokens + draft_tokens
+            if self.max_context_length is not None:
+                assert req_num_tokens <= self.max_context_length, (
+                    f"Context tokens ({req_num_tokens}) exceeds limit ({self.max_context_length})"
+                )
+            if self._has_token_limit and (
+                self._batch_num_tokens + req_num_tokens > self.max_num_tokens
+            ):
+                return False
+            self._context_requests.append(req)
+            self._batch_num_tokens += req_num_tokens
+        else:
+            # Chunking: tentative schedule (finalized later)
+            req.context_chunk_size = req.context_remaining_length
+            draft_tokens = (
+                req.num_draft_tokens if (req.is_last_context_chunk and req.has_draft_tokens) else 0
+            )
+            req_num_tokens = req.context_chunk_size + draft_tokens
+            if self.max_context_length is not None:
+                if self.max_context_length < req_num_tokens:
+                    req_num_tokens = self.max_context_length
+                    self._all_context_requests_fit = False
+            self._contexts_to_be_chunked.append(req)
+            self._num_chunked_tokens += req_num_tokens
+
+        self._scheduled_req_size += 1
+        self._num_fitting += 1
+        if self._scheduled_req_size >= self.max_batch_size:
+            self.batch_full = True
+        return True
+
+    def finalize(self) -> tuple[RequestList, RequestList, int]:
+        """Apply chunking and sorting. Returns (context, generation, num_fitting)."""
+        # Verify chunking fits
+        if self._has_token_limit and self._num_chunked_tokens > (
+            self.max_num_tokens - self._batch_num_tokens
+        ):
+            self._all_context_requests_fit = False
+
+        # Apply chunking strategy
+        if not self._all_context_requests_fit and self._contexts_to_be_chunked:
+            remaining_capacity = (
+                (self.max_num_tokens - self._batch_num_tokens) if self._has_token_limit else None
+            )
+            self._set_ctx_requests_chunk_size(self._contexts_to_be_chunked, remaining_capacity)
+
+        # Finalize chunked requests
+        for req in self._contexts_to_be_chunked:
+            if req.context_chunk_size > 0:
+                self._context_requests.append(req)
+                self._batch_num_tokens += req.context_chunk_size
+
+        # Sort requests for consistency with C++
+        self._sort_requests(
+            self._context_requests, self._generation_requests, not self._all_context_requests_fit
+        )
+
+        return (self._context_requests, self._generation_requests, self._num_fitting)
+
+    # ------------------------------------------------------------------
+    # Context chunking and sorting helpers
+    # ------------------------------------------------------------------
+
+    def _sort_requests(
+        self,
+        context_requests: RequestList,
+        generation_requests: RequestList,
+        chunks_present: bool,
+    ) -> None:
+        """Sort requests by LoRA task ID. C++ reference: inflightBatchingUtils.cpp."""
+
+        def get_lora_task_id(req: LlmRequest):
+            lora_id = getattr(req, "lora_task_id", None)
+            if lora_id is None:
+                return (0, 0)
+            return (1, lora_id)
+
+        if chunks_present:
+            not_last_chunk = [r for r in context_requests if not r.is_last_context_chunk]
+            last_chunk = [r for r in context_requests if r.is_last_context_chunk]
+            not_last_chunk.sort(key=get_lora_task_id)
+            last_chunk.sort(key=get_lora_task_id)
+            context_requests.clear()
+            context_requests.extend(not_last_chunk)
+            context_requests.extend(last_chunk)
+        else:
+            context_requests.sort(key=get_lora_task_id)
+
+        generation_requests.sort(key=get_lora_task_id)
+
+    def _set_ctx_requests_chunk_size(self, requests: RequestList, capacity: Optional[int]):
+        for req in requests:
+            req.context_chunk_size = 0
+
+        policy = self.ctx_chunk_config.chunking_policy
+        unit_size = self.ctx_chunk_config.chunk_unit_size
+
+        if policy == ChunkingPolicy.EQUAL_PROGRESS:
+            self._chunk_equal_progress(requests, capacity, unit_size)
+        elif policy == ChunkingPolicy.FIRST_COME_FIRST_SERVED:
+            self._chunk_fcfs(requests, capacity, unit_size)
+        else:
+            raise ValueError(f"Invalid chunking policy: {policy}")
+
+        self._fit_draft_tokens(requests, capacity, unit_size)
+
+    def _chunk_equal_progress(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        num_ctx_tokens = 0
+        num_tokens_single_loop = 1
+
+        while (capacity is None or num_ctx_tokens < capacity) and num_tokens_single_loop > 0:
+            num_tokens_single_loop = 0
+            for req in requests:
+                past_size = req.context_chunk_size
+                suggested_size = min(past_size + unit_size, req.context_remaining_length)
+                req.context_chunk_size = suggested_size
+                actual_size = req.context_chunk_size
+                actual_increment = actual_size - past_size
+                if capacity is not None and (num_ctx_tokens + actual_increment > capacity):
+                    req.context_chunk_size = past_size
+                    continue
+                if self.max_context_length is not None and actual_size > self.max_context_length:
+                    req.context_chunk_size = past_size
+                    continue
+                num_ctx_tokens += actual_increment
+                num_tokens_single_loop += actual_increment
+
+    def _chunk_fcfs(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        current_capacity = capacity if capacity is not None else float("inf")
+
+        for req in requests:
+            suggested_size = req.context_remaining_length
+            actual_size = suggested_size
+            if current_capacity < actual_size:
+                actual_size = current_capacity
+            if self.max_context_length is not None:
+                actual_size = min(self.max_context_length, actual_size)
+            if actual_size < suggested_size:
+                actual_size = (int(actual_size) // unit_size) * unit_size
+            req.context_chunk_size = int(actual_size)
+            if capacity is not None:
+                current_capacity -= req.context_chunk_size
+
+    def _fit_draft_tokens(self, requests: RequestList, capacity: Optional[int], unit_size: int):
+        num_ctx_tokens = sum(req.context_chunk_size for req in requests)
+
+        for req in requests:
+            if req.is_last_context_chunk and req.has_draft_tokens:
+                remainder = req.context_chunk_size % unit_size
+                remaining_space = 0 if remainder == 0 else unit_size - remainder
+                if self.max_context_length is not None:
+                    remaining_context_len = self.max_context_length - req.context_chunk_size
+                    remaining_space = min(remaining_space, remaining_context_len)
+                if capacity is not None:
+                    remaining_space = min(remaining_space, capacity - num_ctx_tokens)
+                    num_ctx_tokens += remaining_space
+                draft_discard = req.num_draft_tokens - remaining_space
+                if draft_discard > 0:
+                    logger.debug(f"Discarding {draft_discard} draft tokens")
+                    if hasattr(req, "discard_draft_tokens"):
+                        req.discard_draft_tokens(draft_discard)
+
+
+class SchedulerPolicyBase(ABC):
+    """
+    Abstract base class for capacity scheduler policies.
+    Each policy implements its own scheduling logic.
+    """
+
+    @abstractmethod
+    def schedule(
+        self,
+        scheduler: "PyCapacityScheduler",
+        active_requests: RequestList,
+        token_tracker: Optional[TokenBudgetTracker] = None,
+    ) -> tuple[RequestList, RequestList, RequestList]:
+        """
+        Schedule requests according to the policy.
+
+        Args:
+            scheduler: The capacity scheduler instance (for accessing shared state)
+            active_requests: List of active requests to schedule
+            token_tracker: If provided, fuses token-budget checks into the
+                capacity loop for single-pass scheduling.
+
+        Returns:
+            Tuple of (fitting_requests, fitting_disagg_gen_init_requests,
+            paused_requests)
+        """
+        raise NotImplementedError
+
+
+class MaxRequestsPolicy(SchedulerPolicyBase):
+    """
+    MaxRequestsScheduler: Simple request count limiting without KV cache checks.
+    C++ reference: capacityScheduler.cpp:154-176
+    """
+
+    def schedule(
+        self,
+        scheduler: "PyCapacityScheduler",
+        active_requests: RequestList,
+        token_tracker: Optional[TokenBudgetTracker] = None,
+    ) -> tuple[RequestList, RequestList, RequestList]:
+        scheduled_requests: RequestList = []
+
+        for req in active_requests:
+            if not scheduler._can_be_scheduled(req):
+                continue
+
+            if len(scheduled_requests) >= scheduler.max_num_requests:
+                break
+
+            if (
+                req.is_encoder_init_state
+                or req.is_context_init_state
+                or req.is_generation_in_progress_state
+            ):
+                if token_tracker is not None:
+                    if not token_tracker.try_add(req):
+                        break
+                    if token_tracker.batch_full:
+                        scheduled_requests.append(req)
+                        break
+                scheduled_requests.append(req)
+
+        return scheduled_requests, [], []
+
+
+class GuaranteedNoEvictPolicy(SchedulerPolicyBase):
+    """
+    GuaranteedNoEvictScheduler: Reserve blocks for requests to complete without eviction.
+    C++ reference: capacityScheduler.cpp:194-331
+    """
+
+    def __init__(self, static_batch: bool = False):
+        self.static_batch = static_batch
+
+    def schedule(
+        self,
+        scheduler: "PyCapacityScheduler",
+        active_requests: RequestList,
+        token_tracker: Optional[TokenBudgetTracker] = None,
+    ) -> tuple[RequestList, RequestList, RequestList]:
+        scheduled_requests: RequestList = []
+        fitting_disagg: RequestList = []
+        has_peft = scheduler.peft_cache_manager is not None
+
+        skipping_is_relevant = scheduler._is_skipping_relevant()
+
+        newly_contributed_context_blocks: Set = set()
+        newly_contributed_cross_context_blocks: Set = set()
+        if not self.static_batch and skipping_is_relevant:
+            newly_contributed_context_blocks, newly_contributed_cross_context_blocks = (
+                scheduler._prefill_contributed_blocks(active_requests)
+            )
+
+        reserved_blocks = NoEvictScheduledBlocksManager(scheduler.kv_cache_manager)
+        reserved_cross_blocks: Optional[NoEvictScheduledBlocksManager] = None
+        if scheduler.cross_kv_cache_manager is not None:
+            reserved_cross_blocks = NoEvictScheduledBlocksManager(scheduler.cross_kv_cache_manager)
+
+        # PEFT state - only used when has_peft
+        claimed_peft_pages = 0
+        available_peft_pages = scheduler._get_max_peft_pages() if has_peft else 0
+        uniq_task_ids: Optional[set[int]] = set() if has_peft else None
+
+        pending_requests: RequestList = []
+        pending_dis_gen_init_requests: RequestList = []
+
+        # Cache hot-path locals to avoid repeated attribute/method lookups
+        _has_tracker = token_tracker is not None
+        _until = scheduler._no_schedule_until_state_value
+        _after = scheduler._no_schedule_after_state_value
+        _max_num = scheduler.max_num_requests
+        _has_cross = reserved_cross_blocks is not None
+        _gen_in_progress = scheduler._gen_in_progress_state_value
+        _sched_append = scheduled_requests.append
+        _pending_append = pending_requests.append
+        _disagg_pending_append = pending_dis_gen_init_requests.append
+        num_scheduled = 0
+
+        # First pass: process in-progress generation and classify requests.
+        # Block decrements are deferred to batch_decrement_list after the loop
+        # for a single Python→C++ call (available_blocks is not read in first pass).
+        # At this point scheduled_requests contains only generation requests
+        # (context → pending_requests, disagg → pending_dis_gen_init_requests),
+        # so we pass it directly to batch_decrement_list instead of a separate list.
+        for req in active_requests:
+            # Inlined _can_be_scheduled_with_disagg_exception
+            is_disagg = req.is_disagg_generation_init_state
+            if not is_disagg:
+                sv = req.state_value
+                if not (_until <= sv < _after):
+                    continue
+
+            if num_scheduled >= _max_num:
+                break
+
+            # sv is defined (set at line 551 on the non-disagg branch);
+            # replaces req.is_generation_in_progress_state to reuse cached state_value.
+            if not is_disagg and sv == _gen_in_progress:
+                # rc: 1=continue, 0=token budget exceeded, -1=batch full
+                rc = 1
+                if _has_tracker:
+                    rc = token_tracker.try_add_generation(req)
+                    if rc == 0:
+                        break  # token budget exceeded
+
+                _sched_append(req)
+                num_scheduled += 1
+
+                if has_peft:
+                    lora_task_id, is_new_task, peft_pages = scheduler._get_peft_task_info(
+                        req, uniq_task_ids
+                    )
+                    if is_new_task:
+                        claimed_peft_pages += peft_pages
+                        uniq_task_ids.add(lora_task_id)
+
+                if rc < 0:
+                    break  # batch full (after all bookkeeping)
+
+            elif is_disagg:
+                _disagg_pending_append(req)
+            else:
+                _pending_append(req)
+
+        # Batch-decrement blocks using C++ batch API (single boundary crossing)
+        reserved_blocks.batch_decrement_list(scheduled_requests)
+        if _has_cross:
+            reserved_cross_blocks.batch_decrement_list(scheduled_requests)
+        # Sync single-window scalar back to dict before second pass reads it
+        reserved_blocks.sync_to_dict()
+        if _has_cross:
+            reserved_cross_blocks.sync_to_dict()
+
+        # Second pass: process pending requests
+        # Skip entirely if first pass already filled the batch
+        if (_has_tracker and token_tracker.batch_full) or num_scheduled >= _max_num:
+            return scheduled_requests, fitting_disagg, []
+        if not self.static_batch or num_scheduled == 0:
+            if has_peft:
+                available_peft_pages -= claimed_peft_pages
+
+            # Disagg requests: all are disagg_generation_init — skip
+            # beneficial_to_skip (never applies) and route directly to
+            # fitting_disagg.
+            _fitting_disagg_append = fitting_disagg.append
+            for req in pending_dis_gen_init_requests:
+                if num_scheduled >= _max_num:
+                    break
+
+                if not reserved_blocks.preview_reserve(req):
+                    break
+                if _has_cross:
+                    if not reserved_cross_blocks.preview_reserve(req):
+                        break
+
+                if has_peft:
+                    lora_task_id, is_new_task, needed_peft_pages = scheduler._get_peft_task_info(
+                        req, uniq_task_ids
+                    )
+                    if needed_peft_pages > available_peft_pages:
+                        continue
+                    available_peft_pages -= needed_peft_pages
+                    if is_new_task:
+                        uniq_task_ids.add(lora_task_id)
+
+                if _has_tracker:
+                    if not token_tracker.try_add_context(req):
+                        break
+                _fitting_disagg_append(req)
+                num_scheduled += 1
+                reserved_blocks.commit_preview()
+                if _has_cross:
+                    reserved_cross_blocks.commit_preview()
+                if _has_tracker and token_tracker.batch_full:
+                    break
+
+            # Context/encoder requests: none are disagg — skip disagg
+            # checks and route directly to scheduled_requests.
+            _skip_check = not self.static_batch and skipping_is_relevant
+            for req in pending_requests:
+                if _skip_check and scheduler._beneficial_to_skip(
+                    req,
+                    newly_contributed_context_blocks,
+                    newly_contributed_cross_context_blocks,
+                ):
+                    continue
+
+                if num_scheduled >= _max_num:
+                    break
+
+                if req.is_context_init_state:
+                    if not reserved_blocks.preview_reserve(req):
+                        break
+                    if _has_cross:
+                        if not reserved_cross_blocks.preview_reserve(req):
+                            break
+
+                    if has_peft:
+                        lora_task_id, is_new_task, needed_peft_pages = (
+                            scheduler._get_peft_task_info(req, uniq_task_ids)
+                        )
+                        if needed_peft_pages > available_peft_pages:
+                            continue
+                        available_peft_pages -= needed_peft_pages
+                        if is_new_task:
+                            uniq_task_ids.add(lora_task_id)
+
+                    if _has_tracker:
+                        if not token_tracker.try_add_context(req):
+                            break
+                    _sched_append(req)
+                    num_scheduled += 1
+                    reserved_blocks.commit_preview()
+                    if _has_cross:
+                        reserved_cross_blocks.commit_preview()
+                    if _has_tracker and token_tracker.batch_full:
+                        break
+
+        return scheduled_requests, fitting_disagg, []
+
+
+class MaxUtilizationPolicy(SchedulerPolicyBase):
+    """
+    MaxUtilizationScheduler: Maximize utilization, may pause started requests.
+    C++ reference: capacityScheduler.cpp:341-425
+    """
+
+    def schedule(
+        self,
+        scheduler: "PyCapacityScheduler",
+        active_requests: RequestList,
+        token_tracker: Optional[TokenBudgetTracker] = None,
+    ) -> tuple[RequestList, RequestList, RequestList]:
+        scheduler.kv_cache_manager.start_scheduling()
+
+        skipping_is_relevant = scheduler._is_skipping_relevant()
+
+        scheduled_blocks_manager = MaxUtilizationScheduledBlocksManager(
+            scheduler.kv_cache_manager, scheduler.two_step_lookahead
+        )
+
+        num_scheduled_peft_pages = 0
+        seen_task_ids: set[int] = set()
+        _max_peft_pages = scheduler._get_max_peft_pages()
+
+        newly_contributed_context_blocks, _ = scheduler._prefill_contributed_blocks(active_requests)
+
+        # Cache hot-path locals
+        _until = scheduler._no_schedule_until_state_value
+        _after = scheduler._no_schedule_after_state_value
+        _max_num = scheduler.max_num_requests
+        _has_tracker = token_tracker is not None
+        # MaxUtilization doesn't pre-compute cross-context blocks (line 678
+        # discards the second return). Use a reusable set cleared per
+        # iteration to avoid per-call allocation while matching the C++
+        # semantics of not accumulating cross-context blocks across requests.
+        _cross_ctx_blocks: Set = set()
+
+        def is_started_request(req: LlmRequest) -> bool:
+            sv = req.state_value
+            if not (_until <= sv < _after):
+                return False
+            return (
+                req.is_context_init_state and not req.is_first_context_chunk
+            ) or req.is_generation_in_progress_state
+
+        scheduled_requests: RequestList = []
+        fitting_disagg: RequestList = []
+        paused_requests: RequestList = []
+        num_scheduled = 0
+
+        requests_list = list(active_requests)
+        req_it_end = len(requests_list)
+        req_it = 0
+
+        while req_it < req_it_end:
+            req = requests_list[req_it]
+
+            # Inlined _can_be_scheduled_with_disagg_exception
+            if not req.is_disagg_generation_init_state:
+                sv = req.state_value
+                if not (_until <= sv < _after):
+                    req_it += 1
+                    continue
+
+            _cross_ctx_blocks.clear()
+            if skipping_is_relevant and scheduler._beneficial_to_skip(
+                req, newly_contributed_context_blocks, _cross_ctx_blocks
+            ):
+                req_it += 1
+                continue
+
+            result = self._try_scheduling_request(
+                scheduler,
+                req,
+                scheduled_requests,
+                fitting_disagg,
+                scheduled_blocks_manager,
+                num_scheduled_peft_pages,
+                _max_peft_pages,
+                num_scheduled,
+                _max_num,
+                seen_task_ids,
+                token_tracker,
+            )
+
+            if result is True:
+                num_scheduled += 1
+                if _has_tracker and token_tracker.batch_full:
+                    break
+                req_it += 1
+            elif result is None:
+                # Token budget exhausted — pausing won't help, stop.
+                break
+            else:
+                # Capacity failure — try pausing an older request.
+                last_started_idx = None
+                for i in range(req_it_end - 1, req_it - 1, -1):
+                    if is_started_request(requests_list[i]):
+                        last_started_idx = i
+                        break
+
+                if last_started_idx is not None:
+                    paused_req = requests_list[last_started_idx]
+                    scheduler.kv_cache_manager.scheduling_remove_sequence(paused_req.py_request_id)
+                    paused_requests.append(paused_req)
+                    # Don't decrement num_scheduled: the paused request is at
+                    # index >= req_it (unprocessed), so it was never counted.
+                    req_it_end = last_started_idx
+                else:
+                    break
+
+        return scheduled_requests, fitting_disagg, paused_requests
+
+    def _try_scheduling_request(
+        self,
+        scheduler: "PyCapacityScheduler",
+        req: LlmRequest,
+        scheduled_requests: RequestList,
+        fitting_disagg: RequestList,
+        scheduled_blocks_manager: "MaxUtilizationScheduledBlocksManager",
+        num_scheduled_peft_pages: int,
+        max_peft_pages: int,
+        num_scheduled: int,
+        max_num_requests: int,
+        seen_task_ids: set[int],
+        token_tracker: Optional[TokenBudgetTracker] = None,
+    ) -> Optional[bool]:
+        """Try to schedule a request.
+
+        Returns:
+            True: request scheduled successfully.
+            False: capacity failure (KV blocks, PEFT, max_num_requests)
+                   — caller may pause an older request and retry.
+            None: token budget exhausted — caller should stop scheduling
+                  (pausing won't help because it doesn't free token budget).
+        """
+        if num_scheduled >= max_num_requests:
+            return False
+
+        if scheduled_blocks_manager.prepare_blocks_if_schedulable(req) is None:
+            return False
+
+        # PEFT check only when needed
+        if scheduler.peft_cache_manager is not None:
+            lora_task_id, is_new_task, num_required_peft_pages = scheduler._get_peft_task_info(
+                req, seen_task_ids
+            )
+            if num_required_peft_pages + num_scheduled_peft_pages > max_peft_pages:
+                return False
+            if is_new_task:
+                seen_task_ids.add(lora_task_id)
+
+        # Token budget check — return None (not False) so the caller
+        # does NOT enter the pause/backtrack path. Pausing frees KV
+        # blocks but not token budget, so retrying would fail again.
+        if token_tracker is not None:
+            if not token_tracker.try_add(req):
+                return None
+
+        scheduled_blocks_manager.update_scheduled_blocks()
+        if req.is_disagg_generation_init_state:
+            fitting_disagg.append(req)
+        else:
+            scheduled_requests.append(req)
+        return True
+
+
+class NoEvictScheduledBlocksManager:
+    """
+    Python equivalent of C++ kv_cache_manager::NoEvictScheduledBlocksManager.
+    Tracks available blocks per window size for GUARANTEED_NO_EVICT scheduling.
+
+    Includes single-window fast path: when only one window size exists
+    (the common case), avoids dict iteration overhead.
+
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:29-62
+    """
+
+    def __init__(self, kv_cache_manager):
+        self.kv_cache_manager = kv_cache_manager
+        stats = kv_cache_manager.get_kv_cache_stats()
+        self.available_blocks: dict[int, int] = dict(stats.num_free_blocks_per_window_size)
+        self._preview_valid = False
+        # Single-window fast path: avoid dict iteration when only one window
+        if len(self.available_blocks) == 1:
+            ws, avail = next(iter(self.available_blocks.items()))
+            self._single_ws = ws
+            self._single_avail = avail
+        else:
+            self._single_ws = None
+            self._single_avail = 0
+
+    def batch_decrement_list(self, requests: RequestList) -> None:
+        """Batch-decrement blocks for a list of requests using C++ batch API.
+
+        Uses get_remaining_blocks_to_completion_batch for a single Python→C++
+        call instead of N individual calls.
+        """
+        if not requests:
+            return
+        if self._single_ws is not None:
+            needed_list = self.kv_cache_manager.get_remaining_blocks_to_completion_batch(
+                requests, self._single_ws
+            )
+            self._single_avail -= sum(needed_list)
+        else:
+            for ws in self.available_blocks:
+                needed_list = self.kv_cache_manager.get_remaining_blocks_to_completion_batch(
+                    requests, ws
+                )
+                self.available_blocks[ws] -= sum(needed_list)
+
+    def sync_to_dict(self) -> None:
+        """Write single-window scalar back to dict. Call before dict is read."""
+        if self._single_ws is not None:
+            self.available_blocks[self._single_ws] = self._single_avail
+
+    def preview_reserve(self, req: LlmRequest) -> bool:
+        """Check if request fits (no mutation). Caches needed blocks for commit_preview.
+
+        Call commit_preview() after all intermediate checks (PEFT, token) pass
+        to apply the cached decrement. This avoids a second C++ call.
+        """
+        self._preview_valid = False
+        if self._single_ws is not None:
+            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(req, self._single_ws)
+            if needed > self._single_avail:
+                return False
+            self._preview_needed_single = needed
+            self._preview_valid = True
+            return True
+        needed_per_ws = {}
+        for ws, avail in self.available_blocks.items():
+            needed = self.kv_cache_manager.get_remaining_blocks_to_completion(req, ws)
+            if needed > avail:
+                return False
+            needed_per_ws[ws] = needed
+        self._preview_needed_multi = needed_per_ws
+        self._preview_valid = True
+        return True
+
+    def commit_preview(self) -> None:
+        """Apply the cached decrement from the last preview_reserve call."""
+        assert self._preview_valid, "commit_preview called without a successful preview_reserve"
+        self._preview_valid = False
+        if self._single_ws is not None:
+            self._single_avail -= self._preview_needed_single
+            return
+        for ws, needed in self._preview_needed_multi.items():
+            self.available_blocks[ws] -= needed
+
+
+class MaxUtilizationScheduledBlocksManager:
+    """
+    Python equivalent of C++ kv_cache_manager::MaxUtilizationScheduledBlocksManager.
+    Tracks scheduled blocks per window size for MAX_UTILIZATION scheduling.
+
+    Includes single-window fast path for the common case.
+
+    Reference: cpp/tensorrt_llm/batch_manager/scheduledBlocksManager.h:64-117
+    """
+
+    def __init__(self, kv_cache_manager, two_steps_look_ahead: bool):
+        self.kv_cache_manager = kv_cache_manager
+        self.two_steps_look_ahead = two_steps_look_ahead
+        window_sizes = set(kv_cache_manager.max_attention_window_vec)
+        self.num_scheduled_blocks: dict[int, int] = {ws: 0 for ws in window_sizes}
+        self._pending_total: int = 0
+        self._pending_blocks: dict[int, int] = {}
+        # Single-window fast path
+        if len(self.num_scheduled_blocks) == 1:
+            self._single_ws: Optional[int] = next(iter(self.num_scheduled_blocks))
+            self._single_scheduled: int = 0
+        else:
+            self._single_ws = None
+            self._single_scheduled = 0
+
+    def prepare_blocks_if_schedulable(self, req: LlmRequest) -> Optional[bool]:
+        """Check if request can be scheduled. Returns True or None (can't fit).
+
+        For single-window: returns True and caches the scheduled_total
+        internally. Call update_scheduled_blocks() to commit.
+        For multi-window: returns a dict of new block counts (legacy).
+        """
+        if self._single_ws is not None:
+            required = self.kv_cache_manager.get_needed_blocks_one_step(
+                req, self.two_steps_look_ahead, self._single_ws
+            )
+            scheduled_total = self._single_scheduled + required
+            if not self.kv_cache_manager.scheduling_has_free_blocks(
+                scheduled_total, self._single_ws
+            ):
+                return None
+            self._pending_total = scheduled_total
+            return True
+        # Multi-window path
+        blocks_if_scheduled = {}
+        for window_size, num_scheduled in self.num_scheduled_blocks.items():
+            required = self.kv_cache_manager.get_needed_blocks_one_step(
+                req, self.two_steps_look_ahead, window_size
+            )
+            scheduled_total = num_scheduled + required
+            if not self.kv_cache_manager.scheduling_has_free_blocks(scheduled_total, window_size):
+                return None
+            blocks_if_scheduled[window_size] = scheduled_total
+        self._pending_blocks = blocks_if_scheduled
+        return True
+
+    def update_scheduled_blocks(self) -> None:
+        """Commit the block counts from the last prepare_blocks_if_schedulable call."""
+        if self._single_ws is not None:
+            self._single_scheduled = self._pending_total
+            self.num_scheduled_blocks[self._single_ws] = self._single_scheduled
+            return
+        for window_size, total in self._pending_blocks.items():
+            self.num_scheduled_blocks[window_size] = total
+
+
+class PyCapacityScheduler:
+    """KV cache capacity scheduler with optional fused token budget tracking.
+
+    Python implementation based on the C++ CapacityScheduler. Core KV-block
+    logic follows cpp/tensorrt_llm/batch_manager/capacityScheduler.cpp.
+
+    Extension: accepts an optional TokenBudgetTracker via schedule_request()
+    to fuse token-budget checks into the capacity loop (single-pass
+    scheduling). When no tracker is provided, behaves identically to the
+    C++ implementation.
+
+    Policies:
+    - MaxRequestsScheduler: No KV cache manager, simple request count limit
+    - GuaranteedNoEvictScheduler: Reserve blocks for completion, no eviction
+    - StaticBatchScheduler: Only schedule when no requests are active
+    - MaxUtilizationScheduler: Maximize utilization, may pause requests
+    """
+
+    def __init__(
+        self,
+        max_num_requests: int,
+        kv_cache_manager=None,
+        peft_cache_manager=None,
+        scheduler_policy: CapacitySchedulerPolicy = CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
+        cross_kv_cache_manager=None,
+        two_step_lookahead: bool = False,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_COMPLETE,
+    ):
+        self.max_num_requests = max_num_requests
+        self.kv_cache_manager = kv_cache_manager
+        self.peft_cache_manager = peft_cache_manager
+        self.cross_kv_cache_manager = cross_kv_cache_manager
+        self.scheduler_policy = scheduler_policy
+        self.two_step_lookahead = two_step_lookahead
+        self.no_schedule_until_state = no_schedule_until_state
+        self.no_schedule_after_state = no_schedule_after_state
+        # Cache state values to avoid repeated .value access (optimization)
+        self._no_schedule_until_state_value = no_schedule_until_state.value
+        self._no_schedule_after_state_value = no_schedule_after_state.value
+        self._gen_in_progress_state_value = LlmRequestState.GENERATION_IN_PROGRESS.value
+
+        # Initialize the appropriate policy
+        self._policy = self._create_policy()
+
+    def _create_policy(self) -> SchedulerPolicyBase:
+        """Create the appropriate policy based on configuration."""
+        if self.kv_cache_manager is None:
+            return MaxRequestsPolicy()
+        elif self.scheduler_policy == CapacitySchedulerPolicy.MAX_UTILIZATION:
+            return MaxUtilizationPolicy()
+        elif self.scheduler_policy == CapacitySchedulerPolicy.GUARANTEED_NO_EVICT:
+            return GuaranteedNoEvictPolicy(static_batch=False)
+        elif self.scheduler_policy == CapacitySchedulerPolicy.STATIC_BATCH:
+            return GuaranteedNoEvictPolicy(static_batch=True)
+        else:
+            raise ValueError(f"Unsupported scheduler policy: {self.scheduler_policy}")
+
+    def _can_be_scheduled(self, req: LlmRequest) -> bool:
+        """
+        Check if request is within the schedulable state range.
+        Returns True if request has reached no_schedule_until_state
+        but has not yet reached no_schedule_after_state.
+        Optimized: use state_value property to avoid enum object creation
+        """
+        # Use state_value property (returns int directly, avoids enum object creation)
+        state_value = req.state_value
+        # Inline comparison: must have reached until_state but not after_state
+        return (
+            state_value >= self._no_schedule_until_state_value
+            and state_value < self._no_schedule_after_state_value
+        )
+
+    def _is_skipping_relevant(self) -> bool:
+        """
+        Check if block reuse skip optimization is relevant.
+        Disabled for VSWA (Variable Sliding Window Attention).
+        C++ reference: capacityScheduler.cpp:207-208, 348
+        """
+        if self.kv_cache_manager is None:
+            return False
+        if self.kv_cache_manager.is_variable_window:
+            return False
+        if (
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.is_variable_window
+        ):
+            return False
+        return True
+
+    def _prefill_contributed_blocks(self, active_requests: RequestList) -> tuple[set, set]:
+        """
+        Collect blocks contributed by chunked context requests already executing.
+        These blocks can be reused by later requests.
+
+        C++ reference: capacityScheduler.cpp:34-68 (prefillWithChunkedContextsAlreadyExecuting)
+        """
+        newly_contributed_context_blocks: Set = set()
+        newly_contributed_cross_context_blocks: Set = set()
+
+        if self.kv_cache_manager is None:
+            return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
+
+        enable_block_reuse = self.kv_cache_manager.enable_block_reuse
+        cross_enable_reuse = (
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.enable_block_reuse
+        )
+
+        for req in active_requests:
+            # Check: isContextInitState() && !isFirstContextChunk()
+            if req.is_context_init_state and not req.is_first_context_chunk:
+                # Chunked context request already executing
+                if enable_block_reuse:
+                    unique_tokens = req.get_unique_tokens(0)
+                    block_key = self.kv_cache_manager.find_new_context_block(unique_tokens, req)
+                    if block_key is not None:
+                        newly_contributed_context_blocks.add(block_key)
+
+                if cross_enable_reuse:
+                    encoder_unique_tokens = req.get_encoder_unique_tokens()
+                    if encoder_unique_tokens is not None:
+                        block_key = self.cross_kv_cache_manager.find_new_context_block(
+                            encoder_unique_tokens, req
+                        )
+                        if block_key is not None:
+                            newly_contributed_cross_context_blocks.add(block_key)
+
+        return newly_contributed_context_blocks, newly_contributed_cross_context_blocks
+
+    def _one_manager_beneficial_to_skip(
+        self, kv_cache_manager, unique_tokens, req: LlmRequest, newly_contributed_blocks: set
+    ) -> bool:
+        """
+        Check if skipping is beneficial for one KV cache manager.
+        C++ reference: capacityScheduler.cpp:70-92 (oneManagerBeneficialToSkip)
+        """
+        new_context_block = kv_cache_manager.find_new_context_block(unique_tokens, req)
+        if new_context_block is not None:
+            if new_context_block in newly_contributed_blocks:
+                return True
+            newly_contributed_blocks.add(new_context_block)
+        return False
+
+    def _beneficial_to_skip(
+        self,
+        req: LlmRequest,
+        newly_contributed_context_blocks: set,
+        newly_contributed_cross_context_blocks: set,
+    ) -> bool:
+        """
+        Check if it's beneficial to skip this request.
+        A request should be skipped if it can reuse blocks contributed by
+        already scheduled context requests.
+
+        C++ reference: capacityScheduler.cpp:97-123 (beneficialToSkip)
+        """
+        if not (req.is_context_init_state and req.is_first_context_chunk):
+            return False
+
+        if self.kv_cache_manager is not None and self.kv_cache_manager.enable_block_reuse:
+            unique_tokens = req.get_unique_tokens(0)
+            if self._one_manager_beneficial_to_skip(
+                self.kv_cache_manager, unique_tokens, req, newly_contributed_context_blocks
+            ):
+                return True
+
+        if (
+            self.cross_kv_cache_manager is not None
+            and self.cross_kv_cache_manager.enable_block_reuse
+        ):
+            encoder_unique_tokens = req.get_encoder_unique_tokens()
+            if encoder_unique_tokens is not None:
+                if self._one_manager_beneficial_to_skip(
+                    self.cross_kv_cache_manager,
+                    encoder_unique_tokens,
+                    req,
+                    newly_contributed_cross_context_blocks,
+                ):
+                    return True
+
+        return False
+
+    def _get_max_peft_pages(self) -> int:
+        """Get maximum PEFT cache pages."""
+        if self.peft_cache_manager is None:
+            return 2**31 - 1  # INT_MAX equivalent
+        return self.peft_cache_manager.max_device_pages
+
+    def _get_peft_pages_for_request(self, req: LlmRequest) -> int:
+        """Get PEFT pages needed for a request."""
+        if self.peft_cache_manager is None:
+            return 0
+        return self.peft_cache_manager.determine_num_pages(req)
+
+    def _get_peft_task_info(
+        self, req: LlmRequest, seen_task_ids: set[int]
+    ) -> tuple[Optional[int], bool, int]:
+        """
+        Get PEFT task information for a request.
+        Returns (lora_task_id, is_new_task, required_pages).
+        """
+        lora_task_id = getattr(req, "lora_task_id", None)
+        is_new_task = lora_task_id is not None and lora_task_id not in seen_task_ids
+        required_pages = self._get_peft_pages_for_request(req) if is_new_task else 0
+        return lora_task_id, is_new_task, required_pages
+
+    def schedule_request(
+        self,
+        active_requests: RequestList,
+        token_tracker: Optional["TokenBudgetTracker"] = None,
+    ) -> tuple[RequestList, RequestList, RequestList]:
+        """
+        Schedule requests based on the configured policy.
+
+        Args:
+            active_requests: List of active requests to consider
+            token_tracker: If provided, fuses token-budget checks into
+                the capacity policy loop (single-pass scheduling).
+
+        Returns:
+            Tuple of (fitting_requests, fitting_disagg_gen_init_requests, paused_requests)
+
+        C++ reference: capacityScheduler.cpp:488-539 (CapacityScheduler::operator())
+        """
+        fitting_requests, fitting_disagg_gen_init_requests, paused = self._policy.schedule(
+            self, active_requests, token_tracker
+        )
+
+        logger.debug(
+            f"[Summary] Capacity scheduler allows {len(fitting_requests)} requests, "
+            f"pauses {len(paused)} requests"
+        )
+
+        return fitting_requests, fitting_disagg_gen_init_requests, paused
+
+
+# ---------------------------------------------------------------------------
+# New data classes for the unified scheduling interface
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ScheduleStepConfig:
+    """Immutable configuration for the unified scheduler."""
+
+    enable_attention_dp: bool = False
+    attention_dp_enable_balance: bool = False
+    attention_dp_time_out_iters: int = 0
+    attention_dp_batching_wait_iters: int = 0
+    batch_wait_timeout_iters: int = 0
+    batch_wait_max_tokens_ratio: float = 0.0
+    max_num_active_requests: int = 0
+    max_batch_size: int = 0
+    max_num_tokens: int = 0
+    benchmark_req_queues_size: int = 0
+
+
+@dataclass
+class ScheduleResult:
+    scheduled_requests: ScheduledRequests
+    fitting_disagg_gen_init_requests: List[LlmRequest]
+    # Counts requests admitted by both capacity and token budget (see docstring item 3).
+    num_fitting_requests: int
+
+
+@dataclass
+class UnifiedScheduleStepOutput:
+    scheduled_requests: ScheduledRequests
+    fitting_disagg_gen_init_requests: List[LlmRequest]
+    # Counts requests admitted by both capacity and token budget (see docstring item 3).
+    num_fitting_requests: int
+    new_requests: List[LlmRequest] = field(default_factory=list)
+    all_new_requests: List[LlmRequest] = field(default_factory=list)
+    expected_num_active_requests: int = 0
+    dummy_request: Optional[LlmRequest] = None
+    use_spec_decode: bool = False
+    max_total_draft_tokens: int = 0
+    validation_failures: List[ValidationFailure] = field(default_factory=list)
+
+
+# ---------------------------------------------------------------------------
+# SimpleUnifiedScheduler — Python-only scheduler with consolidated logic
+# ---------------------------------------------------------------------------
+
+
+class SimpleUnifiedScheduler(RequestScheduler):
+    """Python-only scheduler with consolidated scheduling logic.
+
+    Replaces the two-pass pipeline in SimpleScheduler (C++ bindings:
+    BindCapacityScheduler → BindMicroBatchScheduler) with a single-pass
+    fused approach. Gated by TLLM_USE_PYTHON_SCHEDULER=1.
+
+    The immediate scheduled result (context_requests + generation_requests)
+    is equivalent to SimpleScheduler for the same inputs. However, the
+    fused single-pass approach has different internal semantics — this is
+    an intentional tradeoff for reduced host overhead.
+
+    Differences vs the two-pass SimpleScheduler:
+
+    1. Single-pass fused scheduling (performance):
+       Capacity and token-budget checks run in one loop via TokenBudgetTracker,
+       instead of capacity first then microbatch second. This eliminates one
+       full iteration over fitting_requests and avoids wasted KV-block
+       accounting on requests that would exceed the token budget. Inflight
+       and beam-width-mismatch skips still follow the same bookkeeping
+       semantics as the C++ capacity path.
+
+    2. MaxUtilization produces fewer pauses:
+       When token budget is exhausted, the fused path stops the capacity
+       loop early (token failure returns None, not False, so pause/backtrack
+       is not triggered). In SimpleScheduler, capacity evaluates ALL requests
+       first (potentially pausing some to make room), then microbatch drops
+       the ones exceeding token budget — meaning those pauses were wasted
+       (they freed KV blocks for requests that got dropped anyway). The fused
+       path avoids this: fewer pauses, equivalent or better batch utilization.
+
+    3. num_fitting_requests counts requests passing both capacity AND token
+       budget (via TokenBudgetTracker._num_fitting), not just capacity-fitting.
+       In SimpleScheduler, num_fitting_requests was len(fitting_requests)
+       from the capacity pass only. The new count reports how many requests
+       actually made it into the scheduled batch.
+
+    4. Scheduling orchestration consolidated in scheduler (code organization):
+       Validation, ADP routing, and drafter setup are orchestrated by
+       schedule_step(), instead of being scattered across py_executor.py
+       as in the SimpleScheduler path. Request activation
+       (active_requests.extend) remains in the executor.
+
+    5. speculation_permanently_disabled pushback:
+       New field not present in SimpleScheduler. Set by the executor when
+       rolling acceptance rate drops below threshold. Ensures the scheduler
+       respects the decision immediately in the next _setup_drafter() call.
+    """
+
+    def __init__(
+        self,
+        max_batch_size: int,
+        max_num_tokens: int,
+        kv_cache_manager,
+        peft_cache_manager,
+        scheduler_policy: CapacitySchedulerPolicy,
+        ctx_chunk_config: Optional[tuple[StrEnum, int]] = None,
+        cross_kv_cache_manager=None,
+        two_step_lookahead: bool = False,
+        scheduler_capacity: Optional[int] = None,
+        config: Optional[ScheduleStepConfig] = None,
+        adp_router: Optional[ADPRouter] = None,
+        dist=None,
+        drafter: Optional["Drafter"] = None,
+        max_total_draft_tokens: int = 0,
+        request_validator: Optional[RequestValidator] = None,
+    ):
+        # Use scheduler_capacity if provided, otherwise fall back to max_batch_size
+        # scheduler_capacity may differ from max_batch_size (e.g., adjusted for attention_dp + disagg)
+        capacity = scheduler_capacity if scheduler_capacity is not None else max_batch_size
+
+        self.capacity_scheduler = PyCapacityScheduler(
+            max_num_requests=capacity,
+            kv_cache_manager=kv_cache_manager,
+            peft_cache_manager=peft_cache_manager,
+            scheduler_policy=scheduler_policy,
+            cross_kv_cache_manager=cross_kv_cache_manager,
+            two_step_lookahead=two_step_lookahead,
+        )
+
+        self._max_batch_size = max_batch_size
+        self._max_num_tokens = max_num_tokens
+        self._ctx_chunk_config = None
+        if ctx_chunk_config:
+            input_policy = ctx_chunk_config[0]
+            if "EQUAL_PROGRESS" in str(input_policy):
+                policy_enum = ChunkingPolicy.EQUAL_PROGRESS
+            else:
+                policy_enum = ChunkingPolicy.FIRST_COME_FIRST_SERVED
+            self._ctx_chunk_config = ContextChunkingConfig(policy_enum, ctx_chunk_config[1])
+
+        self._config = config or ScheduleStepConfig()
+        self._adp_router = adp_router
+        self._dist = dist
+        self._request_validator = request_validator
+
+        # Drafter state
+        self._drafter = drafter
+        self._max_total_draft_tokens = max_total_draft_tokens
+        self._use_spec_decode = False
+        self._speculation_permanently_disabled = False
+
+        # Mutable iteration counters (moved from PyExecutor)
+        self._adp_ctx_waiting_iters_count = 0
+        self._adp_ctx_batching_wait_iters_count = 0
+        self._batch_wait_iters_count = 0
+        self._expected_num_active_requests = 0
+
+    # ------------------------------------------------------------------
+    # ABC methods (unchanged from before the refactor)
+    # ------------------------------------------------------------------
+
+    def schedule_request(
+        self, active_requests: RequestList, inflight_request_ids: object = None
+    ) -> SchedulerOutput:
+        """Single-pass fused capacity + token budget scheduling.
+
+        A TokenBudgetTracker is passed into the capacity policy loop so that
+        each request admission check includes both KV-block and token-budget
+        gates simultaneously. The tracker classifies requests into
+        context/generation and handles chunking/sorting.
+        """
+        tracker = TokenBudgetTracker(
+            self._max_batch_size, self._max_num_tokens, self._ctx_chunk_config, inflight_request_ids
+        )
+        _, fitting_disagg_gen_init, paused_requests = self.capacity_scheduler.schedule_request(
+            active_requests, tracker
+        )
+        # num_fitting reflects requests passing both capacity AND token budget.
+        context_requests, generation_requests, num_fitting = tracker.finalize()
+        return SchedulerOutput(
+            context_requests=context_requests,
+            generation_requests=generation_requests,
+            paused_requests=paused_requests,
+            fitting_disagg_gen_init_requests=fitting_disagg_gen_init,
+            num_fitting_requests=num_fitting,
+        )
+
+    def can_schedule(self, requests: RequestList) -> bool:
+        fitting, _, _ = self.capacity_scheduler.schedule_request(requests)
+        return len(fitting) == len(requests)
+
+    # ------------------------------------------------------------------
+    # _fetch_new_requests — allgather + pop + ADP routing
+    # ------------------------------------------------------------------
+
+    def _fetch_new_requests(
+        self,
+        waiting_queue: WaitingQueue,
+        active_requests: List[LlmRequest],
+        exclude_last_generation_logits: bool,
+    ) -> tuple[List[LlmRequest], list, int, List[ValidationFailure]]:
+        """Fetch, route, merge, and validate new requests.
+
+        Performs the complete request intake pipeline:
+        1. ADP allgather + pop from waiting queue
+        2. ADP routing across ranks
+        3. CP merge (RequestQueueItem → LlmRequest)
+        4. Validation (beam width, token IDs, sampler)
+
+        Returns:
+            (validated_requests, all_new_requests, expected_num_active,
+             validation_failures)
+        """
+        cfg = self._config
+
+        # 1. Gather rank states and calculate total_num_active_requests
+        if cfg.enable_attention_dp and self._adp_router is not None:
+            all_rank_states = self._adp_router.gather_all_rank_states(active_requests)
+            all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+            total_num_active_requests = sum(all_ranks_num_active_requests)
+        else:
+            total_num_active_requests = len(active_requests)
+            all_ranks_num_active_requests = None
+            all_rank_states = None
+
+        # 2. Pop requests from waiting queue based on capacity
+        if cfg.enable_attention_dp:
+            total_max = self._dist.tp_size * cfg.max_num_active_requests
+        else:
+            total_max = cfg.max_num_active_requests
+
+        max_new_requests = total_max - total_num_active_requests
+        new_requests = get_from_waiting_queue(
+            waiting_queue,
+            max_new_requests,
+            enable_attention_dp=cfg.enable_attention_dp,
+            max_num_active_requests=cfg.max_num_active_requests,
+            all_ranks_num_active_requests=all_ranks_num_active_requests,
+        )
+
+        all_new_requests = list(new_requests)
+
+        # 3. Route requests across ranks (ADP only)
+        if cfg.enable_attention_dp and self._adp_router is not None:
+            all_ranks_new_requests, self._expected_num_active_requests = (
+                self._adp_router.route_requests(
+                    all_rank_states, new_requests, cfg.max_num_active_requests
+                )
+            )
+            new_requests = all_ranks_new_requests[self._dist.tp_rank]
+
+        # 4. CP merge (RequestQueueItem → LlmRequest)
+        new_requests = merge_requests(
+            new_requests,
+            cp_config=self._dist.cp_config,
+            cp_rank=self._dist.cp_rank,
+            cp_size=self._dist.cp_size,
+            exclude_last_generation_logits=exclude_last_generation_logits,
+        )
+
+        # 5. Validate
+        if self._request_validator is None:
+            raise RuntimeError("Request validator is required for unified scheduler step.")
+        validated_requests, validation_failures = self._request_validator.validate_requests(
+            new_requests
+        )
+
+        return (
+            validated_requests,
+            all_new_requests,
+            self._expected_num_active_requests,
+            validation_failures,
+        )
+
+    # ------------------------------------------------------------------
+    # schedule_step — single consolidated entry point
+    # ------------------------------------------------------------------
+
+    def schedule_step(
+        self,
+        *,
+        waiting_queue: WaitingQueue,
+        active_requests: List[LlmRequest],
+        inflight_req_ids,
+        kv_cache_manager,
+        kv_cache_transceiver,
+        kv_connector_manager,
+        is_warmup: bool,
+        num_fetch_requests: int,
+        exclude_last_generation_logits: bool,
+    ) -> UnifiedScheduleStepOutput:
+        """Full scheduling pipeline — the primary entry point per executor iteration.
+
+        Called once per iteration by _prepare_and_schedule_batch(). Orchestrates:
+        1. Fetch new requests (pop + ADP route + CP merge + validate)
+        2. KV connector marking (DISAGG_GENERATION_INIT)
+        3. Build combined request list for scheduling
+        4. Disagg ctx schedulable check
+        5. Pad ADP dummy request
+        6. Drafter setup (spec decode decision + draft token prep)
+        7. Capacity + microbatch scheduling
+
+        For lightweight re-scheduling (e.g., kv_connector second pass),
+        use schedule_active_requests() instead.
+        """
+        # 1. Fetch new requests (ADP allgather + pop + route + CP merge + validate)
+        (
+            validated_requests,
+            all_new_requests,
+            self._expected_num_active_requests,
+            validation_failures,
+        ) = self._fetch_new_requests(waiting_queue, active_requests, exclude_last_generation_logits)
+
+        # 2. KV connector marking (mutates request objects, not the list)
+        if kv_connector_manager:
+            for request in validated_requests:
+                if not request.is_generation_only_request:
+                    request.state = LlmRequestState.DISAGG_GENERATION_INIT
+
+        # 3. Build local combined list for scheduling (does NOT mutate
+        #    the caller's active_requests — executor owns activation)
+        if validated_requests:
+            all_requests = list(active_requests) + validated_requests
+        else:
+            all_requests = list(active_requests)
+
+        # 4. Disagg ctx schedulable check
+        if kv_cache_transceiver:
+            check_disagg_ctx_schedulable(
+                validated_requests,
+                kv_cache_transceiver,
+            )
+
+        # 5. Pad ADP dummy request
+        dummy = None
+        if self._config.enable_attention_dp:
+            dummy = create_adp_dummy_request(
+                all_requests,
+                expected_num_active_requests=self._expected_num_active_requests,
+                kv_cache_manager=kv_cache_manager,
+                kv_cache_transceiver=kv_cache_transceiver,
+                is_warmup=is_warmup,
+                max_total_draft_tokens=self._max_total_draft_tokens,
+                num_fetch_requests=num_fetch_requests,
+                benchmark_req_queues_size=self._config.benchmark_req_queues_size,
+            )
+        if dummy is not None:
+            all_requests.append(dummy)
+
+        # 6. Drafter setup
+        if self._drafter is not None:
+            self._setup_drafter(all_requests)
+
+        # 7. Run capacity + microbatch scheduling
+        result = self.schedule_active_requests(all_requests, inflight_req_ids)
+
+        return UnifiedScheduleStepOutput(
+            scheduled_requests=result.scheduled_requests,
+            fitting_disagg_gen_init_requests=result.fitting_disagg_gen_init_requests,
+            num_fitting_requests=result.num_fitting_requests,
+            new_requests=validated_requests,
+            all_new_requests=all_new_requests,
+            expected_num_active_requests=self._expected_num_active_requests,
+            dummy_request=dummy,
+            use_spec_decode=self._use_spec_decode,
+            max_total_draft_tokens=self._max_total_draft_tokens,
+            validation_failures=validation_failures,
+        )
+
+    # ------------------------------------------------------------------
+    # schedule — capacity + microbatch + ADP balance + batch wait
+    # ------------------------------------------------------------------
+
+    def schedule_active_requests(
+        self,
+        active_requests: List[LlmRequest],
+        inflight_req_ids,
+    ) -> ScheduleResult:
+        """Lightweight scheduling — capacity + microbatch + ADP balance + batch wait.
+
+        Does NOT fetch, validate, pad, or set up the drafter. Used for:
+        - kv_connector re-scheduling (second pass after mark_ready_requests)
+        - PP path scheduling via PyExecutor._schedule()
+        - Internal use by schedule_step() (step 7)
+
+        For full per-iteration scheduling, use schedule_step() instead.
+        """
+        cfg = self._config
+
+        scheduler_output = self.schedule_request(active_requests, inflight_req_ids)
+
+        scheduled_context_requests = scheduler_output.context_requests
+
+        if cfg.enable_attention_dp and cfg.attention_dp_enable_balance:
+            (
+                scheduled_context_requests,
+                self._adp_ctx_waiting_iters_count,
+                self._adp_ctx_batching_wait_iters_count,
+            ) = balance_adp_requests(
+                scheduler_output.context_requests,
+                scheduler_output.generation_requests,
+                dist=self._dist,
+                max_batch_size=cfg.max_batch_size,
+                enable_balance=cfg.attention_dp_enable_balance,
+                timeout_iters=cfg.attention_dp_time_out_iters,
+                batching_wait_iters=cfg.attention_dp_batching_wait_iters,
+                ctx_waiting_count=self._adp_ctx_waiting_iters_count,
+                ctx_batching_count=self._adp_ctx_batching_wait_iters_count,
+            )
+
+        enable_batch_waiting = (
+            cfg.batch_wait_timeout_iters > 0 or cfg.batch_wait_max_tokens_ratio > 0
+        )
+        should_check_waiting = (
+            not cfg.enable_attention_dp
+            and enable_batch_waiting
+            and len(scheduler_output.context_requests) > 0
+            and len(scheduler_output.generation_requests) > 0
+        )
+        if should_check_waiting:
+            scheduled_context_requests, self._batch_wait_iters_count = check_batch_waiting(
+                scheduler_output.context_requests,
+                scheduler_output.generation_requests,
+                batch_wait_iters_count=self._batch_wait_iters_count,
+                batch_wait_timeout_iters=cfg.batch_wait_timeout_iters,
+                batch_wait_max_tokens_ratio=cfg.batch_wait_max_tokens_ratio,
+                max_num_tokens=cfg.max_num_tokens,
+            )
+
+        scheduled_requests = ScheduledRequests()
+        scheduled_requests.context_requests = scheduled_context_requests
+        scheduled_requests.generation_requests = scheduler_output.generation_requests
+        scheduled_requests.paused_requests = scheduler_output.paused_requests
+
+        return ScheduleResult(
+            scheduled_requests=scheduled_requests,
+            fitting_disagg_gen_init_requests=scheduler_output.fitting_disagg_gen_init_requests,
+            num_fitting_requests=scheduler_output.num_fitting_requests,
+        )
+
+    # ------------------------------------------------------------------
+    # Drafter integration
+    # ------------------------------------------------------------------
+
+    @property
+    def speculation_permanently_disabled(self) -> bool:
+        return self._speculation_permanently_disabled
+
+    @speculation_permanently_disabled.setter
+    def speculation_permanently_disabled(self, disabled: bool) -> None:
+        """Monotonic False→True transition; called by executor."""
+        if disabled:
+            self._speculation_permanently_disabled = True
+
+    def _setup_drafter(self, active_requests: List[LlmRequest]) -> None:
+        """Dynamic draft length + use_spec_decode decision + stamp draft_tokens."""
+        drafter = self._drafter
+
+        if drafter.draft_len_schedule is not None:
+            batch_size_input = len(active_requests)
+            self._max_total_draft_tokens = drafter.get_draft_len_for_batch_size(batch_size_input)
+            drafter.update_max_total_draft_tokens(self._max_total_draft_tokens)
+
+        # Determine whether to use speculative decoding
+        if drafter.draft_len_schedule is not None and self._max_total_draft_tokens == 0:
+            self._use_spec_decode = False
+        elif self._speculation_permanently_disabled:
+            self._use_spec_decode = False
+        else:
+            self._use_spec_decode = drafter.should_use_spec_decode(
+                active_requests,
+                self._config.max_batch_size,
+                self._config.max_num_tokens,
+                self._max_total_draft_tokens,
+            )
+        logger.debug(f"Use spec decode: {self._use_spec_decode}")
+
+        # Stamp draft_tokens on generation-in-progress and disagg-gen-init.
+        # NOTE: py_disable_speculative_decoding is NOT stamped here — it must
+        # be scoped to scheduled requests only (matching SimpleScheduler
+        # behavior). The executor stamps it post-scheduling.
+        for request in active_requests:
+            if request.state not in (
+                LlmRequestState.GENERATION_IN_PROGRESS,
+                LlmRequestState.DISAGG_GENERATION_INIT,
+            ):
+                continue
+            request.draft_tokens = (
+                [0] * self._max_total_draft_tokens if self._max_total_draft_tokens > 0 else []
+            )
+
+        # Initialize py_draft_tokens for scheduling awareness
+        prepare_draft_requests(active_requests, self._max_total_draft_tokens, self._use_spec_decode)

@@ -31,7 +31,12 @@ import pytest
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import HostProfiler, ProfileTarget
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
+    _PRESET_CONFIGS,
+    HostProfiler,
+    ProfileTarget,
+    _expand_presets,
+)
 
 
 def _sample_function_to_profile(n: int) -> int:
@@ -222,19 +227,18 @@ def test_e2e_profiler_with_model(tinyllama_path, mocker):
     """
     from tensorrt_llm import LLM
     from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
-    from tensorrt_llm.tools.profiler.host_profile_tools import host_profiler
 
     with tempfile.TemporaryDirectory() as tmpdir:
         output_path = os.path.join(tmpdir, "profiler_output.txt")
 
-        # Clear default targets and use only our specific targets
-        mocker.patch.object(host_profiler, "DEFAULT_PROFILE_TARGETS", [])
-
-        # Patch MPI to propagate env vars to workers
+        # Patch MPI to propagate env vars to workers.
+        # TLLM_LINE_PROFILER_PRESET=none suppresses default preset targets
+        # so only the explicit TLLM_LINE_PROFILER_FUNCTIONS are profiled.
         _patch_mpi_pool_session_for_env(
             mocker,
             {
                 "TLLM_LINE_PROFILER_PATH": output_path,
+                "TLLM_LINE_PROFILER_PRESET": "none",
                 "TLLM_LINE_PROFILER_FUNCTIONS": ", ".join(E2E_PROFILE_TARGETS),
             },
         )
@@ -276,3 +280,110 @@ def test_e2e_profiler_with_model(tinyllama_path, mocker):
         print("\n=== E2E Passed ===")
         print(f"Output: {len(content)} bytes")
         print(f"Verified methods with timing data: {expected_methods}")
+
+
+def test_preset_default_matches_legacy():
+    """Test that presets=["default"] produces the same targets as use_defaults=True."""
+    legacy = HostProfiler(use_defaults=True, presets=None)
+    preset = HostProfiler(use_defaults=False, presets=["default"])
+
+    legacy_paths = legacy.list_targets()
+    preset_paths = preset.list_targets()
+
+    assert legacy_paths == preset_paths
+    assert len(legacy_paths) > 10, "Should have many default targets"
+
+
+def test_preset_scheduler_hotpath():
+    """Test that scheduler_hotpath preset includes expected targets."""
+    profiler = HostProfiler(use_defaults=False, presets=["scheduler_hotpath"])
+
+    paths = profiler.list_targets()
+    expected_methods = [
+        "schedule_step",
+        "schedule",
+        "try_add_generation",
+        "try_add_context",
+        "finalize",
+        "preview_reserve",
+        "commit_preview",
+    ]
+    for method in expected_methods:
+        assert any(method in p for p in paths), (
+            f"Expected method '{method}' not found in scheduler_hotpath preset"
+        )
+
+
+def test_preset_none_clears_all(monkeypatch):
+    """Test that TLLM_LINE_PROFILER_PRESET=none disables all presets."""
+    monkeypatch.setenv("TLLM_LINE_PROFILER_PRESET", "none")
+
+    profiler = HostProfiler(use_defaults=True)
+    assert len(profiler.targets) == 0, "Preset 'none' should disable all preset targets"
+
+
+def test_preset_env_overrides_use_defaults(monkeypatch):
+    """Test that env var overrides use_defaults."""
+    monkeypatch.setenv("TLLM_LINE_PROFILER_PRESET", "scheduler_hotpath")
+
+    profiler = HostProfiler(use_defaults=True)
+    paths = profiler.list_targets()
+
+    # Should have scheduler targets, not default targets
+    assert any("schedule_step" in p for p in paths)
+    # Default targets should NOT be present (env overrides use_defaults)
+    assert not any("_forward_step" in p for p in paths)
+
+
+def test_preset_unknown_warns():
+    """Test that unknown preset names produce a warning but don't crash."""
+    profiler = HostProfiler(use_defaults=False, presets=["nonexistent_preset"])
+    assert len(profiler.targets) == 0
+
+
+def test_partial_failure_tolerance():
+    """Test that one invalid target doesn't prevent other targets from loading."""
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        output_path = f.name
+
+    try:
+        profiler = HostProfiler(output_path=output_path, use_defaults=False)
+        # Invalid target
+        profiler.add_function("nonexistent.module", "FakeClass", "fake_method")
+        # Valid target
+        profiler.add_standalone_function(__name__, "_sample_function_to_profile")
+
+        assert profiler.start() is True, "Profiler should start with partial failures"
+
+        _sample_function_to_profile(10)
+        profiler.stop()
+    finally:
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
+
+def test_target_deduplication():
+    """Test that duplicate targets are deduplicated by full_path."""
+    targets = [
+        ProfileTarget("os", None, "getcwd"),
+        ProfileTarget("os", None, "getcwd"),
+        ProfileTarget("os.path", None, "join"),
+    ]
+    profiler = HostProfiler(use_defaults=False, targets=targets)
+
+    assert len(profiler.targets) == 2
+    assert profiler.list_targets() == ["os.getcwd", "os.path.join"]
+
+
+def test_preset_configs_registry():
+    """Test that preset registry has expected presets."""
+    assert "default" in _PRESET_CONFIGS
+    assert "scheduler_hotpath" in _PRESET_CONFIGS
+
+    # Verify default preset targets match _expand_presets output
+    default_targets = _expand_presets(["default"])
+    assert len(default_targets) > 10
+
+    # Verify scheduler_hotpath has targets
+    sched_targets = _expand_presets(["scheduler_hotpath"])
+    assert len(sched_targets) > 5

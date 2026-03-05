@@ -21,6 +21,14 @@ Usage:
     Set environment variable TLLM_LINE_PROFILER_PATH to enable:
         TLLM_LINE_PROFILER_PATH=./lp_results.txt pytest ...
 
+    Preset selection (additive groups of targets):
+        TLLM_LINE_PROFILER_PATH=./results.txt
+        TLLM_LINE_PROFILER_PRESET=default,scheduler_hotpath
+        trtllm-bench ...
+
+    Disable all presets (only profile explicit TLLM_LINE_PROFILER_FUNCTIONS):
+        TLLM_LINE_PROFILER_PRESET=none ...
+
     Or use programmatically:
         profiler = HostProfiler(output_path="./results.txt")
         profiler.start()
@@ -31,9 +39,10 @@ Usage:
 import importlib
 import os
 import threading
+import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, Tuple
 
 from tensorrt_llm.logger import logger
 
@@ -43,6 +52,10 @@ LINE_PROFILER_PATH_ENV_VAR = "TLLM_LINE_PROFILER_PATH"
 # Environment variable to specify additional functions to profile (comma-separated).
 # Format: "module.Class.method,module.Class.method2,..."
 LINE_PROFILER_FUNCTIONS_ENV_VAR = "TLLM_LINE_PROFILER_FUNCTIONS"
+
+# Environment variable to select named preset groups (comma-separated).
+# Special value "none" (case-insensitive) disables all presets.
+LINE_PROFILER_PRESET_ENV_VAR = "TLLM_LINE_PROFILER_PRESET"
 
 
 @dataclass
@@ -117,8 +130,25 @@ class ProfileTarget:
             logger.warning(f"Failed to resolve profile target {self.full_path}: {e}")
             return None
 
+    def resolve_owner(self) -> Optional[Tuple[object, str, Callable]]:
+        """Resolve to (owner_obj, attr_name, original_func) for monkey-patching.
 
-# Default functions to profile for host overhead analysis
+        Returns:
+            Tuple of (owner, attribute_name, original_callable), or None on failure.
+        """
+        try:
+            module = importlib.import_module(self.module_path)
+            if self.is_standalone:
+                return (module, self.method_name, getattr(module, self.method_name))
+            else:
+                cls = getattr(module, self.class_name)
+                return (cls, self.method_name, getattr(cls, self.method_name))
+        except (ImportError, AttributeError) as e:
+            logger.warning(f"Failed to resolve owner for {self.full_path}: {e}")
+            return None
+
+
+# Named preset groups for profile targets.
 # Hierarchical config: {module_path: {class_name: [method_names]}}
 # Use None as class_name for standalone module-level functions
 #
@@ -127,51 +157,72 @@ class ProfileTarget:
 #   - {None: ["*"]}: Profile all standalone functions in the module
 #   - {"*": ["*"]}: Profile all classes and all their methods in the module
 _PYEXEC = "tensorrt_llm._torch.pyexecutor"
-_DEFAULT_PROFILE_CONFIG: Dict[str, Dict[Optional[str], List[str]]] = {
-    f"{_PYEXEC}.py_executor": {
-        "PyExecutor": [
-            "_prepare_and_schedule_batch",
-            "_schedule",
-            "_forward_step",
-            "_sample_async",
-            "_update_requests",
-            "_update_request_states",
-            "_fetch_and_activate_new_requests",
-            "_handle_responses",
-            "_handle_canceled_requests",
-            "_enqueue_responses",
-        ],
+_SCHED = f"{_PYEXEC}.scheduler.unified_scheduler"
+
+_PRESET_CONFIGS: Dict[str, Dict[str, Dict[Optional[str], List[str]]]] = {
+    # The "default" preset — executor, sampler, resource manager, scheduler entry point
+    "default": {
+        f"{_PYEXEC}.py_executor": {
+            "PyExecutor": [
+                "_prepare_and_schedule_batch",
+                "_schedule",
+                "_forward_step",
+                "_sample_async",
+                "_update_requests",
+                "_update_request_states",
+                "_fetch_and_activate_new_requests",
+                "_handle_responses",
+                "_handle_canceled_requests",
+                "_enqueue_responses",
+            ],
+        },
+        f"{_PYEXEC}.sampler": {
+            "TorchSampler": [
+                "sample_async",
+                "update_requests",
+                "_process_requests",
+                "_write_finish_reasons",
+                "_prepare_beam_search",
+                "_select_generated_logits",
+                "_sample_batched_by_strategy",
+            ],
+        },
+        f"{_PYEXEC}.resource_manager": {
+            "ResourceManager": ["prepare_resources", "update_resources", "free_resources"],
+            "KVCacheManager": ["prepare_resources", "update_resources"],
+        },
+        f"{_PYEXEC}.scheduler": {
+            "RequestScheduler": ["schedule_request"],
+        },
     },
-    f"{_PYEXEC}.sampler": {
-        "TorchSampler": [
-            "sample_async",
-            "update_requests",
-            "_process_requests",
-            "_write_finish_reasons",
-            "_prepare_beam_search",
-            "_select_generated_logits",
-            "_sample_batched_by_strategy",
-        ],
-        # Standalone module-level functions (use None as class_name)
-        None: [
-            "_group_requests_by_strategy_key",
-        ],
-    },
-    f"{_PYEXEC}.resource_manager": {
-        "ResourceManager": ["prepare_resources", "update_resources", "free_resources"],
-        "KVCacheManager": ["prepare_resources", "update_resources"],
-    },
-    f"{_PYEXEC}.scheduler": {
-        "RequestScheduler": ["schedule_request"],
-    },
-    f"{_PYEXEC}.executor_request_queue": {
-        "ExecutorRequestQueue": [
-            "_fetch_new_requests_attention_tp",
-            "_fetch_new_requests_attention_dp",
-            "_fetch_and_process_requests",
-            "_merge_requests",
-            "fetch_new_requests",
-        ],
+    # Scheduler hot-path internals — opt-in for profiling scheduling overhead.
+    # Note: mypyc-compiled functions lack __code__ and will be silently skipped.
+    "scheduler_hotpath": {
+        _SCHED: {
+            "SimpleUnifiedScheduler": [
+                "schedule_step",
+                "schedule_active_requests",
+                "schedule_request",
+            ],
+            "PyCapacityScheduler": ["schedule_request"],
+            "GuaranteedNoEvictPolicy": ["schedule"],
+            "MaxUtilizationPolicy": ["schedule"],
+            "TokenBudgetTracker": [
+                "try_add",
+                "try_add_generation",
+                "try_add_context",
+                "finalize",
+            ],
+            "NoEvictScheduledBlocksManager": [
+                "preview_reserve",
+                "commit_preview",
+                "batch_decrement_list",
+            ],
+            "MaxUtilizationScheduledBlocksManager": [
+                "prepare_blocks_if_schedulable",
+                "update_scheduled_blocks",
+            ],
+        },
     },
 }
 
@@ -354,7 +405,22 @@ def _expand_profile_config(
     return targets
 
 
-DEFAULT_PROFILE_TARGETS: List[ProfileTarget] = _expand_profile_config(_DEFAULT_PROFILE_CONFIG)
+def _expand_presets(preset_names: List[str]) -> List[ProfileTarget]:
+    """Expand named presets into a flat list of ProfileTarget objects."""
+    targets: List[ProfileTarget] = []
+    for name in preset_names:
+        config = _PRESET_CONFIGS.get(name)
+        if config is None:
+            logger.warning(f"Unknown profile preset: '{name}'")
+            continue
+        targets.extend(_expand_profile_config(config))
+    return targets
+
+
+# Module-level constant for external consumers.  HostProfiler.__init__ resolves
+# presets independently; to suppress defaults use presets=[] or
+# TLLM_LINE_PROFILER_PRESET=none.
+DEFAULT_PROFILE_TARGETS: List[ProfileTarget] = _expand_presets(["default"])
 
 
 class HostProfiler:
@@ -387,30 +453,69 @@ class HostProfiler:
         output_path: Optional[str] = None,
         targets: Optional[List[ProfileTarget]] = None,
         use_defaults: bool = True,
+        presets: Optional[List[str]] = None,
     ):
         """Initialize the host profiler.
 
         Args:
             output_path: Path to save results. If None, uses env var TLLM_LINE_PROFILER_PATH.
-            targets: List of ProfileTarget objects. If None and use_defaults=True,
-                     uses DEFAULT_PROFILE_TARGETS.
-            use_defaults: Whether to include default profile targets.
+            targets: List of ProfileTarget objects to add on top of presets.
+            use_defaults: Legacy flag. When True (and no presets arg / env var),
+                          loads the "default" preset.  Prefer ``presets`` instead.
+            presets: Explicit list of preset names to load (e.g. ``["default",
+                     "scheduler_hotpath"]``).  Overrides ``use_defaults`` when
+                     provided.  The ``TLLM_LINE_PROFILER_PRESET`` env var takes
+                     precedence over both.
         """
         self.output_path = output_path or os.environ.get(LINE_PROFILER_PATH_ENV_VAR)
         self.targets: List[ProfileTarget] = []
         self._line_profiler = None
         self._enabled = False
+        # Timer fallback for functions without __code__ (e.g. mypyc-compiled)
+        self._timer_patches: List[Tuple[object, str, Callable]] = []
+        self._timer_stats: Dict[str, Dict] = {}
 
-        # Add default targets if requested
-        if use_defaults:
-            self.targets.extend(DEFAULT_PROFILE_TARGETS)
+        # Resolve which presets to load.
+        # Priority: env var > presets arg > use_defaults fallback
+        preset_names = self._resolve_preset_names(presets, use_defaults)
+        self.targets.extend(_expand_presets(preset_names))
 
-        # Add custom targets
+        # Add explicit targets
         if targets:
             self.targets.extend(targets)
 
         # Parse additional targets from environment variable
         self._parse_env_targets()
+
+        # Deduplicate by full_path (preserving first occurrence order)
+        self._deduplicate_targets()
+
+    @staticmethod
+    def _resolve_preset_names(
+        presets: Optional[List[str]],
+        use_defaults: bool,
+    ) -> List[str]:
+        """Determine which presets to load from args and environment."""
+        env_val = os.environ.get(LINE_PROFILER_PRESET_ENV_VAR, "").strip()
+        if env_val:
+            if env_val.lower() == "none":
+                return []
+            return [p.strip() for p in env_val.split(",") if p.strip()]
+        if presets is not None:
+            return list(presets)
+        # Legacy fallback
+        return ["default"] if use_defaults else []
+
+    def _deduplicate_targets(self) -> None:
+        """Remove duplicate targets by full_path, keeping first occurrence."""
+        seen: set = set()
+        deduped: List[ProfileTarget] = []
+        for t in self.targets:
+            fp = t.full_path
+            if fp not in seen:
+                seen.add(fp)
+                deduped.append(t)
+        self.targets = deduped
 
     def _parse_env_targets(self) -> None:
         """Parse additional profile targets from environment variable.
@@ -572,50 +677,106 @@ class HostProfiler:
         """Check if profiling is currently active."""
         return self._enabled
 
+    @staticmethod
+    def _make_timer_wrapper(original: Callable, stats: Dict) -> Callable:
+        """Create a timing wrapper for functions without __code__ (e.g. mypyc)."""
+        _perf_counter_ns = time.perf_counter_ns
+
+        def wrapper(*args, **kwargs):
+            t0 = _perf_counter_ns()
+            try:
+                return original(*args, **kwargs)
+            except BaseException:
+                stats["exceptions"] += 1
+                raise
+            finally:
+                elapsed = _perf_counter_ns() - t0
+                stats["calls"] += 1
+                stats["total_ns"] += elapsed
+                if elapsed < stats["min_ns"]:
+                    stats["min_ns"] = elapsed
+                if elapsed > stats["max_ns"]:
+                    stats["max_ns"] = elapsed
+
+        return wrapper
+
     def start(self) -> bool:
         """Start profiling.
+
+        Functions with ``__code__`` use line_profiler for line-level profiling.
+        Functions without ``__code__`` (e.g. mypyc-compiled) are automatically
+        monkey-patched with a function-level timing wrapper instead.
 
         Returns:
             True if profiling started successfully, False otherwise.
         """
         if not self.should_profile:
-            logger.info("Line profiler not enabled (no output path specified)")
-            return False
-
-        if not self.is_available:
-            logger.warning("line_profiler not installed. Install with: pip install line_profiler")
+            logger.info("Profiler not enabled (no output path specified)")
             return False
 
         if self._enabled:
-            logger.warning("Line profiler already started")
+            logger.warning("Profiler already started")
             return True
 
         try:
-            from line_profiler import LineProfiler
+            lp_count = 0
+            timer_count = 0
 
-            self._line_profiler = LineProfiler()
+            # Try to create line_profiler (may not be installed)
+            try:
+                from line_profiler import LineProfiler
 
-            # Add all target functions
-            resolved_count = 0
+                self._line_profiler = LineProfiler()
+            except ImportError:
+                logger.info("line_profiler not installed, using timer fallback for all targets")
+                self._line_profiler = None
+
             for target in self.targets:
                 func = target.resolve()
-                if func is not None:
+                if func is None:
+                    continue
+
+                # Functions with __code__ go to line_profiler (if available)
+                if hasattr(func, "__code__") and self._line_profiler is not None:
                     logger.info(
-                        f"line profiler func code ID: {id(func.__code__)}, target: {target.full_path}"
+                        f"line profiler func code ID: {id(func.__code__)}, "
+                        f"target: {target.full_path}"
                     )
                     self._line_profiler.add_function(func)
-                    resolved_count += 1
+                    lp_count += 1
+                else:
+                    # Fallback: monkey-patch with timing wrapper
+                    owner_info = target.resolve_owner()
+                    if owner_info is None:
+                        continue
+                    owner, attr_name, original = owner_info
+                    stats = {
+                        "calls": 0,
+                        "total_ns": 0,
+                        "min_ns": float("inf"),
+                        "max_ns": 0,
+                        "exceptions": 0,
+                    }
+                    self._timer_stats[target.full_path] = stats
+                    setattr(owner, attr_name, self._make_timer_wrapper(original, stats))
+                    self._timer_patches.append((owner, attr_name, original))
+                    timer_count += 1
 
-            if resolved_count == 0:
+            if lp_count + timer_count == 0:
                 logger.warning("No profile targets could be resolved")
                 self._line_profiler = None
                 return False
 
-            self._line_profiler.enable()
+            if self._line_profiler is not None and lp_count > 0:
+                self._line_profiler.enable()
+            elif self._line_profiler is not None:
+                self._line_profiler = None
+
             self._enabled = True
             self._profiler_thread_id = threading.current_thread().ident
             logger.info(
-                f"Line profiler enabled with {resolved_count}/{len(self.targets)} targets. "
+                f"Profiler enabled: {lp_count} line-profiled, {timer_count} timer-patched "
+                f"(of {len(self.targets)} targets). "
                 f"Thread ID: {self._profiler_thread_id}, Thread name: {threading.current_thread().name}. "
                 f"Results will be saved to: {self.output_path}"
             )
@@ -623,9 +784,43 @@ class HostProfiler:
             return True
 
         except Exception as e:
-            logger.error(f"Failed to start line profiler: {e}")
+            logger.error(f"Failed to start profiler: {e}")
             self._line_profiler = None
+            for owner, attr_name, original in reversed(self._timer_patches):
+                setattr(owner, attr_name, original)
+            self._timer_patches.clear()
+            self._timer_stats.clear()
             return False
+
+    def _write_timer_stats(self, stream) -> None:
+        """Write monkey-patch timer results to *stream*."""
+        stream.write("\n=== Function Timer Results (mypyc-compatible) ===\n")
+        stream.write("Timer unit: 1 ns\n\n")
+        header = (
+            f"{'Total calls':>12}  {'Total (ms)':>12}  "
+            f"{'Avg (\u03bcs)':>10}  {'Min (\u03bcs)':>10}  {'Max (\u03bcs)':>10}  "
+            f"{'Exceptions':>10}  Function\n"
+        )
+        stream.write(header)
+        stream.write("-" * len(header.rstrip()) + "\n")
+
+        sorted_stats = sorted(
+            self._timer_stats.items(),
+            key=lambda x: x[1]["total_ns"],
+            reverse=True,
+        )
+        for name, s in sorted_stats:
+            if s["calls"] == 0:
+                continue
+            total_ms = s["total_ns"] / 1_000_000
+            avg_us = s["total_ns"] / s["calls"] / 1_000
+            min_us = s["min_ns"] / 1_000
+            max_us = s["max_ns"] / 1_000
+            stream.write(
+                f"{s['calls']:>12}  {total_ms:>12.3f}  "
+                f"{avg_us:>10.3f}  {min_us:>10.3f}  {max_us:>10.3f}  "
+                f"{s.get('exceptions', 0):>10}  {name}\n"
+            )
 
     def stop(self) -> bool:
         """Stop profiling and save results.
@@ -633,26 +828,35 @@ class HostProfiler:
         Returns:
             True if results were saved successfully, False otherwise.
         """
-        if not self._enabled or self._line_profiler is None:
+        if not self._enabled:
             return False
 
         try:
-            self._line_profiler.disable()
             self._enabled = False
+
+            # Restore all monkey-patched methods
+            for owner, attr_name, original in reversed(self._timer_patches):
+                setattr(owner, attr_name, original)
+            self._timer_patches.clear()
 
             # Save results
             with open(self.output_path, "w") as f:
-                self._line_profiler.print_stats(stream=f)
+                if self._line_profiler is not None:
+                    self._line_profiler.disable()
+                    self._line_profiler.print_stats(stream=f)
+                if self._timer_stats:
+                    self._write_timer_stats(f)
 
-            logger.info(f"Line profiler results saved to: {self.output_path}")
+            logger.info(f"Profiler results saved to: {self.output_path}")
             return True
 
         except Exception as e:
-            logger.error(f"Failed to save line profiler results: {e}")
+            logger.error(f"Failed to save profiler results: {e}")
             return False
 
         finally:
             self._line_profiler = None
+            self._timer_stats.clear()
 
     @contextmanager
     def profile(self):
@@ -675,13 +879,16 @@ class HostProfiler:
         Returns:
             Stats string if profiling is active, None otherwise.
         """
-        if self._line_profiler is None:
+        if self._line_profiler is None and not self._timer_stats:
             return None
 
         import io
 
         stream = io.StringIO()
-        self._line_profiler.print_stats(stream=stream)
+        if self._line_profiler is not None:
+            self._line_profiler.print_stats(stream=stream)
+        if self._timer_stats:
+            self._write_timer_stats(stream)
         return stream.getvalue()
 
     def list_targets(self) -> List[str]:

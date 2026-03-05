@@ -461,6 +461,36 @@ def build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=False):
     print("-- Done building kv_cache_manager_v2.")
 
 
+def build_pyexecutor_scheduler(project_dir, venv_python, use_mypyc=False):
+    print("-- Building pyexecutor scheduler...")
+    scheduler_dir = project_dir / "tensorrt_llm/_torch/pyexecutor/scheduler"
+    pyexecutor_dir = project_dir / "tensorrt_llm/_torch/pyexecutor"
+
+    # Clean up any existing mypyc artifacts to prevent stale inclusion
+    if not use_mypyc:
+        for so_file in pyexecutor_dir.glob("*__mypyc*.so"):
+            print(f"Removing stale mypyc artifact: {so_file}")
+            so_file.unlink()
+
+        for so_file in scheduler_dir.glob("*.so"):
+            print(f"Removing stale artifact: {so_file}")
+            so_file.unlink()
+
+    if use_mypyc:
+        print("-- Building scheduler mypyc extensions...", end=" ")
+        setup_mypyc = scheduler_dir / "setup_mypyc.py"
+        build_run(f'"{venv_python}" "{setup_mypyc}" build_ext --inplace',
+                  cwd=pyexecutor_dir)
+
+        # Verify that the shared library was generated
+        if not list(pyexecutor_dir.glob("*__mypyc*.so")) and not list(
+                scheduler_dir.glob("*.so")):
+            raise RuntimeError(
+                "Failed to build scheduler: no shared library generated.")
+        print("Done")
+    print("-- Done building pyexecutor scheduler.")
+
+
 def main(*,
          build_type: str = "Release",
          generator: str = "",
@@ -956,6 +986,7 @@ def main(*,
                         binding_lib_file_name)
 
     build_kv_cache_manager_v2(project_dir, venv_python, use_mypyc=mypyc)
+    build_pyexecutor_scheduler(project_dir, venv_python, use_mypyc=mypyc)
 
     if not skip_building_wheel:
         if dist_dir is None:

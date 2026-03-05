@@ -1,19 +1,28 @@
-"""Utility functions for request processing."""
+"""Utility functions for request processing and validation."""
 
 import os
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
+    from . import sampler as sampler_module
     from .scheduler import WaitingQueue
 
 import torch
 
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.disaggregated_params import DisaggScheduleStyle
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import CpType
 
 from ..distributed import Distributed
 from .hang_detector import HangDetector
-from .llm_request import ExecutorRequest, LlmRequest, executor_request_to_llm_request
+from .llm_request import (
+    ExecutorRequest,
+    LlmRequest,
+    LlmRequestState,
+    executor_request_to_llm_request,
+)
 
 # Type alias for request queue items (to avoid circular import)
 # The actual RequestQueueItem class is defined in executor_request_queue.py
@@ -460,6 +469,197 @@ def merge_requests(
     return merge_requests_to_llm_requests(new_requests, exclude_last_generation_logits)
 
 
+def balance_adp_requests(
+    context_requests: list[LlmRequest],
+    generation_requests: list[LlmRequest],
+    *,
+    dist,
+    max_batch_size: int,
+    enable_balance: bool,
+    timeout_iters: int,
+    batching_wait_iters: int,
+    ctx_waiting_count: int,
+    ctx_batching_count: int,
+) -> tuple[list[LlmRequest], int, int]:
+    """Balance ADP context requests across ranks.
+
+    Returns (balanced_requests, new_ctx_waiting_count, new_ctx_batching_count).
+    """
+    balanced_context_requests = context_requests
+    num_scheduled_context_requests = len(context_requests)
+    num_scheduled_generation_requests = len(generation_requests)
+    num_scheduled_tokens = (
+        sum([len(req.get_tokens(0)) for req in context_requests])
+        + num_scheduled_generation_requests
+    )
+    responses_list = dist.tp_allgather(
+        [num_scheduled_context_requests, num_scheduled_generation_requests, num_scheduled_tokens]
+    )
+    all_ranks_num_scheduled_context_requests = [response[0] for response in responses_list]
+    all_ranks_num_scheduled_generation_requests = [response[1] for response in responses_list]
+    all_ranks_have_free_ctx_slots = all(
+        [num_gen < max_batch_size for num_gen in all_ranks_num_scheduled_generation_requests]
+    )
+    all_ranks_have_ctx_requests = all(
+        [num_ctx > 0 for num_ctx in all_ranks_num_scheduled_context_requests]
+    )
+    all_ranks_have_gen_requests = all(
+        [num_gen > 0 for num_gen in all_ranks_num_scheduled_generation_requests]
+    )
+
+    if enable_balance:
+        if all_ranks_have_free_ctx_slots and all_ranks_have_ctx_requests:
+            ctx_waiting_count = 0
+            if all_ranks_have_gen_requests:
+                if ctx_batching_count < batching_wait_iters:
+                    ctx_batching_count += 1
+                    balanced_context_requests = []
+                else:
+                    ctx_batching_count = 0
+        else:
+            ctx_waiting_count += 1
+            balanced_context_requests = []
+            timeout_reached = ctx_waiting_count >= timeout_iters
+            if timeout_reached or not all_ranks_have_gen_requests:
+                ctx_waiting_count = 0
+                balanced_context_requests = context_requests
+    return balanced_context_requests, ctx_waiting_count, ctx_batching_count
+
+
+def check_batch_waiting(
+    context_requests: list[LlmRequest],
+    generation_requests: list[LlmRequest],
+    *,
+    batch_wait_iters_count: int,
+    batch_wait_timeout_iters: int,
+    batch_wait_max_tokens_ratio: float,
+    max_num_tokens: int,
+) -> tuple[list[LlmRequest], int]:
+    """Hold context requests if the batch is under-sized.
+
+    Returns (context_requests_or_empty, new_batch_wait_iters_count).
+    """
+    num_scheduled_ctx_tokens = sum(len(ctx_req.get_tokens(0)) for ctx_req in context_requests)
+    num_scheduled_gen_tokens = sum(1 + gen_req.num_draft_tokens for gen_req in generation_requests)
+    num_scheduled_tokens = num_scheduled_ctx_tokens + num_scheduled_gen_tokens
+
+    should_waiting = (
+        batch_wait_iters_count < batch_wait_timeout_iters
+        and num_scheduled_tokens < batch_wait_max_tokens_ratio * max_num_tokens
+    )
+    if should_waiting:
+        batch_wait_iters_count += 1
+        return [], batch_wait_iters_count
+
+    batch_wait_iters_count = 0
+    return context_requests, batch_wait_iters_count
+
+
+def prepare_draft_requests(
+    active_requests: List[LlmRequest],
+    max_total_draft_tokens: int,
+    use_spec_decode: bool,
+) -> None:
+    """Set py_draft_tokens / py_last_draft_tokens / py_draft_pages_allocated."""
+    for req in active_requests:
+        if req.state not in (
+            LlmRequestState.GENERATION_IN_PROGRESS,
+            LlmRequestState.DISAGG_GENERATION_INIT,
+        ):
+            continue
+
+        req.py_last_draft_tokens = req.py_draft_tokens
+
+        if (
+            max_total_draft_tokens > 0
+            and use_spec_decode
+            and not req.py_disable_speculative_decoding
+        ):
+            req.py_draft_tokens = [0] * max_total_draft_tokens
+            req.py_draft_pages_allocated = max_total_draft_tokens
+        else:
+            req.py_draft_tokens = []
+            req.py_draft_pages_allocated = 0
+
+
+def create_adp_dummy_request(
+    active_requests: List[LlmRequest],
+    *,
+    expected_num_active_requests: int,
+    kv_cache_manager,
+    kv_cache_transceiver,
+    is_warmup: bool,
+    max_total_draft_tokens: int,
+    num_fetch_requests: int,
+    benchmark_req_queues_size: int,
+) -> Optional[LlmRequest]:
+    """Create an ADP dummy generation request if needed. Returns the dummy or None."""
+    if expected_num_active_requests < len(active_requests):
+        raise RuntimeError(
+            f"expected_num_active_requests ({expected_num_active_requests}) "
+            f"< len(active_requests) ({len(active_requests)})"
+        )
+
+    if kv_cache_transceiver is None:
+        num_active_request = len(active_requests)
+    else:
+        num_active_request = len(
+            [
+                req
+                for req in active_requests
+                if not (
+                    req.is_disagg_generation_init_state
+                    or req.is_disagg_generation_transmission_in_progress
+                )
+            ]
+        )
+
+    # In benchmark disagg mode the fill loop saturates all slots with INIT
+    # requests simultaneously.  Skip dummy addition until KV transfers
+    # complete and real requests become active (num_active_request > 0).
+    if (
+        benchmark_req_queues_size > 0
+        and kv_cache_transceiver
+        and not is_warmup
+        and len(active_requests) > 0
+        and num_active_request == 0
+    ):
+        logger.info(
+            f"Skipped adding dummy requests: "
+            f"num_fetch_requests={num_fetch_requests}, "
+            f"{num_active_request=}"
+        )
+        return None
+
+    if expected_num_active_requests - num_active_request > 0 and num_active_request == 0:
+        llm_request = kv_cache_manager.add_dummy_requests(
+            request_ids=[0],
+            is_gen=True,
+            prepare_resource=True,
+            max_num_draft_tokens=max_total_draft_tokens,
+        )[0]
+        llm_request.is_attention_dp_dummy = True
+        return llm_request
+
+    return None
+
+
+def check_disagg_ctx_schedulable(
+    new_requests: List[LlmRequest],
+    kv_cache_transceiver,
+) -> None:
+    """Prepare disagg context requests with GENERATION_FIRST schedule style."""
+    ctx_only_requests = [
+        req
+        for req in new_requests
+        if req.is_context_only_request
+        and req.py_disaggregated_params is not None
+        and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+    ]
+    if ctx_only_requests:
+        kv_cache_transceiver.prepare_context_requests(ctx_only_requests)
+
+
 class RequestBroadcaster:
     """Broadcasts requests across distributed ranks (TP, PP, CP)."""
 
@@ -556,3 +756,93 @@ class RequestBroadcaster:
                 self.send_requests_handler = pp_send_func(payloads, self.dist.next_pp_rank, tag)
 
         return payloads
+
+
+# ---------------------------------------------------------------------------
+# Request validation
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class ValidationFailure:
+    request: LlmRequest
+    error_msg: str
+
+
+class RequestValidator:
+    """Validates incoming requests before they are activated."""
+
+    def __init__(
+        self,
+        *,
+        model_engine,
+        sampler: "sampler_module.Sampler",
+        max_beam_width: int,
+    ):
+        self._model_engine = model_engine
+        self._sampler = sampler
+        self._max_beam_width = max_beam_width
+
+    def _validate_token_id_range(self, request: LlmRequest) -> None:
+        # Lazy imports to avoid circular dependency:
+        # request_utils → models.modeling_llama → checkpoints → models.modeling_utils
+        from ..models import modeling_llama, modeling_utils
+
+        if isinstance(
+            self._model_engine.model,
+            modeling_utils.DecoderModelForCausalLM,
+        ):
+            # Only skip token-range checks for Llama4 when the request has multimodal data.
+            if isinstance(
+                self._model_engine.model,
+                modeling_llama.Llama4ForConditionalGeneration,
+            ):
+                has_mm = bool(request.py_multimodal_data)
+                if has_mm:
+                    logger.debug(
+                        f"Skipping token-range validation for {type(self._model_engine.model).__name__} "
+                        "(multimodal request)"
+                    )
+                    return
+
+            # FIXME: This check is necessary because of how Qwen2ForProcessRewardModel
+            #        subclasses DecoderModelForCausalLM. Perhaps the functionality
+            #        of DecoderModelForCausalLM reused by Qwen2ForProcessRewardModel
+            #        should be factored out into a separate class instead.
+            if not hasattr(self._model_engine.model, "lm_head"):
+                return
+
+            if not request.check_token_id_range(self._model_engine.model.lm_head.num_embeddings):
+                raise ValueError("Token ID out of range")
+
+    def validate_request(self, request: LlmRequest) -> None:
+        sampling_config = request.sampling_config
+        if sampling_config is not None:
+            if sampling_config.beam_width != self._max_beam_width:
+                raise ValueError(
+                    f"Request beam width {sampling_config.beam_width} "
+                    f"is not equal to max_beam_width {self._max_beam_width}. This is not supported!"
+                )
+
+        self._validate_token_id_range(request)
+        self._sampler.validate_request(request)
+
+    def validate_requests(
+        self, requests: List[LlmRequest]
+    ) -> Tuple[List[LlmRequest], List[ValidationFailure]]:
+        validated: List[LlmRequest] = []
+        failures: List[ValidationFailure] = []
+
+        for request in requests:
+            try:
+                self.validate_request(request)
+                validated.append(request)
+            except Exception as error:
+                failures.append(
+                    ValidationFailure(
+                        request=request,
+                        error_msg=str(error),
+                    )
+                )
+
+        return validated, failures
