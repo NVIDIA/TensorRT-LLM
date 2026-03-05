@@ -97,9 +97,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-2-7b-chat-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-8B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-8B-Instruct-FP8
+  yaml_extra: ['llama3_1_8b.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base

@@ -7,6 +7,10 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.transform.interface import TransformConfig
+from tensorrt_llm._torch.auto_deploy.transform.library.fuse_rmsnorm_quant_fp8 import (
+    FuseRMSNormQuantFP8,
+)
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import fp4_global_scale, fp8_scale
@@ -178,3 +182,49 @@ def test_fuse_quant_rewrites_fp4_linear(use_bias):
         None,  # dynamic_shapes
         False,  # skip_output_assert
     )
+
+
+class TinyRMSNormQuantFP8(nn.Module):
+    """Minimal graph containing flashinfer_rms_norm -> trtllm_quant_fp8_linear."""
+
+    def __init__(self, hidden_size=128):
+        super().__init__()
+        self.eps = 1e-5
+        self.norm_weight = nn.Parameter(
+            torch.ones(hidden_size, dtype=torch.bfloat16, device="cuda")
+        )
+        self.input_scale = nn.Buffer(torch.tensor(1.0, dtype=torch.float32, device="cuda"))
+
+        with torch.no_grad():
+            w_scale = torch.tensor(1.0, dtype=torch.float32, device="cuda")
+            w_bf16 = torch.randn(hidden_size, hidden_size, dtype=torch.bfloat16, device="cuda")
+            w_fp8 = (w_bf16 / w_scale).clamp(-448.0, 448.0).to(torch.float8_e4m3fn)
+        self.register_buffer("weight_fp8", w_fp8)
+        self.register_buffer("weight_scale", w_scale)
+
+    def forward(self, x):
+        norm_out = torch.ops.auto_deploy.flashinfer_rms_norm(x, self.norm_weight, self.eps)
+        return torch.ops.auto_deploy.trtllm_quant_fp8_linear(
+            norm_out,
+            self.weight_fp8,
+            None,
+            input_scale=self.input_scale,
+            weight_scale=self.weight_scale,
+        )
+
+
+@pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
+def test_fuse_rmsnorm_quant_fp8_rewrites_graph():
+    model = TinyRMSNormQuantFP8().cuda()
+    gm = torch.fx.symbolic_trace(model)
+
+    assert any(is_op(n, torch.ops.auto_deploy.flashinfer_rms_norm) for n in gm.graph.nodes)
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear) for n in gm.graph.nodes)
+
+    transform = FuseRMSNormQuantFP8(TransformConfig(stage="post_load_fusion"))
+    gm, info = transform._apply(gm, None, None, None)
+
+    assert info.num_matches == 1
+    assert any(is_op(n, torch.ops.auto_deploy.triton_rms_norm_quant_fp8) for n in gm.graph.nodes)
+    assert any(is_op(n, torch.ops.auto_deploy.trtllm_fp8_prequant_linear) for n in gm.graph.nodes)
+    assert not any(is_op(n, torch.ops.auto_deploy.trtllm_quant_fp8_linear) for n in gm.graph.nodes)

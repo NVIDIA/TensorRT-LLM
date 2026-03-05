@@ -142,6 +142,7 @@ transforms:
   fuse_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
+    requires_shape_prop: true
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -177,6 +178,9 @@ transforms:
   fuse_add_rms_norm:
     stage: post_load_fusion
     enabled: true
+  fuse_rmsnorm_quant_fp8:
+    stage: post_load_fusion
+    enabled: false
   gather_logits_before_lm_head:
     stage: post_load_fusion
     # TODO: fix https://github.com/NVIDIA/TensorRT-LLM/issues/9878 to enable by default
