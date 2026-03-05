@@ -512,6 +512,7 @@ description = "Collection of common python utils"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "etils-1.13.0-py3-none-any.whl", hash = "sha256:d9cd4f40fbe77ad6613b7348a18132cc511237b6c076dbb89105c0b520a4c6bb"},
     {file = "etils-1.13.0.tar.gz", hash = "sha256:a5b60c71f95bcd2d43d4e9fb3dc3879120c1f60472bb5ce19f7a860b1d44f607"},
@@ -533,6 +534,44 @@ ecolab = ["etils[enp]", "etils[epy]", "etils[etree]", "jupyter", "mediapy", "num
 edc = ["etils[epy]"]
 enp = ["einops", "etils[epy]", "numpy"]
 epath = ["etils[epy]", "fsspec", "importlib_resources", "typing_extensions", "zipp"]
+epath-gcs = ["etils[epath]", "gcsfs"]
+epath-s3 = ["etils[epath]", "s3fs"]
+epy = ["typing_extensions"]
+etqdm = ["absl-py", "etils[epy]", "tqdm"]
+etree = ["etils[array-types]", "etils[enp]", "etils[epy]", "etils[etqdm]"]
+etree-dm = ["dm-tree", "etils[etree]"]
+etree-jax = ["etils[etree]", "jax[cpu]"]
+etree-tf = ["etils[etree]", "tensorflow"]
+lazy-imports = ["etils[ecolab]"]
+
+[[package]]
+name = "etils"
+version = "1.14.0"
+description = "Collection of common python utils"
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+markers = "python_version >= \"3.11\""
+files = [
+    {file = "etils-1.14.0-py3-none-any.whl", hash = "sha256:b5df7341f54dbe1405a4450b2741207b4a8c279780402b45f87202b94dfc52b4"},
+    {file = "etils-1.14.0.tar.gz", hash = "sha256:8136e7f4c4173cd0af0ca5481c4475152f0b8686192951eefa60ee8711e1ede4"},
+]
+
+[package.dependencies]
+fsspec = {version = "*", optional = true, markers = "extra == \"epath\""}
+typing_extensions = {version = "*", optional = true, markers = "extra == \"epath\" or extra == \"epy\""}
+zipp = {version = "*", optional = true, markers = "extra == \"epath\""}
+
+[package.extras]
+all = ["etils[array-types]", "etils[eapp]", "etils[ecolab]", "etils[edc]", "etils[enp]", "etils[epath-gcs]", "etils[epath-s3]", "etils[epath]", "etils[epy]", "etils[etqdm]", "etils[etree-dm]", "etils[etree-jax]", "etils[etree-tf]", "etils[etree]"]
+array-types = ["etils[enp]"]
+dev = ["chex", "fiddle", "optree", "pydantic", "pyink", "pylint (>=2.6.0)", "pytest", "pytest-subtests", "pytest-xdist", "tensorflow_datasets", "torch"]
+docs = ["etils[all,dev]", "sphinx-apitree[ext]"]
+eapp = ["absl-py", "etils[epy]", "simple_parsing"]
+ecolab = ["etils[enp]", "etils[epy]", "etils[etree]", "jupyter", "mediapy", "numpy", "packaging", "protobuf"]
+edc = ["etils[epy]"]
+enp = ["einops", "etils[epy]", "numpy"]
+epath = ["etils[epy]", "fsspec", "typing_extensions", "zipp"]
 epath-gcs = ["etils[epath]", "gcsfs"]
 epath-s3 = ["etils[epath]", "s3fs"]
 epy = ["typing_extensions"]
@@ -996,6 +1035,7 @@ description = "Read resources from Python packages"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "importlib_resources-6.5.2-py3-none-any.whl", hash = "sha256:789cfdc3ed28c78b67a06acb8126751ced69a3d5f79c095a98298cd8a760ccec"},
     {file = "importlib_resources-6.5.2.tar.gz", hash = "sha256:185f87adef5bcc288449d98fb4fba07cea78bc036455dd44c5fc4a2fe78fed2c"},
@@ -1783,14 +1823,14 @@ nvidia-nvjitlink-cu12 = "*"
 
 [[package]]
 name = "nvidia-nccl-cu12"
-version = "2.29.3"
+version = "2.29.7"
 description = "NVIDIA Collective Communication Library (NCCL) Runtime"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 files = [
-    {file = "nvidia_nccl_cu12-2.29.3-py3-none-manylinux_2_18_aarch64.whl", hash = "sha256:6351b79dc7d2cc3d654ea1523616b9eeded71fe9c8da66b71eef9a5d1b2adad4"},
-    {file = "nvidia_nccl_cu12-2.29.3-py3-none-manylinux_2_18_x86_64.whl", hash = "sha256:35ad42e7d5d722a83c36a3a478e281c20a5646383deaf1b9ed1a9ab7d61bed53"},
+    {file = "nvidia_nccl_cu12-2.29.7-py3-none-manylinux_2_18_aarch64.whl", hash = "sha256:0cf032ee22b560447daf0456108a75e32bd74a4de6c6b64725637a359fa48cd8"},
+    {file = "nvidia_nccl_cu12-2.29.7-py3-none-manylinux_2_18_x86_64.whl", hash = "sha256:ecd0a012051abc20c1aa87328841efa8cade3ced65803046e38c2f03c0891fea"},
 ]
 
 [[package]]
@@ -2311,15 +2351,15 @@ six = ">=1.5"
 
 [[package]]
 name = "pytz"
-version = "2025.2"
+version = "2026.1.post1"
 description = "World timezone definitions, modern and historical"
 optional = false
 python-versions = "*"
 groups = ["main"]
 markers = "python_version == \"3.10\""
 files = [
-    {file = "pytz-2025.2-py2.py3-none-any.whl", hash = "sha256:5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00"},
-    {file = "pytz-2025.2.tar.gz", hash = "sha256:360b9e3dbb49a209c21ad61809c7fb453643e048b38924c765813546746e81c3"},
+    {file = "pytz-2026.1.post1-py2.py3-none-any.whl", hash = "sha256:f2fd16142fda348286a75e1a524be810bb05d444e5a081f37f7affc635035f7a"},
+    {file = "pytz-2026.1.post1.tar.gz", hash = "sha256:3378dde6a0c3d26719182142c56e60c7f9af7e968076f31aae569d72a0358ee1"},
 ]
 
 [[package]]
@@ -2843,14 +2883,14 @@ files = [
 
 [[package]]
 name = "tabulate"
-version = "0.9.0"
+version = "0.10.0"
 description = "Pretty-print tabular data"
 optional = false
-python-versions = ">=3.7"
+python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "tabulate-0.9.0-py3-none-any.whl", hash = "sha256:024ca478df22e9340661486f85298cff5f6dcdba14f3813e8830015b9ed1948f"},
-    {file = "tabulate-0.9.0.tar.gz", hash = "sha256:0095b12bf5966de529c0feb1fa08671671b3368eec77d7ef7ab114be2c068b3c"},
+    {file = "tabulate-0.10.0-py3-none-any.whl", hash = "sha256:f0b0622e567335c8fabaaa659f1b33bcb6ddfe2e496071b743aa113f8774f2d3"},
+    {file = "tabulate-0.10.0.tar.gz", hash = "sha256:e2cfde8f79420f6deeffdeda9aaec3b6bc5abce947655d17ac662b126e48a60d"},
 ]
 
 [package.extras]

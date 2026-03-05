@@ -125,6 +125,12 @@ torch::Tensor fp8_per_tensor_scale_moe_runner(torch::optional<torch::Tensor> con
     {
         TORCH_CHECK(top_k == 1, "Current routing kernel (no groups, Llama4) only supports top_k=1.");
     }
+    else if (static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::Renormalize
+        || static_cast<RoutingMethodType>(routing_method_type) == RoutingMethodType::RenormalizeNaive)
+    {
+        TORCH_CHECK(top_k <= 32 && top_k > 0,
+            "Current routing kernel (no groups, renormalize) only supports top_k<=32 && top_k>0.");
+    }
 
     TORCH_CHECK(num_experts % 4 == 0, "Routing kernel expects that num_experts must be divisible by 4");
     TORCH_CHECK(num_experts > top_k, "num_experts must be greater than top_k");

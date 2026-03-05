@@ -208,23 +208,23 @@ __global__ void deepseek_v3_topk_kernel(InputT* scores, OutputT* topkValues, Idx
         if (warpIdx == 0)
         {
             int constexpr NumInterTopKPerThread = (NumInterTopK - 1) / WARP_SIZE + 1;
-            float intermidiateScore[NumInterTopKPerThread];
-            int32_t intermidiateExpert[NumInterTopKPerThread];
+            float intermediateScore[NumInterTopKPerThread];
+            int32_t intermediateExpert[NumInterTopKPerThread];
             for (int i = laneIdx; i < NumInterTopKPerThread * WARP_SIZE; i += WARP_SIZE)
             {
                 int ii = i / WARP_SIZE;
                 if (i < NumInterTopK)
                 {
-                    intermidiateScore[ii] = smemInterTopScores[i];
-                    intermidiateExpert[ii] = smemInterTopExperts[i];
+                    intermediateScore[ii] = smemInterTopScores[i];
+                    intermediateExpert[ii] = smemInterTopExperts[i];
                 }
                 else
                 {
-                    intermidiateScore[ii] = invalidScoreFloat;
-                    intermidiateExpert[ii] = MaxNumExperts - 1;
+                    intermediateScore[ii] = invalidScoreFloat;
+                    intermediateExpert[ii] = MaxNumExperts - 1;
                 }
             }
-            reduce_topk::reduceTopK(warp, topScores, topExperts, intermidiateScore, intermidiateExpert,
+            reduce_topk::reduceTopK(warp, topScores, topExperts, intermediateScore, intermediateExpert,
                 /* minValue */ invalidScoreFloat, topk);
         }
     }

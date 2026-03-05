@@ -502,6 +502,7 @@ description = "Collection of common python utils"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "etils-1.13.0-py3-none-any.whl", hash = "sha256:d9cd4f40fbe77ad6613b7348a18132cc511237b6c076dbb89105c0b520a4c6bb"},
     {file = "etils-1.13.0.tar.gz", hash = "sha256:a5b60c71f95bcd2d43d4e9fb3dc3879120c1f60472bb5ce19f7a860b1d44f607"},
@@ -523,6 +524,44 @@ ecolab = ["etils[enp]", "etils[epy]", "etils[etree]", "jupyter", "mediapy", "num
 edc = ["etils[epy]"]
 enp = ["einops", "etils[epy]", "numpy"]
 epath = ["etils[epy]", "fsspec", "importlib_resources", "typing_extensions", "zipp"]
+epath-gcs = ["etils[epath]", "gcsfs"]
+epath-s3 = ["etils[epath]", "s3fs"]
+epy = ["typing_extensions"]
+etqdm = ["absl-py", "etils[epy]", "tqdm"]
+etree = ["etils[array-types]", "etils[enp]", "etils[epy]", "etils[etqdm]"]
+etree-dm = ["dm-tree", "etils[etree]"]
+etree-jax = ["etils[etree]", "jax[cpu]"]
+etree-tf = ["etils[etree]", "tensorflow"]
+lazy-imports = ["etils[ecolab]"]
+
+[[package]]
+name = "etils"
+version = "1.14.0"
+description = "Collection of common python utils"
+optional = false
+python-versions = ">=3.11"
+groups = ["main"]
+markers = "python_version >= \"3.11\""
+files = [
+    {file = "etils-1.14.0-py3-none-any.whl", hash = "sha256:b5df7341f54dbe1405a4450b2741207b4a8c279780402b45f87202b94dfc52b4"},
+    {file = "etils-1.14.0.tar.gz", hash = "sha256:8136e7f4c4173cd0af0ca5481c4475152f0b8686192951eefa60ee8711e1ede4"},
+]
+
+[package.dependencies]
+fsspec = {version = "*", optional = true, markers = "extra == \"epath\""}
+typing_extensions = {version = "*", optional = true, markers = "extra == \"epath\" or extra == \"epy\""}
+zipp = {version = "*", optional = true, markers = "extra == \"epath\""}
+
+[package.extras]
+all = ["etils[array-types]", "etils[eapp]", "etils[ecolab]", "etils[edc]", "etils[enp]", "etils[epath-gcs]", "etils[epath-s3]", "etils[epath]", "etils[epy]", "etils[etqdm]", "etils[etree-dm]", "etils[etree-jax]", "etils[etree-tf]", "etils[etree]"]
+array-types = ["etils[enp]"]
+dev = ["chex", "fiddle", "optree", "pydantic", "pyink", "pylint (>=2.6.0)", "pytest", "pytest-subtests", "pytest-xdist", "tensorflow_datasets", "torch"]
+docs = ["etils[all,dev]", "sphinx-apitree[ext]"]
+eapp = ["absl-py", "etils[epy]", "simple_parsing"]
+ecolab = ["etils[enp]", "etils[epy]", "etils[etree]", "jupyter", "mediapy", "numpy", "packaging", "protobuf"]
+edc = ["etils[epy]"]
+enp = ["einops", "etils[epy]", "numpy"]
+epath = ["etils[epy]", "fsspec", "typing_extensions", "zipp"]
 epath-gcs = ["etils[epath]", "gcsfs"]
 epath-s3 = ["etils[epath]", "s3fs"]
 epy = ["typing_extensions"]
@@ -971,6 +1010,7 @@ description = "Read resources from Python packages"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
+markers = "python_version == \"3.10\""
 files = [
     {file = "importlib_resources-6.5.2-py3-none-any.whl", hash = "sha256:789cfdc3ed28c78b67a06acb8126751ced69a3d5f79c095a98298cd8a760ccec"},
     {file = "importlib_resources-6.5.2.tar.gz", hash = "sha256:185f87adef5bcc288449d98fb4fba07cea78bc036455dd44c5fc4a2fe78fed2c"},
@@ -2023,15 +2063,15 @@ six = ">=1.5"
 
 [[package]]
 name = "pytz"
-version = "2025.2"
+version = "2026.1.post1"
 description = "World timezone definitions, modern and historical"
 optional = false
 python-versions = "*"
 groups = ["main"]
 markers = "python_version == \"3.10\""
 files = [
-    {file = "pytz-2025.2-py2.py3-none-any.whl", hash = "sha256:5ddf76296dd8c44c26eb8f4b6f35488f3ccbf6fbbd7adee0b7262d43f0ec2f00"},
-    {file = "pytz-2025.2.tar.gz", hash = "sha256:360b9e3dbb49a209c21ad61809c7fb453643e048b38924c765813546746e81c3"},
+    {file = "pytz-2026.1.post1-py2.py3-none-any.whl", hash = "sha256:f2fd16142fda348286a75e1a524be810bb05d444e5a081f37f7affc635035f7a"},
+    {file = "pytz-2026.1.post1.tar.gz", hash = "sha256:3378dde6a0c3d26719182142c56e60c7f9af7e968076f31aae569d72a0358ee1"},
 ]
 
 [[package]]
@@ -2799,14 +2839,14 @@ telegram = ["requests"]
 
 [[package]]
 name = "transformers"
-version = "5.2.0"
+version = "5.3.0"
 description = "Transformers: the model-definition framework for state-of-the-art machine learning models in text, vision, audio, and multimodal models, for both inference and training."
 optional = false
 python-versions = ">=3.10.0"
 groups = ["main"]
 files = [
-    {file = "transformers-5.2.0-py3-none-any.whl", hash = "sha256:9ecaf243dc45bee11a7d93f8caf03746accc0cb069181bbf4ad8566c53e854b4"},
-    {file = "transformers-5.2.0.tar.gz", hash = "sha256:0088b8b46ccc9eff1a1dca72b5d618a5ee3b1befc3e418c9512b35dea9f9a650"},
+    {file = "transformers-5.3.0-py3-none-any.whl", hash = "sha256:50ac8c89c3c7033444fb3f9f53138096b997ebb70d4b5e50a2e810bf12d3d29a"},
+    {file = "transformers-5.3.0.tar.gz", hash = "sha256:009555b364029da9e2946d41f1c5de9f15e6b1df46b189b7293f33a161b9c557"},
 ]
 
 [package.dependencies]
@@ -2818,7 +2858,7 @@ regex = "!=2019.12.17"
 safetensors = ">=0.4.3"
 tokenizers = ">=0.22.0,<=0.23.0"
 tqdm = ">=4.27"
-typer-slim = "*"
+typer = "*"
 
 [package.extras]
 accelerate = ["accelerate (>=1.1.0)"]
@@ -2828,8 +2868,8 @@ benchmark = ["optimum-benchmark (>=0.3.0)"]
 chat-template = ["jinja2 (>=3.1.0)", "jmespath (>=1.0.1)"]
 codecarbon = ["codecarbon (>=2.8.1)"]
 deepspeed = ["accelerate (>=1.1.0)", "deepspeed (>=0.9.3)"]
-deepspeed-testing = ["GitPython (<3.1.19)", "accelerate (>=1.1.0)", "accelerate (>=1.1.0)", "beautifulsoup4", "datasets (>=2.15.0)", "datasets (>=2.15.0)", "deepspeed (>=0.9.3)", "dill (<0.3.5)", "evaluate (>=0.4.6)", "faiss-cpu", "fastapi", "filelock", "libcst", "mistral-common[image] (>=1.8.8)", "nltk (<=3.8.1)", "openai (>=1.98.0)", "optuna", "parameterized (>=0.9)", "protobuf", "protobuf", "psutil", "pydantic (>=2)", "pytest (>=7.2.0,<9.0.0)", "pytest-asyncio (>=1.2.0)", "pytest-env", "pytest-order", "pytest-random-order", "pytest-rerunfailures (<16.0)", "pytest-rich", "pytest-timeout", "pytest-xdist", "rich", "rich", "rjieba", "rouge-score (!=0.0.7,!=0.0.8,!=0.1,!=0.1.1)", "ruff (==0.14.10)", "sacrebleu (>=1.4.12,<2.0.0)", "sacremoses", "sentencepiece (>=0.1.91,!=0.1.92)", "sentencepiece (>=0.1.91,!=0.1.92)", "starlette", "tensorboard", "timeout-decorator", "torch (>=2.4)", "urllib3 (<2.0.0)", "uvicorn"]
-dev = ["GitPython (<3.1.19)", "Pillow (>=10.0.1,<=15.0)", "accelerate (>=1.1.0)", "accelerate (>=1.1.0)", "av", "beautifulsoup4", "blobfile", "datasets (>=2.15.0)", "datasets (>=2.15.0)", "dill (<0.3.5)", "evaluate (>=0.4.6)", "faiss-cpu", "fastapi", "filelock", "fugashi (>=1.0)", "ipadic (>=1.0.0,<2.0)", "jinja2 (>=3.1.0)", "jmespath (>=1.0.1)", "kernels (>=0.10.2,<0.11)", "libcst", "librosa", "mistral-common[image] (>=1.8.8)", "mistral-common[image] (>=1.8.8)", "nltk (<=3.8.1)", "num2words", "openai (>=1.98.0)", "parameterized (>=0.9)", "phonemizer", "protobuf", "protobuf", "psutil", "pyctcdecode (>=0.4.0)", "pydantic (>=2)", "pytest (>=7.2.0,<9.0.0)", "pytest-asyncio (>=1.2.0)", "pytest-env", "pytest-order", "pytest-random-order", "pytest-rerunfailures (<16.0)", "pytest-rich", "pytest-timeout", "pytest-xdist", "rhoknp (>=1.1.0,<1.3.1)", "rich", "rich", "rjieba", "rouge-score (!=0.0.7,!=0.0.8,!=0.1,!=0.1.1)", "ruff (==0.14.10)", "sacrebleu (>=1.4.12,<2.0.0)", "sacremoses", "scikit-learn", "sentencepiece (>=0.1.91,!=0.1.92)", "sentencepiece (>=0.1.91,!=0.1.92)", "starlette", "sudachidict_core (>=20220729)", "sudachipy (>=0.6.6)", "tensorboard", "tiktoken", "timeout-decorator", "timm (>=1.0.23)", "torch (>=2.4)", "torch (>=2.4)", "torchaudio", "torchvision", "unidic (>=1.0.2)", "unidic_lite (>=1.0.7)", "urllib3 (<2.0.0)", "uvicorn"]
+deepspeed-testing = ["GitPython (<3.1.19)", "accelerate (>=1.1.0)", "accelerate (>=1.1.0)", "beautifulsoup4", "datasets (>=2.15.0)", "datasets (>=2.15.0)", "deepspeed (>=0.9.3)", "dill (<0.3.5)", "evaluate (>=0.4.6)", "faiss-cpu", "fastapi", "filelock", "libcst", "mistral-common[image] (>=1.8.8)", "nltk (<=3.8.1)", "openai (>=1.98.0)", "optuna", "parameterized (>=0.9)", "protobuf", "protobuf", "psutil", "pydantic (>=2)", "pytest (>=7.2.0,<9.0.0)", "pytest-asyncio (>=1.2.0)", "pytest-env", "pytest-order", "pytest-random-order", "pytest-rerunfailures (<16.0)", "pytest-rich", "pytest-timeout", "pytest-xdist", "rich", "rich", "rjieba", "rouge-score (!=0.0.7,!=0.0.8,!=0.1,!=0.1.1)", "ruff (==0.14.10)", "sacrebleu (>=1.4.12,<2.0.0)", "sacremoses", "sentencepiece (>=0.1.91,!=0.1.92)", "sentencepiece (>=0.1.91,!=0.1.92)", "starlette", "tensorboard", "timeout-decorator", "torch (>=2.4)", "ty (==0.0.12)", "urllib3 (<2.0.0)", "uvicorn"]
+dev = ["GitPython (<3.1.19)", "Pillow (>=10.0.1,<=15.0)", "accelerate (>=1.1.0)", "accelerate (>=1.1.0)", "av", "beautifulsoup4", "blobfile", "datasets (>=2.15.0)", "datasets (>=2.15.0)", "dill (<0.3.5)", "evaluate (>=0.4.6)", "faiss-cpu", "fastapi", "filelock", "fugashi (>=1.0)", "ipadic (>=1.0.0,<2.0)", "jinja2 (>=3.1.0)", "jmespath (>=1.0.1)", "kernels (>=0.10.2,<0.11)", "libcst", "librosa", "mistral-common[image] (>=1.8.8)", "mistral-common[image] (>=1.8.8)", "nltk (<=3.8.1)", "num2words", "openai (>=1.98.0)", "parameterized (>=0.9)", "phonemizer", "protobuf", "protobuf", "psutil", "pyctcdecode (>=0.4.0)", "pydantic (>=2)", "pytest (>=7.2.0,<9.0.0)", "pytest-asyncio (>=1.2.0)", "pytest-env", "pytest-order", "pytest-random-order", "pytest-rerunfailures (<16.0)", "pytest-rich", "pytest-timeout", "pytest-xdist", "rhoknp (>=1.1.0,<1.3.1)", "rich", "rich", "rjieba", "rouge-score (!=0.0.7,!=0.0.8,!=0.1,!=0.1.1)", "ruff (==0.14.10)", "sacrebleu (>=1.4.12,<2.0.0)", "sacremoses", "scikit-learn", "sentencepiece (>=0.1.91,!=0.1.92)", "sentencepiece (>=0.1.91,!=0.1.92)", "starlette", "sudachidict_core (>=20220729)", "sudachipy (>=0.6.6)", "tensorboard", "tiktoken", "timeout-decorator", "timm (>=1.0.23)", "torch (>=2.4)", "torch (>=2.4)", "torchaudio", "torchvision", "ty (==0.0.12)", "unidic (>=1.0.2)", "unidic_lite (>=1.0.7)", "urllib3 (<2.0.0)", "uvicorn"]
 integrations = ["codecarbon (>=2.8.1)", "kernels (>=0.10.2,<0.11)", "optuna", "ray[tune] (>=2.7.0)"]
 ja = ["fugashi (>=1.0)", "ipadic (>=1.0.0,<2.0)", "rhoknp (>=1.1.0,<1.3.1)", "sudachidict_core (>=20220729)", "sudachipy (>=0.6.6)", "unidic (>=1.0.2)", "unidic_lite (>=1.0.7)"]
 kernels = ["kernels (>=0.10.2,<0.11)"]
@@ -2837,14 +2877,14 @@ mistral-common = ["mistral-common[image] (>=1.8.8)"]
 num2words = ["num2words"]
 open-telemetry = ["opentelemetry-api", "opentelemetry-exporter-otlp", "opentelemetry-sdk"]
 optuna = ["optuna"]
-quality = ["GitPython (<3.1.19)", "datasets (>=2.15.0)", "libcst", "rich", "ruff (==0.14.10)", "urllib3 (<2.0.0)"]
+quality = ["GitPython (<3.1.19)", "datasets (>=2.15.0)", "libcst", "rich", "ruff (==0.14.10)", "ty (==0.0.12)", "urllib3 (<2.0.0)"]
 ray = ["ray[tune] (>=2.7.0)"]
 retrieval = ["datasets (>=2.15.0)", "faiss-cpu"]
 sagemaker = ["sagemaker (>=2.31.0)"]
 sentencepiece = ["protobuf", "sentencepiece (>=0.1.91,!=0.1.92)"]
 serving = ["accelerate (>=1.1.0)", "fastapi", "openai (>=1.98.0)", "pydantic (>=2)", "rich", "starlette", "torch (>=2.4)", "uvicorn"]
 sklearn = ["scikit-learn"]
-testing = ["GitPython (<3.1.19)", "accelerate (>=1.1.0)", "beautifulsoup4", "datasets (>=2.15.0)", "datasets (>=2.15.0)", "dill (<0.3.5)", "evaluate (>=0.4.6)", "faiss-cpu", "fastapi", "filelock", "libcst", "mistral-common[image] (>=1.8.8)", "nltk (<=3.8.1)", "openai (>=1.98.0)", "parameterized (>=0.9)", "protobuf", "psutil", "pydantic (>=2)", "pytest (>=7.2.0,<9.0.0)", "pytest-asyncio (>=1.2.0)", "pytest-env", "pytest-order", "pytest-random-order", "pytest-rerunfailures (<16.0)", "pytest-rich", "pytest-timeout", "pytest-xdist", "rich", "rich", "rjieba", "rouge-score (!=0.0.7,!=0.0.8,!=0.1,!=0.1.1)", "ruff (==0.14.10)", "sacrebleu (>=1.4.12,<2.0.0)", "sacremoses", "sentencepiece (>=0.1.91,!=0.1.92)", "starlette", "tensorboard", "timeout-decorator", "torch (>=2.4)", "urllib3 (<2.0.0)", "uvicorn"]
+testing = ["GitPython (<3.1.19)", "accelerate (>=1.1.0)", "beautifulsoup4", "datasets (>=2.15.0)", "datasets (>=2.15.0)", "dill (<0.3.5)", "evaluate (>=0.4.6)", "faiss-cpu", "fastapi", "filelock", "libcst", "mistral-common[image] (>=1.8.8)", "nltk (<=3.8.1)", "openai (>=1.98.0)", "parameterized (>=0.9)", "protobuf", "psutil", "pydantic (>=2)", "pytest (>=7.2.0,<9.0.0)", "pytest-asyncio (>=1.2.0)", "pytest-env", "pytest-order", "pytest-random-order", "pytest-rerunfailures (<16.0)", "pytest-rich", "pytest-timeout", "pytest-xdist", "rich", "rich", "rjieba", "rouge-score (!=0.0.7,!=0.0.8,!=0.1,!=0.1.1)", "ruff (==0.14.10)", "sacrebleu (>=1.4.12,<2.0.0)", "sacremoses", "sentencepiece (>=0.1.91,!=0.1.92)", "starlette", "tensorboard", "timeout-decorator", "torch (>=2.4)", "ty (==0.0.12)", "urllib3 (<2.0.0)", "uvicorn"]
 tiktoken = ["blobfile", "tiktoken"]
 timm = ["timm (>=1.0.23)"]
 torch = ["accelerate (>=1.1.0)", "torch (>=2.4)"]
@@ -2905,21 +2945,6 @@ annotated-doc = ">=0.0.2"
 click = ">=8.2.1"
 rich = ">=12.3.0"
 shellingham = ">=1.3.0"
-
-[[package]]
-name = "typer-slim"
-version = "0.24.0"
-description = "Typer, build great CLIs. Easy to code. Based on Python type hints."
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "typer_slim-0.24.0-py3-none-any.whl", hash = "sha256:d5d7ee1ee2834d5020c7c616ed5e0d0f29b9a4b1dd283bdebae198ec09778d0e"},
-    {file = "typer_slim-0.24.0.tar.gz", hash = "sha256:f0ed36127183f52ae6ced2ecb2521789995992c521a46083bfcdbb652d22ad34"},
-]
-
-[package.dependencies]
-typer = ">=0.24.0"
 
 [[package]]
 name = "typing-extensions"

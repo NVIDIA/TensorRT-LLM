@@ -408,18 +408,6 @@ def should_skip_deepgemm(
     if backend_type != MoeBackendType.DEEPGEMM:
         return None
 
-    # DeepGemm workspace allocation in set_strides (fused_moe_deepgemm.py) uses a
-    # storage size that is 4x too small when combined with DeepEPLowLatency dispatch.
-    # The workspace is allocated based on assumptions that do not account for the
-    # DeepEPLowLatency output format ([num_local_experts, ep_size * max_tokens, hidden_size]).
-    if comm_method == "DEEPEPLOWLATENCY":
-        return (
-            "[Potential Bug] DeepGemmFusedMoE workspace allocation is incompatible "
-            "with DeepEPLowLatency: set_strides requires storage of "
-            "[num_local_experts * tokens * hidden_size] bytes but the allocated "
-            "workspace is ~4x too small, causing setStorage out of bounds."
-        )
-
     # Issue: DEEPGEMM + FP8_BLOCK_SCALES crashes with CUDA illegal memory access
     # on large expert counts (e.g. e384_k8_h7168_i2048) during post_load_weights().
     # The crash occurs in get_col_major_tma_aligned_packed_tensor (fp8_utils.py)
