@@ -523,6 +523,7 @@ def _handle_decode(
     kv_b_proj_weight: torch.Tensor,
     latent_cache: torch.Tensor,
     num_tokens: int,
+    num_prefill: int,
     num_heads: int,
     num_kv_heads: int,
     qk_nope_head_dim: int,
@@ -574,12 +575,9 @@ def _handle_decode(
     )
 
     cu_q = torch.arange(num_tokens + 1, dtype=torch.int32, device=q_nope_flat.device) * num_heads
-    cu_kv = torch.zeros(
-        num_tokens + 1,
-        dtype=torch.int32,
-        device=q_nope_flat.device,
-    )
-    cu_kv[1:] = sequence_length[:num_tokens].cumsum(0)
+    cu_kv = torch.zeros(num_tokens + 1, dtype=torch.int32, device=q_nope_flat.device)
+    num_seq = num_prefill + num_tokens
+    cu_kv[1:] = sequence_length[num_prefill:num_seq].cumsum(0)
 
     _call_thop_attention_mla(
         fused_q_flat,
@@ -612,7 +610,7 @@ def _handle_decode(
         host_kv_cache_pool_mapping,
         cu_q_seqlens=cu_q,
         cu_kv_seqlens=cu_kv,
-        fmha_scheduler_counter=_GlobalTrtllmMLAPlanner.fmha_scheduler_counter,
+        fmha_scheduler_counter=torch.zeros(1, dtype=torch.uint32, device=q_nope_flat.device),
     )
 
     # Project from latent space back to v_head_dim
@@ -799,6 +797,7 @@ def trtllm_mla_with_cache(
             kv_b_proj_weight,
             latent_cache[num_prefill_tokens:num_tokens],
             num_decode,
+            num_prefill,
             *_make_decode_shared(),
         )
     elif num_prefill > 0:
@@ -816,6 +815,7 @@ def trtllm_mla_with_cache(
             kv_b_proj_weight,
             latent_cache,
             num_tokens,
+            0,
             *_make_decode_shared(),
         )
 
