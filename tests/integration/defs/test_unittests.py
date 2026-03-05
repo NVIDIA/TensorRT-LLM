@@ -141,7 +141,7 @@ def test_unittests_v2(llm_root, llm_venv, case: str, output_dir, request):
         "-vv",
         "--tb=short",
         "-rF",
-        "--timeout=30",
+        "--timeout=2400",
         "--timeout-method=thread",
         "--periodic-junit",
         "--periodic-batch-size=1",

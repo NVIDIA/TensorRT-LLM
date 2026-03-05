@@ -1,6 +1,5 @@
 import pickle
 import sys
-import time
 import traceback
 
 import cloudpickle
@@ -277,7 +276,6 @@ def test_mlp(mpi_pool_executor):
                          ids=["balanced", "unbalanced"])
 @pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
 def test_column_linear(hidden_size, mpi_pool_executor):
-    time.sleep(30)
     torch.manual_seed(42)
     seq_len = 10
     dtype = torch.bfloat16
