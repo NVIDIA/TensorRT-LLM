@@ -45,14 +45,11 @@ jobs:
         with:
           use_rest_api: true  # use GitHub API so base commit need not be in local repo
 
-      - name: Write changed files list
+      - name: Run pre-commit checks
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
             echo "${{ steps.changed-files.outputs.all_modified_files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
+            python3 -u scripts/release_check.py --files-from changed_files.txt
           else
-            touch changed_files.txt
+            python3 -u scripts/release_check.py
           fi
-
-      - name: Run pre-commit checks
-        run: |
-          python3 -u scripts/release_check.py --files-from changed_files.txt
