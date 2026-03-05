@@ -27,7 +27,9 @@ import os
 
 os.environ["TLLM_DISABLE_MPI"] = "1"
 
+import datetime
 import gc
+import socket
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -260,7 +262,7 @@ def _transformer_inputs(device: str = "cuda"):
 # ============================================================================
 
 
-def _cfg_worker(rank, world_size, checkpoint_path, inputs, return_dict):
+def _cfg_worker(rank, world_size, checkpoint_path, inputs, return_dict, master_port):
     """Load pipeline with CFG parallel and run one denoising step per rank."""
     import os as _os
 
@@ -270,12 +272,17 @@ def _cfg_worker(rank, world_size, checkpoint_path, inputs, return_dict):
     _os.environ.update(
         {
             "MASTER_ADDR": "localhost",
-            "MASTER_PORT": "12355",
+            "MASTER_PORT": str(master_port),
             "RANK": str(rank),
             "WORLD_SIZE": str(world_size),
         }
     )
-    dist.init_process_group("nccl", rank=rank, world_size=world_size)
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=60),
+    )
     torch.cuda.set_device(rank)
 
     try:
@@ -292,7 +299,12 @@ def _cfg_worker(rank, world_size, checkpoint_path, inputs, return_dict):
             )
         ).load(skip_warmup=True)
 
-        prompt_embeds, neg_embeds, latents, timestep = [t.to(f"cuda:{rank}") for t in inputs]
+        prompt_embeds, neg_embeds, latents, timestep = [
+            t.to(f"cuda:{rank}")
+            if t.dtype == torch.long
+            else t.to(f"cuda:{rank}", dtype=torch.bfloat16)
+            for t in inputs
+        ]
 
         cfg = pipeline._setup_cfg_config(
             guidance_scale=5.0,
@@ -306,6 +318,98 @@ def _cfg_worker(rank, world_size, checkpoint_path, inputs, return_dict):
         expected_embeds = prompt_embeds if cfg["cfg_group"] == 0 else neg_embeds
         assert torch.allclose(cfg["local_embeds"], expected_embeds), (
             f"Rank {rank}: local_embeds does not match expected branch"
+        )
+
+        transformer = pipeline.transformer
+
+        def _fwd(lat, _extra, ts, enc, _tensors):
+            return transformer(hidden_states=lat, timestep=ts, encoder_hidden_states=enc)
+
+        with torch.no_grad():
+            noise_pred, *_ = pipeline._denoise_step_cfg_parallel(
+                latents=latents,
+                extra_stream_latents={},
+                timestep=timestep,
+                local_embeds=cfg["local_embeds"],
+                forward_fn=_fwd,
+                guidance_scale=5.0,
+                guidance_rescale=0.0,
+                ulysses_size=cfg["ulysses_size"],
+                local_extras={},
+            )
+
+        assert not torch.isnan(noise_pred).any(), f"Rank {rank}: NaN in output"
+        assert not torch.isinf(noise_pred).any(), f"Rank {rank}: Inf in output"
+
+        if rank == 0:
+            return_dict["output"] = noise_pred.cpu()
+
+        del pipeline
+        torch.cuda.empty_cache()
+
+    finally:
+        dist.destroy_process_group()
+
+
+# ============================================================================
+# CFG + TeaCache + FP8 blockwise worker — module-level for mp.spawn pickling
+# ============================================================================
+
+
+def _cfg_teacache_fp8_worker(rank, world_size, checkpoint_path, inputs, return_dict, master_port):
+    """Load pipeline with CFG parallel + TeaCache + FP8 blockwise and run one denoising step."""
+    import os as _os
+
+    import torch.distributed as dist
+
+    _os.environ.pop("TLLM_DISABLE_MPI", None)
+    _os.environ.update(
+        {
+            "MASTER_ADDR": "localhost",
+            "MASTER_PORT": str(master_port),
+            "RANK": str(rank),
+            "WORLD_SIZE": str(world_size),
+        }
+    )
+    dist.init_process_group(
+        "nccl",
+        rank=rank,
+        world_size=world_size,
+        timeout=datetime.timedelta(seconds=60),
+    )
+    torch.cuda.set_device(rank)
+
+    try:
+        from tensorrt_llm._torch.visual_gen.config import (
+            DiffusionArgs,
+            ParallelConfig,
+            TeaCacheConfig,
+        )
+        from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
+
+        pipeline = PipelineLoader(
+            DiffusionArgs(
+                checkpoint_path=checkpoint_path,
+                device=f"cuda:{rank}",
+                dtype="bfloat16",
+                skip_components=_SKIP_AUX,
+                quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+                teacache=TeaCacheConfig(enable_teacache=True, teacache_thresh=0.2),
+                parallel=ParallelConfig(dit_cfg_size=world_size),
+            )
+        ).load(skip_warmup=True)
+
+        prompt_embeds, neg_embeds, latents, timestep = [
+            t.to(f"cuda:{rank}")
+            if t.dtype == torch.long
+            else t.to(f"cuda:{rank}", dtype=torch.bfloat16)
+            for t in inputs
+        ]
+
+        cfg = pipeline._setup_cfg_config(
+            guidance_scale=5.0,
+            prompt_embeds=prompt_embeds,
+            neg_prompt_embeds=neg_embeds,
         )
 
         transformer = pipeline.transformer
@@ -464,6 +568,13 @@ class TestWanPipelineFeatures:
 
     def test_fp8_weights_loaded(self, fp8_pipeline):
         """FP8 transformer blocks have float8_e4m3fn weights and weight_scale."""
+        try:
+            if not hasattr(torch.ops, "tensorrt_llm"):
+                pytest.skip("tensorrt_llm torch ops not available")
+            _ = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor
+            _ = torch.ops.tensorrt_llm.quantize_e4m3_activation
+        except (AttributeError, RuntimeError) as e:
+            pytest.skip(f"FP8 quantization ops not available: {e}")
         for name, module in fp8_pipeline.transformer.named_modules():
             if isinstance(module, Linear) and "blocks." in name:
                 assert module.weight.dtype == torch.float8_e4m3fn, (
@@ -475,6 +586,13 @@ class TestWanPipelineFeatures:
 
     def test_fp8_block_scales_weights_loaded(self, fp8_block_pipeline):
         """FP8_BLOCK_SCALES transformer blocks have float8_e4m3fn weights and weight_scale."""
+        try:
+            if not hasattr(torch.ops, "tensorrt_llm"):
+                pytest.skip("tensorrt_llm torch ops not available")
+            _ = torch.ops.tensorrt_llm.quantize_e4m3_per_tensor
+            _ = torch.ops.tensorrt_llm.quantize_e4m3_activation
+        except (AttributeError, RuntimeError) as e:
+            pytest.skip(f"FP8 quantization ops not available: {e}")
         for name, module in fp8_block_pipeline.transformer.named_modules():
             if isinstance(module, Linear) and "blocks." in name:
                 assert module.weight.dtype == torch.float8_e4m3fn, (
@@ -486,6 +604,12 @@ class TestWanPipelineFeatures:
 
     def test_nvfp4_weights_loaded(self, nvfp4_pipeline):
         """NVFP4 transformer blocks have packed FP4 weights with two-level scale."""
+        if torch.cuda.get_device_capability(0) < (10, 0):
+            pytest.skip("NVFP4 requires SM>=10.0 (Blackwell+)")
+        try:
+            _ = torch.ops.trtllm.fp4_quantize
+        except (AttributeError, RuntimeError) as e:
+            pytest.skip(f"fp4_quantize op not available: {e}")
         from tensorrt_llm.quantization.utils import fp4_utils
 
         for name, module in nvfp4_pipeline.transformer.named_modules():
@@ -610,12 +734,16 @@ class TestWanCFGParallel:
             torch.tensor([500], dtype=torch.long),  # timestep
         ]
 
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind(("", 0))
+            master_port = _s.getsockname()[1]
+
         manager = mp.Manager()
         return_dict = manager.dict()
 
         mp.spawn(
             _cfg_worker,
-            args=(2, WAN21_1_3B_PATH, inputs, return_dict),
+            args=(2, WAN21_1_3B_PATH, inputs, return_dict, master_port),
             nprocs=2,
             join=True,
         )
@@ -628,3 +756,63 @@ class TestWanCFGParallel:
             f"\n  CFG parallel output shape: {output.shape}, "
             f"range: [{output.min():.4f}, {output.max():.4f}]"
         )
+
+    def test_cfg_teacache_fp8_block_accuracy(self, bf16_pipeline):
+        """CFG + TeaCache + FP8_BLOCK_SCALES: cos_sim > 0.95 vs BF16 CFG reference."""
+        if not os.path.exists(WAN21_1_3B_PATH):
+            pytest.skip(
+                f"Checkpoint not found: {WAN21_1_3B_PATH} (set DIFFUSION_MODEL_PATH_WAN21_1_3B)"
+            )
+
+        import torch.multiprocessing as mp
+
+        torch.manual_seed(0)
+        inputs = [
+            torch.randn(1, 128, 4096),  # prompt_embeds
+            torch.randn(1, 128, 4096),  # neg_prompt_embeds
+            torch.randn(1, 16, 1, 32, 32),  # latents
+            torch.tensor([500], dtype=torch.long),  # timestep
+        ]
+
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as _s:
+            _s.bind(("", 0))
+            master_port = _s.getsockname()[1]
+
+        manager = mp.Manager()
+        return_dict = manager.dict()
+
+        mp.spawn(
+            _cfg_teacache_fp8_worker,
+            args=(2, WAN21_1_3B_PATH, inputs, return_dict, master_port),
+            nprocs=2,
+            join=True,
+        )
+
+        assert "output" in return_dict, "Rank 0 did not produce output"
+        combined_out = return_dict["output"].float()
+
+        # BF16 CFG reference: compute both branches then merge manually
+        prompt_embeds, neg_embeds, latents, timestep = [
+            t.cuda() if t.dtype == torch.long else t.cuda().to(torch.bfloat16) for t in inputs
+        ]
+        guidance_scale = 5.0
+        with torch.no_grad():
+            pos_out = bf16_pipeline.transformer(
+                hidden_states=latents.clone(),
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+            ).float()
+            neg_out = bf16_pipeline.transformer(
+                hidden_states=latents.clone(), timestep=timestep, encoder_hidden_states=neg_embeds
+            ).float()
+        bf16_combined = (neg_out + guidance_scale * (pos_out - neg_out)).cpu()
+
+        cos_sim = F.cosine_similarity(combined_out.flatten(), bf16_combined.flatten(), dim=0).item()
+        threshold = 0.95
+        print(
+            f"\n  CFG+TeaCache+FP8_BLOCK_SCALES combined output (shape: {combined_out.shape}):"
+            f"\n    cos_sim:   {cos_sim:.6f}"
+            f"\n    threshold: {threshold:.6f}"
+            f"\n    delta:     {cos_sim - threshold:+.6f}"
+        )
+        assert cos_sim > threshold, f"cos_sim too low: {cos_sim:.6f} (threshold={threshold})"

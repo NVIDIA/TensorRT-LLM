@@ -3,14 +3,14 @@
 
 """Correctness tests for Wan 2.1 I2V pipeline against HuggingFace reference.
 
-Tests verify that the TRTLLM WanImageToVideoPipeline (I2V) produces denoised latents
-with >= 0.97 cosine similarity to the HuggingFace diffusers WanImageToVideoPipeline
-baseline. Latents are captured before VAE decoding for maximum numerical precision.
-The threshold is 0.97 (not 0.99) because bfloat16 error accumulates across 10
-denoising steps in the full pipeline, and the 14B I2V model (40 layers, hidden
-size 5120) accumulates more error per step than the smaller 1.3B T2V model. The
-single-step transformer test (test_wan_transformer.py) enforces the tighter 0.99
-threshold.
+Tests verify that the TRTLLM WanImageToVideoPipeline (I2V) produces decoded video
+with >= 0.99 cosine similarity to the HuggingFace diffusers WanImageToVideoPipeline
+baseline. Both pipelines run the full denoising loop and VAE decode; the comparison
+is performed on the final (T, H, W, C) float tensors in [0, 1]. The threshold is
+0.99 because decoded pixel values are bounded and numerically smoother than raw
+latents, so tight agreement is expected even across 10 bfloat16 denoising steps.
+The single-step transformer test (test_wan_transformer.py) also enforces 0.99 but
+operates on a single forward pass rather than the full pipeline.
 
 Wan 2.1 I2V uses CLIP image embeddings for image conditioning alongside the
 concatenated VAE-encoded image condition latent.

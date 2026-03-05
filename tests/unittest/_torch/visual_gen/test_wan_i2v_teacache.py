@@ -87,7 +87,7 @@ def _checkpoint(env_var: str, default_name: str) -> str:
 WAN21_I2V_480P_PATH = os.environ.get("DIFFUSION_MODEL_PATH_WAN21_I2V_480P", "")
 WAN21_I2V_720P_PATH = os.environ.get("DIFFUSION_MODEL_PATH_WAN21_I2V_720P", "")
 
-WAN22_I2V_A14B_PATH = str(_llm_models_root() / "Wan2.2-I2V-A14B-Diffusers")
+WAN22_I2V_A14B_PATH = _checkpoint("DIFFUSION_MODEL_PATH_WAN22_I2V", "Wan2.2-I2V-A14B-Diffusers")
 
 INFER_NUM_FRAMES = 33  # (33-1)/4+1 = 9 latent frames; smallest realistic shape
 INFER_NUM_STEPS = 50  # Required for meaningful cache hits with calibrated coefficients
@@ -116,7 +116,7 @@ def _make_pipeline(checkpoint_path: str, use_ret_steps: bool = False):
     return pipeline
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def wan21_i2v_480p_pipeline():
     pipeline = _make_pipeline(WAN21_I2V_480P_PATH)
     yield pipeline
@@ -124,7 +124,7 @@ def wan21_i2v_480p_pipeline():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def wan21_i2v_480p_ret_steps_pipeline():
     pipeline = _make_pipeline(WAN21_I2V_480P_PATH, use_ret_steps=True)
     yield pipeline
@@ -132,7 +132,7 @@ def wan21_i2v_480p_ret_steps_pipeline():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def wan21_i2v_720p_pipeline():
     pipeline = _make_pipeline(WAN21_I2V_720P_PATH)
     yield pipeline
@@ -151,7 +151,14 @@ def _make_test_image(height: int, width: int) -> Image.Image:
     return Image.fromarray(img, mode="RGB")
 
 
-def _assert_i2v_teacache(pipeline, height: int, width: int, model: str = "") -> None:
+def _assert_i2v_teacache(
+    pipeline,
+    height: int,
+    width: int,
+    model: str = "",
+    expected_hit_rate: float = None,
+    atol: float = 0.02,
+) -> None:
     """Run forward and verify TeaCache produces cache hits (single-stage Wan 2.1 I2V)."""
     test_image = _make_test_image(height, width)
 
@@ -174,6 +181,11 @@ def _assert_i2v_teacache(pipeline, height: int, width: int, model: str = "") -> 
         f"  transformer: {stats['cached_steps']}/{stats['total_steps']} cached "
         f"({stats['hit_rate']:.1%} hit rate)"
     )
+    if expected_hit_rate is not None:
+        # Reference hit rates derived from vFly reference runs
+        print(f"  expected:    {expected_hit_rate:.1%}  (vFly reference, atol={atol:.0%})")
+        delta = stats["hit_rate"] - expected_hit_rate
+        print(f"  delta:       {delta:+.1%}")
     print("  ================================================")
 
     assert stats["total_steps"] == INFER_NUM_STEPS, (
@@ -183,6 +195,11 @@ def _assert_i2v_teacache(pipeline, height: int, width: int, model: str = "") -> 
     assert stats["cached_steps"] > 0, (
         f"0 cache hits after {stats['total_steps']} steps. TeaCache is not working. Stats: {stats}"
     )
+    if expected_hit_rate is not None:
+        assert abs(stats["hit_rate"] - expected_hit_rate) <= atol + 1e-9, (
+            f"Hit rate {stats['hit_rate']:.1%} not within {atol:.0%} "
+            f"of expected {expected_hit_rate:.1%} (vFly reference)"
+        )
 
 
 # ============================================================================
@@ -197,11 +214,17 @@ class TestWan21I2V_480P_TeaCache:
     """Wan2.1-I2V-14B-480P  480x832  single-stage."""
 
     def test_wan21_i2v_480p_teacache(self, wan21_i2v_480p_pipeline):
-        _assert_i2v_teacache(wan21_i2v_480p_pipeline, height=480, width=832, model="I2V-14B")
+        _assert_i2v_teacache(
+            wan21_i2v_480p_pipeline, height=480, width=832, model="I2V-14B", expected_hit_rate=0.54
+        )
 
     def test_wan21_i2v_480p_teacache_ret_steps(self, wan21_i2v_480p_ret_steps_pipeline):
         _assert_i2v_teacache(
-            wan21_i2v_480p_ret_steps_pipeline, height=480, width=832, model="I2V-14B"
+            wan21_i2v_480p_ret_steps_pipeline,
+            height=480,
+            width=832,
+            model="I2V-14B",
+            expected_hit_rate=0.50,
         )
 
 
@@ -212,7 +235,9 @@ class TestWan21I2V_720P_TeaCache:
     """Wan2.1-I2V-14B-720P  720x1280  single-stage."""
 
     def test_wan21_i2v_720p_teacache(self, wan21_i2v_720p_pipeline):
-        _assert_i2v_teacache(wan21_i2v_720p_pipeline, height=720, width=1280, model="I2V-14B")
+        _assert_i2v_teacache(
+            wan21_i2v_720p_pipeline, height=720, width=1280, model="I2V-14B", expected_hit_rate=0.54
+        )
 
 
 @pytest.mark.integration
@@ -232,5 +257,5 @@ class TestWan22_I2V_TeaCacheRaisesError:
             dtype="bfloat16",
             teacache=TeaCacheConfig(enable_teacache=True),
         )
-        with pytest.raises(ValueError, match="TeaCache is not supported for Wan 2.2"):
+        with pytest.raises(ValueError, match="TeaCache is not supported for Wan 2\\.2"):
             PipelineLoader(args).load(skip_warmup=True)

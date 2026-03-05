@@ -302,12 +302,12 @@ class TeaCacheHook:
         Returns True to compute, False to use cache.
         """
         # Warmup: Always compute first few steps to build stable cache
-        if self.config.ret_steps and state["cnt"] < self.config.ret_steps:
+        if self.config.ret_steps is not None and state["cnt"] < self.config.ret_steps:
             state["acc_dist"] = 0.0
             return True
 
         # Cooldown: Always compute last few steps for quality
-        if self.config.cutoff_steps and state["cnt"] >= self.config.cutoff_steps:
+        if self.config.cutoff_steps is not None and state["cnt"] >= self.config.cutoff_steps:
             return True
 
         # First step: no previous input to compare
@@ -338,7 +338,7 @@ class TeaCacheHook:
 
         # Cache decision based on accumulated distance
         if state["acc_dist"] < self.config.teacache_thresh:
-            # Below threshold: use cache, apply decay to distance
+            # Below threshold: use cache
             return False
         else:
             # Above threshold: compute, reset accumulated distance

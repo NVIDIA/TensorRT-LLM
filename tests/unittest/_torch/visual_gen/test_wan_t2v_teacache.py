@@ -109,7 +109,7 @@ def _make_pipeline(checkpoint_path: str, use_ret_steps: bool = False):
     return pipeline
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def wan21_1_3b_pipeline():
     pipeline = _make_pipeline(WAN21_1_3B_PATH)
     yield pipeline
@@ -117,7 +117,7 @@ def wan21_1_3b_pipeline():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def wan21_1_3b_ret_steps_pipeline():
     pipeline = _make_pipeline(WAN21_1_3B_PATH, use_ret_steps=True)
     yield pipeline
@@ -125,7 +125,7 @@ def wan21_1_3b_ret_steps_pipeline():
     torch.cuda.empty_cache()
 
 
-@pytest.fixture(scope="module")
+@pytest.fixture
 def wan21_14b_pipeline():
     pipeline = _make_pipeline(WAN21_14B_PATH)
     yield pipeline
@@ -138,7 +138,14 @@ def wan21_14b_pipeline():
 # ============================================================================
 
 
-def _assert_single_stage_teacache(pipeline, height: int, width: int, model: str = "") -> None:
+def _assert_single_stage_teacache(
+    pipeline,
+    height: int,
+    width: int,
+    model: str = "",
+    expected_hit_rate: float = None,
+    atol: float = 0.02,
+) -> None:
     """Run forward and verify TeaCache produces cache hits (single-stage Wan 2.1)."""
     with torch.no_grad():
         pipeline.forward(
@@ -158,6 +165,11 @@ def _assert_single_stage_teacache(pipeline, height: int, width: int, model: str 
         f"  transformer: {stats['cached_steps']}/{stats['total_steps']} cached "
         f"({stats['hit_rate']:.1%} hit rate)"
     )
+    if expected_hit_rate is not None:
+        # Reference hit rates derived from vFly reference runs
+        print(f"  expected:    {expected_hit_rate:.1%}  (vFly reference, atol={atol:.0%})")
+        delta = stats["hit_rate"] - expected_hit_rate
+        print(f"  delta:       {delta:+.1%}")
     print("  ================================================================")
 
     assert stats["total_steps"] == INFER_NUM_STEPS, (
@@ -167,6 +179,11 @@ def _assert_single_stage_teacache(pipeline, height: int, width: int, model: str 
     assert stats["cached_steps"] > 0, (
         f"0 cache hits after {stats['total_steps']} steps. TeaCache is not working. Stats: {stats}"
     )
+    if expected_hit_rate is not None:
+        assert abs(stats["hit_rate"] - expected_hit_rate) <= atol + 1e-9, (
+            f"Hit rate {stats['hit_rate']:.1%} not within {atol:.0%} "
+            f"of expected {expected_hit_rate:.1%} (vFly reference)"
+        )
 
 
 # ============================================================================
@@ -181,11 +198,17 @@ class TestWan21_1_3B_TeaCache:
     """Wan2.1-T2V-1.3B  480x832  single-stage."""
 
     def test_wan21_1_3b_teacache(self, wan21_1_3b_pipeline):
-        _assert_single_stage_teacache(wan21_1_3b_pipeline, height=480, width=832, model="T2V-1.3B")
+        _assert_single_stage_teacache(
+            wan21_1_3b_pipeline, height=480, width=832, model="T2V-1.3B", expected_hit_rate=0.68
+        )
 
     def test_wan21_1_3b_teacache_ret_steps(self, wan21_1_3b_ret_steps_pipeline):
         _assert_single_stage_teacache(
-            wan21_1_3b_ret_steps_pipeline, height=480, width=832, model="T2V-1.3B"
+            wan21_1_3b_ret_steps_pipeline,
+            height=480,
+            width=832,
+            model="T2V-1.3B",
+            expected_hit_rate=0.72,
         )
 
 
@@ -196,7 +219,9 @@ class TestWan21_14B_TeaCache:
     """Wan2.1-T2V-14B  720x1280  single-stage."""
 
     def test_wan21_14b_teacache(self, wan21_14b_pipeline):
-        _assert_single_stage_teacache(wan21_14b_pipeline, height=720, width=1280, model="T2V-14B")
+        _assert_single_stage_teacache(
+            wan21_14b_pipeline, height=720, width=1280, model="T2V-14B", expected_hit_rate=0.48
+        )
 
 
 @pytest.mark.integration
@@ -214,5 +239,5 @@ class TestWan22_T2V_TeaCacheRaisesError:
             dtype="bfloat16",
             teacache=TeaCacheConfig(enable_teacache=True),
         )
-        with pytest.raises(ValueError, match="TeaCache is not supported for Wan 2.2"):
+        with pytest.raises(ValueError, match=r"TeaCache is not supported for Wan 2\.2"):
             PipelineLoader(args).load(skip_warmup=True)

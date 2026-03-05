@@ -3,12 +3,9 @@
 
 """Correctness tests for Wan 2.1 T2V pipeline against HuggingFace reference.
 
-Tests verify that the TRTLLM WanPipeline (T2V) produces denoised latents with
->= 0.98 cosine similarity to the HuggingFace diffusers WanPipeline baseline.
-The threshold is 0.98 (not 0.99) because bfloat16 error accumulates across 10
-denoising steps in the full pipeline. The single-step transformer test
-(test_wan_transformer.py) enforces the tighter 0.99 threshold.
-Latents are captured before VAE decoding for maximum numerical precision.
+Tests verify that the TRTLLM WanPipeline (T2V) produces decoded video frames with
+>= 0.99 cosine similarity to the HuggingFace diffusers WanPipeline baseline.
+Comparison is performed on decoded video frames (after VAE decoding).
 
 Models tested:
   - Wan2.1-T2V-1.3B-Diffusers   (480x832, 33 frames)
@@ -27,11 +24,8 @@ Override checkpoint paths:
         pytest tests/unittest/_torch/visual_gen/test_wan_21_t2v_pipeline.py -v -s
 """
 
-import os
-
-os.environ["TLLM_DISABLE_MPI"] = "1"
-
 import gc
+import os
 from pathlib import Path
 
 import numpy as np
@@ -46,8 +40,13 @@ from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 @pytest.fixture(autouse=True, scope="module")
 def _cleanup_mpi_env():
+    prev = os.environ.get("TLLM_DISABLE_MPI")
+    os.environ["TLLM_DISABLE_MPI"] = "1"
     yield
-    os.environ.pop("TLLM_DISABLE_MPI", None)
+    if prev is None:
+        os.environ.pop("TLLM_DISABLE_MPI", None)
+    else:
+        os.environ["TLLM_DISABLE_MPI"] = prev
 
 
 # ============================================================================
@@ -57,14 +56,10 @@ def _cleanup_mpi_env():
 
 def _llm_models_root() -> Path:
     if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    else:
-        root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
+        return Path(os.environ["LLM_MODELS_ROOT"])
+    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
     if not root.exists():
         root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "Set LLM_MODELS_ROOT or ensure /home/scratch.trt_llm_data_ci/llm-models/ is accessible."
-    )
     return root
 
 

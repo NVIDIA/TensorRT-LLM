@@ -203,9 +203,13 @@ class WanPipeline(BasePipeline):
                 checkpoint_dir, subfolder=PipelineComponent.SCHEDULER
             )
             scheduler_class_name = sched_cfg.get("_class_name", "FlowMatchEulerDiscreteScheduler")
-            SchedulerClass = getattr(
-                diffusers, scheduler_class_name, FlowMatchEulerDiscreteScheduler
-            )
+            if not hasattr(diffusers, scheduler_class_name):
+                raise ValueError(
+                    f"Scheduler '{scheduler_class_name}' not found in diffusers "
+                    f"(from scheduler/scheduler_config.json '_class_name'). "
+                    f"Upgrade diffusers or set '_class_name' to a known scheduler."
+                )
+            SchedulerClass = getattr(diffusers, scheduler_class_name)
             if issubclass(SchedulerClass, FlowMatchEulerDiscreteScheduler):
                 if sched_cfg.get("shift", 1.0) == 1.0:
                     sched_cfg["shift"] = sched_cfg.get("flow_shift") or 5.0
