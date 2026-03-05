@@ -127,13 +127,7 @@ class GenericExtractor:
         )
 
         # Call configured timestep embedding function
-        try:
-            return self.config.timestep_embed_fn(module, timestep_flat, guidance)
-        except Exception as e:
-            logger.error(f"Timestep embedder failed: {e}")
-            # Last resort: use timestep as-is
-            logger.warning("Using timestep fallback")
-            return timestep_flat.unsqueeze(-1) if timestep_flat.ndim == 1 else timestep_flat
+        return self.config.timestep_embed_fn(module, timestep_flat, guidance)
 
     def __call__(self, module: torch.nn.Module, *args, **kwargs) -> CacheContext:
         """Main extractor logic - called by TeaCacheHook.

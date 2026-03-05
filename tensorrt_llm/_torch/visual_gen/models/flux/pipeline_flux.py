@@ -51,9 +51,11 @@ class FluxPipeline(BasePipeline):
 
     @staticmethod
     def _compute_flux_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX transformer.
+        """Compute timestep embedding for FLUX.1 transformer.
 
-        FLUX combines timestep and guidance embeddings.
+        FLUX.1 uses CombinedTimestepGuidanceTextProjEmbeddings which combines
+        timestep + guidance + pooled_projection. For TeaCache, we only need the
+        timestep + guidance components (pooled_projection is constant across steps).
 
         Args:
             module: FluxTransformer2DModel instance
@@ -61,19 +63,20 @@ class FluxPipeline(BasePipeline):
             guidance: Guidance scale tensor [B] (optional)
 
         Returns:
-            Combined timestep embedding for TeaCache distance calculation
+            Combined timestep+guidance embedding for TeaCache distance calculation
         """
-        # Cast to embedder's dtype (avoid int8 quantized layers)
-        te_dtype = next(iter(module.time_text_embed.parameters())).dtype
-        if timestep.dtype != te_dtype and te_dtype != torch.int8:
-            timestep = timestep.to(te_dtype)
+        embed = module.time_text_embed
+        # Use timestep_embedder sub-component directly (avoids needing pooled_projection)
+        te_dtype = next(embed.timestep_embedder.parameters()).dtype
+        if te_dtype == torch.int8:
+            te_dtype = torch.bfloat16
 
-        temb = module.time_text_embed(timestep)
+        timesteps_proj = embed.time_proj(timestep)
+        temb = embed.timestep_embedder(timesteps_proj.to(te_dtype))
 
-        if module.guidance_embeds and guidance is not None:
-            if guidance.dtype != te_dtype and te_dtype != torch.int8:
-                guidance = guidance.to(te_dtype)
-            temb = temb + module.guidance_embed(guidance)
+        if hasattr(embed, "guidance_embedder") and guidance is not None:
+            guidance_proj = embed.time_proj(guidance)
+            temb = temb + embed.guidance_embedder(guidance_proj.to(te_dtype))
 
         return temb
 
@@ -209,8 +212,8 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.1-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

@@ -44,11 +44,11 @@ from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
 
-# TeaCache coefficients for FLUX.2
+# TeaCache coefficients for FLUX.2 (different from FLUX.1)
 FLUX2_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [1.04582360e02, -6.87605554e00, -8.61659379e-02, 5.37600252e-02],
+        "standard": [1.04582360e02, -6.87605554e00, -8.61659379e-02, 5.37600252e-02],
     },
 }
 
@@ -125,24 +125,31 @@ class Flux2Pipeline(BasePipeline):
     def _compute_flux2_timestep_embedding(module, timestep, guidance=None):
         """Compute timestep embedding for FLUX.2 transformer.
 
-        Always uses time_guidance_embed (handles both guided and unguided variants).
+        FLUX.2 uses TimeGuidanceEmbed which combines timestep + guidance.
+        For TeaCache, we compute this directly using the sub-components.
 
         Args:
             module: Flux2Transformer2DModel instance
             timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional, None for klein)
+            guidance: Guidance scale tensor [B] (optional)
 
         Returns:
-            Timestep embedding for TeaCache distance calculation
+            Combined timestep+guidance embedding for TeaCache distance calculation
         """
         embed = module.time_guidance_embed
-        te_dtype = next(embed.timestep_embedder.linear_1.parameters()).dtype
-        if te_dtype != torch.int8:
-            t = timestep.to(te_dtype)
-            g = guidance.to(te_dtype) if guidance is not None else None
-        else:
-            t, g = timestep, guidance
-        return embed(t, g)
+        # Use timestep_embedder sub-component directly
+        te_dtype = next(embed.timestep_embedder.parameters()).dtype
+        if te_dtype == torch.int8:
+            te_dtype = torch.bfloat16
+
+        timesteps_proj = embed.time_proj(timestep)
+        temb = embed.timestep_embedder(timesteps_proj.to(te_dtype))
+
+        if hasattr(embed, "guidance_embedder") and guidance is not None:
+            guidance_proj = embed.time_proj(guidance)
+            temb = temb + embed.guidance_embedder(guidance_proj.to(te_dtype))
+
+        return temb
 
     @property
     def dtype(self):
@@ -301,8 +308,8 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.2-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX2_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.2-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

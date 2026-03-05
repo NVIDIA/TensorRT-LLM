@@ -169,6 +169,12 @@ class BasePipeline(nn.Module):
                         teacache_cfg.coefficients = coeff_data
                         logger.info(f"TeaCache: Using {model_size} coefficients")
                     break
+            else:
+                raise ValueError(
+                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                    f"Available variants: {list(coefficients.keys())}. "
+                    f"TeaCache is not supported for this model variant."
+                )
 
         # Initialize and enable TeaCache backend
         logger.info("TeaCache: Initializing...")
