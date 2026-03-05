@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -201,11 +201,11 @@ public:
 
     //! \brief Detach this block from the lookup tree.
     //! \details Clears the block's value slot in its current node and resets mLookupNode /
-    //! mWindowSize to their null states. The Node's cascade-prune logic then removes empty
-    //! ancestor nodes automatically.
+    //! mWindowSize to their null states. The Node cascade-prune logic then removes empty
+    //! ancestor nodes automatically (bottom-up, stopping at the first non-empty ancestor).
     void detachFromLookupNode();
 
-    //! \brief Initialise a dummy root block's lookup-node link.
+    //! \brief Initialize a dummy root block's lookup-node link.
     //! \details Stores \p self as the value for \p windowSize in \p rootNode so that
     //! direct children can retrieve the root block via getPrevBlock(). Must be called once
     //! after constructing the mCachedBlocksRoot block.
@@ -238,7 +238,10 @@ public:
 
     //! \brief Return the parent block in the lookup tree.
     //! \details Navigates via mLookupNode->getParentNode()->getValue(mWindowSize).
-    //! Returns nullptr when the block is not in the tree or is a direct child of the root.
+    //! Returns nullptr when:
+    //!   - The block is not attached to the tree (mLookupNode == nullptr), or
+    //!   - This block IS the root (mLookupNode->getParentNode() returns nullptr).
+    //! For direct children of the root, returns the root block (mCachedBlocksRoot)
     //! NOTE: return type is by value (not const&) because the result is computed on the fly.
     [[nodiscard]] BlockPtr getPrevBlock() const;
 
@@ -249,6 +252,18 @@ public:
     void addNextBlock(BlockKey const& blockKey, BlockPtr block);
 
     void removeNextBlock(BlockKey const& blockKey);
+
+    //! \brief True if this block has no physical GPU memory.
+    //! \details Placeholder blocks exist in the sequence's block list to preserve prefix-chain
+    //! structure in the lookup tree without consuming pool memory. Used by Mamba / linear-
+    //! attention layers: only snapshot-position blocks are real; intervening positions are
+    //! placeholders. Placeholder blocks are excluded from the eviction pool.
+    [[nodiscard]] bool isPlaceholder() const;
+
+    //! \brief Create a placeholder KVCacheBlock with no GPU memory.
+    //! \details The placeholder holds a block ID for sequence bookkeeping but mIsPlaceholder
+    //! is set so that getCacheBlockIndices returns a nil index and the eviction pool ignores it.
+    static BlockPtr createPlaceholder(IdType blockId);
 
     void freeDescendantsRecursively();
     void freeBlockAndAllDescendants();
@@ -312,10 +327,14 @@ private:
     radix_block_tree::LookupNodePtr mLookupNode;
 
     // Window size slot this block occupies in mLookupNode->mValue.
-    // -1 when mLookupNode is nullptr.
+    // 0 when mLookupNode is nullptr (unattached sentinel; 0 is never a valid window size).
     int mWindowSize;
 
-    // Previous block in sequence, == nullptr for first block
+    // True when this block has no physical GPU memory (Mamba placeholder).
+    bool mIsPlaceholder;
+
+    // Previous block in the physical allocation sequence, nullptr for first block.
+    // Distinct from getPrevBlock() (which navigates the radix lookup tree)
     BlockPtr mPrevBlockInSeq;
 
     // Iterator pointing to this block in mFreeBlocks.
@@ -574,8 +593,9 @@ public:
         bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
         std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
         std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
-        std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr, bool enableIndexerKCache = false,
-        SizeType32 indexerKCacheQuantBlockSize = 128, SizeType32 indexerKCacheIndexHeadDim = 0);
+        radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent = nullptr,
+        bool enableIndexerKCache = false, SizeType32 indexerKCacheQuantBlockSize = 128,
+        SizeType32 indexerKCacheIndexHeadDim = 0);
 
     ~WindowBlockManager();
 
@@ -895,12 +915,12 @@ public:
     void resetReuseState()
     {
         std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
-        // Create a fresh lookup tree; the old one is released once all blocks drop their
-        // LookupNodePtr references (no manual cleanup required).
-        mLookupTree = radix_block_tree::UnifiedBlockTree();
+        // The shared lookup tree is reset once by BlockManager::resetReuseState() before
+        // this method is called.  Here we only need to re-create the per-window root block
+        // and wire it into the (already fresh) shared tree.
         mCachedBlocksRoot
             = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
-        mCachedBlocksRoot->setAsRoot(mLookupTree.getRoot(), mWindowSize, mCachedBlocksRoot);
+        mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize, mCachedBlocksRoot);
     }
 
 private:
@@ -967,9 +987,10 @@ private:
     bool mIsSWA;
     // List of all blocks by idx
     std::vector<BlockPtr> mAllBlocksById;
-    // Per-manager radix lookup tree. mCachedBlocksRoot->mLookupNode points to its root.
-    // In PR B this will be promoted to a shared tree owned by BlockManager.
-    radix_block_tree::UnifiedBlockTree mLookupTree;
+    // Pointer to the shared radix lookup tree owned by BlockManager.
+    // All WindowBlockManager instances under the same BlockManager share one tree,
+    // using window size as the value key so their nodes coexist in the same trie.
+    radix_block_tree::UnifiedBlockTree* mLookupTree;
     // Dummy block acting as root for BlockToken searches
     BlockPtr mCachedBlocksRoot;
     // KV cache type (self or cross)
@@ -1422,6 +1443,9 @@ public:
 
     void resetReuseState()
     {
+        // Reset the shared tree once; all blocks' LookupNodePtr references to the old
+        // tree are released automatically as the shared_ptrs in KVCacheBlock expire.
+        mLookupTree = radix_block_tree::UnifiedBlockTree();
         for (auto& [windowSize, manager] : mWindowBlockManagers)
         {
             manager.resetReuseState();
@@ -1457,6 +1481,10 @@ private:
     bool mIsVariableWindow;
     bool mIsVariableGQA;
 
+    // Shared radix lookup tree used by all WindowBlockManager instances.
+    // Stored before mWindowBlockManagers so it is constructed first and its address
+    // is stable when passed to each WindowBlockManager constructor.
+    radix_block_tree::UnifiedBlockTree mLookupTree;
     std::map<SizeType32, WindowBlockManager> mWindowBlockManagers;
     std::map<SizeType32, WindowSizeMetadata> mWindowSizeToMetadata;
     std::vector<SizeType32> mLayerToWindowSize;

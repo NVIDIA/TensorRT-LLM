@@ -221,8 +221,8 @@ public:
         }
         else
         {
-            mValue.try_emplace(vkey, value);
-            return false;
+            auto const& [itr, inserted] = mValue.try_emplace(vkey, value);
+            return !inserted; // true iff slot was already occupied (value NOT updated)
         }
     }
 
@@ -391,6 +391,9 @@ private:
     friend Trie<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
 
     // Private debugging method.
+    // Returns the prefix path to every node that holds a value, including nodes that
+    // are both terminal (have a value) and internal (have children). Used only in
+    // unit tests via getEdges().
     void _getEdges(std::vector<NodeKey> edge, std::vector<std::vector<NodeKey>>& edges) const
     {
         auto const isRoot = mPrevNode.expired();
@@ -402,12 +405,9 @@ private:
         {
             edges.emplace_back(edge);
         }
-        else
+        for (auto const& [key, node] : mNextNodes)
         {
-            for (auto const& [key, node] : mNextNodes)
-            {
-                node->_getEdges(edge, edges);
-            }
+            node->_getEdges(edge, edges);
         }
     }
 

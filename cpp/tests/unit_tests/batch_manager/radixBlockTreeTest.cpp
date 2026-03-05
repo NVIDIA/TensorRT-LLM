@@ -518,3 +518,175 @@ TEST(RadixBlockTreeTest, PartialMatchSkipsRefedBlockWhenNoCopy)
     EXPECT_EQ(numMatched2, 3);
     EXPECT_EQ(found2, block);
 }
+
+// ---------------------------------------------------------------------------
+// 18. kRecurrentStates sentinel is negative (distinguishes from all valid window sizes)
+// ---------------------------------------------------------------------------
+
+TEST(MambaTest, kRecurrentStatesSentinelIsNegative)
+{
+    EXPECT_LT(kRecurrentStates, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 19. createPlaceholder / isPlaceholder round-trip
+// ---------------------------------------------------------------------------
+
+TEST(MambaTest, CreatePlaceholderIsPlaceholder)
+{
+    auto ph = KVCacheBlock::createPlaceholder(42);
+    ASSERT_NE(ph, nullptr);
+    EXPECT_TRUE(ph->isPlaceholder());
+    EXPECT_EQ(ph->getBlockId(), 42);
+}
+
+TEST(MambaTest, RegularBlockIsNotPlaceholder)
+{
+    auto block = makeBlock(7);
+    EXPECT_FALSE(block->isPlaceholder());
+}
+
+// ---------------------------------------------------------------------------
+// 20. insertBlocks / lookupBlock with kRecurrentStates
+// ---------------------------------------------------------------------------
+
+TEST(MambaTest, InsertBlocksLookupBlockDeepest)
+{
+    UnifiedBlockTree tree;
+
+    BlockKey k0 = makeKey({1, 2, 3});
+    BlockKey k1 = makeKey({4, 5, 6});
+    BlockKey k2 = makeKey({7, 8, 9});
+    UnifiedBlockTree::PrefixKey prefix = {k0, k1, k2};
+
+    auto b0 = makeBlock(10);
+    auto b2 = makeBlock(12);
+    // Position 1 is nullptr (placeholder)
+    tree.insertBlocks(prefix, kRecurrentStates, {b0, nullptr, b2});
+
+    // lookupBlock returns deepest valid block = b2
+    auto result = tree.lookupBlock(prefix, kRecurrentStates, /*allowPartialMatch=*/false);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, b2);
+}
+
+// ---------------------------------------------------------------------------
+// 21. lookupBlocksAtAllPositions gives per-position view with nullopt placeholders
+// ---------------------------------------------------------------------------
+
+TEST(MambaTest, LookupBlocksAtAllPositionsPerPositionView)
+{
+    UnifiedBlockTree tree;
+
+    BlockKey k0 = makeKey({1, 2, 3});
+    BlockKey k1 = makeKey({4, 5, 6});
+    BlockKey k2 = makeKey({7, 8, 9});
+    UnifiedBlockTree::PrefixKey prefix = {k0, k1, k2};
+
+    auto b0 = makeBlock(10);
+    auto b2 = makeBlock(12);
+    tree.insertBlocks(prefix, kRecurrentStates, {b0, nullptr, b2});
+
+    auto all = tree.lookupBlocksAtAllPositions(prefix, kRecurrentStates);
+    ASSERT_EQ(all.size(), 3u);
+    ASSERT_TRUE(all[0].has_value());
+    EXPECT_EQ(*all[0], b0);
+    EXPECT_FALSE(all[1].has_value()); // placeholder → nullopt
+    ASSERT_TRUE(all[2].has_value());
+    EXPECT_EQ(*all[2], b2);
+}
+
+// ---------------------------------------------------------------------------
+// 22. lookupBlocksAtAllPositions pads with nullopt for missing trie nodes
+// ---------------------------------------------------------------------------
+
+TEST(MambaTest, LookupBlocksAtAllPositionsPaddingForMissingNodes)
+{
+    UnifiedBlockTree tree;
+
+    BlockKey k0 = makeKey({1, 2, 3});
+    UnifiedBlockTree::PrefixKey prefix1 = {k0};
+
+    auto b0 = makeBlock(10);
+    tree.insertBlocks(prefix1, kRecurrentStates, {b0});
+
+    BlockKey k1 = makeKey({4, 5, 6});
+    BlockKey k2 = makeKey({7, 8, 9});
+    UnifiedBlockTree::PrefixKey prefix3 = {k0, k1, k2};
+
+    // Lookup a longer prefix — last two positions have no nodes → padded with nullopt
+    auto all = tree.lookupBlocksAtAllPositions(prefix3, kRecurrentStates);
+    ASSERT_EQ(all.size(), 3u);
+    EXPECT_TRUE(all[0].has_value());
+    EXPECT_FALSE(all[1].has_value());
+    EXPECT_FALSE(all[2].has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 23. insertBlock does not overwrite an existing block for the same prefix+window
+// ---------------------------------------------------------------------------
+
+TEST(UnifiedBlockTreeTest, InsertBlockDoesNotOverwrite)
+{
+    UnifiedBlockTree tree;
+    constexpr int kWindowSize = 64;
+
+    BlockKey k1 = makeKey({1, 2, 3});
+    UnifiedBlockTree::PrefixKey prefix = {k1};
+
+    auto block1 = makeBlock(1);
+    auto block2 = makeBlock(2);
+    tree.insertBlock(prefix, kWindowSize, block1);
+    tree.insertBlock(prefix, kWindowSize, block2); // should be a no-op
+
+    auto result = tree.lookupBlock(prefix, kWindowSize, /*allowPartialMatch=*/false);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, block1); // first block retained
+}
+
+// ---------------------------------------------------------------------------
+// 24. lookupBlock returns nullopt when prefix chain is broken (missing intermediate)
+// ---------------------------------------------------------------------------
+
+TEST(UnifiedBlockTreeTest, LookupBlockBrokenChainReturnsNullopt)
+{
+    UnifiedBlockTree tree;
+    constexpr int kWindowSize = 64;
+
+    // Only insert a block at depth 1 (one key)
+    BlockKey k0 = makeKey({1, 2, 3});
+    UnifiedBlockTree::PrefixKey prefix1 = {k0};
+    auto b0 = makeBlock(10);
+    tree.insertBlock(prefix1, kWindowSize, b0);
+
+    // Lookup with a 2-step prefix; depth-2 node doesn't exist → chain broken → nullopt
+    BlockKey k1 = makeKey({4, 5, 6});
+    UnifiedBlockTree::PrefixKey prefix2 = {k0, k1};
+    auto result = tree.lookupBlock(prefix2, kWindowSize, /*allowPartialMatch=*/false);
+    EXPECT_FALSE(result.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 25. lookupBlock returns deepest match when multiple positions have valid blocks
+// ---------------------------------------------------------------------------
+
+TEST(UnifiedBlockTreeTest, LookupBlockReturnsDeepestMatch)
+{
+    UnifiedBlockTree tree;
+    constexpr int kWindowSize = 64;
+
+    BlockKey k0 = makeKey({1, 2, 3});
+    BlockKey k1 = makeKey({4, 5, 6});
+    UnifiedBlockTree::PrefixKey prefix1 = {k0};
+    UnifiedBlockTree::PrefixKey prefix2 = {k0, k1};
+
+    auto blockShallow = makeBlock(1);
+    auto blockDeep = makeBlock(2);
+    tree.insertBlock(prefix1, kWindowSize, blockShallow);
+    tree.insertBlock(prefix2, kWindowSize, blockDeep);
+
+    // Lookup the full 2-step prefix — should return blockDeep (most specific)
+    auto result = tree.lookupBlock(prefix2, kWindowSize, /*allowPartialMatch=*/false);
+    ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(*result, blockDeep);
+}
