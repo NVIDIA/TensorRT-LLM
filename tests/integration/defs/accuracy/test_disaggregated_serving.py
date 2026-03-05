@@ -1563,13 +1563,12 @@ class TestQwen3_30B_A3B(LlmapiAccuracyTestHarness):
 @pytest.mark.timeout(10800)
 @skip_pre_blackwell
 class TestKimiK2(LlmapiAccuracyTestHarness):
-    MODEL_NAME = "moonshotai/Kimi-K2-Instruct"
-    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Instruct"
+    MODEL_NAME = "moonshotai/Kimi-K2-Thinking"
+    MODEL_PATH = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
 
     @pytest.mark.skip_less_device(8)
     @pytest.mark.skip_less_device_memory(200000)
     def test_nvfp4(self):
-        model_path = f"{llm_models_root()}/Kimi-K2-Thinking-NVFP4"
         ctx_server_config = {
             "max_batch_size": 16,
             "disable_overlap_scheduler": True,
@@ -1611,7 +1610,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
         }
         with launch_disaggregated_llm(disaggregated_server_config,
                                       ctx_server_config, gen_server_config,
-                                      model_path) as llm:
+                                      self.MODEL_PATH) as llm:
             run_accuracy_test(llm, self.MODEL_NAME, ["GSM8K"])
 
 
