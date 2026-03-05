@@ -503,10 +503,16 @@ def collect_terminal_users_through_passthrough(
 ) -> Tuple[List[Node], bool]:
     """Collect terminal users while traversing trivial passthrough users.
 
+    Only follows passthrough nodes whose primary data argument (args[0])
+    comes from the source data path.  This prevents the traversal from
+    leaking into unrelated graph regions when the source node is referenced
+    as a non-data argument (e.g. shape) of a passthrough op.
+
     Returns:
         (terminal_users, traversal_ok)
     """
     terminal_users: List[Node] = []
+    data_nodes = {source_node}
     stack = list(source_node.users)
     seen = set()
     while stack:
@@ -517,8 +523,10 @@ def collect_terminal_users_through_passthrough(
         if len(seen) > max_traversal_nodes:
             return [], False
         if is_trivial_passthrough_user(user):
-            stack.extend(list(user.users))
-            continue
+            if user.args and isinstance(user.args[0], Node) and user.args[0] in data_nodes:
+                data_nodes.add(user)
+                stack.extend(list(user.users))
+                continue
         terminal_users.append(user)
     return terminal_users, True
 

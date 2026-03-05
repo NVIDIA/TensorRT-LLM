@@ -651,7 +651,15 @@ class TrtllmAttention(AttentionDescriptor):
                 # at the downstream linear, so move it before attention if needed.
                 if first_scale.op == "get_attr":
                     source_attn_node.prepend(first_scale)
-                out_scale = first_scale
+                # thop.attention expects out_scale in "multiply" convention
+                # (output_fp8 = output * out_scale), but the FP8 linear's
+                # input_scale uses "divide" convention (fp8 = input / scale).
+                # Invert to match thop.attention's expectation.
+                with source_attn_node.graph.inserting_before(source_attn_node):
+                    inv_scale = source_attn_node.graph.call_function(
+                        torch.ops.aten.reciprocal.default, (first_scale,)
+                    )
+                out_scale = inv_scale
 
         return [
             scale,
