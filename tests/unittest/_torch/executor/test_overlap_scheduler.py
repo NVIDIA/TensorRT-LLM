@@ -27,6 +27,8 @@ def create_llm(model_dir,
                sampler_type,
                scheduler_config=None):
     """Create LLM with specific overlap scheduler setting"""
+    if scheduler_config is None:
+        scheduler_config = SchedulerConfig()
     pytorch_config = dict(disable_overlap_scheduler=disable_overlap_scheduler,
                           sampler_type=sampler_type)
 
@@ -54,7 +56,7 @@ def create_llm(model_dir,
 def test_overlap_scheduler_consistency(model_path, test_case, sampler_type,
                                        use_python_scheduler):
     scheduler_config = SchedulerConfig(
-        use_python_scheduler=True) if use_python_scheduler else None
+        use_python_scheduler=use_python_scheduler)
 
     # Test configuration
     prompts = test_case["prompts"]
