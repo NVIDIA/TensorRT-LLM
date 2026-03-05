@@ -659,8 +659,8 @@ class BaseLLM:
             timeout (float, optional): Max wait time in seconds when retrieving stats from queue. Defaults to 2.
 
         Returns:
-            List[dict]: A list of runtime stats as dict.
-                e.g., ['{"cpuMemUsage": ..., "iter": 0, ...}', '{"cpuMemUsage": ..., "iter": 1, ...}']
+            List[dict]: A list of runtime stats as dicts.
+                e.g., [{"cpuMemUsage": ..., "iter": 0, ...}, {"cpuMemUsage": ..., "iter": 1, ...}]
         '''
         return self._executor.get_stats(timeout=timeout)
 
@@ -717,7 +717,7 @@ class BaseLLM:
             - set `enable_block_reuse` to True in the `KvCacheConfig`.
 
         Args:
-            timeout (float, optional): Max wait time in seconds when retrieving events from queue. . Defaults to 2.
+            timeout (float, optional): Max wait time in seconds when retrieving events from queue. Defaults to 2.
 
         Returns:
             tensorrt_llm.executor.result.IterationResult: An async iterable object containing runtime events.
@@ -761,7 +761,7 @@ class BaseLLM:
                 f"The sampling_params must be type SamplingParams or None, but got {type(sampling_params)}"
             )
 
-        # auto enabled context and/or generation logits flags, as they are required by logprob computation for TRT backend.
+        # auto enable context and/or generation logits flags, as they are required by logprob computation for TRT backend.
         if self.args.backend not in ["pytorch", "_autodeploy"]:
             if sampling_params.prompt_logprobs and not sampling_params.return_context_logits:
                 sampling_params.return_context_logits = True
@@ -793,11 +793,11 @@ class BaseLLM:
 
         build_config = self.args.build_config
 
-        built_enging_cfg_file = Path(self.args.model) / 'config.json'
-        with open(built_enging_cfg_file) as f:
-            built_enging_cfg = json.load(f)
-        max_seq_len = built_enging_cfg['build_config'][
-            'max_seq_len'] if 'build_config' in built_enging_cfg else build_config.max_seq_len
+        built_engine_cfg_file = Path(self.args.model) / 'config.json'
+        with open(built_engine_cfg_file) as f:
+            built_engine_cfg = json.load(f)
+        max_seq_len = built_engine_cfg['build_config'][
+            'max_seq_len'] if 'build_config' in built_engine_cfg else build_config.max_seq_len
         # TODO: Remove this check and left the request verification to cpp runtime
 
         if (not self.args.enable_chunked_prefill) and (

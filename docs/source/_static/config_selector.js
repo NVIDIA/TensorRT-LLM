@@ -42,14 +42,51 @@
     return Number(a) - Number(b);
   }
 
+  function isFileProtocol() {
+    return window.location.protocol === "file:";
+  }
+
+  function xhrLoadJson(url) {
+    return new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("GET", url, true);
+      xhr.onload = function () {
+        if (xhr.status === 0 || (xhr.status >= 200 && xhr.status < 300)) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch (e) {
+            reject(new Error("Failed to parse config DB JSON: " + String(e)));
+          }
+        } else {
+          reject(new Error("Failed to load config DB (" + xhr.status + "): " + url));
+        }
+      };
+      xhr.onerror = function () {
+        reject(
+          new Error(
+            "Failed to load configuration database. If viewing locally, " +
+              "serve the docs with an HTTP server:\n" +
+              "  python -m http.server -d docs/build/html\n" +
+              "Then open http://localhost:8000/deployment-guide/"
+          )
+        );
+      };
+      xhr.send();
+    });
+  }
+
   async function loadDb(dbUrl) {
     if (!dbPromise) {
-      dbPromise = fetch(dbUrl, { credentials: "same-origin" }).then((r) => {
-        if (!r.ok) {
-          throw new Error(`Failed to load config DB (${r.status}): ${dbUrl}`);
-        }
-        return r.json();
-      });
+      if (isFileProtocol()) {
+        dbPromise = xhrLoadJson(dbUrl);
+      } else {
+        dbPromise = fetch(dbUrl, { credentials: "same-origin" }).then((r) => {
+          if (!r.ok) {
+            throw new Error("Failed to load config DB (" + r.status + "): " + dbUrl);
+          }
+          return r.json();
+        });
+      }
     }
     return dbPromise;
   }
@@ -577,8 +614,14 @@
       const payload = await loadDb(dbUrl);
       for (const c of containers) initOne(c, payload);
     } catch (err) {
+      const hint = isFileProtocol()
+        ? "\n\nThis page requires an HTTP server. " +
+          "Run: python -m http.server -d docs/build/html " +
+          "and open http://localhost:8000/deployment-guide/"
+        : "";
       for (const c of containers) {
-        c.textContent = `Failed to load configuration database: ${String(err)}`;
+        c.classList.add("trtllm-config-selector");
+        c.textContent = "Failed to load configuration database: " + String(err) + hint;
       }
     }
   }

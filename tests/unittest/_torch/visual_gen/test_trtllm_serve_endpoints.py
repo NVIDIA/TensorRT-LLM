@@ -227,19 +227,23 @@ def _clear_video_store():
 
 @pytest.fixture(autouse=True)
 def _mock_video_encoding():
-    """Mock MP4 encoding to avoid PyAV dependency in unit tests.
+    """Mock video encoding to avoid ffmpeg dependency in unit tests.
 
-    Replaces MediaStorage._save_mp4 with a stub that writes a small
-    dummy file so FileResponse can serve it.
+    Replaces MediaStorage._save_encoded_video with a stub that writes a small
+    dummy file so FileResponse can serve it. Also mocks ffmpeg availability
+    so resolve_video_format always resolves to mp4.
     """
 
-    def _dummy_save_mp4(video, audio, output_path, frame_rate):
+    def _dummy_save_encoded_video(video, audio, output_path, frame_rate):
         os.makedirs(os.path.dirname(str(output_path)) or ".", exist_ok=True)
         with open(str(output_path), "wb") as f:
             f.write(b"\x00\x00\x00\x1cftypisom" + b"\x00" * 32)
         return str(output_path)
 
-    with patch.object(MediaStorage, "_save_mp4", staticmethod(_dummy_save_mp4)):
+    with (
+        patch.object(MediaStorage, "_save_encoded_video", staticmethod(_dummy_save_encoded_video)),
+        patch("tensorrt_llm.serve.media_storage._check_ffmpeg_available", return_value=True),
+    ):
         yield
 
 

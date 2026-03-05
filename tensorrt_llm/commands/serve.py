@@ -2,7 +2,7 @@ import asyncio
 import gc
 import json
 import os
-import signal  # Added import
+import signal
 import socket
 import subprocess  # nosec B404
 import sys
@@ -56,7 +56,6 @@ def _signal_handler_cleanup_child(signum, frame):
     """Signal handler to clean up the child process."""
     global _child_p_global
     if _child_p_global and _child_p_global.poll() is None:
-        # Using print for safety in signal handlers
         logger.info(
             f"Parent process (PID {os.getpid()}) received signal {signal.Signals(signum).name}. Terminating child process (PID {_child_p_global.pid})."
         )
@@ -147,6 +146,7 @@ def get_llm_args(
         moe_expert_parallel_size: Optional[int] = None,
         gpus_per_node: Optional[int] = None,
         free_gpu_memory_fraction: float = 0.9,
+        kv_cache_dtype: str = "auto",
         num_postprocess_workers: int = 0,
         trust_remote_code: bool = False,
         revision: Optional[str] = None,
@@ -186,8 +186,9 @@ def get_llm_args(
         "postprocess_tokenizer_dir":
         tokenizer or model,
         "kv_cache_config":
-        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction)
-        if free_gpu_memory_fraction != kv_cache_default_fraction else None,
+        KvCacheConfig(free_gpu_memory_fraction=free_gpu_memory_fraction,
+                      dtype=kv_cache_dtype) if free_gpu_memory_fraction
+        != kv_cache_default_fraction or kv_cache_dtype != "auto" else None,
         "cp_config":
         cp_config,
         "build_config":
@@ -623,6 +624,14 @@ class ChoiceWithAlias(click.Choice):
               help=help_info_with_stability_tag(
                   "Free GPU memory fraction reserved for KV Cache, "
                   "after allocating model weights and buffers.", "beta"))
+@click.option(
+    "--kv_cache_dtype",
+    type=click.Choice(("auto", "fp8", "nvfp4")),
+    default="auto",
+    help=help_info_with_stability_tag(
+        "KV cache quantization dtype for PyTorch backend. "
+        "'auto' uses checkpoint/model metadata; explicit values force override.",
+        "prototype"))
 @click.option("--num_postprocess_workers",
               type=int,
               default=0,
@@ -738,11 +747,11 @@ def serve(
         tensor_parallel_size: int, pipeline_parallel_size: int,
         context_parallel_size: int, moe_expert_parallel_size: Optional[int],
         moe_cluster_parallel_size: Optional[int], gpus_per_node: Optional[int],
-        free_gpu_memory_fraction: float, num_postprocess_workers: int,
-        trust_remote_code: bool, revision: Optional[str],
-        extra_llm_api_options: Optional[str], reasoning_parser: Optional[str],
-        tool_parser: Optional[str], metadata_server_config_file: Optional[str],
-        server_role: Optional[str],
+        free_gpu_memory_fraction: float, kv_cache_dtype: str,
+        num_postprocess_workers: int, trust_remote_code: bool,
+        revision: Optional[str], extra_llm_api_options: Optional[str],
+        reasoning_parser: Optional[str], tool_parser: Optional[str],
+        metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
@@ -781,6 +790,7 @@ def serve(
             moe_cluster_parallel_size=moe_cluster_parallel_size,
             gpus_per_node=gpus_per_node,
             free_gpu_memory_fraction=free_gpu_memory_fraction,
+            kv_cache_dtype=kv_cache_dtype,
             num_postprocess_workers=num_postprocess_workers,
             trust_remote_code=trust_remote_code,
             revision=revision,
@@ -941,7 +951,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     """
     logger.set_level(log_level)
 
-    # TODO: expose more argument progressivly
+    # TODO: expose more arguments progressively
     llm_args, _ = get_llm_args(model=model,
                                max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
@@ -1073,7 +1083,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
         set_cuda_device()
-    # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
+    # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
 
     from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
@@ -1106,7 +1116,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"
     )
 
-    # Leader ranks will start the trtllm-server using it's own server config
+    # Leader ranks will start the trtllm-server using its own server config
     # and start a RemoteMPISessionServer to accept MPI tasks
     if is_leader:
         os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(

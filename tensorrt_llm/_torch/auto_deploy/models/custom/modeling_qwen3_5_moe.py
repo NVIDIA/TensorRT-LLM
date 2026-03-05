@@ -1507,6 +1507,7 @@ class Qwen3_5MoeModel(nn.Module):
         pixel_values_videos: Optional[torch.Tensor] = None,
         image_grid_thw: Optional[torch.LongTensor] = None,
         video_grid_thw: Optional[torch.LongTensor] = None,
+        position_ids: Optional[torch.LongTensor] = None,
         **kwargs,
     ) -> Qwen3_5MoeOutput:
         """Multimodal forward: vision encoding + embedding merge + mRoPE + text model.
@@ -1541,6 +1542,16 @@ class Qwen3_5MoeModel(nn.Module):
                 input_ids, inputs_embeds, video_features=video_embeds
             )
             inputs_embeds = inputs_embeds.masked_scatter(video_mask, video_embeds)
+
+        # TODO: Multi-modal case isn't handled here yet. Remove this once we have a proper way to handle multimodal
+        # position_ids. ADExecutor always provides a text-only position_ids.
+        if position_ids is not None:
+            # External position_ids (from AD runtime / nest_sequences) — pass
+            # directly to the language model which handles mRoPE expansion.
+            return self.language_model(
+                inputs_embeds=inputs_embeds,
+                position_ids=position_ids,
+            )
 
         # Compute 3D position IDs and mRoPE cos/sin
         position_ids, self.rope_deltas = self.get_rope_index(
