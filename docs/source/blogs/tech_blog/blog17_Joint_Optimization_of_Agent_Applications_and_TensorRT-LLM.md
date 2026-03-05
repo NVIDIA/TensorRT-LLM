@@ -2,7 +2,7 @@
 
 ## Overview
 
-In our previous tech blog "Inference Time Compute Implementation in TensorRT-LLM", we introduced the Scaffolding framework, which provides powerful abstractions for various inference-time compute methods. Orthogonal to inference-time compute, (multi-)agents (e.g., Deep Research, Claude Code, Manus, etc.) have demonstrated tremendous potential to push the frontier of intelligence even further. At the same time, agents represent a new workload that, compared to traditional chatbots, poses new challenges while also opening up new opportunities for LLM serving engines, particularly in areas such as end-to-end performance, fairness, and quality of service (QoS).
+In our [previous tech blog](https://nvidia.github.io/TensorRT-LLM/latest/blogs/tech_blog/blog13_Inference_Time_Compute_Implementation_in_TensorRT-LLM.html), we introduced the Scaffolding framework, which provides powerful abstractions for various inference-time compute methods. Orthogonal to inference-time compute, (multi-)agents (e.g., Deep Research, Claude Code, Manus, etc.) have demonstrated tremendous potential to push the frontier of intelligence even further. At the same time, agents represent a new workload that, compared to traditional chatbots, poses new challenges while also opening up new opportunities for LLM serving engines, particularly in areas such as end-to-end performance, fairness, and quality of service (QoS).
 
 In this tech blog, we introduce our latest efforts to apply Scaffolding to (multi-)agent systems. With Scaffolding, we build Open Deep Research, which is a representative multi-agent application for information collection and analysis. Scaffolding's decoupled frontend-backend architecture and modular design enable it to express Open Deep Research's logic concisely and accurately. More importantly, this architecture creates opportunities for joint optimization between agents and LLM inference engines. 
 
@@ -48,13 +48,9 @@ class Supervisor(Controller):
                 break
             
             # Reflect or spawn sub-agents
-            research_tasks_list = []
-            for tool_call in research_planning_task.messages[-1].tool_calls:
-                tool_name = tool_call.function.name
-                arguments = json.loads(tool_call.function.arguments)
+            research_tasks_list = [make_research_task(tool_call) for tool_call in research_planning_task.messages[-1].tool_calls:]
             
             yield ParallelProcess(researcher_controllers, research_tasks_list, kwargs_list)
-
 ```
 
 ```python
@@ -63,16 +59,7 @@ class Researcher(Controller):
 
     def process(self, research_tasks: List[ResearchTask], **kwargs):
         # Construct the chat task from the research topic
-        chat_task = ChatTask.create_from_prompt(
-            research_tasks[0].research_topic,
-            [
-                SystemMessage(
-                    research_system_prompt.format(date=get_today_str()),
-                    prefix=research_system_prompt_prefix,
-                )
-            ],
-            tools=self.tools,
-        )
+        chat_task = ChatTask.create_from_prompt(research_tasks[0].research_topic, self.system_prompt, self.tools)
 
         # Perform multiple rounds of tool calls
         yield from self.chat_with_tools_controller.process([chat_task])
@@ -238,7 +225,7 @@ The effectiveness of agent tree in achieving performance isolation between chat 
 </div>
 <p align="center"><sub><em>Figure 2. Queuing Delays of Agent and Chatbot Tasks </em></sub></p>
 
-We also notice that gang scheduling, which works by scheduling requests from the same agent job (e.g., Researcher sub-agents spawned by a Supervisor) in a batch, shows potential to tame the traffic spike by shortening the E2E completion times of the burst jobs and thereby shortening the burst period. We will detail agent-aware scheduling policies in our next blog.
+We also find that [gang scheduling](https://arxiv.org/abs/2412.20993v2) shows promise for mitigating traffic spikes. By concentrating batch slot resources on requests from a subset of agent jobs, it reduces end-to-end completion times for burst jobs, thereby shortening the burst period. We will explore agent-aware scheduling policies in detail in our next blog post.
 
 ## Future Work
 
