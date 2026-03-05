@@ -2326,34 +2326,30 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     def _reverse_interleave_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
         if scale_3d_u8.numel() == 0 or scale_3d_u8.shape[0] == 0:
             return scale_3d_u8
-        out = []
-        for e in range(scale_3d_u8.shape[0]):
-            unswizzled = torch.ops.trtllm.block_scale_interleave_reverse(
-                scale_3d_u8[e].unsqueeze(0)
-            ).view(scale_3d_u8[e].shape)
-            out.append(unswizzled)
-        return torch.stack(out, dim=0).contiguous()
+        # block_scale_interleave_reverse supports 3D [E, rows, cols] directly.
+        return torch.ops.trtllm.block_scale_interleave_reverse(scale_3d_u8).contiguous()
 
     def _shuffle_weight_stack(weight_3d: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if weight_3d.numel() == 0:
             return weight_3d
         epilogue_tile_m = 128
-        e_count, m_dim, _ = weight_3d.shape
-        cache_key = (m_dim, is_gated, "w")
-        if cache_key not in _permute_cache:
-            first = weight_3d[0]
-            if is_gated:
-                perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(first).to(first.device)
-            else:
-                perm0 = torch.arange(first.shape[0], dtype=torch.long, device=first.device)
-            perm1 = get_shuffle_matrix_a_row_indices(first, epilogue_tile_m=epilogue_tile_m)
-            if perm1.device != first.device:
-                perm1 = perm1.to(first.device)
-            _permute_cache[cache_key] = perm0[perm1]
-
-        permute = _permute_cache[cache_key]
-        out = [torch.ops.trtllm.shuffle_matrix(weight_3d[e], permute) for e in range(e_count)]
-        return torch.stack(out, dim=0).contiguous()
+        single_expert_weight = weight_3d[0]
+        if is_gated:
+            perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_weight).to(
+                single_expert_weight.device
+            )
+        else:
+            perm0 = torch.arange(
+                single_expert_weight.shape[0], dtype=torch.long, device=single_expert_weight.device
+            )
+        perm1 = get_shuffle_matrix_a_row_indices(
+            single_expert_weight, epilogue_tile_m=epilogue_tile_m
+        )
+        if perm1.device != single_expert_weight.device:
+            perm1 = perm1.to(single_expert_weight.device)
+        permute = perm0[perm1]
+        # shuffle_matrix expects 2D, so use index_select instead of shuffle_matrix
+        return torch.index_select(weight_3d, 1, permute)
 
     def _shuffle_scale_stack(scale_3d_u8: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if scale_3d_u8.numel() == 0:
@@ -2364,29 +2360,24 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
         if m_dim % 128 != 0 or k_dim % 4 != 0:
             return scale_3d_u8.view(torch.float8_e4m3fn)
 
-        cache_key = (m_dim, k_dim, is_gated, "s")
-        if cache_key not in _permute_cache:
-            first = scale_3d_u8[0]
-            if is_gated:
-                perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(first.float()).to(
-                    first.device
-                )
-            else:
-                perm0 = torch.arange(first.shape[0], dtype=torch.long, device=first.device)
-            perm1 = get_shuffle_matrix_sf_a_row_indices(
-                first, epilogue_tile_m=epilogue_tile_m, num_elts_per_sf=num_elts_per_sf
+        single_expert_scale = scale_3d_u8[0]
+        if is_gated:
+            perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_scale.float()).to(
+                single_expert_scale.device
             )
-            if perm1.device != first.device:
-                perm1 = perm1.to(first.device)
-            _permute_cache[cache_key] = perm0[perm1]
-
-        permute = _permute_cache[cache_key]
-        out = []
-        for e in range(e_count):
-            shuffled = torch.ops.trtllm.shuffle_matrix(scale_3d_u8[e], permute)
-            interleaved = torch.ops.trtllm.block_scale_interleave(shuffled)
-            out.append(interleaved.reshape(m_dim, k_dim))
-        return torch.stack(out, dim=0).contiguous().view(torch.float8_e4m3fn)
+        else:
+            perm0 = torch.arange(
+                single_expert_scale.shape[0], dtype=torch.long, device=single_expert_scale.device
+            )
+        perm1 = get_shuffle_matrix_sf_a_row_indices(
+            single_expert_scale, epilogue_tile_m=epilogue_tile_m, num_elts_per_sf=num_elts_per_sf
+        )
+        if perm1.device != single_expert_scale.device:
+            perm1 = perm1.to(single_expert_scale.device)
+        permute = perm0[perm1]
+        shuffled = torch.index_select(scale_3d_u8, 1, permute)
+        interleaved = torch.ops.trtllm.block_scale_interleave(shuffled)
+        return interleaved.reshape(e_count, m_dim, k_dim).view(torch.float8_e4m3fn).contiguous()
 
     fused_key_counter = 0
     graph = gm.graph
@@ -2449,7 +2440,6 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 (0, (fc2_w_k_padded - fc2_w_k_dim) // 2, 0, fc2_w_n_padded - fc2_w_n_dim),
             )
 
-        _permute_cache: dict = {}
         fc1_shuffled = _shuffle_weight_stack(fc1_w_stacked, is_gated=is_gated_mlp)
         fc2_shuffled = _shuffle_weight_stack(fc2_w_stacked, is_gated=False)
 
