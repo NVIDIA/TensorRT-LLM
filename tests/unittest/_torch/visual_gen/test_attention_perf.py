@@ -349,7 +349,7 @@ class WanAttentionPerformanceBenchmark:
 
             return stats
 
-        except Exception as e:
+        except (RuntimeError, torch.cuda.CudaError) as e:
             if verbose:
                 print(f"  {backend} (cross): ERROR - {e}")
             return None
