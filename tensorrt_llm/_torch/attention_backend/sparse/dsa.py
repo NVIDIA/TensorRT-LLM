@@ -27,7 +27,6 @@ from tensorrt_llm.bindings.internal.batch_manager import \
 from tensorrt_llm.deep_gemm import (fp8_mqa_logits, fp8_paged_mqa_logits,
                                     get_paged_mqa_logits_metadata)
 from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
-from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.utils import fp8_utils
@@ -39,15 +38,7 @@ ModelConfig = tensorrt_llm.bindings.ModelConfig
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import DecodingBaseConfig
 
-# Optional import: fast-hadamard-transform causes CI build issues (requires wheel+torch pre-installed)
-try:
-    from fast_hadamard_transform import hadamard_transform
-    HAS_FAST_HADAMARD = True
-except ImportError:
-    hadamard_transform = None
-    HAS_FAST_HADAMARD = False
-
-# Check for fused cat+hadamard+fp8 kernel availability.
+# Check for fused cat+fp8 kernel availability.
 # Env var TRTLLM_DSA_FUSED_PREP: "1" to enable (default), "0" to disable.
 _FUSED_PREP_ENV = os.environ.get("TRTLLM_DSA_FUSED_PREP", "1")
 _USE_FUSED_PREP = _FUSED_PREP_ENV == "1"
@@ -78,24 +69,6 @@ def _unravel_indices(flat_indices: torch.Tensor,
     flat_indices = flat_indices // d1
     i0 = flat_indices
     return i0, i1, i2, i3
-
-
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
-
-    if not HAS_FAST_HADAMARD:
-        # Fallback: skip transformation (acceptable for test/dev)
-        logger.warning_once(
-            "fast-hadamard-transform not available. DSA sparse attention will skip "
-            "hadamard transformation. Install with: "
-            "pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git",
-            key="fast_hadamard_import_missing")
-        return x
-
-    hidden_size = x.size(-1)
-    assert (hidden_size & (hidden_size - 1)
-            ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
-    return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
 def transform_local_topk_and_prepare_pool_view(
@@ -1564,15 +1537,14 @@ class Indexer(nn.Module):
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
         """Concatenate, rotate, and FP8 quantize for Q or K"""
         if _HAS_FUSED_CAT_HADAMARD_FP8:
-            # Fused path: cat + hadamard + fp8_quantize in one kernel.
+            # Fused path: cat + fp8_quantize in one kernel.
             # The kernel accepts non-contiguous inputs (stride(-1)==1 required)
             # and computes M as numel/size(-1), so no reshape needed.
             fp8_out, scale = torch.ops.trtllm.fused_cat_hadamard_fp8(
                 qk_pe, qk_nope, self.scale_fmt == "ue8m0")
             return fp8_out, scale
-        # Fallback: sequential cat → hadamard → fp8_quantize
+        # Fallback: sequential cat → fp8_quantize
         q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
-        q_or_k = rotate_activation(q_or_k)
         q_or_k = q_or_k.view(-1, self.head_dim)
         q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
             q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")

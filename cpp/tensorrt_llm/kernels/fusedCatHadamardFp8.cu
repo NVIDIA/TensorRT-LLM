@@ -41,34 +41,6 @@ constexpr int ELEMS_PER_THREAD = 4; // 128 / 32 = 4 elements per thread
 constexpr int ROWS_PER_BLOCK = 8;   // Process 8 rows per block for occupancy
 constexpr float FP8_E4M3_MAX = 448.0f;
 
-/// Butterfly Hadamard step: XOR shuffle across lanes.
-__device__ __forceinline__ void hadamardButterflyShfl(float& v0, float& v1, float& v2, float& v3, int xor_mask)
-{
-    float o0 = __shfl_xor_sync(0xFFFFFFFF, v0, xor_mask);
-    float o1 = __shfl_xor_sync(0xFFFFFFFF, v1, xor_mask);
-    float o2 = __shfl_xor_sync(0xFFFFFFFF, v2, xor_mask);
-    float o3 = __shfl_xor_sync(0xFFFFFFFF, v3, xor_mask);
-
-    // Standard Hadamard butterfly: for element index i with stride s,
-    //   if (i & s) == 0: new_val = old_val + old_partner
-    //   if (i & s) != 0: new_val = old_partner - old_val
-    // This is: new_val = sign * old_val + old_partner, where sign = ((lane & xor_mask) ? -1 : 1).
-    int lane = threadIdx.x % WARP_SIZE;
-    float sign = (lane & xor_mask) ? -1.0f : 1.0f;
-    v0 = sign * v0 + o0;
-    v1 = sign * v1 + o1;
-    v2 = sign * v2 + o2;
-    v3 = sign * v3 + o3;
-}
-
-/// Butterfly Hadamard step: within a single thread's registers.
-__device__ __forceinline__ void hadamardButterflyLocal(float& a, float& b)
-{
-    float tmp = a;
-    a = a + b;
-    b = tmp - b;
-}
-
 /// Compute UE8M0 scale: 2^ceil(log2(amax / FP8_MAX))
 /// This ensures amax / scale <= FP8_MAX, with scale being a power of 2.
 __device__ __forceinline__ float computeUe8m0Scale(float amax)
@@ -112,7 +84,7 @@ union FP8x4
     __nv_fp8_e4m3 fp8[4];
 };
 
-/// Fused kernel: cat + Hadamard transform + FP8 quantization.
+/// Fused kernel: cat + FP8 quantization.
 ///
 /// Grid: (ceil(M / ROWS_PER_BLOCK),)
 /// Block: (WARP_SIZE * ROWS_PER_BLOCK,)   i.e., (256,)
@@ -120,7 +92,6 @@ union FP8x4
 /// Each warp handles one row. Within a warp:
 ///   - Thread t handles elements [4t, 4t+1, 4t+2, 4t+3] of the 128-dim row.
 ///   - Loads from pe or nope based on element index (vectorized 8-byte loads).
-///   - Performs 7-stage Walsh-Hadamard butterfly (stages 0-1 local, stages 2-6 via shfl_xor).
 ///   - FP8 quantizes with per-row scale (vectorized 4-byte stores).
 __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8Kernel(
     __nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe,
@@ -174,39 +145,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
         v3 = f1.y;
     }
 
-    // ---- Stage 2: Walsh-Hadamard Transform (7 stages for dim=128) ----
-    // The full Hadamard matrix H_128 = H_2 ⊗ H_2 ⊗ ... (7 times).
-    // We decompose this into butterfly stages with increasing stride.
-    //
-    // Stages 0-1: Within-thread (stride 1, 2 within the 4-element group)
-    // Stage 0: stride 1 - pairs (v0,v1) and (v2,v3)
-    hadamardButterflyLocal(v0, v1);
-    hadamardButterflyLocal(v2, v3);
-
-    // Stage 1: stride 2 - pairs (v0,v2) and (v1,v3)
-    hadamardButterflyLocal(v0, v2);
-    hadamardButterflyLocal(v1, v3);
-
-    // Stages 2-6: Cross-thread via __shfl_xor_sync
-    // stride 4  -> XOR mask 1  (swap between lanes 0↔1, 2↔3, ...)
-    // stride 8  -> XOR mask 2
-    // stride 16 -> XOR mask 4
-    // stride 32 -> XOR mask 8
-    // stride 64 -> XOR mask 16
-    hadamardButterflyShfl(v0, v1, v2, v3, 1);
-    hadamardButterflyShfl(v0, v1, v2, v3, 2);
-    hadamardButterflyShfl(v0, v1, v2, v3, 4);
-    hadamardButterflyShfl(v0, v1, v2, v3, 8);
-    hadamardButterflyShfl(v0, v1, v2, v3, 16);
-
-    // Apply normalization: scale by head_dim^{-0.5} = 128^{-0.5} = 1/sqrt(128)
-    constexpr float HADAMARD_SCALE = 0.088388347648318440f; // 1.0 / sqrt(128)
-    v0 *= HADAMARD_SCALE;
-    v1 *= HADAMARD_SCALE;
-    v2 *= HADAMARD_SCALE;
-    v3 *= HADAMARD_SCALE;
-
-    // ---- Stage 3: FP8 Quantization (1x128 block = entire row) ----
+    // ---- Stage 2: FP8 Quantization (1x128 block = entire row) ----
     // Find per-row amax
     float local_max = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
     float amax = warpReduceMax(local_max);
@@ -231,7 +170,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
         return __nv_fp8_e4m3(scaled);
     };
 
-    // ---- Stage 4: Store (vectorized 4-byte FP8 store) ----
+    // ---- Stage 3: Store (vectorized 4-byte FP8 store) ----
     FP8x4 packed;
     packed.fp8[0] = quantize(v0);
     packed.fp8[1] = quantize(v1);

@@ -28,11 +28,10 @@ TRTLLM_NAMESPACE_BEGIN
 namespace kernels
 {
 
-/// Fused concat + Hadamard transform + FP8 1x128 quantization.
+/// Fused concat + FP8 1x128 quantization.
 ///
 /// Given two BF16 input matrices `pe` [M, pe_dim] and `nope` [M, nope_dim],
 /// this kernel concatenates them along the last dimension (pe first, nope second),
-/// applies a Walsh-Hadamard transform with scaling factor head_dim^{-0.5},
 /// then quantizes each row to FP8 E4M3 with one scale factor per row.
 ///
 /// Inputs need not be fully contiguous — only the innermost dimension must be
