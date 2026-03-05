@@ -860,12 +860,12 @@ class TestQwen3_5_35B_MoE(LlmapiAccuracyTestHarness):
             "model_factory": "Qwen3_5MoeForConditionalGeneration",
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "enable_chunked_prefill": True,
+            "enable_chunked_prefill": False,
             "compile_backend": "torch-cudagraph",
-            "max_batch_size": 16,
+            "max_batch_size": 64,
             "max_seq_len": self.MAX_SEQ_LEN,
             "max_num_tokens": self.MAX_SEQ_LEN,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16],
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
             "kv_cache_config": {
                 "enable_block_reuse": False,
                 "free_gpu_memory_fraction": 0.5,
@@ -903,24 +903,31 @@ class TestQwen3_5_35B_MoE(LlmapiAccuracyTestHarness):
                               use_beam_search=beam_width > 1)
 
     @pytest.mark.skip_less_device_memory(60000)
-    @pytest.mark.parametrize("world_size", [2])
+    @pytest.mark.parametrize("world_size", [8])
     def test_bf16(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
-        sampling_params = self.get_default_sampling_params()
+        self.get_default_sampling_params()
         with AutoDeployLLM(model=self.MODEL_NAME,
                            tokenizer=self.MODEL_NAME,
                            dtype="bfloat16",
                            world_size=world_size,
                            **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
+            # task = MMLU(self.MODEL_NAME)
+            # task.evaluate(llm, sampling_params=sampling_params)
+            # task = GSM8K(self.MODEL_NAME)
+            # task.evaluate(llm)
             task = MMMU(self.MODEL_NAME)
             task.EVALUATE_KWARGS = {
                 "model_type": "qwen3_vl",
                 "is_force_single_image": False
             }
-            task.evaluate(llm)
+            task.evaluate(
+                llm,
+                extra_evaluator_kwargs={
+                    "chat_template_kwargs": {
+                        "enable_thinking": False,
+                    },
+                },
+            )

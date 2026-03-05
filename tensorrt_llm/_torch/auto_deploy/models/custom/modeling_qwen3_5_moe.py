@@ -45,6 +45,7 @@ from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForImageTextToTextFactory,
     TextModelExportInfo,
 )
+from tensorrt_llm._torch.auto_deploy.utils.multimodal import MultimodalBucket
 
 # =============================================================================
 # Configuration
@@ -1460,8 +1461,6 @@ class Qwen3_5MoeModel(nn.Module):
     computes the correct mRoPE cos/sin.
     """
 
-    persistent_multimodal_keys = {"mrope_position_deltas"}
-
     def __init__(self, config: Qwen3_5MoeConfig):
         super().__init__()
         self.config = config
@@ -1603,7 +1602,32 @@ class Qwen3_5MoeModel(nn.Module):
         else:
             if position_ids is None:
                 raise ValueError("position_ids is required for text-only or decode-only forward")
-            position_ids_3d = (position_ids + delta)[None].expand(3, -1, -1)
+            if (
+                isinstance(delta, torch.Tensor)
+                and batch_info is not None
+                and batch_info[1].item() < position_ids.shape[-1]
+            ):
+                # Apply mRoPE deltas only to decode tokens. Prefill tokens are left unchanged.
+                num_prefill_tokens = batch_info[1].item()
+                num_prefill_seqs = batch_info[0].item()
+                decode_pos_2d = position_ids[..., num_prefill_tokens:]
+                gen_deltas = delta[num_prefill_seqs:]
+                decode_adjusted = decode_pos_2d + gen_deltas.T
+                if num_prefill_tokens > 0:
+                    prefill_pos_3d = position_ids[..., :num_prefill_tokens][None].expand(3, -1, -1)
+                    decode_pos_3d = decode_adjusted[None].expand(3, -1, -1)
+                    position_ids_3d = torch.cat([prefill_pos_3d, decode_pos_3d], dim=-1)
+                else:
+                    position_ids_3d = decode_adjusted[None].expand(3, -1, -1)
+            elif (
+                isinstance(delta, torch.Tensor)
+                and batch_info is not None
+                and batch_info[0].item() == 0
+            ):
+                # Decode-only batch.
+                position_ids_3d = (position_ids + delta.T)[None].expand(3, -1, -1)
+            else:
+                position_ids_3d = position_ids[None].expand(3, -1, -1)
 
         return self.language_model(
             inputs_embeds=inputs_embeds,
@@ -1641,18 +1665,28 @@ class Qwen3_5MoeModel(nn.Module):
             end = cu_seqlen[i + 1].item()
             req_ids = input_ids[..., start:end]
 
-            has_img = image_grid_thw is not None and (req_ids == self.config.image_token_id).any()
-            has_vid = video_grid_thw is not None and (req_ids == self.config.video_token_id).any()
+            # Infer per-request vision segments from vision-start markers only. This avoids
+            # misclassifying chunked slices that may contain image/video placeholder tokens
+            # without the corresponding start marker.
+            vision_starts = torch.where(req_ids[0] == self.config.vision_start_token_id)[0]
+            if len(vision_starts) > 0:
+                vision_tokens = req_ids[0][vision_starts + 1]
+                n_img = int((vision_tokens == self.config.image_token_id).sum().item())
+                n_vid = int((vision_tokens == self.config.video_token_id).sum().item())
+            else:
+                n_img = 0
+                n_vid = 0
+
+            has_img = image_grid_thw is not None and n_img > 0
+            has_vid = video_grid_thw is not None and n_vid > 0
 
             if has_img or has_vid:
                 req_img_grid = None
                 req_vid_grid = None
                 if has_img:
-                    n_img = (req_ids[0] == self.config.vision_start_token_id).sum().item()
                     req_img_grid = image_grid_thw[img_grid_idx : img_grid_idx + n_img]
                     img_grid_idx += n_img
                 if has_vid:
-                    n_vid = (req_ids[0] == self.config.vision_start_token_id).sum().item()
                     req_vid_grid = video_grid_thw[vid_grid_idx : vid_grid_idx + n_vid]
                     vid_grid_idx += n_vid
 
@@ -1774,9 +1808,15 @@ class Qwen3_5MoeInputProcessor:
         token_ids, extra = self._base(inputs, sampling_params)
 
         if extra is not None and "multimodal_data" in extra:
-            mm_data = extra["multimodal_data"]
-            image_grid_thw = mm_data.get("image_grid_thw")
-            video_grid_thw = mm_data.get("video_grid_thw")
+            mm_data = extra["multimodal_data"] or {}
+            prefill_bucket = mm_data.get(MultimodalBucket.PREFILL.value)
+            assert prefill_bucket is not None, (
+                "Expected bucketed multimodal_data with a 'prefill' bucket for Qwen3.5 input processing."
+            )
+            common_bucket = mm_data.setdefault(MultimodalBucket.COMMON.value, {})
+
+            image_grid_thw = prefill_bucket.get("image_grid_thw")
+            video_grid_thw = prefill_bucket.get("video_grid_thw")
 
             if image_grid_thw is not None or video_grid_thw is not None:
                 input_ids_t = torch.tensor([token_ids], dtype=torch.long)
@@ -1789,7 +1829,9 @@ class Qwen3_5MoeInputProcessor:
                     vision_start_token_id=self._mrope_config.vision_start_token_id,
                     spatial_merge_size=self._mrope_config.vision_config.spatial_merge_size,
                 )
-                mm_data["mrope_position_deltas"] = deltas
+                common_bucket["mrope_position_deltas"] = deltas
+
+            extra["multimodal_data"] = mm_data
 
         return token_ids, extra
 

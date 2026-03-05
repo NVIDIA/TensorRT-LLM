@@ -12,6 +12,7 @@ from .distributed import common as dist_ad
 from .llm_args import LlmArgs
 from .models.factory import ModelFactory
 from .shim.demollm import DemoGenerationExecutor
+from .utils.multimodal import MultimodalBucket
 
 
 class ADInputProcessor(DefaultInputProcessor):
@@ -92,7 +93,9 @@ class ADInputProcessor(DefaultInputProcessor):
             token_ids = all_args.pop("input_ids")
             assert token_ids.shape[0] == 1, "messages should be unbatched at this point."
             if all_args:
-                extra_processed_inputs = {"multimodal_data": all_args}
+                extra_processed_inputs = {
+                    "multimodal_data": {MultimodalBucket.PREFILL.value: all_args}
+                }
             else:
                 extra_processed_inputs = None
             return token_ids[0].tolist(), extra_processed_inputs

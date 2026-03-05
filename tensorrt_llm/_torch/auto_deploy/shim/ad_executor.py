@@ -72,42 +72,67 @@ from ..distributed.common import initialize_or_skip
 from ..llm_args import LlmArgs
 from ..transform.optimizer import InferenceOptimizer
 from ..utils.logger import ad_logger
+from ..utils.multimodal import MultimodalBucket
 from .interface import CachedSequenceInterface, GetInferenceModel
 
 
-def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Walk the wrapper chain (e.g. CapturedGraph → GraphModule → ...) to the innermost model."""
-    while hasattr(model, "model") and model.model is not model:
-        model = model.model
-    return model
+def _select_multimodal_fields_for_phase(
+    mm: Optional[dict], phase_bucket: MultimodalBucket
+) -> Dict[str, torch.Tensor]:
+    if mm is None:
+        return {}
+
+    common_fields = dict(mm.get(MultimodalBucket.COMMON.value, {}))
+    phase_fields = dict(mm.get(phase_bucket.value, {}))
+
+    collisions = sorted(set(common_fields).intersection(phase_fields))
+    assert not collisions, (
+        f"Found key collisions between '{MultimodalBucket.COMMON.value}' and "
+        f"'{phase_bucket.value}' buckets: {collisions}"
+    )
+
+    selected: Dict[str, torch.Tensor] = {**common_fields, **phase_fields}
+    return selected
 
 
-def _collect_persistent_multimodal_keys(
-    persist_keys: set,
-    ordered_requests: list,
+def _collect_bucketed_multimodal_fields(
+    ordered_requests: List[LlmRequest],
+    num_prefill_seqs: int,
     extra_args: Dict[str, List[torch.Tensor]],
 ) -> None:
-    """Collect persistent multimodal metadata from all requests.
+    # Phase-specific fields: collect only for that phase (no cross-phase zero fill).
+    for idx, request in enumerate(ordered_requests):
+        mm = request.py_multimodal_data
+        if mm is None:
+            continue
+        phase_bucket = (
+            MultimodalBucket.PREFILL if idx < num_prefill_seqs else MultimodalBucket.DECODE
+        )
+        phase_fields = dict(mm.get(phase_bucket.value, {}))
+        common_fields = dict(mm.get(MultimodalBucket.COMMON.value, {}))
+        collisions = sorted(set(common_fields).intersection(phase_fields))
+        assert not collisions, (
+            f"Found key collisions between '{MultimodalBucket.COMMON.value}' and "
+            f"'{phase_bucket.value}' buckets: {collisions}"
+        )
+        for key, value in phase_fields.items():
+            extra_args[key].append(value)
 
-    Models declare which ``py_multimodal_data`` keys should persist across
-    context and generation phases via a ``persistent_multimodal_keys`` class
-    attribute.  For each declared key this function gathers the value from
-    every request (context **and** generation), zero-filling for requests
-    that lack the key.
-    """
-    for key in persist_keys:
-        per_request: List[Optional[torch.Tensor]] = []
-        ref: Optional[torch.Tensor] = None
-        for request in ordered_requests:
-            mm = request.py_multimodal_data
-            if mm is not None and key in mm:
-                per_request.append(mm[key])
-                if ref is None:
-                    ref = mm[key]
-            else:
-                per_request.append(None)
-        if ref is not None:
-            extra_args[key] = [v if v is not None else torch.zeros_like(ref) for v in per_request]
+    # Common fields: align across all requests with zero fill for missing ones.
+    common_by_request: List[Dict[str, torch.Tensor]] = []
+    refs: Dict[str, torch.Tensor] = {}
+    for request in ordered_requests:
+        mm = request.py_multimodal_data
+        common_fields = {} if mm is None else dict(mm.get(MultimodalBucket.COMMON.value, {}))
+        common_by_request.append(common_fields)
+        for key, value in common_fields.items():
+            refs.setdefault(key, value)
+
+    for key, ref in refs.items():
+        extra_args[key] = [
+            common_fields.get(key) if key in common_fields else torch.zeros_like(ref)
+            for common_fields in common_by_request
+        ]
 
 
 @dataclass
@@ -573,8 +598,6 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-        inner = _unwrap_model(self.model)
-        self._persistent_multimodal_keys = getattr(inner, "persistent_multimodal_keys", set())
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -656,12 +679,6 @@ class ADEngine(ModelEngine):
 
             if token_gather_indices is not None:
                 token_gather_indices.append(len(input_ids) - 1)
-
-            # store extra arguments (skip keys handled by persistent collection)
-            if request.py_multimodal_data is not None:
-                for k, v in request.py_multimodal_data.items():
-                    if k not in self._persistent_multimodal_keys:
-                        extra_args[k].append(v)
 
         # store num_prefill and num_prefill_tokens
         num_prefill = len(context_requests)
@@ -756,9 +773,7 @@ class ADEngine(ModelEngine):
         num_decode_tokens = num_decode
         batch_info = [num_prefill_seqs, num_all_prefill_tokens, num_decode]
 
-        _collect_persistent_multimodal_keys(
-            self._persistent_multimodal_keys, ordered_requests, extra_args
-        )
+        _collect_bucketed_multimodal_fields(ordered_requests, num_prefill_seqs, extra_args)
 
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(
