@@ -57,7 +57,7 @@ All published functionality in the Release Notes has been fully tested and verif
     - Also updated the Feature Combination Matrix and Paged Attention, IFB, and Request Scheduling guide.
   - **Tech Blogs:** Published blogs on:
     - "[Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)](./blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md)" 
-    - "[Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](./blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html)".
+    - "[Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](./blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.md)".
   - **Examples:** 
     - Added new section on disaggregated serving service discovery method. 
     - Added examples for K-EXAONE, Nemotron Nano V2 VL and Nemotron Nano V3.
