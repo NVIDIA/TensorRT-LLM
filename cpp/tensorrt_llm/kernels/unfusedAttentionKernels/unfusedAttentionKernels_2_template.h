@@ -889,9 +889,8 @@ __global__ void applyBiasRopeUpdateKVCacheV2(QKVPreprocessingParams<T, KVCacheBu
         [[maybe_unused]] float2 const* rotary_coef_cache_buffer = nullptr;
         if (params.mrope_rotary_cos_sin != nullptr)
         {
-            rotary_coef_cache_buffer = params.mrope_rotary_cos_sin
-                + batch_idx * params.rotary_embedding_max_positions * params.half_rotary_dim
-                + static_cast<size_t>(rotary_position) * params.half_rotary_dim;
+            rotary_coef_cache_buffer
+                = params.mrope_rotary_cos_sin + static_cast<size_t>(rotary_position) * params.half_rotary_dim;
         }
         else
         {

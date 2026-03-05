@@ -2152,14 +2152,6 @@ class PyTorchModelEngine(ModelEngine):
                 multimodal_data=request.py_multimodal_data,
                 multimodal_runtime=py_multimodal_runtime)
             if multimodal_params.has_content():
-                if self.use_mrope:
-                    ctx_mrope_position_ids = multimodal_params.multimodal_data[
-                        'mrope_config'][
-                            'mrope_position_ids'][:, :,
-                                                  begin_compute:begin_compute +
-                                                  len(prompt_tokens)]
-                    mrope_position_ids.append(ctx_mrope_position_ids)
-
                 # TODO: Visit later to decide the appropriate position of sending multimodal data & selectively sending multimodal data
                 multimodal_params.to_device("multimodal_data",
                                             "cuda",
@@ -2168,6 +2160,13 @@ class PyTorchModelEngine(ModelEngine):
                                                 self.model,
                                                 "multimodal_data_device_paths",
                                                 None))
+                if self.use_mrope:
+                    ctx_mrope_position_ids = multimodal_params.multimodal_data[
+                        'mrope_config'][
+                            'mrope_position_ids'][:, :,
+                                                  begin_compute:begin_compute +
+                                                  len(prompt_tokens)]
+                    mrope_position_ids.append(ctx_mrope_position_ids)
 
                 #re-assign the multimodal_data to the request after to_device for generation requests
                 request.py_multimodal_data = multimodal_params.multimodal_data

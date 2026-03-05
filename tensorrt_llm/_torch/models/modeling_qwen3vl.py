@@ -583,6 +583,13 @@ class Qwen3VisionModel(torch.nn.Module):
 
         head_dim = self.config.hidden_size // self.config.num_heads
         self.rotary_pos_emb = HFQwen3VLVisionRotaryEmbedding(head_dim // 2)
+        # self.config.num_attention_heads = self.config.num_heads
+        # self.config.head_dim = self.config.hidden_size // self.config.num_heads // 2
+        # self.config.max_position_embeddings = 8192
+        # rope_params = RopeParams.from_config(self.config)
+        # self.rotary_pos_emb = RotaryEmbedding(rope_params,
+        #     head_dim=self.config.hidden_size // self.config.num_attention_heads,
+        #     is_neox=True)
 
         self.blocks = nn.ModuleList(
             [
@@ -651,66 +658,121 @@ class Qwen3VisionModel(torch.nn.Module):
         embeddings = embeddings.flatten(1)
         return embeddings
 
-    def fast_pos_embed_interpolate(self, grid_thw):
-        grid_ts, grid_hs, grid_ws = grid_thw[:, 0], grid_thw[:, 1], grid_thw[:, 2]
+    # @property
+    # def device(self) -> torch.device:
+    #     return self.patch_embed.proj.weight.device
 
-        idx_list = [[] for _ in range(4)]
-        weight_list = [[] for _ in range(4)]
+    # @staticmethod
+    # @lru_cache(maxsize=1024)
+    # def rot_pos_ids(h: int, w: int, spatial_merge_size: int) -> torch.Tensor:
+    #     hpos_ids = np.broadcast_to(np.arange(h).reshape(h, 1), (h, w))
+    #     h_div = h // spatial_merge_size
+    #     w_div = w // spatial_merge_size
+    #     hpos_ids = hpos_ids.reshape(
+    #         h_div,
+    #         spatial_merge_size,
+    #         w_div,
+    #         spatial_merge_size,
+    #     )
+    #     hpos_ids = hpos_ids.transpose(0, 2, 1, 3)
+    #     hpos_ids = hpos_ids.flatten()
 
-        for t, h, w in zip(grid_ts, grid_hs, grid_ws):
-            h_idxs = torch.linspace(0, self.num_grid_per_side - 1, h)
-            w_idxs = torch.linspace(0, self.num_grid_per_side - 1, w)
+    #     wpos_ids = np.broadcast_to(np.arange(w).reshape(1, w), (h, w))
+    #     wpos_ids = wpos_ids.reshape(
+    #         h_div,
+    #         spatial_merge_size,
+    #         w_div,
+    #         spatial_merge_size,
+    #     )
+    #     wpos_ids = wpos_ids.transpose(0, 2, 1, 3)
+    #     wpos_ids = wpos_ids.flatten()
 
-            h_idxs_floor = h_idxs.int()
-            w_idxs_floor = w_idxs.int()
-            h_idxs_ceil = (h_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
-            w_idxs_ceil = (w_idxs.int() + 1).clip(max=self.num_grid_per_side - 1)
+    #     return torch.from_numpy(np.stack([hpos_ids, wpos_ids], axis=-1))
 
-            dh = h_idxs - h_idxs_floor
-            dw = w_idxs - w_idxs_floor
+    # def rot_pos_emb(self, grid_thw: torch.Tensor):
+    #     max_grid_size = max(max(h, w) for _, h, w in grid_thw)
+    #     pos_ids = [
+    #         self.rot_pos_ids(h, w, self.spatial_merge_size)
+    #         if t == 1
+    #         else self.rot_pos_ids(h, w, self.spatial_merge_size).repeat(t, 1)
+    #         for t, h, w in grid_thw
+    #     ]
+    #     pos_ids = torch.cat(pos_ids, dim=0).to(self.device, non_blocking=True)
 
-            base_h = h_idxs_floor * self.num_grid_per_side
-            base_h_ceil = h_idxs_ceil * self.num_grid_per_side
+    #     # Use pre-computed cos_sin_cache from RotaryEmbedding
+    #     cos, sin = self.rotary_pos_emb.rotary_cos_sin[:max_grid_size].chunk(2, dim=-1)
 
-            indices = [
-                (base_h[None].T + w_idxs_floor[None]).flatten(),
-                (base_h[None].T + w_idxs_ceil[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_floor[None]).flatten(),
-                (base_h_ceil[None].T + w_idxs_ceil[None]).flatten(),
-            ]
+    #     cos_combined = cos[pos_ids].flatten(1)
+    #     sin_combined = sin[pos_ids].flatten(1)
+    #     # print(f"[TRT-LLM DEBUG] cos_combined: {cos_combined.shape}, sin_combined: {sin_combined.shape}")
+    #     return (cos_combined, sin_combined)
 
-            weights = [
-                ((1 - dh)[None].T * (1 - dw)[None]).flatten(),
-                ((1 - dh)[None].T * dw[None]).flatten(),
-                (dh[None].T * (1 - dw)[None]).flatten(),
-                (dh[None].T * dw[None]).flatten(),
-            ]
+    # Adopted from https://github.com/vllm-project/vllm/blob/21eb2c3372fb6447ef36bee44ff7af79a330ffec/vllm/model_executor/models/qwen3_vl.py#L470)
+    def fast_pos_embed_interpolate(self, grid_thw: list[list[int]]) -> torch.Tensor:
+        num_grid_per_side = self.num_grid_per_side
+        m_size = self.spatial_merge_size
+        hidden_dim = self.pos_embed.embedding_dim
 
-            for i in range(4):
-                idx_list[i].extend(indices[i].tolist())
-                weight_list[i].extend(weights[i].tolist())
-
-        idx_tensor = torch.tensor(idx_list, dtype=torch.long, device=self.pos_embed.weight.device)
-        weight_tensor = torch.tensor(
-            weight_list, dtype=self.pos_embed.weight.dtype, device=self.pos_embed.weight.device
-        )
-        pos_embeds = self.pos_embed(idx_tensor) * weight_tensor[:, :, None]
-        patch_pos_embeds = pos_embeds[0] + pos_embeds[1] + pos_embeds[2] + pos_embeds[3]
-
-        patch_pos_embeds = patch_pos_embeds.split([h * w for h, w in zip(grid_hs, grid_ws)])
-
-        patch_pos_embeds_permute = []
-        merge_size = self.config.spatial_merge_size
-        for pos_embed, t, h, w in zip(patch_pos_embeds, grid_ts, grid_hs, grid_ws):
-            pos_embed = pos_embed.repeat(t, 1)
-            pos_embed = (
-                pos_embed.view(t, h // merge_size, merge_size, w // merge_size, merge_size, -1)
-                .permute(0, 1, 3, 2, 4, 5)
-                .flatten(0, 4)
+        outputs = []
+        for t, h, w in grid_thw:
+            h_idxs = torch.linspace(
+                0,
+                num_grid_per_side - 1,
+                h,
+                dtype=torch.float32,
+                device=self.pos_embed.weight.device,
             )
-            patch_pos_embeds_permute.append(pos_embed)
-        patch_pos_embeds = torch.cat(patch_pos_embeds_permute)
-        return patch_pos_embeds
+            w_idxs = torch.linspace(
+                0,
+                num_grid_per_side - 1,
+                w,
+                dtype=torch.float32,
+                device=self.pos_embed.weight.device,
+            )
+
+            h_floor = h_idxs.to(torch.long)
+            w_floor = w_idxs.to(torch.long)
+            h_ceil = torch.clamp(h_floor + 1, max=num_grid_per_side - 1)
+            w_ceil = torch.clamp(w_floor + 1, max=num_grid_per_side - 1)
+
+            dh = h_idxs - h_floor
+            dw = w_idxs - w_floor
+
+            # Create meshgrid view for all h, w vars
+            dh_grid, dw_grid = torch.meshgrid(dh, dw, indexing="ij")
+            h_floor_grid, w_floor_grid = torch.meshgrid(h_floor, w_floor, indexing="ij")
+            h_ceil_grid, w_ceil_grid = torch.meshgrid(h_ceil, w_ceil, indexing="ij")
+
+            # original computation of weights
+            # w00 = (1 - dh_grid) * (1 - dw_grid)
+            # w01 = (1 - dh_grid) * dw_grid
+            # w10 = dh_grid * (1 - dw_grid)
+            # w11 = dh_grid * dw_grid
+            # we reuse w11 here to avoid duplicate
+            # dh_grid * dw_grid computation
+            w11 = dh_grid * dw_grid
+            w10 = dh_grid - w11
+            w01 = dw_grid - w11
+            w00 = 1 - dh_grid - w01
+
+            h_grid = torch.stack([h_floor_grid, h_floor_grid, h_ceil_grid, h_ceil_grid])
+            w_grid = torch.stack([w_floor_grid, w_ceil_grid, w_floor_grid, w_ceil_grid])
+            h_grid_idx = h_grid * num_grid_per_side
+
+            indices = (h_grid_idx + w_grid).reshape(4, -1)
+            weights = torch.stack([w00, w01, w10, w11], dim=0).reshape(4, -1, 1)
+            weights = weights.to(dtype=self.pos_embed.weight.dtype)
+
+            embeds = self.pos_embed(indices)
+            embeds *= weights
+            combined = embeds.sum(dim=0)
+
+            combined = combined.reshape(h // m_size, m_size, w // m_size, m_size, hidden_dim)
+            combined = combined.permute(0, 2, 1, 3, 4).reshape(1, -1, hidden_dim)
+            repeated = combined.expand(t, -1, -1).reshape(-1, hidden_dim)
+            outputs.append(repeated)
+
+        return torch.cat(outputs, dim=0)
 
     def prepare_attn_metadata(self, seq_lens, attn_metadata: AttentionMetadata):
         # NOTE: The single prompt is divided into multiple seq_lens, so pretending have many batch_sizes.
@@ -727,25 +789,29 @@ class Qwen3VisionModel(torch.nn.Module):
         attn_metadata.prepare()
         return attn_metadata
 
+    @nvtx_range("Qwen3VisionModel forward compute")
     @torch.inference_mode()
     def forward(
         self, pixel_values: torch.Tensor, grid_thw: torch.Tensor, **kwargs
     ) -> Tuple[torch.Tensor, List[torch.Tensor]]:
-        seq_lens = torch.repeat_interleave(grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]).tolist()
-        attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
+        with nvtx_range("Qwen3VisionModel forward compute prepare_attn_metadata"):
+            seq_lens = torch.repeat_interleave(
+                grid_thw[:, 1] * grid_thw[:, 2], grid_thw[:, 0]
+            ).tolist()
+            attn_metadata = self.prepare_attn_metadata(seq_lens, self.attn_metadata)
 
-        # Getting positional embedding
-        rotary_pos_emb = self.rot_pos_emb(grid_thw)
-        pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
+        with nvtx_range("Qwen3VisionModel forward compute rot_pos_emb"):
+            # Getting positional embedding
+            rotary_pos_emb = self.rot_pos_emb(grid_thw)
+        with nvtx_range("Qwen3VisionModel forward compute fast_pos_embed_interpolate"):
+            pos_embeds = self.fast_pos_embed_interpolate(grid_thw)
 
-        # From this point, pure GPU operation
         hidden_states = self.patch_embed(pixel_values)
-        hidden_states = hidden_states + pos_embeds
-        seq_len, _ = hidden_states.size()
-        hidden_states = hidden_states.reshape(seq_len, -1)
+        hidden_states += pos_embeds
+        hidden_states = hidden_states.flatten(1)
 
-        rotary_pos_emb = rotary_pos_emb.reshape(seq_len, -1)
-        emb = torch.cat((rotary_pos_emb, rotary_pos_emb), dim=-1)
+        rotary_pos_emb = rotary_pos_emb.flatten(1)
+        emb = rotary_pos_emb.repeat(1, 2)
         position_embeddings = (emb.cos(), emb.sin())
 
         deepstack_feature_lists = []
@@ -866,6 +932,7 @@ class Qwen3VisionModelBase(nn.Module):
 
         return mm_content_dict, mm_extra_data
 
+    @nvtx_range("Qwen3VisionModelBase forward")
     @torch.inference_mode()
     def forward(self, multimodal_params: List[MultimodalParams]) -> List[torch.Tensor]:
         mm_content_data, mm_extra_data = self._parse_and_batch_multimodal_data(multimodal_params)
@@ -969,45 +1036,34 @@ class Qwen3VLModelBase(PreTrainedModel):
             mrope_section=pos_embd_params.mrope_section,
             mrope_interleaved=pos_embd_params.mrope_interleaved,
         ).to("cuda")
-        self.mrope_position_ids_padding_cuda = torch.zeros(
-            (
-                3,
-                1,
-                config.max_position_embeddings,
-            ),
-            dtype=torch.int32,
-            device="cuda",
-        )
+        # self.mrope_position_ids_padding_cuda = torch.zeros(
+        #     (
+        #         3,
+        #         1,
+        #         config.max_position_embeddings,
+        #     ),
+        #     dtype=torch.int32,
+        #     device="cuda",
+        # )
 
     @nvtx_range("Qwen3-VL prepare_mrope_config")
     def prepare_mrope_config(
-        self, multimodal_params: List[MultimodalParams], num_context_requests: int
+        self,
+        multimodal_params: List[MultimodalParams],
+        num_context_requests: int,
+        num_generation_requests: int,
+        position_ids: torch.Tensor,
     ):
         mrope_config = {}
-        mrope_rotary_cos_sin = []
+        mrope_rotary_cos_sin = None
         mrope_position_deltas = []
-        for multimodal_param in multimodal_params[:num_context_requests]:
-            if multimodal_param.multimodal_data.get("mrope_config") is not None:
-                with nvtx_range("Qwen3-VL get_cos_sin"):
-                    if (
-                        multimodal_param.multimodal_data["mrope_config"].get("mrope_position_ids")
-                        is not None
-                    ):
-                        mrope_position_ids = multimodal_param.multimodal_data["mrope_config"][
-                            "mrope_position_ids"
-                        ]
-
-                        self.mrope_position_ids_padding_cuda[
-                            :, :, : mrope_position_ids.shape[-1]
-                        ] = mrope_position_ids
-                        self.mrope_position_ids_padding_cuda[
-                            :, :, mrope_position_ids.shape[-1] :
-                        ] = 0
-                        cos, sin = self.rotary_emb.get_cos_sin(self.mrope_position_ids_padding_cuda)
-                        concat_cos_sin = torch.stack((cos, sin), dim=-1)
-                        concat_cos_sin = concat_cos_sin.reshape(concat_cos_sin.shape[0], -1)
-                        mrope_rotary_cos_sin.append(concat_cos_sin)
-
+        if position_ids.shape[-1] > num_generation_requests:
+            if num_generation_requests > 0:
+                ctx_position_ids = position_ids[:, :, :-num_generation_requests]
+            else:
+                ctx_position_ids = position_ids
+            cos, sin = self.rotary_emb.get_cos_sin(ctx_position_ids)
+            mrope_rotary_cos_sin = torch.stack((cos, sin), dim=-1).flatten(1)
         for multimodal_param in multimodal_params[num_context_requests:]:
             if multimodal_param.multimodal_data.get("mrope_config") is not None:
                 if (
@@ -1018,12 +1074,14 @@ class Qwen3VLModelBase(PreTrainedModel):
                         multimodal_param.multimodal_data["mrope_config"]["mrope_position_deltas"]
                     )
 
-        with nvtx_range("Qwen3-VL concat mrope_rotary_cos_sin"):
-            if mrope_rotary_cos_sin:
-                mrope_config["mrope_rotary_cos_sin"] = torch.cat(mrope_rotary_cos_sin, dim=0)
-        with nvtx_range("Qwen3-VL concat mrope_position_deltas"):
-            if mrope_position_deltas:
-                mrope_config["mrope_position_deltas"] = torch.cat(mrope_position_deltas, dim=0)
+        if mrope_rotary_cos_sin is not None:
+            mrope_config["mrope_rotary_cos_sin"] = mrope_rotary_cos_sin
+        if mrope_position_deltas:
+            mrope_config["mrope_position_deltas"] = (
+                mrope_position_deltas[0]
+                if len(mrope_position_deltas) == 1
+                else torch.cat(mrope_position_deltas, dim=0)
+            )
 
         return mrope_config
 
@@ -1048,9 +1106,6 @@ class Qwen3VLModelBase(PreTrainedModel):
         num_context_requests, num_generation_requests = (
             attn_metadata.num_contexts,
             attn_metadata.num_generations,
-        )
-        logger.debug(
-            f"num_context_requests: {num_context_requests}, num_generation_requests: {num_generation_requests}"
         )
 
         multimodal_params = kwargs.get("multimodal_params", [])
@@ -1083,7 +1138,9 @@ class Qwen3VLModelBase(PreTrainedModel):
                     deepstack_embeds.extend(deepstack_embed)
 
         if not self.model_config.pretrained_config.disable_fuse_rope:
-            mrope_config = self.prepare_mrope_config(multimodal_params, num_context_requests)
+            mrope_config = self.prepare_mrope_config(
+                multimodal_params, num_context_requests, num_generation_requests, position_ids
+            )
 
         result = fuse_input_embeds(
             self.llm.model.embed_tokens,
@@ -1152,7 +1209,13 @@ class Qwen3VLModel(Qwen3VLModelBase):
 
     @property
     def multimodal_data_device_paths(self) -> List[str]:
-        return ["image.pixel_values", "video.pixel_values_videos", "multimodal_embedding"]
+        return [
+            "image.pixel_values",
+            "video.pixel_values_videos",
+            "multimodal_embedding",
+            "mrope_config.mrope_position_ids",
+            "mrope_config.mrope_position_deltas",
+        ]
 
     def load_weights(self, weights: Dict[str, torch.Tensor], weight_mapper: BaseWeightMapper):
         if not _is_disagg():
