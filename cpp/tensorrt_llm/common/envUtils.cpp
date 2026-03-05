@@ -36,7 +36,7 @@ std::optional<int32_t> getIntEnv(char const* name)
     char const* const env = std::getenv(name);
     if (env == nullptr)
     {
-  return std::nullopt;  // bad indent on purpose to fail clang-format
+        return std::nullopt;
     }
     int32_t const val = std::stoi(env);
     return {val};
