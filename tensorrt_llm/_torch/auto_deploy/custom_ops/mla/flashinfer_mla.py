@@ -30,6 +30,7 @@ from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
+from ...utils.logger import ad_logger
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -526,16 +527,15 @@ def flashinfer_mla_with_cache(
     compressed_kv_flat = compressed_kv.contiguous().view(bs, kv_lora_rank)
     kpe_flat = kpe.contiguous().view(bs, qk_rope_head_dim)
 
-    # Convert cache dtype if needed
-    if ckv_cache.dtype == torch.float8_e4m3fn:
-        compressed_kv_flat = compressed_kv_flat.to(torch.float8_e4m3fn)
-        kpe_flat = kpe_flat.to(torch.float8_e4m3fn)
+    # Cast to cache dtype for writes (no-op when dtypes already match).
+    compressed_kv_for_cache = compressed_kv_flat.to(ckv_cache.dtype)
+    kpe_for_cache = kpe_flat.to(kpe_cache.dtype)
 
     # Append to paged cache using FlashInfer's append function
     # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
     flashinfer.page.append_paged_mla_kv_cache(
-        compressed_kv_flat,
-        kpe_flat,
+        compressed_kv_for_cache,
+        kpe_for_cache,
         flashinfer_batch_indices,
         flashinfer_positions,
         ckv_cache,
@@ -932,7 +932,17 @@ class FlashInferMLAAttention(AttentionDescriptor):
         if qk_rope_head_dim != 64:
             raise ValueError("qk_rope_head_dim must be 64 for flashinfer_mla")
 
-        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
+        model_dtype = compressed_kv_fake.dtype
+        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, model_dtype)
+
+        # FlashInfer MLA kernels currently require BF16 cache dtype.
+        if cache_dtype != torch.bfloat16:
+            ad_logger.warning(
+                "FlashInfer MLA requires BF16 KV cache; overriding %s to %s.",
+                cache_dtype,
+                torch.bfloat16,
+            )
+            cache_dtype = torch.bfloat16
 
         # FlashInfer MLA uses two separate paged caches with no num_heads dimension
         return {
