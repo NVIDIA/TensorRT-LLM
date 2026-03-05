@@ -19,6 +19,7 @@ import io
 import os
 import sys
 
+import grpc
 import pytest
 import torch
 from PIL import Image
@@ -537,6 +538,50 @@ class TestComprehensiveSamplingParamsConversion:
 
 
 # ============================================================================
+# Servicer validation tests (no GPU required)
+# ============================================================================
+
+
+class TestGenerateValidation:
+    """Test that invalid gRPC requests return INVALID_ARGUMENT status.
+
+    No GPU or model required — validation happens before LLM interaction.
+    """
+
+    def _servicer(self):
+        """Create a servicer with no real LLM (validation aborts before use)."""
+        return TrtllmServiceServicer(request_manager=None)
+
+    def _assert_invalid_argument(self, request):
+        """Assert that a GenerateRequest results in INVALID_ARGUMENT abort."""
+        servicer = self._servicer()
+
+        async def run():
+            ctx = _MockContext()
+            try:
+                async for _ in servicer.Generate(request, ctx):
+                    pass
+            except grpc.aio.AbortError:
+                pass
+            return ctx.code, ctx.details
+
+        code, details = _run_async(run())
+        assert code == grpc.StatusCode.INVALID_ARGUMENT, (
+            f"Expected INVALID_ARGUMENT, got {code}: {details}"
+        )
+        return details
+
+    def test_missing_tokenized_input(self):
+        """Request without tokenized field should be rejected."""
+        request = pb2.GenerateRequest(
+            request_id="test-no-tokenized",
+            max_tokens=10,
+        )
+        details = self._assert_invalid_argument(request)
+        assert "Missing tokenized input" in details
+
+
+# ============================================================================
 # End-to-end gRPC service tests (with real model)
 # ============================================================================
 
@@ -587,8 +632,17 @@ def _run_async(coro):
 class _MockContext:
     """Minimal mock for grpc.aio.ServicerContext."""
 
+    def __init__(self):
+        self.code = None
+        self.details = None
+
     def cancelled(self):
         return False
+
+    async def abort(self, code, details=""):
+        self.code = code
+        self.details = details
+        raise grpc.aio.AbortError(code, details)
 
 
 @skip_no_gpu
