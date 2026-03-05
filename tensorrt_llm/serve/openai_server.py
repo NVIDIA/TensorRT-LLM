@@ -721,9 +721,8 @@ class OpenAIServer:
             if self.tool_parser and request.tools:
                 tool_parser_cls = ToolParserFactory.parsers.get(
                     self.tool_parser.lower())
-                if tool_parser_cls and getattr(tool_parser_cls,
-                                               'needs_raw_special_tokens',
-                                               False):
+                if tool_parser_cls and getattr(
+                        tool_parser_cls, 'needs_raw_special_tokens', False):
                     sampling_params.skip_special_tokens = False
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(request.disaggregated_params)
