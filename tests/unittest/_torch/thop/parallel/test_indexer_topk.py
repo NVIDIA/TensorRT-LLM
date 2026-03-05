@@ -348,6 +348,71 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype)
     ), "CuTE DSL top-k results don't match torch.topk"
 
 
+# TODO: failed on one of the fp16 test. 
+@pytest.mark.parametrize("batch_size", [1, 4, 64])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [32768, 65536])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("chunk_size_per_cta", [16384])
+# @pytest.mark.parametrize("batch_size", [64])
+# @pytest.mark.parametrize("next_n", [3])
+# @pytest.mark.parametrize("index_topk", [2048])
+# @pytest.mark.parametrize("num_tokens", [32768])
+# @pytest.mark.parametrize("dtype", [torch.float16])
+# @pytest.mark.parametrize("chunk_size_per_cta", [16384])
+def test_cute_dsl_topk_decode_multi_cta(batch_size, next_n, index_topk,
+                                        num_tokens, dtype,
+                                        chunk_size_per_cta):
+    skip_if_no_cute_dsl()
+    skip_if_not_blackwell()
+
+    torch.manual_seed(42)
+    torch.cuda.manual_seed(42)
+
+    # Set input data (same structure as test_indexer_topk_decode)
+    num_gen_tokens = batch_size * next_n
+    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
+    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
+    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
+
+    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
+
+    # Create logits with the specified dtype
+    logits = create_random_logits(row_starts, row_ends, dtype, 42)
+
+    # Run CuTE DSL multi-CTA implementation
+    result = torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
+        input_values=logits,
+        seq_lens=seq_lens,
+        top_k=index_topk,
+        next_n=next_n,
+        num_copy_bits=256,
+        chunk_size_per_cta=chunk_size_per_cta,
+    )
+    cute_indices = result
+
+    torch.cuda.synchronize()
+
+    # Run reference implementation
+    max_row_len = row_ends.max().item()
+    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
+    mask_lo = torch_indices >= 0
+    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
+    mask = mask_lo & mask_hi
+    torch_indices = torch_indices.masked_fill(~mask, -1)
+
+    # Convert cute_indices to int32 for comparison
+    cute_indices_int32 = cute_indices.to(torch.int32)
+
+    # Compare results
+    assert compare_top_k_results(
+        logits, cute_indices_int32, torch_indices, row_starts, row_ends,
+        index_topk
+    ), "CuTE DSL multi-CTA top-k results don't match torch.topk"
+
+
 def index_topk_decode_benchmark(
     batch_size=64,
     next_n=1,
@@ -431,11 +496,11 @@ def index_topk_decode_benchmark(
     end_event.record()
     torch.cuda.synchronize()
 
-    time_standard_ms = start_event.elapsed_time(end_event) / num_iterations
+    time_standard_us = start_event.elapsed_time(end_event) / num_iterations * 1000
 
-    print(f"  Average time: {time_standard_ms:.4f} ms")
+    print(f"  Average time: {time_standard_us:.4f} us")
     print(
-        f"  Throughput: {num_gen_tokens * num_tokens / time_standard_ms / 1e6:.2f} G elements/s\n"
+        f"  Throughput: {num_gen_tokens * num_tokens / time_standard_us / 1e6:.2f} M elements/s\n"
     )
 
     # ========================================================================
@@ -467,20 +532,20 @@ def index_topk_decode_benchmark(
     end_event.record()
     torch.cuda.synchronize()
 
-    time_cute_ms = start_event.elapsed_time(end_event) / num_iterations
+    time_cute_us = start_event.elapsed_time(end_event) / num_iterations * 1000
 
-    print(f"  Average time: {time_cute_ms:.4f} ms")
-    print(f"  Throughput: {num_gen_tokens * num_tokens / time_cute_ms / 1e6:.2f} G elements/s\n")
+    print(f"  Average time: {time_cute_us:.4f} us")
+    print(f"  Throughput: {num_gen_tokens * num_tokens / time_cute_us / 1e6:.2f} M elements/s\n")
 
     # ========================================================================
     # Results Summary
     # ========================================================================
-    speedup = time_standard_ms / time_cute_ms
+    speedup = time_standard_us / time_cute_us
     print(f"{'=' * 80}")
     print("Results Summary:")
     print(f"{'=' * 80}")
-    print(f"  Standard implementation: {time_standard_ms:.4f} ms")
-    print(f"  CuTE DSL implementation: {time_cute_ms:.4f} ms")
+    print(f"  Standard implementation: {time_standard_us:.4f} us")
+    print(f"  CuTE DSL implementation: {time_cute_us:.4f} us")
     print(
         f"  Speedup: {speedup:.2f}x {'(CuTE DSL faster)' if speedup > 1 else '(Standard faster)'}"
     )
@@ -512,8 +577,8 @@ def index_topk_decode_benchmark(
             "num_tokens": num_tokens,
             "dtype": str(dtype),
         },
-        "standard_ms": time_standard_ms,
-        "cute_dsl_ms": time_cute_ms,
+        "standard_us": time_standard_us,
+        "cute_dsl_us": time_cute_us,
         "speedup": speedup,
         "correct": correct,
     }
@@ -523,7 +588,7 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Top-K Performance Benchmark")
-    parser.add_argument("--batch_size", type=int, default=64, help="Batch size")
+    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
     parser.add_argument("--next_n", type=int, default=1, help="Number of candidates per sequence")
     parser.add_argument("--index_topk", type=int, default=2048, help="Top-k value")
     parser.add_argument("--num_tokens", type=int, default=8192, help="Vocabulary size")
@@ -606,7 +671,7 @@ if __name__ == "__main__":
         for r in results:
             config_str = f"B={r['config']['batch_size']}, K={r['config']['index_topk']}, V={r['config']['num_tokens']}"
             print(
-                f"{config_str:<40} {r['standard_ms']:>14.4f} {r['cute_dsl_ms']:>14.4f} {r['speedup']:>9.2f}x"
+                f"{config_str:<40} {r['standard_us']:>14.4f} {r['cute_dsl_us']:>14.4f} {r['speedup']:>9.2f}x"
             )
         print("=" * 80 + "\n")
 

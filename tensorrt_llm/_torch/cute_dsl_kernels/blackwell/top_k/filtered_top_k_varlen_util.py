@@ -472,6 +472,8 @@ class FilteredTopKKernelVarlen:
                 if i < length:
                     if cutlass.const_expr(self.enable_multi_cta):
                         dst[i] = i + row_start
+                    elif cutlass.const_expr(self.merge_blocks):
+                        dst[i] = indices[i]
                     else:
                         dst[i] = i
                     if cutlass.const_expr(self.return_val):

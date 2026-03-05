@@ -76,6 +76,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         chunk_size_per_cta: int = 16384,
         num_ctas_per_row: int = 1,
         merge_blocks: bool = False,
+        debug: bool = False,
     ):
         super().__init__(
             dtype,
@@ -118,7 +119,27 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                 self.enable_gmem_store = False
 
             # set the number of threads per cta to 512.
-            self.num_threads_per_cta = 512
+            if cutlass.const_expr(not self.merge_blocks):
+                self.num_threads_per_cta = 512
+            else:
+                # For merge_blocks, cap num_threads_per_cta so that the tile
+                # width (num_threads_per_cta * vec_size) does not exceed
+                # max_num_cols. Otherwise, out-of-bounds padding elements
+                # created by _fill_oob are counted in the radix histogram
+                # and may be selected as top-k candidates with invalid
+                # indices, causing incorrect results.
+                self.num_threads_per_cta = self.max_num_cols // self.vec_size
+
+        # only used for debug info
+        if cutlass.const_expr(debug):
+            print(f"dtype: {self.dtype}, vec_size: {self.vec_size}")
+            print(f"max_num_cols: {self.max_num_cols}, num_threads_per_cta: {self.num_threads_per_cta}")
+            print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
+            print(f"enable_gmem_store: {self.enable_gmem_store}")
+            print(f"return_val: {self.return_val}")
+            print(f"large_occupancy: {large_occupancy}")
+            print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
+            print(f"first_refine_shift: {self.first_refine_shift}, num_refine_rounds: {self.num_refine_rounds}")
 
     @cute.jit
     def run_kernel(
