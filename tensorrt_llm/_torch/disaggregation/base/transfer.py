@@ -1,10 +1,9 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections import namedtuple
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, List, Optional
+from typing import List, Optional
 
 from tensorrt_llm import DisaggregatedParams
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -76,77 +75,6 @@ class SessionStatus(Enum):
 
 
 TaskIdType = int
-
-
-@dataclass
-class AuxBufferMeta:
-    ptrs: list[int]
-    size: list[int]
-    item_sizes: list[int] = field(default_factory=list)
-    device: str = "cpu"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "ptrs": self.ptrs,
-            "size": self.size,
-            "item_sizes": self.item_sizes,
-            "device": self.device,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AuxBufferMeta":
-        return cls(
-            ptrs=data["ptrs"],
-            size=data["size"],
-            item_sizes=data.get("item_sizes", []),
-            device=data.get("device", "cpu"),
-        )
-
-
-AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
-
-
-class AuxBufferBase(ABC):
-    """
-    Abstract base class defining the interface for auxiliary buffer management.
-    """
-
-    @abstractmethod
-    def alloc_slot(self) -> AuxSlot:
-        """
-        Allocate a free slot and return its index.
-        """
-        ...
-
-    @abstractmethod
-    def free_slot(self, slot: int) -> None:
-        """
-        Release the specified slot.
-        """
-        ...
-
-    @property
-    @abstractmethod
-    def meta(self) -> AuxBufferMeta:
-        """
-        Retrieve meta-information about the underlying buffer(s).
-        Returns buffer info (e.g., pointers, sizes, device).
-        """
-        ...
-
-    @abstractmethod
-    def fill_slot(self, slot: int, request: LlmRequest) -> None:
-        """
-        Fill/overwrite the contents of the given slot with data from the request.
-        """
-        ...
-
-    @abstractmethod
-    def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
-        """
-        Get the token data (e.g., first/draft tokens) from the specified slot.
-        """
-        ...
 
 
 @dataclass

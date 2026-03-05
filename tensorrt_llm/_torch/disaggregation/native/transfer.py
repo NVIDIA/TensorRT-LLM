@@ -3,9 +3,11 @@ import os
 import queue
 import threading
 import weakref
+from abc import ABC, abstractmethod
+from collections import namedtuple
 from dataclasses import asdict, dataclass, field
 from enum import Enum
-from typing import List, Optional
+from typing import Any, Callable, List, Optional
 
 import msgpack
 import torch
@@ -28,7 +30,6 @@ from tensorrt_llm._torch.disaggregation.base.agent import (
     TransferRequest,
 )
 from tensorrt_llm._torch.disaggregation.base.transfer import (
-    AuxSlot,
     KVSlice,
     RxSessionBase,
     SessionState,
@@ -122,6 +123,77 @@ class TaskStatus(Enum):
     COMPLETED = "COMPLETED"
     CANCELED = "CANCELED"
     ERROR = "ERROR"
+
+
+@dataclass
+class AuxBufferMeta:
+    ptrs: list[int]
+    size: list[int]
+    item_sizes: list[int] = field(default_factory=list)
+    device: str = "cpu"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "ptrs": self.ptrs,
+            "size": self.size,
+            "item_sizes": self.item_sizes,
+            "device": self.device,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> "AuxBufferMeta":
+        return cls(
+            ptrs=data["ptrs"],
+            size=data["size"],
+            item_sizes=data.get("item_sizes", []),
+            device=data.get("device", "cpu"),
+        )
+
+
+AuxSlot = namedtuple("AuxSlot", ["id", "buffer"])
+
+
+class AuxBufferBase(ABC):
+    """
+    Abstract base class defining the interface for auxiliary buffer management.
+    """
+
+    @abstractmethod
+    def alloc_slot(self) -> AuxSlot:
+        """
+        Allocate a free slot and return its index.
+        """
+        ...
+
+    @abstractmethod
+    def free_slot(self, slot: int) -> None:
+        """
+        Release the specified slot.
+        """
+        ...
+
+    @property
+    @abstractmethod
+    def meta(self) -> AuxBufferMeta:
+        """
+        Retrieve meta-information about the underlying buffer(s).
+        Returns buffer info (e.g., pointers, sizes, device).
+        """
+        ...
+
+    @abstractmethod
+    def fill_slot(self, slot: int, request: LlmRequest) -> None:
+        """
+        Fill/overwrite the contents of the given slot with data from the request.
+        """
+        ...
+
+    @abstractmethod
+    def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
+        """
+        Get the token data (e.g., first/draft tokens) from the specified slot.
+        """
+        ...
 
 
 class AuxSendTask:
@@ -470,12 +542,12 @@ class Sender:
         peer_registrar: PeerRegistrar,
         device_id: int,
         agent: BaseTransferAgent,
-        aux_buffer: Optional[AuxBuffer] = None,
+        session_creator: Optional[Callable[[int], TxSessionBase]] = None,
     ):
         self._registrar = peer_registrar
         self._device_id = device_id
         self._agent = agent
-        self._aux_buffer = aux_buffer
+        self._session_creator = session_creator
         self._peer_reqs = ReqInfoManager()
 
         self._messenger = ZMQMessenger(mode="ROUTER")
@@ -524,7 +596,8 @@ class Sender:
         return
 
     def _get_tx_session(self, unique_rid: int) -> TxSessionBase:
-        session_ref = self._tx_sessions.get(unique_rid)
+        with self._sessions_lock:
+            session_ref = self._tx_sessions.get(unique_rid)
         if session_ref is None:
             return None
         session = session_ref()
@@ -537,12 +610,7 @@ class Sender:
         session = self._get_tx_session(unique_rid)
         if session is None:
             # create an incomplete session without request
-            incomplete_session = TxSession(
-                unique_rid=unique_rid,
-                sender=self,
-                aux_slot=self._aux_buffer.alloc_slot() if self._aux_buffer else None,
-            )
-            return incomplete_session
+            return self._session_creator(unique_rid)
         return session
 
     def submit_task(self, agent_args: WriteMeta):
@@ -697,7 +765,7 @@ class Sender:
         # assert agent_args.src_aux_ptrs is not None
 
         session = self._get_tx_session(agent_args.unique_rid)
-        assert session is not None
+        assert session is not None, f"cannot get session for unique_rid {agent_args.unique_rid}"
         if session._aux_task._perf_timer is not None:
             session._aux_task._perf_timer.record_push_end(agent_args.peer_rank)
         skip_send = len(agent_args.src_aux_ptrs) == 0
@@ -776,10 +844,6 @@ class Sender:
 
     def _register_peer_rank(self, send_id: bytes, message: list[bytes]):
         ri: RankInfo = RankInfo.from_bytes(message[1])
-        logger.info(
-            f"Received REGISTER_RANK_INFO for instance='{ri.instance_name}', rank={ri.instance_rank}"
-        )
-
         self._registrar.register(ri.instance_name, ri.instance_rank, ri)
 
         agent_name = ri.instance_name + str(ri.instance_rank)
@@ -805,9 +869,6 @@ class Sender:
         # use self._sessions_lock to ensure the session will not be inserted between
         # self._save_peer_req_info and get_tx_session
         info: RecvReqInfo = RecvReqInfo.from_bytes(message[1])
-        logger.info(
-            f"Received REQUEST_DATA for req_id={info.unique_rid} from peer_rank={info.instance_rank}"
-        )
         with self._sessions_lock:
             # In generation-first flow, ctx/gen requests are sent in parallel,
             # if the ctx server has not received the request but gen server sent the kv cache,
@@ -1471,7 +1532,9 @@ class TransferWorker:
         if self._aux_buffer is not None:
             self._register_aux_buffer()
 
-        self._sender = Sender(self._peer_registrar, device_id, self._agent, self._aux_buffer)
+        self._sender = Sender(
+            self._peer_registrar, device_id, self._agent, self._create_tx_session_from_id
+        )
         self._receiver = Receiver(self._peer_registrar, device_id, self._agent)
         self._rank_info.transfer_engine_info = bytes(self._agent.get_local_agent_desc())
         # self._rank_info.endpoint = self._sender.endpoint
@@ -1493,6 +1556,13 @@ class TransferWorker:
         """
         return TxSession(
             request=request,
+            sender=self._sender,
+            aux_slot=self._aux_buffer.alloc_slot() if self._aux_buffer else None,
+        )
+
+    def _create_tx_session_from_id(self, unique_rid: int) -> TxSession:
+        return TxSession(
+            unique_rid=unique_rid,
             sender=self._sender,
             aux_slot=self._aux_buffer.alloc_slot() if self._aux_buffer else None,
         )
