@@ -1241,7 +1241,7 @@ FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
 class BlockSparseTop2MLPFineGrainedFP8(nn.Module):
     """FineGrainedFP8 expert with per-block weight scales."""
 
-    def __init__(self, ffn_dim, hidden_dim, dtype=torch.bfloat16, device="cuda", block_size=None):
+    def __init__(self, ffn_dim, hidden_dim, device="cuda", block_size=None):
         super().__init__()
         self.ffn_dim = ffn_dim
         self.hidden_dim = hidden_dim

@@ -54,7 +54,6 @@ from ...utils.node_utils import (
     is_any_lin_op,
     is_any_moe_op,
     is_any_ssm_op,
-    is_fake_quantized_linear_op,
     is_op,
     is_weight_node,
     num_users_of_weight_node,
@@ -74,25 +73,9 @@ from ..interface import (
     TransformRegistry,
 )
 
-
 ########################################################
 #  Helper functions
 ########################################################
-def is_quantized_linear_scale_tensor(node: "Node", weight_node_key: str) -> bool:
-    """Check if a weight node is a scale tensor for a quantized linear op.
-
-    Scale tensors (e.g., weight_scale_inv for FineGrained FP8) are in "block space" and should
-    not be sharded with the same min_local_shape as the actual weight tensor.
-    They are handled separately by quantization_cb.
-
-    Args:
-        node: The linear operation node
-        weight_node_key: The parameter key of the weight node (e.g., "model.layers.0.self_attn.v_proj.weight_scale_inv")
-
-    Returns:
-        True if this is a scale tensor for a quantized linear op, False otherwise
-    """
-    return is_fake_quantized_linear_op(node) and "_scale" in weight_node_key
 
 
 ########################################################
@@ -524,6 +507,22 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
     def scale_names(self) -> List[str]:
         return ["weight_scale_inv"]
 
+    @staticmethod
+    def _split_scale(scale: torch.Tensor, dim: int, rank: int, world_size: int) -> torch.Tensor:
+        """Split a block-scale tensor along *dim*, handling the edge case where
+        ``scale.shape[dim] < world_size``.
+
+        When the scale dimension is smaller than world_size (e.g. a 2-row scale
+        shared across 8 GPUs), we group ranks that share the same scale row:
+        ``group = rank // (world_size // scale_dim)``.
+        """
+        scale_dim = scale.shape[dim]
+        if scale_dim >= world_size:
+            return torch.tensor_split(scale, world_size, dim=dim)[rank]
+        # More ranks than scale rows → group ranks that share a row
+        group = rank // (world_size // scale_dim)
+        return torch.tensor_split(scale, scale_dim, dim=dim)[group]
+
     def shard_scales(
         self,
         dim: int,
@@ -535,7 +534,7 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
     ) -> Dict[str, torch.Tensor]:
         # weight_scale_inv has shape [N/block_n, K/block_k]
         # When we shard weight along dim, we need to shard scale along the same dim
-        sharded_scale = torch.tensor_split(weight_scale_inv, world_size, dim=dim)[rank]
+        sharded_scale = self._split_scale(weight_scale_inv, dim, rank, world_size)
         return {"weight_scale_inv": sharded_scale}
 
     def shard_load_hook(
@@ -552,7 +551,7 @@ class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightSharding
         scale_key = weight_name + "_scale_inv"
         if scale_key in state_dict:
             scale = state_dict[scale_key]
-            state_dict[scale_key] = torch.tensor_split(scale, world_size, dim=dim)[rank]
+            state_dict[scale_key] = self._split_scale(scale, dim, rank, world_size)
 
 
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
@@ -1370,7 +1369,10 @@ def shard_weight_tensor(
         min_d_shape: int = min_local_shape,
     ) -> torch.Tensor:
         # The local tensor shape has to be divisible by min_d_shape
-        max_split_size = t.shape[d] // min_d_shape
+        max_split_size = t.shape[d] // min_d_shape if min_d_shape > 0 else 0
+        if max_split_size == 0:
+            # Tensor dimension is smaller than min_d_shape; replicate instead of splitting
+            return t
         if ws > max_split_size:
             num_groups = math.ceil(ws / max_split_size)
             ad_logger.debug(
@@ -1471,12 +1473,6 @@ def _shard_parameter_node(
             min_local_shape=min_local_shape,
             fused_weight_dims=fused_weight_dims,
         )
-        if is_quantized_linear_scale_tensor(node, weight_node.node_key):
-            ad_logger.debug(
-                f"Skipping scale tensor {weight_node.node_key} in shard_weight_tensor - "
-                f"will be handled by weight's quantization_cb"
-            )
-            continue
         if quantization_cb is not None:
             quantization_cb(
                 gm=gm,

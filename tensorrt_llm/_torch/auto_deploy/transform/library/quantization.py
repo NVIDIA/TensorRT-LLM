@@ -313,6 +313,22 @@ class FP8LinearQuantizationFromConfig(Quantization):
             scale = amax / FP8_MAX
             state_dict[scale_name] = scale
 
+    def _apply(
+        self,
+        gm: GraphModule,
+        cm: CachedSequenceInterface,
+        factory: ModelFactory,
+        shared_config: SharedConfig,
+    ) -> Tuple[GraphModule, TransformInfo]:
+        qcfg = factory.get_quant_config()
+        # Skip if the config specifies block-wise (fine-grained) FP8 quantization via
+        # weight_block_size; those should be handled by FineGrainedFP8LinearQuantization.
+        if qcfg and qcfg.get("weight_block_size"):
+            return gm, TransformInfo(
+                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
+            )
+        return super()._apply(gm, cm, factory, shared_config)
+
 
 @TransformRegistry.register("quantize_nvfp4_linear_from_config")
 class NVFP4LinearQuantizationFromConfig(Quantization):
@@ -780,7 +796,9 @@ class FineGrainedFP8LinearQuantization(Quantization):
         # Default block size is 128x128 for FineGrained FP8
         N, K = original_weight_shape
         block_n, block_k = 128, 128
-        scale_shape = (N // block_n, K // block_k)
+        # Use ceil to handle dimensions smaller than or not divisible by block size
+        # (e.g. after TP sharding or small projection weights).
+        scale_shape = (math.ceil(N / block_n), math.ceil(K / block_k))
         return {"weight_scale_inv": torch.ones(scale_shape, dtype=torch.bfloat16)}
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
@@ -826,13 +844,14 @@ class FineGrainedFP8LinearQuantization(Quantization):
         excluded = qcfg.get("modules_to_not_convert", [])
 
         cnt = 0
-        for n in gm.graph.nodes:
-            if not is_linear_op(n):
-                continue
-            if should_skip_quantization(n, excluded):
-                continue
-            self._insert_quantized_linear(gm, n, is_quantized_graph=False)
-            cnt += 1
+        with WeightBiasInfoCache():
+            for n in gm.graph.nodes:
+                if not is_linear_op(n):
+                    continue
+                if should_skip_quantization(n, excluded):
+                    continue
+                self._insert_quantized_linear(gm, n, is_quantized_graph=False)
+                cnt += 1
 
         return gm, TransformInfo(
             skipped=False, num_matches=cnt, is_clean=False, has_valid_shapes=(cnt == 0)

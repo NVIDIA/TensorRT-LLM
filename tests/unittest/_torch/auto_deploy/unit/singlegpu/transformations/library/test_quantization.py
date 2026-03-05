@@ -113,9 +113,8 @@ def test_quantization(quant_config, atol, rtol, num_p_og):
     torch_export_to_gm(gm_transformed, args=(x,))
 
 
-@pytest.mark.parametrize("bias", [True, False])
 @pytest.mark.skipif(not fp8_compatible(), reason="Requires fp8 support")
-def test_finegrained_fp8_quantization(bias):
+def test_finegrained_fp8_quantization():
     """Test FineGrained FP8 quantization transform.
 
     This tests the quantize_finegrained_fp8_linear_from_config transform which converts

@@ -419,11 +419,13 @@ def _process_moe_node(
     fused_w_down_experts = torch.stack([gm.get_parameter(n.target) for n in w2_list], dim=0)
     new_key_w_down = f"fused_moe_w2_stacked_{fused_key_counter}"
 
-    # Register the stacked weights as parameters
+    # Register the stacked weights as parameters and free intermediate tensors
     param_w_up = torch.nn.Parameter(fused_w_up_experts)
+    del fused_w_up_experts
     gm.register_parameter(new_key_w_up, param_w_up)
 
     param_w_down = torch.nn.Parameter(fused_w_down_experts)
+    del fused_w_down_experts
     gm.register_parameter(new_key_w_down, param_w_down)
 
     # Create fused MoE node - kernel applies routing to output
@@ -431,7 +433,7 @@ def _process_moe_node(
         w_up_arg = graph.get_attr(new_key_w_up)
         w_down_arg = graph.get_attr(new_key_w_down)
         # Get weight dtype for casting - fused kernel requires activation dtype to match weight dtype
-        weight_dtype = fused_w_up_experts.dtype
+        weight_dtype = param_w_up.dtype
 
         if apply_routing_on_input:
             # Scale input: hidden_states = hidden_states * routing_weights
