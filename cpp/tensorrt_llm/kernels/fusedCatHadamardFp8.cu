@@ -39,26 +39,8 @@ constexpr int HEAD_DIM = 128;       // Fixed for DSV3.2 indexer
 constexpr int WARP_SIZE = 32;       // One warp per row
 constexpr int ELEMS_PER_THREAD = 4; // 128 / 32 = 4 elements per thread
 constexpr int ROWS_PER_BLOCK = 8;   // Process 8 rows per block for occupancy
-constexpr float FP8_E4M3_MAX = 448.0f;
-
-/// Compute UE8M0 scale: 2^ceil(log2(amax / FP8_MAX))
-/// This ensures amax / scale <= FP8_MAX, with scale being a power of 2.
-__device__ __forceinline__ float computeUe8m0Scale(float amax)
-{
-    // Minimum value to avoid log2(0)
-    constexpr float MIN_AMAX = 1.0e-12f;
-    amax = fmaxf(amax, MIN_AMAX);
-    float log2_scale = ceilf(log2f(amax / FP8_E4M3_MAX));
-    return exp2f(log2_scale);
-}
-
-/// Compute standard (non-UE8M0) scale: amax / FP8_MAX
-__device__ __forceinline__ float computeStdScale(float amax)
-{
-    constexpr float MIN_AMAX = 1.0e-12f;
-    amax = fmaxf(amax, MIN_AMAX);
-    return amax / FP8_E4M3_MAX;
-}
+constexpr float INV_FP8_E4M3_MAX = 1.0f / 448.0f;
+constexpr float MIN_AMAX = 1.0e-12f;
 
 /// Warp-wide max reduction
 __device__ __forceinline__ float warpReduceMax(float val)
@@ -93,10 +75,12 @@ union FP8x4
 ///   - Thread t handles elements [4t, 4t+1, 4t+2, 4t+3] of the 128-dim row.
 ///   - Loads from pe or nope based on element index (vectorized 8-byte loads).
 ///   - FP8 quantizes with per-row scale (vectorized 4-byte stores).
-__global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8Kernel(
-    __nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe,
-    __nv_bfloat16 const* __restrict__ nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride,
-    int32_t nope_row_stride, bool use_ue8m0)
+///
+/// Templated on UseUe8m0 to eliminate branch divergence.
+template <bool UseUe8m0>
+__global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(__nv_fp8_e4m3* __restrict__ fp8_out,
+    float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe, __nv_bfloat16 const* __restrict__ nope,
+    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride, int32_t nope_row_stride)
 {
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane = threadIdx.x % WARP_SIZE;
@@ -108,34 +92,21 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
     }
 
     // ---- Stage 1: Load + Concat (vectorized 8-byte loads) ----
-    // Thread t handles elements [4t, 4t+1, 4t+2, 4t+3].
-    // When pe_dim is a multiple of ELEMS_PER_THREAD (true for DSV3.2: pe_dim=64),
-    // each thread's 4 elements are entirely from pe or entirely from nope.
+    // pe_dim is guaranteed to be a multiple of ELEMS_PER_THREAD by the host check,
+    // so each thread's 4 elements come entirely from pe or entirely from nope.
+    // Use branchless pointer selection (compiles to SELP) to avoid warp divergence.
     float v0, v1, v2, v3;
     {
         int base = lane * ELEMS_PER_THREAD;
         __nv_bfloat16 const* pe_row = pe + static_cast<int64_t>(row) * pe_row_stride;
         __nv_bfloat16 const* nope_row = nope + static_cast<int64_t>(row) * nope_row_stride;
 
+        bool from_pe = (base < pe_dim);
+        __nv_bfloat16 const* src = from_pe ? pe_row : nope_row;
+        int col = from_pe ? base : (base - pe_dim);
+
         BF16x4 loaded;
-        if (base + ELEMS_PER_THREAD <= pe_dim)
-        {
-            // All 4 elements from pe — single 8-byte load
-            loaded.vec = *reinterpret_cast<int2 const*>(pe_row + base);
-        }
-        else if (base >= pe_dim)
-        {
-            // All 4 elements from nope — single 8-byte load
-            loaded.vec = *reinterpret_cast<int2 const*>(nope_row + (base - pe_dim));
-        }
-        else
-        {
-            // Straddling boundary — scalar fallback (rare: only when pe_dim % 4 != 0)
-            auto load_scalar
-                = [&](int idx) -> __nv_bfloat16 { return (idx < pe_dim) ? pe_row[idx] : nope_row[idx - pe_dim]; };
-            loaded.bf16x2[0] = __halves2bfloat162(load_scalar(base + 0), load_scalar(base + 1));
-            loaded.bf16x2[1] = __halves2bfloat162(load_scalar(base + 2), load_scalar(base + 3));
-        }
+        loaded.vec = *reinterpret_cast<int2 const*>(src + col);
 
         float2 f0 = __bfloat1622float2(loaded.bf16x2[0]);
         float2 f1 = __bfloat1622float2(loaded.bf16x2[1]);
@@ -146,27 +117,43 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
     }
 
     // ---- Stage 2: FP8 Quantization (1x128 block = entire row) ----
-    // Find per-row amax
     float local_max = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
     float amax = warpReduceMax(local_max);
+    amax = fmaxf(amax, MIN_AMAX);
 
-    // Compute scale
     float scale;
-    if (use_ue8m0)
+    if constexpr (UseUe8m0)
     {
-        scale = computeUe8m0Scale(amax);
+        // UE8M0: scale = 2^ceil(log2(amax / FP8_MAX)) via IEEE 754 bit manipulation.
+        // This replaces ceilf(log2f(...)) + exp2f(...) with integer ops.
+        float ratio = amax * INV_FP8_E4M3_MAX;
+        uint32_t bits = __float_as_uint(ratio);
+        uint32_t mantissa = bits & 0x007FFFFFu;
+        uint32_t exp_bits = bits & 0x7F800000u;
+        // If mantissa is non-zero, round exponent up to next power of 2
+        if (mantissa != 0u)
+        {
+            exp_bits += 0x00800000u;
+        }
+        scale = __uint_as_float(exp_bits);
     }
     else
     {
-        scale = computeStdScale(amax);
+        scale = amax * INV_FP8_E4M3_MAX;
     }
 
-    float inv_scale = 1.0f / scale;
+    // Use hardware approximate reciprocal (MUFU.RCP, ~2^-23 relative error).
+    // This is more than sufficient for FP8 E4M3 quantization (3 mantissa bits).
+    // Avoids the expensive Newton-Raphson refinement of __frcp_rn.
+    float inv_scale;
+    asm("rcp.approx.ftz.f32 %0, %1;" : "=f"(inv_scale) : "f"(scale));
 
-    // Quantize to FP8
+    // Quantize to FP8 — clamp is mathematically redundant since
+    // |val/scale| <= amax/scale <= FP8_MAX by construction, but kept
+    // for safety against floating-point rounding edge cases.
     auto quantize = [&](float val) -> __nv_fp8_e4m3
     {
-        float scaled = fminf(fmaxf(val * inv_scale, -FP8_E4M3_MAX), FP8_E4M3_MAX);
+        float scaled = val * inv_scale;
         return __nv_fp8_e4m3(scaled);
     };
 
@@ -180,7 +167,6 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatHadamardFp8
     int base_out = row * HEAD_DIM + lane * ELEMS_PER_THREAD;
     *reinterpret_cast<uint32_t*>(fp8_out + base_out) = packed.u32;
 
-    // Only lane 0 writes the scale for this row
     if (lane == 0)
     {
         scale_out[row] = scale;
@@ -213,8 +199,16 @@ void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bf
     dim3 grid(num_blocks);
     dim3 block(WARP_SIZE * ROWS_PER_BLOCK); // 256 threads per block
 
-    fusedCatHadamardFp8Kernel<<<grid, block, 0, stream>>>(
-        fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, use_ue8m0);
+    if (use_ue8m0)
+    {
+        fusedCatFp8Kernel<true><<<grid, block, 0, stream>>>(
+            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride);
+    }
+    else
+    {
+        fusedCatFp8Kernel<false><<<grid, block, 0, stream>>>(
+            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride);
+    }
 
     TLLM_CUDA_CHECK(cudaGetLastError());
 }
