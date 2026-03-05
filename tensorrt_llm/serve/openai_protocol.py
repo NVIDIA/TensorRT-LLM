@@ -1108,10 +1108,6 @@ def to_llm_disaggregated_params(
         disaggregated_params: DisaggregatedParams) -> LlmDisaggregatedParams:
     if disaggregated_params is None:
         return None
-    # from tensorrt_llm.logger import logger
-    # logger.info(f"Converting disaggregated params: {disaggregated_params.schedule_style} {disaggregated_params}")
-    # if disaggregated_params.schedule_style is None:
-    #     raise RuntimeError(f"Disaggregated params schedule style is None {disaggregated_params}")
     return LlmDisaggregatedParams(
         request_type=disaggregated_params.request_type,
         first_gen_tokens=disaggregated_params.first_gen_tokens,

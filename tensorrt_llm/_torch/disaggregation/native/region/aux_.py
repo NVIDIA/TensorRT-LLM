@@ -1,79 +1,9 @@
-from abc import ABC, abstractmethod
 from collections import deque
-from dataclasses import dataclass, field
-from typing import Any
 
 import torch
 
+from tensorrt_llm._torch.disaggregation.base.transfer import AuxBufferBase, AuxBufferMeta, AuxSlot
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
-
-
-@dataclass
-class AuxBufferMeta:
-    ptrs: list[int]
-    size: list[int]
-    item_sizes: list[int] = field(default_factory=list)
-    device: str = "cpu"
-
-    def to_dict(self) -> dict[str, Any]:
-        return {
-            "ptrs": self.ptrs,
-            "size": self.size,
-            "item_sizes": self.item_sizes,
-            "device": self.device,
-        }
-
-    @classmethod
-    def from_dict(cls, data: dict[str, Any]) -> "AuxBufferMeta":
-        return cls(
-            ptrs=data["ptrs"],
-            size=data["size"],
-            item_sizes=data.get("item_sizes", []),
-            device=data.get("device", "cpu"),
-        )
-
-
-class AuxBufferBase(ABC):
-    """
-    Abstract base class defining the interface for auxiliary buffer management.
-    """
-
-    @abstractmethod
-    def alloc_slot(self) -> int:
-        """
-        Allocate a free slot and return its index.
-        """
-        ...
-
-    @abstractmethod
-    def free_slot(self, slot: int) -> None:
-        """
-        Release the specified slot.
-        """
-        ...
-
-    @property
-    @abstractmethod
-    def meta(self) -> AuxBufferMeta:
-        """
-        Retrieve meta-information about the underlying buffer(s).
-        Returns buffer info (e.g., pointers, sizes, device).
-        """
-        ...
-
-    @abstractmethod
-    def fill_slot(self, slot: int, request: LlmRequest) -> None:
-        """
-        Fill/overwrite the contents of the given slot with data from the request.
-        """
-        ...
-
-    @abstractmethod
-    def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
-        """
-        Get the token data (e.g., first/draft tokens) from the specified slot.
-        """
-        ...
 
 
 class AuxBuffer(AuxBufferBase):
@@ -112,7 +42,7 @@ class AuxBuffer(AuxBufferBase):
             device=self._device,
         )
 
-    def alloc_slot(self) -> int:
+    def alloc_slot(self) -> AuxSlot:
         if not self._free_slots:
             raise ValueError(
                 f"No free auxiliary buffer slots available (max slots = {self._max_slot_num}). "
@@ -126,7 +56,7 @@ class AuxBuffer(AuxBufferBase):
                 "This indicates a bug in slot management."
             )
         self._occupied_slots.add(slot_id)
-        return slot_id
+        return AuxSlot(slot_id, self)
 
     def free_slot(self, slot: int) -> None:
         if slot not in self._occupied_slots:

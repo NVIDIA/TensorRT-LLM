@@ -229,7 +229,7 @@ def launch_disaggregated_llm(
     gen_ports = [int(url.split(":")[1]) for url in gen_urls]
 
     ctx_servers = []
-    current_gpu_offset = 2
+    current_gpu_offset = 0
 
     base_env = os.environ.copy()
     if extra_env:
@@ -295,7 +295,7 @@ def launch_disaggregated_llm(
         gen_servers.append((env, gen_server_args))
 
     @contextlib.contextmanager
-    def multi_popen(server_configs, server_name="", enable_redirect_log=True):
+    def multi_popen(server_configs, server_name="", enable_redirect_log=False):
         processes = []
         log_files = []
         try:

@@ -99,7 +99,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             endpoints=ctx_server_endpoints, layer_num_per_pp=layer_num_per_pp
         )
 
-        logger.info(f" transfer worker  ctx_server_endpoints: {ctx_server_endpoints}")
+        logger.info(f"transfer worker  ctx_server_endpoints: {ctx_server_endpoints}")
         logger.info(f"layer_num_per_pp: {layer_num_per_pp}")
         logger.info(f"self.context_info_endpoint: {self.context_info_endpoint}")
         self.send_sessions = {}  # request_id to send_session
@@ -114,37 +114,26 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         return KVSlice(is_last_slice=True, block_ids=block_ids)
 
     @staticmethod
-    def _is_generation_first(req: LlmRequest) -> bool:
+    def _need_aux_transfer(req: LlmRequest) -> bool:
         params = req.py_disaggregated_params
         return params is not None and params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
 
-    def _has_peer_req_data(self, req: LlmRequest) -> bool:
-        params = req.py_disaggregated_params
-        if params is None:
-            return False
-        unique_rid = (
-            params.disagg_request_id
-            if params.disagg_request_id is not None
-            else params.ctx_request_id
-        )
-        if unique_rid is None:
-            return False
-
-        req_info_dict = self.transfer_worker._sender._peer_reqs.get_req_info(unique_rid)
-        return req_info_dict is not None and len(req_info_dict) > 0
-
     def respond_and_send_async(self, req: LlmRequest):
-        logger.info(f"Responding and sending async for request {req.request_id}")
+        if req.request_id not in self.send_sessions:
+            send_session = self.transfer_worker.create_tx_session(req)
+            self.send_sessions[req.request_id] = send_session
+        else:
+            send_session = self.send_sessions[req.request_id]
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-        send_session = self.transfer_worker.create_tx_session(req)
-        self.send_sessions[req.request_id] = send_session
         kv_slice = self._create_kv_slice(req)
         send_task_id = send_session.send(kv_slice)
-        if self._is_generation_first(req):
-            self.transfer_worker.pack_aux(send_session, req)
+        if self._need_aux_transfer(req):
             send_session.send_aux()
-        else:
-            logger.info(f"No aux task for request {req.request_id}")
+        if (
+            req.py_disaggregated_params
+            and req.py_disaggregated_params.schedule_style == DisaggScheduleStyle.GENERATION_FIRST
+        ):
+            send_session.dispatch_req()
         self.send_task_ids[req.request_id] = send_task_id
 
         req.context_phase_params = ContextPhaseParams(
@@ -170,7 +159,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         recv_task_id = recv_session.receive(kv_slice)
         self.recv_task_ids[req.request_id] = recv_task_id
         self.recv_req_id_to_request[req.request_id] = req
-        return
 
     def check_context_transfer_status(self, at_least_request_num: int, mark_complete: bool = False):
         block_all = at_least_request_num is None
@@ -185,6 +173,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             elif session.state.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
+
         if self.ctx_need_tp_sync:
             sync_request_ids = self.dist.tp_allgather(local_sync_request_ids)
         else:
@@ -225,8 +214,10 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                     f"Request {request_id} timed out waiting for context KV cache transfer after",
                     f"{self.sender_future_timeout_ms} milliseconds.",
                 )
-            except Exception:
+            except Exception as e:
                 failed_request_ids.append(request_id)
+                logger.error(f"Request {request_id} failed with exception: {e}")
+
         for request_id in completed_request_ids + failed_request_ids:
             if request_id in completed_request_ids:
                 if mark_complete:
@@ -251,17 +242,19 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
             req = self.recv_req_id_to_request[request_id]
-            if self._is_generation_first(req):
-                if session.state.status == SessionStatus.AUX_TRANSFERRED:
+            need_aux_transfer = self._need_aux_transfer(req)
+            session_status = session.state.status
+            if need_aux_transfer:
+                if session_status == SessionStatus.AUX_TRANSFERRED:
                     local_completed_request_ids.append(request_id)
-                    self.transfer_worker.unpack_aux(self.recv_sessions[request_id], req)
-                elif session.state.status == SessionStatus.ERROR:
+                elif session_status == SessionStatus.ERROR:
                     local_failed_request_ids.append(request_id)
-            elif session.state.status == SessionStatus.TRANSFERRED:
+            elif session_status == SessionStatus.TRANSFERRED:
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == SessionStatus.ERROR:
+            elif session_status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
+
         if self.gen_need_sync:
             sync_request_ids = self.gen_sync_allgather_fun(local_sync_request_ids)
         else:
@@ -293,11 +286,11 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             recv_task_id = self.recv_task_ids[request_id]
             recv_session = self.recv_sessions[request_id]
             req = self.recv_req_id_to_request[request_id]
-            wait_aux = self._is_generation_first(req)
-            if recv_session.wait_complete(recv_task_id, wait_aux=wait_aux):
+            if recv_session.wait_complete(recv_task_id, wait_aux=self._need_aux_transfer(req)):
                 completed_request_ids.append(request_id)
             else:
                 failed_request_ids.append(request_id)
+
         for request_id in completed_request_ids + failed_request_ids:
             if request_id in completed_request_ids:
                 self.recv_req_id_to_request[
@@ -329,16 +322,27 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         }
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
+        # Create session for new generation-first requests
+        # Context request may arrive before or after the kvcache request.
+        # If peer request data is available, the context request should be set to CONTEXT_INIT.
+        # Otherwise, the context request should be set to DISAGG_CONTEXT_TRANS_IN_PROGRESS.
         for req in requests:
-            if not self._has_peer_req_data(req):
-                # Keep request non-schedulable until peer req-info arrives.
-                req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
-            elif req.state < LlmRequestState.CONTEXT_INIT:
+            if req.request_id not in self.send_sessions:
+                send_session = self.transfer_worker.create_tx_session(req)
+                self.send_sessions[req.request_id] = send_session
+                req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+            else:
+                send_session = self.send_sessions[req.request_id]
+            # If kv ReqInfo arrives before the context request, the session is incomplete,
+            # set the request to the session
+            if send_session.request is None:
+                send_session.set_request(req)
+            # When the session is ready, set the context request state to CONTEXT_INIT to allow scheduler to it
+            if (
+                send_session.state.status == SessionStatus.READY
+                and req.state == LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+            ):
                 req.state = LlmRequestState.CONTEXT_INIT
-        logger.info(
-            f"Prepared context requests: {len(requests)}, waiting req "
-            f"{len([req for req in requests if req.state == LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS])}"
-        )
 
     def _check_compatible(self):
         if self.mapping.cp_size != 1:
