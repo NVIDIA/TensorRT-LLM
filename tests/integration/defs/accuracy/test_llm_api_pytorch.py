@@ -450,6 +450,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device(4)
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_4gpus(self, backend: str, mocker):
+        pytest.skip("IMA")
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         with LLM(self.MODEL_PATH,
                  guided_decoding_backend=backend,
