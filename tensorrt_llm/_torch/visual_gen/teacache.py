@@ -302,12 +302,12 @@ class TeaCacheHook:
         Returns True to compute, False to use cache.
         """
         # Warmup: Always compute first few steps to build stable cache
-        if self.config.ret_steps and state["cnt"] < self.config.ret_steps:
+        if self.config.ret_steps is not None and state["cnt"] < self.config.ret_steps:
             state["acc_dist"] = 0.0
             return True
 
         # Cooldown: Always compute last few steps for quality
-        if self.config.cutoff_steps and state["cnt"] >= self.config.cutoff_steps:
+        if self.config.cutoff_steps is not None and state["cnt"] >= self.config.cutoff_steps:
             return True
 
         # First step: no previous input to compare
@@ -338,8 +338,7 @@ class TeaCacheHook:
 
         # Cache decision based on accumulated distance
         if state["acc_dist"] < self.config.teacache_thresh:
-            # Below threshold: use cache, apply decay to distance
-            state["acc_dist"] *= 0.95
+            # Below threshold: use cache
             return False
         else:
             # Above threshold: compute, reset accumulated distance
@@ -384,15 +383,12 @@ class TeaCacheBackend:
         # Reset cache state (clears previous residuals and counters)
         self.hook.reset_state()
 
-        # Configure warmup and cutoff based on mode
-        if self.config.use_ret_steps:
-            # Aggressive warmup: 5 steps to stabilize cache
-            self.config.ret_steps = 5
-            self.config.cutoff_steps = num_inference_steps  # No cutoff (cache until end)
-        else:
-            # Minimal warmup: 1 step
-            self.config.ret_steps = 1
-            self.config.cutoff_steps = num_inference_steps - 2  # Compute last 2 steps
+        # Derive warmup/cutoff from mode (use_ret_steps)
+        if self.config.ret_steps is None:
+            self.config.ret_steps = 5 if self.config.use_ret_steps else 1
+        self.config.cutoff_steps = (
+            num_inference_steps if self.config.use_ret_steps else num_inference_steps - 1
+        )
 
         self.config.num_steps = num_inference_steps
 
