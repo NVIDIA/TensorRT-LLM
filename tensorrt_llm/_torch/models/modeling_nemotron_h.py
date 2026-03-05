@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import re
+from dataclasses import replace
 from typing import TYPE_CHECKING
 
 import torch
@@ -268,7 +269,10 @@ class NemotronHMOE(nn.Module):
         assert hidden_states_hp.shape[-1] == self.hidden_dim
         orig_shape = hidden_states_hp.shape
         hidden_states_hp_2d = hidden_states_hp.view(-1, self.hidden_dim)
-        all_rank_num_tokens = attn_metadata.all_rank_num_tokens
+        # MTP sublayer may pass a corrected all_rank_num_tokens via kwargs,
+        # since attn_metadata still holds the main model's token count.
+        all_rank_num_tokens = kwargs.get('all_rank_num_tokens',
+                                         attn_metadata.all_rank_num_tokens)
 
         def _compute_shared_output():
             if self.shared_experts is not None:
@@ -725,6 +729,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
+        **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.has_start_projections:
             assert inputs_embeds is not None
@@ -753,6 +758,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states = self.mixer(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            **kwargs,
         )
 
         if self.has_end_norm:
@@ -798,14 +804,14 @@ class NemotronHMTP(nn.Module):
             sublayer_quant_config = self._get_mtp_sublayer_quant_config(
                 model_config, self.layer_idx)
 
-            # Create a temporary model_config with the override quant_config
-            sublayer_model_config = ModelConfig(
-                pretrained_config=model_config.pretrained_config,
-                mapping=model_config.mapping,
-                quant_config=sublayer_quant_config,
-                skip_create_weights_in_init=model_config.
-                skip_create_weights_in_init,
-            )
+            # Create a model_config copy with quant_config overridden and
+            # spec_config cleared. All other fields (use_cuda_graph,
+            # moe_backend, moe_max_num_tokens, etc.) must be inherited
+            # so MoE layers are configured correctly for CUDA graph
+            # capture and communication (e.g., DeepEP).
+            sublayer_model_config = replace(model_config,
+                                            quant_config=sublayer_quant_config,
+                                            spec_config=None)
 
             self.layers[str(step_rel_idx)] = NemotronHMTPDecoderLayer(
                 model_config=sublayer_model_config,
@@ -859,6 +865,7 @@ class NemotronHMTP(nn.Module):
                 hidden_states=hidden_states,
                 residual=residual,
                 attn_metadata=attn_metadata,
+                all_rank_num_tokens=all_rank_num_tokens,
             )
         return hidden_states
 
