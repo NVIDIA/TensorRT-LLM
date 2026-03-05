@@ -28,8 +28,9 @@
 namespace tensorrt_llm::common
 {
 
-struct SageQuantQkParams
+struct SageQuantParams
 {
+    // Required arguments for SageQuantQk (Q or K):
     int sumSeqLensQk{};
     int numHeads{};
     int headDim{};
@@ -54,6 +55,6 @@ struct SageQuantQkParams
     cudaStream_t stream{};
 };
 
-void invokeSageQuantQk(SageQuantQkParams const& params);
+void invokeSageQuant(SageQuantParams const& params);
 
 } // namespace tensorrt_llm::common

@@ -15,7 +15,7 @@
  * limitations under the License.
  */
 
-#include "sageQuantQk.h"
+#include "sageQuant.h"
 
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
@@ -344,7 +344,7 @@ __global__ void sageQuantQkvKernel(int sumSeqLensQk, void const* ptrQk, void* pt
 }
 
 template <typename Element>
-void invokeSageQuantQkImpl(SageQuantQkParams const& params)
+void invokeSageQuantQkvImpl(SageQuantParams const& params)
 {
     using namespace cute;
     TLLM_CHECK_WITH_INFO(params.sumSeqLensQk > 0 && params.numHeads > 0 && params.headDim > 0
@@ -362,7 +362,7 @@ void invokeSageQuantQkImpl(SageQuantQkParams const& params)
         constexpr int HeadDim_ = headDimStatic;
         constexpr int TokenBlockSize_ = tokenBlockSizeStatic;
 
-        SageQuantQkParams kernelParams = params;
+        SageQuantParams kernelParams = params;
         void* kernelArgs[] = {&kernelParams.sumSeqLensQk, &kernelParams.ptrQk, &kernelParams.ptrQkQuant,
             &kernelParams.ptrQkScale, &kernelParams.ptrKMean, &kernelParams.sumSeqLensV, &kernelParams.numHeadsV,
             &kernelParams.ptrV, &kernelParams.ptrVQuant, &kernelParams.ptrVScale};
@@ -403,7 +403,7 @@ void invokeSageQuantQkImpl(SageQuantQkParams const& params)
         case 0: launchWithVStage(Int<0>{}); return;
         case 1: launchWithVStage(Int<1>{}); return;
         case 2: launchWithVStage(Int<2>{}); return;
-        default: TLLM_THROW("Unsupported SageQuantQk V stage: %d.", params.vStage);
+        default: TLLM_THROW("Unsupported SageQuantV stage: %d.", params.vStage);
         }
     };
 
@@ -442,17 +442,17 @@ void invokeSageQuantQkImpl(SageQuantQkParams const& params)
         "Unsupported SageQuantQk dispatch config: headDim=%d tokenBlockSize=%d", params.headDim, params.tokenBlockSize);
 }
 
-void invokeSageQuantQk(SageQuantQkParams const& params)
+void invokeSageQuant(SageQuantParams const& params)
 {
     if (params.inputType == kernels::DATA_TYPE_FP16)
     {
-        invokeSageQuantQkImpl<cutlass::half_t>(params);
+        invokeSageQuantQkvImpl<cutlass::half_t>(params);
         return;
     }
 #ifdef ENABLE_BF16
     if (params.inputType == kernels::DATA_TYPE_BF16)
     {
-        invokeSageQuantQkImpl<cutlass::bfloat16_t>(params);
+        invokeSageQuantQkvImpl<cutlass::bfloat16_t>(params);
         return;
     }
 #endif

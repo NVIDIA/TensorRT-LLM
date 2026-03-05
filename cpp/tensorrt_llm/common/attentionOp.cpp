@@ -20,7 +20,7 @@
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/memoryUtils.h"
-#include "tensorrt_llm/common/sageQuantQk.h"
+#include "tensorrt_llm/common/sageQuant.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention.h"
 #include "tensorrt_llm/kernels/flashMLA/flash_mla.h"
 #include "tensorrt_llm/kernels/gptKernels.h"
@@ -1831,7 +1831,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     "SageAttention disregards the configured params.kv_scale_quant_orig, invalidating the result.");
                 check_cuda_error(cudaMemsetAsync(sage_v_sfs_buf, 0, sage_v_sfs_buffer_size, stream));
 
-                tc::SageQuantQkParams qkParams{};
+                tc::SageQuantParams qkParams{};
                 qkParams.headDim = getHeadSize();
                 qkParams.inputType = std::is_same_v<T, __nv_bfloat16> ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
                 qkParams.quantType = mSageAttnQkInt8 ? DATA_TYPE_INT8 : DATA_TYPE_E4M3;
@@ -1854,7 +1854,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     qkParams.ptrQkQuant = fp8_q_buf;
                     qkParams.ptrQkScale = sage_q_sfs_buf;
                     qkParams.vStage = 1;
-                    tc::invokeSageQuantQk(qkParams);
+                    tc::invokeSageQuant(qkParams);
                 }
                 else
                 {
@@ -1871,7 +1871,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     qkParams.ptrQkQuant = fp8_k_buf;
                     qkParams.ptrQkScale = sage_k_sfs_buf;
                     qkParams.vStage = 2;
-                    tc::invokeSageQuantQk(qkParams);
+                    tc::invokeSageQuant(qkParams);
                 }
                 else
                 {
