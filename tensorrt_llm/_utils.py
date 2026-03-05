@@ -1537,15 +1537,13 @@ class EnergyMonitor:
         can be called at any point while the monitor is active to get a live
         reading of energy consumed so far.
         """
-        if not self._enabled or self._start_energies is None:
+        if not self._enabled:
             return None
         try:
             total_energy = 0.0
-            for handle, start_energy in zip(self._handles,
-                                            self._start_energies):
-                energy = (nvmlDeviceGetTotalEnergyConsumption(handle) -
-                          start_energy) / 1000.0
-                total_energy += energy
+            for handle in self._handles:
+                total_energy += nvmlDeviceGetTotalEnergyConsumption(
+                    handle) / 1000.0
             return total_energy * self._world_size / self._device_count
         except NVMLError as e:
             logger.warning(f"Failed to read GPU energy: {e}")
