@@ -156,11 +156,14 @@ def iterate_hf_lora(
             hf_module = module_name
 
             # If module_name contains dots (e.g., "shared_expert.down_proj"),
-            # extract just the final component (e.g., "down_proj")
+            # extract just the final component (e.g., "down_proj").
+            # Skip this fallback for shared_expert modules to avoid
+            # silently mapping them to the wrong mlp_* module type.
             if hf_module not in hf_modules and "." in hf_module:
-                final_component = hf_module.split(".")[-1]
-                if final_component in hf_modules:
-                    hf_module = final_component
+                if not hf_module.startswith("shared_expert."):
+                    final_component = hf_module.split(".")[-1]
+                    if final_component in hf_modules:
+                        hf_module = final_component
 
             if hf_module not in hf_modules:
                 # Skip modules not in the supported mapping (only log once per module type)
