@@ -15,8 +15,7 @@
 """Unit tests for fused_cat_hadamard_fp8 custom op.
 
 Compares the fused kernel output against a sequential reference implementation
-(torch.cat → fast_hadamard_transform → fp8_quantize_1x128) for numerical
-correctness.
+(torch.cat → fp8_quantize_1x128) for numerical correctness.
 """
 
 import os
@@ -41,27 +40,16 @@ try:
 except (AttributeError, RuntimeError):
     HAS_FUSED_OP = False
 
-# Check for fast_hadamard_transform for reference impl
-try:
-    from fast_hadamard_transform import hadamard_transform
 
-    HAS_HADAMARD = True
-except ImportError:
-    HAS_HADAMARD = False
-
-
-def _reference_cat_hadamard_fp8(pe, nope, use_ue8m0=False):
-    """Sequential reference: cat → hadamard → fp8_quantize_1x128_sf_transpose."""
+def _reference_cat_fp8(pe, nope, use_ue8m0=False):
+    """Sequential reference: cat → fp8_quantize_1x128_sf_transpose."""
     from tensorrt_llm.quantization.utils import fp8_utils
 
     # Cat
     combined = torch.cat([pe, nope], dim=-1)
 
-    # Hadamard transform
-    head_dim = combined.shape[-1]
-    combined = hadamard_transform(combined, scale=head_dim**-0.5)
-
     # FP8 quantize
+    head_dim = combined.shape[-1]
     combined_2d = combined.view(-1, head_dim)
     fp8_out, scale = fp8_utils.fp8_quantize_1x128_sf_transpose(combined_2d, use_ue8m0=use_ue8m0)
 
@@ -73,16 +61,9 @@ def _reference_cat_hadamard_fp8(pe, nope, use_ue8m0=False):
 @pytest.mark.parametrize("pe_dim,nope_dim", [(64, 64)])
 @pytest.mark.parametrize("use_ue8m0", [True, False])
 @pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
-@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_hadamard_fp8_correctness(M, pe_dim, nope_dim, use_ue8m0):
-    """Test that fused kernel matches sequential reference within FP8 tolerance.
-
-    The fused kernel computes Hadamard in float32 while the reference library
-    (fast_hadamard_transform) computes in BF16. This causes small numerical
-    differences that propagate to the FP8 quantization. We compare the
-    dequantized outputs (fp8 * scale) against a float32 Hadamard ground truth.
-    """
+    """Test that fused kernel matches sequential reference (cat + fp8 quantize)."""
     torch.manual_seed(42)
     device = torch.device("cuda")
 
@@ -93,51 +74,23 @@ def test_fused_cat_hadamard_fp8_correctness(M, pe_dim, nope_dim, use_ue8m0):
     fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_hadamard_fp8(pe, nope, use_ue8m0)
 
     # Reference
-    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(pe, nope, use_ue8m0)
+    ref_fp8, ref_scale = _reference_cat_fp8(pe, nope, use_ue8m0)
 
-    # 1. Compare dequantized outputs: both should be close to the true
-    #    Hadamard-transformed values. The fused kernel is actually more accurate
-    #    since it uses float32 for the Hadamard transform.
-    fused_deq = fused_fp8.float() * fused_scale
-    ref_deq = ref_fp8.float() * ref_scale
-    # Both dequantized outputs should be close to each other
-    rel_err = (fused_deq - ref_deq).abs() / ref_deq.abs().clamp(min=1e-6)
-    mean_rel_err = rel_err.mean().item()
-    assert mean_rel_err < 0.05, (
-        f"Mean relative dequantized error too high: {mean_rel_err:.4f}. "
-        f"M={M}, use_ue8m0={use_ue8m0}"
-    )
-
-    # 2. Check FP8 values match rate (most values should be identical or 1 ULP)
+    # 1. Compare FP8 values — should match exactly (both do cat + fp8 in float32)
     abs_diff = (fused_fp8.float() - ref_fp8.float()).abs()
     match_rate = (abs_diff == 0).float().mean().item()
-    # With UE8M0, scales are identical so FP8 match rate should be high.
-    # With standard scales, the fused kernel has slightly different scales
-    # due to float32 vs bf16 Hadamard, so more FP8 values may differ.
-    min_match = 0.90 if use_ue8m0 else 0.80
-    assert match_rate > min_match, (
+    assert match_rate > 0.95, (
         f"FP8 value match rate too low: {match_rate:.4f} "
-        f"(expected > {min_match}). M={M}, use_ue8m0={use_ue8m0}"
+        f"(expected > 0.95). M={M}, use_ue8m0={use_ue8m0}"
     )
 
-    # 3. Compare scales
+    # 2. Compare scales — should be very close
     fused_scale_flat = fused_scale.view(-1)
     ref_scale_flat = ref_scale.view(-1)
     assert fused_scale_flat.shape == ref_scale_flat.shape, (
         f"Scale shape mismatch: fused={fused_scale_flat.shape}, ref={ref_scale_flat.shape}"
     )
-
-    if use_ue8m0:
-        # UE8M0 scales must match exactly (both are power-of-2)
-        scale_match = torch.allclose(fused_scale_flat, ref_scale_flat, atol=0, rtol=0)
-        if not scale_match:
-            mismatches = (fused_scale_flat != ref_scale_flat).nonzero()
-            n_mismatch = mismatches.shape[0]
-            assert n_mismatch / M < 0.05, f"Too many UE8M0 scale mismatches: {n_mismatch}/{M}"
-    else:
-        # Standard scales: differ due to float32 vs bf16 Hadamard intermediate.
-        # Allow up to 0.5% relative difference.
-        torch.testing.assert_close(fused_scale_flat, ref_scale_flat, rtol=5e-3, atol=1e-5)
+    torch.testing.assert_close(fused_scale_flat, ref_scale_flat, rtol=1e-5, atol=1e-6)
 
 
 @pytest.mark.parametrize("M", [1, 256])
@@ -179,7 +132,6 @@ def test_fused_cat_hadamard_fp8_zero_input():
 
 @pytest.mark.parametrize("M", [64, 1024])
 @pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
-@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_hadamard_fp8_noncontiguous_input(M):
     """Test with non-contiguous inputs (simulates torch.split in DSA indexer).
@@ -204,9 +156,7 @@ def test_fused_cat_hadamard_fp8_noncontiguous_input(M):
     fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_hadamard_fp8(pe, nope, True)
 
     # Reference with contiguous copies
-    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(
-        pe.contiguous(), nope.contiguous(), use_ue8m0=True
-    )
+    ref_fp8, ref_scale = _reference_cat_fp8(pe.contiguous(), nope.contiguous(), use_ue8m0=True)
 
     # Compare dequantized outputs
     fused_deq = fused_fp8.float() * fused_scale
@@ -220,7 +170,6 @@ def test_fused_cat_hadamard_fp8_noncontiguous_input(M):
 @pytest.mark.parametrize("M", [1, 16, 64])
 @pytest.mark.parametrize("n_heads", [64])
 @pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
-@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_hadamard_fp8_3d_input(M, n_heads):
     """Test with 3D inputs matching Q path: [M, n_heads, dim] from split.
@@ -251,7 +200,7 @@ def test_fused_cat_hadamard_fp8_3d_input(M, n_heads):
     assert fused_scale.shape == (total_rows, 1)
 
     # Reference with explicit reshape (old behavior)
-    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(
+    ref_fp8, ref_scale = _reference_cat_fp8(
         pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=True
     )
 
@@ -265,7 +214,6 @@ def test_fused_cat_hadamard_fp8_3d_input(M, n_heads):
 
 @pytest.mark.parametrize("M", [1, 16])
 @pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_hadamard_fp8 op not available")
-@pytest.mark.skipif(not HAS_HADAMARD, reason="fast_hadamard_transform not available for reference")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_hadamard_fp8_mixed_contiguity(M):
     """Test where pe is contiguous but nope is non-contiguous.
@@ -288,7 +236,7 @@ def test_fused_cat_hadamard_fp8_mixed_contiguity(M):
     assert not nope.is_contiguous()
 
     fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_hadamard_fp8(pe, nope, True)
-    ref_fp8, ref_scale = _reference_cat_hadamard_fp8(
+    ref_fp8, ref_scale = _reference_cat_fp8(
         pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=True
     )
 
