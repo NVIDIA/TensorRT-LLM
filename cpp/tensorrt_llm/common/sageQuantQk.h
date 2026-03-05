@@ -41,6 +41,15 @@ struct SageQuantQkParams
     kernels::Data_type quantType{kernels::DATA_TYPE_E4M3};
     float* ptrQkScale{nullptr};
     float* ptrKMean{nullptr};
+    // Optional arguments for SageQuantV:
+    // vStage: 0: disabled, 1: collect scales, 2: quantize
+    int vStage{};
+    int sumSeqLensV{};
+    int numHeadsV{};
+    void const* ptrV{nullptr};
+    void* ptrVQuant{nullptr};
+    float* ptrVScale{nullptr};
+    // Hardware into. Required.
     int smCount{};
     cudaStream_t stream{};
 };

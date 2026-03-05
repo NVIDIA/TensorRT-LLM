@@ -1823,20 +1823,28 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 TLLM_CHECK_WITH_INFO(mNumAttnHeads == mNumAttnKVHeads, "SageAttention does not support MQA / GQA yet.");
                 TLLM_CHECK_WITH_INFO(
                     mFmhaDispatcher->isSupported(), "SageAttention has no unfused fallback implemented.");
-                TLLM_CHECK_WITH_INFO(mSageAttnNumEltsPerBlkV == 1,
-                    "SageAttention V quantization currently only supports mSageAttnNumEltsPerBlkV == 1.");
+                TLLM_CHECK_WITH_INFO(
+                    mSageAttnNumEltsPerBlkQ > 0 && mSageAttnNumEltsPerBlkK > 0 && mSageAttnNumEltsPerBlkV == 1,
+                    "SageQuant requires positive block sizes for Q and K while the block size for V must be 1.");
                 TLLM_CHECK_WITH_INFO(params.batch_size == 1, "SageAttention does not support batching requests yet.");
                 TLLM_CHECK_WITH_INFO(!params.kv_scale_quant_orig,
                     "SageAttention disregards the configured params.kv_scale_quant_orig, invalidating the result.");
+                check_cuda_error(cudaMemsetAsync(sage_v_sfs_buf, 0, sage_v_sfs_buffer_size, stream));
 
                 tc::SageQuantQkParams qkParams{};
                 qkParams.headDim = getHeadSize();
                 qkParams.inputType = std::is_same_v<T, __nv_bfloat16> ? DATA_TYPE_BF16 : DATA_TYPE_FP16;
                 qkParams.quantType = mSageAttnQkInt8 ? DATA_TYPE_INT8 : DATA_TYPE_E4M3;
+                qkParams.vStage = 0;
+                qkParams.sumSeqLensV = params.total_kv_len;
+                qkParams.numHeadsV = mNumAttnKVHeads;
+                qkParams.ptrV = params.v_ptr;
+                qkParams.ptrVQuant = fp8_v_buf;
+                qkParams.ptrVScale = sage_v_sfs_buf;
                 qkParams.smCount = mMultiProcessorCount;
                 qkParams.stream = stream;
 
-                // Quantize into Fp8Q, SfsQ
+                // Quantize into Fp8Q, SfsQ, SfsV
                 if (mSageAttnNumEltsPerBlkQ > 0)
                 {
                     qkParams.sumSeqLensQk = params.num_tokens;
@@ -1845,6 +1853,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     qkParams.ptrQk = attention_input;
                     qkParams.ptrQkQuant = fp8_q_buf;
                     qkParams.ptrQkScale = sage_q_sfs_buf;
+                    qkParams.vStage = 1;
                     tc::invokeSageQuantQk(qkParams);
                 }
                 else
@@ -1852,7 +1861,7 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     invokeCudaCast(fp8_q_buf, attention_input, params.num_tokens * local_hidden_units_qo, stream);
                 }
 
-                // Quantize into Fp8K, SfsK
+                // Quantize into Fp8K, SfsK, Fp8V
                 if (mSageAttnNumEltsPerBlkK > 0)
                 {
                     qkParams.sumSeqLensQk = params.total_kv_len;
@@ -1861,20 +1870,13 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                     qkParams.ptrQk = params.k_ptr;
                     qkParams.ptrQkQuant = fp8_k_buf;
                     qkParams.ptrQkScale = sage_k_sfs_buf;
+                    qkParams.vStage = 2;
                     tc::invokeSageQuantQk(qkParams);
                 }
                 else
                 {
                     invokeCudaCast(fp8_k_buf, params.k_ptr, params.total_kv_len * local_hidden_units_kv, stream);
                 }
-
-                // SfsV shape is [H*D/BlkV]. For BlkV==1 it is [H*D], shared across tokens.
-                int64_t const v_num_elts = static_cast<int64_t>(params.total_kv_len) * local_hidden_units_kv;
-                invokeComputeFP8QuantizeScale(
-                    sage_v_sfs_buf, params.v_ptr, v_num_elts, local_hidden_units_kv, tc::QuantizeMode::PER_CHANNEL, stream);
-                invokeQuantizeMatrix(
-                    fp8_v_buf, sage_v_sfs_buf, params.v_ptr, v_num_elts, local_hidden_units_kv, tc::QuantizeMode::PER_CHANNEL, stream);
-
             }
             else
             {
