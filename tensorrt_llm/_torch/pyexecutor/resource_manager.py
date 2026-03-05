@@ -784,6 +784,10 @@ class KVCacheManager(BaseResourceManager):
             requests.append(req)
         return requests
 
+    # Pre-computed skip states for update_resources generation loop
+    _UPDATE_SKIP_STATES = (LlmRequestState.GENERATION_COMPLETE,
+                           LlmRequestState.CONTEXT_INIT)
+
     def update_resources(self,
                          scheduled_batch: ScheduledRequests,
                          attn_metadata: "AttentionMetadata" = None,
@@ -799,16 +803,18 @@ class KVCacheManager(BaseResourceManager):
         # - CONTEXT_INIT: requests whose state was reset after being paused with KV cache freed.
         #   With overlap scheduler, the scheduler pauses a request and frees KV cache at iteration N,
         #   while the previous batch (N-1) is still trying to update the KV cache after forward pass.
+        impl = self.impl
+        rewind_kv_cache = self.rewind_kv_cache
+        skip_states = KVCacheManager._UPDATE_SKIP_STATES
         for request in scheduled_batch.generation_requests:
-            if request.state in (LlmRequestState.GENERATION_COMPLETE,
-                                 LlmRequestState.CONTEXT_INIT):
+            if request.state in skip_states:
                 continue
             if request.py_rewind_len > 0:
-                self.rewind_kv_cache(request, request.py_rewind_len)
+                rewind_kv_cache(request, request.py_rewind_len)
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
-            self.impl.store_context_blocks(request)
+            impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         return self.impl.remove_sequence(request.py_request_id, request,

@@ -3355,6 +3355,7 @@ class PyExecutor:
         kv_cache_transceiver = self.kv_cache_transceiver
         disable_overlap_scheduler = self.disable_overlap_scheduler
         stream_interval = self.stream_interval
+        always_create_response = stream_interval == 1
         iter_counter = self.iter_counter
         dist_rank = self.dist.rank
 
@@ -3403,8 +3404,9 @@ class PyExecutor:
                 request.update_perf_metrics(iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % stream_interval == 0:
+            if always_create_response or request.py_decoding_iter == 1 \
+                    or request.is_finished \
+                    or request.py_decoding_iter % stream_interval == 0:
                 response = request.create_response(False, dist_rank)
                 if response:
                     request_done = request.is_finished
