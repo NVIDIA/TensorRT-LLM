@@ -42,6 +42,9 @@ def setup_sequence_parallelism(
         Both num_attention_heads and sequence length must be divisible by ulysses_size.
         Head count is validated here; sequence length is validated at runtime during forward pass.
     """
+    if model_config is None:
+        return False, 1, None, 0
+
     ulysses_size = model_config.parallel.dit_ulysses_size
     ring_size = model_config.parallel.dit_ring_size
     cfg_size = model_config.parallel.dit_cfg_size

@@ -42,7 +42,7 @@ Before running these examples, ensure you have:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.1-dev --extra_visual_gen_options ./configs/flux1.yml
    trtllm-serve $LLM_MODEL_DIR/FLUX.2-dev --extra_visual_gen_options ./configs/flux2.yml
-   trtllm-serve $LLM_MODEL_DIR/LTX-2-checkpoint/ --extra_visual_gen_options ./configs/ltx2.yml
+   trtllm-serve $LLM_MODEL_DIR/LTX-2/ --extra_visual_gen_options ./configs/ltx2.yml
 
    # Run server on background:
    trtllm-serve $LLM_MODEL_DIR/Wan2.1-T2V-1.3B-Diffusers --extra_visual_gen_options ./configs/wan.yml > /tmp/serve.log 2>&1 &
@@ -51,6 +51,7 @@ Before running these examples, ensure you have:
    tail -f /tmp/serve.log
 
    ```
+   For LTX-2, you need to provide a proper text_encoder_path in `./configs/ltx2.yml`.
 
 ## Examples
 

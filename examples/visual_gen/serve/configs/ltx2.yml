@@ -1,4 +1,4 @@
-text_encoder_path: /llm-models/gemma-3-12b-it
+text_encoder_path: /scratch.trt_llm_data/llm-models/gemma/gemma-3-12b-it/
 teacache:
    enable_teacache: true
    teacache_thresh: 0.2
