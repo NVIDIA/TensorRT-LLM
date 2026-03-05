@@ -54,9 +54,9 @@ namespace kernels
 /// @param nope_row_stride Stride (in elements) between consecutive rows of nope.
 /// @param use_ue8m0       If true, use UE8M0 (power-of-two) scale format.
 /// @param stream          CUDA stream.
-void invokeFusedCatHadamardFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe,
-    __nv_bfloat16 const* nope, int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride,
-    int32_t nope_row_stride, bool use_ue8m0, cudaStream_t stream = 0);
+void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe, __nv_bfloat16 const* nope,
+    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride,
+    bool use_ue8m0, cudaStream_t stream = 0);
 
 } // namespace kernels
 
