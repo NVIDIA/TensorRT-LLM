@@ -16,30 +16,6 @@ The PyTorch backend supports a wide variety of features, listed below:
 
 ## General usage
 
-There are two sampling backends available.
-
-* Torch Sampler
-* TRTLLM Sampler
-
-Torch Sampler currently supports a superset of features of TRTLLM Sampler, and is intended as the long-term solution. One can specify which sampler to use explicitly with:
-
-```python
-from tensorrt_llm import LLM
-
-# Chooses TorchSampler explicitly
-llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          sampler_type="TorchSampler")
-
-# Chooses TRTLLMSampler explicitly
-llm = LLM(model='nvidia/Llama-3.1-8B-Instruct-FP8',
-          sampler_type="TRTLLMSampler")
-```
-
-By default, the sampling backend is chosen to be `auto`. This will use:
-
-* TRTLLM Sampler when using Beam Search.
-* Torch Sampler otherwise.
-
 Here is an example to run a model with basic usage of sampling parameters. This example prepares two identical prompts which will give different results due to the sampling parameters chosen:
 
 ```python
@@ -73,7 +49,7 @@ llm.generate(["Hello, my name is",
             sampling_params_1])
 ```
 
-### LLM API sampling behavior when using Torch Sampler
+### LLM API sampling behavior
 
 * The sampling is controlled via `SamplingParams`.
 
@@ -105,17 +81,17 @@ llm.generate(["Hello, my name is",
 
 ### Performance
 
-The Torch Sampler leverages the optimized sampling kernels provided by
+The sampler leverages the optimized sampling kernels provided by
 [FlashInfer](https://docs.flashinfer.ai/api/sampling.html). The sampler
 also uses the [sorting-free implementations](https://flashinfer.ai/2025/03/10/sampling.html)
 whenever possible. This optimization does not compute the complete set of token sampling probabilities
 (after top-k / top-p masking etc.), which typically can be omitted unless requested by the user or
 required for speculative decoding (rejection sampling).
-In case of unexpected problems, the use of FlashInfer in Torch Sampler can
+In case of unexpected problems, the use of FlashInfer in the sampler can
 be disabled via the `disable_flashinfer_sampling` config option (note that this option is likely
 to be removed in a future TensorRT LLM release).
 
-Moreover, Torch Sampler internally batches requests with compatible sampling parameters. This
+Moreover, the sampler internally batches requests with compatible sampling parameters. This
 can greatly reduce the overall latency of the sampling step when request batches are comprised
 of requests with very heterogeneous sampling strategies (e.g. a mix of requests using greedy and top-p-after-top-k sampling).
 
