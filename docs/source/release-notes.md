@@ -17,7 +17,6 @@ All published functionality in the Release Notes has been fully tested and verif
 - **Features**
   - **Speculative Decoding:**
     - Enabled MTP>1 support for DeepSeek v3.2
-    - Enabled dynamic draft length support
   - **Disaggregated Serving:**
     - Added service discovery mechanism for dynamic scaling
     - Added support for cancelling requests
