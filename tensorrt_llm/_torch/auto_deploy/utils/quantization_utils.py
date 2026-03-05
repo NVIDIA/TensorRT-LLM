@@ -108,18 +108,13 @@ def get_quantization_from_linear_node(node: torch.fx.node.Node):
 
 
 def _pattern_matches(modname: str, pattern: str) -> bool:
-    """Check if a pattern matches the module name.
+    """Check if an exclude pattern matches the module name.
 
-    Supports both:
-    - Glob patterns (with * or ?): use fnmatch
-    - Simple strings (no wildcards): use substring matching (HF style)
+    Keep behavior aligned with upstream: evaluate exclude entries via fnmatch.
+    This preserves exact module-path excludes (for example:
+    ``model.layers.0.self_attn.q_a_proj``) and wildcard entries.
     """
-    # If pattern contains wildcards, use fnmatch
-    if "*" in pattern or "?" in pattern:
-        return fnmatch(modname, pattern)
-    # Otherwise, use substring matching (HF modules_to_not_convert style)
-    # Check if pattern appears as a component in the module path
-    return pattern in modname.split(".")
+    return fnmatch(modname, pattern)
 
 
 def should_skip_quantization(
