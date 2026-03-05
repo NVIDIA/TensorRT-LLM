@@ -240,8 +240,9 @@ def create_py_executor(
     Returns:
         A fully initialized PyExecutor instance.
     """
-    torch.cuda.set_per_process_memory_fraction(1.0)
 
+    skip_est = os.environ.get("TRTLLM_SKIP_KV_CACHE_ESTIMATION", '0') == '1'
+    torch.cuda.set_per_process_memory_fraction(1.0)
     # Apply model-specific defaults early, before destructuring llm_args fields
     checkpoint_loader = _construct_checkpoint_loader(llm_args.backend,
                                                      llm_args.checkpoint_loader,
@@ -321,12 +322,20 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine(
-    ) and not spec_config.allow_advanced_sampling:
-        logger.warning(
-            f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
-            "want to use non-greedy sampling, please set allow_advanced_sampling=True."
-        )
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if not spec_config.allow_advanced_sampling:
+            logger.warning(
+                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+            )
+        # Check FLASHINFER compatibility with one-engine speculative decoding
+        if llm_args.attn_backend == "FLASHINFER":
+            raise ValueError(
+                f"FLASHINFER attention backend is not supported with one-engine speculative "
+                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
+                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
+                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
+                f"backend instead by setting attn_backend='TRTLLM'.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True
@@ -697,8 +706,11 @@ def create_py_executor(
             sparse_attention_config=sparse_attention_config,
             execution_stream=execution_stream,
             draft_config=draft_config,
+            skip_est=skip_est,
         )
+
         estimating_kv_cache = kv_cache_creator.try_prepare_estimation()
+
         with allocation_scope(
                 ExecutorMemoryType.INIT_KV_CACHE if estimating_kv_cache else
                 ExecutorMemoryType.KV_CACHE, RestoreMode.NONE):
@@ -731,6 +743,8 @@ def create_py_executor(
     with allocation_scope(
             ExecutorMemoryType.INIT_EXTRA_RESOURCES if estimating_kv_cache else
             ExecutorMemoryType.EXTRA_RESOURCES, RestoreMode.PINNED):
+        # run gc.collect() to free memory of the previous py_executor, avoid cudaFree overlap with cuda graph capture
+        gc.collect()
         py_executor = create_py_executor_instance(
             dist=dist,
             resources=resources,
@@ -756,6 +770,7 @@ def create_py_executor(
             virtual_memory_pools=vm_pools if not estimating_kv_cache else None,
             execution_stream=execution_stream,
         )
+
         # Originally, peft_cache_config might be mutated inside
         # create_py_executor_instance. Restore it here.
         peft_cache_config = py_executor.peft_cache_config
@@ -786,7 +801,6 @@ def create_py_executor(
                     if llm_args.cuda_graph_config is not None:
                         eng._release_cuda_graphs()
                     eng.attn_metadata = None
-
         with allocation_scope(ExecutorMemoryType.EXTRA_RESOURCES,
                               RestoreMode.PINNED):
 
@@ -824,4 +838,5 @@ def create_py_executor(
         logger.info(f"LLM Args:\n{llm_args}")
 
     py_executor.start_worker()
+
     return py_executor
