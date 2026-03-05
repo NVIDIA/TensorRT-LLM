@@ -6,32 +6,86 @@ All published functionality in the Release Notes has been fully tested and verif
 
 ## TensorRT-LLM Release 1.2
 
-### Key Features and Enhancements
+### Highlights
 
-- **DGX Spark Support (Beta)**
-  - Added beta support for single-node DGX Spark.
-  - Validated models and precision formats:
-    - GPT-OSS-20B, GPT-OSS-120B (MXFP4)
-    - Llama-3.1-8B-Instruct (FP16/FP8/NVFP4)
-    - Llama-3.3-70B-Instruct (FP8/NVFP4)
-    - Qwen3-8B, Qwen3-14B (FP16/FP8/NVFP4)
-    - Qwen3-32B (FP16/NVFP4)
-    - Qwen3-30B-A3B (FP16/NVFP4)
-    - NVIDIA-Nemotron-Nano-9B-v2 (FP4)
-    - Llama-3.3-Nemotron-Super-49B-v1.5 (FP8)
-    - Phi-4-multimodal-instruct (FP16/FP8/NVFP4)
-    - Phi-4-reasoning-plus (FP16/FP8/NVFP4)
+- **Model Support**
+  - Added support for K-EXAONE, Nemotron Nano V3, Nemotron Super V3, Qwen3-Next and Qwen3-VL.
+  - Improved GPT-OSS, Nemotron, EXAONE, GLM, Starcoder2, Qwen3, KimiK2, DeepSeek v3.2 and Mistral Large 3 support and validation.
+  - Expanded Blackwell/Hopper/Ampere enablement including B300/GB200/GB300 and SM120/SM121/SM103 paths.
+  - Broadened low-precision and MoE capabilities (FP8/NVFP4/MXFP4/INT4-AWQ), including routing and kernels.
 
-### Infrastructure Changes
+- **Features**
+  - **Speculative Decoding:**
+    - Enabled MTP>1 support for DeepSeek v3.2
+    - Enabled dynamic draft length support
+  - **Disaggregated Serving:**
+    - Added service discovery mechanism for dynamic scaling
+    - Added support for cancelling requests
+    - Added NIXL-LibFabric support
+    - Added support for Mooncake transfer engine as a cache transceiver backend
+  - **Sampling:**
+    - Implemented batched sampling using FlashInfer sampling 
+    - Added support for returning logprobs incrementally with streaming mode in PyTorch backend
+    - Added Beam Search support to TorchSampler
+  - **Performance:**
+    - Improved TorchSampler performance
+    - Enabled PDL by default and added PDL support for indexer TopK and additional kernels.
+    - Improved trtllm-gen kernels 
+    - Enabled early exit with overlap scheduler 
+    - Added NUMA-aware CPU affinity automatic configuration
+  - **Expert Parallelism:**
+    - Enabled EPLB for trtllm-gen and cutlass backend
+    - Enabled CuteDSL MoE with large EP
+    - Added CUDA graph support for DeepEP
+    - Multiple performance improvements
+  - **Hardware:**
+    - DGX Spark Support (Beta)
+  - **Others:**
+    - Helix parallelism support
+    - New Ray orchestrator type
 
-### API Changes
+- **Documentation**
+  - **Deployment Guides:** 
+    - Added comprehensive deployment guides for KimiK2, Qwen3 and Qwen3-Next. 
+    - Added new guide on CPU Affinity configuration. 
+    - Updated GPT-OSS guide.
+  - **Developer Guides:** 
+    - Added developer guide about KV Cache Transmission. 
+    - New section on MoE Expert Load Balance Analysis (Perfect Router) in Performance Analysis guide.
+    - New section on API Change Principles in LLM API Change guide.
+  - **Feature Documentation:** 
+    - Created new guides for Additional Outputs, Helix Parallelism, KV Cache Connector, Ray Orchestrator, Sparse Attention and Torch Compile & Piecewise CUDA Graph. 
+    - Also updated the Feature Combination Matrix and Paged Attention, IFB, and Request Scheduling guide.
+  - **Tech Blogs:** Published blogs on:
+    - "[Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)](./blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.md)" 
+    - "[Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs](./blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html)".
+  - **Examples:** 
+    - Added new section on disaggregated serving service discovery method. 
+    - Added examples for K-EXAONE, Nemotron Nano V2 VL and Nemotron Nano V3.
+    - Added RocketKV usage documentation.
 
-### Fixed Issues
+- **Infrastructure Changes**
 
-### Known Issues
+  - The base Docker image for TensorRT-LLM is updated to `nvcr.io/nvidia/pytorch:25.12-py3`.
+  - The base Docker image for TensorRT-LLM Backend is updated to `nvcr.io/nvidia/tritonserver:25.12-py3`.
+  - The dependent public PyTorch version is updated to 2.9.1.
+  - The dependent transformers version is updated to 4.57.3.
+  - The dependent triton version is updated to 3.5.1.
+  - The dependent NIXL version is updated to 0.8.0.
 
-- **DGX Spark:** DGX Spark support is in beta. Only single-node configurations and the models listed above have been validated in this release.
-- **Disaggregated Serving:** A hang may occur in disaggregated serving with context pipeline parallelism and generation tensor parallelism configurations.
+- **API Changes**
+  - **Breaking Changes:** 
+    - FlashInfer sampling now used by default with PyTorch backend.
+    - Changes to sampling strategy in some previously undefined cases.
+  - **OpenAI API:** 
+    - Enabled n > 1 with PyTorch backend
+    - Added support for GET/DELETE v1/responses
+
+- **Fixed multiple Issues**
+
+- **Known Issues**
+  - **DGX Spark:** DGX Spark support is in beta. Only single-node configurations and the models listed above have been validated in this release.
+  - **Disaggregated Serving:** A hang may occur in disaggregated serving with context pipeline parallelism and generation tensor parallelism configurations.
 
 ## TensorRT-LLM Release 1.1
 
