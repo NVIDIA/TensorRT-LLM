@@ -49,8 +49,10 @@ def config_file_lock(timeout: int = 10):
     try:
         with lock:
             yield
-    except (PermissionError, filelock.Timeout):
-        # Fallback to tempdir
+    except (PermissionError, OSError, filelock.Timeout):
+        # Fallback to tempdir when primary lock path is unusable (e.g.,
+        # NFS locking failures like ENOLCK/ESTALE, permission issues,
+        # or lock acquisition timeouts)
         tmp_dir = Path(tempfile.gettempdir())
         tmp_dir.mkdir(parents=True, exist_ok=True)
         tmp_lock_path = tmp_dir / "_remote_code.lock"
@@ -64,7 +66,7 @@ def config_file_lock(timeout: int = 10):
             )
             # proceed without lock
             yield
-        except (PermissionError) as e:
+        except (PermissionError, OSError) as e:
             logger.warning(
                 f"tempdir config lock unavailable due to OS/permission issue: {e}, proceeding without lock"
             )
