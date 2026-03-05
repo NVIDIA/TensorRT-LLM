@@ -122,34 +122,35 @@ class Flux2Pipeline(BasePipeline):
         super().__init__(model_config)
 
     @staticmethod
-    def _compute_flux2_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX.2 transformer.
+    def _compute_flux2_timestep_embedding(
+        module, hidden_states=None, timestep=None, guidance=None, **kwargs,
+    ):
+        """Compute modulated input for FLUX.2 TeaCache (matches original paper).
 
-        FLUX.2 uses TimeGuidanceEmbed which combines timestep + guidance.
-        For TeaCache, we compute this directly using the sub-components.
-
-        Args:
-            module: Flux2Transformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional)
-
-        Returns:
-            Combined timestep+guidance embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states)) * (1 + scale) + shift using
+        the first transformer block's modulation, which captures both temporal
+        (timestep) and content (hidden_states) changes.
         """
-        embed = module.time_guidance_embed
-        # Use timestep_embedder sub-component directly
-        te_dtype = next(embed.timestep_embedder.parameters()).dtype
-        if te_dtype == torch.int8:
-            te_dtype = torch.bfloat16
 
-        timesteps_proj = embed.time_proj(timestep)
-        temb = embed.timestep_embedder(timesteps_proj.to(te_dtype))
+        # Embed hidden states through x_embedder (same as forward() line 698)
+        x = module.x_embedder(hidden_states.contiguous())
 
-        if hasattr(embed, "guidance_embedder") and guidance is not None:
-            guidance_proj = embed.time_proj(guidance)
-            temb = temb + embed.guidance_embedder(guidance_proj.to(te_dtype))
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
 
-        return temb
+        # Compute temb (timestep + optional guidance)
+        temb = module.time_guidance_embed(timestep, guidance)
+
+        # Compute modulation from first block: ((shift1, scale1, gate1), ...)
+        img_mod = module.double_stream_modulation_img(temb)
+        shift1, scale1, _gate1 = img_mod[0]
+
+        # Apply modulation: norm1(x) * (1 + scale) + shift (same as block line 293-294)
+        modulated_input = module.transformer_blocks[0].norm1(x) * (1 + scale1) + shift1
+
+        return modulated_input
 
     @property
     def dtype(self):

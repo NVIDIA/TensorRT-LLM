@@ -50,35 +50,36 @@ class FluxPipeline(BasePipeline):
         super().__init__(model_config)
 
     @staticmethod
-    def _compute_flux_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX.1 transformer.
+    def _compute_flux_timestep_embedding(
+        module, hidden_states=None, timestep=None, guidance=None,
+        pooled_projections=None, **kwargs,
+    ):
+        """Compute modulated input for FLUX.1 TeaCache (matches original paper).
 
-        FLUX.1 uses CombinedTimestepGuidanceTextProjEmbeddings which combines
-        timestep + guidance + pooled_projection. For TeaCache, we only need the
-        timestep + guidance components (pooled_projection is constant across steps).
-
-        Args:
-            module: FluxTransformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional)
-
-        Returns:
-            Combined timestep+guidance embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states), emb=temb) from the first
+        transformer block, which captures both temporal (timestep) and content
+        (hidden_states) changes for cache distance calculation.
         """
-        embed = module.time_text_embed
-        # Use timestep_embedder sub-component directly (avoids needing pooled_projection)
-        te_dtype = next(embed.timestep_embedder.parameters()).dtype
-        if te_dtype == torch.int8:
-            te_dtype = torch.bfloat16
 
-        timesteps_proj = embed.time_proj(timestep)
-        temb = embed.timestep_embedder(timesteps_proj.to(te_dtype))
+        # Embed hidden states through x_embedder (same as forward() line 790)
+        x = module.x_embedder(hidden_states.contiguous())
 
-        if hasattr(embed, "guidance_embedder") and guidance is not None:
-            guidance_proj = embed.time_proj(guidance)
-            temb = temb + embed.guidance_embedder(guidance_proj.to(te_dtype))
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
 
-        return temb
+        # Compute full temb (timestep + guidance + pooled_projection)
+        if module.config.guidance_embeds and guidance is not None:
+            temb = module.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = module.time_text_embed(timestep, pooled_projections)
+
+        # Apply AdaLayerNorm from first transformer block:
+        # norm1(x, emb=temb) -> (modulated_x, gate, shift_mlp, scale_mlp, gate_mlp)
+        modulated_input = module.transformer_blocks[0].norm1(x, emb=temb)[0]
+
+        return modulated_input
 
     @property
     def dtype(self):
