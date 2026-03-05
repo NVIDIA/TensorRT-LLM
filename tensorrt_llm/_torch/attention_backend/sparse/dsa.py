@@ -1022,15 +1022,7 @@ class Indexer(nn.Module):
         - Prepares schedule_metadata for fp8_paged_mqa_logits
         - Stores generation request IDs for decode phase
         """
-        # Skip indexer preparation if the kv_cache_manager doesn't have index_head_dim.
-        # This can happen when the metadata is being used with a draft KV cache manager
-        # during MTP speculative decoding, which uses a regular KVCacheManager instead
-        # of DSACacheManager.
         kv_cache_manager = metadata.kv_cache_manager
-        if kv_cache_manager is None or not hasattr(kv_cache_manager,
-                                                   'index_head_dim'):
-            return
-
         num_contexts = metadata.num_contexts
         num_generations = metadata.num_generations
         num_ctx_tokens = metadata.num_ctx_tokens
