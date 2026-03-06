@@ -123,7 +123,11 @@ class Flux2Pipeline(BasePipeline):
 
     @staticmethod
     def _compute_flux2_timestep_embedding(
-        module, hidden_states=None, timestep=None, guidance=None, **kwargs,
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        **kwargs,
     ):
         """Compute modulated input for FLUX.2 TeaCache (matches original paper).
 

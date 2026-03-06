@@ -51,8 +51,12 @@ class FluxPipeline(BasePipeline):
 
     @staticmethod
     def _compute_flux_timestep_embedding(
-        module, hidden_states=None, timestep=None, guidance=None,
-        pooled_projections=None, **kwargs,
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        pooled_projections=None,
+        **kwargs,
     ):
         """Compute modulated input for FLUX.1 TeaCache (matches original paper).
 
