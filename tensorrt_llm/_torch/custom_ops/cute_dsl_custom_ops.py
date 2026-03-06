@@ -867,6 +867,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
                     mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+                # Skip tactics where the cluster shape exceeds available
+                # tiles. Launching more cluster CTAs than tiles causes
+                # out-of-bounds memory access in the CuteDSL kernel.
+                if (ceil_div(m, mma_tiler_mn[0]) < cluster_shape_mn[0]
+                        or ceil_div(n, mma_tiler_mn[1]) < cluster_shape_mn[1]):
+                    continue
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
@@ -1162,6 +1168,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             for mma_tiler_mn, cluster_shape_mn, raster_along_m in itertools.product(
                     mma_tiler_mn_candidates, cluster_shape_mn_candidates,
                     raster_along_m_candidates):
+                # Skip tactics where the cluster shape exceeds available
+                # tiles. Launching more cluster CTAs than tiles causes
+                # out-of-bounds memory access in the CuteDSL kernel.
+                if (ceil_div(m, mma_tiler_mn[0]) < cluster_shape_mn[0]
+                        or ceil_div(n, mma_tiler_mn[1]) < cluster_shape_mn[1]):
+                    continue
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
@@ -1548,6 +1560,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             valid_tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
                     mma_tiler_mn_candidates, cluster_shape_mn_candidates):
+                # Skip tactics where the cluster shape exceeds available
+                # tiles. Launching more cluster CTAs than tiles causes
+                # out-of-bounds memory access in the CuteDSL kernel.
+                if (ceil_div(m, mma_tiler_mn[0]) < cluster_shape_mn[0]
+                        or ceil_div(n, mma_tiler_mn[1]) < cluster_shape_mn[1]):
+                    continue
                 if self.__class__.kernel_class.can_implement(
                         ab_dtype=cutlass.Float4E2M1FN,
                         sf_dtype=cutlass.Float8E4M3FN,
