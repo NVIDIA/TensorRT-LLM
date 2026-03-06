@@ -132,15 +132,16 @@ def triton_fused_topk_softmax_fn(
         top_k: Number of experts to select per token.
 
     Returns:
-        routing_weights: (T, top_k) float32 tensor of softmax routing weights.
+        routing_weights: (T, top_k) tensor of softmax routing weights (same dtype as input).
         selected_experts: (T, top_k) int32 tensor of expert indices.
     """
     assert router_logits.ndim == 2, "router_logits must be 2-D (T, E)"
     num_tokens, num_experts = router_logits.shape
 
-    # Allocate outputs
+    # Allocate outputs — use input dtype to avoid downstream FP32→BF16 cast kernels.
+    # The Triton kernel computes softmax in FP32 internally and auto-casts on store.
     routing_weights = torch.empty(
-        (num_tokens, top_k), dtype=torch.float32, device=router_logits.device
+        (num_tokens, top_k), dtype=router_logits.dtype, device=router_logits.device
     )
     selected_experts = torch.empty(
         (num_tokens, top_k), dtype=torch.int32, device=router_logits.device
@@ -195,7 +196,7 @@ def triton_fused_topk_softmax(
 
     Returns:
         A tuple of:
-        - routing_weights: (T, top_k) float32 tensor.
+        - routing_weights: (T, top_k) tensor (same dtype as router_logits).
         - selected_experts: (T, top_k) int32 tensor.
     """
     return triton_fused_topk_softmax_fn(router_logits, top_k)
@@ -208,6 +209,6 @@ def _triton_fused_topk_softmax_fake(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fake (meta) implementation for tracing / export."""
     num_tokens = router_logits.shape[0]
-    routing_weights = router_logits.new_empty((num_tokens, top_k), dtype=torch.float32)
+    routing_weights = router_logits.new_empty((num_tokens, top_k), dtype=router_logits.dtype)
     selected_experts = router_logits.new_empty((num_tokens, top_k), dtype=torch.int32)
     return routing_weights, selected_experts
