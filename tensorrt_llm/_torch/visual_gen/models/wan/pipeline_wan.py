@@ -87,21 +87,12 @@ class WanPipeline(BasePipeline):
 
         super().__init__(model_config)
 
-    def _compute_wan_timestep_embedding(self, module, timestep, guidance=None):
+    def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
 
         WAN uses a condition_embedder with timesteps_proj and time_embedder layers.
-        Handles dtype casting to match the embedder's dtype.
-
-        Args:
-            module: WanTransformer3DModel instance
-            timestep: Timestep tensor (shape: [batch_size])
-            guidance: Unused for WAN (no guidance embedding)
-
-        Returns:
-            Timestep embedding tensor used by TeaCache for distance calculation.
-            Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
-            calibration), or temb when use_ret_steps=False (standard mode).
+        Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
+        calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
         t_freq = ce.timesteps_proj(timestep)
