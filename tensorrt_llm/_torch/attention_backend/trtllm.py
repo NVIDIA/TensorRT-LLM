@@ -1500,13 +1500,13 @@ class TrtllmAttentionMetadata(AttentionMetadata):
 
             # These buffers are accessed more like removing input padding,
             # rather than using max_total_draft_tokens + 1 as the offset between different requests.
-            if not is_spec_dec_tree and self.spec_decoding_position_offsets is None:
+            if is_spec_dec_tree and self.spec_decoding_position_offsets is None:
                 self.spec_decoding_position_offsets = torch.empty(
                     [self.max_num_requests, max_total_draft_tokens + 1],
                     dtype=torch.int,
                     device='cuda',
                 )
-            if not is_spec_dec_tree and self.spec_decoding_packed_mask is None:
+            if is_spec_dec_tree and self.spec_decoding_packed_mask is None:
                 self.spec_decoding_packed_mask = torch.empty(
                     [
                         self.max_num_requests, max_total_draft_tokens + 1,
@@ -1599,7 +1599,9 @@ class TrtllmAttentionMetadata(AttentionMetadata):
                 # Dynamic draft length needs position offsets and packed mask to be shaped for each runtime draft length.
                 # So we create cache for position offsets and packed mask for each draft length to avoid reallocation.
                 assert max_draft_len == max_total_draft_tokens, "max_draft_len should be equal to max_total_draft_tokens for linear tree"
-                runtime_draft_len = spec_metadata.runtime_draft_len
+                runtime_draft_len = (spec_metadata.runtime_draft_len
+                                     if spec_metadata is not None else
+                                     max_draft_len)
                 self.generate_spec_decoding_generation_length(
                     runtime_draft_len=runtime_draft_len)
                 self.spec_decoding_position_offsets = generate_spec_decoding_position_offsets(
