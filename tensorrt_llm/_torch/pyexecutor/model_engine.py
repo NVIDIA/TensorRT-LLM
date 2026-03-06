@@ -180,9 +180,12 @@ class PyTorchModelEngine(ModelEngine):
         # Saved before zeroing for draft models; used by update_spec_dec_param.
         self._spec_dec_max_total_draft_tokens = spec_config.max_total_draft_tokens if spec_config is not None else 0
 
-        # The draft model won't have any draft tokens attached to
-        # generation requests when we invoke it autoregressively
-        if spec_config is not None and is_draft_model:
+        # The non-wrapped draft model won't have any draft tokens attached to
+        # generation requests when we invoke it autoregressively. Keep the
+        # original speculative lengths for wrapped chain-drafter models, which
+        # still need the full Eagle speculative metadata during the fused loop.
+        if (spec_config is not None and is_draft_model
+                and drafting_loop_wrapper is None):
             spec_config.max_draft_len = 0
             spec_config.max_total_draft_tokens = 0
         self.spec_config = spec_config
