@@ -334,6 +334,58 @@ def test_DetokenizedGenerationResultBase():
     assert result._done
 
 
+def test_abort_on_GenerationResultBase():
+    """abort() and aborted() are available on GenerationResultBase."""
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+    assert not result.aborted()
+    result.abort()
+    assert result.aborted()
+
+
+def test_abort_on_DetokenizedGenerationResultBase():
+    """DetokenizedGenerationResultBase inherits abort() so postprocess workers
+    can call it without AttributeError (NVBug 5955173)."""
+    sampling_params = SamplingParams(max_tokens=4)
+    result = DetokenizedGenerationResultBase(id=1,
+                                             sampling_params=sampling_params)
+    assert not result.aborted()
+    result._handle_response(create_rsp(10, finished=False))
+    assert not result._done
+
+    result.abort()
+    assert result.aborted()
+
+
+def test_PostprocWorker_Output_should_abort():
+    """PostprocWorker.Output carries should_abort flag for worker-to-main-thread
+    abort signal propagation."""
+    out_default = PostprocWorker.Output(client_id=0, res=None, is_final=False)
+    assert out_default.should_abort is False
+
+    out_abort = PostprocWorker.Output(client_id=0,
+                                      res=None,
+                                      is_final=False,
+                                      should_abort=True)
+    assert out_abort.should_abort is True
+
+
+def test_handle_response_propagates_should_abort():
+    """When a PostprocWorker.Output has should_abort=True, _handle_response
+    on the main-thread GenerationResult calls abort() (NVBug 5955173)."""
+    sampling_params = SamplingParams(max_tokens=4)
+    result = GenerationResultBase(id=1, sampling_params=sampling_params)
+    assert not result.aborted()
+
+    output = PostprocWorker.Output(client_id=1,
+                                   res="mock_sse_data",
+                                   is_final=False,
+                                   should_abort=True)
+    result._handle_response(output)
+    assert result.aborted()
+    assert result._outputs[0]._postprocess_result == "mock_sse_data"
+
+
 def _ZeroMqQueue_sync_sync_task(addr: str):
     print(f"Setup receiver: {addr}")
     pull_pipe = ZeroMqQueue(address=addr, is_server=False, is_async=True)
