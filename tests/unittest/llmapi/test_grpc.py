@@ -376,23 +376,17 @@ class TestComprehensiveSamplingParamsConversion:
             return_generation_logits=True,
             exclude_input_from_output=True,
         )
-        stop_words = [
-            pb2.TokenSequence(token_ids=[50256]),
-            pb2.TokenSequence(token_ids=[50257, 50258]),
-        ]
-        bad_words = [
-            pb2.TokenSequence(token_ids=[100, 101]),
-        ]
         embedding_bias = [0.0] * 10 + [1.5, -1.5]
 
         params = create_sampling_params_from_proto(
             proto_config=proto_config,
             output_config=output_config,
             max_tokens=256,
-            end_id=50256,
-            pad_id=50257,
-            stop_words=stop_words,
-            bad_words=bad_words,
+            stop=["<|endoftext|>", "<|end|>"],
+            stop_token_ids=[50256],
+            ignore_eos=True,
+            bad=["badword1"],
+            bad_token_ids=[100, 101],
             embedding_bias=embedding_bias,
         )
 
@@ -432,20 +426,21 @@ class TestComprehensiveSamplingParamsConversion:
 
         # Other params
         assert params.max_tokens == 256
-        assert params.end_id == 50256
-        assert params.pad_id == 50257
         assert params.detokenize is False  # key optimization
+        assert params.ignore_eos is True
 
-        # Stop/bad words (set as pre-tokenized word IDs)
-        assert params._stop_word_ids == [[50256], [50257, 50258]]
-        assert params._bad_word_ids == [[100, 101]]
+        # Stop/bad words (passed as strings/token IDs for TRT-LLM's _setup() to tokenize)
+        assert params.stop == ["<|endoftext|>", "<|end|>"]
+        assert params.stop_token_ids == [50256]
+        assert params.bad == ["badword1"]
+        assert params.bad_token_ids == [100, 101]
 
         # Embedding bias converted to torch.Tensor
         assert params.embedding_bias is not None
         assert len(params.embedding_bias) == 12
 
-    def test_end_id_minus_one_sets_ignore_eos(self):
-        """Test that end_id=-1 correctly sets ignore_eos=True."""
+    def test_ignore_eos_flag(self):
+        """Test that ignore_eos=True correctly sets ignore_eos on SamplingParams."""
         proto_config = pb2.SamplingConfig(temperature=0.7)
         output_config = pb2.OutputConfig()
 
@@ -453,10 +448,9 @@ class TestComprehensiveSamplingParamsConversion:
             proto_config=proto_config,
             output_config=output_config,
             max_tokens=100,
-            end_id=-1,
+            ignore_eos=True,
         )
 
-        assert params.end_id == -1
         assert params.ignore_eos is True
 
     def test_defaults_when_fields_unset(self):
