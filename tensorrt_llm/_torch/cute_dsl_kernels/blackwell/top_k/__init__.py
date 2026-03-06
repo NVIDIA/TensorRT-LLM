@@ -14,9 +14,7 @@
 
 """CuTE DSL Top-K kernels for Blackwell architecture."""
 
-from .filtered_top_k_decode_varlen import (
-    FilteredTopKKernelVarlenDecode,
-)
+from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
 from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
 
 __all__ = [
