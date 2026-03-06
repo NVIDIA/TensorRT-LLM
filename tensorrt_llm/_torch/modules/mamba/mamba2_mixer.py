@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import functools
 from typing import Optional
 
 import torch
@@ -21,6 +22,8 @@ from flashinfer.mamba import selective_state_update as selective_state_update_fi
 from torch import nn
 
 from tensorrt_llm._torch.modules.mamba.mamba2_metadata import Mamba2Metadata
+from tensorrt_llm._torch.modules.multi_stream_utils import \
+    maybe_execute_in_parallel
 from tensorrt_llm._torch.pyexecutor.mamba_cache_manager import \
     use_cpp_mamba_cache_manager
 from tensorrt_llm.logger import logger
@@ -190,6 +193,9 @@ class Mamba2Mixer(nn.Module):
             skip_create_weights_in_init=config.skip_create_weights_in_init,
             allreduce_strategy=config.allreduce_strategy)
 
+        self.aux_steram = torch.cuda.Stream()
+        self.events = [torch.cuda.Event(), torch.cuda.Event()]
+
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -334,36 +340,54 @@ class Mamba2Mixer(nn.Module):
                 draft_token_num = spec_metadata.max_draft_len + 1
                 intermediate_conv_states = layer_cache.intermediate_conv_window
 
-                self.intermediate_state_indices = torch.arange(
-                    num_decodes,
-                    dtype=torch.int32,
-                    device=state_indices_d.device)
+                intermediate_state_indices = _cached_arange(
+                    attn_metadata.kv_cache_manager.get_max_resource_count(),
+                    state_indices_d.device)[:num_decodes]
 
                 # Reshape for batch processing
                 xbc_d_reshaped = xbc_d.view(num_decodes, draft_token_num,
                                             -1).transpose(1, 2)
-                # TODO:support tree structure [TRTLLM-10320]
-                xbc_d_processed = causal_conv1d_update_triton(
-                    xbc_d_reshaped,
-                    conv_states,
-                    self.conv1d.weight,
-                    self.conv1d.bias,
-                    activation="silu",
-                    conv_state_indices=state_indices_d[:num_decodes],
-                    intermediate_conv_window=intermediate_conv_states,
-                    intermediate_state_indices=self.intermediate_state_indices,
-                )
 
-                xbc_d = xbc_d_processed.transpose(1, 2).view(
-                    num_decode_tokens, -1)
+                def conv1d():
+                    # TODO:support tree structure [TRTLLM-10320]
+                    xbc_d_processed = causal_conv1d_update_triton(
+                        xbc_d_reshaped,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d[:num_decodes],
+                        intermediate_conv_window=intermediate_conv_states,
+                        intermediate_state_indices=intermediate_state_indices,
+                    )
+
+                    return xbc_d_processed.transpose(1, 2).view(
+                        num_decode_tokens, -1)
 
             else:
-                xbc_d = causal_conv1d_update(xbc_d,
-                                             conv_states,
-                                             self.conv1d.weight,
-                                             self.conv1d.bias,
-                                             activation="silu",
-                                             conv_state_indices=state_indices_d)
+
+                def conv1d():
+                    return causal_conv1d_update(
+                        xbc_d,
+                        conv_states,
+                        self.conv1d.weight,
+                        self.conv1d.bias,
+                        activation="silu",
+                        conv_state_indices=state_indices_d)
+
+            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
+            def convert_dt():
+                return dt_d.to(dtype=torch.float32)
+
+            # If we're in a cuda graph and using PDL on conv1d, the next kernel
+            # if PDL'd will launch when convert_dt is done and conv1d triggers
+            # dependent kernels.  If these don't happen in parallel, then
+            # convert will go second and we lose PDL, but we're using cuda
+            # graphs for low latency so that seems ok.
+            xbc_d, dt_d = maybe_execute_in_parallel(conv1d, convert_dt,
+                                                    self.events[0],
+                                                    self.events[1],
+                                                    self.aux_steram)
 
             x_d, B_d, C_d = torch.split(
                 xbc_d,
@@ -374,8 +398,6 @@ class Mamba2Mixer(nn.Module):
                 ],
                 dim=-1,
             )
-            # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
-            dt_d = dt_d.to(dtype=torch.float32)
             x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
             B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
@@ -419,7 +441,7 @@ class Mamba2Mixer(nn.Module):
                     disable_state_update=True,
                     intermediate_states_buffer=intermediate_ssm_states,
                     cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    intermediate_state_indices=intermediate_state_indices,
                 )
             else:
                 self.selective_state_update_func_no_mtp(
@@ -445,3 +467,11 @@ class Mamba2Mixer(nn.Module):
         out = self.out_proj(hidden_states)
 
         return out[:num_actual_tokens]
+
+
+# We want to cache the largest indexing vector we'd ever need and mask it, vs
+# recreating it.  But we don't know the size at __init__, and it could even
+# change later if the mamba cache manager changes.
+@functools.cache
+def _cached_arange(n: int, device: torch.device) -> torch.Tensor:
+    return torch.arange(n, dtype=torch.int32, device=device)
