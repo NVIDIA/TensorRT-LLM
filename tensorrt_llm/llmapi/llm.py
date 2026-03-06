@@ -789,18 +789,20 @@ class BaseLLM:
         provided as strings.
 
         Args:
-            action: The cache management action to perform. Currently only
+            action (Literal["truncate"]): The cache management action to
+                perform. Currently only
                 "truncate" is supported.
-            messages_to_retain: The prefix of the conversation whose KV cache
-                entries should be kept. Can be a text string or a list of
-                pre-tokenized token IDs.
-            messages: The full message sequence to associate with the retained
-                cache. Can be a text string or a list of pre-tokenized token
-                IDs. If empty (empty string or empty list), this method is a
-                no-op.
-            sampling_params: Optional sampling parameters used during
-                tokenization of string inputs (e.g., for applying chat
-                templates). Not used when inputs are already token IDs.
+            messages_to_retain (Union[str, List[int]]): The prefix of the
+                conversation whose KV cache entries should be kept. Can be a
+                text string or a list of pre-tokenized token IDs.
+            messages (Union[str, List[int]]): The full message sequence to
+                associate with the retained cache. Can be a text string or a
+                list of pre-tokenized token IDs. If empty (empty string or
+                empty list), this method is a no-op.
+            sampling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Optional sampling
+                parameters used during tokenization of string inputs, for
+                example when applying chat templates. Not used when inputs are
+                already token IDs. Defaults to None.
         '''
         if isinstance(messages, str) and messages == "":
             return
@@ -1308,7 +1310,9 @@ class _TorchLLM(BaseLLM):
             kwargs (dict, optional): Keyword arguments to pass to the worker method. Defaults to None.
             non_block (bool): Whether to block until all workers have completed the RPC call. Defaults to False.
             unique_reply_rank (int, optional): The rank of the worker that will be used to send the reply. Defaults to None.
-            target_ranks: (int, list[int], optional): The rank(s) of the worker(s) that will be used to send the reply. Defaults to None.
+            target_ranks (int | list[int], optional): The rank or ranks of the
+                worker(s) that will be used to send the reply. Defaults to
+                None.
 
         Returns:
             list[Any]: A list of results from each worker.
