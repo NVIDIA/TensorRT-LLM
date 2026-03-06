@@ -2448,56 +2448,32 @@ class PyTorchModelEngine(ModelEngine):
         _request_ids_append = request_ids.append
         _gen_slots_append = gen_request_seq_slots.append
 
-        for request in generation_requests:
-            _request_ids_append(request.py_request_id)
-            beam_width = request.sampling_config.beam_width
-            for beam in range(beam_width):
-                # the request has no previous tensor:
-                # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
-                # (2) a dummy request; or
-                # (3) the first step in the generation server of disaggregated serving
+        # Fast path: beam_width=1, no helix, no mrope — covers the common
+        # text-only generation case and avoids per-request sampling_config
+        # access, range() creation, and beam-index branching.
+        if not self.use_beam_search and not _has_cp_helix and not _use_mrope:
+            _prev_append = previous_batch_indices.append
+            for request in generation_requests:
+                _request_ids_append(request.py_request_id)
+                # beam=0 always; no beam loop needed
                 if _no_previous or request.is_dummy or request.py_batch_idx is None:
-                    # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
-                    # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
-                        # Track position for GPU update (draft model only)
                         if _is_draft_model and num_accepted_tokens_device is not None:
                             start_idx = len(input_ids)
-                            input_ids.append(request.get_last_tokens(beam))
+                            input_ids.append(request.get_last_tokens(0))
                             end_idx = len(input_ids)
                             slot_idx = req_id_to_old_request[
                                 request.py_request_id].py_seq_slot
                             first_draft_input_ids_positions.append(
                                 (start_idx, end_idx, slot_idx))
                         else:
-                            input_ids.append(request.get_last_tokens(beam))
+                            input_ids.append(request.get_last_tokens(0))
                     past_seen_token_num = request.max_beam_num_tokens - 1
                 else:
-                    # the request has previous tensor
-                    # previous_batch_indices is used per request, not per beam
-                    # Only append it once for the first beam of each request
-                    if beam == 0:
-                        previous_batch_indices.append(request.py_batch_idx)
+                    _prev_append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
 
-                position_id = past_seen_token_num
-                if _has_cp_helix:
-                    # We compute a global position_id because each helix rank has only a subset of
-                    # tokens for a sequence.
-                    position_id = request.total_input_len_cp + request.py_decoding_iter - 1
-                    if request.py_helix_is_inactive_rank:
-                        past_seen_token_num = request.seqlen_this_rank_cp
-                    else:
-                        # Discount the token added to active rank in resource manager as it hasn't
-                        # been previously seen.
-                        past_seen_token_num = request.seqlen_this_rank_cp - 1
-
-                    # Update helix-specific parameters.
-                    helix_is_inactive_rank.append(
-                        request.py_helix_is_inactive_rank)
-                    helix_position_offsets.append(position_id)
-
-                _position_ids_append(position_id)
+                _position_ids_append(past_seen_token_num)
                 _num_cached_append(past_seen_token_num)
                 request.cached_tokens = past_seen_token_num
                 _prompt_lengths_append(request.py_prompt_len)
@@ -2506,37 +2482,100 @@ class PyTorchModelEngine(ModelEngine):
                 _num_accepted_append(0)
                 _gather_ids_append(len(position_ids) - 1)
 
-                # Multimodal: only construct MultimodalParams when the model
-                # uses mrope (e.g., Qwen2-VL). For text-only models and
-                # non-mrope VLMs, strip_for_generation() clears all data so
-                # has_content() is always False — skip entirely.
-                if _use_mrope:
-                    multimodal_params = MultimodalParams(
-                        multimodal_data=request.py_multimodal_data)
-                    multimodal_params.strip_for_generation()
-                    if multimodal_params.has_content():
-                        mrope_position_deltas = multimodal_params.multimodal_data[
-                            'mrope_config']['mrope_position_deltas']
-                        # NOTE: Expanding position_ids to 3D tensor who is using mrope
-                        gen_mrope_position_ids = (past_seen_token_num +
-                                                  mrope_position_deltas).expand(
-                                                      3, 1, 1)
-                        mrope_position_ids.append(gen_mrope_position_ids)
-                        if mrope_position_deltas.device.type == "cpu":
-                            multimodal_params.to_device(
-                                "multimodal_data",
-                                "cuda",
-                                pin_memory=prefer_pinned(),
-                                target_keywords=[
-                                    "mrope_config.mrope_position_deltas"
-                                ])
-                        multimodal_params_list.append(multimodal_params)
+                seq_slot = request.py_seq_slot
+                request.py_batch_idx = seq_slot
+                if not request.is_cuda_graph_dummy:
+                    _gen_slots_append(seq_slot)
+        else:
+            for request in generation_requests:
+                _request_ids_append(request.py_request_id)
+                beam_width = request.sampling_config.beam_width
+                for beam in range(beam_width):
+                    # the request has no previous tensor:
+                    # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
+                    # (2) a dummy request; or
+                    # (3) the first step in the generation server of disaggregated serving
+                    if _no_previous or request.is_dummy or request.py_batch_idx is None:
+                        # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
+                        # can be aligned to the correct positions.
+                        if not request.is_cuda_graph_dummy:
+                            # Track position for GPU update (draft model only)
+                            if _is_draft_model and num_accepted_tokens_device is not None:
+                                start_idx = len(input_ids)
+                                input_ids.append(request.get_last_tokens(beam))
+                                end_idx = len(input_ids)
+                                slot_idx = req_id_to_old_request[
+                                    request.py_request_id].py_seq_slot
+                                first_draft_input_ids_positions.append(
+                                    (start_idx, end_idx, slot_idx))
+                            else:
+                                input_ids.append(request.get_last_tokens(beam))
+                        past_seen_token_num = request.max_beam_num_tokens - 1
+                    else:
+                        # the request has previous tensor
+                        # previous_batch_indices is used per request, not per beam
+                        # Only append it once for the first beam of each request
+                        if beam == 0:
+                            previous_batch_indices.append(request.py_batch_idx)
+                        past_seen_token_num = request.max_beam_num_tokens
 
-            request.py_batch_idx = request.py_seq_slot
-            # Do not add a gen_request_seq_slot for CUDA graph dummy requests
-            # to prevent access errors due to None values
-            if not request.is_cuda_graph_dummy:
-                _gen_slots_append(request.py_seq_slot)
+                    position_id = past_seen_token_num
+                    if _has_cp_helix:
+                        # We compute a global position_id because each helix rank has only a subset of
+                        # tokens for a sequence.
+                        position_id = request.total_input_len_cp + request.py_decoding_iter - 1
+                        if request.py_helix_is_inactive_rank:
+                            past_seen_token_num = request.seqlen_this_rank_cp
+                        else:
+                            # Discount the token added to active rank in resource manager as it hasn't
+                            # been previously seen.
+                            past_seen_token_num = request.seqlen_this_rank_cp - 1
+
+                        # Update helix-specific parameters.
+                        helix_is_inactive_rank.append(
+                            request.py_helix_is_inactive_rank)
+                        helix_position_offsets.append(position_id)
+
+                    _position_ids_append(position_id)
+                    _num_cached_append(past_seen_token_num)
+                    request.cached_tokens = past_seen_token_num
+                    _prompt_lengths_append(request.py_prompt_len)
+                    _draft_lens_append(0)
+                    _sequence_lengths_append(1)
+                    _num_accepted_append(0)
+                    _gather_ids_append(len(position_ids) - 1)
+
+                    # Multimodal: only construct MultimodalParams when the model
+                    # uses mrope (e.g., Qwen2-VL). For text-only models and
+                    # non-mrope VLMs, strip_for_generation() clears all data so
+                    # has_content() is always False — skip entirely.
+                    if _use_mrope:
+                        multimodal_params = MultimodalParams(
+                            multimodal_data=request.py_multimodal_data)
+                        multimodal_params.strip_for_generation()
+                        if multimodal_params.has_content():
+                            mrope_position_deltas = multimodal_params.multimodal_data[
+                                'mrope_config']['mrope_position_deltas']
+                            # NOTE: Expanding position_ids to 3D tensor who is using mrope
+                            gen_mrope_position_ids = (past_seen_token_num +
+                                                      mrope_position_deltas).expand(
+                                                          3, 1, 1)
+                            mrope_position_ids.append(gen_mrope_position_ids)
+                            if mrope_position_deltas.device.type == "cpu":
+                                multimodal_params.to_device(
+                                    "multimodal_data",
+                                    "cuda",
+                                    pin_memory=prefer_pinned(),
+                                    target_keywords=[
+                                        "mrope_config.mrope_position_deltas"
+                                    ])
+                            multimodal_params_list.append(multimodal_params)
+
+                request.py_batch_idx = request.py_seq_slot
+                # Do not add a gen_request_seq_slot for CUDA graph dummy requests
+                # to prevent access errors due to None values
+                if not request.is_cuda_graph_dummy:
+                    _gen_slots_append(request.py_seq_slot)
 
         previous_batch_len = len(previous_batch_indices)
 

@@ -655,12 +655,18 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(len(draft_tokens)):
                             impl.add_token(req.py_request_id)
             else:
-                for req in generation_batch:
-                    impl.add_token(req.py_request_id)
-                    draft_tokens = req.py_draft_tokens
-                    if draft_tokens:
-                        for _ in range(len(draft_tokens)):
-                            impl.add_token(req.py_request_id)
+                if num_extra_kv_tokens == 0:
+                    # Fast path: no spec decode — skip py_draft_tokens access
+                    _add_token = impl.add_token
+                    for req in generation_batch:
+                        _add_token(req.py_request_id)
+                else:
+                    for req in generation_batch:
+                        impl.add_token(req.py_request_id)
+                        draft_tokens = req.py_draft_tokens
+                        if draft_tokens:
+                            for _ in range(len(draft_tokens)):
+                                impl.add_token(req.py_request_id)
 
             # prefill and generation kernels wait for scheduled offload/onboard/partial copy work before launching
             impl.refresh_blocks()
