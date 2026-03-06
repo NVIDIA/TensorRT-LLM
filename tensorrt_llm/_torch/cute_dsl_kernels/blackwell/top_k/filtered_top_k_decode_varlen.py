@@ -305,6 +305,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
 
             if cutlass.const_expr(self.merge_blocks):
                 # Note, after 1st kernel, the output is fix-lenght.
+                # Note, for merge_block kernels, need to ensure max_num_cols is the same as bucketed_num_cols.
                 row_end = self.max_num_cols
                 length = self.max_num_cols
 
@@ -455,6 +456,13 @@ def _next_positive_power_of_2(x: int) -> int:
     return 1 << (x - 1).bit_length()
 
 
+_TORCH_TO_CUTLASS_DTYPE = {
+    torch.float16: cutlass.Float16,
+    torch.bfloat16: cutlass.BFloat16,
+    torch.float32: cutlass.Float32,
+}
+
+
 def _bucket_num_cols(num_cols: int) -> int:
     """Bucket num_cols to the next power of 2 for compilation caching.
 
@@ -480,12 +488,7 @@ def cute_dsl_topk_wrapper(
     num_copy_bits=256,
 ):
     torch_dtype = input_values.dtype
-    torch_dtype_to_cutlass_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
+    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
@@ -505,10 +508,11 @@ def cute_dsl_topk_wrapper(
     )
     if key not in compiled_filter_topk_dict:
         # Create fake tensors for compilation
-        n = cute.sym_int()
-        n_div_32 = cute.sym_int(divisibility=32)
+        n_rows = cute.sym_int()
+        n_cols = cute.sym_int()
+        n_batch = cute.sym_int()
         input_fake = cute.runtime.make_fake_compact_tensor(
-            dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32
+            dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
         )
         # used for large num_cols
         buffer_fake = cute.runtime.make_fake_compact_tensor(
@@ -519,23 +523,23 @@ def cute_dsl_topk_wrapper(
         )
         seqlen_fake = cute.runtime.make_fake_compact_tensor(
             cute.Int32,
-            (n,),
+            (n_batch,),
             stride_order=(0,),
         )
         output_indices_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
-            (n, top_k),
+            (n_rows, top_k),
             stride_order=(1, 0),
         )
         if return_val:
             output_values_fake = cute.runtime.make_fake_compact_tensor(
                 dtype,
-                (n, top_k),
+                (n_rows, top_k),
                 stride_order=(1, 0),
             )
         else:
             output_values_fake = None
-        fake_stream = cute.runtime.make_fake_stream()
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
         filtered_topk_func = FilteredTopKKernelVarlenDecode(
             dtype,
@@ -560,6 +564,7 @@ def cute_dsl_topk_wrapper(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,  # TODO: do we need this one?
+            options="--enable-tvm-ffi",
         )
         compiled_filter_topk_dict[key] = compiled_kernel
     else:
@@ -579,9 +584,7 @@ def cute_dsl_topk_wrapper(
     buffer_torch = torch.empty(num_rows, buffer_numbers, num_cols, dtype=torch.int32, device="cuda")
     g_global_counter_torch = None
 
-    torch_stream = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-
+    # TVM FFI uses env stream automatically
     compiled_kernel(
         input_values,
         None,  # indices, used for merge blocks kernel of the multi-cta.
@@ -590,7 +593,6 @@ def cute_dsl_topk_wrapper(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-        current_stream,
     )
     return output_indices_torch, output_values_torch
 
@@ -606,12 +608,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     chunk_size_per_cta=16384,
 ):
     torch_dtype = input_values.dtype
-    torch_dtype_to_cutlass_dtype = {
-        torch.float16: cutlass.Float16,
-        torch.bfloat16: cutlass.BFloat16,
-        torch.float32: cutlass.Float32,
-    }
-    dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
+    dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
     num_rows, num_cols = input_values.shape
     bucketed_num_cols = _bucket_num_cols(num_cols)
 
@@ -636,10 +633,11 @@ def cute_dsl_topk_multi_cta_wrapper(
     )
     if key not in compiled_filter_topk_dict:
         # Create fake tensors for compilation
-        n = cute.sym_int()
-        n_div_32 = cute.sym_int(divisibility=32)
+        n_rows = cute.sym_int()
+        n_cols = cute.sym_int()
+        n_batch = cute.sym_int()
         input_fake = cute.runtime.make_fake_compact_tensor(
-            dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32
+            dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
         )
         # used for large num_cols
         buffer_fake = cute.runtime.make_fake_compact_tensor(
@@ -650,23 +648,24 @@ def cute_dsl_topk_multi_cta_wrapper(
         )
         seqlen_fake = cute.runtime.make_fake_compact_tensor(
             cute.Int32,
-            (n,),
+            (n_batch,),
             stride_order=(0,),
         )
         # used for load-balance, now we don't support it.
         # TODO: used for first kernel output.
+        n_first_output_cols = cute.sym_int()
         first_kernel_output_indices_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
-            (n, n_div_32),
+            (n_rows, n_first_output_cols),
             stride_order=(1, 0),
         )
         first_kernel_output_values_fake = cute.runtime.make_fake_compact_tensor(
             dtype,
-            (n, n_div_32),
+            (n_rows, n_first_output_cols),
             stride_order=(1, 0),
             assumed_align=32,
         )
-        fake_stream = cute.runtime.make_fake_stream()
+        fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
         filtered_topk_func_first = FilteredTopKKernelVarlenDecode(
             dtype,
@@ -697,22 +696,23 @@ def cute_dsl_topk_multi_cta_wrapper(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
+            options="--enable-tvm-ffi",
         )
 
         # TODO: 2nd kernel: use the output of the first kernel as the input.
         indices_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
-            (n, n_div_32),
+            (n_rows, n_first_output_cols),
             stride_order=(1, 0),
         )
         output_indices_fake = cute.runtime.make_fake_compact_tensor(
             cutlass.Int32,
-            (n, top_k),
+            (n_rows, top_k),
             stride_order=(1, 0),
         )
         output_values_fake = cute.runtime.make_fake_compact_tensor(
             dtype,
-            (n, top_k),
+            (n_rows, top_k),
             stride_order=(1, 0),
         )
         filtered_topk_func_second = FilteredTopKKernelVarlenDecode(
@@ -741,6 +741,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
+            options="--enable-tvm-ffi",
         )
 
         compiled_filter_topk_dict[key] = (compiled_kernel_first, compiled_kernel_second)
@@ -772,9 +773,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     )
     g_global_counter_torch = None
 
-    torch_stream = torch.cuda.current_stream()
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-
+    # TVM FFI uses env stream automatically
     compiled_kernel_first(
         input_values,
         None,  # indices, used for merge blocks kernel of the multi-cta.
@@ -783,7 +782,6 @@ def cute_dsl_topk_multi_cta_wrapper(
         seq_lens,
         first_kernel_output_indices_torch,
         first_kernel_output_values_torch,
-        current_stream,
     )
 
     compiled_kernel_second(
@@ -794,7 +792,6 @@ def cute_dsl_topk_multi_cta_wrapper(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-        current_stream,
     )
     return output_indices_torch, output_values_torch
 
@@ -869,16 +866,14 @@ def run_filtered_topk_decode(
     torch.manual_seed(seed)
     torch.cuda.manual_seed(seed)
 
-    torch_stream = torch.cuda.Stream()
-    current_stream = cuda.CUstream(torch_stream.cuda_stream)
-
     # Create fake tensors for compilation
-    n = cute.sym_int()
-    n_div_32 = cute.sym_int(divisibility=32)
+    n_rows = cute.sym_int()
+    n_cols = cute.sym_int()
+    n_batch = cute.sym_int()
 
     # # We need to pad the input tensor so that each row can be aligned to vec_size and could use vectorized copy.
     input_fake = cute.runtime.make_fake_compact_tensor(
-        dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32
+        dtype, (n_rows, n_cols), stride_order=(1, 0), assumed_align=32
     )
     # TODO
     if dtype == cutlass.Float32:
@@ -887,7 +882,7 @@ def run_filtered_topk_decode(
         buffer_numbers = 1
     buffer_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (n, n, n_div_32),
+        (n_rows, cute.sym_int(), n_cols),
         stride_order=(2, 1, 0),
         assumed_align=32,
     )
@@ -896,23 +891,23 @@ def run_filtered_topk_decode(
     )
     seqlen_fake = cute.runtime.make_fake_compact_tensor(
         cute.Int32,
-        (n,),
+        (n_batch,),
         stride_order=(0,),
     )
     output_indices_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
-        (n, top_k),
+        (n_rows, top_k),
         stride_order=(1, 0),
     )
     if return_val:
         output_values_fake = cute.runtime.make_fake_compact_tensor(
             dtype,
-            (n, top_k),
+            (n_rows, top_k),
             stride_order=(1, 0),
         )
     else:
         output_values_fake = None
-    fake_stream = cute.runtime.make_fake_stream()
+    fake_stream = cute.runtime.make_fake_stream(use_tvm_ffi_env_stream=True)
 
     filtered_topk_func = FilteredTopKKernelVarlenDecode(
         dtype,
@@ -938,6 +933,7 @@ def run_filtered_topk_decode(
         enable_persistent_dynamic_scheduling=load_balance,
         # TODO: confirm this parameter.
         min_blocks_per_mp=4 if large_occupancy else 1,
+        options="--enable-tvm-ffi",
     )
 
     # Set input data
@@ -969,11 +965,12 @@ def run_filtered_topk_decode(
     buffer_torch = torch.zeros(
         num_gen_tokens,
         buffer_numbers,
-        max_num_cols,
+        input_torch.shape[1],
         dtype=torch.int32,
         device="cuda",
     )
 
+    # TVM FFI uses env stream automatically
     compiled_kernel(
         input_torch,
         None,  # indices, used for merge blocks kernel of the multi-cta.
@@ -982,7 +979,6 @@ def run_filtered_topk_decode(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-        current_stream,
     )
 
     if do_ref_check and top_k <= max_num_cols and return_val:
@@ -1093,7 +1089,6 @@ def run_filtered_topk_decode(
                 seq_lens,
                 output_indices_tensor,
                 output_values_tensor,
-                current_stream,
             )
 
         workspace_count = 1
@@ -1118,6 +1113,8 @@ def run_filtered_topk_decode(
             # Here, we war the memset by setting the workspace_count to the sum of warmup_iterations and iterations.
             workspace_count = iterations + warmup_iterations
             print("workspace_count: ", workspace_count)
+        torch_stream = torch.cuda.Stream()
+        benchmark_stream = cuda.CUstream(torch_stream.cuda_stream)
         time = cute.testing.benchmark(
             compiled_kernel,
             workspace_generator=generate_inputs,
@@ -1125,7 +1122,7 @@ def run_filtered_topk_decode(
             warmup_iterations=warmup_iterations,
             iterations=iterations,
             use_cuda_graphs=True,
-            stream=current_stream,
+            stream=benchmark_stream,
         )
         if print_verbose:
             print(f"Time: {time} us")
@@ -1170,7 +1167,9 @@ def run_topk_decode(
 if __name__ == "__main__":
     import argparse
 
-    parser = argparse.ArgumentParser(description="Blackwell CuTE DSL filtered top-k decode benchmark.")
+    parser = argparse.ArgumentParser(
+        description="Blackwell CuTE DSL filtered top-k decode benchmark."
+    )
     parser.add_argument(
         "--dtype",
         type=cutlass.dtype,
