@@ -466,7 +466,7 @@ class TestNixlFunctionalTransfer:
         agent_b.deregister_memory(dst_descs)
 
     def test_nixl_wait_in_progress_on_zero_timeout(self):
-        """Test that wait(timeout_ms=0) returns IN_PROGRESS or SUCCESS, never FAILURE."""
+        """Test that wait(timeout_ms=0) returns IN_PROGRESS for a large in-flight transfer."""
         device = torch.device("cuda:0")
 
         # Use a large tensor to maximize chance of catching transfer in-flight
@@ -497,7 +497,6 @@ class TestNixlFunctionalTransfer:
         status = agent_a.submit_transfer_requests(request)
 
         # With timeout_ms=0, wait checks status once and returns immediately.
-        # The transfer may or may not have completed, but it should never be FAILURE.
         result = status.wait(timeout_ms=0)
         assert result == tab.TransferState.IN_PROGRESS
 
@@ -683,7 +682,7 @@ class TestMooncakeFunctionalTransfer:
         agent_b.deregister_memory(dst_descs)
 
     def test_mooncake_wait_in_progress_on_zero_timeout(self):
-        """Test that wait(timeout_ms=0) returns IN_PROGRESS or SUCCESS, never FAILURE."""
+        """Test that wait(timeout_ms=0) returns IN_PROGRESS for a large in-flight transfer."""
         device = torch.device("cuda:0")
 
         num_elements = 10_000_000
