@@ -18,6 +18,7 @@
 #include "compileEngine.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/config.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/envUtils.h"
 #include "tensorrt_llm/common/utils.h"
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/cubin/xqa_kernel_cubin.h"
@@ -27,6 +28,8 @@
 #include "tensorrt_llm/kernels/decoderMaskedMultiheadAttention/tensorMapUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/kernels/xqaDispatcher.h"
+#include <cuda_fp16.h> // For half type and __half2float
+#include <vector>      // For std::vector
 
 namespace
 {
@@ -361,12 +364,181 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
 
             invokeQKVPreprocessing<T, KVCacheBuffer>(preprocessingParams, stream);
             sync_check_cuda_error(stream);
+
+            // DEBUG: Print KV cache info after preprocessing
+            if (xqaParams.multi_query_tokens)
+            {
+                cudaDeviceSynchronize();
+                int batch_idx = 0;
+                int head_dim = xqaParams.head_size;
+                int num_kv_heads = xqaParams.num_kv_heads;
+
+                // Get sequence length for batch 0
+                int32_t seq_len_host = 0;
+                cudaMemcpy(&seq_len_host, xqaParams.sequence_lengths, sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+                // printf(
+                //     "[DEBUG-KV-CACHE] batch_idx=%d, seq_len (from xqaParams.sequence_lengths)=%d, head_dim=%d, "
+                //     "num_kv_heads=%d\n",
+                //     batch_idx, seq_len_host, head_dim, num_kv_heads);
+                // printf(
+                //     "[DEBUG-KV-CACHE] generation_input_length=%d, total_num_input_tokens=%d, batch_size=%d, "
+                //     "paged_kv_cache=%d\n",
+                //     xqaParams.generation_input_length, xqaParams.total_num_input_tokens, xqaParams.batch_size,
+                //     xqaParams.paged_kv_cache);
+
+                // For paged KV cache only (use if constexpr to avoid compilation errors for linear buffer)
+                if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+                {
+                    // Paged KV cache: need to copy block indices to CPU first
+                    size_t dataSize = kv_cache_buffer.mMaxSeqs * kv_cache_buffer.mMaxBlocksPerSeq * 2;
+                    int32_t* h_data = new int32_t[dataSize];
+                    cudaMemcpy(h_data, kv_cache_buffer.data, dataSize * sizeof(int32_t), cudaMemcpyDeviceToHost);
+
+                    // Create a CPU-accessible copy of kv_cache_buffer
+                    KVCacheBuffer h_kv = kv_cache_buffer;
+                    h_kv.data = reinterpret_cast<KVCacheIndex*>(h_data);
+
+                    int print_elements = std::min(4, head_dim);
+                    int head_idx = 0;
+                    int tokensPerBlock = 1 << kv_cache_buffer.mTokensPerBlockLog2;
+
+                    //     printf("[DEBUG-KV-CACHE] tokensPerBlock=%d, mMaxBlocksPerSeq=%d\n", tokensPerBlock,
+                    //         kv_cache_buffer.mMaxBlocksPerSeq);
+                    //     printf("[DEBUG-KV-CACHE] kv_cache_buffer.data=%p, mMaxSeqs=%d, mBytesPerBlock=%d\n",
+                    //         kv_cache_buffer.data, kv_cache_buffer.mMaxSeqs, kv_cache_buffer.mBytesPerBlock);
+
+                    //     // Print first few block offsets
+                    //     printf("[DEBUG-KV-CACHE] Block offsets for batch 0:\n");
+                    //     for (int blk = 0; blk < std::min(5, (int) kv_cache_buffer.mMaxBlocksPerSeq); blk++)
+                    //     {
+                    //         printf("  block[%d]: K_idx=%d, V_idx=%d\n", blk,
+                    //             h_data[batch_idx * kv_cache_buffer.mMaxBlocksPerSeq * 2 + blk * 2],
+                    //             h_data[batch_idx * kv_cache_buffer.mMaxBlocksPerSeq * 2 + blk * 2 + 1]);
+                    //     }
+
+                    //     // Print context positions (first 3)
+                    //     printf("[DEBUG-KV-CACHE] Context K values:\n");
+                    //     for (int token_idx = 0; token_idx < std::min(3, seq_len_host); token_idx++)
+                    //     {
+                    //         auto kBlockPtr = reinterpret_cast<uint8_t*>(h_kv.getKBlockPtr(batch_idx, token_idx));
+                    //         int32_t offset_in_block
+                    //             = head_idx * tokensPerBlock * head_dim + (token_idx % tokensPerBlock) * head_dim;
+                    //         T* k_src = reinterpret_cast<T*>(kBlockPtr) + offset_in_block;
+
+                    //         std::vector<T> k_host(print_elements);
+                    //         cudaMemcpy(k_host.data(), k_src, print_elements * sizeof(T), cudaMemcpyDeviceToHost);
+
+                    //         printf("[DEBUG-KV-CACHE] K[pos=%d, head=0]: ", token_idx);
+                    //         for (int i = 0; i < print_elements; i++)
+                    //         {
+                    //             printf("%.4f ", float(k_host[i]));
+                    //         }
+                    //         printf("...\n");
+                    //     }
+
+                    //     // Print draft token positions
+                    //     printf("[DEBUG-KV-CACHE] Draft token K values:\n");
+                    //     int context_len = seq_len_host - xqaParams.generation_input_length;
+                    //     for (int i = 0; i < std::min(5, xqaParams.generation_input_length); i++)
+                    //     {
+                    //         int token_idx = context_len + i;
+                    //         if (token_idx >= 0 && token_idx < seq_len_host)
+                    //         {
+                    //             auto kBlockPtr = reinterpret_cast<uint8_t*>(h_kv.getKBlockPtr(batch_idx, token_idx));
+                    //             int32_t offset_in_block
+                    //                 = head_idx * tokensPerBlock * head_dim + (token_idx % tokensPerBlock) * head_dim;
+                    //             T* k_src = reinterpret_cast<T*>(kBlockPtr) + offset_in_block;
+
+                    //             std::vector<T> k_host(print_elements);
+                    //             cudaMemcpy(k_host.data(), k_src, print_elements * sizeof(T), cudaMemcpyDeviceToHost);
+
+                    //             printf("[DEBUG-KV-CACHE] K[pos=%d (draft %d), head=0]: ", token_idx, i);
+                    //             for (int j = 0; j < print_elements; j++)
+                    //             {
+                    //                 printf("%.4f ", float(k_host[j]));
+                    //             }
+                    //             printf("...\n");
+                    //         }
+                    //     }
+
+                    //     // DEBUG: Print KV cache statistics (similar to Q input stats)
+                    //     // Collect K values for all positions and compute stats
+                    //     int total_kv_size = seq_len_host * head_dim;
+                    //     int kv_print_size = std::min(total_kv_size, 10 * 4096);
+                    //     std::vector<T> all_k_values(kv_print_size);
+                    //     int k_idx = 0;
+                    //     for (int token_idx = 0; token_idx < seq_len_host && k_idx < kv_print_size; token_idx++)
+                    //     {
+                    //         auto kBlockPtr = reinterpret_cast<uint8_t*>(h_kv.getKBlockPtr(batch_idx, token_idx));
+                    //         int32_t offset_in_block
+                    //             = head_idx * tokensPerBlock * head_dim + (token_idx % tokensPerBlock) * head_dim;
+                    //         T* k_src = reinterpret_cast<T*>(kBlockPtr) + offset_in_block;
+
+                    //         int copy_size = std::min(head_dim, kv_print_size - k_idx);
+                    //         cudaMemcpy(all_k_values.data() + k_idx, k_src, copy_size * sizeof(T),
+                    //         cudaMemcpyDeviceToHost); k_idx += copy_size;
+                    //     }
+                    //     cudaDeviceSynchronize();
+
+                    //     float k_min = 1e9, k_max = -1e9, k_sum = 0;
+                    //     printf("[DEBUG-KV-CACHE-STATS] K first 100 values: ");
+                    //     for (int i = 0; i < k_idx; i++)
+                    //     {
+                    //         float val = float(all_k_values[i]);
+                    //         k_min = std::min(k_min, val);
+                    //         k_max = std::max(k_max, val);
+                    //         k_sum += val;
+                    //         if (i < 100)
+                    //             printf("%.4f ", val);
+                    //     }
+                    //     printf("...\n");
+                    //     printf("[DEBUG-KV-CACHE-STATS] K stats (head=0, %d values): min=%.4f, max=%.4f, mean=%.6f\n",
+                    //     k_idx,
+                    //         k_min, k_max, k_sum / k_idx);
+
+                    //     // DEBUG: Also collect V cache stats
+                    //     std::vector<T> all_v_values(kv_print_size);
+                    //     int v_idx = 0;
+                    //     for (int token_idx = 0; token_idx < seq_len_host && v_idx < kv_print_size; token_idx++)
+                    //     {
+                    //         auto vBlockPtr = reinterpret_cast<uint8_t*>(h_kv.getVBlockPtr(batch_idx, token_idx));
+                    //         int32_t offset_in_block
+                    //             = head_idx * tokensPerBlock * head_dim + (token_idx % tokensPerBlock) * head_dim;
+                    //         T* v_src = reinterpret_cast<T*>(vBlockPtr) + offset_in_block;
+
+                    //         int copy_size = std::min(head_dim, kv_print_size - v_idx);
+                    //         cudaMemcpy(all_v_values.data() + v_idx, v_src, copy_size * sizeof(T),
+                    //         cudaMemcpyDeviceToHost); v_idx += copy_size;
+                    //     }
+                    //     cudaDeviceSynchronize();
+
+                    //     float v_min = 1e9, v_max = -1e9, v_sum = 0;
+                    //     printf("[DEBUG-KV-CACHE-STATS] V first 100 values: ");
+                    //     for (int i = 0; i < v_idx; i++)
+                    //     {
+                    //         float val = float(all_v_values[i]);
+                    //         v_min = std::min(v_min, val);
+                    //         v_max = std::max(v_max, val);
+                    //         v_sum += val;
+                    //         if (i < 100)
+                    //             printf("%.4f ", val);
+                    //     }
+                    //     printf("...\n");
+                    //     printf("[DEBUG-KV-CACHE-STATS] V stats (head=0, %d values): min=%.4f, max=%.4f, mean=%.6f\n",
+                    //     v_idx,
+                    //         v_min, v_max, v_sum / v_idx);
+
+                    //     delete[] h_data;
+                }
+            }
         }
         else
         {
             xqa_q_input_ptr = xqaParams.quant_q_buffer_ptr;
         }
     }
+    // printf("====come decoderXQAImplJIT.cpp xqa running====\n");
 
     auto const makeSpecDecParams = [&]() -> SpecDecParams
     {
@@ -374,6 +546,15 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         uint32_t maxQSeqLen = xqaParams.spec_decoding_is_generation_length_variable
             ? xqaParams.spec_decoding_max_generation_length
             : qSeqLen;
+        // DEBUG: Print speculative decoding parameters
+        TLLM_LOG_DEBUG("=== SpecDecParams Debug Info ===");
+        TLLM_LOG_DEBUG("qSeqLen=%u, maxQSeqLen=%u", qSeqLen, maxQSeqLen);
+        TLLM_LOG_DEBUG("generation_input_length=%d, max_generation_length=%d, is_variable=%d",
+            xqaParams.generation_input_length, xqaParams.spec_decoding_max_generation_length,
+            xqaParams.spec_decoding_is_generation_length_variable);
+        TLLM_LOG_DEBUG("batch_size=%d, is_spec_dec_tree=%d, multi_query_tokens=%d", xqaParams.batch_size,
+            xqaParams.is_spec_dec_tree, xqaParams.multi_query_tokens);
+
         return {.qSeqLen = maxQSeqLen,
             .qCuSeqLens = reinterpret_cast<uint32_t const*>(launchParams.cu_seq_lens),
             .mask = reinterpret_cast<SpecDecParams::MaskType const*>(xqaParams.spec_decoding_packed_mask)};
@@ -428,10 +609,20 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
             xqaParams.spec_decoding_max_generation_length
                                                                                         : qSeqLen;
 
+        // DEBUG: Print key parameters for XQA kernel
+        TLLM_LOG_DEBUG("=== XQA Kernel Parameters (JIT)  and isSpecDec  is %d and xqaParams.is_spec_dec_tree %d ===",
+            isSpecDec, xqaParams.is_spec_dec_tree);
+        TLLM_LOG_DEBUG("generation_input_length=%d, qSeqLen=%u, maxQSeqLen=%u", xqaParams.generation_input_length,
+            qSeqLen, maxQSeqLen);
+        TLLM_LOG_DEBUG(
+            "mTileSize=%u, headGrpSize=%u, nbTokenBlocksPerGrp=%u", mTileSize, headGrpSize, nbTokenBlocksPerGrp);
+        TLLM_LOG_DEBUG("batch_size=%d, num_k_heads=%u", xqaParams.batch_size, launchParams.num_k_heads);
+
         appendParam(&maxQSeqLen);
         appendParam(&launchParams.num_k_heads);
         appendParam(&headGrpSize);
         appendParam(&launchParams.cu_seq_lens);
+
         bool const allowSlidingWindow
             = !(isSpecDec && xqaParams.is_spec_dec_tree); // sliding windows does not support spec dec with tree-based
                                                           // token, only chained tokens
@@ -447,6 +638,38 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         }
         appendParam(&kernel_input_tokens);
         appendParam(&xqaParams.spec_decoding_packed_mask);
+
+        // // DEBUG: Print spec_decoding_packed_mask
+        // if (xqaParams.spec_decoding_packed_mask != nullptr)
+        // {
+        //     TLLM_LOG_DEBUG("spec_decoding_packed_mask address: %p", xqaParams.spec_decoding_packed_mask);
+        //     // Print packed mask values directly
+        //     int mask_print_size = 10; // Print first 32 values
+        //     std::vector<int32_t> mask_host(mask_print_size);
+        //     cudaMemcpy(mask_host.data(), xqaParams.spec_decoding_packed_mask, mask_print_size * sizeof(int32_t),
+        //         cudaMemcpyDeviceToHost);
+        //     cudaDeviceSynchronize();
+
+        //     printf("[DEBUG-XQA-MASK] spec_decoding_packed_mask first %d values: ", mask_print_size);
+        //     for (int i = 0; i < mask_print_size; i++)
+        //     {
+        //         printf("%d ", mask_host[i]);
+        //     }
+        //     printf("\n");
+
+        //     // Print in binary format for the first 10 values
+        //     printf("[DEBUG-XQA-MASK] First 10 masks in binary: ");
+        //     for (int i = 0; i < std::min(10, mask_print_size); i++)
+        //     {
+        //         printf("[%d]=0b", i);
+        //         for (int b = 9; b >= 0; b--)
+        //         {
+        //             printf("%d", (mask_host[i] >> b) & 1);
+        //         }
+        //         printf(" ");
+        //     }
+        //     printf("\n");
+        // }
         appendParam(&xqaParams.attention_sinks);
         appendParam(&launchParams.kvCacheParams);
         if (xqaParams.beam_width > 1)
@@ -466,7 +689,99 @@ void DecoderXQAImplJIT::runImpl(XQAParams const& xqaParams, KVCacheBuffer const&
         auto const gridDim = (dim3{multi_block, xqaParams.num_kv_heads * nbTokenBlocksPerGrp, xqaParams.batch_size});
         dim3 const blockDim(128, 1, 2);
 
+        // // DEBUG: Print additional kernel parameters
+        // printf("[DEBUG-XQA-PARAMS] qScale=%.6f, kv_scale_quant_orig=%p\n", launchParams.qScale,
+        //     launchParams.kv_scale_quant_orig);
+        // printf("[DEBUG-XQA-PARAMS] slidingWindowSize=%d, attention_sinks=%p\n", launchParams.slidingWindowSize,
+        //     xqaParams.attention_sinks);
+
+        // // Print kvCacheParams based on type
+        // if constexpr (std::is_same_v<KVCacheBuffer, KVBlockArray>)
+        // {
+        //     printf(
+        //         "[DEBUG-XQA-PARAMS] kvCacheParams(Paged): poolPtr=%p, blockIndices=%p, sequence_lengths=%p, "
+        //         "capacity=%u\n",
+        //         launchParams.kvCacheParams.poolPtr, launchParams.kvCacheParams.blockIndices,
+        //         launchParams.kvCacheParams.sequence_lengths, launchParams.kvCacheParams.capacity);
+        // }
+        // else
+        // {
+        //     printf("[DEBUG-XQA-PARAMS] kvCacheParams(Linear): data=%p, sequence_lengths=%p, capacity=%u\n",
+        //         launchParams.kvCacheParams.data, launchParams.kvCacheParams.sequence_lengths,
+        //         launchParams.kvCacheParams.capacity);
+        // }
+
+        // printf(
+        //     "[DEBUG-XQA-PARAMS] output ptr=%p, kernel_input_tokens ptr=%p\n", launchParams.output,
+        //     kernel_input_tokens);
+        // printf("[DEBUG-XQA-PARAMS] gridDim=(%u, %u, %u), blockDim=(%u, %u, %u)\n", gridDim.x, gridDim.y, gridDim.z,
+        //     blockDim.x, blockDim.y, blockDim.z);
+
+        // // DEBUG: Print sequence_lengths value
+        // if (launchParams.kvCacheParams.sequence_lengths != nullptr)
+        // {
+        //     int seq_len_val;
+        //     cudaMemcpy(&seq_len_val, launchParams.kvCacheParams.sequence_lengths, sizeof(int),
+        //     cudaMemcpyDeviceToHost); printf("[DEBUG-XQA-PARAMS] kvCacheParams.sequence_lengths[0]=%d\n",
+        //     seq_len_val);
+        // }
+
+        // // DEBUG: Print XQA input Q before kernel
+        // {
+        //     cudaDeviceSynchronize();
+        //     int print_size = 10 * 4096;
+        //     std::vector<half> q_host(print_size);
+        //     cudaMemcpy(q_host.data(), kernel_input_tokens, print_size * sizeof(half), cudaMemcpyDeviceToHost);
+        //     cudaDeviceSynchronize();
+
+        //     printf("[DEBUG-XQA-INPUT-Q] Input Q first %d values: ", print_size);
+        //     float q_min = 1e9, q_max = -1e9, q_sum = 0;
+        //     for (int i = 0; i < print_size; i++)
+        //     {
+        //         float val = __half2float(q_host[i]);
+        //         q_min = std::min(q_min, val);
+        //         q_max = std::max(q_max, val);
+        //         q_sum += val;
+        //         if (i < 100)
+        //             printf("%.4f ", val);
+        //     }
+        //     printf("...\n");
+        //     printf(
+        //         "[DEBUG-XQA-INPUT-Q] Input Q stats: min=%.4f, max=%.4f, mean=%.6f\n", q_min, q_max, q_sum /
+        //         print_size);
+        // }
+
         cubinObj->launch(gridDim, blockDim, stream, kernelParams);
+
+        // // DEBUG: Print XQA output after kernel
+        // {
+        //     cudaDeviceSynchronize();
+        //     int num_tokens = xqaParams.generation_input_length;
+        //     int head_size = xqaParams.head_size;
+        //     int num_heads = xqaParams.num_q_heads;
+        //     int out_size = num_tokens * num_heads * head_size;
+        //     // int print_size = std::min(out_size, 64);
+        //     int print_size = 10 * 4096;
+
+        //     std::vector<half> out_host(print_size);
+        //     cudaMemcpy(out_host.data(), launchParams.output, print_size * sizeof(half), cudaMemcpyDeviceToHost);
+        //     cudaDeviceSynchronize();
+
+        //     printf("[DEBUG-XQA-OUTPUT] Output first %d values: ", print_size);
+        //     float out_min = 1e9, out_max = -1e9, out_sum = 0;
+        //     for (int i = 0; i < print_size; i++)
+        //     {
+        //         float val = __half2float(out_host[i]);
+        //         out_min = std::min(out_min, val);
+        //         out_max = std::max(out_max, val);
+        //         out_sum += val;
+        //         if (i < 100)
+        //             printf("%.4f ", val);
+        //     }
+        //     printf("...\n");
+        //     printf("[DEBUG-XQA-OUTPUT] Output stats: min=%.4f, max=%.4f, mean=%.6f\n", out_min, out_max,
+        //         out_sum / print_size);
+        // }
     }
     else
     {

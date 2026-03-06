@@ -53,7 +53,9 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            get_num_extra_kv_tokens, get_spec_metadata,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
-from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
+from ..speculative.eagle3 import (Eagle3OneModelSpecMetadata,
+                                  Eagle3ResourceManager, Eagle3SpecMetadata)
+from ..speculative.mtp import SampleStateTensorsMTP
 from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
@@ -3500,7 +3502,6 @@ class PyTorchModelEngine(ModelEngine):
                 new_tensors_device: Optional[SampleStateTensors] = None,
                 gather_context_logits: bool = False,
                 cache_indirection_buffer: Optional[torch.Tensor] = None,
-                spec_decoding_tensor: Optional[SpecDecodingTensor] = None,
                 num_accepted_tokens_device: Optional[torch.Tensor] = None,
                 req_id_to_old_request: Optional[Dict[int, LlmRequest]] = None):
         kv_cache_manager = resource_manager.get_resource_manager(
@@ -3529,11 +3530,10 @@ class PyTorchModelEngine(ModelEngine):
                 is_spec_dec_tree=spec_metadata.is_spec_dec_tree,
                 is_spec_dec_dynamic_tree=spec_metadata.is_spec_dec_dynamic_tree,
                 max_draft_len=self.original_max_draft_len,
-                max_total_draft_tokens=self._spec_dec_max_total_draft_tokens,
+                max_total_draft_tokens=self.original_max_total_draft_tokens,
+                is_target_model=not self.is_draft_model,
                 model_is_wrapped=self.model_is_wrapped,
-                spec_metadata=spec_metadata,
-                spec_tree_manager=spec_tree_manager,
-                spec_decoding_tensor=spec_decoding_tensor)
+                spec_tree_manager=spec_tree_manager)
         else:
             spec_resource_manager = None
             spec_metadata = None

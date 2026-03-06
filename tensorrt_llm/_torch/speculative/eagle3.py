@@ -65,7 +65,8 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.spec_tree_manager = None
 
         if isinstance(config,
-                      EagleDecodingConfig) and config.eagle_choices is not None:
+                      EagleDecodingConfig) and (config.eagle_choices is not None
+                                                or config.use_dynamic_tree):
             self.spec_tree_manager = SpecTreeManager(
                 max_num_requests=self.max_num_requests,
                 use_dynamic_tree=config.use_dynamic_tree,
@@ -558,6 +559,61 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
+
+        # Check if dynamic tree CUDA kernel is available
+        dynamic_tree_buffers = getattr(spec_metadata, 'dynamic_tree_buffers',
+                                       None)
+        tree_structure = dynamic_tree_buffers.get(
+            'tree_structure') if dynamic_tree_buffers else None
+
+        if tree_structure is not None and hasattr(self, 'tree_ops_converter'):
+            # Use CUDA kernel for dynamic tree verification
+            try:
+                # Extract generation logits (skip context)
+                gen_logits = logits[
+                    num_contexts:]  # [num_gens * num_draft_tokens, vocab_size]
+                gen_logits = gen_logits.reshape(num_gens, -1,
+                                                gen_logits.shape[-1])
+
+                # Get draft tokens
+                draft_tokens = spec_metadata.draft_tokens.reshape(num_gens, -1)
+
+                # Call CUDA kernel
+                verify_results = self.tree_ops_converter.verify_dynamic_tree_greedy(
+                    draft_tokens=draft_tokens,
+                    target_logits=gen_logits,
+                    tree_buffers=tree_structure,
+                    num_spec_step=self.max_draft_len + 1,
+                )
+
+                # Convert CUDA kernel results to expected format
+                accepted_tokens = torch.empty(
+                    (batch_size, self.max_draft_len + 1),
+                    dtype=torch.int,
+                    device=logits.device)
+                num_accepted_tokens = torch.ones(batch_size,
+                                                 dtype=torch.int,
+                                                 device=logits.device)
+
+                # Context requests: sample tokens
+                if num_contexts > 0:
+                    ctx_target_tokens = self._sample_tokens_for_batch(
+                        logits[:num_contexts], spec_metadata, 0, num_contexts)
+                    accepted_tokens[:num_contexts, 0] = ctx_target_tokens
+
+                # Generation requests: use CUDA kernel results
+                # TODO: Convert verify_results to accepted_tokens format
+                # For now, fallback to base implementation
+                raise NotImplementedError(
+                    "CUDA tree verification result conversion not yet implemented"
+                )
+
+            except Exception as e:
+                import warnings
+                warnings.warn(
+                    f"Dynamic tree CUDA verification failed, using Python fallback: {e}"
+                )
+                # Fallback to base implementation
 
         # Reshape draft tokens for base implementation
         draft_tokens = spec_metadata.draft_tokens.reshape(

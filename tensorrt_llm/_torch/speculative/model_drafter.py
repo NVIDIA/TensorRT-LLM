@@ -8,6 +8,7 @@ import torch
 from tensorrt_llm._utils import nvtx_range, prefer_pinned
 from tensorrt_llm.logger import logger
 
+from ...llmapi.llm_args import EagleDecodingConfig
 from ..attention_backend.trtllm import TrtllmAttention
 from ..pyexecutor.guided_decoder import GuidedDecoder
 from ..pyexecutor.handle_logits import HandleLogits
@@ -674,6 +675,34 @@ class ModelDrafter(Drafter):
             draft_tokens_host = outputs[1].host.new_tokens
             outputs[1].sampler_event.synchronize()
 
+        # Get the dynamic tree buffers
+        topk_score_indices, history_draft_tokens_parent_buffer = None, None
+        spec_tree_manager = None
+        tree_structure = None
+        if isinstance(
+                self.spec_config,
+                EagleDecodingConfig) and self.spec_config.use_dynamic_tree:
+            dynamic_tree_buffers = outputs["dynamic_tree_buffers"]
+            topk_score_indices = dynamic_tree_buffers["topk_score_indices"].cpu(
+            )  # [batch_size, self.max_total_draft_tokens]
+            history_draft_tokens_parent_buffer = dynamic_tree_buffers[
+                "history_draft_tokens_parent_buffer"].cpu(
+                )  # [batch_size, dynamic_tree_max_topK + dynamic_tree_max_topK * dynamic_tree_max_topK * (max_draft_len - 1)]
+            tree_structure = dynamic_tree_buffers.get("tree_structure")
+
+            spec_tree_manager = self.spec_resource_manager.spec_tree_manager
+            assert spec_tree_manager is not None
+
+        # Clone retrieve buffers before loop to avoid aliasing
+        # (tree_structure wraps spec_tree_manager's buffers at [:batch_size])
+        retrieve_bufs_copy = None
+        if tree_structure is not None:
+            retrieve_bufs_copy = (
+                tree_structure.retrieve_index.clone(),
+                tree_structure.retrieve_next_token.clone(),
+                tree_structure.retrieve_next_sibling.clone(),
+            )
+
         for req_idx, req in enumerate(draft_batch.all_requests()):
             target_model_req = self.req_id_to_old_request[req.py_request_id]
             if target_model_req.state != LlmRequestState.GENERATION_IN_PROGRESS:
@@ -689,6 +718,17 @@ class ModelDrafter(Drafter):
             # The overlap scheduler doesn't support rejection sampling yet, so we don't update the py_draft_logits to get it fallback to greedy sampling.
             if self.disable_overlap_scheduler:
                 target_model_req.py_draft_logits = torch.stack(py_draft_logits)
+
+            # Copy retrieve buffers from batch index to seq_slot
+            # retrieveIndex stores local indices (0, 1, ..., N-1), no offset correction needed.
+            if retrieve_bufs_copy is not None:
+                seq_slot = target_model_req.py_seq_slot
+                spec_tree_manager.retrieve_index[seq_slot] = retrieve_bufs_copy[
+                    0][req_idx]
+                spec_tree_manager.retrieve_next_token[
+                    seq_slot] = retrieve_bufs_copy[1][req_idx]
+                spec_tree_manager.retrieve_next_sibling[
+                    seq_slot] = retrieve_bufs_copy[2][req_idx]
 
     def process_dynamic_draft_outputs(
             self,
@@ -960,11 +1000,8 @@ class ModelDrafter(Drafter):
         self.last_draft_latency_ms = (draft_end_time - draft_start_time) * 1e3
 
     @nvtx_range("prepare_draft_tokens")
-    def prepare_draft_tokens(
-        self,
-        scheduled_requests: ScheduledRequests,
-        resource_manager: Optional[ResourceManager] = None,
-    ) -> None:
+    def prepare_draft_tokens(self, scheduled_requests: ScheduledRequests,
+                             resource_manager: ResourceManager) -> None:
         """
         Prepare draft tokens for the scheduled requests.
 

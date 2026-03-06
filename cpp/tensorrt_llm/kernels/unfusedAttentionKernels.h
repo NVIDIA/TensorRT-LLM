@@ -359,6 +359,7 @@ void invokeApplyBiasRopeUpdateKVCacheDispatch(QKVPreprocessingParams<T, KVCacheB
 template <typename T, typename KVCacheBuffer>
 void invokeQKVPreprocessing(QKVPreprocessingParams<T, KVCacheBuffer> params, cudaStream_t stream)
 {
+    // printf("====come invokeQKVPreprocessing.cpp xqa running and qkv preprocessing params====\n");
     params.setCommonParameters();
     if (params.cache_type == KvCacheDataType::INT8)
     {

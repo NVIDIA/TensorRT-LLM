@@ -235,6 +235,7 @@ class Eagle3DecoderLayer(DecoderLayer):
         residual = hidden_states
 
         hidden_states = self.hidden_norm(hidden_states)
+
         if not self._next_layer_regular:
             embeds = self.input_layernorm(embeds)
             hidden_states = torch.cat([embeds, hidden_states], dim=-1)
@@ -410,13 +411,11 @@ class Eagle3DraftModel(DecoderModel):
                     spec_metadata=spec_metadata,
                 )
         else:
-            hidden_states, residual = self.midlayer(
-                position_ids=position_ids,
-                embeds=inputs_embeds,
-                hidden_states=hidden_states,
-                attn_metadata=attn_metadata,
-                spec_metadata=spec_metadata,
-            )
+            hidden_states, residual = self.midlayer(position_ids=position_ids,
+                                                    embeds=inputs_embeds,
+                                                    hidden_states=hidden_states,
+                                                    attn_metadata=attn_metadata,
+                                                    spec_metadata=spec_metadata)
 
         hidden_states, hidden_states_to_save = self.norm(
             hidden_states, residual)
