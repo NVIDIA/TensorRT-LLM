@@ -38,6 +38,8 @@ class KVCacheV2Scheduler(RequestScheduler):
         ctx_chunk_config: Optional[tuple] = None,
         peft_cache_manager=None,
         scheduler_capacity: Optional[int] = None,
+        no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
+        no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -75,11 +77,12 @@ class KVCacheV2Scheduler(RequestScheduler):
                 )
 
         # State value caches for fast comparison.
-        # Use GENERATION_TO_COMPLETE as upper bound (exclusive) — same as V1's
-        # MicroBatchScheduler. GENERATION_TO_COMPLETE requests are handled by the
-        # overlap scheduler / decoder; we must not assign them token budget.
-        self._no_schedule_until_state_value = LlmRequestState.CONTEXT_INIT.value
-        self._no_schedule_after_state_value = LlmRequestState.GENERATION_TO_COMPLETE.value
+        # Default range [CONTEXT_INIT, GENERATION_TO_COMPLETE) matches C++
+        # MicroBatchScheduler. For encoder-decoder models, caller should pass
+        # no_schedule_until_state=ENCODER_INIT to widen the range (same as
+        # C++ trtEncoderModel which passes kENCODER_INIT).
+        self._no_schedule_until_state_value = no_schedule_until_state.value
+        self._no_schedule_after_state_value = no_schedule_after_state.value
         self._context_init_state_value = LlmRequestState.CONTEXT_INIT.value
         self._encoder_init_state_value = LlmRequestState.ENCODER_INIT.value
         self._disagg_gen_init_state_value = LlmRequestState.DISAGG_GENERATION_INIT.value
@@ -218,19 +221,29 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
 
                     context_tokens = req.context_remaining_length
-                    draft_tokens = req.num_draft_tokens if req.has_draft_tokens else 0
-                    req_tokens = context_tokens + draft_tokens
-
-                    assert (
-                        self.max_context_length is None or req_tokens <= self.max_context_length
-                    ), f"Context tokens ({req_tokens}) exceeds limit ({self.max_context_length})"
 
                     if max_num_tokens is not None and (
-                        batch_num_tokens + req_tokens > max_num_tokens
+                        batch_num_tokens + context_tokens > max_num_tokens
                     ):
                         break
+
+                    assert (
+                        self.max_context_length is None or context_tokens <= self.max_context_length
+                    ), (
+                        f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
+                    )
                     if self.kv_cache_manager.resize_context(req, context_tokens):
                         self._commit_peft(req, peft_pages)
+                        req_tokens = context_tokens
+                        if req.has_draft_tokens:
+                            req.context_chunk_size = context_tokens
+                            budget_remaining = (
+                                (max_num_tokens - batch_num_tokens - context_tokens)
+                                if max_num_tokens is not None
+                                else None
+                            )
+                            self._fit_draft_tokens_single(req, budget_remaining)
+                            req_tokens += req.num_draft_tokens
                         scheduled_ctx.append(req)
                         batch_num_tokens += req_tokens
                         num_scheduled += 1
@@ -383,7 +396,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         """
         while req_it_end > req_it:
             victim_idx = None
-            for i in range(req_it_end - 1, req_it - 1, -1):
+            for i in range(req_it_end - 1, req_it, -1):
                 if self._is_started_request(requests_list[i]):
                     victim_idx = i
                     break
@@ -397,6 +410,10 @@ class KVCacheV2Scheduler(RequestScheduler):
             # No token budget reclaim is needed.
             self.kv_cache_manager.suspend_request(victim)
             evicted.append(victim)
+            logger.debug(
+                f"KVCacheV2Scheduler: evicting request {victim.request_id} "
+                f"to free pages for request {req.request_id}"
+            )
             req_it_end = victim_idx
 
             if self.kv_cache_manager.try_allocate_generation(req):
