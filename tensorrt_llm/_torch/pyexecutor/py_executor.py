@@ -1314,13 +1314,14 @@ class PyExecutor:
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    # made in model_engine.py::_forward_step. This is only
+                    # needed for disaggregated serving; for non-disaggregated
+                    # serving, generation requests always have batch_idx.
+                    if self.kv_cache_transceiver is not None:
+                        scheduled_batch.generation_requests = sorted(  # stable sort
+                            scheduled_batch.generation_requests,
+                            key=lambda req: int(req.py_batch_idx is not None),
+                        )
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -2087,13 +2088,14 @@ class PyExecutor:
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    # made in model_engine.py::_forward_step. This is only
+                    # needed for disaggregated serving; for non-disaggregated
+                    # serving, generation requests always have batch_idx.
+                    if self.kv_cache_transceiver is not None:
+                        scheduled_batch.generation_requests = sorted(  # stable sort
+                            scheduled_batch.generation_requests,
+                            key=lambda req: int(req.py_batch_idx is not None),
+                        )
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
