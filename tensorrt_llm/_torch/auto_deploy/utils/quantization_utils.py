@@ -1,5 +1,5 @@
 from fnmatch import fnmatch
-from typing import Dict, Optional, Tuple, Union
+from typing import Tuple, Union
 
 import torch
 import torch.nn.functional as F
@@ -125,25 +125,6 @@ def should_skip_quantization(
         modname = weight_name.rpartition(".")[0]
 
     return any(fnmatch(modname, pattern) for pattern in excluded_patterns)
-
-
-def extract_scales_from_node(node: Node, scale_names: list[str]) -> Dict[str, Optional[Node]]:
-    """
-    Extracts scale tensors from node.args/kwargs using a fixed list of expected scale names.
-    """
-    scales = {}
-    args = list(node.args)
-
-    # Try kwargs first
-    for i, name in enumerate(scale_names):
-        scales[name] = node.kwargs.get(name, None)
-
-    # Fallback to positional args (starting after input, weight, bias)
-    for i, name in enumerate(scale_names):
-        if scales[name] is None and len(args) > 3 + i:
-            scales[name] = args[3 + i]
-
-    return scales
 
 
 def unpack_uint8_to_int4_weight_2d(

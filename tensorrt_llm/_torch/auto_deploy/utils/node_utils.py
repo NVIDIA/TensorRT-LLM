@@ -436,16 +436,6 @@ def num_users_of_weight_node(node: Node) -> int:
     return len(weight_node.users)
 
 
-def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
-    """Get the overload packet from the op overload."""
-    if isinstance(node, OpOverloadPacket):
-        return node
-    elif isinstance(node, OpOverload):
-        return node.overloadpacket
-    else:
-        raise ValueError(f"Expected OpOverloadPacket or OpOverload, got {type(node)}")
-
-
 def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     """Check if the node is a call to one of the ops."""
     if not isinstance(node, Node):

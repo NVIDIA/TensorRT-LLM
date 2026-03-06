@@ -87,10 +87,6 @@ class Role:
     ALL = DataRole("all")
 
 
-def compute_page_count(token_count: int, tokens_per_page: int) -> int:
-    return (token_count + tokens_per_page) // tokens_per_page
-
-
 class BaseResourceManager(ABC):
 
     @abstractmethod
