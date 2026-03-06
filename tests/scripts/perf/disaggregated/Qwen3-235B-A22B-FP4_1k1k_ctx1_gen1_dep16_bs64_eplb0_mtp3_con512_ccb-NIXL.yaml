@@ -1,5 +1,5 @@
 metadata:
-  model_name: Qwen3-235B-A22B-FP4
+  model_name: qwen3_235b_a22b_fp4
   precision: fp4
   model_dir_name: Qwen3-235B-A22B-FP4
   supported_gpus:
