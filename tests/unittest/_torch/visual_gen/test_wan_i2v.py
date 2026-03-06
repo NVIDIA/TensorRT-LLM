@@ -965,7 +965,7 @@ class TestWanI2VTwoStage:
         print("✓ forward() accepts boundary_ratio parameter for runtime override")
 
     def test_two_stage_with_all_optimizations(self, wan22_i2v_pipeline_fp8):
-        """Test Wan 2.2 with FP8, TeaCache, and TRTLLM attention."""
+        """Test Wan 2.2 with FP8 and TRTLLM attention (TeaCache not supported for Wan 2.2)."""
         # Skip if not two-stage
         if (
             wan22_i2v_pipeline_fp8.boundary_ratio is None
@@ -973,7 +973,7 @@ class TestWanI2VTwoStage:
         ):
             pytest.skip("Not a two-stage checkpoint")
 
-        # Load pipeline with all optimizations
+        # Load pipeline with all supported optimizations (no TeaCache for Wan 2.2)
         args = DiffusionArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
@@ -981,11 +981,6 @@ class TestWanI2VTwoStage:
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="TRTLLM"),
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
 
@@ -999,18 +994,6 @@ class TestWanI2VTwoStage:
             )
             print(f"✓ FP8: transformer={fp8_t1}, transformer_2={fp8_t2}")
             assert fp8_t1 and fp8_t2
-
-            # Check TeaCache on both transformers
-            has_cache_t1 = (
-                hasattr(pipeline, "transformer_cache_backend")
-                and pipeline.transformer_cache_backend
-            )
-            has_cache_t2 = (
-                hasattr(pipeline, "transformer_2_cache_backend")
-                and pipeline.transformer_2_cache_backend
-            )
-            print(f"✓ TeaCache: transformer={has_cache_t1}, transformer_2={has_cache_t2}")
-            assert has_cache_t1 and has_cache_t2
 
             # Check TRTLLM attention
             attn1_backend = pipeline.transformer.blocks[0].attn1.attn_backend

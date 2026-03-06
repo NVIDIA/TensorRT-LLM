@@ -553,7 +553,7 @@ class WanImageToVideoPipeline(BasePipeline):
             else:
                 condition_to_use = condition_data
 
-            latent_model_input = torch.cat([latents_input.to(self.dtype), condition_to_use], dim=1)
+            latent_model_input = torch.cat([latents_input, condition_to_use], dim=1).to(self.dtype)
             timestep_input = timestep.expand(latents_input.shape[0])
 
             # Forward pass with I2V conditioning
@@ -564,7 +564,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 timestep=timestep_input,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds,
-            ).to(latents_input.dtype)
+            )
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
         latents = self.denoise(
@@ -709,7 +709,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         # Create random noise latents
         shape = (1, num_channels_latents, num_latent_frames, latent_height, latent_width)
-        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=torch.float32)
+        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
         # Load and preprocess image(s)
         if isinstance(image, str):
@@ -758,11 +758,11 @@ class WanImageToVideoPipeline(BasePipeline):
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latent_condition.dtype)
+            .to(latents.device, latents.dtype)
         )
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
             1, self.vae.config.z_dim, 1, 1, 1
-        ).to(latents.device, latent_condition.dtype)
+        ).to(latents.device, latents.dtype)
         latent_condition = (latent_condition - latents_mean) * latents_std
 
         # Create mask in video frame space

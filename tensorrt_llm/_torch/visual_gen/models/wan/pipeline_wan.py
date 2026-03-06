@@ -431,10 +431,10 @@ class WanPipeline(BasePipeline):
                 current_model = self.transformer
 
             return current_model(
-                hidden_states=latents.to(self.dtype),
+                hidden_states=latents,
                 timestep=timestep,
                 encoder_hidden_states=encoder_hidden_states,
-            ).to(latents.dtype)
+            )
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
         latents = self.denoise(
@@ -554,7 +554,7 @@ class WanPipeline(BasePipeline):
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
-        return randn_tensor(shape, generator=generator, device=self.device, dtype=torch.float32)
+        return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
     @nvtx_range("_decode_latents", color="blue")
     def _decode_latents(self, latents):
