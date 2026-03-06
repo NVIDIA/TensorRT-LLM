@@ -97,10 +97,11 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
                 proto_config=request.sampling_config,
                 output_config=request.output_config,
                 max_tokens=request.max_tokens,
-                end_id=request.end_id if request.HasField("end_id") else None,
-                pad_id=request.pad_id if request.HasField("pad_id") else None,
-                bad_words=list(request.bad_words) if request.bad_words else None,
-                stop_words=list(request.stop_words) if request.stop_words else None,
+                stop=list(request.stop) if request.stop else None,
+                stop_token_ids=list(request.stop_token_ids) if request.stop_token_ids else None,
+                ignore_eos=request.ignore_eos,
+                bad=list(request.bad) if request.bad else None,
+                bad_token_ids=list(request.bad_token_ids) if request.bad_token_ids else None,
                 guided_decoding=request.guided_decoding
                 if request.HasField("guided_decoding")
                 else None,
@@ -485,15 +486,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             complete = trtllm_service_pb2.GenerateComplete(
                 output_token_ids=output_tokens,
                 sequence_index=completion.index,
-                finish_reason=completion.finish_reason or "stop",
+                finish_reason=completion.finish_reason or "",
                 prompt_tokens=len(prompt_token_ids),
                 completion_tokens=len(output_tokens),
                 cached_tokens=cached_tokens,
             )
 
-            # Add stop reason if available
-            if hasattr(completion, "stop_reason") and completion.stop_reason:
-                complete.stop_reason = str(completion.stop_reason)
+            # Add matched stop if available (int token ID or str stop sequence)
+            if hasattr(completion, "stop_reason") and completion.stop_reason is not None:
+                if isinstance(completion.stop_reason, int):
+                    complete.matched_token_id = completion.stop_reason
+                else:
+                    complete.matched_stop_str = str(completion.stop_reason)
 
             # Add generation logprobs if available
             if completion.logprobs:
