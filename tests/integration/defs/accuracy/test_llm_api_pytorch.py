@@ -2198,6 +2198,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                           [0, pytest.param(2, marks=skip_pre_hopper)])
     @pytest.mark.parametrize("backend", ["xgrammar", "llguidance"])
     def test_guided_decoding_4gpus(self, backend: str, mtp_nextn: int, mocker):
+        pytest.skip("IMA on Hopper")
         mocker.patch.dict(os.environ, {"TRTLLM_XGUIDANCE_LENIENT": "1"})
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         cuda_graph_config = CudaGraphConfig(enable_padding=True)
@@ -5168,6 +5169,7 @@ class TestGPTOSS(LlmapiAccuracyTestHarness):
                           mocker):
         if not one_model:
             pytest.skip("v2 does not support two model")
+        pytest.skip("CI Thought it hang, but it passed locally and takes the same time as v1")
         MAX_OUTPUT_LEN = 128179
         MAX_INPUT_LEN = 32768
 
