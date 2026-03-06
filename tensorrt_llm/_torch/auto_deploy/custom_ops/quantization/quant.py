@@ -281,16 +281,16 @@ def nvfp4_linear(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
-    alpha: Optional[torch.Tensor] = None,
+    weight_scale_2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP4 linear op similar to torch.nn.linear.
 
     Args:
         input: unquantized input tensor
         weight_fp4: pre-quantized weight tensor, with dtype torch.uint8 (1 uint8 == 2 elements)
-        input_scale: a scalar tensor defined as per_tensor_amax / (FP8 max value (448.0) * FP4 max value (6.0)).
+        input_scale: per-tensor input scale_2 = input_amax / FP4_GLOBAL_SCALE_MAX.
         weight_scale: per-block scale in torch FP8 (float8_e4m3fn), shape (out_dim, in_dim/16) or padded.
-        alpha: 1 / (input_scale * weight_scale_2).
+        weight_scale_2: per-tensor weight scale_2 = weight_amax / FP4_GLOBAL_SCALE_MAX.
 
     Returns:
         The linear output with the original dtype as the input.
@@ -305,10 +305,9 @@ def nvfp4_linear(
     assert k % 16 == 0
     assert weight_shape[-1] % 8 == 0
 
-    # FP4 compatibility
     assert input_scale is not None
     assert weight_scale is not None
-    assert alpha is not None
+    assert weight_scale_2 is not None
 
     # Convert torch-compatible FP8 per-block scale to CUTLASS (padded, swizzled) for the kernel.
     from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
@@ -318,13 +317,17 @@ def nvfp4_linear(
     weight_scale_cutlass = modelopt_fp4_scale_to_cutlass_fp4_scale(weight_scale)
     assert weight_scale_cutlass.numel() % (128 * 4) == 0
 
+    # Derive kernel values from raw per-tensor scales
+    fp4_input_scale = 1.0 / torch.clamp(input_scale, min=1e-30)
+    kernel_alpha = torch.clamp(input_scale * weight_scale_2, min=1e-30)
+
     input = input.reshape(-1, k)
 
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
-        input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
+        input, fp4_input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
     output = torch.ops.trtllm.nvfp4_gemm(
-        x_fp4, weight_fp4, x_sf_block, weight_scale_cutlass, alpha, input.dtype
+        x_fp4, weight_fp4, x_sf_block, weight_scale_cutlass, kernel_alpha, input.dtype
     )
 
     if bias is not None:
@@ -340,7 +343,7 @@ def fp4_linear_fake(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
-    alpha: Optional[torch.Tensor] = None,
+    weight_scale_2: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 
