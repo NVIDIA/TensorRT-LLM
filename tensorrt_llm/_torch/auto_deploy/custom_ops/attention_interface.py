@@ -1374,6 +1374,12 @@ class SequenceInfo:
             (self.host_device, self._host_suffix),
             (self.device, ""),
         ):
+            # --- input_ids ---
+            # use cu_seqlen as heuristic to get the input_ids if available
+            input_ids_flat = self.get_arg(f"input_ids{suffix}", truncate=False, unflatten=False)
+            extraction_indices = (self.get_arg(f"cu_seqlen{suffix}", truncate=True)[1:] - 1).long()
+            self.copy_(f"input_ids{suffix}", input_ids_flat[extraction_indices], strict=False)
+
             # --- input_pos ---
             input_pos = self.get_arg(f"input_pos{suffix}", truncate=True)
             input_pos += self.get_arg(f"seq_len{suffix}", truncate=True) - 1
@@ -1385,12 +1391,6 @@ class SequenceInfo:
             # --- seq_len ---
             seq_len = self.get_arg(f"seq_len{suffix}", truncate=True)
             seq_len.fill_(1)
-
-            # --- input_ids ---
-            # use cu_seqlen as heuristic to get the input_ids if available
-            input_ids_flat = self.get_arg(f"input_ids{suffix}", truncate=False, unflatten=False)
-            extraction_indices = (cu_seqlen[1:] - 1).long()
-            self.copy_(f"input_ids{suffix}", input_ids_flat[extraction_indices], strict=False)
 
             # --- update derivative metadata that change in generate-only mode if active ---
             self.copy_(f"position_ids{suffix}", input_pos, strict=False)
