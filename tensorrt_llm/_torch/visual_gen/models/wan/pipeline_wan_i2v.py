@@ -3,6 +3,7 @@ import os
 import time
 from typing import Optional, Tuple, Union
 
+import diffusers
 import PIL.Image
 import torch
 from diffusers import AutoencoderKLWan, FlowMatchEulerDiscreteScheduler
@@ -22,13 +23,44 @@ from tensorrt_llm.logger import logger
 # - Wan2.1-I2V-14B-480P: Single-stage image-to-video
 # - Wan2.1-I2V-14B-720P: Single-stage image-to-video
 # - Wan2.2-I2V-14B: Two-stage image-to-video (no CLIP, boundary_ratio for two-stage denoising)
-# Note: Wan2.2-I2V-5B (expand_timesteps mode) is NOT supported by this pipeline
-# Import shared coefficients from T2V pipeline
-from .pipeline_wan import WAN_TEACACHE_COEFFICIENTS
 from .transformer_wan import WanTransformer3DModel
 
-# Use same coefficients
-WAN_I2V_TEACACHE_COEFFICIENTS = WAN_TEACACHE_COEFFICIENTS
+WAN_I2V_TEACACHE_COEFFICIENTS = {
+    # Wan 2.1 I2V 14B 480P
+    "480P": {
+        "ret_steps": [
+            2.57151496e05,
+            -3.54229917e04,
+            1.40286849e03,
+            -1.35890334e01,
+            1.32517977e-01,
+        ],
+        "standard": [
+            -3.02331670e02,
+            2.23948934e02,
+            -5.25463970e01,
+            5.87348440e00,
+            -2.01973289e-01,
+        ],
+    },
+    # Wan 2.1 I2V 14B 720P
+    "720P": {
+        "ret_steps": [
+            8.10705460e03,
+            2.13393892e03,
+            -3.72934672e02,
+            1.66203073e01,
+            -4.17769401e-02,
+        ],
+        "standard": [
+            -114.36346466,
+            65.26524496,
+            -18.82220707,
+            4.91518089,
+            -0.23412683,
+        ],
+    },
+}
 
 # Default negative prompt for Wan I2V models
 WAN_DEFAULT_NEGATIVE_PROMPT = (
@@ -66,11 +98,21 @@ class WanImageToVideoPipeline(BasePipeline):
         self.boundary_ratio = getattr(model_config.pretrained_config, "boundary_ratio", None)
         self.is_wan22 = self.boundary_ratio is not None
 
+        # Validate TeaCache compatibility before allocating GPU memory
+        if self.is_wan22 and model_config.teacache.enable_teacache:
+            raise ValueError(
+                "TeaCache is not supported for Wan 2.2 I2V models. "
+                "Set enable_teacache=False in TeaCacheConfig."
+            )
+
         super().__init__(model_config)
 
-    @staticmethod
-    def _compute_wan_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for Wan I2V transformer."""
+    def _compute_wan_timestep_embedding(self, module, timestep, guidance=None):
+        """Compute timestep embedding for Wan I2V transformer.
+
+        Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
+        calibration), or temb when use_ret_steps=False (standard mode).
+        """
         ce = module.condition_embedder
         t_freq = ce.timesteps_proj(timestep)
 
@@ -79,7 +121,13 @@ class WanImageToVideoPipeline(BasePipeline):
         if t_freq.dtype != te_dtype and te_dtype != torch.int8:
             t_freq = t_freq.to(te_dtype)
 
-        return ce.time_embedder(t_freq)
+        t_emb = ce.time_embedder(t_freq)
+
+        if self.model_config.teacache.use_ret_steps:
+            # ret_steps mode: use timestep_proj — what the ret_steps coefficients were calibrated for
+            return ce.time_proj(ce.act_fn(t_emb)).to(torch.float32)
+        else:
+            return t_emb.to(torch.float32)
 
     @property
     def dtype(self):
@@ -170,15 +218,20 @@ class WanImageToVideoPipeline(BasePipeline):
 
         if PipelineComponent.SCHEDULER not in skip_components:
             logger.info("Loading scheduler...")
-            self.scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-                checkpoint_dir,
-                subfolder=PipelineComponent.SCHEDULER,
+            sched_cfg = FlowMatchEulerDiscreteScheduler.load_config(
+                checkpoint_dir, subfolder=PipelineComponent.SCHEDULER
             )
-            if not hasattr(self.scheduler.config, "shift") or self.scheduler.config.shift == 1.0:
-                self.scheduler = FlowMatchEulerDiscreteScheduler.from_config(
-                    self.scheduler.config,
-                    shift=5.0,
+            scheduler_class_name = sched_cfg.get("_class_name", "FlowMatchEulerDiscreteScheduler")
+            if not hasattr(diffusers, scheduler_class_name):
+                raise ValueError(
+                    f"Scheduler class '{scheduler_class_name}' not found in diffusers "
+                    f"(checkpoint: {checkpoint_dir}). Check the scheduler config."
                 )
+            SchedulerClass = getattr(diffusers, scheduler_class_name)
+            if issubclass(SchedulerClass, FlowMatchEulerDiscreteScheduler):
+                if sched_cfg.get("shift", 1.0) == 1.0:
+                    sched_cfg["shift"] = sched_cfg.get("flow_shift") or 5.0
+            self.scheduler = SchedulerClass.from_config(sched_cfg)
 
         if self.transformer_2 is not None and self.boundary_ratio is None:
             raise RuntimeError(
@@ -252,29 +305,25 @@ class WanImageToVideoPipeline(BasePipeline):
     def post_load_weights(self) -> None:
         super().post_load_weights()  # Calls transformer.post_load_weights() for FP8 scale transformations
         if self.transformer is not None:
-            # Register TeaCache extractor for this model type
-            register_extractor_from_config(
-                ExtractorConfig(
-                    model_class_name="WanTransformer3DModel",
-                    timestep_embed_fn=self._compute_wan_timestep_embedding,
-                    return_dict_default=False,  # Wan returns raw tensors, not wrapped outputs
+            # Only register TeaCache extractor when TeaCache is actually enabled.
+            if self.model_config.teacache.enable_teacache:
+                register_extractor_from_config(
+                    ExtractorConfig(
+                        model_class_name="WanTransformer3DModel",
+                        timestep_embed_fn=self._compute_wan_timestep_embedding,
+                        return_dict_default=False,  # Wan returns raw tensors, not wrapped outputs
+                    )
                 )
-            )
 
-            # Enable TeaCache optimization with Wan I2V-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=WAN_I2V_TEACACHE_COEFFICIENTS)
-            # Save transformer backend before it gets overwritten
-            self.transformer_cache_backend = self.cache_backend
+            if not self.is_wan22:
+                self._setup_teacache(self.transformer, coefficients=WAN_I2V_TEACACHE_COEFFICIENTS)
+                self.transformer_cache_backend = self.cache_backend
+            else:
+                self.transformer_cache_backend = None
 
-        # Wan2.2: Setup TeaCache for second transformer (low-noise stage)
         if self.transformer_2 is not None:
             if hasattr(self.transformer_2, "post_load_weights"):
                 self.transformer_2.post_load_weights()
-
-            # Enable TeaCache for low-noise stage with same coefficients
-            self._setup_teacache(self.transformer_2, coefficients=WAN_I2V_TEACACHE_COEFFICIENTS)
-            # Save transformer_2 backend
-            self.transformer_2_cache_backend = self.cache_backend
 
     def _run_warmup(self, warmup_steps: int) -> None:
         """Run warmup inference to trigger torch.compile and CUDA init.
@@ -377,7 +426,7 @@ class WanImageToVideoPipeline(BasePipeline):
             guidance_scale = 4.0 if self.is_wan22 else 5.0
 
         if self.is_wan22 and guidance_scale_2 is None:
-            guidance_scale_2 = 3.0  # Wan2.2 recommended default
+            guidance_scale_2 = guidance_scale  # Match HF: default to guidance_scale when unset
 
         # Validate two-stage denoising configuration
         if guidance_scale_2 is not None and boundary_ratio is None:
@@ -501,7 +550,7 @@ class WanImageToVideoPipeline(BasePipeline):
             else:
                 condition_to_use = condition_data
 
-            latent_model_input = torch.cat([latents_input, condition_to_use], dim=1).to(self.dtype)
+            latent_model_input = torch.cat([latents_input.to(self.dtype), condition_to_use], dim=1)
             timestep_input = timestep.expand(latents_input.shape[0])
 
             # Forward pass with I2V conditioning
@@ -512,7 +561,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 timestep=timestep_input,
                 encoder_hidden_states=encoder_hidden_states,
                 encoder_hidden_states_image=image_embeds,
-            )
+            ).to(latents_input.dtype)
 
         # Two-stage denoising: model switching in forward_fn, guidance scale switching in denoise()
         latents = self.denoise(
@@ -657,7 +706,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         # Create random noise latents
         shape = (1, num_channels_latents, num_latent_frames, latent_height, latent_width)
-        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
+        latents = randn_tensor(shape, generator=generator, device=self.device, dtype=torch.float32)
 
         # Load and preprocess image(s)
         if isinstance(image, str):
@@ -706,11 +755,11 @@ class WanImageToVideoPipeline(BasePipeline):
         latents_mean = (
             torch.tensor(self.vae.config.latents_mean)
             .view(1, self.vae.config.z_dim, 1, 1, 1)
-            .to(latents.device, latents.dtype)
+            .to(latents.device, latent_condition.dtype)
         )
         latents_std = 1.0 / torch.tensor(self.vae.config.latents_std).view(
             1, self.vae.config.z_dim, 1, 1, 1
-        ).to(latents.device, latents.dtype)
+        ).to(latents.device, latent_condition.dtype)
         latent_condition = (latent_condition - latents_mean) * latents_std
 
         # Create mask in video frame space
