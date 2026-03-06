@@ -50,32 +50,40 @@ class FluxPipeline(BasePipeline):
         super().__init__(model_config)
 
     @staticmethod
-    def _compute_flux_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX transformer.
+    def _compute_flux_timestep_embedding(
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        pooled_projections=None,
+        **kwargs,
+    ):
+        """Compute modulated input for FLUX.1 TeaCache (matches original paper).
 
-        FLUX combines timestep and guidance embeddings.
-
-        Args:
-            module: FluxTransformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional)
-
-        Returns:
-            Combined timestep embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states), emb=temb) from the first
+        transformer block, which captures both temporal (timestep) and content
+        (hidden_states) changes for cache distance calculation.
         """
-        # Cast to embedder's dtype (avoid int8 quantized layers)
-        te_dtype = next(iter(module.time_text_embed.parameters())).dtype
-        if timestep.dtype != te_dtype and te_dtype != torch.int8:
-            timestep = timestep.to(te_dtype)
 
-        temb = module.time_text_embed(timestep)
+        # Embed hidden states through x_embedder (same as forward() line 790)
+        x = module.x_embedder(hidden_states.contiguous())
 
-        if module.guidance_embeds and guidance is not None:
-            if guidance.dtype != te_dtype and te_dtype != torch.int8:
-                guidance = guidance.to(te_dtype)
-            temb = temb + module.guidance_embed(guidance)
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
 
-        return temb
+        # Compute full temb (timestep + guidance + pooled_projection)
+        if module.config.guidance_embeds and guidance is not None:
+            temb = module.time_text_embed(timestep, guidance, pooled_projections)
+        else:
+            temb = module.time_text_embed(timestep, pooled_projections)
+
+        # Apply AdaLayerNorm from first transformer block:
+        # norm1(x, emb=temb) -> (modulated_x, gate, shift_mlp, scale_mlp, gate_mlp)
+        modulated_input = module.transformer_blocks[0].norm1(x, emb=temb)[0]
+
+        return modulated_input
 
     @property
     def dtype(self):
@@ -209,8 +217,8 @@ class FluxPipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.1-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""
