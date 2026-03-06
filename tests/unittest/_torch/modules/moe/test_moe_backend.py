@@ -52,6 +52,7 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
+from tensorrt_llm._torch.utils import ActivationType
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -106,6 +107,7 @@ def create_test_backend(
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
     weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
+    activation_type: ActivationType = ActivationType.Swiglu,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -138,6 +140,7 @@ def create_test_backend(
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
         weight_loading_mode=weight_loading_mode,
+        activation_type=activation_type,
     )
 
 
@@ -576,3 +579,175 @@ def test_moe_backend(
             with torch.inference_mode():
                 output = run_moe()
                 ref_fused_moe.check_accuracy(output, ref_output)
+
+
+# ============================================================================
+# Non-gated Activation Type Tests: Relu2, Silu
+# ============================================================================
+#
+# As an additional test, we want to verify that element-wise activations (Relu2, Silu)
+# are correctly applied by the MoE backend kernels that support them.
+#
+# =============================================================================
+# Purpose & Scope
+# =============================================================================
+#
+# Similar to the main test.
+#
+# =============================================================================
+# Test Coverage Matrix
+# =============================================================================
+#   Relu2  (element-wise) – CUTLASS + unquantized  (no gate projection)
+#   Relu2  (element-wise) – TRTLLM  + NVFP4        (quantized path)
+#   Silu   (element-wise) – TRTLLM  + NVFP4        (only backend that supports Silu)
+#
+# =============================================================================
+# Skip Logic
+# =============================================================================
+#
+# Similar to the main test.
+
+
+# (activation_type, backend_type, quant_algo) — valid combinations only.
+_ELEMENT_WISE_BACKEND_COMBOS = [
+    (ActivationType.Relu2, MoeBackendType.CUTLASS, None),
+    (ActivationType.Relu2, MoeBackendType.TRTLLM, QuantAlgo.NVFP4),
+    (ActivationType.Silu, MoeBackendType.TRTLLM, QuantAlgo.NVFP4),
+]
+
+
+def _generate_element_wise_test_params() -> List:
+    params: List = []
+    for activation_type, backend_type, quant_algo in _ELEMENT_WISE_BACKEND_COMBOS:
+        for (
+            _,  # swiglu_alpha  (ignored)
+            _,  # swiglu_beta   (ignored)
+            _,  # swiglu_limit  (ignored)
+            model_config,
+            seq_len,
+            dtype,
+            _bt,
+            _qa,
+            _routing_method_cls,
+            skip_reason,
+            base_test_id,
+        ) in iter_base_test_configs(
+            [(1, 0, float("inf"))],  # swiglu parameters are irrelevant
+            MOE_MODEL_CONFIGS,
+            SEQ_LENS_TO_TEST,
+            DTYPES_TO_TEST,
+            [backend_type],
+            [quant_algo],
+        ):
+            if skip_reason:
+                continue
+            test_id = f"act={activation_type.name}-{base_test_id}"
+            param_values = (activation_type, backend_type, quant_algo, model_config, seq_len, dtype)
+            params.append(create_test_param(param_values, test_id))
+    return params
+
+
+ELEMENT_WISE_TEST_PARAMS = _generate_element_wise_test_params()
+
+
+@pytest.mark.parametrize(
+    "activation_type,backend_type,quant_algo,model_config,seq_len,dtype",
+    ELEMENT_WISE_TEST_PARAMS,
+)
+def test_moe_backend_element_wise(
+    activation_type: ActivationType,
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo],
+    model_config: MoeModelConfig,
+    seq_len: int,
+    dtype: torch.dtype,
+):
+    """
+    Verify that element-wise activations (Relu2, Silu) are correctly applied by
+    the MoE backend kernels.
+
+    Each combo is tested against a float-precision reference (RefMLPFusedMoE with MLP experts).
+    A single small model config is used to keep runtime short.
+    """
+    num_experts = model_config.num_experts
+    top_k = model_config.top_k
+    hidden_size = model_config.hidden_size
+    intermediate_size = model_config.intermediate_size
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype)
+
+    mapping = Mapping()
+    mapping.rank = mpi_rank()
+
+    with torch.device(f"cuda:{mapping.rank}"):
+        torch.manual_seed(42)
+        torch.cuda.manual_seed(42)
+
+        AutoTuner.get().setup_distributed_state(mapping)
+
+        routing_method = RenormalizeMoeRoutingMethod(top_k=top_k)
+
+        x = torch.randn((seq_len, hidden_size), dtype=dtype, device="cuda")
+        router_logits = torch.randn((seq_len, num_experts), dtype=dtype, device="cuda")
+
+        quantize_util_cls, quant_config, quant_kwargs = get_test_quant_params(
+            quant_algo, x, backend_type
+        )
+
+        quantize_util = quantize_util_cls(
+            num_experts=num_experts,
+            dtype=dtype,
+            intermediate_size=intermediate_size,
+            hidden_size=hidden_size,
+            quant_config=quant_config,
+            activation_type=activation_type,
+        )
+
+        # Create backend with the specified activation type.
+        backend = create_test_backend(
+            backend_type=backend_type,
+            routing_method=routing_method,
+            num_experts=num_experts,
+            hidden_size=hidden_size,
+            intermediate_size=intermediate_size,
+            dtype=dtype,
+            quant_config=quant_config,
+            mapping=mapping,
+            activation_type=activation_type,
+        )
+
+        # Create weights.  For NVFP4 element-wise the reference uses pre-quantization
+        # float weights stored by the util; fall back to the quantized dict otherwise.
+        weights = quantize_util.create_weights(**quant_kwargs)
+        ref_weights = weights
+
+        backend.load_weights([weights])
+        backend.post_load_weights()
+        backend.cuda()
+
+        # Create and load reference module.
+        ref_fused_moe = quantize_util.create_ref_module(routing_method)
+        ref_fused_moe.load_weights([ref_weights])
+        ref_fused_moe.cuda()
+
+        # Reference output.
+        with torch.inference_mode():
+            ref_output = ref_fused_moe.forward(x, router_logits)
+
+        def run_moe():
+            token_selected_experts, token_final_scales = routing_method.apply(router_logits)
+            x_quantized, x_sf = backend.quantize_input(x, post_quant_comm=False)
+            return run_backend_moe(
+                backend,
+                backend_type,
+                x_quantized,
+                x_sf,
+                token_selected_experts,
+                token_final_scales,
+                dtype,
+                router_logits,
+            )
+
+        with torch.inference_mode():
+            output = run_moe()
+            ref_fused_moe.check_accuracy(output, ref_output)
