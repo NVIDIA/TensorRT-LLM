@@ -638,6 +638,12 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+
+        # When using MTP, the effective draft config is the target model config,
+        # so we need to get the sparse attention config from the target model config.
+        # For other cases, this will be None.
+        draft_sparse_attn_config = getattr(effective_draft_config,
+                                           'sparse_attention_config', None)
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
@@ -647,7 +653,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=None,  # Not applicable for draft in one-model mode
+            sparse_attn_config=draft_sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
