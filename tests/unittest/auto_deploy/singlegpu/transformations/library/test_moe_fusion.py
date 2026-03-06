@@ -1375,8 +1375,8 @@ class FineGrainedFP8MoEOpModel(nn.Module):
         return out
 
     def get_input(self, device, dtype=torch.bfloat16):
-        """
-        fp8_blockscale_gemm_kernel requires expected_m > 64
+        """fp8_blockscale_gemm_kernel requires expected_m > 64.
+
         expected_m = (num_tokens x top_k) / num_experts
         min_num_tokens >=  kernel_threshold * num_experts / top_k
         """
