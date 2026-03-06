@@ -3905,28 +3905,30 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @parametrize_with_ids(
-        "eagle3_one_model,enable_chunked_prefill,max_concurrency,enable_draft_len_schedule",
+        "eagle3_one_model,enable_chunked_prefill,enable_max_concurrency,enable_draft_len_schedule",
         [
             # Base coverage: eagle3_one_model x enable_chunked_prefill.
-            (True, True, None, False),
-            (True, False, None, False),
-            (False, True, None, False),
-            (False, False, None, False),
+            (True, True, False, False),
+            (True, False, False, False),
+            (False, True, False, False),
+            (False, False, False, False),
             # Test max_concurrency control and draft_len_schedule.
-            (True, False, None, True),
-            (True, False, 100, False),
+            (True, False, False, True),
+            (True, False, True, False),
         ])
     def test_eagle3(self, eagle3_one_model, enable_chunked_prefill,
-                    max_concurrency, enable_draft_len_schedule):
+                    enable_max_concurrency, enable_draft_len_schedule):
+        max_concurrency = 100 if enable_max_concurrency else None
         draft_len_schedule = {
             50: 4,
             200: 3,
             350: 2
         } if enable_draft_len_schedule else None
+        cuda_graph_config = (CudaGraphConfig(
+            max_batch_size=500) if enable_draft_len_schedule
+                             or enable_max_concurrency else None)
+
         max_draft_len = 4
-        cuda_graph_config = CudaGraphConfig(
-            max_batch_size=500
-            if draft_len_schedule or max_concurrency is not None else None)
         pytorch_config = dict(
             disable_overlap_scheduler=not eagle3_one_model,
             cuda_graph_config=cuda_graph_config,
