@@ -1822,7 +1822,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
             if (useSageAttnSeparateQkv)
             {
                 TLLM_CHECK_WITH_INFO(mFP8ContextFMHA, "SageAttention kernel runs under mFP8ContextFMHA option.");
-                TLLM_CHECK_WITH_INFO(mNumAttnHeads == mNumAttnKVHeads, "SageAttention does not support MQA / GQA yet.");
                 TLLM_CHECK_WITH_INFO(
                     mFmhaDispatcher->isSupported(), "SageAttention has no unfused fallback implemented.");
                 TLLM_CHECK_WITH_INFO(

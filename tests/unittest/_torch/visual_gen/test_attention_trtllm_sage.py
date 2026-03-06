@@ -135,7 +135,7 @@ def _test_attention_trtllm_sage(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TRTLLM attention.")
-@pytest.mark.parametrize("gqa_groups", [1])
+@pytest.mark.parametrize("gqa_groups", [1, 2, 4])
 @pytest.mark.parametrize("num_heads", [4, 12, 16])
 @pytest.mark.parametrize("seq_len", [128, 256, 1024, 8192])
 @pytest.mark.parametrize(
@@ -170,9 +170,9 @@ def test_attention_trtllm_sage(
         out_dtype=out_dtype,
     )
 
-    assert out_tllm.shape == out_native.shape
-    assert torch.isfinite(out_native).all()
-    assert torch.isfinite(out_tllm).all()
+    assert out_tllm.shape == out_native.shape, "Shape mismatch"
+    assert torch.isfinite(out_native).all(), "Inf / NaN detected in Torch SDPA"
+    assert torch.isfinite(out_tllm).all(), "Inf / NaN detected in TRTLLM attention"
 
     print("\nResults:")
     print(f"  Output shape: {out_tllm.shape}")
@@ -180,5 +180,5 @@ def test_attention_trtllm_sage(
     print(f"  Mean absolute difference: {mean_abs:.6f}")
     print(f"  Cosine similarity: {cos_sim:.6f}")
 
-    assert cos_sim > 0.90, "Cosine similarity check failed"
+    assert cos_sim > 0.990, f"Cosine similarity {cos_sim:.6f} below threshold"
     torch.testing.assert_close(out_tllm, out_native, atol=atol, rtol=rtol)
