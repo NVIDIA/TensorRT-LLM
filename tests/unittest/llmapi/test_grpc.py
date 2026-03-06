@@ -211,6 +211,34 @@ class TestDisaggregatedParamsConversion:
 
         assert params is not None
 
+    def test_context_phase_params(self):
+        """Test context_phase_params maps first_gen_token_id to first_gen_tokens list."""
+        proto_params = pb2.DisaggregatedParams(
+            request_type=pb2.DisaggregatedParams.REQUEST_TYPE_GENERATION_ONLY,
+            ctx_request_id="gen-789",
+            context_phase_params=pb2.ContextPhaseParams(
+                first_gen_token_id=42,
+            ),
+        )
+
+        params = create_disaggregated_params_from_proto(proto_params)
+
+        assert params is not None
+        assert params.request_type == "generation_only"
+        assert params.first_gen_tokens == [42]
+
+    def test_context_phase_params_no_token(self):
+        """Test context_phase_params with no first_gen_token_id leaves first_gen_tokens as None."""
+        proto_params = pb2.DisaggregatedParams(
+            request_type=pb2.DisaggregatedParams.REQUEST_TYPE_GENERATION_ONLY,
+            context_phase_params=pb2.ContextPhaseParams(),
+        )
+
+        params = create_disaggregated_params_from_proto(proto_params)
+
+        assert params is not None
+        assert params.first_gen_tokens is None
+
     def test_none_params(self):
         """Test None disaggregated params returns None."""
         params = create_disaggregated_params_from_proto(None)
