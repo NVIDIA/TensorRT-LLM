@@ -745,6 +745,11 @@ class EagleWrapper(nn.Module):
         # NOTE: we assume gather_context_logits is False so that gathering here works!
         target_logits = csi.info.maybe_gather_and_squeeze(out.logits)
 
+        # TODO: investigate root cause — without this sync the hidden_states_cache buffers
+        # read by _collect_hidden_states can contain stale data, dropping the spec-dec
+        # acceptance rate from ~31% to ~7%.
+        torch.cuda.synchronize()
+
         # ---- Phase 2: Collect hidden states from cache buffers ----
         hidden_states = self._collect_hidden_states(csi.named_args, num_total_tokens)
         hidden_states = self.apply_eagle3_fc(hidden_states)
