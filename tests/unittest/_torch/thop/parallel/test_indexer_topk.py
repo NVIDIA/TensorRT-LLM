@@ -283,19 +283,24 @@ def skip_if_not_blackwell():
         pytest.skip("CuTE DSL top-k kernel requires Blackwell (SM100+)")
 
 
-@pytest.mark.parametrize("batch_size", [1, 4, 64])
-@pytest.mark.parametrize("next_n", [1, 3])
-@pytest.mark.parametrize("index_topk", [2048])
-@pytest.mark.parametrize("num_tokens", [4096, 8192])
-@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype):
+def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype,
+                            run_fn):
+    """Common test logic for CuTE DSL top-k kernels.
+
+    Args:
+        batch_size: Number of sequences in the batch.
+        next_n: Number of next tokens per sequence.
+        index_topk: Number of top-k indices to select.
+        num_tokens: Maximum sequence length for generating seq_lens.
+        dtype: Data type for the logits tensor.
+        run_fn: Callable(logits, seq_lens) -> indices tensor.
+    """
     skip_if_no_cute_dsl()
     skip_if_not_blackwell()
 
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
 
-    # Set input data (same structure as test_indexer_topk_decode)
     num_gen_tokens = batch_size * next_n
     row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
     row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
@@ -304,385 +309,65 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype)
     seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
 
-    # Create logits with the specified dtype
     logits = create_random_logits(row_starts, row_ends, dtype, 42)
 
-    # Run CuTE DSL implementation
-    # result = cute_dsl_topk_wrapper(
-    #     input_values=logits,
-    #     seq_lens=seq_lens,
-    #     top_k=index_topk,
-    #     next_n=next_n,
-    #     return_val=return_val,
-    #     load_balance=False,
-    #     num_copy_bits=256,
-    # )
-    # # Extract indices from result
-    # # The wrapper returns (indices, values) if return_val=True
-    # if isinstance(result, tuple):
-    #     cute_indices, _ = result
-    # else:
-    #     cute_indices = result
-
-    result = torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
-        input_values=logits, seq_lens=seq_lens, top_k=index_topk, next_n=next_n, num_copy_bits=256
-    )
-    cute_indices = result
-
+    cute_indices = run_fn(logits, seq_lens)
     torch.cuda.synchronize()
 
-    # Run reference implementation
     max_row_len = row_ends.max().item()
     torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
-    mask_lo = torch_indices >= 0
-    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
-    mask = mask_lo & mask_hi
+    mask = (torch_indices >= 0) & (
+        (torch_indices - (row_ends - row_starts)[:, None]) < 0)
     torch_indices = torch_indices.masked_fill(~mask, -1)
 
-    # Convert cute_indices to int32 for comparison
-    cute_indices_int32 = cute_indices.to(torch.int32)
-
-    # Compare results
     assert compare_top_k_results(
-        logits, cute_indices_int32, torch_indices, row_starts, row_ends, index_topk
+        logits, cute_indices.to(torch.int32), torch_indices, row_starts,
+        row_ends, index_topk
     ), "CuTE DSL top-k results don't match torch.topk"
 
 
-# TODO: failed on one of the fp16 test. 
+@pytest.mark.parametrize("batch_size", [1, 4, 64])
+@pytest.mark.parametrize("next_n", [1, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens,
+                              dtype):
+    _run_cute_dsl_topk_test(
+        batch_size, next_n, index_topk, num_tokens, dtype,
+        lambda logits, seq_lens: torch.ops.trtllm.
+        cute_dsl_topk_decode_blackwell(
+            input_values=logits, seq_lens=seq_lens, top_k=index_topk,
+            next_n=next_n, num_copy_bits=256))
+
+
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [32768, 65536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
-# @pytest.mark.parametrize("batch_size", [64])
-# @pytest.mark.parametrize("next_n", [3])
-# @pytest.mark.parametrize("index_topk", [2048])
-# @pytest.mark.parametrize("num_tokens", [32768])
-# @pytest.mark.parametrize("dtype", [torch.float16])
-# @pytest.mark.parametrize("chunk_size_per_cta", [16384])
 def test_cute_dsl_topk_decode_multi_cta(batch_size, next_n, index_topk,
                                         num_tokens, dtype,
                                         chunk_size_per_cta):
-    skip_if_no_cute_dsl()
-    skip_if_not_blackwell()
-
-    torch.manual_seed(42)
-    torch.cuda.manual_seed(42)
-
-    # Set input data (same structure as test_indexer_topk_decode)
-    num_gen_tokens = batch_size * next_n
-    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
-    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
-    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
-
-    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
-    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
-
-    # Create logits with the specified dtype
-    logits = create_random_logits(row_starts, row_ends, dtype, 42)
-
-    # Run CuTE DSL multi-CTA implementation
-    result = torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
-        input_values=logits,
-        seq_lens=seq_lens,
-        top_k=index_topk,
-        next_n=next_n,
-        num_copy_bits=256,
-        chunk_size_per_cta=chunk_size_per_cta,
-    )
-    cute_indices = result
-
-    torch.cuda.synchronize()
-
-    # Run reference implementation
-    max_row_len = row_ends.max().item()
-    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
-    mask_lo = torch_indices >= 0
-    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
-    mask = mask_lo & mask_hi
-    torch_indices = torch_indices.masked_fill(~mask, -1)
-
-    # Convert cute_indices to int32 for comparison
-    cute_indices_int32 = cute_indices.to(torch.int32)
-
-    # Compare results
-    assert compare_top_k_results(
-        logits, cute_indices_int32, torch_indices, row_starts, row_ends,
-        index_topk
-    ), "CuTE DSL multi-CTA top-k results don't match torch.topk"
+    _run_cute_dsl_topk_test(
+        batch_size, next_n, index_topk, num_tokens, dtype,
+        lambda logits, seq_lens: torch.ops.trtllm.
+        cute_dsl_topk_decode_multi_cta_blackwell(
+            input_values=logits, seq_lens=seq_lens, top_k=index_topk,
+            next_n=next_n, num_copy_bits=256,
+            chunk_size_per_cta=chunk_size_per_cta))
 
 
-def index_topk_decode_benchmark(
-    batch_size=64,
-    next_n=1,
-    index_topk=2048,
-    num_tokens=8192,
-    dtype=torch.float16,
-    num_warmup=10,
-    num_iterations=100,
-):
-    """Benchmark comparison between CuTE DSL and standard top-k implementations.
-
-    Args:
-        batch_size: Number of sequences
-        next_n: Number of candidates per sequence (for speculative decoding)
-        index_topk: Number of top elements to select
-        num_tokens: Vocabulary size
-        dtype: Data type for logits
-        num_warmup: Number of warmup iterations
-        num_iterations: Number of timed iterations
-
-    Returns:
-        dict: Performance metrics for both implementations
-    """
-
-    # Check if CuTE DSL is available
-    if not IS_CUTLASS_DSL_AVAILABLE:
-        print("CuTE DSL not available, skipping benchmark")
-        return None
-
-    # Check if Blackwell architecture
-    sm = getSMVersion()
-    if sm < 100:
-        print(f"CuTE DSL top-k requires Blackwell (SM100+), got SM{sm}")
-        return None
-
-    print(f"\n{'=' * 80}")
-    print("Top-K Performance Benchmark")
-    print(f"{'=' * 80}")
-    print("Configuration:")
-    print(f"  batch_size: {batch_size}")
-    print(f"  next_n: {next_n}")
-    print(f"  index_topk: {index_topk}")
-    print(f"  num_tokens: {num_tokens}")
-    print(f"  dtype: {dtype}")
-    print(f"  num_warmup: {num_warmup}")
-    print(f"  num_iterations: {num_iterations}")
-    print(f"{'=' * 80}\n")
-
-    # Set up input data
-    num_gen_tokens = batch_size * next_n
-    row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
-    row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
-    next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
-
-    seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
-    row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
-
-    # Create logits
-    logits = create_random_logits(row_starts, row_ends, dtype, 42)
-
-    # Create output tensors for standard implementation
-    indices_standard = torch.empty((num_gen_tokens, index_topk), dtype=torch.int32, device="cuda")
-
-    # ========================================================================
-    # Benchmark 1: Standard indexer_topk_decode
-    # ========================================================================
-    print("Benchmarking: torch.ops.trtllm.indexer_topk_decode")
-
-    # Warmup
-    for _ in range(num_warmup):
-        torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices_standard, next_n, index_topk)
-    torch.cuda.synchronize()
-
-    # Timed runs
-    start_event = torch.cuda.Event(enable_timing=True)
-    end_event = torch.cuda.Event(enable_timing=True)
-
-    start_event.record()
-    for _ in range(num_iterations):
-        torch.ops.trtllm.indexer_topk_decode(logits, seq_lens, indices_standard, next_n, index_topk)
-    end_event.record()
-    torch.cuda.synchronize()
-
-    time_standard_us = start_event.elapsed_time(end_event) / num_iterations * 1000
-
-    print(f"  Average time: {time_standard_us:.4f} us")
-    print(
-        f"  Throughput: {num_gen_tokens * num_tokens / time_standard_us / 1e6:.2f} M elements/s\n"
-    )
-
-    # ========================================================================
-    # Benchmark 2: CuTE DSL top-k
-    # ========================================================================
-    print("Benchmarking: torch.ops.trtllm.cute_dsl_topk_decode_blackwell")
-
-    # Warmup
-    for _ in range(num_warmup):
-        indices_cute = torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-        )
-    torch.cuda.synchronize()
-
-    # Timed runs
-    start_event.record()
-    for _ in range(num_iterations):
-        indices_cute = torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
-            input_values=logits,
-            seq_lens=seq_lens,
-            top_k=index_topk,
-            next_n=next_n,
-            num_copy_bits=256,
-        )
-    end_event.record()
-    torch.cuda.synchronize()
-
-    time_cute_us = start_event.elapsed_time(end_event) / num_iterations * 1000
-
-    print(f"  Average time: {time_cute_us:.4f} us")
-    print(f"  Throughput: {num_gen_tokens * num_tokens / time_cute_us / 1e6:.2f} M elements/s\n")
-
-    # ========================================================================
-    # Results Summary
-    # ========================================================================
-    speedup = time_standard_us / time_cute_us
-    print(f"{'=' * 80}")
-    print("Results Summary:")
-    print(f"{'=' * 80}")
-    print(f"  Standard implementation: {time_standard_us:.4f} us")
-    print(f"  CuTE DSL implementation: {time_cute_us:.4f} us")
-    print(
-        f"  Speedup: {speedup:.2f}x {'(CuTE DSL faster)' if speedup > 1 else '(Standard faster)'}"
-    )
-    print(f"{'=' * 80}\n")
-
-    # Verify correctness
-    print("Verifying correctness...")
-    max_row_len = row_ends.max().item()
-    torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
-    mask_lo = torch_indices >= 0
-    mask_hi = (torch_indices - (row_ends - row_starts)[:, None]) < 0
-    mask = mask_lo & mask_hi
-    torch_indices = torch_indices.masked_fill(~mask, -1)
-
-    # Convert cute_indices to int32 for comparison
-    cute_indices_int32 = indices_cute.to(torch.int32)
-
-    # Compare results
-    correct = compare_top_k_results(
-        logits, cute_indices_int32, torch_indices, row_starts, row_ends, index_topk
-    )
-    print(f"Correctness check: {'PASSED' if correct else 'FAILED'}\n")
-
-    return {
-        "config": {
-            "batch_size": batch_size,
-            "next_n": next_n,
-            "index_topk": index_topk,
-            "num_tokens": num_tokens,
-            "dtype": str(dtype),
-        },
-        "standard_us": time_standard_us,
-        "cute_dsl_us": time_cute_us,
-        "speedup": speedup,
-        "correct": correct,
-    }
-
-
-if __name__ == "__main__":
-    import argparse
-
-    parser = argparse.ArgumentParser(description="Top-K Performance Benchmark")
-    parser.add_argument("--batch_size", type=int, default=1, help="Batch size")
-    parser.add_argument("--next_n", type=int, default=1, help="Number of candidates per sequence")
-    parser.add_argument("--index_topk", type=int, default=2048, help="Top-k value")
-    parser.add_argument("--num_tokens", type=int, default=8192, help="Vocabulary size")
-    parser.add_argument(
-        "--dtype",
-        type=str,
-        default="float32",
-        choices=["float16", "bfloat16", "float32"],
-        help="Data type",
-    )
-    parser.add_argument("--num_warmup", type=int, default=10, help="Number of warmup iterations")
-    parser.add_argument(
-        "--num_iterations", type=int, default=100, help="Number of timed iterations"
-    )
-    parser.add_argument("--sweep", action="store_true", help="Run parameter sweep")
-
-    args = parser.parse_args()
-
-    dtype_map = {
-        "float16": torch.float16,
-        "bfloat16": torch.bfloat16,
-        "float32": torch.float32,
-    }
-
-    if args.sweep:
-        print("\n" + "=" * 80)
-        print("Running Parameter Sweep")
-        print("=" * 80 + "\n")
-
-        results = []
-
-        # Sweep configurations
-        configs = [
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 4096},
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 8192},
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 16384},
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 32768},
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 65536},
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 131072},
-            {"batch_size": 1, "next_n": 1, "index_topk": 2048, "num_tokens": 262144},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 4096},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 8192},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 16384},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 32768},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 65536},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 131072},
-            {"batch_size": 16, "next_n": 1, "index_topk": 2048, "num_tokens": 262144},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 4096},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 8192},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 16384},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 32768},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 65536},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 131072},
-            {"batch_size": 64, "next_n": 1, "index_topk": 2048, "num_tokens": 262144},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 4096},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 8192},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 16384},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 32768},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 65536},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 131072},
-            {"batch_size": 128, "next_n": 1, "index_topk": 2048, "num_tokens": 262144},
-        ]
-
-        for config in configs:
-            result = index_topk_decode_benchmark(
-                dtype=dtype_map[args.dtype],
-                num_warmup=args.num_warmup,
-                num_iterations=args.num_iterations,
-                **config,
-            )
-            if result:
-                results.append(result)
-
-        # Print summary table
-        print("\n" + "=" * 80)
-        print("Summary Table")
-        print("=" * 80)
-        print(f"{'Config':<40} {'Standard (ms)':<15} {'CuTE DSL (ms)':<15} {'Speedup':<10}")
-        print("-" * 80)
-        for r in results:
-            config_str = f"B={r['config']['batch_size']}, K={r['config']['index_topk']}, V={r['config']['num_tokens']}"
-            print(
-                f"{config_str:<40} {r['standard_us']:>14.4f} {r['cute_dsl_us']:>14.4f} {r['speedup']:>9.2f}x"
-            )
-        print("=" * 80 + "\n")
-
-    else:
-        # Single run
-        index_topk_decode_benchmark(
-            batch_size=args.batch_size,
-            next_n=args.next_n,
-            index_topk=args.index_topk,
-            num_tokens=args.num_tokens,
-            dtype=dtype_map[args.dtype],
-            num_warmup=args.num_warmup,
-            num_iterations=args.num_iterations,
-        )
+@pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
+@pytest.mark.parametrize("next_n", [1, 2])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
+def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk,
+                                      num_tokens):
+    _run_cute_dsl_topk_test(
+        batch_size, next_n, index_topk, num_tokens, torch.float32,
+        lambda logits, seq_lens: torch.ops.trtllm.
+        cute_dsl_indexer_topk_decode(
+            input_values=logits, seq_lens=seq_lens, top_k=index_topk,
+            next_n=next_n, num_copy_bits=256))
