@@ -9,7 +9,6 @@ from tensorrt_llm._torch.shared_tensor import SharedTensorContainer
 from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.bindings import executor as tllm_executor
 from tensorrt_llm.executor.result import TokenLogprobs
-from tensorrt_llm.logger import logger
 from tensorrt_llm.sampling_params import LogprobMode
 
 SamplingConfig = tensorrt_llm.bindings.SamplingConfig
@@ -839,21 +838,6 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
             if not time_breakdown_metrics:
                 time_breakdown_metrics = None
 
-        if len(result) > 0 and self.is_context_only_request:
-            import tensorrt_llm.bindings.executor as _tllm_exec
-            try:
-                deserialized = _tllm_exec.deserialize_result(result)
-                _cpp = getattr(deserialized, 'context_phase_params',
-                               'MISSING_ATTR')
-                logger.info(
-                    f"[DISAGG_DEBUG] create_response: ctx_only req={self.py_request_id}, "
-                    f"is_final={is_final}, state={self.state}, "
-                    f"cpp_context_phase_params={_cpp}, "
-                    f"req.context_phase_params={self.context_phase_params}")
-            except Exception as e:
-                logger.info(
-                    f"[DISAGG_DEBUG] create_response: deserialization check failed: {e}"
-                )
         return LlmResponse(
             request_id=self.py_request_id
             if not self.is_child else self.parent_request_id,

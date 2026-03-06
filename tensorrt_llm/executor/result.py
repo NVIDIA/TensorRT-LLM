@@ -19,8 +19,6 @@ try:
 except ModuleNotFoundError:
     pass
 
-import logging as _logging
-
 from .._utils import nvtx_range_debug
 from ..bindings import executor as tllm
 from ..disaggregated_params import DisaggregatedParams
@@ -29,8 +27,6 @@ from ..llmapi.utils import AsyncQueue, print_traceback_on_error
 from ..metrics import MetricNames, MetricsCollector, RequestEventTiming
 from ..sampling_params import LogprobParams, SamplingParams
 from .utils import ErrorResponse, has_event_loop, is_llm_response
-
-_disagg_debug_logger = _logging.getLogger("tensorrt_llm.disagg_debug")
 
 if TYPE_CHECKING:
     from .executor import GenerationExecutor
@@ -257,14 +253,6 @@ class GenerationResultBase:
 
         output = self._outputs[seq_idx]
         output.disaggregated_params = self.disaggregated_params
-        if self.disaggregated_params is not None:
-            _disagg_debug_logger.info(
-                "[DISAGG_DEBUG] _handle_sequence: setting output.disaggregated_params "
-                "ctx_request_id=%s, request_type=%s, disagg_request_id=%s",
-                self.disaggregated_params.ctx_request_id,
-                self.disaggregated_params.request_type,
-                self.disaggregated_params.disagg_request_id,
-            )
         output._last_token_ids_len = len(output.token_ids)
         if self.sampling_params.use_beam_search:
             # Beam search enforces returning all generated tokens
@@ -450,26 +438,7 @@ class GenerationResultBase:
             self.decoding_iter = response_result.decoding_iter
             self.cached_tokens = getattr(response_result, 'cached_tokens', 0)
             self.avg_decoded_tokens_per_iter = response_result.avg_decoded_tokens_per_iter
-            _disagg_debug_logger.info(
-                "[DISAGG_DEBUG] _handle_response (LLM path): "
-                "request_id=%s, is_final=%s, "
-                "context_phase_params=%s, "
-                "existing_disagg_params=%s",
-                response.request_id,
-                response_result.is_final,
-                context_phase_params,
-                self._disaggregated_params,
-            )
             if context_phase_params is not None:
-                _disagg_debug_logger.info(
-                    "[DISAGG_DEBUG] _handle_response: context_phase_params details: "
-                    "req_id=%s, first_gen_tokens=%s, ctx_dp_rank=%s, "
-                    "disagg_info_endpoint=%s",
-                    context_phase_params.req_id,
-                    context_phase_params.first_gen_tokens,
-                    context_phase_params.ctx_dp_rank,
-                    context_phase_params.disagg_info_endpoint,
-                )
                 existing_disagg_params = self.disaggregated_params
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
                 # `mrope_position_deltas_handle`. However, explicitly set
@@ -484,22 +453,6 @@ class GenerationResultBase:
                     ctx_dp_rank=context_phase_params.ctx_dp_rank,
                     ctx_info_endpoint=context_phase_params.disagg_info_endpoint,
                     multimodal_embedding_handles=None,
-                )
-                _disagg_debug_logger.info(
-                    "[DISAGG_DEBUG] _handle_response: UPDATED _disaggregated_params: "
-                    "ctx_request_id=%s, request_type=%s, disagg_request_id=%s",
-                    self._disaggregated_params.ctx_request_id,
-                    self._disaggregated_params.request_type,
-                    self._disaggregated_params.disagg_request_id,
-                )
-            else:
-                _disagg_debug_logger.info(
-                    "[DISAGG_DEBUG] _handle_response: context_phase_params is None! "
-                    "Retaining initial _disaggregated_params with "
-                    "ctx_request_id=%s, request_type=%s",
-                    getattr(self._disaggregated_params, 'ctx_request_id',
-                            'N/A'),
-                    getattr(self._disaggregated_params, 'request_type', 'N/A'),
                 )
 
             finish_reasons = response_result.finish_reasons

@@ -516,18 +516,6 @@ def completion_response_post_processor(
             text = args.prompt + text
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
-        import logging as _pp_logging
-        _pp_logger = _pp_logging.getLogger("tensorrt_llm.disagg_debug")
-        _pp_logger.info(
-            "[DISAGG_DEBUG] completion_response_post_processor: "
-            "output.disaggregated_params=%s, "
-            "converted=%s, "
-            "ctx_request_id=%s, request_type=%s",
-            output.disaggregated_params,
-            disaggregated_params,
-            getattr(disaggregated_params, 'ctx_request_id', 'N/A'),
-            getattr(disaggregated_params, 'request_type', 'N/A'),
-        )
         choice = CompletionResponseChoice(
             text=text if args.detokenize else "",
             token_ids=None if args.detokenize else output.token_ids,

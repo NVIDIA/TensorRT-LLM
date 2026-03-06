@@ -194,24 +194,7 @@ class BindKvCacheTransceiver(KvCacheTransceiver):
             rnn_layer_num_per_pp_rank)
 
     def respond_and_send_async(self, req: LlmRequest):
-        logger.info(
-            f"[DISAGG_DEBUG] BindKvCacheTransceiver.respond_and_send_async: "
-            f"BEFORE C++ call: req_id={req.py_request_id}, "
-            f"request_id={req.request_id}, state={req.state}, "
-            f"context_phase_params_before={req.context_phase_params}")
-        result = self.impl.respond_and_send_async(req)
-        logger.info(
-            f"[DISAGG_DEBUG] BindKvCacheTransceiver.respond_and_send_async: "
-            f"AFTER C++ call: req_id={req.py_request_id}, "
-            f"state={req.state}, "
-            f"context_phase_params_after={req.context_phase_params}")
-        if req.context_phase_params is not None:
-            logger.info(
-                f"[DISAGG_DEBUG] BindKvCacheTransceiver.respond_and_send_async: "
-                f"cpp.req_id={req.context_phase_params.req_id}, "
-                f"cpp.first_gen_tokens={req.context_phase_params.first_gen_tokens}, "
-                f"cpp.ctx_dp_rank={req.context_phase_params.ctx_dp_rank}")
-        return result
+        return self.impl.respond_and_send_async(req)
 
     def request_and_receive_sync(self, req: LlmRequest):
         return self.impl.request_and_receive_sync(req)
