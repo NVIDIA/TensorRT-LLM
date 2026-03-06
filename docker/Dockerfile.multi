@@ -35,8 +35,8 @@ ARG NCCL_VER
 ARG CUBLAS_VER
 ARG TORCH_INSTALL_TYPE="skip"
 RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=source=docker/common,target=/tmp/docker/common \
-    --mount=source=constraints.txt,target=/tmp/constraints.txt \
+    --mount=source=docker/common,target=/mnt/docker/common \
+    --mount=source=constraints.txt,target=/mnt/constraints.txt \
     GITHUB_MIRROR=${GITHUB_MIRROR} \
     PYTHON_VERSION=${PYTHON_VERSION} \
     TRT_VER=${TRT_VER} \
@@ -47,17 +47,17 @@ RUN --mount=type=cache,target=/root/.cache/pip \
     TORCH_INSTALL_TYPE=${TORCH_INSTALL_TYPE} \
     echo "Using GitHub mirror: $GITHUB_MIRROR" && \
     echo "Using Python version: $PYTHON_VERSION" && \
-    bash /tmp/docker/common/install.sh --base --cmake --ccache --cuda_toolkit --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
-    pip3 install --no-cache-dir -r /tmp/constraints.txt && \
+    bash /mnt/docker/common/install.sh --base --cmake --ccache --cuda_toolkit --tensorrt --polygraphy --mpi4py --pytorch --opencv && \
+    pip3 install --no-cache-dir -r /mnt/constraints.txt && \
     # Remove nbconvert to avoid https://github.com/advisories/GHSA-xm59-rqc7-hhvf in the base NGC PyTorch image.
     (pip3 uninstall -y nbconvert || true)
 
 # Install UCX, NIXL, etcd
 RUN --mount=type=cache,target=/root/.cache/pip \
-    --mount=source=docker/common,target=/tmp/docker/common \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /tmp/docker/common/install_ucx.sh && \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /tmp/docker/common/install_nixl.sh && \
-    bash /tmp/docker/common/install_etcd.sh && \
+    --mount=source=docker/common,target=/mnt/docker/common \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /mnt/docker/common/install_ucx.sh && \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /mnt/docker/common/install_nixl.sh && \
+    bash /mnt/docker/common/install_etcd.sh && \
     rm -rf /root/.cache/uv/archive-v0 && \
     # WAR against https://github.com/advisories/GHSA-58pv-8j8x-9vj2
     rm -rf /usr/local/lib/python3.12/dist-packages/setuptools/_vendor/jaraco.context-5.3.0.dist-info && \
@@ -67,8 +67,8 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 # Generate OSS attribution file for devel image
 ARG TRT_LLM_VER
 ARG TARGETARCH
-RUN --mount=source=scripts/generate_container_oss_attribution.sh,target=/tmp/generate_container_oss_attribution.sh \
-    bash /tmp/generate_container_oss_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
+RUN --mount=source=scripts/generate_container_oss_attribution.sh,target=/mnt/generate_container_oss_attribution.sh \
+    bash /mnt/generate_container_oss_attribution.sh "devel" "${TRT_LLM_VER}" "${TARGETARCH}"
 
 FROM ${TRITON_IMAGE}:${TRITON_BASE_TAG} AS triton
 
@@ -82,12 +82,12 @@ COPY --from=triton /opt/tritonserver/bin /opt/tritonserver/bin
 COPY --from=triton /opt/tritonserver/caches /opt/tritonserver/caches
 
 # Install Triton and Mooncake
-RUN --mount=source=docker/common,target=/tmp/docker/common \
-    GITHUB_MIRROR=${GITHUB_MIRROR} bash /tmp/docker/common/install_triton.sh && \
+RUN --mount=source=docker/common,target=/mnt/docker/common \
+    GITHUB_MIRROR=${GITHUB_MIRROR} bash /mnt/docker/common/install_triton.sh && \
     if [ -f /etc/redhat-release ]; then \
         echo "Rocky8 detected, skipping mooncake installation"; \
     else \
-        bash /tmp/docker/common/install_mooncake.sh; \
+        bash /mnt/docker/common/install_mooncake.sh; \
     fi
 
 FROM ${DEVEL_IMAGE} AS wheel
@@ -116,26 +116,26 @@ WORKDIR /app/tensorrt_llm
 RUN --mount=type=cache,target=/root/.cache/pip --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
     pip install /tmp/wheel/tensorrt_llm*.whl
 
-RUN --mount=source=README.md,target=/tmp/ctx/README.md \
-    --mount=source=docs,target=/tmp/ctx/docs \
-    --mount=source=cpp/include,target=/tmp/ctx/include \
-    --mount=source=examples,target=/tmp/ctx/examples \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/tmp/wheel \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/tmp/benchmarks \
-    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/benchmarks,target=/tmp/cpp_benchmarks \
+RUN --mount=source=README.md,target=/mnt/ctx/README.md \
+    --mount=source=docs,target=/mnt/ctx/docs \
+    --mount=source=cpp/include,target=/mnt/ctx/include \
+    --mount=source=examples,target=/mnt/ctx/examples \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/build,target=/mnt/wheel \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/benchmarks,target=/mnt/benchmarks \
+    --mount=type=bind,from=wheel,source=/src/tensorrt_llm/cpp/build/benchmarks,target=/mnt/cpp_benchmarks \
     # Copy build context files
-    cp /tmp/ctx/README.md ./ && \
-    cp -r /tmp/ctx/docs ./docs && \
-    cp -r /tmp/ctx/include ./include && \
-    cp -r /tmp/ctx/examples ./examples && \
+    cp /mnt/ctx/README.md ./ && \
+    cp -r /mnt/ctx/docs ./docs && \
+    cp -r /mnt/ctx/include ./include && \
+    cp -r /mnt/ctx/examples ./examples && \
     chmod -R a+w examples && \
     # Copy wheel stage outputs
-    cp /tmp/wheel/tensorrt_llm*.whl ./ && \
-    cp -r /tmp/benchmarks ./benchmarks && \
+    cp /mnt/wheel/tensorrt_llm*.whl ./ && \
+    cp -r /mnt/benchmarks ./benchmarks && \
     mkdir -p benchmarks/cpp && \
-    cp /tmp/cpp_benchmarks/bertBenchmark \
-       /tmp/cpp_benchmarks/gptManagerBenchmark \
-       /tmp/cpp_benchmarks/disaggServerBenchmark \
+    cp /mnt/cpp_benchmarks/bertBenchmark \
+       /mnt/cpp_benchmarks/gptManagerBenchmark \
+       /mnt/cpp_benchmarks/disaggServerBenchmark \
        benchmarks/cpp/ && \
     rm -v \
       benchmarks/cpp/bertBenchmark.cpp \
@@ -164,8 +164,8 @@ ENV TRT_LLM_GIT_COMMIT=${GIT_COMMIT} \
     TRT_LLM_VERSION=${TRT_LLM_VER}
 
 # Generate OSS attribution file for release image
-RUN --mount=source=scripts/generate_container_oss_attribution.sh,target=/tmp/generate_container_oss_attribution.sh \
-    bash /tmp/generate_container_oss_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
+RUN --mount=source=scripts/generate_container_oss_attribution.sh,target=/mnt/generate_container_oss_attribution.sh \
+    bash /mnt/generate_container_oss_attribution.sh "release" "${TRT_LLM_VER}" "${TARGETARCH}"
 
 FROM wheel AS tritonbuild
 
