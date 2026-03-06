@@ -3,8 +3,6 @@
 import os
 from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
-import numpy as np
-
 if TYPE_CHECKING:
     from .scheduler import WaitingQueue
 
@@ -469,30 +467,9 @@ class RequestBroadcaster:
         self.dist = dist
         self.hang_detector = hang_detector
         self.send_requests_handler = None
-        # Pre-allocated buffer for cheap count broadcast (avoids pickle)
-        self._count_buf = np.zeros(1, dtype=np.int32)
-        self._mpi_comm = None
-        self._use_mpi_fast_path = False
-        try:
-            from tensorrt_llm._utils import mpi_comm
-            from tensorrt_llm.bindings.BuildInfo import ENABLE_MULTI_DEVICE
-            if ENABLE_MULTI_DEVICE:
-                self._mpi_comm = mpi_comm()
-                self._use_mpi_fast_path = True
-        except Exception:
-            pass
 
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
-        # Fast path: skip expensive pickle broadcast when no new requests.
-        # Uses a cheap MPI.Bcast of a single int32 to synchronize the count.
-        if self._use_mpi_fast_path:
-            if self.dist.rank == 0:
-                self._count_buf[0] = len(new_requests)
-            self._mpi_comm.Bcast(self._count_buf, root=0)
-            if self._count_buf[0] == 0:
-                return [], None
-
         if self.dist.rank == 0:
             py_request_objects = self._collect_py_objects(new_requests)
         else:
