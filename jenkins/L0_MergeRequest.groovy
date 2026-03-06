@@ -66,6 +66,8 @@ boolean enableFailFast = !(env.JOB_NAME ==~ /.*PostMerge.*/ || env.JOB_NAME ==~ 
 
 boolean isReleaseCheckMode = (gitlabParamsFromBot.get("run_mode", "full") == "release_check")
 
+GEN_POST_MERGE_BUILDS_ONLY = (env.JOB_NAME?.contains("GenPostMergeBuilds") ?: false)
+
 BUILD_STATUS_NAME = isReleaseCheckMode ? "Jenkins Release Check" : "Jenkins Full Build"
 
 def trimForStageList(stageNameList)
@@ -342,15 +344,12 @@ def mergeWaiveList(pipeline, globalVars)
 
     try {
         // Get TOT waive list
-        LLM_TOT_ROOT = "llm-tot"
         targetBranch = env.gitlabTargetBranch ? env.gitlabTargetBranch : globalVars[TARGET_BRANCH]
         echo "Target branch: ${targetBranch}"
         withCredentials([string(credentialsId: 'default-llm-repo', variable: 'DEFAULT_LLM_REPO')]) {
-            trtllm_utils.checkoutSource(DEFAULT_LLM_REPO, targetBranch, LLM_TOT_ROOT, false, true)
+            trtllm_utils.checkoutFile(DEFAULT_LLM_REPO, targetBranch, "tests/integration/test_lists/waives.txt", ".")
         }
-        targetBranchTOTCommit = sh (script: "cd ${LLM_TOT_ROOT} && git rev-parse HEAD", returnStdout: true).trim()
-        echo "Target branch TOT commit: ${targetBranchTOTCommit}"
-        sh "cp ${LLM_TOT_ROOT}/tests/integration/test_lists/waives.txt ./waives_TOT_${targetBranchTOTCommit}.txt"
+        sh "mv waives.txt waives_TOT.txt"
 
         // Get waive list diff in current MR
         def diff = getMergeRequestOneFileChanges(pipeline, globalVars, "tests/integration/test_lists/waives.txt")
@@ -362,7 +361,7 @@ def mergeWaiveList(pipeline, globalVars)
         sh """
             python3 mergeWaiveList.py \
             --cur-waive-list=waives_CUR_${env.gitlabCommit}.txt \
-            --latest-waive-list=waives_TOT_${targetBranchTOTCommit}.txt \
+            --latest-waive-list=waives_TOT.txt \
             --diff-file=diff_content.txt \
             --output-file=waives.txt
         """
@@ -1051,6 +1050,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
     stages = [
         "Release-Check": {
             script {
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping Release-Check (GenPostMergeBuilds mode: builds only)"
+                    return
+                }
                 launchReleaseCheck(this)
             }
         },
@@ -1064,6 +1067,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         'wheelDockerImagePy312': globalVars["LLM_ROCKYLINUX8_PY312_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-x86_64", reuseBuild, enableFailFast, globalVars, "x86_64", additionalParameters)
+                }
+
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping x86_64 tests (GenPostMergeBuilds mode: builds only)"
+                    return
                 }
 
                 testStageName = "[Test-x86_64-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
@@ -1169,6 +1177,11 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
                         "dockerImage": globalVars["LLM_SBSA_DOCKER_IMAGE"],
                     ]
                     launchJob("/LLM/helpers/Build-SBSA", reuseBuild, enableFailFast, globalVars, "SBSA", additionalParameters)
+                }
+
+                if (GEN_POST_MERGE_BUILDS_ONLY) {
+                    echo "Skipping SBSA tests (GenPostMergeBuilds mode: builds only)"
+                    return
                 }
 
                 testStageName = "[Test-SBSA-Single-GPU] ${env.localJobCredentials ? "Remote Run" : "Run"}"
@@ -1281,10 +1294,10 @@ def launchStages(pipeline, reuseBuild, testFilter, enableFailFast, globalVars)
         }
     ]
 
-    if (env.JOB_NAME ==~ /.*PostMerge.*/) {
+    if (env.JOB_NAME ==~ /.*PostMerge.*/ && !GEN_POST_MERGE_BUILDS_ONLY) {
         stages += dockerBuildJob
     }
-    if (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images")) {
+    if (!GEN_POST_MERGE_BUILDS_ONLY && (testFilter[(TEST_STAGE_LIST)]?.contains("Build-Docker-Images") || testFilter[(EXTRA_STAGE_LIST)]?.contains("Build-Docker-Images"))) {
         stages += dockerBuildJob
         testFilter[(TEST_STAGE_LIST)]?.remove("Build-Docker-Images")
         testFilter[(EXTRA_STAGE_LIST)]?.remove("Build-Docker-Images")
@@ -1374,6 +1387,19 @@ pipeline {
                         globalVars[CACHED_CHANGED_FILE_LIST] = null
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
+                }
+            }
+        }
+        stage("Upload Build Info") {
+            steps {
+                script {
+                    def buildInfo = "commit=${env.gitlabCommit}\n" +
+                        "branch=${env.gitlabTargetBranch ?: env.BRANCH_NAME ?: 'unknown'}\n" +
+                        "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                        "jenkins_url=${env.BUILD_URL}"
+                    writeFile file: 'build_info.txt', text: buildInfo
+                    trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+                    echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
                 }
             }
         }

@@ -1069,7 +1069,7 @@ class FP8BatchedGemmRunner(TunableRunner):
     def get_dynamic_tensor_specs(cls) -> Tuple[DynamicTensorSpec, ...]:
         """Get the dynamic tensor specs for use with the AutoTuner."""
 
-        # These indices correspond to the 0th input tensor and it's first dimension
+        # These indices correspond to the 0th input tensor and its first dimension
         # i.e. we are tuning M where the first input tensor is of shape [B, M, K]
 
         MAT1_IDX = 0
@@ -1769,7 +1769,11 @@ class AllReduceRunner(TunableRunner):
                                                 do_preparation=True)
             return input
         if tactic == -1:
-            tactic = AllReduceStrategy.NCCL_SYMMETRIC.value
+            # tactic == -1 means the autotuner cache missed for this shape,
+            # so we fall back to plain NCCL instead of NCCL_SYMMETRIC.
+            # NCCL_SYMMETRIC requires ncclMemAlloc which can fail asymmetrically
+            # across ranks under OOM, causing a deadlock at ncclCommWindowRegister.
+            tactic = AllReduceStrategy.NCCL.value
 
         return torch.ops.trtllm.allreduce(
             input,

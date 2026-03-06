@@ -14,7 +14,6 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
   co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
-- Python imports: `from package.subpackage import module` (never `from module import Class`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
 
 ## Common Commands
@@ -101,7 +100,6 @@ HuggingFace Model → LLM API → Executor (PyTorch/AutoDeploy/TensorRT)
 - **Integration tests need GPUs + models** — always set `LLM_MODELS_ROOT` and ensure GPU access. Unit tests don't.
 - **Copyright year** — update to current year when modifying existing files; add full header to new files.
 - **Avoid broad exception handling** — catch specific exceptions, not bare `except:` (see `CODING_GUIDELINES.md`).
-- **Python import style is enforced** — `from package.subpackage import module`, never `from module import Class`. Pre-commit will not catch this.
 - **One concern per PR** — avoid scope creep. If a PR touches unrelated areas, split it.
 - **User-facing configuration classes** - when editing or defining any user-facing configuration classes (particularly `LlmArgs` or any class used in its fields), you **MUST** follow the Pydantic guidelines in `CODING_GUIDELINES.md`.
 

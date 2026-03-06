@@ -3,6 +3,7 @@ import contextlib
 import functools
 import gc
 import inspect
+import itertools
 import math
 import os
 import weakref
@@ -53,7 +54,7 @@ from ..speculative import (SpecMetadata, get_draft_kv_cache_manager,
                            update_spec_config_from_model_config)
 from ..speculative.drafting_loops import BaseDraftingLoopWrapper
 from ..speculative.eagle3 import Eagle3ResourceManager, Eagle3SpecMetadata
-from ..speculative.mtp import SampleStateTensorsMTP
+from ..speculative.spec_sampler_base import SampleStateTensorsSpec
 from ..speculative.utils import SpecDecodingTensor
 from ..utils import (get_model_extra_attrs,
                      set_per_request_piecewise_cuda_graph_flag,
@@ -361,7 +362,7 @@ class PyTorchModelEngine(ModelEngine):
         # 3) The model configuration is not loaded until the model engine
         # is initialized.
         #
-        # NOTE: This can simplified by decoupling the model config loading and
+        # NOTE: This can be simplified by decoupling the model config loading and
         # the model engine.
         self.attn_metadata = None
         self.iter_states = {}
@@ -676,13 +677,18 @@ class PyTorchModelEngine(ModelEngine):
         if not self.mapping.has_cp_helix():
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
-
-        # Set the value back to the original value after all warmups are complete
-        self.enable_spec_decode = self.is_spec_decode
+        if not self.is_draft_model and not self.mapping.has_cp_helix(
+        ) and self.guided_decoder is None:
+            # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
+            self._general_warmup(resource_manager, reverse=True)
 
     def _general_warmup(self,
                         resource_manager: ResourceManager,
                         reverse: bool = False):
+        """
+        A General warmup to warmup with several different requests.
+        It is used to warmup torch.compile path and warmup memory pool before running real requests.
+        """
         kv_cache_manager = resource_manager.get_resource_manager(
             self.kv_cache_manager_key)
         token_num_upper_bound = min(self.max_num_tokens,
@@ -691,8 +697,8 @@ class PyTorchModelEngine(ModelEngine):
             token_num_upper_bound=token_num_upper_bound,
             max_num_draft_tokens=self.original_max_draft_len)
         max_batch_size = min(
-            self.batch_size,
-            curr_max_num_tokens // (1 + self.runtime_draft_len))
+            self.batch_size, curr_max_num_tokens //
+            (1 + self.runtime_draft_len) // self.max_beam_width)
 
         warmup_requests_configs = {
             (1, 1),  # Specialize for 1 token.
@@ -705,19 +711,28 @@ class PyTorchModelEngine(ModelEngine):
                                          reverse=reverse)
 
         for num_tokens, num_gen_tokens in warmup_requests_configs:
-            with self._release_batch_context(
-                    self._create_warmup_request(resource_manager, num_tokens,
-                                                num_gen_tokens),
-                    resource_manager) as batch:
-                if batch is None:
-                    continue  # Not enough KV cache space
-                logger.info(
-                    f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
-                )
-                self.forward(batch,
-                             new_tensors_device=None,
-                             resource_manager=resource_manager)
-                torch.cuda.synchronize()
+            # Helix CP does not support warmup with context requests.
+            if self.mapping.has_cp_helix() and num_tokens != num_gen_tokens:
+                continue
+            try:
+                with self._release_batch_context(
+                        self._create_warmup_request(resource_manager,
+                                                    num_tokens, num_gen_tokens),
+                        resource_manager) as batch:
+                    if batch is None:
+                        continue  # Not enough KV cache space
+                    logger.info(
+                        f"Run warmup with {num_tokens} tokens, include {num_gen_tokens} generation tokens"
+                    )
+                    self.forward(batch,
+                                 new_tensors_device=None,
+                                 resource_manager=resource_manager)
+                    torch.cuda.synchronize()
+            except torch.OutOfMemoryError:
+                logger.warning(
+                    f"OOM during general warmup with {num_tokens} tokens, "
+                    f"{num_gen_tokens} generation tokens. Skipping.")
+                torch.cuda.empty_cache()
 
     def _run_torch_compile_warmup(self, resource_manager: ResourceManager):
         """Runs warmup iterations to specialize torch.compile kernels."""
@@ -867,6 +882,8 @@ class PyTorchModelEngine(ModelEngine):
                                      new_tensors_device=None,
                                      resource_manager=resource_manager)
                         torch.cuda.synchronize()
+        # Set the value back to the original value after cuda graph warmups are complete
+        self.enable_spec_decode = self.is_spec_decode
 
     def _capture_piecewise_cuda_graphs(self, resource_manager: ResourceManager):
         """Captures piecewise CUDA graphs for context/prefill steps via torch.compile."""
@@ -903,8 +920,8 @@ class PyTorchModelEngine(ModelEngine):
                     gc.collect()
                     torch.cuda.empty_cache()
 
-        # When using piecewise cuda graph, the logits may suffer severe memory faction problem.
-        # When the num of requests is growing, the block allocated by torch cannot be reused.
+        # When using piecewise cuda graph, the logits may suffer severe memory fragmentation problem.
+        # As the number of requests grows, the blocks allocated by torch cannot be reused.
         # So after piecewise cuda graph capture, a request with most requests is triggered to make
         # sure that large enough blocks are allocated and can be correctly reused.
         for num_tokens in piecewise_cuda_graph_num_tokens:
@@ -1024,8 +1041,8 @@ class PyTorchModelEngine(ModelEngine):
 
         blocks_to_use = num_full_seqs * math.ceil(
             max_seq_len / kv_cache_manager.tokens_per_block) + math.ceil(
-                num_left_over_tokens /
-                kv_cache_manager.tokens_per_block) + num_gen_requests
+                num_left_over_tokens / kv_cache_manager.tokens_per_block
+            ) + num_gen_requests * self.max_beam_width
 
         if blocks_to_use > available_blocks and isinstance(
                 kv_cache_manager, KVCacheManager):
@@ -1266,7 +1283,8 @@ class PyTorchModelEngine(ModelEngine):
                 self.batch_size,
                 max_num_tokens=self.max_num_tokens,
                 spec_resource_manager=spec_resource_manager,
-                is_draft_model=self.is_draft_model)
+                is_draft_model=self.is_draft_model,
+                max_seq_len=self.max_seq_len)
 
         if self.spec_metadata is not None:
             return self.spec_metadata
@@ -1276,7 +1294,8 @@ class PyTorchModelEngine(ModelEngine):
             self.batch_size,
             max_num_tokens=self.max_num_tokens,
             spec_resource_manager=spec_resource_manager,
-            is_draft_model=self.is_draft_model)
+            is_draft_model=self.is_draft_model,
+            max_seq_len=self.max_seq_len)
         return self.spec_metadata
 
     def __del__(self) -> None:
@@ -1386,14 +1405,14 @@ class PyTorchModelEngine(ModelEngine):
 
     def get_max_num_sequences(self) -> int:
         """
-        Return the maximum number of sequences that the model supports. PyExecutor need this to compute max_num_active_requests
+        Return the maximum number of sequences that the model supports. PyExecutor needs this to compute max_num_active_requests
         """
         num_batches = self.mapping.pp_size
         return num_batches * self.batch_size
 
     def _preprocess_inputs(self, inputs: Dict[str, Any]):
         """
-        Make some changes to the device inputs and avoid block the async data transfer
+        Make some changes to the device inputs and avoid blocking the async data transfer
         """
         if self.enable_spec_decode and not self._disable_overlap_scheduler:
             # When enabling overlap scheduler, the kv cache for draft tokens will
@@ -1551,7 +1570,7 @@ class PyTorchModelEngine(ModelEngine):
                 return padded_num_tokens, True, None
             else:
                 logger.debug(
-                    f"Picewise cudagraph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
+                    f"Piecewise CUDA graph cannot be used with {total_num_tokens} tokens, {num_ctx_requests} context requests"
                 )
                 return total_num_tokens, False, None
 
@@ -2064,8 +2083,8 @@ class PyTorchModelEngine(ModelEngine):
         if new_tensors_device is not None:
             # speculative decoding cases: [batch, 1 + draft_len], others: [batch]
             new_tokens_device = new_tensors_device.new_tokens
-            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsMTP.
-            if isinstance(new_tensors_device, SampleStateTensorsMTP):
+            # When using overlap scheduler with speculative decoding, the target model's inputs would be SampleStateTensorsSpec.
+            if isinstance(new_tensors_device, SampleStateTensorsSpec):
                 assert self.enable_spec_decode and not self.is_draft_model
                 new_tokens_lens_device = new_tensors_device.new_tokens_lens  # [batch]
                 next_draft_tokens_device = new_tensors_device.next_draft_tokens  # [batch, draft_len]
@@ -2779,8 +2798,6 @@ class PyTorchModelEngine(ModelEngine):
         num_generation_requests = len(gen_request_seq_slots)
         # Cache indirection is only used for beam search on generation requests
         if self.use_beam_search and num_generation_requests > 0:
-            # CUDA Graph needs to set beam width during warmup (where the graph is captured), to ensure that cache indirection buffer is correctly picked up by the CUDA graph
-            is_cuda_graph_during_warmup = self.is_warmup and attn_metadata.is_cuda_graph
             if cache_indirection_buffer is not None:
                 #Copy cache indirection to local buffer with offsets changing:  seq_slots[i] -> i
                 # Convert to GPU tensor to avoid implicit sync
@@ -2791,7 +2808,7 @@ class PyTorchModelEngine(ModelEngine):
                                                    non_blocking=True)
                 self.cache_indirection_attention[:num_generation_requests].copy_(
                     cache_indirection_buffer[gen_request_seq_slots_tensor])
-            if cache_indirection_buffer is not None or is_cuda_graph_during_warmup:
+            if cache_indirection_buffer is not None or self.is_warmup:
                 attn_metadata.beam_width = self.max_beam_width
         else:
             attn_metadata.beam_width = 1
@@ -3452,6 +3469,22 @@ class PyTorchModelEngine(ModelEngine):
             else:
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
+
+        # Initialize SA state for new requests (MTP+SA path)
+        use_sa_spec = (self.spec_config is not None
+                       and getattr(self.spec_config, 'use_sa_spec', False))
+        if (use_sa_spec and spec_metadata is not None
+                and hasattr(spec_metadata, 'sa_manager')
+                and spec_metadata.sa_manager is not None
+                and self.mapping.is_last_pp_rank()):
+            sa_manager = spec_metadata.sa_manager
+            for request in itertools.chain(
+                    scheduled_requests.context_requests,
+                    scheduled_requests.generation_requests):
+                if request.py_request_id not in sa_manager._initialized_requests:
+                    sa_manager.add_request(request.py_request_id,
+                                           request.get_tokens(0))
+                    sa_manager._initialized_requests.add(request.py_request_id)
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
