@@ -1,0 +1,5 @@
+name: mooncake
+description: Mooncake transfer engine for distributed KV cache
+source: container
+directory_matches:
+- /usr/local/Mooncake

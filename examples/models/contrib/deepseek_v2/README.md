@@ -27,7 +27,7 @@ The Deepseek-v2 model requires least 8x80G GPU memory, model contains 236B param
 
 ## Overview
 
-The TensorRT LLM Deepseek-v2 implementation can be found in [tensorrt_llm/models/deepseek_v2/model.py](../../tensorrt_llm/models/deepseek_v2/model.py). The TensorRT LLM Deepseek-v2 example code is located in [`examples/models/contrib/deepseek_v2`](./). There is one main file:
+The TensorRT LLM Deepseek-v2 implementation can be found in [tensorrt_llm/models/deepseek_v2/model.py](../../../../tensorrt_llm/models/deepseek_v2/model.py). The TensorRT LLM Deepseek-v2 example code is located in [`examples/models/contrib/deepseek_v2`](./). There is one main file:
 
 * [`convert_checkpoint.py`](./convert_checkpoint.py) to convert the Deepseek-v2 model into TensorRT LLM checkpoint format.
 

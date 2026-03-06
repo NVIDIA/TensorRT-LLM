@@ -11,7 +11,7 @@ from torch import nn
 
 from tensorrt_llm.logger import logger
 
-from ..._utils import get_sm_version
+from ..._utils import get_sm_version, prefer_pinned
 from ..attention_backend.trtllm import (AttentionBackend, TrtllmAttention,
                                         TrtllmAttentionMetadata)
 from ..flashinfer_utils import IS_FLASHINFER_AVAILABLE
@@ -63,9 +63,12 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    SA = auto()
     DRAFT_TARGET = auto()
+    DRAFT_TARGET_ONE_MODEL = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
+    PARD = auto()
     NONE = auto()
     AUTO = auto()
 
@@ -85,13 +88,20 @@ class SpeculativeDecodingMode(IntEnum):
         return self == SpeculativeDecodingMode.EAGLE3
 
     def use_one_engine(self):
-        return self.is_eagle3_one_model() or self.is_mtp_one_model()
+        return self.is_eagle3_one_model() or self.is_mtp_one_model(
+        ) or self.is_external_drafter() or self.is_sa()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
 
+    def is_pard(self):
+        return self == SpeculativeDecodingMode.PARD
+
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
+
+    def is_sa(self):
+        return self == SpeculativeDecodingMode.SA
 
     def is_user_provided(self):
         return self == SpeculativeDecodingMode.USER_PROVIDED
@@ -102,25 +112,34 @@ class SpeculativeDecodingMode(IntEnum):
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
+    def is_draft_target_one_model(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+
     def is_save_hidden_states(self):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
+    def is_external_drafter(self):
+        return self.is_pard() or self.is_draft_target_one_model()
+
     def without_logits(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_external_drafter() or self.is_sa()
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram()
+        ) or self.is_ngram() or self.is_sa() or self.is_external_drafter()
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.has_draft_model()
+        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
+        )
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
-        return self.is_mtp_one_model() or self.is_eagle3_one_model()
+        return self.is_mtp_one_model() or self.is_eagle3_one_model(
+        ) or self.is_external_drafter() or self.is_sa()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -138,16 +157,16 @@ class SpeculativeDecodingMode(IntEnum):
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
-        return self.is_eagle3_one_model()
+        return self.is_eagle3_one_model() or self.is_external_drafter()
 
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model()
+        ) or self.is_eagle3_one_model() or self.is_external_drafter(
+        ) or self.is_sa()
 
     def has_spec_drafter(self):
-        return self.is_eagle3(
-        ) or self.is_draft_target() or self.is_ngram() or self.is_user_provided(
-        ) or self.is_mtp_eagle() or self.is_save_hidden_states()
+        return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
+        ) or self.is_user_provided() or self.is_mtp_eagle()
 
     def extend_ctx(self, attention_backend: Type[AttentionBackend]):
         """
@@ -164,12 +183,11 @@ class SpeculativeDecodingMode(IntEnum):
                               TrtllmAttention) or not xqa_supported
 
     def attention_need_spec_dec_mode(
-        self,
-        spec_resource_manager: Optional[BaseResourceManager],
-        is_draft_model: bool,
-        attention_backend: Type[AttentionBackend],
-        use_chain_drafter: bool,  # CDL
-        is_mla: bool,
+            self,
+            spec_resource_manager: Optional[BaseResourceManager],
+            is_draft_model: bool,
+            attention_backend: Type[AttentionBackend],
+            use_chain_drafter: bool,  # CDL
     ):
         """
         If true, the attention backend kernel needs to run in spec-dec mode (multi-token query mode).
@@ -182,8 +200,7 @@ class SpeculativeDecodingMode(IntEnum):
         is_trtllm_attention = issubclass(attention_backend, TrtllmAttention)
 
         # Always use the multi-token query mode for 1-model if the kernels are available.
-        xqa_supported = not is_mla or get_sm_version() < 120
-        use_case_1 = self.use_one_engine() and xqa_supported
+        use_case_1 = self.use_one_engine()
         # For 2-model, we need to enable it when we process multiple tokens at once. This occurs with
         # the target model (verification) or on the first draft for CDL based speculation.
         use_case_2 = not self.use_one_engine() and (
@@ -368,15 +385,13 @@ class SpecMetadata:
                 device='cuda')
 
         self.temperatures[:len(temperatures)].copy_(torch.tensor(
-            temperatures, dtype=torch.float32, pin_memory=True),
+            temperatures, dtype=torch.float32, pin_memory=prefer_pinned()),
                                                     non_blocking=True)
-        self.top_ks[:len(top_ks)].copy_(torch.tensor(top_ks,
-                                                     dtype=torch.int32,
-                                                     pin_memory=True),
+        self.top_ks[:len(top_ks)].copy_(torch.tensor(
+            top_ks, dtype=torch.int32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
-        self.top_ps[:len(top_ps)].copy_(torch.tensor(top_ps,
-                                                     dtype=torch.float32,
-                                                     pin_memory=True),
+        self.top_ps[:len(top_ps)].copy_(torch.tensor(
+            top_ps, dtype=torch.float32, pin_memory=prefer_pinned()),
                                         non_blocking=True)
 
 
@@ -390,9 +405,9 @@ class SpecWorkerBase(nn.Module, ABC):
         super().__init__()
         self.guided_decoder: Optional["CapturableGuidedDecoder"] = None
         self.force_num_accepted_tokens = get_force_num_accepted_tokens()
-        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.0"
-        self.seed = 0
-        self.offset = 0
+        self.use_flashinfer = IS_FLASHINFER_AVAILABLE and flashinfer.__version__ >= "0.6.4"
+        self.seed: Optional[torch.Tensor] = None
+        self.offset: Optional[torch.Tensor] = None
         self.use_separate_draft_kv_cache = use_separate_draft_kv_cache
 
     @property
@@ -526,7 +541,6 @@ class SpecWorkerBase(nn.Module, ABC):
         gen_target_tokens = target_tokens[num_contexts:].reshape(
             num_gens, self.max_draft_len + 1)
         accepted_tokens[num_contexts:, :] = gen_target_tokens
-
         # Compare draft tokens with target tokens using cumulative product
         # Counts consecutive matches from the start
         num_accepted_tokens[num_contexts:] += torch.cumprod(
@@ -641,6 +655,14 @@ class SpecWorkerBase(nn.Module, ABC):
             yield
             return
 
+        # Check if draft KV cache block offsets are allocated
+        draft_block_offsets = getattr(attn_metadata,
+                                      'draft_kv_cache_block_offsets', None)
+        if draft_block_offsets is None:
+            # Draft KV cache block offsets not allocated, skip switching
+            yield
+            return
+
         # Save main KV cache manager and block offsets
         target_kv_cache_manager = attn_metadata.kv_cache_manager
         target_kv_cache_block_offsets = attn_metadata.kv_cache_block_offsets
@@ -649,7 +671,7 @@ class SpecWorkerBase(nn.Module, ABC):
         # Switch to draft KV cache manager and its block offsets
         attn_metadata.kv_cache_manager = draft_kv_cache_manager
         attn_metadata.kv_cache_block_offsets = attn_metadata.draft_kv_cache_block_offsets
-        attn_metadata.host_kv_cache_block_offsets = attn_metadata.draft_host_kv_cache_block_offsets
+        attn_metadata.host_kv_cache_block_offsets = draft_kv_cache_manager.host_kv_cache_block_offsets
 
         try:
             yield
@@ -690,7 +712,16 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
+                # Lazily initialize seed/offset tensors on correct device
+                if self.seed is None:
+                    self.seed = torch.tensor([0],
+                                             dtype=torch.int64,
+                                             device=logits.device)
+                    self.offset = torch.tensor([0],
+                                               dtype=torch.int64,
+                                               device=logits.device)
                 self.seed += 1
+                self.seed %= (2**31)
 
             sampled_tokens = sampling_batch_spec_dec_one_model(
                 logits,

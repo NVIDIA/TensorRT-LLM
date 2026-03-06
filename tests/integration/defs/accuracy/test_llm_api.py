@@ -33,7 +33,8 @@ class TestLlama3_1_8B(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise(self):
-        quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
 
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
@@ -113,28 +114,28 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
     @skip_post_blackwell
     def test_smooth_quant(self):
         quant_config = QuantConfig(
-            QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
+            quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL_PER_TOKEN_PLUGIN)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_post_blackwell
     def test_smooth_quant_ootb(self):
-        quant_config = QuantConfig(QuantAlgo.W8A8_SQ_PER_CHANNEL)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W8A8_SQ_PER_CHANNEL)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_post_blackwell
     def test_int4_awq(self):
-        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
 
     @skip_post_blackwell
     def test_int4_awq_int8_kv_cache(self):
-        quant_config = QuantConfig(QuantAlgo.W4A16_AWQ)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W4A16_AWQ)
         kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.INT8)
         with LLM(self.MODEL_PATH,
                  quant_config=quant_config,
@@ -144,7 +145,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH,
                  quant_config=quant_config,
@@ -155,7 +156,7 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device(2)
     def test_fp8_pp2(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         kv_cache_config = KvCacheConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH,
                  pipeline_parallel_size=2,
@@ -168,7 +169,8 @@ class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     @skip_post_blackwell
     def test_fp8_rowwise(self):
-        quant_config = QuantConfig(QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.FP8_PER_CHANNEL_PER_TOKEN)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -231,7 +233,7 @@ class TestMistralNemo12B(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_device_memory(80000)
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8,
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8,
                                    kv_cache_quant_algo=QuantAlgo.FP8)
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.9)
 
@@ -313,7 +315,7 @@ class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm)
@@ -338,7 +340,7 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_post_blackwell
     def test_weight_only(self):
-        quant_config = QuantConfig(QuantAlgo.W8A16)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
@@ -346,7 +348,7 @@ class TestQwen2_7BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
@@ -379,7 +381,7 @@ class TestQwen2_5_0_5BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
@@ -407,7 +409,7 @@ class TestQwen2_5_1_5BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_post_blackwell
     def test_weight_only(self):
-        quant_config = QuantConfig(QuantAlgo.W8A16)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.W8A16)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
@@ -415,7 +417,7 @@ class TestQwen2_5_1_5BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
@@ -443,7 +445,7 @@ class TestQwen2_5_7BInstruct(LlmapiAccuracyTestHarness):
 
     @skip_pre_ada
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH, quant_config=quant_config) as llm:
             task = CnnDailymail(self.MODEL_NAME)
             task.evaluate(llm,
@@ -529,7 +531,7 @@ class TestStarCoder2_7B(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device_memory(70000)
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH,
                  quant_config=quant_config,
                  kv_cache_config=self.kv_cache_config) as llm:
@@ -555,7 +557,7 @@ class TestCodestral_22B_V01(LlmapiAccuracyTestHarness):
     @skip_pre_ada
     @pytest.mark.skip_less_device_memory(80000)
     def test_fp8(self):
-        quant_config = QuantConfig(QuantAlgo.FP8)
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8)
         with LLM(self.MODEL_PATH,
                  quant_config=quant_config,
                  kv_cache_config=self.kv_cache_config) as llm:

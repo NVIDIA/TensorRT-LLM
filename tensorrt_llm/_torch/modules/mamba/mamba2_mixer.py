@@ -33,6 +33,8 @@ from ..linear import Linear, TensorParallelMode
 from .causal_conv1d import causal_conv1d_fn, causal_conv1d_update
 from .causal_conv1d_triton import \
     causal_conv1d_update as causal_conv1d_update_triton
+from .fuse_elementwise_ops import (extract_transpose_xbc_prefill,
+                                   fused_split_rearrange_after_conv1d)
 from .layernorm_gated import RMSNorm as RMSNormGated
 from .selective_state_update import \
     selective_state_update as selective_state_update_native
@@ -227,14 +229,16 @@ class Mamba2Mixer(nn.Module):
 
         # in_proj
         zxbcdt = self.in_proj(hidden_states)
-        z, xbc, dt = torch.split(
-            zxbcdt,
-            [self.tp_d_inner, self.tp_conv_dim, self.tp_nheads],
-            dim=-1,
-        )
+
+        # Split z and dt with views.
+        z = zxbcdt[:, :self.tp_d_inner]
+        dt = zxbcdt[:, self.tp_d_inner + self.tp_conv_dim:]
         z_p, z_d = torch.split(z, seqlen_split_size, dim=0)
-        xbc_p, xbc_d = torch.split(xbc, seqlen_split_size, dim=0)
         dt_p, dt_d = torch.split(dt, seqlen_split_size, dim=0)
+
+        # Decode path uses regular view since no transpose is needed.
+        xbc_d = zxbcdt[num_prefill_tokens:num_actual_tokens,
+                       self.tp_d_inner:self.tp_d_inner + self.tp_conv_dim]
 
         # Preallocate output tensor to avoid memcpy cost for merging prefill
         # and decode outputs
@@ -243,8 +247,8 @@ class Mamba2Mixer(nn.Module):
                 zxbcdt.shape[0],
                 (self.num_heads * self.head_dim) // self.tp_size,
             ],
-            dtype=hidden_states.dtype,
-            device=hidden_states.device,
+            dtype=zxbcdt.dtype,
+            device=zxbcdt.device,
         )
         preallocated_ssm_out_p, preallocated_ssm_out_d = torch.split(
             preallocated_ssm_out,
@@ -259,27 +263,29 @@ class Mamba2Mixer(nn.Module):
             has_initial_states = mamba_metadata.has_initial_states[:
                                                                    num_prefills]
 
-            xbc_p = causal_conv1d_fn(xbc_p.transpose(0, 1),
+            # Fused kernel to avoid expensive .contiguous() call in causal_conv1d_fn.
+            xbc_p_t = extract_transpose_xbc_prefill(zxbcdt, num_prefill_tokens,
+                                                    self.tp_d_inner,
+                                                    self.tp_conv_dim)
+            xbc_p = causal_conv1d_fn(xbc_p_t,
                                      self.conv1d.weight,
                                      self.conv1d.bias,
                                      activation="silu",
                                      conv_states=conv_states,
                                      has_initial_state=has_initial_states,
                                      query_start_loc=cu_seqlens,
-                                     cache_indices=state_indices_p).transpose(
-                                         0, 1)
+                                     cache_indices=state_indices_p)
 
-            x_p, B_p, C_p = torch.split(xbc_p.unsqueeze(0), [
+            # Fused kernel to avoid expensive .contiguous() calls after split/rearrange.
+            x_p, B_p, C_p = fused_split_rearrange_after_conv1d(
+                xbc_p,
                 self.tp_d_inner,
-                self.tp_ngroups * self.d_state,
-                self.tp_ngroups * self.d_state,
-            ],
-                                        dim=-1)
-
-            x_p = rearrange(x_p, "b l (h p) -> b l h p", h=self.tp_nheads)
+                self.tp_ngroups,
+                self.d_state,
+                self.tp_nheads,
+                self.head_dim,
+            )
             dt_p = dt_p.unsqueeze(0)
-            B_p = rearrange(B_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
-            C_p = rearrange(C_p, "b l (g n) -> b l g n", g=self.tp_ngroups)
             z_p = rearrange(z_p.unsqueeze(0),
                             "b l (h p) -> b l h p",
                             h=self.tp_nheads)

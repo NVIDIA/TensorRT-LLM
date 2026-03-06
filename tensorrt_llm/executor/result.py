@@ -170,7 +170,7 @@ class GenerationResultBase:
         self.id = id
         self.sampling_params = sampling_params
         self.postproc_params = postproc_params
-        self.disaggregated_params = None
+        self._disaggregated_params = None
         self.decoding_iter = 0
         self.cached_tokens = 0
         # Average decoded tokens per runtime iteration; set when the first LLM response arrives.
@@ -196,7 +196,8 @@ class GenerationResultBase:
             CompletionOutput(i) for i in range(self.sampling_params.best_of)
         ]
         self._context_logits: Optional[torch.Tensor] = None
-        self._mm_embedding_handle: Optional[Dict[str, Any]] = None
+        # Request-level time breakdown (PyTorch backend); not on CompletionOutput to avoid API churn.
+        self.time_breakdown_metrics: Optional[Dict] = None
 
         self._background_error_handler = None
         if background_error_handler is not None:
@@ -234,9 +235,9 @@ class GenerationResultBase:
         return self._context_logits
 
     @property
-    # TODO: Keep this property only for backward compatibility. In the future, access multimodal embedding handles from disaggregated_params instead.
-    def mm_embedding_handle(self) -> Optional[Dict[str, Any]]:
-        return self._mm_embedding_handle
+    def disaggregated_params(self) -> Optional[DisaggregatedParams]:
+        """Returns the disaggregated params."""
+        return self._disaggregated_params
 
     def _handle_sequence(self,
                          finish_reasons,
@@ -288,16 +289,33 @@ class GenerationResultBase:
                 output.logprobs += response_tensors.log_probs[src_idx]
 
             # overcome some WAR in the cpp executor
-            if finish_reasons[
-                    src_idx] != tllm.FinishReason.CANCELLED and self.use_trtllm_sampler:
-                # Check if logprobs is a list (not a dict or other structure)
-                if len(output.logprobs) > output.length:
+            if finish_reasons[src_idx] != tllm.FinishReason.CANCELLED:
+                if self.use_trtllm_sampler and len(
+                        output.logprobs) > output.length:
                     # LlmResult holds a reference to LogProbStorage, which may be updated by the worker before the result is serialized.
                     # Therefore, we treat extra logprobs/logits as expected and only consume what's needed.
                     output.logprobs = output.logprobs[:output.length]
-            assert len(
-                output.logprobs
-            ) == output.length, f"logprobs length: {len(output.logprobs)} != output.length: {output.length}"
+
+                is_generation_only = (self.disaggregated_params is not None
+                                      and self.disaggregated_params.request_type
+                                      == "generation_only")
+                if is_generation_only:
+                    assert len(output.logprobs) >= output.length - 1, (
+                        f"logprobs length: {len(output.logprobs)} < "
+                        f"output.length - 1: {output.length - 1}")
+                    if len(output.logprobs) < output.length:
+                        logger.warning(
+                            "Disaggregated serving: the response contains "
+                            "%d logprob entries instead of %d because "
+                            "logprobs for the first generated token were "
+                            "not transferred from the context server. "
+                            "Enable logprobs on both the prefill and "
+                            "decode servers to receive complete results.",
+                            len(output.logprobs), output.length)
+                else:
+                    assert len(output.logprobs) == output.length, (
+                        f"logprobs length: {len(output.logprobs)} != "
+                        f"output.length: {output.length}")
 
         if response_tensors.generation_logits is not None:
             output.generation_logits = response_tensors.generation_logits[
@@ -319,6 +337,11 @@ class GenerationResultBase:
 
         if response_tensors.request_perf_metrics is not None:
             output.request_perf_metrics = response_tensors.request_perf_metrics
+
+        # Request-level time breakdown (e.g. from PyTorch LlmResult); kept on result, not CompletionOutput.
+        if hasattr(response_tensors, 'time_breakdown_metrics'
+                   ) and response_tensors.time_breakdown_metrics is not None:
+            self.time_breakdown_metrics = response_tensors.time_breakdown_metrics
 
         # Check if this specific sequence is finished (not just if the entire request is done)
         # This is important for best_of > n sampling where sequences finish at different times
@@ -420,7 +443,7 @@ class GenerationResultBase:
                 # Use `replace` to preserve things like `mrope_position_ids_handle` and
                 # `mrope_position_deltas_handle`. However, explicitly set
                 # `multimodal_embedding_handles=None` since they should no longer be needed.
-                self.disaggregated_params = dataclasses.replace(
+                self._disaggregated_params = dataclasses.replace(
                     existing_disagg_params or DisaggregatedParams(),
                     request_type="context_only",
                     first_gen_tokens=context_phase_params.first_gen_tokens,
@@ -444,22 +467,39 @@ class GenerationResultBase:
                                       response_result.sequence_index,
                                       logprobs_result, req_perf_metrics_dict)
 
+            # For context_only responses, carry the first gen token's
+            # logprobs and generation logits so the generation_only side
+            # can prepend them.
+            if (context_phase_params is not None
+                    and self._disaggregated_params is not None):
+                first_gen_lp = [
+                    out.logprobs[0] for out in self._outputs if out.logprobs
+                ]
+                if first_gen_lp:
+                    self._disaggregated_params.first_gen_log_probs = \
+                        first_gen_lp
+
+                first_gen_logits = [
+                    out.generation_logits for out in self._outputs
+                    if out.generation_logits is not None
+                ]
+                if first_gen_logits:
+                    self._disaggregated_params.first_gen_logits = \
+                        first_gen_logits
+
             if response_result.context_logits is not None:
                 self._context_logits = response_result.context_logits
 
-            if hasattr(response_result, 'mm_embedding_handle'
-                       ) and response_result.mm_embedding_handle is not None:
-                self._mm_embedding_handle = response_result.mm_embedding_handle
-                if self.disaggregated_params is not None:
-                    self.disaggregated_params.multimodal_embedding_handles = [
-                        response_result.mm_embedding_handle
-                    ],
-                    self.disaggregated_params.multimodal_hashes = self._multimodal_hashes
+            if hasattr(response_result, "mm_embedding_handles"
+                       ) and response_result.mm_embedding_handles is not None:
+                # mm_embedding_handles is a list of handles (one per multimodal item).
+                mm_embedding_handles = response_result.mm_embedding_handles
+                if self._disaggregated_params is not None:
+                    self._disaggregated_params.multimodal_embedding_handles = mm_embedding_handles
+                    self._disaggregated_params.multimodal_hashes = self._multimodal_hashes
                 else:
-                    self.disaggregated_params = DisaggregatedParams(
-                        multimodal_embedding_handles=[
-                            response_result.mm_embedding_handle
-                        ],
+                    self._disaggregated_params = DisaggregatedParams(
+                        multimodal_embedding_handles=mm_embedding_handles,
                         multimodal_hashes=self._multimodal_hashes)
 
             # Handle mrope handles for both:
@@ -468,9 +508,9 @@ class GenerationResultBase:
             #    were already computed in encode phase, but mrope still needs forwarding)
             if (getattr(response_result, "mrope_position_ids_handle", None)
                     is not None and self.disaggregated_params is not None):
-                self.disaggregated_params.mrope_position_ids_handle = (
+                self._disaggregated_params.mrope_position_ids_handle = (
                     response_result.mrope_position_ids_handle)
-                self.disaggregated_params.mrope_position_deltas_handle = (
+                self._disaggregated_params.mrope_position_deltas_handle = (
                     response_result.mrope_position_deltas_handle)
 
             # Processing background errors here ASAF during generation.
@@ -716,7 +756,7 @@ class GenerationResult(GenerationResultBase):
         )
         self._generation_request = generation_request
         self._streaming = generation_request.streaming
-        self.disaggregated_params = disaggregated_params
+        self._disaggregated_params = disaggregated_params
         # minimal sampling params needed for logprob calculation
         self._logprob_params = logprob_params
         self.trace_headers = generation_request.trace_headers
@@ -837,7 +877,7 @@ class GenerationResult(GenerationResultBase):
             'outputs',
             'finished',
             "context_logits",
-            "mm_embedding_handle",
+            "disaggregated_params",
         ]
 
     def __repr__(self) -> str:
@@ -915,6 +955,7 @@ def compute_logprobs(
     context_logits: Optional[torch.Tensor],
     generation_logits: Optional[torch.Tensor],
     output_token_ids: Optional[list[int]],
+    prompt_token_ids: Optional[list[int]] = None,
 ) -> LogProbsResult:
     """
     Compute top-K logprobs from logits when engine doesn't provide them directly.
@@ -981,8 +1022,8 @@ def compute_logprobs(
         return results
 
     prompt_logprobs = _topk_logprobs(
-        context_logits, k_prompt_logprobs,
-        None) if k_prompt_logprobs and context_logits is not None else None
+        context_logits, k_prompt_logprobs, prompt_token_ids
+    ) if k_prompt_logprobs is not None and context_logits is not None else None
     generation_logprobs = _topk_logprobs(
         generation_logits, k_logprobs, output_token_ids
     ) if k_logprobs is not None and generation_logits is not None else None

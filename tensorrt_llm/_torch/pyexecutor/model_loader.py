@@ -10,6 +10,7 @@ from tensorrt_llm._torch.models.checkpoints.base_checkpoint_loader import (
     AutoCheckpointMapper, BaseCheckpointLoader)
 from tensorrt_llm._utils import str_dtype_to_torch
 from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+from tensorrt_llm.llmapi.llm_utils import apply_model_defaults_to_llm_args
 from tensorrt_llm.logger import logger
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.mapping import Mapping
@@ -36,7 +37,12 @@ _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
                                            mamba_ssm_cache_dtype: str) -> None:
     if mamba_ssm_cache_dtype == "auto":
-        mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
+        hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
+                           None)
+        if hf_dtype is not None:
+            mamba_ssm_cache_dtype = str_dtype_to_torch(hf_dtype)
+        else:
+            mamba_ssm_cache_dtype = config.pretrained_config.torch_dtype
     else:
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
@@ -69,17 +75,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # If we get to this point we have a valid quantization setting, but if
-    # we have an existing setting and it doesn't match we shouldn't proceed.
+    # If we get to this point we have a valid explicit quantization setting.
+    # Explicit kv_cache_dtype requests force override the checkpoint setting.
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
-        raise RuntimeError(
-            "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
-            f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
-            "pre-quantized KV cache that doesn't match.")
+        logger.warning("Overriding checkpoint KV cache quantization "
+                       f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
+                       f'"{pyt_kv_cache_dtype}".')
 
-    # We have an open ended KV cache in the checkpoint
-    # and we have a specified override.
+    # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
@@ -211,6 +214,40 @@ class ModelLoader:
         self.max_num_tokens = max_num_tokens
         self.max_seq_len = max_seq_len
         self.lora_config = lora_config
+
+    @staticmethod
+    def load_config_and_apply_defaults(
+            checkpoint_dir: str, llm_args: TorchLlmArgs,
+            checkpoint_loader: BaseCheckpointLoader) -> TorchLlmArgs:
+        """Load model config and apply model-specific defaults to llm_args."""
+        if checkpoint_loader is None:
+            return llm_args
+
+        config_kwargs = {
+            'trust_remote_code': True,
+            'mm_encoder_only': llm_args.mm_encoder_only,
+        }
+        if llm_args.parallel_config:
+            config_kwargs['mapping'] = llm_args.parallel_config.to_mapping()
+
+        if llm_args.speculative_config:
+            config_kwargs['spec_config'] = llm_args.speculative_config
+
+        config = checkpoint_loader.load_config(checkpoint_dir, **config_kwargs)
+
+        model_cls = AutoModelForCausalLM._resolve_class(config)
+
+        # model_cls is None when the architecture is unknown/unsupported.
+        if model_cls and hasattr(model_cls, 'get_model_defaults'):
+            model_defaults = model_cls.get_model_defaults(llm_args)
+            if model_defaults:
+                applied_defaults = apply_model_defaults_to_llm_args(
+                    llm_args, model_defaults)
+                if applied_defaults:
+                    logger.info("Applied model defaults for %s: %s",
+                                model_cls.__name__, applied_defaults)
+
+        return llm_args
 
     def load(
         self,

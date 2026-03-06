@@ -1,10 +1,9 @@
 hostname: localhost
-port: 8000
 model: DeepSeek-V3-Lite/fp8
 free_gpu_memory_fraction: 0.1
-backend: "pytorch"
+backend: pytorch
 cuda_graph_config: null
-disable_overlap_scheduler: True
+disable_overlap_scheduler: true
 speculative_config:
   decoding_type: MTP
   num_nextn_predict_layers: 1
@@ -15,8 +14,6 @@ context_servers:
   enable_attention_dp: true
   cache_transceiver_config:
     backend: DEFAULT
-  urls:
-      - "localhost:8001"
 generation_servers:
   num_instances: 1
   tensor_parallel_size: 1
@@ -24,5 +21,3 @@ generation_servers:
   enable_attention_dp: false
   cache_transceiver_config:
     backend: DEFAULT
-  urls:
-      - "localhost:8002"

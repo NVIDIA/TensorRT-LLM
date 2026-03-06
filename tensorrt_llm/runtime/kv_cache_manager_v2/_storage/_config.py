@@ -21,7 +21,16 @@ from .._common import LayerId
 from .._config import CacheTierConfig, DataRole, KVCacheManagerConfig
 from .._life_cycle_registry import LayerGroupId, LifeCycle, LifeCycleId, LifeCycleRegistry
 from .._storage._core import PoolGroupIndex, PoolIndex
-from .._utils import HomoTuple, TypedIndexList, filled_list, get_uniform_attribute, is_sorted
+from .._utils import (
+    HomoTuple,
+    TypedIndexList,
+    exact_div,
+    filled_list,
+    get_uniform_attribute,
+    is_sorted,
+    typed_map,
+    value_or,
+)
 
 
 class BufferId(NamedTuple):
@@ -53,7 +62,7 @@ class SlotDescVariant:
     """
 
     life_cycle_id: LifeCycleId
-    coalesced_buffers: HomoTuple[CoalescedBuffer]
+    coalesced_buffers: TypedIndexList[PoolIndex, CoalescedBuffer]
 
     def __post_init__(self) -> None:
         assert is_sorted(self.coalesced_buffers, key=lambda s: s.size, reverse=True)
@@ -63,8 +72,8 @@ class SlotDescVariant:
         return self.life_cycle_id
 
     @property
-    def slot_size_list(self) -> HomoTuple[int]:
-        return tuple(s.size for s in self.coalesced_buffers)
+    def slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
+        return typed_map(self.coalesced_buffers, lambda cb: cb.size)
 
 
 @dataclass(slots=True, frozen=True)
@@ -76,7 +85,7 @@ class SlotDesc:
     variants: HomoTuple[SlotDescVariant]
 
     @property
-    def slot_size_list(self) -> HomoTuple[int]:
+    def slot_size_list(self) -> TypedIndexList[PoolIndex, int]:
         return get_uniform_attribute(self.variants, lambda s: s.slot_size_list)
 
 
@@ -85,13 +94,15 @@ class BufferAttr:
     life_cycle_id: LifeCycleId
     pool_index: PoolIndex
     offset: int
-    size: int
+    size: int  # expanded size of the buffer
+    expansion: int  # expansion factor of page due to heterogeneous tokens_per_block
 
 
 @dataclass(slots=True, frozen=True)
 class StorageConfig:
     cache_tiers: HomoTuple[CacheTierConfig]
     slot_desc_list: TypedIndexList[PoolGroupIndex, SlotDesc]
+    expansion: dict[BufferId, int]  # expansion factor of page due to heterogeneous tokens_per_block
 
     @property
     def num_life_cycles(self) -> LifeCycleId:
@@ -114,7 +125,11 @@ class StorageConfig:
                     offset = 0
                     for b in cb.buffer_ids:
                         ret[b] = BufferAttr(
-                            life_cycle_id, PoolIndex(pool), offset, cb.single_buffer_size
+                            life_cycle_id,
+                            PoolIndex(pool),
+                            offset,
+                            cb.single_buffer_size,
+                            self.expansion.get(b, 1),
                         )
                         offset += cb.single_buffer_size
         return ret
@@ -146,14 +161,19 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
         lambda: defaultdict[int, list[BufferId]](list[BufferId])
     )
     life_cycle_registry = LifeCycleRegistry(config)
+    tokens_per_block = config.tokens_per_block
+    expansion_map = dict[BufferId, int]()
     for layer in config.layers:
-        life_cycle = LifeCycle.make(
-            layer.window_size, layer.num_sink_tokens, config.tokens_per_block
-        )
+        life_cycle = LifeCycle.make(layer.window_size, layer.num_sink_tokens, tokens_per_block)
         life_cycle_id = life_cycle_registry.get_id(life_cycle)
         size_to_buffers = buffer_groups[life_cycle_id]
         for buffer in layer.buffers:
-            size_to_buffers[buffer.size].append(BufferId(layer.layer_id, buffer.role))
+            tokens_per_block_override = value_or(buffer.tokens_per_block_override, tokens_per_block)
+            expansion = exact_div(tokens_per_block, tokens_per_block_override)
+            size = buffer.size * expansion
+            buf_id = BufferId(layer.layer_id, buffer.role)
+            expansion_map[buf_id] = expansion
+            size_to_buffers[size].append(buf_id)
     # Create one slot group for each life cycle.
     # It's possible that buffers with different sizes form coalesced buffers with the same coalesced size.
     # @TODO: add test for this case.
@@ -163,15 +183,21 @@ def create_storage_config(config: KVCacheManagerConfig) -> StorageConfig:
             CoalescedBuffer(size, tuple(buffer_ids)) for size, buffer_ids in size_to_buffers.items()
         ]
         slots.sort(key=lambda p: p.size, reverse=True)
-        slot_groups.append(SlotDescVariant(life_cycle_id, tuple(slots)))
+        slot_groups.append(
+            SlotDescVariant(life_cycle_id, cast(TypedIndexList[PoolIndex, CoalescedBuffer], slots))
+        )
     # Merge slot groups with the same slot_size_list
     pool_groups_by_slot_size_list = defaultdict[HomoTuple[int], list[SlotDescVariant]](
         list[SlotDescVariant]
     )
     for slot_group in slot_groups:
-        pool_groups_by_slot_size_list[slot_group.slot_size_list].append(slot_group)
+        pool_groups_by_slot_size_list[tuple(slot_group.slot_size_list)].append(slot_group)
     slot_desc_list = cast(
         TypedIndexList[PoolGroupIndex, SlotDesc],
         [SlotDesc(tuple(slot_groups)) for slot_groups in pool_groups_by_slot_size_list.values()],
     )
-    return StorageConfig(cache_tiers=tuple(config.cache_tiers), slot_desc_list=slot_desc_list)
+    return StorageConfig(
+        cache_tiers=tuple(config.cache_tiers),
+        slot_desc_list=slot_desc_list,
+        expansion=expansion_map,
+    )

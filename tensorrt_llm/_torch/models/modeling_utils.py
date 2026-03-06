@@ -523,6 +523,29 @@ class DecoderModelForCausalLM(nn.Module,
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
+    @classmethod
+    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+        """Return model-specific LLM API default overrides.
+
+        Subclasses can override this to provide defaults that are applied
+        when the user hasn't explicitly set the corresponding llm_args
+        fields.
+
+        This will enable model-specific default overrides for better OOTB experience.
+        For example,
+        - to disable some defaults when model doesn't support it, like KV cache block reuse.
+            return {"kv_cache_config": {"enable_block_reuse": False}}
+        - Adaptively setting the moe backend based on the model and hardware.
+        - etc.
+
+        Model authors are encouraged to override this method for tuning default behavior
+        informed by the model's capabilities and hardware.
+
+        The returned dict is deep-merged with the user's llm_args, with
+        user-set values taking priority over these defaults.
+        """
+        return {}
+
     @property
     def config(self):
         return self.model_config.pretrained_config

@@ -655,8 +655,8 @@ def test_sequence_info_estimate_cache_tokens_per_forward_with_overflow():
     assert result == 128
 
 
-def test_sequence_info_estimate_cache_loc_capacity_no_resize():
-    """Test estimate_cache_loc_capacity() when capacity is sufficient."""
+def test_sequence_info_update_cache_information_no_resize():
+    """Test update_cache_information() when capacity is sufficient."""
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
@@ -667,29 +667,31 @@ def test_sequence_info_estimate_cache_loc_capacity_no_resize():
     initial_capacity = seq_info._input_buffer.get_capacity("cache_loc")
 
     # Request a small capacity that should already be available
-    seq_info.estimate_cache_loc_capacity(num_blocks=4)
+    seq_info.update_cache_information(num_blocks=4)
 
     # Capacity should not have changed if it was already sufficient
     if initial_capacity >= 4 * 4 + 1:  # num_blocks * max_batch_size + 1
         assert seq_info._input_buffer.get_capacity("cache_loc") == initial_capacity
 
 
-def test_sequence_info_estimate_cache_loc_capacity_resizes():
-    """Test estimate_cache_loc_capacity() resizes buffer when needed."""
+def test_sequence_info_update_cache_information_resizes():
+    """Test update_cache_information() resizes buffer when needed."""
     seq_info = SequenceInfo(
         max_seq_len=128,
         max_batch_size=4,
-        tokens_per_block=32,
-        max_num_tokens=128,  # Small to have small initial capacity
+        tokens_per_block=4,
+        max_num_tokens=16,  # Small to have small initial capacity
     )
 
     initial_capacity = seq_info._input_buffer.get_capacity("cache_loc")
 
     # Request a large capacity
     large_num_blocks = 1000
-    seq_info.estimate_cache_loc_capacity(num_blocks=large_num_blocks)
+    seq_info.update_cache_information(num_blocks=large_num_blocks)
 
-    expected_capacity = large_num_blocks * 4 + 1  # num_blocks * max_batch_size + 1
+    # estimated_capacity = max_batch_size * max_blocks_per_seq + 1
+    # max_blocks_per_seq = ceil(128 / 4) = 32
+    expected_capacity = 4 * 32 + 1
     if expected_capacity > initial_capacity:
         assert seq_info._input_buffer.get_capacity("cache_loc") >= expected_capacity
 
@@ -704,16 +706,17 @@ def test_sequence_info_last_page_len_uses_tokens_per_block():
 
     # Set up a sequence with 25 tokens
     # last_page_len = (25 - 1) % 16 + 1 = 24 % 16 + 1 = 8 + 1 = 9
-    input_ids = [[1] * 25]
+    input_ids = [1] * 25
     seq_info.nest_sequences(
         input_ids,
-        input_pos=0,
+        cu_seqlen=[0, 25],
+        input_pos=[0],
         cache_loc=[0, 1],  # 2 pages
-        pages_per_seq=[2],
+        cu_num_pages=[0, 2],
     )
 
     expected_last_page_len = (25 - 1) % 16 + 1
-    assert seq_info._args_list["last_page_len"][0] == expected_last_page_len
+    assert seq_info.get_arg("last_page_len_host", truncate=True)[0].item() == expected_last_page_len
 
 
 def test_sequence_info_page_assignments():
@@ -725,15 +728,20 @@ def test_sequence_info_page_assignments():
     )
 
     # Set up two sequences with different page assignments
-    input_ids = [[1] * 10, [1] * 20]
+    input_ids = [1] * 10 + [1] * 20
     seq_info.nest_sequences(
         input_ids,
-        input_pos=0,
+        cu_seqlen=[0, 10, 30],
+        input_pos=[0, 0],
         cache_loc=[0, 1, 2],  # seq 0 has page 0, seq 1 has pages 1 and 2
-        pages_per_seq=[1, 2],
+        cu_num_pages=[0, 1, 3],
     )
 
-    page_assignments = seq_info.page_assignments
+    cache_loc = seq_info.get_arg("cache_loc_host", truncate=True).tolist()
+    cu_num_pages = seq_info.get_arg("cu_num_pages_host", truncate=True).tolist()
+    page_assignments = [
+        cache_loc[cu_num_pages[i] : cu_num_pages[i + 1]] for i in range(len(cu_num_pages) - 1)
+    ]
     assert page_assignments == [[0], [1, 2]]
 
 
@@ -886,3 +894,75 @@ def test_generic_state_handler_allocated_locally(paged_kv_cache_config):
     assert interface._caches["generic_state"] is not None
     # Without typed handlers, should use plain KVCacheManager
     assert isinstance(interface.kv_cache_manager, KVCacheManager)
+
+
+# =============================================================================
+# _requires_copy Tests
+# =============================================================================
+
+
+def test_active_host_prep_args_initially_empty():
+    """Verify _active_host_prep_args starts empty and is populated by register_host_prepare."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # Initially empty -- only populated by register_host_prepare_for_attention_forward
+    assert len(seq_info._active_host_prep_args) == 0
+
+    # Register a host prepare function to populate it
+    def dummy_host_prepare(batch_info_host: torch.Tensor, cu_num_pages_host: torch.Tensor):
+        pass
+
+    seq_info.register_host_prepare_for_attention_forward(
+        dummy_host_prepare, ["batch_info_host", "cu_num_pages_host"]
+    )
+
+    assert "batch_info_host" in seq_info._active_host_prep_args
+    assert "cu_num_pages_host" in seq_info._active_host_prep_args
+
+
+def test_requires_copy_args_not_in_named_args():
+    """Verify that _requires_copy args do NOT appear in named_args."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    named_args = seq_info.named_args
+    for rc_arg in seq_info._active_host_prep_args:
+        assert rc_arg not in named_args, f"{rc_arg} should not be in named_args"
+        assert f"{rc_arg}_host" not in named_args, f"{rc_arg}_host should not be in named_args"
+
+
+def test_args_stored_to_input_buffer():
+    """Verify that args are written to InputBuffer by nest_sequences."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # nest_sequences should store token_gather_indices and tokens_gather_info
+    seq_info.nest_sequences(
+        input_ids=[1, 2, 3],
+        cu_seqlen=[0, 3],
+        input_pos=[0],
+        cache_loc=[0],
+        cu_num_pages=[0, 1],
+    )
+
+    # Should be accessible via get_arg (reads from InputBuffer)
+    token_gather_indices = seq_info.get_arg("token_gather_indices", truncate=True)
+    assert token_gather_indices is not None
+
+    tokens_gather_info = seq_info.get_arg("tokens_gather_info", truncate=True)
+    assert tokens_gather_info is not None
+
+
+def test_register_host_prepare_populates_requires_copy():
+    """Verify register_host_prepare_for_attention_forward auto-populates _requires_copy."""
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=32)
+
+    # Define a dummy host prepare function
+    def dummy_host_prepare(batch_info_host: torch.Tensor, cu_num_pages_host: torch.Tensor):
+        pass
+
+    # batch_info_host and cu_num_pages_host should be marked in _requires_copy
+    seq_info.register_host_prepare_for_attention_forward(
+        dummy_host_prepare, ["batch_info_host", "cu_num_pages_host"]
+    )
+
+    assert "batch_info_host" in seq_info._active_host_prep_args
+    assert "cu_num_pages_host" in seq_info._active_host_prep_args

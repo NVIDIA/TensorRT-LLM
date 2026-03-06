@@ -30,6 +30,7 @@ from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
+from ...utils.logger import ad_logger
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -243,12 +244,6 @@ class _FlashInferMLAPlanner:
             plan_params: Parameters for planning.
         """
         # Decode qo_indptr: [0, 1, 2, ..., batch_size] (1 token per sequence)
-        batch_size = kv_page_indptr.shape[0] - 1
-        qo_indptr = torch.arange(batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32)
-
-        # Compute kv_len_arr for CUDA graph wrapper initialization
-        num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
-        kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
 
         # we want to plan during warm-up of cuda graph capture to ensure we have the plan cached
         if (
@@ -257,6 +252,14 @@ class _FlashInferMLAPlanner:
         ):
             # During CUDA graph capture, the metadata tensors provided by auto-deploy are stable.
             # Pass the buffer tensors to the wrapper for use_cuda_graph=True
+            batch_size = kv_page_indptr.shape[0] - 1
+            qo_indptr = torch.arange(
+                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
+            )
+
+            # Compute kv_len_arr for CUDA graph wrapper initialization
+            num_pages_per_seq = kv_page_indptr[1:] - kv_page_indptr[:-1]
+            kv_len_arr = (num_pages_per_seq - 1) * plan_params.page_size + kv_last_page_len
             wrapper = self._init_decode_wrapper(
                 use_cuda_graph=True,
                 qo_indptr=qo_indptr,
@@ -276,6 +279,11 @@ class _FlashInferMLAPlanner:
 
         # Re-plan if plan_params changed
         if plan_params != self.plan_params_decode:
+            batch_size = kv_page_indptr.shape[0] - 1
+            qo_indptr = torch.arange(
+                batch_size + 1, device=kv_page_indptr.device, dtype=torch.int32
+            )
+
             self._plan_mla_wrapper(
                 self.decode_wrapper,
                 qo_indptr,
@@ -519,16 +527,15 @@ def flashinfer_mla_with_cache(
     compressed_kv_flat = compressed_kv.contiguous().view(bs, kv_lora_rank)
     kpe_flat = kpe.contiguous().view(bs, qk_rope_head_dim)
 
-    # Convert cache dtype if needed
-    if ckv_cache.dtype == torch.float8_e4m3fn:
-        compressed_kv_flat = compressed_kv_flat.to(torch.float8_e4m3fn)
-        kpe_flat = kpe_flat.to(torch.float8_e4m3fn)
+    # Cast to cache dtype for writes (no-op when dtypes already match).
+    compressed_kv_for_cache = compressed_kv_flat.to(ckv_cache.dtype)
+    kpe_for_cache = kpe_flat.to(kpe_cache.dtype)
 
     # Append to paged cache using FlashInfer's append function
     # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
     flashinfer.page.append_paged_mla_kv_cache(
-        compressed_kv_flat,
-        kpe_flat,
+        compressed_kv_for_cache,
+        kpe_for_cache,
         flashinfer_batch_indices,
         flashinfer_positions,
         ckv_cache,
@@ -925,7 +932,17 @@ class FlashInferMLAAttention(AttentionDescriptor):
         if qk_rope_head_dim != 64:
             raise ValueError("qk_rope_head_dim must be 64 for flashinfer_mla")
 
-        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
+        model_dtype = compressed_kv_fake.dtype
+        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, model_dtype)
+
+        # FlashInfer MLA kernels currently require BF16 cache dtype.
+        if cache_dtype != torch.bfloat16:
+            ad_logger.warning(
+                "FlashInfer MLA requires BF16 KV cache; overriding %s to %s.",
+                cache_dtype,
+                torch.bfloat16,
+            )
+            cache_dtype = torch.bfloat16
 
         # FlashInfer MLA uses two separate paged caches with no num_heads dimension
         return {

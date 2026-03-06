@@ -1,5 +1,6 @@
 import contextlib
 import functools
+import inspect
 import itertools
 import os
 import unittest.mock
@@ -443,9 +444,9 @@ class Runner:
 
         def forward(position_ids, hidden_states, attn_metadata, residual, **kwargs):
             # TODO: to be more general, we should call DecoderModel.forward
-            residual_fusion = hasattr(model.model.layers[layer_indices[0]], "next_layer_layernorm")
             for layer_idx in layer_indices:
                 layer = model.model.layers[layer_idx]
+                residual_fusion = "residual" in inspect.signature(layer.forward).parameters
                 if residual_fusion:
                     hidden_states, residual = layer(
                         position_ids, hidden_states, attn_metadata, residual, **kwargs
@@ -775,12 +776,12 @@ class Runner:
             assert tokens_per_block == 64
 
         # Please refer to `tensorrt_llm/_torch/pyexecutor/_util.py` for `kv_cache_manager`
-        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config)
         config = model_config.pretrained_config
         kv_cache_config = KvCacheConfig(
             max_tokens=max_batch_size * round_up(max_seq_len, tokens_per_block),
             enable_block_reuse=False,
         )
+        kv_cache_manager_cls = get_kv_cache_manager_cls(model_config, kv_cache_config)
         kv_cache_dtype = {
             "FP8": tensorrt_llm.bindings.DataType.FP8,
             "NVFP4": tensorrt_llm.bindings.DataType.NVFP4,

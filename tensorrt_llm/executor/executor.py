@@ -4,6 +4,7 @@ import multiprocessing
 import platform
 import signal
 import traceback
+import weakref
 from abc import ABC, abstractmethod
 from collections.abc import Mapping
 from pathlib import Path
@@ -88,7 +89,10 @@ class GenerationExecutor(ABC):
         self.kv_events_queues = IterationResultQueue()
         self.stats_queues = IterationResultQueue()
 
-        atexit.register(self.shutdown)
+        atexit.register(
+            lambda ref, finalizer=type(self).shutdown: finalizer(obj)
+            if (obj := ref()) is not None else None,
+            weakref.ref(self))
 
         # This is used to capture the exceptions from the threads.
         self._error_queue = Queue()
@@ -221,7 +225,7 @@ class GenerationExecutor(ABC):
             self, request: GenerationRequest) -> Optional[LogprobParams]:
         """Store logprobs-related fields from request for the later logprob calculation."""
         logprob_params = None
-        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs:
+        if request.sampling_params.logprobs is not None or request.sampling_params.prompt_logprobs is not None:
             logprob_params = LogprobParams(
                 logprobs=request.sampling_params.logprobs,
                 prompt_logprobs=request.sampling_params.prompt_logprobs,
@@ -324,7 +328,7 @@ class GenerationExecutor(ABC):
         """
         if self._iter_stats_result is None:
             print_colored(
-                "Iteration statistics are not available yet. To collect runtime statistics, please call get_stats_async() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
+                "Iteration statistics are not available yet. To collect runtime statistics, please call aget_stats() in async coroutine or the /metrics endpoint (if you're using trtllm-serve) AFTER prompts have been submitted.\n",
                 "yellow")
             return empty_async_iterable()
 
@@ -534,8 +538,8 @@ class GenerationExecutor(ABC):
                 use_worker=True)
 
         # For single-gpu case:
-        # Partition the workload to multiple process for streaming performance.
-        # While this requires uses to protect their entrypoint to
+        # Partition the workload to multiple processes for streaming performance.
+        # While this requires users to protect their entrypoint to
         # `if __name__ == "__main__":`.
         if not platform.system() == 'Windows':
             if orchestrator_is_rpc:
