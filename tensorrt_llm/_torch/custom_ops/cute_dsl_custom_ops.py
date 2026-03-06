@@ -3279,16 +3279,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     key]
 
             # Prepare intermediate output tensors for first kernel
-            first_kernel_output_indices_torch = torch.empty(
-                num_rows,
-                num_ctas_per_row * top_k,
-                dtype=torch.int32,
-                device="cuda")
-            first_kernel_output_values_torch = torch.empty(
-                num_rows,
-                num_ctas_per_row * top_k,
-                dtype=torch_dtype,
-                device="cuda")
+            first_kernel_output_indices_torch = torch.empty(num_rows,
+                                                            num_ctas_per_row *
+                                                            top_k,
+                                                            dtype=torch.int32,
+                                                            device="cuda")
+            first_kernel_output_values_torch = torch.empty(num_rows,
+                                                           num_ctas_per_row *
+                                                           top_k,
+                                                           dtype=torch_dtype,
+                                                           device="cuda")
 
             # Prepare final output tensors
             output_indices_torch = torch.empty(num_rows,
@@ -3308,12 +3308,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
-            buffer_torch = torch.empty(
-                num_rows * num_ctas_per_row,
-                buffer_numbers,
-                max(chunk_size_per_cta, num_ctas_per_row * top_k),
-                dtype=torch.int32,
-                device="cuda")
+            buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+                                       buffer_numbers,
+                                       max(chunk_size_per_cta,
+                                           num_ctas_per_row * top_k),
+                                       dtype=torch.int32,
+                                       device="cuda")
 
             # Get current CUDA stream
             torch_stream = torch.cuda.current_stream()
@@ -3345,10 +3345,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return output_indices_torch, output_values_torch
 
-    @torch.library.custom_op(
-        "trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
-        mutates_args=(),
-        device_types="cuda")
+    @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
     def cute_dsl_topk_decode_multi_cta_blackwell(
         input_values: torch.Tensor,
         seq_lens: torch.Tensor,
@@ -3440,5 +3439,95 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ):
         num_rows = input_values.shape[0]
 
+        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+        return indices
+
+    @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_indexer_topk_decode(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+    ) -> torch.Tensor:
+        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
+
+        Automatically chooses the faster kernel based on a dual-condition:
+          1. dtype threshold: fp16/bf16 >= 32768, fp32 >= 65536
+          2. SM utilization < 15% AND multi-CTA waves <= 2
+        Multi-CTA is only used when both conditions are met, ensuring it
+        only activates when single-CTA occupancy is genuinely low and
+        multi-CTA overhead is bounded.
+        Uses chunk_size_per_cta=16384 for multi-CTA, num_sms=148 (Blackwell).
+
+        Based on benchmark results (Blackwell SM100, top_k=2048).
+        See bench_cute_dsl_multi_cta_vs_single_cta_topk_results.txt
+        and bench_cute_dsl_indexer_topk_results.txt.
+
+        Args:
+            input_values: Input logits tensor [batch_size * next_n, vocab_size]
+            seq_lens: Sequence lengths for each batch [batch_size]
+            top_k: Number of top elements to select (max 2048)
+            next_n: Number of candidates per sequence (for speculative decoding)
+            num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+
+        Returns:
+            indices: Top-k indices [batch_size * next_n, top_k]
+        """
+        num_rows = input_values.shape[0]
+        num_tokens = input_values.shape[1]
+        chunk_size_per_cta = 16384
+
+        # Multi-CTA thresholds by dtype (num_tokens above which multi-CTA is faster)
+        if input_values.dtype == torch.float32:
+            use_multi_cta = num_tokens >= 65536
+        else:
+            # fp16 / bf16
+            use_multi_cta = num_tokens >= 32768
+
+        # Only use multi-CTA when both conditions are met:
+        # 1. Single CTA SM utilization is low (< 15%) — not enough rows
+        #    to keep SMs busy with one block each.
+        # 2. Multi-CTA total blocks fit within 2 waves — beyond that the
+        #    2-pass overhead (kernel launch + intermediate buffer I/O)
+        #    outweighs the parallelism gain.
+        # 148 is the number of SMs in Blackwell GPU.
+        # See bench_cute_dsl_multi_cta_vs_single_cta_topk_results.txt.
+        if use_multi_cta:
+            num_sms = 148
+            num_ctas_per_row = math.ceil(num_tokens / chunk_size_per_cta)
+            sm_util_low = num_rows < num_sms * 15 // 100  # < 15%
+            multi_waves = math.ceil(num_rows * num_ctas_per_row / num_sms)
+            use_multi_cta = sm_util_low and multi_waves <= 2
+
+        if use_multi_cta:
+            return cute_dsl_topk_decode_multi_cta_blackwell(
+                input_values=input_values,
+                seq_lens=seq_lens,
+                top_k=top_k,
+                next_n=next_n,
+                num_copy_bits=num_copy_bits,
+                chunk_size_per_cta=chunk_size_per_cta,
+            )
+        else:
+            return cute_dsl_topk_decode_blackwell(
+                input_values=input_values,
+                seq_lens=seq_lens,
+                top_k=top_k,
+                next_n=next_n,
+                num_copy_bits=num_copy_bits,
+            )
+
+    @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
+    def _(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+    ):
+        num_rows = input_values.shape[0]
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
         return indices

@@ -128,18 +128,22 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                 # created by _fill_oob are counted in the radix histogram
                 # and may be selected as top-k candidates with invalid
                 # indices, causing incorrect results.
-                self.num_threads_per_cta = self.max_num_cols // self.vec_size
+                self.num_threads_per_cta = min(self.max_num_cols // self.vec_size, 512)
 
         # only used for debug info
         if cutlass.const_expr(debug):
             print(f"dtype: {self.dtype}, vec_size: {self.vec_size}")
-            print(f"max_num_cols: {self.max_num_cols}, num_threads_per_cta: {self.num_threads_per_cta}")
+            print(
+                f"max_num_cols: {self.max_num_cols}, num_threads_per_cta: {self.num_threads_per_cta}"
+            )
             print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
             print(f"enable_gmem_store: {self.enable_gmem_store}")
             print(f"return_val: {self.return_val}")
             print(f"large_occupancy: {large_occupancy}")
             print(f"filtered_topk_smem_input_size: {self.filtered_topk_smem_input_size}")
-            print(f"first_refine_shift: {self.first_refine_shift}, num_refine_rounds: {self.num_refine_rounds}")
+            print(
+                f"first_refine_shift: {self.first_refine_shift}, num_refine_rounds: {self.num_refine_rounds}"
+            )
 
     @cute.jit
     def run_kernel(
