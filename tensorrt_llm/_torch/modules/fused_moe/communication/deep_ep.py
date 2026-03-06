@@ -25,6 +25,7 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.modules.fused_moe.deep_ep_utils import buffer_pool, deep_ep_installed
 from tensorrt_llm._utils import local_mpi_size
 from tensorrt_llm.mapping import Mapping
@@ -76,12 +77,24 @@ class DeepEP(Communication):
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
+    def destroy(self):
+        """Release the DeepEP buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
+
     @staticmethod
     def is_platform_supported() -> bool:
         """
-        Check if DeepEP is supported on the current platform
+        Check if DeepEP is supported on the current platform.
+
+        DeepEP requires NVLink connectivity between all GPUs
+        (NUM_MAX_NVL_PEERS=8 hardcoded in upstream configs.cuh).
         """
-        return deep_ep_installed
+        return deep_ep_installed and MnnvlMemory.supports_mnnvl()
 
     @staticmethod
     def _is_deepep_feasible(num_ranks: int) -> bool:
