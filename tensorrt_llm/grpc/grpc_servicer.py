@@ -193,13 +193,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             EmbedResponse protobuf
         """
         logger.warning("Embed RPC not yet implemented")
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Embed RPC not yet implemented")
-        return trtllm_service_pb2.EmbedResponse(
-            request_id=request.request_id,
-            embedding=[],
-            prompt_tokens=0,
-        )
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Embed RPC not yet implemented")
 
     async def HealthCheck(
         self,
