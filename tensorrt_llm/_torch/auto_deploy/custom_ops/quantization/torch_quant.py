@@ -232,29 +232,24 @@ def torch_fake_quant_nvfp4_linear(
     """
     Reference (eager) implementation for NVFP4 fake-quant linear.
     Expects torch-compatible FP8 per-block weight scale (no kernel-specific swizzling).
-      - input_scale[0]  = s_in2   (scalar, (448*6)/amax for input)
+      - input_scale[0]  = per-tensor input scale_2 (amax / FP4_GLOBAL_SCALE_MAX)
       - weight_scale[0] = per-block scale in FP8 (torch.float8_e4m3fn), shape >= N*(K/16)
-      - weight_scale[1] = alpha = 1/(s_in2 * s_w2) (inverse combined per-tensor scale)
+      - weight_scale[1] = per-tensor weight scale_2 (amax / FP4_GLOBAL_SCALE_MAX)
     """
     if weight_quantized.dtype != torch.uint8:
         raise TypeError("NVFP4 path requires packed uint8 weights (2x FP4 per byte).")
 
-    inv_x = _expect_single_scale(input_scale, "input_scale")
+    s2_x = _expect_single_scale(input_scale, "input_scale")
     if len(weight_scale) < 2 or weight_scale[0] is None or weight_scale[1] is None:
         raise ValueError(
-            "NVFP4 needs weight_scale[0] (per-block FP8 scale) and weight_scale[1] (alpha)."
+            "NVFP4 needs weight_scale[0] (per-block FP8 scale) and weight_scale[1] (weight scale_2)."
         )
     per_block_scale = weight_scale[0]
-    alpha = weight_scale[1]
+    s2_w = weight_scale[1]
 
     if per_block_scale.dtype != torch.float8_e4m3fn:
         raise TypeError("NVFP4 expects weight_scale[0] in torch-compatible FP8 (float8_e4m3fn).")
 
-    inv_w = 1 / (inv_x * alpha)
-    s2_x = 1.0 / inv_x
-    s2_w = 1.0 / inv_w
-
-    # Shapes
     in_dtype = input.dtype
     input_shape = input.shape
     N, K_packed = weight_quantized.shape[-2], weight_quantized.shape[-1]

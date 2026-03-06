@@ -364,7 +364,7 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         return torch.empty((m, n // 2), dtype=torch.uint8, device=w.device)
 
     def scale_names(self) -> List[str]:
-        return ["input_scale", "weight_scale", "alpha"]
+        return ["input_scale", "weight_scale", "weight_scale_2"]
 
     def _pad_m_n(self, m: int, n: int) -> Tuple[int, int]:
         """Pad m and n to be divisible by 128 and 4 respectively.
@@ -378,19 +378,14 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         m, n = original_weight_shape
         n = n // TRTLLM_NVFP4_SCALING_VECTOR_SIZE
         padded_m, padded_n = self._pad_m_n(m, n)
-        # definition of scales
-        # input_scale: FP4_GLOBAL_SCALE_MAX / input_amax
-        # weight_scale_2: FP4_GLOBAL_SCALE_MAX / weight_amax
-        # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
             "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.float8_e4m3fn),
-            "alpha": torch.tensor(1.0 / 6.0),
+            "weight_scale_2": torch.tensor(1.0 / 6.0),
         }
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
-        # weight_scale list is (per-block FP8 scale, alpha)
-        return ([scales["input_scale"]], [scales["weight_scale"], scales["alpha"]], [], [])
+        return ([scales["input_scale"]], [scales["weight_scale"], scales["weight_scale_2"]], [], [])
 
     def _scale_buffer_key(self, weight_name: str, prefix: str = "") -> str:
         """Key for the weight_scale buffer (get_scale_name('weight_scale') = attrname + '_weight_scale')."""
@@ -402,21 +397,20 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         if weight_name in state_dict:
             modname = weight_name.rsplit(".", 1)[0]
             input_scale_name = modname + ".input_scale"
-            alpha_name = modname + ".alpha"
+            ws2_name = modname + ".weight_scale_2"
             scale_buffer_key = self._scale_buffer_key(weight_name, prefix)
             weight = state_dict[weight_name]
             # ModelOpt quantized graph path
             if weight.dtype != torch.uint8:
                 assert input_scale_name in state_dict
-                # Unquantized weight
                 amax_name = weight_name + "_quantizer._amax"
                 if amax_name in state_dict:
-                    weight_scale_2 = FP4_GLOBAL_SCALE_MAX / state_dict[amax_name].to(torch.float)
+                    ws2_global = FP4_GLOBAL_SCALE_MAX / state_dict[amax_name].to(torch.float)
                 else:
-                    weight_scale_2 = fp4_global_scale(weight)
+                    ws2_global = fp4_global_scale(weight)
                 weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
                     weight.to("cuda"),
-                    weight_scale_2.to("cuda"),
+                    ws2_global.to("cuda"),
                     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
                     False,
                 )
@@ -425,25 +419,10 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                 state_dict[scale_buffer_key] = cutlass_fp4_scale_to_modelopt_fp4_scale(
                     weight_scale_cutlass, (m, k)
                 )
-                state_dict[weight_name + "_scale_2"] = weight_scale_2
-                state_dict[alpha_name] = 1 / torch.clamp(
-                    weight_scale_2 * state_dict[input_scale_name], min=1e-30
+                state_dict[input_scale_name] = 1 / torch.clamp(
+                    state_dict[input_scale_name], min=1e-30
                 )
-            # Unified HF ckpt path
-            else:
-                if (
-                    weight_name + "_scale_2" in state_dict
-                    and weight_name + "_scale" in state_dict
-                    and input_scale_name in state_dict
-                    and float4_sf_dtype
-                ):
-                    alpha = state_dict[weight_name + "_scale_2"] * state_dict[input_scale_name]
-                    alpha = torch.clamp(alpha, min=1e-30)
-                    state_dict[alpha_name] = alpha
-                    input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
-                    state_dict[input_scale_name] = 1 / input_scale
-                    weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    state_dict[scale_buffer_key] = weight_scale
+                state_dict[ws2_name] = 1 / torch.clamp(ws2_global, min=1e-30)
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
         """Convert amax from modelopt quantized graph to scales."""

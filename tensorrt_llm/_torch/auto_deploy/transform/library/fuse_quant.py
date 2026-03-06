@@ -59,14 +59,14 @@ def _fp4_ref_pattern_1(
     w_fp4: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
+    weight_scale_2: torch.Tensor,
 ):
     return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         w_fp4,
         None,
         input_scale=[input_scale],
-        weight_scale=[weight_scale, alpha],
+        weight_scale=[weight_scale, weight_scale_2],
         input_zp=[],
         weight_zp=[],
     )
@@ -77,7 +77,7 @@ def _fp4_ref_repl_1(
     w_fp4: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
+    weight_scale_2: torch.Tensor,
 ):
     return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         x,
@@ -85,7 +85,7 @@ def _fp4_ref_repl_1(
         bias=None,
         input_scale=input_scale,
         weight_scale=weight_scale,
-        alpha=alpha,
+        weight_scale_2=weight_scale_2,
     )
 
 
@@ -96,14 +96,14 @@ def _fp4_ref_pattern_2(
     bias: torch.Tensor,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
+    weight_scale_2: torch.Tensor,
 ):
     return torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         w_fp4,
         bias,
         input_scale=[input_scale],
-        weight_scale=[weight_scale, alpha],
+        weight_scale=[weight_scale, weight_scale_2],
         input_zp=[],
         weight_zp=[],
     )
@@ -115,7 +115,7 @@ def _fp4_ref_repl_2(
     bias: torch.Tensor | None,
     input_scale: torch.Tensor,
     weight_scale: torch.Tensor,
-    alpha: torch.Tensor,
+    weight_scale_2: torch.Tensor,
 ):
     return torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         x,
@@ -123,7 +123,7 @@ def _fp4_ref_repl_2(
         bias=bias,
         input_scale=input_scale,
         weight_scale=weight_scale,
-        alpha=alpha,
+        weight_scale_2=weight_scale_2,
     )
 
 
@@ -212,7 +212,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
     w_fp4 = torch.randint(0, 255, (N, K_packed), device="meta", dtype=torch.uint8)
 
     s_in2 = torch.tensor(0.01, device="meta", dtype=torch.float32)
-    alpha = torch.tensor(1.2345, device="meta", dtype=torch.float32)
+    ws2 = torch.tensor(1.2345, device="meta", dtype=torch.float32)
 
     cutlass_len = N * (K_eff // 16)  # 32 * (64/16) = 128
     cutlass_vec = torch.randint(0, 255, (cutlass_len,), device="meta", dtype=torch.uint8)
@@ -223,7 +223,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         w_fp4,
         s_in2,
         cutlass_vec,
-        alpha,
+        ws2,
     ]
     register_ad_pattern(
         search_fn=_fp4_ref_pattern_1,
@@ -239,7 +239,7 @@ def _register_quant_fp4_linear_patterns(patterns: ADPatternMatcherPass) -> None:
         torch.randn(N, device="meta", dtype=torch.float16),  # bias
         s_in2,
         cutlass_vec,
-        alpha,
+        ws2,
     ]
     register_ad_pattern(
         search_fn=_fp4_ref_pattern_2,
