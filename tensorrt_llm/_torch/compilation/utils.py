@@ -3,23 +3,8 @@ from typing import Callable, List, Union
 
 import torch
 from torch.fx import Node
-from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
 from ..cuda_tile_utils import IS_CUDA_TILE_AVAILABLE
-
-
-def get_symint_val(i: Union[torch.SymInt | int]):
-    if isinstance(i, int):
-        return i
-    elif isinstance(i, torch.SymInt):
-        node = i.node
-        expr = node.expr
-        shape_env: ShapeEnv = node.shape_env
-        var_val = shape_env.var_to_val.get(expr, None) or expr.xreplace(
-            shape_env.var_to_val)
-        return var_val
-    else:
-        raise Exception("Only support int or torch.SymInt")
 
 
 def get_arg(node, idx, arg_name):

@@ -99,9 +99,6 @@ class KvCacheConnectorWorker(ABC):
     def get_connector_meta(self) -> object:
         return self._metadata
 
-    def _clear_connector_meta(self):
-        self._metadata = None
-
     def register_forward_pass_callable(self) -> Callable:
         """
         This callable will be called at the end of the forward pass.
