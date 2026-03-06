@@ -231,7 +231,7 @@ class Distributed(ABC):
 # Max payload size that can be inlined into the header Bcast.  Kept small
 # (256 bytes) to stay within MPI eager-send thresholds and avoid falling
 # into the slower rendezvous protocol.
-_INLINE_DATA_MAX = 256
+_INLINE_DATA_MAX = 4096
 _HEADER_INTS = 3
 _HEADER_BYTES = _HEADER_INTS * 8  # 24 bytes (3 x int64)
 _INLINE_BUF_SIZE = _HEADER_BYTES + _INLINE_DATA_MAX
