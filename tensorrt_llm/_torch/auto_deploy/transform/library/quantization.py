@@ -25,6 +25,7 @@ from ...utils.node_utils import (
     is_linear_op,
 )
 from ...utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
     fp4_global_scale,
     fp8_scale,
     get_quantization_from_linear_node,
@@ -383,21 +384,26 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
         # alpha: 1 / (input_scale * weight_scale_2)
         return {
             "input_scale": torch.tensor(1.0 / 6.0),
-            "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.uint8),
-            # "weight_scale": torch.empty((m, n), dtype=torch.uint8),
-            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.float8_e4m3fn),
-            # "weight_scale": torch.empty(padded_m * padded_n, dtype=torch.uint8),
+            "weight_scale": torch.empty((padded_m, padded_n), dtype=torch.float8_e4m3fn),
             "alpha": torch.tensor(1.0 / 6.0),
         }
 
     def build_custom_args_for_linear(self, scales: Dict[str, Node]) -> Tuple:
-        # weight_scale list is (cutlass_vec, alpha)
+        # weight_scale list is (per-block FP8 scale, alpha)
         return ([scales["input_scale"]], [scales["weight_scale"], scales["alpha"]], [], [])
+
+    def _scale_buffer_key(self, weight_name: str, prefix: str = "") -> str:
+        """Key for the weight_scale buffer (get_scale_name('weight_scale') = attrname + '_weight_scale')."""
+        modname, _, attrname = weight_name.rpartition(".")
+        scale_buffer_name = attrname + "_weight_scale"
+        return prefix + modname + "." + scale_buffer_name
 
     def load_hook(self, state_dict, prefix, *args, weight_name):
         if weight_name in state_dict:
-            input_scale_name = weight_name.rsplit(".", 1)[0] + ".input_scale"
-            alpha_name = weight_name.rsplit(".", 1)[0] + ".alpha"
+            modname = weight_name.rsplit(".", 1)[0]
+            input_scale_name = modname + ".input_scale"
+            alpha_name = modname + ".alpha"
+            scale_buffer_key = self._scale_buffer_key(weight_name, prefix)
             weight = state_dict[weight_name]
             # ModelOpt quantized graph path
             if weight.dtype != torch.uint8:
@@ -408,14 +414,17 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     weight_scale_2 = FP4_GLOBAL_SCALE_MAX / state_dict[amax_name].to(torch.float)
                 else:
                     weight_scale_2 = fp4_global_scale(weight)
-                weight_fp4, weight_scale = torch.ops.trtllm.fp4_quantize(
+                weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
                     weight.to("cuda"),
                     weight_scale_2.to("cuda"),
                     TRTLLM_NVFP4_SCALING_VECTOR_SIZE,
                     False,
                 )
                 state_dict[weight_name] = weight_fp4
-                state_dict[weight_name + "_scale"] = weight_scale
+                m, k = weight.shape
+                state_dict[scale_buffer_key] = cutlass_fp4_scale_to_modelopt_fp4_scale(
+                    weight_scale_cutlass, (m, k)
+                )
                 state_dict[weight_name + "_scale_2"] = weight_scale_2
                 state_dict[alpha_name] = 1 / torch.clamp(
                     weight_scale_2 * state_dict[input_scale_name], min=1e-30
@@ -434,20 +443,7 @@ class NVFP4LinearQuantizationFromConfig(Quantization):
                     input_scale = torch.clamp(state_dict[input_scale_name], min=1e-30)
                     state_dict[input_scale_name] = 1 / input_scale
                     weight_scale = state_dict[weight_name + "_scale"].view(float4_sf_dtype)
-                    # Round the weight block scale factors to 128x4 and then swizzle.
-                    weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
-                        weight_scale.view(torch.uint8).cpu().contiguous()
-                    ).view(float4_sf_dtype)
-
-                    m, n = weight_scale.shape
-                    # scaling factors m is padded along 128 and n is padded along 4.
-                    # check cpp/tensorrt_llm/plugins/fp4GemmPlugin/fp4GemmPlugin.cpp for more details.
-                    padded_m, padded_n = self._pad_m_n(m, n)
-                    swizzled_shape = (padded_m, padded_n)
-
-                    state_dict[weight_name + "_scale"] = weight_scale_swizzled.reshape(
-                        swizzled_shape
-                    )
+                    state_dict[scale_buffer_key] = weight_scale
 
     def convert_amax_hook(self, state_dict, prefix, *args, scale_name: str, amax_name: str):
         """Convert amax from modelopt quantized graph to scales."""

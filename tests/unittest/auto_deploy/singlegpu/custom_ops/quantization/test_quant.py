@@ -5,6 +5,7 @@ from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_availab
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+    cutlass_fp4_scale_to_modelopt_fp4_scale,
     fp4_global_scale,
     pack_int4_in_uint8,
     unpack_uint8_to_int4_weight_2d,
@@ -195,15 +196,16 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         alpha=alpha_fused,
     )
 
+    weight_scale_fp8 = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale_cutlass, (N, K))
     out_unified = torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
         weight_fp4,
         bias,
         [s_in2],  # input_scale list
         [
-            weight_scale_cutlass,
+            weight_scale_fp8,
             alpha_fused,
-        ],  # weight_scale list: [per-block vector, combined alpha]
+        ],  # weight_scale list: [per-block FP8 scale, alpha]
         [],  # input_zp
         [],  # weight_zp
     )
