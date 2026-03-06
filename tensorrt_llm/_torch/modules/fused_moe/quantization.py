@@ -554,7 +554,8 @@ class FusedMoEMethodBase(ABC):
         # device don't have to be 'cuda', e.g. 'cpu' for online EPLB
         device = dst_w3_w1_weight.device
         if not allow_partial_loading:
-            assert w1_weight is not None and w3_weight is not None
+            assert w1_weight is not None
+            assert w3_weight is not None or not module.is_gated_activation
         w1_weight_shard = load_weight_shard(
             w1_weight,
             module.tp_size,
@@ -2055,9 +2056,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
     def load_expert_fc31_input_scale_nvfp4(self, w1_input_scale, w3_input_scale,
                                            dst_fc31_input_scale: torch.Tensor):
         w1_input_scale = w1_input_scale[...].reshape([])
-        w3_input_scale = w3_input_scale[...].reshape([])
-        assert torch.allclose(
-            w1_input_scale, w3_input_scale), "w1_input_scale != w3_input_scale"
+        if w3_input_scale is not None:
+            w3_input_scale = w3_input_scale[...].reshape([])
+            assert torch.allclose(
+                w1_input_scale,
+                w3_input_scale), "w1_input_scale != w3_input_scale"
         dst_fc31_input_scale.copy_(w1_input_scale)
 
     def load_expert_fc2_input_scale_nvfp4(self, w2_input_scale,
@@ -2068,10 +2071,11 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                                      final_fc31_input_scale: torch.Tensor,
                                      dst_fc31_alpha: torch.Tensor):
         w1_weight_scale_2 = w1_weight_scale_2[...].reshape([])
-        w3_weight_scale_2 = w3_weight_scale_2[...].reshape([])
-        assert torch.allclose(
-            w1_weight_scale_2,
-            w3_weight_scale_2), "w1_weight_scale_2 != w3_weight_scale_2"
+        if w3_weight_scale_2 is not None:
+            w3_weight_scale_2 = w3_weight_scale_2[...].reshape([])
+            assert torch.allclose(
+                w1_weight_scale_2,
+                w3_weight_scale_2), "w1_weight_scale_2 != w3_weight_scale_2"
 
         w3_w1_weight_scale_2 = 1.0 / w1_weight_scale_2
         dst_fc31_alpha.copy_(1.0 /
@@ -2103,10 +2107,12 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 if not ignore_weight_scale:
                     w1_weight_scale = weights[f"{expert_id}.w1.weight_scale"]
-                    w3_weight_scale = weights[f"{expert_id}.w3.weight_scale"]
+                    w3_weight_scale = weights[
+                        f"{expert_id}.w3.weight_scale"] if module.is_gated_activation else None
                     w2_weight_scale = weights[f"{expert_id}.w2.weight_scale"]
                 w1_weight_scale_2 = weights[f"{expert_id}.w1.weight_scale_2"]
-                w3_weight_scale_2 = weights[f"{expert_id}.w3.weight_scale_2"]
+                w3_weight_scale_2 = weights[
+                    f"{expert_id}.w3.weight_scale_2"] if module.is_gated_activation else None
                 w2_weight_scale_2 = weights[f"{expert_id}.w2.weight_scale_2"]
             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 if not ignore_weight_scale:
@@ -2117,7 +2123,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     w2_weight_scale = weights["down_proj_weight_scale"][
                         expert_id].transpose(0, 1).contiguous()
                 w1_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
-                w3_weight_scale_2 = weights["gate_up_proj_weight_scale_2"]
+                w3_weight_scale_2 = weights[
+                    "gate_up_proj_weight_scale_2"] if module.is_gated_activation else None
                 w2_weight_scale_2 = weights["down_proj_weight_scale_2"]
             else:
                 raise NotImplementedError(
@@ -2126,7 +2133,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
             expert_idx = local_slot_id
 
-            if not torch.allclose(w1_weight_scale_2, w3_weight_scale_2):
+            if w3_weight_scale_2 is not None and not torch.allclose(
+                    w1_weight_scale_2, w3_weight_scale_2):
                 logger.warning(
                     f"w1_weight_scale_2 != w3_weight_scale_2 ({w1_weight_scale_2} != {w3_weight_scale_2}), selecting the larger value. Accuracy may be affected."
                 )
@@ -2140,8 +2148,10 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                     dst_w3_w1_weight_scale[expert_idx])
                 self.load_expert_w2_weight_scale_nvfp4(
                     module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
-                module._add_raw_shared_weights_for_unmap(
-                    [w1_weight_scale, w3_weight_scale, w2_weight_scale])
+                module._add_raw_shared_weights_for_unmap([
+                    w for w in [w1_weight_scale, w3_weight_scale, w2_weight_scale]
+                    if w is not None
+                ])
 
             self.load_expert_fc31_alpha_nvfp4(w1_weight_scale_2,
                                               w3_weight_scale_2,
@@ -2179,11 +2189,13 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
         for expert_id in range(module.num_experts):
             if module.weight_loading_mode == MoEWeightLoadingMode.VANILLA:
                 w1_input_scale = weights[f"{expert_id}.w1.input_scale"]
-                w3_input_scale = weights[f"{expert_id}.w3.input_scale"]
+                w3_input_scale = weights[
+                    f"{expert_id}.w3.input_scale"] if module.is_gated_activation else None
                 w2_input_scale = weights[f"{expert_id}.w2.input_scale"]
             elif module.weight_loading_mode == MoEWeightLoadingMode.FUSED_GATE_UP_PROJ:
                 w1_input_scale = weights["gate_up_proj_input_scale"]
-                w3_input_scale = weights["gate_up_proj_input_scale"]
+                w3_input_scale = weights[
+                    "gate_up_proj_input_scale"] if module.is_gated_activation else None
                 w2_input_scale = weights["down_proj_input_scale"]
             else:
                 raise NotImplementedError(
@@ -3105,24 +3117,26 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.input_hidden_alignment // module.scaling_vector_size,
-            alignment)
+        if w3_weight_scale is not None:
+            w3_weight_scale = maybe_pad_for_mxfp4(
+                w3_weight_scale,
+                self.input_hidden_alignment // module.scaling_vector_size,
+                alignment)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+        if w3_weight_scale is not None:
+            w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
 
         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
-        w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
+        w3_size = w3_weight_scale.shape[0] if w3_weight_scale is not None and w3_weight_scale.numel() > 0 else 0
         # Keep weights in device buffer
         if module.is_gated_activation:
             # Gated activation: buffer contains both w3 and w1 scales
