@@ -42,7 +42,6 @@ from tensorrt_llm.llmapi import DraftTargetDecodingConfig, Eagle3DecodingConfig,
 prompts = [
     "What is the capital of France?",
     "Please explain the concept of gravity in simple words and a single sentence.",
-    "Write a short poem about the ocean.",
     "What are the main differences between Python and C++?",
     "Summarize the plot of Romeo and Juliet in three sentences.",
 ]
