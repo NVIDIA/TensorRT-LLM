@@ -88,7 +88,7 @@ class TransformerArgsPreprocessor:
         attention_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         batch_size = x.shape[0]
-        context = self.caption_projection(context)
+        context = self.caption_projection(context.contiguous())
         context = context.view(batch_size, -1, x.shape[-1])
         return context, attention_mask
 
@@ -131,7 +131,7 @@ class TransformerArgsPreprocessor:
         )
 
     def prepare(self, modality: Modality) -> TransformerArgs:
-        x = self.patchify_proj(modality.latent)
+        x = self.patchify_proj(modality.latent.contiguous())
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )

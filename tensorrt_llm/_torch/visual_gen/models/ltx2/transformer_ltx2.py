@@ -177,6 +177,7 @@ class LTX2Attention(Attention):
         """
         if not self._has_dual_attn:
             return
+        self._modules.pop("attn", None)
         self.attn = self._ulysses_attn if active else self._plain_attn
 
     def _init_qkv_proj(self):
