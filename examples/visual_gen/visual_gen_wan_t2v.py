@@ -84,6 +84,12 @@ def parse_args():
         default=0.2,
         help="TeaCache similarity threshold (rel_l1_thresh)",
     )
+    parser.add_argument(
+        "--use_ret_steps",
+        action="store_true",
+        help="Use ret_steps mode for TeaCache. "
+        "Using Retention Steps will result in faster generation speed and better generation quality.",
+    )
 
     # Quantization
     parser.add_argument(
@@ -185,6 +191,7 @@ def main():
         "teacache": {
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,
+            "use_ret_steps": args.use_ret_steps,
         },
         "parallel": {
             "dit_cfg_size": args.cfg_size,
