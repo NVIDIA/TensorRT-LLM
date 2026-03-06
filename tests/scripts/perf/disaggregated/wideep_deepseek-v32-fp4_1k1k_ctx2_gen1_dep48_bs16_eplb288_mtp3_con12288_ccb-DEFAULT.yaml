@@ -8,7 +8,6 @@ metadata:
   script_file: disaggr_torch.slurm
   benchmark_type: 1k1k
   config_index: 7
-  dataset_file: disagg_datasets/deepseek-v32-1024-1024-200000-ratio-1_for_serve.json
 slurm:
   script_file: disaggr_torch.slurm
   partition: <partition>
@@ -26,7 +25,7 @@ benchmark:
   concurrency_list: '12288'
   input_length: 1024
   output_length: 1024
-  dataset_file: <dataset_file>
+  dataset_file: datasets/perf-ci/deepseek_v32-1k1k-20480-ratio-1_for_serve.json
 hardware:
   gpus_per_node: 4
   num_ctx_servers: 2
