@@ -41,14 +41,17 @@ jobs:
       - name: Get changed files
         id: changed-files
         if: github.event_name == 'pull_request'
-        uses: tj-actions/changed-files@v45
-        with:
-          use_rest_api: true  # use GitHub API so base commit need not be in local repo
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files=$(gh api "repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --paginate --jq '.[].filename' | paste -sd ' ' -)
+          echo "files=$files" >> $GITHUB_OUTPUT
 
       - name: Run pre-commit checks
         run: |
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "${{ steps.changed-files.outputs.all_modified_files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
+            echo "${{ steps.changed-files.outputs.files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
             python3 -u scripts/release_check.py --files-from changed_files.txt
           else
             python3 -u scripts/release_check.py
