@@ -733,7 +733,7 @@ class ConfigurableMoE(MoE):
                 )
 
                 # Step 4b: Quantization AFTER dispatch
-                x, x_sf = self.backend.quantize_input(x)
+                x, x_sf = self.backend.quantize_input(x, post_quant_comm=False)
         else:
             # No communication, just quantize
             # (use non-post-quant-comm path for TRTLLMGenFusedMoE)

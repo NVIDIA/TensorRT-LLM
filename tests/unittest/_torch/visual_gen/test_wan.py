@@ -3209,64 +3209,6 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             gc.collect()
             torch.cuda.empty_cache()
 
-    def test_two_stage_with_teacache_both_transformers(self):
-        """Test that TeaCache is enabled for both transformers in two-stage mode."""
-        if not is_wan22_checkpoint():
-            pytest.skip(
-                "This test requires Wan 2.2 T2V checkpoint. Set DIFFUSION_MODEL_PATH_WAN22_T2V."
-            )
-        print("\n" + "=" * 80)
-        print("WAN 2.2 TWO-STAGE + TEACACHE TEST")
-        print("=" * 80)
-
-        args = DiffusionArgs(
-            checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
-        )
-        pipeline = PipelineLoader(args).load(skip_warmup=True)
-
-        try:
-            # Skip if not two-stage
-            if pipeline.boundary_ratio is None or pipeline.transformer_2 is None:
-                pytest.skip("Checkpoint is not Wan 2.2 (two-stage)")
-
-            # Verify TeaCache on transformer (high-noise)
-            assert hasattr(pipeline, "transformer_cache_backend"), (
-                "Pipeline missing transformer_cache_backend"
-            )
-            assert pipeline.transformer_cache_backend is not None
-            print("\n[TeaCache] ✓ Transformer (high-noise): TeaCache enabled")
-
-            # Verify TeaCache on transformer_2 (low-noise)
-            assert hasattr(pipeline, "transformer_2_cache_backend"), (
-                "Pipeline missing transformer_2_cache_backend"
-            )
-            assert pipeline.transformer_2_cache_backend is not None
-            print("[TeaCache] ✓ Transformer_2 (low-noise): TeaCache enabled")
-
-            # Verify both have get_stats method
-            assert hasattr(pipeline.transformer_cache_backend, "get_stats")
-            assert hasattr(pipeline.transformer_2_cache_backend, "get_stats")
-            print("[TeaCache] ✓ Both transformers support statistics logging")
-
-            print("\n[PASS] ✓ TeaCache enabled for BOTH transformers")
-            print("       ✓ Low-noise stage benefits MORE from TeaCache")
-            print("=" * 80)
-
-        finally:
-            del pipeline
-            import gc
-
-            gc.collect()
-            torch.cuda.empty_cache()
-
     def test_two_stage_with_fp8_quantization(self):
         """Test two-stage with FP8 quantization on both transformers."""
         if not is_wan22_checkpoint():
@@ -3386,14 +3328,14 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_two_stage_all_optimizations(self):
-        """Test two-stage with ALL optimizations: FP8 + TeaCache + TRTLLM."""
+        """Test two-stage with all supported optimizations: FP8 + TRTLLM."""
         if not is_wan22_checkpoint():
             pytest.skip(
                 "This test requires Wan 2.2 T2V checkpoint. Set DIFFUSION_MODEL_PATH_WAN22_T2V."
             )
         print("\n" + "=" * 80)
         print("WAN 2.2 TWO-STAGE + ALL OPTIMIZATIONS TEST")
-        print("FP8 + TeaCache + TRTLLM Attention")
+        print("FP8 + TRTLLM Attention (TeaCache not supported for Wan 2.2)")
         print("=" * 80)
 
         args = DiffusionArgs(
@@ -3403,11 +3345,6 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="TRTLLM"),
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
         )
         pipeline = PipelineLoader(args).load(skip_warmup=True)
 
@@ -3428,19 +3365,12 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             if pipeline.transformer.blocks[0].attn1.attn_backend == "TRTLLM":
                 optimizations.append("TRTLLM")
 
-            # Check TeaCache
-            if (
-                hasattr(pipeline, "transformer_cache_backend")
-                and pipeline.transformer_cache_backend is not None
-            ):
-                optimizations.append("TeaCache")
-
             # Check two-stage
             optimizations.append("Two-Stage")
 
             print(f"\n[All Optimizations] Enabled: {', '.join(optimizations)}")
-            assert len(optimizations) == 4, (
-                f"Expected 4 optimizations, got {len(optimizations)}: {optimizations}"
+            assert len(optimizations) == 3, (
+                f"Expected 3 optimizations, got {len(optimizations)}: {optimizations}"
             )
 
             # Verify all optimizations on transformer_2 as well
@@ -3451,12 +3381,6 @@ class TestWanTwoStageTransformer(unittest.TestCase):
 
             if pipeline.transformer_2.blocks[0].attn1.attn_backend == "TRTLLM":
                 print("[All Optimizations] ✓ Transformer_2: TRTLLM enabled")
-
-            if (
-                hasattr(pipeline, "transformer_2_cache_backend")
-                and pipeline.transformer_2_cache_backend is not None
-            ):
-                print("[All Optimizations] ✓ Transformer_2: TeaCache enabled")
 
             print("\n[PASS] ✓ All optimizations working on BOTH transformers")
             print("=" * 80)
