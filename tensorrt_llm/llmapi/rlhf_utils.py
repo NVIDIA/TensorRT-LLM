@@ -3,6 +3,7 @@ import gc
 from typing import Optional
 
 import torch
+import inspect
 
 from tensorrt_llm import serialization
 from tensorrt_llm._ray_utils import control_action_decorator
@@ -32,6 +33,16 @@ class WorkerExtension:
 
         >>> llm._collective_rpc("update_weights", args=(ipc_handles,))
     """
+    
+    def supports_partial_loading(self) -> bool:
+        """Check if the model supports partial weight loading."""
+        try:
+            model = self.engine.model_engine.model
+            load_weights_args = inspect.getfullargspec(model.load_weights).args
+            return "allow_partial_loading" in load_weights_args
+        except Exception as e:
+            logger.warning(f"Failed to check partial loading support: {e}")
+            return False
 
     @control_action_decorator
     def update_weights(self, ipc_handles: Optional[dict] = None):
@@ -111,8 +122,10 @@ class WorkerExtension:
                     weights[param_name] = tensor
 
                 logger.info(f"weights key size: {len(weights.keys())}")
+                model = self.engine.model_engine.model
+
                 self.engine.model_engine.model_loader.reload(
-                    self.engine.model_engine.model, weights, allow_partial_loading=True
+                    model, weights, allow_partial_loading=self.supports_partial_loading()
                 )
                 del weights
                 torch.cuda.ipc_collect()
