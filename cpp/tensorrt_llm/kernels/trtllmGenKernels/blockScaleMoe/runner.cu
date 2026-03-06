@@ -205,6 +205,39 @@ void Runner::run(void* routingLogits, void* routingBias, int32_t numTokens, int3
 
         moe::dev::routing::routingRenormalize::run(routingData, stream);
     }
+    else if (routingMethodType == RoutingMethodType::MiniMax2)
+    {
+        moe::dev::routing::routingMiniMax::Data routingData;
+        routingData.mDtypeExpW = btg::Dtype::Bfloat16;
+        routingData.mUsePdl = true;
+        routingData.mNormTopkProb = true;
+
+        routingData.mPtrTopKPacked = routingExpertIndexes;
+        routingData.mPtrExpertCounts = expertCountHistogram;
+        routingData.mPtrPermutedIdxSize = permutedIdxSize;
+        routingData.mPtrExpandedIdxToPermutedIdx = expandedIdxToPermutedIdx;
+        routingData.mPtrPermutedIdxToExpandedIdx = permutedIdxToExpandedIdx;
+        routingData.mPtrPermutedIdxToTokenIdx = permutedIdxToTokenIdx;
+        routingData.mPtrTopKWeights = expertWeights;
+        routingData.mPtrTopKIds = expertIds;
+
+        routingData.mPtrCtaIdxXyToBatchIdx = ctaIdxXyToBatchIdx;
+        routingData.mPtrCtaIdxXyToMnLimit = ctaIdxXyToMnLimit;
+        routingData.mPtrNumNonExitingCtas = numNonExitingCtas;
+
+        routingData.mPtrRoutingBias = routingBias;
+        routingData.mPtrScores = expertIds == nullptr ? routingLogits : nullptr;
+        routingData.mNumTokens = numTokens;
+        routingData.mNumExperts = numExperts;
+        routingData.mTopK = topK;
+        routingData.mPaddingLog2 = computeLog2(mTileTokensDim);
+        routingData.mTileTokensDim = mTileTokensDim;
+        routingData.mLocalExpertsStartIdx = localExpertOffset;
+        routingData.mLocalExpertsStrideLog2 = 0;
+        routingData.mNumLocalExperts = localNumExperts;
+
+        moe::dev::routing::routingMiniMax::run(routingData, stream);
+    }
     else
     {
         TLLM_CHECK_WITH_INFO(false, "Unimplemented routing method %s of enum %d",
