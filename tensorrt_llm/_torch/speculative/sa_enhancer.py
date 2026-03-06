@@ -36,8 +36,8 @@ class SADraftEnhancer:
     Usage:
         1. Construct once during worker ``__init__`` when ``use_sa_spec`` is True.
         2. Call ``extend_and_prepare`` after ``sample_and_accept_draft_tokens``.
-        3. Call ``maybe_override_draft_tokens`` inside each draft step (per-layer
-           workers like MTP/EAGLE3) or once after all drafts are produced (PARD).
+        3. Call ``maybe_override_all_draft_tokens`` once after all draft layers
+           have finished, so that neural draft layers never see SA tokens.
     """
 
     def __init__(self, sa_spec_threshold: int):
@@ -87,41 +87,14 @@ class SADraftEnhancer:
             self.sa_match_len.copy_(match_len)
             self.sa_draft_tokens.copy_(draft_tokens_sa)
 
-    def maybe_override_draft_tokens(
-        self,
-        draft_tokens: torch.Tensor,
-        num_contexts: int,
-    ) -> torch.Tensor:
-        """Override neural draft tokens with SA draft tokens where match is strong.
-
-        For per-layer workers (MTP, EAGLE3), call this once per draft step —
-        it automatically advances ``sa_spec_index``.
-
-        Args:
-            draft_tokens: [batch_size] draft tokens from the neural drafter.
-            num_contexts: Number of context requests in the batch.
-
-        Returns:
-            The (potentially overridden) draft tokens tensor.
-        """
-        if self.sa_match_len is not None and self.sa_match_len.shape[0] > 0:
-            draft_tokens[num_contexts:] = torch.where(
-                self.sa_match_len >= self.sa_spec_threshold,
-                self.sa_draft_tokens[:, self.sa_spec_index],
-                draft_tokens[num_contexts:],
-            )
-            self.sa_spec_index += 1
-
-        return draft_tokens
-
     def maybe_override_all_draft_tokens(
         self,
         draft_tokens: torch.Tensor,
     ) -> torch.Tensor:
-        """Override all K draft positions at once (for parallel-draft workers like PARD).
+        """Override all K draft positions at once.
 
-        Unlike ``maybe_override_draft_tokens`` which overrides one position per
-        call, this method overrides all K columns in a single vectorized operation.
+        Used by all one-engine workers (MTP, EAGLE3, PARD) to override neural
+        draft tokens with SA tokens after the draft loop completes.
 
         Args:
             draft_tokens: [num_gens, K] draft tokens from the neural drafter.

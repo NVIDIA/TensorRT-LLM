@@ -465,6 +465,15 @@ class MTPWorker(SpecWorkerBase):
                 }
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
+        # Override with SA draft tokens after all MTP layers have run,
+        # so that MTP layers never see SA tokens in their inputs.
+        if self.sa_enhancer is not None:
+            num_contexts = attn_metadata.num_contexts
+            gen_draft_tokens = next_draft_tokens[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            next_draft_tokens[num_contexts:] = gen_draft_tokens
+
         # restore attn metadata
         if attn_metadata is not None:
             self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -1094,13 +1103,6 @@ class MTPWorker(SpecWorkerBase):
             # Simple argmax if no TP or no model config
             draft_tokens = self._draft_sampler_greedy(logits)
 
-        if self.sa_enhancer is not None:
-            num_contexts = draft_tokens.shape[0] - (
-                self.sa_enhancer.sa_match_len.shape[0]
-                if self.sa_enhancer.sa_match_len is not None else 0)
-            draft_tokens = self.sa_enhancer.maybe_override_draft_tokens(
-                draft_tokens, num_contexts)
-
         return draft_tokens
 
 
@@ -1307,6 +1309,17 @@ class MTPEagleWorker(MTPWorker):
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
+
+        # Override with SA draft tokens after all MTP layers have run,
+        # so that MTP layers never see SA tokens in their inputs.
+        # Must happen before stacking since next_draft_tokens is still a list.
+        if self.sa_enhancer is not None:
+            stacked = torch.stack(next_draft_tokens, dim=1)
+            gen_draft_tokens = stacked[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            stacked[num_contexts:] = gen_draft_tokens
+            next_draft_tokens = [stacked[:, i] for i in range(stacked.shape[1])]
 
         next_draft_tokens, next_new_tokens = self._prepare_next_tokens(
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,
