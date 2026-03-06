@@ -53,7 +53,6 @@ from ...utils.node_utils import (
     is_any_delta_op,
     is_any_lin_op,
     is_any_moe_op,
-    is_any_ssm_op,
     is_op,
     is_weight_node,
     num_users_of_weight_node,
@@ -2806,42 +2805,6 @@ def detect_sharding_from_config(
         num_matches=num_matches,
         is_clean=False,
         has_valid_shapes=False,
-    )
-
-
-def detect_ssm_shard(
-    gm: GraphModule,
-    transform_container: ShardingTransformContainer,
-) -> TransformInfo:
-    """A transformation to apply sharding to the model following SSM parallelism.
-    TODO: This is a TEMPORARY place for this logic due to the incompatibility between the
-    identify_regions_between_residuals() and subgraph() methods to detect layers.
-    The goal is to have a unified single pass over the graph to detect layers and apply
-    appropriate sharding transformations.
-    """
-    config = transform_container.config
-    world_size = config.world_size
-    if world_size < 2:
-        ad_logger.info("Skipping TP sharding for single device")
-        return TransformInfo(skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True)
-    ad_logger.info("Running SSM sharding detection")
-
-    # find all ssm nodes in the graph
-    ssm_nodes = filtered_nodes(gm.graph.nodes, is_any_ssm_op)
-    num_ssm_shards = 0
-    for ssm_node in ssm_nodes:
-        # We assume that one ssm node defines a subgraph corresponding
-        # to a single Mamba layer.
-        # Find defining previous (in_proj) and next (out_proj) linear nodes.
-        in_proj_node, _ = bfs(ssm_node, is_any_lin_op, attr_next="args", include_root=False)
-
-        num_ssm_shards += int(
-            _process_ssm_sharding(gm, in_proj_node, transform_container, config=config)
-        )
-
-    ad_logger.info(f"Found {num_ssm_shards} SSM shards")
-    return TransformInfo(
-        skipped=False, num_matches=num_ssm_shards, is_clean=False, has_valid_shapes=False
     )
 
 
