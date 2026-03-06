@@ -13,7 +13,6 @@
 # limitations under the License.
 
 
-import argparse
 import math
 from typing import Type
 
@@ -213,7 +212,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         tiler_mn: cute.Shape,
         copy_atom: cute.CopyAtom,
         tiled_copy: cute.TiledCopy,
-        enable_persistent_dymamic_scheduling: cutlass.Constexpr[bool] = False,
+        enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """CuTe DSL implementation of TopK kernel based on radix-based filter algorithm."""
@@ -278,7 +277,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             byte_alignment=128,
         )
 
-        if cutlass.const_expr(not enable_persistent_dymamic_scheduling):
+        if cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             # Thread and block indexing
             bidx, bidy, _ = cute.arch.block_idx()
 
@@ -407,18 +406,18 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         output_indices,
         output_values,
         stream: cuda.CUstream,
-        enable_persistent_dymamic_scheduling: cutlass.Constexpr[bool] = False,
+        enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
     ):
         """Host function for the filtered topk kernel"""
         # now we don't support it.
-        assert not (self.enable_multi_cta and enable_persistent_dymamic_scheduling), (
-            "enable_multi_cta and enable_persistent_dymamic_scheduling cannot both be True"
+        assert not (self.enable_multi_cta and enable_persistent_dynamic_scheduling), (
+            "enable_multi_cta and enable_persistent_dynamic_scheduling cannot both be True"
         )
 
         num_rows = input_values.shape[0]
         # each cta processes one row of input.
-        if cutlass.const_expr(not enable_persistent_dymamic_scheduling):
+        if cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             blocks = (num_rows, self.num_ctas_per_row, 1)
         else:
             blocks = (min(148 * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
@@ -439,7 +438,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             tiler_mn,
             copy_atom,
             tiled_copy,
-            enable_persistent_dymamic_scheduling,
+            enable_persistent_dynamic_scheduling,
             min_blocks_per_mp,
         ).launch(
             grid=blocks,
@@ -540,7 +539,7 @@ def cute_dsl_topk_wrapper(
             output_indices_fake,
             output_values_fake,
             stream=fake_stream,
-            enable_persistent_dymamic_scheduling=load_balance,
+            enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,  # TODO: do we need this one?
         )
         compiled_filter_topk_dict[key] = compiled_kernel
@@ -675,7 +674,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             first_kernel_output_indices_fake,
             first_kernel_output_values_fake,
             stream=fake_stream,
-            enable_persistent_dymamic_scheduling=load_balance,
+            enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
         )
 
@@ -719,7 +718,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             output_indices_fake,
             output_values_fake,
             stream=fake_stream,
-            enable_persistent_dymamic_scheduling=load_balance,
+            enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
         )
 
@@ -879,8 +878,6 @@ def run_filtered_topk_decode(
         (n,),
         stride_order=(0,),
     )
-    print("input_fake: ", input_fake)
-    print("seqlen_fake: ", seqlen_fake)
     output_indices_fake = cute.runtime.make_fake_compact_tensor(
         cutlass.Int32,
         (n, top_k),
@@ -917,7 +914,7 @@ def run_filtered_topk_decode(
         output_indices_fake,
         output_values_fake,
         stream=fake_stream,
-        enable_persistent_dymamic_scheduling=load_balance,
+        enable_persistent_dynamic_scheduling=load_balance,
         # TODO: confirm this parameter.
         min_blocks_per_mp=4 if large_occupancy else 1,
     )
@@ -926,7 +923,6 @@ def run_filtered_topk_decode(
     # num_gen_tokens is the number of rows in the input tensor
     g_global_counter_torch = torch.zeros(1, dtype=torch.int32, device="cuda")
     torch.cuda.synchronize()
-    print("g_global_counter_torch: ", g_global_counter_torch)
     num_gen_tokens = batch_size * next_n  # Use the same variable name as dsa.py
     row_starts = torch.zeros(num_gen_tokens, dtype=torch.int32, device="cuda")
     row_indices = torch.arange(num_gen_tokens, device="cuda") // next_n
@@ -936,17 +932,12 @@ def run_filtered_topk_decode(
     seq_lens = generate_seq_lens(batch_size, top_k, max_num_cols)
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
     row_ends = row_ends.to(torch.int32)
-    # print("row_ends: ", row_ends)
-    print("row_ends.dtype: ", row_ends.dtype)
-
     input_torch = create_random_logits(
         row_starts,
         row_ends,
         torch_dtype(dtype),
         seed,
     )
-    print("input_torch.shape: ", input_torch.shape)
-
     output_indices_torch = torch.empty(num_gen_tokens, top_k, dtype=torch.int32, device="cuda")
     if return_val:
         output_values_torch = torch.empty(
@@ -1156,7 +1147,9 @@ def run_topk_decode(
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Example of Sm100 Dense BlockScaled GEMM.")
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Blackwell CuTE DSL filtered top-k decode benchmark.")
     parser.add_argument(
         "--dtype",
         type=cutlass.dtype,

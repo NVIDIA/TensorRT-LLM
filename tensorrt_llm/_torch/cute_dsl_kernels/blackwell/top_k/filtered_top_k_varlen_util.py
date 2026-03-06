@@ -53,6 +53,10 @@ class FilteredTopKKernelVarlen:
         self.max_num_cols = max_num_cols
         self.top_k = top_k
         self.num_copy_bits = num_copy_bits
+        self.enable_multi_cta = enable_multi_cta
+        self.chunk_size_per_cta = chunk_size_per_cta
+        self.num_ctas_per_row = num_ctas_per_row
+        self.merge_blocks = merge_blocks
 
         # Note: now we only support top_k <= 2048, we could change the code here to support larger top_k.
         self.filtered_topk_max_k = 2048
@@ -1140,10 +1144,6 @@ def compare_top_k_results(
     """
     num_rows = cuda_indices.shape[0]
 
-    # Handle potentially different k values
-    cuda_indices.shape[1]
-    torch_indices.shape[1]
-
     # Calculate valid lengths for each row (vectorized)
     row_lengths = row_ends - row_starts
 
@@ -1167,7 +1167,7 @@ def compare_top_k_results(
         if cuda_valid.shape[0] != torch_valid.shape[0]:
             print(
                 f"Row {row_idx}: Different number of valid indices - "
-                f"Row {row_idx}: CUDA: {cuda_valid.shape[0]}, PyTorch: {torch_valid.shape[0]}"
+                f"CUDA: {cuda_valid.shape[0]}, PyTorch: {torch_valid.shape[0]}"
             )
             return False
 

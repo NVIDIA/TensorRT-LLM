@@ -2861,7 +2861,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 - Kernel is compiled on first use for each unique configuration
                 - Compilation cache grows unbounded (consider clearing periodically)
                 - Uses current CUDA stream for asynchronous execution
-                - Occupancy is automatically optimized for batch_size > 148
+                - Occupancy is automatically optimized when batch_size > num_SMs
             """
             torch_dtype = input_values.dtype
             torch_dtype_to_cutlass_dtype = {
@@ -2872,9 +2872,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
             num_rows, num_cols = input_values.shape
 
-            # 148 is the number of SMs in Blackwell GPU.
-            # TODO: replace with api query sm count.
-            large_occupancy = num_rows > 148
+            num_sms = torch.cuda.get_device_properties().multi_processor_count
+            large_occupancy = num_rows > num_sms
             load_balance = False
 
             # Compilation key
@@ -2944,7 +2943,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output_indices_fake,
                     output_values_fake,
                     stream=fake_stream,
-                    enable_persistent_dymamic_scheduling=load_balance,
+                    enable_persistent_dynamic_scheduling=load_balance,
                     min_blocks_per_mp=1,
                 )
                 self.__class__.kernel_cache[key] = compiled_kernel
@@ -2969,6 +2968,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
+            buffer_bytes = num_rows * buffer_numbers * num_cols * 4
+            if buffer_bytes > 1 << 30:  # > 1 GB
+                logger.warning(
+                    f"CuTE DSL top-k: intermediate buffer is {buffer_bytes / (1 << 30):.1f} GB "
+                    f"(num_rows={num_rows}, num_cols={num_cols}). "
+                    "Consider reducing batch size or vocab size to avoid OOM."
+                )
             buffer_torch = torch.empty(num_rows,
                                        buffer_numbers,
                                        num_cols,
@@ -3149,9 +3155,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
             num_rows, num_cols = input_values.shape
 
-            # 148 is the number of SMs in Blackwell GPU.
-            # TODO: replace with api query sm count.
-            large_occupancy = num_rows > 148
+            num_sms = torch.cuda.get_device_properties().multi_processor_count
+            large_occupancy = num_rows > num_sms
             load_balance = False
 
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
@@ -3224,7 +3229,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     first_kernel_output_indices_fake,
                     first_kernel_output_values_fake,
                     stream=fake_stream,
-                    enable_persistent_dymamic_scheduling=load_balance,
+                    enable_persistent_dynamic_scheduling=load_balance,
                     min_blocks_per_mp=1,
                 )
 
@@ -3268,7 +3273,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output_indices_fake,
                     output_values_fake,
                     stream=fake_stream,
-                    enable_persistent_dymamic_scheduling=load_balance,
+                    enable_persistent_dynamic_scheduling=load_balance,
                     min_blocks_per_mp=1,
                 )
 
@@ -3308,10 +3313,18 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 2
             else:
                 buffer_numbers = 1
+            buffer_dim2 = max(chunk_size_per_cta, num_ctas_per_row * top_k)
+            buffer_bytes = num_rows * num_ctas_per_row * buffer_numbers * buffer_dim2 * 4
+            if buffer_bytes > 1 << 30:  # > 1 GB
+                logger.warning(
+                    f"CuTE DSL multi-CTA top-k: intermediate buffer is "
+                    f"{buffer_bytes / (1 << 30):.1f} GB "
+                    f"(num_rows={num_rows}, num_ctas_per_row={num_ctas_per_row}). "
+                    "Consider reducing batch size or vocab size to avoid OOM."
+                )
             buffer_torch = torch.empty(num_rows * num_ctas_per_row,
                                        buffer_numbers,
-                                       max(chunk_size_per_cta,
-                                           num_ctas_per_row * top_k),
+                                       buffer_dim2,
                                        dtype=torch.int32,
                                        device="cuda")
 
@@ -3460,7 +3473,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Multi-CTA is only used when both conditions are met, ensuring it
         only activates when single-CTA occupancy is genuinely low and
         multi-CTA overhead is bounded.
-        Uses chunk_size_per_cta=16384 for multi-CTA, num_sms=148 (Blackwell).
+        Uses chunk_size_per_cta=16384 for multi-CTA.
 
         Based on benchmark results (Blackwell SM100, top_k=2048).
         See bench_cute_dsl_multi_cta_vs_single_cta_topk_results.txt
@@ -3493,10 +3506,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         # 2. Multi-CTA total blocks fit within 2 waves — beyond that the
         #    2-pass overhead (kernel launch + intermediate buffer I/O)
         #    outweighs the parallelism gain.
-        # 148 is the number of SMs in Blackwell GPU.
-        # See bench_cute_dsl_multi_cta_vs_single_cta_topk_results.txt.
         if use_multi_cta:
-            num_sms = 148
+            num_sms = torch.cuda.get_device_properties().multi_processor_count
             num_ctas_per_row = math.ceil(num_tokens / chunk_size_per_cta)
             sm_util_low = num_rows < num_sms * 15 // 100  # < 15%
             multi_waves = math.ceil(num_rows * num_ctas_per_row / num_sms)

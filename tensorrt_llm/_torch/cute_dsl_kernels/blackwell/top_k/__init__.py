@@ -16,24 +16,10 @@
 
 from .filtered_top_k_decode_varlen import (
     FilteredTopKKernelVarlenDecode,
-    cute_dsl_topk_multi_cta_wrapper,
-    cute_dsl_topk_wrapper,
-    run_topk_decode,
 )
-from .filtered_top_k_varlen_util import (
-    FilteredTopKKernelVarlen,
-    compare_top_k_results,
-    create_random_logits,
-    run_reference_top_k,
-)
+from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
 
 __all__ = [
-    "FilteredTopKKernelVarlenDecode",
     "FilteredTopKKernelVarlen",
-    "cute_dsl_topk_wrapper",
-    "cute_dsl_topk_multi_cta_wrapper",
-    "run_topk_decode",
-    "create_random_logits",
-    "run_reference_top_k",
-    "compare_top_k_results",
+    "FilteredTopKKernelVarlenDecode",
 ]

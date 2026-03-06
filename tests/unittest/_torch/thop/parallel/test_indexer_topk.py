@@ -91,10 +91,6 @@ def compare_top_k_results(
     """
     num_rows = cuda_indices.shape[0]
 
-    # Handle potentially different k values
-    cuda_indices.shape[1]
-    torch_indices.shape[1]
-
     # Calculate valid lengths for each row (vectorized)
     row_lengths = row_ends - row_starts
 
