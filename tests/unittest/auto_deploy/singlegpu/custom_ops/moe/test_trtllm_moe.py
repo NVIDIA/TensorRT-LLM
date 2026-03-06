@@ -1004,8 +1004,7 @@ FINEGRAINED_FP8_BLOCK_SIZE = 128  # FineGrained FP8 uses 128x128 block scales
 def quantize_to_finegrained_fp8_block_scale(
     tensor: torch.Tensor, block_size: int = FINEGRAINED_FP8_BLOCK_SIZE
 ):
-    """
-    Quantize tensor to FP8 with per-block scales (HuggingFace format).
+    """Quantize tensor to FP8 with per-block scales (HuggingFace format).
 
     Args:
         tensor: Input tensor of shape [E, N, K] (experts, rows, cols)

@@ -128,8 +128,8 @@ class TinyFP4Ref(nn.Module):
 
 
 class TinyFineGrainedFP8Ref(nn.Module):
-    """
-    A tiny module whose forward uses the FineGrained FP8 op:
+    """A tiny module whose forward uses the FineGrained FP8 op.
+
       torch_fake_quant_finegrained_fp8_linear(x, w_fp8, bias, [], [weight_scale_inv], [], [])
 
     This simulates models like MiniMax M2 and DeepSeek that use HF's block-wise FP8.
