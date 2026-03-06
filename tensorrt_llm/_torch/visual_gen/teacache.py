@@ -384,6 +384,8 @@ class TeaCacheBackend:
         self.hook.reset_state()
 
         # Derive warmup/cutoff from mode (use_ret_steps)
+        # Aligns with TeaCache repo settings for Wan 2.1
+        # (ref: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4Wan2.1/teacache_generate.py)
         if self.config.ret_steps is None:
             self.config.ret_steps = 5 if self.config.use_ret_steps else 1
         self.config.cutoff_steps = (
