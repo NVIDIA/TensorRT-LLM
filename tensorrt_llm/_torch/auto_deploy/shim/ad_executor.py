@@ -637,11 +637,11 @@ class ADEngine(ModelEngine):
 
             # there are cases:
             # 1. No overlap: we are preparing for the current iteration --> use previous token count
-            # 2. Overlap: we are preparing for the next iteration --> use max_beam_num_tokens
-            # 3. Draft request (overlap or not) --> use previous token counts, overlap scheduler is
-            #    accounted for by incrementing position/cache in-place based on new_tokens_lens.
+            # 2. Overlap: we are preparing for the next iteration -->
+            #    use max_beam_num_tokens; the overlap scheduler offset (new_tokens_lens - 1)
+            #    applied in offset_with_new_lens_ accounts for not-yet-committed tokens.
             num_tokens_seen = request.max_beam_num_tokens
-            if draft_len > 0 or not is_overlap:
+            if not is_overlap:
                 num_tokens_seen -= 1
 
             # build input ids
