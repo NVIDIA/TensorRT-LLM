@@ -41,3 +41,4 @@ nanobind>=2.9.0
 nixl==0.8.0
 hf-transfer==0.1.9
 line_profiler
+pygments==2.17.2
