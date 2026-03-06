@@ -542,9 +542,17 @@ class TestNixlFunctionalTransfer:
 
         request = tab.TransferRequest(tab.TransferOp.WRITE, src_descs, dst_descs, "agent_b")
 
-        # Submitting to an invalidated remote should raise or return a failed status
-        with pytest.raises(Exception):
-            agent_a.submit_transfer_requests(request)
+        # Backend may either raise on submit or return a failed status
+        try:
+            status = agent_a.submit_transfer_requests(request)
+        except Exception:
+            pass  # Raising is acceptable behavior
+        else:
+            # If no exception, the transfer should fail when waited on
+            result = status.wait(timeout_ms=5000)
+            assert result == tab.TransferState.FAILURE, (
+                f"Expected FAILURE after invalidation, got {result}"
+            )
 
         agent_a.deregister_memory(src_descs)
         agent_b.deregister_memory(dst_descs)
@@ -742,8 +750,17 @@ class TestMooncakeFunctionalTransfer:
             tab.TransferOp.WRITE, src_descs, dst_descs, "mooncake_agent_b"
         )
 
-        with pytest.raises(Exception):
-            agent_a.submit_transfer_requests(request)
+        # Backend may either raise on submit or return a failed status
+        try:
+            status = agent_a.submit_transfer_requests(request)
+        except Exception:
+            pass  # Raising is acceptable behavior
+        else:
+            # If no exception, the transfer should fail when waited on
+            result = status.wait(timeout_ms=5000)
+            assert result == tab.TransferState.FAILURE, (
+                f"Expected FAILURE after invalidation, got {result}"
+            )
 
         agent_a.deregister_memory(src_descs)
         agent_b.deregister_memory(dst_descs)
