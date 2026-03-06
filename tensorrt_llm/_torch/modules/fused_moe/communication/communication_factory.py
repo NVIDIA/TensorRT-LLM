@@ -46,6 +46,8 @@ class CommunicationFactory:
     - Workload characteristics
     """
 
+    _nvlink_one_sided_failed: bool = False
+
     @staticmethod
     def create_strategy(
         model_config: ModelConfig,
@@ -119,25 +121,25 @@ class CommunicationFactory:
                 alltoall_result_do_sum,
             )
 
-        # Auto-selection: Try strategies in priority order using try-catch
-        # Priority: NVLinkOneSided > NVLinkTwoSided > DeepEP > DeepEPLowLatency > AllGather
-
-        try:
-            enable_eplb = model_config.moe_load_balancer is not None
-            strategy = NVLinkOneSided(
-                mapping,
-                num_slots,
-                top_k,
-                max_num_tokens,
-                payload_in_workspace,
-                hidden_size=hidden_size,
-                dtype=act_dtype,
-                num_experts=num_experts if enable_eplb else None,
-            )
-            logger.info("Selected communication strategy: NVLinkOneSided")
-            return strategy
-        except RuntimeError as e:
-            logger.debug(f"NVLinkOneSided not available: {e}")
+        # Auto-selection: NVLinkOneSided > NVLinkTwoSided > DeepEP > DeepEPLowLatency > AllGather
+        if not CommunicationFactory._nvlink_one_sided_failed:
+            try:
+                enable_eplb = model_config.moe_load_balancer is not None
+                strategy = NVLinkOneSided(
+                    mapping,
+                    num_slots,
+                    top_k,
+                    max_num_tokens,
+                    payload_in_workspace,
+                    hidden_size=hidden_size,
+                    dtype=act_dtype,
+                    num_experts=num_experts if enable_eplb else None,
+                )
+                logger.info("Selected communication strategy: NVLinkOneSided")
+                return strategy
+            except Exception as e:
+                CommunicationFactory._nvlink_one_sided_failed = True
+                logger.debug(f"NVLinkOneSided not available: {e}")
 
         try:
             strategy = NVLinkTwoSided(

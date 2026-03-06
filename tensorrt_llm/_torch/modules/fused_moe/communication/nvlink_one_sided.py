@@ -224,25 +224,34 @@ class NVLinkOneSided(Communication):
                 f"NVLinkOneSided: Allocating workspace with size {self.workspace_size_per_rank} bytes."
                 f"ep_rank: {self.ep_rank}, ep_size: {self.ep_size}, top_k: {self.top_k}, max_num_tokens_per_rank: {self.max_num_tokens_per_rank}"
             )
-            mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
-            workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
-            metainfo = torch.ops.trtllm.moe_a2a_initialize(
-                workspace,
-                self.ep_rank,
-                self.ep_size,
-                self.max_num_tokens_per_rank,
-                self.eplb_stats_num_experts,
-            )
-            NVLinkOneSided._WORKSPACE = {
-                "workspace_size_per_rank": self.workspace_size_per_rank,
-                "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
-                "ep_rank": self.ep_rank,
-                "ep_size": self.ep_size,
-                "eplb_stats_num_experts": self.eplb_stats_num_experts,
-                "mnnvl_mem": mnnvl_mem,
-                "workspace": workspace,
-                "metainfo": metainfo,
-            }
+            mnnvl_mem = None
+            try:
+                mnnvl_mem = MnnvlMemory(mapping, self.workspace_size_per_rank)
+                workspace = mnnvl_mem.as_torch_strided_tensor(torch.uint8)
+                metainfo = torch.ops.trtllm.moe_a2a_initialize(
+                    workspace,
+                    self.ep_rank,
+                    self.ep_size,
+                    self.max_num_tokens_per_rank,
+                    self.eplb_stats_num_experts,
+                )
+                NVLinkOneSided._WORKSPACE = {
+                    "workspace_size_per_rank": self.workspace_size_per_rank,
+                    "max_num_tokens_per_rank": self.max_num_tokens_per_rank,
+                    "ep_rank": self.ep_rank,
+                    "ep_size": self.ep_size,
+                    "eplb_stats_num_experts": self.eplb_stats_num_experts,
+                    "mnnvl_mem": mnnvl_mem,
+                    "workspace": workspace,
+                    "metainfo": metainfo,
+                }
+            except Exception:
+                if mnnvl_mem is not None:
+                    try:
+                        MnnvlMemory.close_mnnvl_memory(mnnvl_mem.ptr)
+                    except Exception:
+                        pass
+                raise
         else:
             assert self._WORKSPACE["workspace_size_per_rank"] == self.workspace_size_per_rank, (
                 "reuse workspace with different workspace_size_per_rank"
