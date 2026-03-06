@@ -127,6 +127,11 @@ def _selective_scan_update_kernel(
     HAS_EAGLE_TREE_CUSTOM_ATTN_MASK: tl.constexpr,
     HAS_INTERMEDIATE_STATE_INDICES: tl.constexpr,
     BLOCK_SIZE_DSTATE: tl.constexpr,
+    MAMBA_STATE_QUANT_INT16: tl.constexpr,
+    MAMBA_STATE_QUANT_FP16: tl.constexpr,
+    MAMBA_STATE_QUANT_BLOCK_INT16: tl.constexpr, 
+    MAMBA_STATE_QUANT_BLOCK_FP16: tl.constexpr, 
+    BLOCK_SIZE: tl.constexpr,
 ):
     pid_m = tl.program_id(axis=0)
     pid_b = tl.program_id(axis=1)
@@ -164,6 +169,53 @@ def _selective_scan_update_kernel(
     if HAS_STATE_BATCH_INDICES:
         mask &= state_batch_idx != pad_slot_id
     state = tl.load(state_ptrs, mask=mask, other=0.0).to(tl.float32)
+
+    fp16_max: tl.constexpr = 65504.0
+    int16_max: tl.constexpr = 32767.0
+
+    # Reshape to BLOCK_SIZE on last dim
+    if BLOCK_SIZE != 0:
+        state = state.reshape(BLOCK_SIZE_M * BLOCK_SIZE_DSTATE // BLOCK_SIZE, BLOCK_SIZE)
+    if MAMBA_STATE_QUANT_INT16:
+        # encode_scale = tl.load(encode_scale_ptr)
+        # decode_scale = tl.load(decode_scale_ptr)
+        # state = state * encode_scale
+        state = tl.extra.cuda.libdevice.round(state)
+        state = tl.minimum(tl.maximum(state, -int16_max), int16_max)
+        state = state.to(tl.int16).to(tl.float32)
+        # state = state * decode_scale
+    if MAMBA_STATE_QUANT_FP16:
+        # encode_scale = tl.load(encode_scale_ptr)
+        # decode_scale = tl.load(decode_scale_ptr)
+        # state = state * encode_scale
+        state = tl.minimum(tl.maximum(state, -fp16_max), fp16_max)
+        state = state.to(tl.float16).to(tl.float32)
+        # state = state * decode_scale
+    # int16 with block scales
+    if MAMBA_STATE_QUANT_BLOCK_INT16:
+        amax = tl.max(tl.abs(state), axis=-1, keep_dims=True)
+        encode_scale = tl.where(amax == 0.0, 1.0, int16_max / amax)
+        decode_scale = 1.0 / encode_scale
+
+        state = state * encode_scale
+        state = tl.extra.cuda.libdevice.round(state)
+        state = tl.minimum(tl.maximum(state, -int16_max), int16_max)
+        state = state.to(tl.int16).to(tl.float32)
+        state = state * decode_scale
+    # FP16 with block scales
+    if MAMBA_STATE_QUANT_BLOCK_FP16:
+        amax = tl.max(tl.abs(state), axis=-1, keep_dims=True)
+        encode_scale = tl.where(amax == 0.0, 1.0, fp16_max / amax)
+        decode_scale = 1.0 / encode_scale
+
+        state = state * encode_scale
+        state = tl.minimum(tl.maximum(state, -fp16_max), fp16_max)
+        state = state.to(tl.float16).to(tl.float32)
+        state = state * decode_scale
+    # Reshape to original shape
+    if BLOCK_SIZE != 0:
+        state = state.reshape(BLOCK_SIZE_M, BLOCK_SIZE_DSTATE)
+
 
     if HAS_DT_BIAS:
         dt_bias_ptrs = dt_bias_ptr + offs_m * stride_dt_bias_dim
@@ -390,6 +442,64 @@ def selective_state_update(
                                  ((4, 4) if dstate <= 128 else ((4, 8))))))
     tie_hdim = (A.stride(-1) == 0 and A.stride(-2) == 0 and dt.stride(-1) == 0
                 and dt_bias.stride(-1) == 0)
+    import os
+    mamba_state_quant_int16 = False
+    mamba_state_quant_fp16 = False
+    mamba_state_quant_block_int16 = False
+    mamba_state_quant_block_fp16 = False
+    block_size = 0
+    mamba_state_quant_cfg = os.environ.get("MAMBA_STATE_QUANT_CFG")
+    #print(f"dalo: mamba_state_quant_cfg: {mamba_state_quant_cfg}")
+    if mamba_state_quant_cfg is not None:
+
+        if mamba_state_quant_cfg == "int16":
+            mamba_state_quant_int16 = True
+        elif mamba_state_quant_cfg == "fp16":
+            mamba_state_quant_fp16 = True
+        elif mamba_state_quant_cfg == "int16_block":
+            mamba_state_quant_block_int16 = True
+        elif mamba_state_quant_cfg == "fp16_block":
+            mamba_state_quant_block_fp16 = True
+        elif mamba_state_quant_cfg == "int16_block128":
+            mamba_state_quant_block_int16 = True
+            block_size=128
+        elif mamba_state_quant_cfg == "fp16_block128":
+            mamba_state_quant_block_fp16 = True
+            block_size=128
+        elif mamba_state_quant_cfg == "int16_block64":
+            mamba_state_quant_block_int16 = True
+            block_size=64
+        elif mamba_state_quant_cfg == "fp16_block64":
+            mamba_state_quant_block_fp16 = True
+            block_size=64
+        elif mamba_state_quant_cfg == "int16_block32":
+            mamba_state_quant_block_int16 = True
+            block_size = 32
+        elif mamba_state_quant_cfg == "fp16_block32":
+            mamba_state_quant_block_fp16 = True
+            block_size = 32
+        elif mamba_state_quant_cfg == "int16_block16":
+            mamba_state_quant_block_int16 = True
+            block_size = 16
+        elif mamba_state_quant_cfg == "fp16_block16":
+            mamba_state_quant_block_fp16 = True
+            block_size = 16
+        elif mamba_state_quant_cfg == "int16_block2":
+            mamba_state_quant_block_int16 = True
+            block_size = 2
+        elif mamba_state_quant_cfg == "fp16_block2":
+            mamba_state_quant_block_fp16 = True
+            block_size = 2
+        elif mamba_state_quant_cfg == "int16_block1":
+            mamba_state_quant_block_int16 = True
+            block_size = 1
+        elif mamba_state_quant_cfg == "fp16_block1":
+            mamba_state_quant_block_fp16 = True
+            block_size = 1
+        else:
+            raise ValueError(f"Invalid MAMBA_STATE_QUANT_CFG: {mamba_state_quant_cfg}")
+
+        assert mamba_state_quant_int16 + mamba_state_quant_fp16 + mamba_state_quant_block_int16 + mamba_state_quant_block_fp16 == 1
 
     retrieve_parent_token_strides = ((retrieve_parent_token.stride(0),
                                       retrieve_parent_token.stride(1))
@@ -459,6 +569,11 @@ def selective_state_update(
             dt_softplus,
             tie_hdim,
             BLOCK_SIZE_M,
+            MAMBA_STATE_QUANT_INT16=mamba_state_quant_int16,
+            MAMBA_STATE_QUANT_FP16=mamba_state_quant_fp16,
+            MAMBA_STATE_QUANT_BLOCK_INT16=mamba_state_quant_block_int16,
+            MAMBA_STATE_QUANT_BLOCK_FP16=mamba_state_quant_block_fp16,
+            BLOCK_SIZE=block_size,
             DISABLE_STATE_UPDATE=disable_state_update,
             num_warps=num_warps,
         )
