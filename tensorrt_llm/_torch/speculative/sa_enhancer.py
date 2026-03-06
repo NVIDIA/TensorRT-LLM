@@ -64,7 +64,8 @@ class SADraftEnhancer:
         Args:
             sa_manager: The SuffixAutomatonManager instance.
             request_ids: Full request ID list (contexts + generations).
-            accepted_tokens: [batch_size, max_draft_len + 1] accepted tokens.
+            accepted_tokens: [batch_size, padded_width] accepted tokens
+                (may be wider than max_draft_len + 1 due to caller padding).
             num_accepted_tokens: [batch_size] number of accepted tokens.
             num_gens: Number of generation requests in the batch.
             num_contexts: Number of context requests in the batch.
@@ -78,9 +79,16 @@ class SADraftEnhancer:
 
         if num_gens > 0:
             gen_request_ids = request_ids[num_contexts:]
+            # The CUDA kernel indexes accepted tokens as
+            #   acceptedTokensIn[i * (draftLength + 1) + j]
+            # so the physical stride must equal max_draft_len + 1.
+            # Callers like PARD pad accepted_tokens to [batch, 2K]; the
+            # slice + .contiguous() below compacts memory so the stride
+            # matches the kernel expectation.
+            gen_accepted = accepted_tokens[num_contexts:, : max_draft_len + 1].contiguous()
             match_len, draft_tokens_sa = sa_manager.extend(
                 gen_request_ids,
-                accepted_tokens[num_contexts:],
+                gen_accepted,
                 num_accepted_tokens[num_contexts:],
                 max_draft_len,
             )
