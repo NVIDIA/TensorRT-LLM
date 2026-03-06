@@ -497,6 +497,8 @@ class FusedMoEMethodBase(ABC):
             # Finalize shared weights eagerly so each layer's CPU tensors are freed
             # before the next layer is loaded. This prevents accumulation of all
             # layers' shared weight tensors in host memory simultaneously.
+            # For partial loading (e.g. RLHF), finalization is deferred to the
+            # caller's explicit finalization phase (see rlhf_utils.py).
             self._finalize_shared_weights(module)
 
     def _prepare_shared_weights_for_finalization(self, module: torch.nn.Module):
