@@ -52,8 +52,7 @@ def help_info_with_stability_tag(
     return f":tag:`{tag}` {help_str}"
 
 
-def _resolve_chunked_prefill(enable: Optional[bool],
-                             disable: bool) -> bool:
+def _resolve_chunked_prefill(enable: Optional[bool], disable: bool) -> bool:
     """Resolve --enable_chunked_prefill / --disable_chunked_prefill flags.
 
     Chunked prefill is enabled by default. The two flags are mutually
@@ -727,14 +726,12 @@ class ChoiceWithAlias(click.Choice):
               default=None,
               help=help_info_with_stability_tag(
                   "Enable chunked prefill (now enabled by default; "
-                  "kept for backward compatibility)",
-                  "prototype"))
+                  "kept for backward compatibility)", "prototype"))
 @click.option("--disable_chunked_prefill",
               is_flag=True,
               default=False,
               help=help_info_with_stability_tag(
-                  "Disable chunked prefill (enabled by default)",
-                  "prototype"))
+                  "Disable chunked prefill (enabled by default)", "prototype"))
 @click.option("--media_io_kwargs",
               type=str,
               default=None,
@@ -781,8 +778,7 @@ def serve(
         metadata_server_config_file: Optional[str], server_role: Optional[str],
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str],
-        enable_chunked_prefill: Optional[bool],
-        disable_chunked_prefill: bool,
+        enable_chunked_prefill: Optional[bool], disable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
         custom_module_dirs: list[Path], chat_template: Optional[str],
         grpc: bool, served_model_name: Optional[str],
