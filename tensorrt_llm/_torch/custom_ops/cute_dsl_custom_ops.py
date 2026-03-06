@@ -2792,16 +2792,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
 
-    def _bucket_num_cols(num_cols: int) -> int:
-        """Bucket num_cols to the next power of 2 for compilation caching.
-
-        This reduces recompilations when num_cols changes slightly (e.g.,
-        KV cache length growing each decode step). Safe because num_cols
-        only affects compile-time config; actual data access is bounded
-        by seq_lens.
-        """
-        return next_positive_power_of_2(num_cols)
-
     def _get_num_sms() -> int:
         """Return the number of SMs on the current device (cached)."""
         if not hasattr(_get_num_sms, "_value"):
@@ -2824,7 +2814,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         radix-based filtering algorithm for efficient top-k selection.
 
         The runner caches compiled kernels based on configuration (dtype, shape, top_k)
-        to avoid redundant recompilation. Cache is shared across all instances.
+        to avoid redundant recompilation.
+
+        All methods are class-level — no instantiation needed. Call methods directly
+        via ``CuteDSLTopKDecodeSingleCTARunner.forward(...)``.
 
         Attributes:
             kernel_cache: Class-level dict mapping configuration tuples to compiled kernels.
@@ -2838,9 +2831,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - Automatically selects occupancy optimization based on batch size
         """
         kernel_cache = dict()
-
-        def __init__(self):
-            pass
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
@@ -2918,8 +2908,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             cls.kernel_cache[key] = compiled_kernel
 
+        @classmethod
         def forward(
-            self,
+            cls,
             input_values: torch.Tensor,
             seq_lens: torch.Tensor,
             top_k: int,
@@ -2931,7 +2922,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_dtype = input_values.dtype
             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
             num_rows, num_cols = input_values.shape
-            bucketed_num_cols = _bucket_num_cols(num_cols)
+            bucketed_num_cols = next_positive_power_of_2(num_cols)
 
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
@@ -2949,8 +2940,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 large_occupancy,
             )
 
-            if key not in self.__class__.kernel_cache:
-                self.__class__._compile(
+            if key not in cls.kernel_cache:
+                cls._compile(
                     dtype,
                     bucketed_num_cols,
                     top_k,
@@ -2960,7 +2951,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     load_balance,
                     large_occupancy,
                 )
-            compiled_kernel = self.__class__.kernel_cache[key]
+            compiled_kernel = cls.kernel_cache[key]
 
             # Prepare output tensors
             output_indices_torch = torch.empty(num_rows,
@@ -3065,9 +3056,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(f"Unsupported dtype {input_values.dtype}. "
                              f"Supported dtypes: {supported_dtypes}")
 
-        # Use the Runner class
-        runner = CuteDSLTopKDecodeSingleCTARunner()
-        indices, _ = runner.forward(
+        indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
             input_values=input_values,
             seq_lens=seq_lens,
             top_k=top_k,
@@ -3103,6 +3092,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         The runner caches compiled kernel pairs (first pass + merge pass) based on
         configuration to avoid redundant recompilation.
 
+        All methods are class-level — no instantiation needed. Call methods directly
+        via ``CuteDSLTopKDecodeMultiCTARunner.forward(...)``.
+
         Attributes:
             kernel_cache: Class-level dict mapping configuration tuples to compiled
                          kernel pairs (first_kernel, second_kernel).
@@ -3114,9 +3106,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             - Automatically selects occupancy optimization based on batch size
         """
         kernel_cache = dict()
-
-        def __init__(self):
-            pass
 
         @classmethod
         def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
@@ -3248,8 +3237,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cls.kernel_cache[key] = (compiled_kernel_first,
                                      compiled_kernel_second)
 
+        @classmethod
         def forward(
-            self,
+            cls,
             input_values: torch.Tensor,
             seq_lens: torch.Tensor,
             top_k: int,
@@ -3262,7 +3252,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             torch_dtype = input_values.dtype
             dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
             num_rows, num_cols = input_values.shape
-            bucketed_num_cols = _bucket_num_cols(num_cols)
+            bucketed_num_cols = next_positive_power_of_2(num_cols)
 
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
@@ -3286,8 +3276,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_ctas_per_row,
             )
 
-            if key not in self.__class__.kernel_cache:
-                self.__class__._compile(
+            if key not in cls.kernel_cache:
+                cls._compile(
                     dtype,
                     bucketed_num_cols,
                     top_k,
@@ -3299,8 +3289,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     chunk_size_per_cta,
                     num_ctas_per_row,
                 )
-            compiled_kernel_first, compiled_kernel_second = self.__class__.kernel_cache[
-                key]
+            compiled_kernel_first, compiled_kernel_second = cls.kernel_cache[key]
 
             # Prepare intermediate output tensors for first kernel
             first_kernel_output_indices_torch = torch.empty(num_rows,
@@ -3440,9 +3429,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             raise ValueError(f"Unsupported dtype {input_values.dtype}. "
                              f"Supported dtypes: {supported_dtypes}")
 
-        # Use the Runner class
-        runner = CuteDSLTopKDecodeMultiCTARunner()
-        indices, _ = runner.forward(
+        indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
             input_values=input_values,
             seq_lens=seq_lens,
             top_k=top_k,
@@ -3527,7 +3514,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             use_multi_cta = sm_util_low and multi_waves <= 2
 
         if use_multi_cta:
-            indices, _ = CuteDSLTopKDecodeMultiCTARunner().forward(
+            indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
                 input_values=input_values,
                 seq_lens=seq_lens,
                 top_k=top_k,
@@ -3537,7 +3524,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 chunk_size_per_cta=chunk_size_per_cta,
             )
         else:
-            indices, _ = CuteDSLTopKDecodeSingleCTARunner().forward(
+            indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
                 input_values=input_values,
                 seq_lens=seq_lens,
                 top_k=top_k,
@@ -3582,7 +3569,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: Whether kernels should return values (default False).
             num_copy_bits: Vectorization width (default 256).
             bucketed_num_cols_list: List of bucketed num_cols to warmup.
-                If None, uses powers of 2 from 4096 to 131072.
+                If None, uses powers of 2 from 4096 to 262144.
             chunk_size_per_cta: Chunk size for multi-CTA (default 16384).
         """
         # Default bucketed num_cols values to warmup (powers of 2 from 4096 to 262144).

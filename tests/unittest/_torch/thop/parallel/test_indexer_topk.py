@@ -1,6 +1,6 @@
 import pytest
 import torch
-from utils.util import getSMVersion, skip_pre_hopper
+from utils.util import getSMVersion, skip_pre_hopper, skip_pre_blackwell
 
 # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
@@ -265,20 +265,6 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
 # CuTE DSL Top-K Tests
 # ============================================================================
 
-
-def skip_if_no_cute_dsl():
-    """Skip test if CuTE DSL is not available."""
-    if not IS_CUTLASS_DSL_AVAILABLE:
-        pytest.skip("CuTE DSL not available")
-
-
-def skip_if_not_blackwell():
-    """Skip test if not running on Blackwell architecture."""
-    sm = getSMVersion()
-    if sm < 100:
-        pytest.skip("CuTE DSL top-k kernel requires Blackwell (SM100+)")
-
-
 def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, run_fn):
     """Common test logic for CuTE DSL top-k kernels.
 
@@ -290,8 +276,6 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
         dtype: Data type for the logits tensor.
         run_fn: Callable(logits, seq_lens) -> indices tensor.
     """
-    skip_if_no_cute_dsl()
-    skip_if_not_blackwell()
 
     torch.manual_seed(42)
     torch.cuda.manual_seed(42)
@@ -319,6 +303,8 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
     ), "CuTE DSL top-k results don't match torch.topk"
 
 
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("index_topk", [2048])
@@ -341,6 +327,8 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype)
     )
 
 
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
 @pytest.mark.parametrize("next_n", [1, 3])
 @pytest.mark.parametrize("index_topk", [2048])
@@ -367,6 +355,8 @@ def test_cute_dsl_topk_decode_multi_cta(
     )
 
 
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [2048])
