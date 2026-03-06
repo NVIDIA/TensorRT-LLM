@@ -289,9 +289,8 @@ def nvfp4_linear(
         input: unquantized input tensor
         weight_fp4: pre-quantized weight tensor, with dtype torch.uint8 (1 uint8 == 2 elements)
         input_scale: a scalar tensor defined as per_tensor_amax / (FP8 max value (448.0) * FP4 max value (6.0)).
-        weight_scale: a 1D tensor with shape (out_dim * in_dim / 16) padded to be multiple of (128 * 4).
-            with value: per_block_amax / per_tensor_amax * FP8 max value (448.0)
-        weight_scale_2: a scalar tensor defined as per_tensor_amax / (FP8 max value (448.0) * FP4 max value (6.0)).
+        weight_scale: per-block scale in torch FP8 (float8_e4m3fn), shape (out_dim, in_dim/16) or padded.
+        alpha: 1 / (input_scale * weight_scale_2).
 
     Returns:
         The linear output with the original dtype as the input.
@@ -305,20 +304,27 @@ def nvfp4_linear(
     k = input_shape[-1]
     assert k % 16 == 0
     assert weight_shape[-1] % 8 == 0
-    assert weight_scale.numel() % (128 * 4) == 0
-
-    input = input.reshape(-1, k)
 
     # FP4 compatibility
     assert input_scale is not None
     assert weight_scale is not None
     assert alpha is not None
 
+    # Convert torch-compatible FP8 per-block scale to CUTLASS (padded, swizzled) for the kernel.
+    from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
+        modelopt_fp4_scale_to_cutlass_fp4_scale,
+    )
+
+    weight_scale_cutlass = modelopt_fp4_scale_to_cutlass_fp4_scale(weight_scale)
+    assert weight_scale_cutlass.numel() % (128 * 4) == 0
+
+    input = input.reshape(-1, k)
+
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
         input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
     output = torch.ops.trtllm.nvfp4_gemm(
-        x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
+        x_fp4, weight_fp4, x_sf_block, weight_scale_cutlass, alpha, input.dtype
     )
 
     if bias is not None:

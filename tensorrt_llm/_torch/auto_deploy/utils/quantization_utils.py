@@ -5,7 +5,6 @@ import torch
 import torch.nn.functional as F
 from torch.fx import GraphModule, Node
 
-from ..custom_ops.quantization.quant import FP4_GLOBAL_SCALE_MAX, FP8_MAX
 from .logger import ad_logger
 from .node_utils import (
     extract_weight_name,
@@ -21,6 +20,12 @@ try:
     from ....quantization.utils.fp4_utils import float4_sf_dtype
 except ImportError:
     float4_sf_dtype = None
+
+# tmp: Local constants to avoid circular import with quant (which uses these same values).
+_FP8_MAX = torch.finfo(torch.float8_e4m3fn).max
+_FP4_MAX = 6.0
+FP4_GLOBAL_SCALE_MAX = _FP8_MAX * _FP4_MAX
+FP8_MAX = _FP8_MAX
 
 
 def modelopt_fp4_scale_to_cutlass_fp4_scale(modelopt_scale: torch.Tensor) -> torch.Tensor:
