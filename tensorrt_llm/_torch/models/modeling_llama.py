@@ -7,8 +7,8 @@ from PIL.Image import Image
 from torch import nn
 from transformers import (AutoProcessor, AutoTokenizer, Llama4Config,
                           Llama4VisionModel, LlamaConfig, PretrainedConfig)
-from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME
 from transformers.models.llama4.modeling_llama4 import Llama4MultiModalProjector
+from transformers.utils import SAFE_WEIGHTS_INDEX_NAME, WEIGHTS_INDEX_NAME
 
 from tensorrt_llm._torch.distributed import (AllReduce, AllReduceFusionOp,
                                              AllReduceParams, MoEAllReduce)
@@ -1119,6 +1119,7 @@ class Llama4VisionEncoder(nn.Module):
         # Otherwise, load the weights from the checkpoint.
         else:
             import json
+
             from safetensors.torch import load_file as _load_safetensors
             folder = self.pretrained_config._name_or_path
             index_path = os.path.join(folder, SAFE_WEIGHTS_INDEX_NAME)
@@ -1133,8 +1134,7 @@ class Llama4VisionEncoder(nn.Module):
                     state_dict.update(_load_safetensors(path))
                 else:
                     state_dict.update(
-                        torch.load(path, map_location="cpu",
-                                   weights_only=True))
+                        torch.load(path, map_location="cpu", weights_only=True))
             module_dict.load_state_dict(state_dict, strict=False)
 
         self.vision_model = module_dict["vision_model"].to(self.device)

@@ -863,5 +863,4 @@ class NemotronHMTP(nn.Module):
         return hidden_states
 
 
-AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig,
-                    exist_ok=True)
+AutoConfig.register(NemotronHConfig.model_type, NemotronHConfig, exist_ok=True)

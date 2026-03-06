@@ -29,8 +29,8 @@ import torch
 import torch.nn as nn
 import yaml
 from tqdm import tqdm
-from transformers import (AutoModelForCausalLM,
-                          AutoModelForImageTextToText, AutoTokenizer)
+from transformers import (AutoModelForCausalLM, AutoModelForImageTextToText,
+                          AutoTokenizer)
 from transformers.models.gpt2.modeling_gpt2 import GPT2Block
 from transformers.pytorch_utils import Conv1D
 

@@ -7,7 +7,6 @@ import torch.nn.functional as F
 from diffusers.models.embeddings import PixArtAlphaTextProjection, TimestepEmbedding, Timesteps
 from tqdm import tqdm
 
-
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP

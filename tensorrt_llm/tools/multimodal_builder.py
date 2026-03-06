@@ -954,7 +954,7 @@ def build_kosmos_engine(args):
             return img_features
 
     model = AutoModelForImageTextToText.from_pretrained(args.model_path,
-                                                   dtype=torch.float16)
+                                                        dtype=torch.float16)
     wrapper = VisionEncoderWrapper(
         model.vision_model.to(args.device),
         model.image_to_text_projection.to(args.device))

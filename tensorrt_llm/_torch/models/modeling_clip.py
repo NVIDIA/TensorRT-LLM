@@ -4,7 +4,6 @@ import torch
 import torch.nn as nn
 from transformers.activations import ACT2FN
 from transformers.modeling_outputs import BaseModelOutput
-
 from transformers.models.clip.configuration_clip import CLIPVisionConfig
 from transformers.models.clip.modeling_clip import CLIPVisionEmbeddings
 

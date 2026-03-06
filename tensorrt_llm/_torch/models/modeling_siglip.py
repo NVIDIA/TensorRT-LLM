@@ -2,7 +2,6 @@ from typing import Dict, Optional, Tuple
 
 import torch
 import torch.nn as nn
-
 from transformers.models.siglip.configuration_siglip import SiglipVisionConfig
 from transformers.models.siglip.modeling_siglip import (SiglipVisionConfig,
                                                         SiglipVisionEmbeddings)

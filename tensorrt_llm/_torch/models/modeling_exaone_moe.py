@@ -12,7 +12,6 @@ from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization import QuantAlgo
 
-from ...logger import logger
 from ..attention_backend import AttentionMetadata
 from ..attention_backend.interface import (
     PositionalEmbeddingParams,
