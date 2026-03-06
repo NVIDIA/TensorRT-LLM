@@ -101,7 +101,7 @@ class WanImageToVideoPipeline(BasePipeline):
         # Validate TeaCache compatibility before allocating GPU memory
         if self.is_wan22 and model_config.teacache.enable_teacache:
             raise ValueError(
-                "TeaCache is not supported for Wan 2.2 I2V models. "
+                "TeaCache is not supported for Wan 2.2 models. "
                 "Set enable_teacache=False in TeaCacheConfig."
             )
 
