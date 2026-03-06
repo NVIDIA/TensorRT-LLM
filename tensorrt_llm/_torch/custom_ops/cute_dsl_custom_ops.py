@@ -2836,6 +2836,62 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self):
             pass
 
+        @classmethod
+        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n,
+                     return_val, num_copy_bits, load_balance,
+                     large_occupancy):
+            """Compile and cache a single-CTA top-k kernel for the given config."""
+            key = (
+                dtype, bucketed_num_cols, top_k, next_n,
+                return_val, num_copy_bits, load_balance, large_occupancy,
+            )
+            if key in cls.kernel_cache:
+                return
+            n = cute.sym_int()
+            n_div_32 = cute.sym_int(divisibility=32)
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32)
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
+            seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n, ), stride_order=(0, ),
+            )
+            output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n, top_k), stride_order=(1, 0),
+            )
+            if return_val:
+                output_values_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype, (n, top_k), stride_order=(1, 0),
+                )
+            else:
+                output_values_fake = None
+            fake_stream = cute.runtime.make_fake_stream()
+
+            filtered_topk_func = FilteredTopKKernelVarlenDecode(
+                dtype, bucketed_num_cols, top_k, next_n,
+                num_copy_bits=num_copy_bits,
+                return_val=return_val,
+                large_occupancy=large_occupancy,
+            )
+            compiled_kernel = cute.compile(
+                filtered_topk_func,
+                input_fake,
+                None,  # indices_fake
+                buffer_fake,
+                None,  # g_global_counter_fake
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
+                min_blocks_per_mp=1,
+            )
+            cls.kernel_cache[key] = compiled_kernel
+
         def forward(
             self,
             input_values: torch.Tensor,
@@ -2845,42 +2901,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
         ):
-            """Execute filtered top-k selection on input logits.
-
-            This method compiles (if not cached) and executes the CuTE DSL top-k kernel.
-            It selects the top_k largest values per row using a radix-based filtering
-            algorithm optimized for Blackwell architecture.
-
-            Args:
-                input_values: Input logits tensor [batch_size * next_n, vocab_size].
-                             Must be 2D with dtype in {float16, bfloat16, float32}.
-                seq_lens: Sequence lengths for each batch [batch_size].
-                         Must be 1D int32 tensor. Used to determine valid range per row.
-                top_k: Number of top elements to select per row (1 to 2048).
-                      Must be divisible by vectorization width.
-                next_n: Number of candidates per sequence (for speculative decoding).
-                       Must be positive integer. Total rows = batch_size * next_n.
-                return_val: If True, return both indices and values.
-                           If False, return only indices (values will be None).
-                           Setting to False saves memory and computation.
-                num_copy_bits: Vectorization width for memory copy (128 or 256).
-
-            Returns:
-                tuple: (indices, values) where:
-                    - indices: Top-k indices [batch_size * next_n, top_k], int32.
-                    - values: Top-k values [batch_size * next_n, top_k] if return_val=True,
-                             else None.
-
-            Raises:
-                ValueError: If inputs have invalid shape, dtype, or parameter values.
-                KeyError: If unsupported dtype is provided.
-
-            Note:
-                - Kernel is compiled on first use for each unique configuration
-                - Compilation cache grows unbounded (consider clearing periodically)
-                - Uses current CUDA stream for asynchronous execution
-                - Occupancy is automatically optimized when batch_size > num_SMs
-            """
+            """Execute filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
             torch_dtype_to_cutlass_dtype = {
                 torch.float16: cutlass.Float16,
@@ -2908,66 +2929,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
             if key not in self.__class__.kernel_cache:
-                # Create fake tensors for compilation
-                n = cute.sym_int()
-                # Do we need div=32? no.
-                n_div_32 = cute.sym_int(divisibility=32)
-                input_fake = cute.runtime.make_fake_compact_tensor(
-                    dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32)
-                buffer_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    # TODO: (n, cute.sym_int(), n_div_32)
-                    (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                    stride_order=(2, 1, 0),
-                    assumed_align=32,
+                self.__class__._compile(
+                    dtype, bucketed_num_cols, top_k, next_n,
+                    return_val, num_copy_bits, load_balance, large_occupancy,
                 )
-                seqlen_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n, ),
-                    stride_order=(0, ),
-                )
-                output_indices_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n, top_k),
-                    stride_order=(1, 0),
-                )
-                if return_val:
-                    output_values_fake = cute.runtime.make_fake_compact_tensor(
-                        dtype,
-                        (n, top_k),
-                        stride_order=(1, 0),
-                    )
-                else:
-                    output_values_fake = None
-                fake_stream = cute.runtime.make_fake_stream()
-
-                filtered_topk_func = FilteredTopKKernelVarlenDecode(
-                    dtype,
-                    bucketed_num_cols,
-                    top_k,
-                    next_n,
-                    num_copy_bits=num_copy_bits,
-                    return_val=return_val,
-                    large_occupancy=large_occupancy,
-                )
-
-                # Compile the kernel
-                compiled_kernel = cute.compile(
-                    filtered_topk_func,
-                    input_fake,
-                    None,  # indices_fake
-                    buffer_fake,
-                    None,  # g_global_counter_fake
-                    seqlen_fake,
-                    output_indices_fake,
-                    output_values_fake,
-                    stream=fake_stream,
-                    enable_persistent_dynamic_scheduling=load_balance,
-                    min_blocks_per_mp=1,
-                )
-                self.__class__.kernel_cache[key] = compiled_kernel
-            else:
-                compiled_kernel = self.__class__.kernel_cache[key]
+            compiled_kernel = self.__class__.kernel_cache[key]
 
             # Prepare output tensors
             output_indices_torch = torch.empty(num_rows,
@@ -3131,6 +3097,107 @@ if IS_CUTLASS_DSL_AVAILABLE:
         def __init__(self):
             pass
 
+        @classmethod
+        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n,
+                     return_val, num_copy_bits, load_balance,
+                     large_occupancy, chunk_size_per_cta,
+                     num_ctas_per_row):
+            """Compile and cache multi-CTA top-k kernels for the given config."""
+            key = (
+                dtype, bucketed_num_cols, top_k, next_n,
+                return_val, num_copy_bits, load_balance, large_occupancy,
+                True, chunk_size_per_cta, num_ctas_per_row,
+            )
+            if key in cls.kernel_cache:
+                return
+            n = cute.sym_int()
+            n_div_32 = cute.sym_int(divisibility=32)
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32)
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
+            seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n, ), stride_order=(0, ),
+            )
+            first_kernel_output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n, n_div_32), stride_order=(1, 0),
+            )
+            first_kernel_output_values_fake = cute.runtime.make_fake_compact_tensor(
+                dtype, (n, n_div_32), stride_order=(1, 0),
+                assumed_align=32,
+            )
+            fake_stream = cute.runtime.make_fake_stream()
+
+            # First kernel: process each chunk independently
+            filtered_topk_func_first = FilteredTopKKernelVarlenDecode(
+                dtype,
+                chunk_size_per_cta,  # num_cols
+                top_k, next_n,
+                num_copy_bits=num_copy_bits,
+                return_val=True,  # first kernel must return values
+                large_occupancy=large_occupancy,
+                enable_multi_cta=True,
+                chunk_size_per_cta=chunk_size_per_cta,
+                num_ctas_per_row=num_ctas_per_row,
+                merge_blocks=False,
+            )
+            compiled_kernel_first = cute.compile(
+                filtered_topk_func_first,
+                input_fake,
+                None,  # indices_fake
+                buffer_fake,
+                None,  # g_global_counter_fake
+                seqlen_fake,
+                first_kernel_output_indices_fake,
+                first_kernel_output_values_fake,
+                stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
+                min_blocks_per_mp=1,
+            )
+
+            # Second kernel: merge partial results
+            indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n, n_div_32), stride_order=(1, 0),
+            )
+            output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32, (n, top_k), stride_order=(1, 0),
+            )
+            if return_val:
+                output_values_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype, (n, top_k), stride_order=(1, 0),
+                )
+            else:
+                output_values_fake = None
+            filtered_topk_func_second = FilteredTopKKernelVarlenDecode(
+                dtype,
+                num_ctas_per_row * top_k,  # num_cols
+                top_k, next_n,
+                num_copy_bits=num_copy_bits,
+                return_val=return_val,
+                large_occupancy=large_occupancy,
+                enable_multi_cta=False,
+                merge_blocks=True,
+            )
+            compiled_kernel_second = cute.compile(
+                filtered_topk_func_second,
+                input_fake,
+                indices_fake,
+                buffer_fake,
+                None,  # g_global_counter_fake
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
+                min_blocks_per_mp=1,
+            )
+            cls.kernel_cache[key] = (compiled_kernel_first,
+                                     compiled_kernel_second)
+
         def forward(
             self,
             input_values: torch.Tensor,
@@ -3141,30 +3208,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_copy_bits: int = 256,
             chunk_size_per_cta: int = 16384,
         ):
-            """Execute multi-CTA filtered top-k selection on input logits.
-
-            Each row is split into chunks of chunk_size_per_cta columns, with each
-            chunk processed by a separate CTA. A second merge kernel combines the
-            partial top-k results into the final output.
-
-            Args:
-                input_values: Input logits tensor [batch_size * next_n, vocab_size].
-                             Must be 2D with dtype in {float16, bfloat16, float32}.
-                seq_lens: Sequence lengths for each batch [batch_size].
-                         Must be 1D int32 tensor.
-                top_k: Number of top elements to select per row (1 to 2048).
-                next_n: Number of candidates per sequence (for speculative decoding).
-                return_val: If True, return both indices and values.
-                           If False, return only indices (values will be None).
-                num_copy_bits: Vectorization width for memory copy (128 or 256).
-                chunk_size_per_cta: Number of columns each CTA processes.
-
-            Returns:
-                tuple: (indices, values) where:
-                    - indices: Top-k indices [batch_size * next_n, top_k], int32.
-                    - values: Top-k values [batch_size * next_n, top_k] if return_val=True,
-                             else None.
-            """
+            """Execute multi-CTA filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
             torch_dtype_to_cutlass_dtype = {
                 torch.float16: cutlass.Float16,
@@ -3198,112 +3242,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
 
             if key not in self.__class__.kernel_cache:
-                # Create fake tensors for compilation
-                n = cute.sym_int()
-                n_div_32 = cute.sym_int(divisibility=32)
-                input_fake = cute.runtime.make_fake_compact_tensor(
-                    dtype, (n, n_div_32), stride_order=(1, 0), assumed_align=32)
-                buffer_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(), cute.sym_int(), cute.sym_int()),
-                    stride_order=(2, 1, 0),
-                    assumed_align=32,
+                self.__class__._compile(
+                    dtype, bucketed_num_cols, top_k, next_n,
+                    return_val, num_copy_bits, load_balance, large_occupancy,
+                    chunk_size_per_cta, num_ctas_per_row,
                 )
-                seqlen_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n, ),
-                    stride_order=(0, ),
-                )
-                first_kernel_output_indices_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n, n_div_32),
-                    stride_order=(1, 0),
-                )
-                first_kernel_output_values_fake = cute.runtime.make_fake_compact_tensor(
-                    dtype,
-                    (n, n_div_32),
-                    stride_order=(1, 0),
-                    assumed_align=32,
-                )
-                fake_stream = cute.runtime.make_fake_stream()
-
-                # First kernel: process each chunk independently
-                filtered_topk_func_first = FilteredTopKKernelVarlenDecode(
-                    dtype,
-                    chunk_size_per_cta,  # num_cols
-                    top_k,
-                    next_n,
-                    num_copy_bits=num_copy_bits,
-                    return_val=True,  # first kernel must return values
-                    large_occupancy=large_occupancy,
-                    enable_multi_cta=True,
-                    chunk_size_per_cta=chunk_size_per_cta,
-                    num_ctas_per_row=num_ctas_per_row,
-                    merge_blocks=False,
-                )
-                compiled_kernel_first = cute.compile(
-                    filtered_topk_func_first,
-                    input_fake,
-                    None,  # indices_fake
-                    buffer_fake,
-                    None,  # g_global_counter_fake
-                    seqlen_fake,
-                    first_kernel_output_indices_fake,
-                    first_kernel_output_values_fake,
-                    stream=fake_stream,
-                    enable_persistent_dynamic_scheduling=load_balance,
-                    min_blocks_per_mp=1,
-                )
-
-                # Second kernel: merge partial results
-                indices_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n, n_div_32),
-                    stride_order=(1, 0),
-                )
-                output_indices_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (n, top_k),
-                    stride_order=(1, 0),
-                )
-                if return_val:
-                    output_values_fake = cute.runtime.make_fake_compact_tensor(
-                        dtype,
-                        (n, top_k),
-                        stride_order=(1, 0),
-                    )
-                else:
-                    output_values_fake = None
-                filtered_topk_func_second = FilteredTopKKernelVarlenDecode(
-                    dtype,
-                    num_ctas_per_row * top_k,  # num_cols
-                    top_k,
-                    next_n,
-                    num_copy_bits=num_copy_bits,
-                    return_val=return_val,
-                    large_occupancy=large_occupancy,
-                    enable_multi_cta=False,
-                    merge_blocks=True,
-                )
-                compiled_kernel_second = cute.compile(
-                    filtered_topk_func_second,
-                    input_fake,
-                    indices_fake,
-                    buffer_fake,
-                    None,  # g_global_counter_fake
-                    seqlen_fake,
-                    output_indices_fake,
-                    output_values_fake,
-                    stream=fake_stream,
-                    enable_persistent_dynamic_scheduling=load_balance,
-                    min_blocks_per_mp=1,
-                )
-
-                self.__class__.kernel_cache[key] = (compiled_kernel_first,
-                                                    compiled_kernel_second)
-            else:
-                compiled_kernel_first, compiled_kernel_second = self.__class__.kernel_cache[
-                    key]
+            compiled_kernel_first, compiled_kernel_second = self.__class__.kernel_cache[key]
 
             # Prepare intermediate output tensors for first kernel
             first_kernel_output_indices_torch = torch.empty(num_rows,
@@ -3564,3 +3508,63 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_rows = input_values.shape[0]
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
         return indices
+
+    # Default bucketed num_cols values to warmup (powers of 2 from 4096 to 262144).
+    _TOPK_WARMUP_BUCKETED_NUM_COLS = [1 << i for i in range(12, 19)]
+
+    def warmup_cute_dsl_topk_kernels(
+        dtype=cutlass.BFloat16,
+        top_k: int = 2048,
+        next_n: int = 1,
+        return_val: bool = False,
+        num_copy_bits: int = 256,
+        bucketed_num_cols_list: list | None = None,
+        chunk_size_per_cta: int = 16384,
+    ):
+        """Pre-compile CuTE DSL top-k kernels for common configurations.
+
+        Enumerates all combinations of (bucketed_num_cols, large_occupancy)
+        and compiles both single-CTA and multi-CTA kernels. This avoids
+        compilation latency on the first decode request.
+
+        Args:
+            dtype: Cutlass data type (default BFloat16).
+            top_k: Number of top-k elements (default 2048).
+            next_n: Speculative decoding candidates (default 1).
+            return_val: Whether kernels should return values (default False).
+            num_copy_bits: Vectorization width (default 256).
+            bucketed_num_cols_list: List of bucketed num_cols to warmup.
+                If None, uses powers of 2 from 4096 to 131072.
+            chunk_size_per_cta: Chunk size for multi-CTA (default 16384).
+        """
+        if bucketed_num_cols_list is None:
+            bucketed_num_cols_list = _TOPK_WARMUP_BUCKETED_NUM_COLS
+
+        load_balance = False
+        count = 0
+        for bucketed_num_cols in bucketed_num_cols_list:
+            for large_occupancy in [False, True]:
+                # Single-CTA kernel
+                CuteDSLTopKDecodeSingleCTARunner._compile(
+                    dtype, bucketed_num_cols, top_k, next_n,
+                    return_val, num_copy_bits, load_balance,
+                    large_occupancy,
+                )
+                count += 1
+
+                # Multi-CTA kernel (only when num_cols > chunk_size_per_cta)
+                num_ctas_per_row = math.ceil(
+                    bucketed_num_cols / chunk_size_per_cta)
+                if num_ctas_per_row > 1:
+                    CuteDSLTopKDecodeMultiCTARunner._compile(
+                        dtype, bucketed_num_cols, top_k, next_n,
+                        return_val, num_copy_bits, load_balance,
+                        large_occupancy, chunk_size_per_cta,
+                        num_ctas_per_row,
+                    )
+                    count += 1
+
+        logger.info(
+            f"Warmup: pre-compiled {count} CuTE DSL top-k kernels "
+            f"(dtype={dtype}, top_k={top_k}, next_n={next_n})"
+        )
