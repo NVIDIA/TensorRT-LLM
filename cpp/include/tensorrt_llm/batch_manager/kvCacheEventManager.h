@@ -24,6 +24,7 @@
 #include <deque>
 #include <mutex>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager

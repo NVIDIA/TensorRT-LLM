@@ -6431,7 +6431,9 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStoreForDifferentWindowDoesNotFlus
         else if (std::holds_alternative<tle::KVCacheStoredData>(event.data))
         {
             if (event.windowSize == wFull && !storedFullPos)
+            {
                 storedFullPos = pos;
+            }
         }
         ++pos;
     }
