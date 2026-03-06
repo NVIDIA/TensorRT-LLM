@@ -279,11 +279,7 @@ bool getEnvEnableTrtllmgenMoeRoutingRenormPDL()
     static std::once_flag flag;
     static bool enabled = false;
 
-    std::call_once(flag,
-        [&]()
-        {
-            enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL");
-        });
+    std::call_once(flag, [&]() { enabled = getBoolEnv("TRTLLM_ENABLE_TRTLLMGEN_MOE_ROUTING_RENORM_PDL"); });
     return enabled;
 }
 
