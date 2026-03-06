@@ -28,18 +28,20 @@ Design Goals:
 
 import itertools
 import logging
-import os
 from typing import List, Optional
 
 import pytest
 import torch
 from _torch.modules.moe.moe_test_utils import (
+    IS_CI_MODE,
     MoeBackendType,
     MoeModelConfig,
     create_test_param,
     get_backend_class,
     iter_base_test_configs,
     replay_tactics_and_check,
+    should_skip_to_accelerate_ci,
+    skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -49,7 +51,7 @@ from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import RenormalizeMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.create_moe import create_moe_backend
-from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.modules.fused_moe.interface import MoE, MoEWeightLoadingMode
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -103,6 +105,7 @@ def create_test_backend(
     swiglu_alpha: Optional[torch.Tensor] = None,
     swiglu_beta: Optional[torch.Tensor] = None,
     swiglu_limit: Optional[torch.Tensor] = None,
+    weight_loading_mode: MoEWeightLoadingMode = MoEWeightLoadingMode.VANILLA,
 ) -> MoE:
     """Create a MoE backend for testing."""
     backend_cls = get_backend_class(backend_type)
@@ -134,6 +137,7 @@ def create_test_backend(
         swiglu_alpha=swiglu_alpha,
         swiglu_beta=swiglu_beta,
         swiglu_limit=swiglu_limit,
+        weight_loading_mode=weight_loading_mode,
     )
 
 
@@ -226,30 +230,28 @@ DTYPES_TO_TEST = [
 # Default runs the CI subset (TRTLLM_TEST_MOE_CI=1).
 # Set TRTLLM_TEST_MOE_CI=0 for the full local config matrix.
 CI_MOE_MODEL_CONFIGS = [
+    # Real models (small/medium — tactic replay is model-size-independent,
+    # e256 is covered by test_moe_module integration tests)
     MoeModelConfig(60, 4, 2048, 1408),  # Qwen1.5-MoE-A2.7B
-    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
     MoeModelConfig(128, 4, 2880, 2880),  # GPT-OSS-120B
     MoeModelConfig(8, 1, 512, 512),  # boundary: top_k=1, single expert activated
-]
-
-LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
-    MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
-    MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
-    MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
-    # === Boundary Tests: num_experts / top_k ===
+    # Boundary tests for tactic correctness
     MoeModelConfig(4, 4, 512, 512),  # top_k=num_experts, all experts activated
     MoeModelConfig(7, 2, 256, 512),  # prime num_experts
     MoeModelConfig(13, 3, 256, 512),  # prime num_experts, odd top_k
+]
+
+LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
+    MoeModelConfig(256, 8, 7168, 2048),  # DeepSeek-V3
+    MoeModelConfig(8, 2, 4096, 14336),  # Mixtral-8x7B
+    MoeModelConfig(64, 6, 2048, 1408),  # DeepSeek-MoE-16B / DeepSeek-V2-Lite
+    MoeModelConfig(8, 2, 6144, 32768),  # Grok-1
     # === Boundary Tests: small sizes ===
     MoeModelConfig(4, 2, 64, 128),  # very small hidden_size
     MoeModelConfig(4, 2, 128, 64),  # intermediate < hidden
 ]
 
-MOE_MODEL_CONFIGS = (
-    CI_MOE_MODEL_CONFIGS
-    if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1"
-    else LOCAL_MOE_MODEL_CONFIGS
-)
+MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS if IS_CI_MODE else LOCAL_MOE_MODEL_CONFIGS
 
 # Sequence lengths to test
 SEQ_LENS_TO_TEST = [1, 8]
@@ -270,9 +272,7 @@ CI_SWIGLU_COMBOS = [
     (1.702, 1.0, 7.0),  # gptoss style (GPT-OSS real values)
 ]
 
-SWIGLU_COMBOS = (
-    CI_SWIGLU_COMBOS if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1" else LOCAL_SWIGLU_COMBOS
-)
+SWIGLU_COMBOS = CI_SWIGLU_COMBOS if IS_CI_MODE else LOCAL_SWIGLU_COMBOS
 
 
 def generate_test_params() -> List:
@@ -381,7 +381,6 @@ TEST_PARAMS = generate_test_params()
 # - 128-alignment requirements for quantization
 #
 # =============================================================================
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.parametrize(
     "dtype_activation,backend_type,quant_algo,seq_len,model_config,"
     "routing_method_cls,swiglu_alpha,swiglu_beta,swiglu_limit",
@@ -412,16 +411,25 @@ def test_moe_backend(
     # Default values: alpha=1, beta=0, limit=inf
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
 
-    # Note: Skip logic is now handled at parametrize level via get_quick_skip_reason()
-    # which calls backend's can_implement() and should_skip_* functions.
-    # This avoids entering test function for invalid combinations, significantly
-    # reducing test collection time (from ~17 min to ~5 sec for 3400+ skipped tests).
+    ci_skip = should_skip_to_accelerate_ci(
+        backend_type=backend_type,
+        quant_algo=quant_algo,
+        model_config=model_config,
+        routing_method_cls=routing_method_cls,
+        dtype=dtype_activation,
+        seq_len=seq_len,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+    )
+    if ci_skip:
+        pytest.skip(ci_skip)
 
     # Extract model parameters
     num_experts = model_config.num_experts
     top_k = model_config.top_k
     hidden_size = model_config.hidden_size
     intermediate_size = model_config.intermediate_size
+
+    skip_if_insufficient_gpu_memory(num_experts, hidden_size, intermediate_size, dtype_activation)
 
     # Create mapping
     mapping = Mapping()
@@ -464,6 +472,11 @@ def test_moe_backend(
         # Get swiglu tensors if swiglu_gptoss_style is enabled
         swiglu_tensors = quantize_util.get_swiglu_tensors()
 
+        # Determine weight loading mode based on quantization algorithm
+        weight_loading_mode = MoEWeightLoadingMode.VANILLA
+        if hasattr(quantize_util, "weight_loading_mode"):
+            weight_loading_mode = quantize_util.weight_loading_mode
+
         # Create backend first (needed for MXFP4_MXFP8 to get shapes)
         backend = create_test_backend(
             backend_type=backend_type,
@@ -478,6 +491,7 @@ def test_moe_backend(
             swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+            weight_loading_mode=weight_loading_mode,
         )
 
         # W4A8_MXFP4_MXFP8 requires different weights for backend and reference
