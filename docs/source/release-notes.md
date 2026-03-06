@@ -9,7 +9,7 @@ All published functionality in the Release Notes has been fully tested and verif
 ### Highlights
 
 - **Model Support**
-  - Added support for K-EXAONE, Nemotron Nano V3, Nemotron Super V3, Qwen3-Next and Qwen3-VL.
+  - Added beta support for K-EXAONE, Nemotron Nano V3, Qwen3-Next and Qwen3-VL.
   - Improved GPT-OSS, Nemotron, EXAONE, GLM, Starcoder2, Qwen3, KimiK2, DeepSeek v3.2 and Mistral Large 3 support and validation.
   - Expanded Blackwell/Hopper/Ampere enablement including B300/GB200/GB300 and SM120/SM121/SM103 paths.
   - Broadened low-precision and MoE capabilities (FP8/NVFP4/MXFP4/INT4-AWQ), including routing and kernels.
