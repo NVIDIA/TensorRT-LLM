@@ -227,6 +227,10 @@ methods:
         annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
         default: null
         status: prototype
+      reorder_policy_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.ReorderRequestPolicyConfig]
+        default: null
+        status: prototype
       env_overrides:
         annotation: Optional[Dict[str, str]]
         default: null
