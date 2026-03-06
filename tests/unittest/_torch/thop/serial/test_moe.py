@@ -22,6 +22,11 @@ import torch
 import torch.nn.functional as F
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
+
+# NOTE: Some tests in this file are deprecated and skipped. They are now covered by the
+# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# and test_moe_module.py. Add new MoE tests there instead of here.
+
 from enum import Enum
 
 from utils.util import getSMVersion
@@ -872,6 +877,10 @@ def are_groups_valid(top_k_groups, n_groups):
     return True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1006,6 +1015,10 @@ class TestMoeFP8:
                        percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -1092,6 +1105,17 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_qwen_next"),
+            pytest.param(
+                {
+                    "num_experts": 2048,
+                    "top_k": 32,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_large_experts"),
         ],
     )
     def test_autotune(self, num_tokens, hidden_size, intermediate_size,
@@ -1175,6 +1199,17 @@ class TestMoeFp4:
                     "routing_method_type": RoutingMethodType.Renormalize
                 },
                 id="RoutingRenormalize_qwen_next"),
+            pytest.param(
+                {
+                    "num_experts": 2048,
+                    "top_k": 32,
+                    "n_groups": None,
+                    "top_k_groups": None,
+                    "routed_scaling": None,
+                    "has_routing_bias": False,
+                    "routing_method_type": RoutingMethodType.Renormalize
+                },
+                id="RoutingRenormalize_large_experts"),
         ],
     )
     @pytest.mark.parametrize("use_topk_as_input", [False, True],
@@ -1328,7 +1363,7 @@ class TestMoeFp4:
             pytest.skip("https://nvbugs/5434352")
 
         assert top_k <= num_experts
-        assert top_k <= 22
+        assert top_k <= 32
         assert num_experts % 4 == 0
 
         if use_topk_as_input:
@@ -1917,6 +1952,10 @@ class TestMoeFp4:
                        percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() < 100 or getSMVersion() >= 110,
     reason="The kernel only supports Blackwell. Current SM is %d." %
@@ -2003,7 +2042,7 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
     tile_tokens_dim = 8
 
     assert top_k <= num_experts
-    assert top_k <= 8
+    assert top_k <= 32
     assert num_experts % 4 == 0
 
     if are_groups_valid(top_k_groups, n_groups):
@@ -2142,6 +2181,10 @@ def test_moe_fp8_per_tensor_scale(num_tokens, hidden_size, intermediate_size,
                    percent=0.925)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(
     getSMVersion() != 100,
     reason="The kernel only supports Blackwell. Current SM is %d." %

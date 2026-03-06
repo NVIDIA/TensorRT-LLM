@@ -82,9 +82,8 @@ def test_load_wan_pipeline_basic(checkpoint_exists):
     args = DiffusionArgs(
         checkpoint_path=CHECKPOINT_PATH,
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
 
     # Verify pipeline type
     assert pipeline.__class__.__name__ == "WanPipeline"
@@ -121,9 +120,8 @@ def test_load_wan_pipeline_with_fp8_dynamic_quant(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
 
     # Verify model config has dynamic_weight_quant enabled
     assert pipeline.model_config.dynamic_weight_quant is True, (
@@ -160,9 +158,8 @@ def test_load_wan_pipeline_with_fp8_blockwise(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
 
     # Verify FP8 weights
     for name, module in pipeline.transformer.named_modules():
@@ -267,9 +264,8 @@ def test_load_without_quant_config_no_fp8(checkpoint_exists):
     args = DiffusionArgs(
         checkpoint_path=CHECKPOINT_PATH,
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
 
     # Verify dynamic_weight_quant is False
     assert pipeline.model_config.dynamic_weight_quant is False, (
@@ -358,9 +354,8 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
     args_bf16 = DiffusionArgs(
         checkpoint_path=CHECKPOINT_PATH,
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline_bf16 = PipelineLoader(args_bf16).load()
+    pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
     bf16_model_mem = _get_module_memory_gb(pipeline_bf16.transformer)
     bf16_total_mem = _get_cuda_memory_gb()
@@ -383,9 +378,8 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline_fp8 = PipelineLoader(args_fp8).load()
+    pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
 
     fp8_model_mem = _get_module_memory_gb(pipeline_fp8.transformer)
     fp8_total_mem = _get_cuda_memory_gb()
@@ -440,9 +434,8 @@ def test_fp8_vs_bf16_memory_comparison(checkpoint_exists):
         checkpoint_path=CHECKPOINT_PATH,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
         skip_components=SKIP_HEAVY_COMPONENTS,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline_fp8_block = PipelineLoader(args_fp8_block).load()
+    pipeline_fp8_block = PipelineLoader(args_fp8_block).load(skip_warmup=True)
 
     fp8_block_model_mem = _get_module_memory_gb(pipeline_fp8_block.transformer)
     fp8_block_total_mem = _get_cuda_memory_gb()

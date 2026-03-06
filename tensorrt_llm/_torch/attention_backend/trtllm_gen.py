@@ -931,7 +931,6 @@ def trtllm_gen_attention(
     v_head_dim: Optional[int],
     mrope_rotary_cos_sin: Optional[torch.Tensor],
     mrope_position_deltas: Optional[torch.Tensor],
-    mla_tensor_params: List[Optional[torch.Tensor]],
     attention_chunk_size: Optional[int],
     softmax_stats_tensor: Optional[torch.Tensor],
     spec_decoding_bool_params: List[bool],
@@ -1028,7 +1027,6 @@ def trtllm_gen_attention(
         v_head_dim: Value head dimension (MLA).
         mrope_rotary_cos_sin: Multi-dimensional rotary cosine/sine values.
         mrope_position_deltas: Position deltas for multi-dimensional rotary.
-        mla_tensor_params: Additional tensor parameters for MLA.
         attention_chunk_size: Chunk size for chunked attention computation.
         softmax_stats_tensor: Tensor for storing softmax statistics.
         spec_decoding_bool_params: Boolean parameters for speculative decoding.

@@ -27,8 +27,8 @@ try:
         AttentionConfig,
         DiffusionModelConfig,
         ParallelConfig,
-        PipelineConfig,
         TeaCacheConfig,
+        TorchCompileConfig,
     )
     from tensorrt_llm._utils import get_free_port
     from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -143,7 +143,7 @@ def _make_model_config(pretrained_dict, ulysses_size=1):
     return DiffusionModelConfig(
         pretrained_config=pretrained_config,
         quant_config=QuantConfig(),
-        pipeline=PipelineConfig(enable_torch_compile=False),
+        torch_compile=TorchCompileConfig(enable_torch_compile=False),
         attention=AttentionConfig(backend="VANILLA"),
         parallel=parallel,
         teacache=TeaCacheConfig(),
