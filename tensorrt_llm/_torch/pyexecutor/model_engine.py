@@ -2240,21 +2240,28 @@ class PyTorchModelEngine(ModelEngine):
         # Requests with draft tokens are treated like extend requests. Dummy extend requests should be
         # at the end of extend_requests.
         extend_requests = []
-        extend_dummy_requests = []
-        generation_requests = []
         first_draft_requests = []
-        for request in scheduled_requests.generation_requests:
-            if get_draft_token_length(
-                    request) > 0 or next_draft_tokens_device is not None:
-                if request.is_dummy:
-                    extend_dummy_requests.append(request)
+        # Fast path: when speculative decoding is off and there are no
+        # next_draft_tokens, all generation requests go to generation_requests
+        # directly — skip per-request classification.
+        if not self.enable_spec_decode and next_draft_tokens_device is None:
+            generation_requests = list(
+                scheduled_requests.generation_requests)
+        else:
+            extend_dummy_requests = []
+            generation_requests = []
+            for request in scheduled_requests.generation_requests:
+                if get_draft_token_length(
+                        request) > 0 or next_draft_tokens_device is not None:
+                    if request.is_dummy:
+                        extend_dummy_requests.append(request)
+                    else:
+                        extend_requests.append(request)
+                elif request.py_is_first_draft:
+                    first_draft_requests.append(request)
                 else:
-                    extend_requests.append(request)
-            elif request.py_is_first_draft:
-                first_draft_requests.append(request)
-            else:
-                generation_requests.append(request)
-        extend_requests += extend_dummy_requests
+                    generation_requests.append(request)
+            extend_requests += extend_dummy_requests
 
         spec_config = self.spec_config if self.enable_spec_decode else None
         if not self._disable_overlap_scheduler and spec_config is not None:
@@ -2423,20 +2430,38 @@ class PyTorchModelEngine(ModelEngine):
             request.py_batch_idx = request.py_seq_slot
 
         helix_is_inactive_rank, helix_position_offsets = [], []
+
+        # Hoist loop invariants
+        _has_cp_helix = self.mapping.has_cp_helix()
+        _is_draft_model = self.is_draft_model
+        _no_previous = new_tokens_device is None
+        _use_mrope = self.use_mrope
+
+        # Cache local references for frequently used list methods
+        _position_ids_append = position_ids.append
+        _num_cached_append = num_cached_tokens_per_seq.append
+        _prompt_lengths_append = prompt_lengths.append
+        _draft_lens_append = draft_lens.append
+        _sequence_lengths_append = sequence_lengths.append
+        _num_accepted_append = num_accepted_draft_tokens.append
+        _gather_ids_append = gather_ids.append
+        _request_ids_append = request_ids.append
+        _gen_slots_append = gen_request_seq_slots.append
+
         for request in generation_requests:
-            request_ids.append(request.py_request_id)
+            _request_ids_append(request.py_request_id)
             beam_width = request.sampling_config.beam_width
             for beam in range(beam_width):
                 # the request has no previous tensor:
                 # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
                 # (2) a dummy request; or
                 # (3) the first step in the generation server of disaggregated serving
-                if new_tokens_device is None or request.is_dummy or request.py_batch_idx is None:
+                if _no_previous or request.is_dummy or request.py_batch_idx is None:
                     # skip adding input_ids of CUDA graph dummy requests so that new_tokens_device
                     # can be aligned to the correct positions.
                     if not request.is_cuda_graph_dummy:
                         # Track position for GPU update (draft model only)
-                        if self.is_draft_model and num_accepted_tokens_device is not None:
+                        if _is_draft_model and num_accepted_tokens_device is not None:
                             start_idx = len(input_ids)
                             input_ids.append(request.get_last_tokens(beam))
                             end_idx = len(input_ids)
@@ -2451,13 +2476,12 @@ class PyTorchModelEngine(ModelEngine):
                     # the request has previous tensor
                     # previous_batch_indices is used per request, not per beam
                     # Only append it once for the first beam of each request
-                    first_beam = 0
-                    if beam == first_beam:
+                    if beam == 0:
                         previous_batch_indices.append(request.py_batch_idx)
                     past_seen_token_num = request.max_beam_num_tokens
 
                 position_id = past_seen_token_num
-                if self.mapping.has_cp_helix():
+                if _has_cp_helix:
                     # We compute a global position_id because each helix rank has only a subset of
                     # tokens for a sequence.
                     position_id = request.total_input_len_cp + request.py_decoding_iter - 1
@@ -2473,21 +2497,24 @@ class PyTorchModelEngine(ModelEngine):
                         request.py_helix_is_inactive_rank)
                     helix_position_offsets.append(position_id)
 
-                position_ids.append(position_id)
-                num_cached_tokens_per_seq.append(past_seen_token_num)
-                request.cached_tokens = num_cached_tokens_per_seq[-1]
-                prompt_lengths.append(request.py_prompt_len)
-                draft_lens.append(0)
-                sequence_lengths.append(1)
-                num_accepted_draft_tokens.append(0)
-                gather_ids.append(len(position_ids) - 1)
+                _position_ids_append(position_id)
+                _num_cached_append(past_seen_token_num)
+                request.cached_tokens = past_seen_token_num
+                _prompt_lengths_append(request.py_prompt_len)
+                _draft_lens_append(0)
+                _sequence_lengths_append(1)
+                _num_accepted_append(0)
+                _gather_ids_append(len(position_ids) - 1)
 
-                # Multimodal
-                multimodal_params = MultimodalParams(
-                    multimodal_data=request.py_multimodal_data)
-                multimodal_params.strip_for_generation()
-                if multimodal_params.has_content():
-                    if self.use_mrope:
+                # Multimodal: only construct MultimodalParams when the model
+                # uses mrope (e.g., Qwen2-VL). For text-only models and
+                # non-mrope VLMs, strip_for_generation() clears all data so
+                # has_content() is always False — skip entirely.
+                if _use_mrope:
+                    multimodal_params = MultimodalParams(
+                        multimodal_data=request.py_multimodal_data)
+                    multimodal_params.strip_for_generation()
+                    if multimodal_params.has_content():
                         mrope_position_deltas = multimodal_params.multimodal_data[
                             'mrope_config']['mrope_position_deltas']
                         # NOTE: Expanding position_ids to 3D tensor who is using mrope
@@ -2509,7 +2536,7 @@ class PyTorchModelEngine(ModelEngine):
             # Do not add a gen_request_seq_slot for CUDA graph dummy requests
             # to prevent access errors due to None values
             if not request.is_cuda_graph_dummy:
-                gen_request_seq_slots.append(request.py_seq_slot)
+                _gen_slots_append(request.py_seq_slot)
 
         previous_batch_len = len(previous_batch_indices)
 
