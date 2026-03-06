@@ -1828,6 +1828,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
+        # Deep-copy so we never mutate the caller's object: CP-helix rewrite and other
+        # edits (quant_config_dict, model_type) would otherwise leave their config mutated.
+        model_config = copy.deepcopy(model_config)
         # Note: Currently the usage of mapping is all over the place making its usage brittle
         # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
         # is in action. This shall be passed on to attention which is the only layer that's

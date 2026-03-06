@@ -38,12 +38,9 @@ def _load_tokenizer_config(config_path: Path) -> Dict[str, Any]:
     for key in _SAFE_CONFIG_KEYS:
         if key in config:
             out[key] = config[key]
-    # extra_special_tokens: transformers 5.x may save as list; old code expects dict.
-    # Omit when it's a list to avoid AttributeError in _set_model_specific_special_tokens.
+
     if "extra_special_tokens" in config:
         out["additional_special_tokens"] = config["extra_special_tokens"]
-        # if isinstance(val, dict):
-        #     out["extra_special_tokens"] = val
     return out
 
 
