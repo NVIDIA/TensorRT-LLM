@@ -146,12 +146,6 @@ class PipelineLoader:
                 authentication failure, offline with no cache, etc.)
         """
         if os.path.exists(checkpoint_dir):
-            if os.path.isfile(checkpoint_dir):
-                parent = os.path.dirname(checkpoint_dir)
-                logger.info(
-                    f"'{checkpoint_dir}' is a file; using parent directory '{parent}'"
-                )
-                return parent
             return checkpoint_dir
 
         revision = self.args.revision if self.args else None
@@ -196,6 +190,28 @@ class PipelineLoader:
         if not checkpoint_dir:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
+
+        # Single-file checkpoints are only supported for LTX-2 specific format.
+        # Other pipelines (Wan, Flux, etc.) expect a directory layout.
+        if os.path.isfile(checkpoint_dir):  
+            if not checkpoint_dir.endswith(".safetensors"):
+                raise ValueError(
+                    f"Single-file checkpoint must be a .safetensors file, "
+                    f"got: {checkpoint_dir}"
+                )
+            native_cfg = DiffusionModelConfig._try_load_safetensors_config(
+                Path(checkpoint_dir),
+            ) or {}
+            is_ltx2 = "transformer" in native_cfg and (
+                "vae" in native_cfg or "audio_vae" in native_cfg
+            )
+            if not is_ltx2:
+                raise ValueError(
+                    f"Single-file checkpoint is only supported for LTX-2 "
+                    f"specific format (safetensors with embedded config metadata). "
+                    f"For other models, provide a checkpoint directory. "
+                    f"Got: {checkpoint_dir}"
+                )
 
         # Get loading options from args
         skip_components = self.args.skip_components if self.args else []

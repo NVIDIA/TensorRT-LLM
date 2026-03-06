@@ -61,6 +61,7 @@ from .ltx2_core.types import (
     VideoPixelShape,
 )
 from .ltx2_core.video_vae import (
+    TilingConfig,
     VideoDecoder,
     VideoDecoderConfigurator,
     VideoEncoder,
@@ -1275,7 +1276,13 @@ class LTX2Pipeline(BasePipeline):
                 return vid_latents
 
             vid_latents = vid_latents.to(self.dtype)
-            video = self.video_decoder(vid_latents, generator=generator)
+            tiling_config = TilingConfig.default()
+            chunks = list(
+                self.video_decoder.tiled_decode(
+                    vid_latents, tiling_config, generator=generator,
+                )
+            )
+            video = torch.cat(chunks, dim=2)
             video = postprocess_video_tensor(video, remove_batch_dim=True)
             return video
 
