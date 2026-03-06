@@ -15,9 +15,12 @@
 """
 Scheduler module for TensorRT-LLM PyExecutor.
 
-This module contains:
-- Request schedulers (capacity, micro-batch, unified)
-- Waiting queues (FCFS)
+File layout:
+    scheduler.py         — Interfaces (ABC) and shared data structures
+    simple_scheduler.py  — SimpleScheduler (C++ binding wrappers)
+    unified_scheduler.py — SimpleUnifiedScheduler (pure-Python)
+    adp_router.py        — Attention-DP routing
+    waiting_queue.py     — FCFS waiting queue
 """
 # ruff: noqa: E402
 
@@ -30,23 +33,27 @@ import sys as _sys  # isort:skip
 _sys.modules.setdefault("scheduler", _sys.modules[__name__])
 del _sys
 
-# Re-export from scheduler.py (C++ bindings path)
+# Re-export from scheduler.py (interfaces)
 from .adp_router import ADPRouter, DefaultADPRouter, RankState
 from .scheduler import (
-    BindCapacityScheduler,
-    BindMicroBatchScheduler,
     CapacityScheduler,
-    KVCacheV2DummyScheduler,
     MicroBatchScheduler,
     RequestList,
     RequestScheduler,
     ScheduledRequests,
     SchedulerOutput,
     SerializableSchedulerOutput,
+)
+
+# Re-export from simple_scheduler.py (C++ binding implementations)
+from .simple_scheduler import (
+    BindCapacityScheduler,
+    BindMicroBatchScheduler,
+    KVCacheV2DummyScheduler,
     SimpleScheduler,
 )
 
-# Re-export from unified_scheduler.py (Python-only path)
+# Re-export from unified_scheduler.py (Python-only implementation)
 from .unified_scheduler import (
     PyCapacityScheduler,
     ScheduleResult,
@@ -59,19 +66,20 @@ from .unified_scheduler import (
 from .waiting_queue import FCFSWaitingQueue, WaitingQueue, create_waiting_queue
 
 __all__ = [
-    # Schedulers (C++ bindings path)
-    "BindCapacityScheduler",
-    "BindMicroBatchScheduler",
+    # Interfaces
     "CapacityScheduler",
-    "KVCacheV2DummyScheduler",
     "MicroBatchScheduler",
     "RequestList",
     "RequestScheduler",
     "ScheduledRequests",
     "SchedulerOutput",
     "SerializableSchedulerOutput",
+    # SimpleScheduler (C++ bindings)
+    "BindCapacityScheduler",
+    "BindMicroBatchScheduler",
+    "KVCacheV2DummyScheduler",
     "SimpleScheduler",
-    # Schedulers (Python-only path)
+    # SimpleUnifiedScheduler (Python)
     "PyCapacityScheduler",
     "ScheduleResult",
     "ScheduleStepConfig",
