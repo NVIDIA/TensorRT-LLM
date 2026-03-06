@@ -1436,17 +1436,6 @@ def get_weight_tensor(node: Node) -> torch.Tensor:
     return weight_nodes.weights[0].tensor
 
 
-def draw_graph(gm: GraphModule, filename: str):
-    """
-    Dump graphmodule to SVG file using PyTorch's built-in drawer.
-    """
-    from torch.fx.passes.graph_drawer import FxGraphDrawer
-
-    drawer = FxGraphDrawer(gm, filename)
-    with open(f"{filename}.svg", "wb") as f:
-        f.write(drawer.get_dot_graph().create_svg())
-
-
 def sync_weight_meta_dtype(gm: GraphModule) -> int:
     """Sync .meta['val'] dtype with actual state_dict dtype for weight nodes.
 
