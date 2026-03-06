@@ -126,6 +126,7 @@ class AuxBuffer(AuxBufferBase):
                 "This indicates a bug in slot management."
             )
         self._occupied_slots.add(slot_id)
+        self._slot_token_counts[slot_id] = (0, 0)
         return slot_id
 
     def free_slot(self, slot: int) -> None:
@@ -139,6 +140,7 @@ class AuxBuffer(AuxBufferBase):
                 f"Invalid slot id {slot}. Valid slot indices are in the range 0..{self._max_slot_num - 1}."
             )
         self._occupied_slots.remove(slot)
+        self._slot_token_counts.pop(slot, None)
         self._free_slots.append(slot)
 
     @property
@@ -174,9 +176,9 @@ class AuxBuffer(AuxBufferBase):
         self._slot_token_counts[slot] = (len(first_gen_tokens), len(draft_tokens))
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
-        first_len, draft_len = self._slot_token_counts.get(
-            slot, (self._beam_width, self._max_draft_len)
-        )
+        if slot not in self._occupied_slots:
+            raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
+        first_len, draft_len = self._slot_token_counts.get(slot, (0, 0))
         first_gen_tokens = self._first_tokens_buffer[slot][:first_len].tolist()
         draft_tokens = self._draft_tokens_buffer[slot][:draft_len].tolist()
 

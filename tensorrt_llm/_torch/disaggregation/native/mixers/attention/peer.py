@@ -148,8 +148,8 @@ class HeadMismatchMapper(RegionMapperBase):
         self._src_layer_off = src_layer_off
 
         kv_factor = self_ri.attention.kv_factor
-        self_tp_per_dp = self_ri.tp_size // self_ri.dp_size
-        peer_tp_per_dp = peer_ri.tp_size // peer_ri.dp_size
+        self_tp_per_dp = self_ri.tp_size_per_dp_group
+        peer_tp_per_dp = peer_ri.tp_size_per_dp_group
         self_tp_rank = self_ri.tp_rank
         peer_tp_rank = peer_ri.tp_rank
 

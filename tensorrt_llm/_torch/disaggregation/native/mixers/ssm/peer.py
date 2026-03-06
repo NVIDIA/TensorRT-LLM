@@ -114,6 +114,10 @@ class MambaHeadMismatchMapper(RegionMapperBase):
         dst_layer_ptrs = dst_group.ptrs[
             self._dst_layer_off : self._dst_layer_off + self._transfer_layers
         ]
+        if len(src_layer_ptrs) != len(dst_layer_ptrs):
+            raise ValueError(
+                f"Number of layer ptrs mismatch: src={len(src_layer_ptrs)}, dst={len(dst_layer_ptrs)}"
+            )
 
         # Apply head offset to each layer's address
         new_src_ptrs = [ptr + self._src_head_off for ptr in src_layer_ptrs]
@@ -275,7 +279,13 @@ def _compute_tp_offsets(
     granularity and needs an intra-rank offset."""
     if self_tp_per_dp == peer_tp_per_dp:
         return 0, 0
-    ratio = max(self_tp_per_dp, peer_tp_per_dp) // min(self_tp_per_dp, peer_tp_per_dp)
+    larger = max(self_tp_per_dp, peer_tp_per_dp)
+    smaller = min(self_tp_per_dp, peer_tp_per_dp)
+    assert larger % smaller == 0, (
+        f"TP sizes must be divisible: self_tp_per_dp={self_tp_per_dp}, "
+        f"peer_tp_per_dp={peer_tp_per_dp}"
+    )
+    ratio = larger // smaller
     if self_tp_per_dp < peer_tp_per_dp:
         # self has fewer ranks -> larger chunk; peer selects sub-chunk
         return (peer_tp_rank % ratio) * transfer_bytes, 0

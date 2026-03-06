@@ -1302,7 +1302,7 @@ class RxSession(RxSessionBase):
 
 
 class RankInfoServer:
-    def __init__(self, rank_info: RankInfo, addr: str = None, port: int = None):
+    def __init__(self, rank_info: RankInfo, addr: Optional[str] = None, port: Optional[int] = None):
         self._rank_info = rank_info
         if addr is None and port is None:
             endpoint = f"tcp://{get_local_ip()}:*"
@@ -1339,7 +1339,7 @@ class RankInfoServer:
 
         self._messenger.start_listener(handle_message)
 
-    def _process_request_rank_info(self, send_id: bytes, message: list[bytes]):
+    def _process_request_rank_info(self, send_id: bytes, _message: list[bytes]):
         self._messenger.send([send_id, self._rank_info.to_bytes()])
 
     def __del__(self):
