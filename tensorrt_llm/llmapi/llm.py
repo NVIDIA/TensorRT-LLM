@@ -799,7 +799,7 @@ class BaseLLM:
                 associate with the retained cache. Can be a text string or a
                 list of pre-tokenized token IDs. If empty (empty string or
                 empty list), this method is a no-op.
-            sampling_params (tensorrt_llm.scheduling_params.SchedulingParams, optional): Optional sampling
+            sampling_params (tensorrt_llm.sampling_params.SamplingParams, optional): Optional sampling
                 parameters used during tokenization of string inputs, for
                 example when applying chat templates. Not used when inputs are
                 already token IDs. Defaults to None.
