@@ -1507,7 +1507,6 @@ def load_weights_from_hf_safetensors(model_dir: str, config: LLaMAConfig):
         config.architecture.split('ForCausalLM')[0]))
     tik = time.time()
     import json
-    import os
 
     import safetensors
     weights = {}

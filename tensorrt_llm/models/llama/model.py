@@ -432,8 +432,6 @@ class LLaMAForCausalLM(DecoderModelForCausalLM):
             **kwargs):
         ''' Create a LLaMAForCausalLM object from give parameters
         '''
-        import transformers
-
         load_by_shard = kwargs.pop('load_by_shard', False)
         load_model_on_cpu = kwargs.pop('load_model_on_cpu', False)
         quant_ckpt_path = kwargs.pop('quant_ckpt_path', None)

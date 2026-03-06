@@ -563,7 +563,6 @@ def find_free_port() -> int:
 
 
 def find_free_ipc_addr() -> str:
-    import os
     import tempfile
     import uuid
     return f'ipc://{os.path.join(tempfile.gettempdir(), "rpc_" + str(uuid.uuid4()))}'

@@ -15,7 +15,6 @@ from tensorrt_llm.llmapi.utils import enable_llm_debug, logger_debug
 
 from ..llmapi.mpi_session import (MpiCommSession, MpiPoolSession, MpiSession,
                                   RemoteMpiCommSessionClient)
-from ..llmapi.utils import logger_debug
 from ..logger import logger
 
 
