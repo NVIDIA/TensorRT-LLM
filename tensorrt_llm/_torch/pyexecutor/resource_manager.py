@@ -726,6 +726,7 @@ class KVCacheManager(BaseResourceManager):
                              is_streaming=False,
                              encoder_input_tokens=encoder_input_tokens)
             req.is_dummy_request = True
+            req.py_is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
                 self.impl.add_sequence(req_id, token_num, beam_width, req)
@@ -2102,6 +2103,7 @@ class KVCacheManagerV2(BaseResourceManager):
                              is_streaming=False,
                              encoder_input_tokens=encoder_input_tokens)
             req.is_dummy_request = True
+            req.py_is_dummy_request = True
             req.paged_kv_block_ids = []
             if prepare_resource:
                 kv_cache = self._create_kv_cache(req.py_request_id,

@@ -3389,8 +3389,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             pin_memory=prefer_pinned(),
         )
         # necessary for beam search and max_length checks
+        # Use py_max_beam_num_tokens (cached during _prepare_tp_inputs) to
+        # avoid C++ boundary crossings; fall back to C++ for context requests.
         seq_lens_host = torch.tensor(
-            [r.max_beam_num_tokens for r in requests],
+            [r.py_max_beam_num_tokens if r.py_max_beam_num_tokens is not None
+             else r.max_beam_num_tokens for r in requests],
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )

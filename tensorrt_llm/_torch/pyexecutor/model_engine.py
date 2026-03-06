@@ -2284,6 +2284,8 @@ class PyTorchModelEngine(ModelEngine):
             request_accepted_path[
                 request.
                 py_request_id] = request.py_num_accepted_draft_tokens_indices
+            _max_beam_num_tokens = request.max_beam_num_tokens
+            request.py_max_beam_num_tokens = _max_beam_num_tokens
             # the request has no previous tensor:
             # (1) next_draft_tokens_device is None, which means overlap scheduler is disabled; or
             # (2) a dummy request; or
@@ -2298,7 +2300,7 @@ class PyTorchModelEngine(ModelEngine):
                     draft_tokens.extend(request.py_draft_tokens)
                 # get other ids and lengths
                 num_draft_tokens = get_draft_token_length(request)
-                past_seen_token_num = request.max_beam_num_tokens - 1
+                past_seen_token_num = _max_beam_num_tokens - 1
                 draft_lens.append(num_draft_tokens)
                 if self.enable_spec_decode and spec_config.spec_dec_mode.extend_ctx(
                         self.attn_backend) and spec_config.is_linear_tree:
@@ -2342,7 +2344,7 @@ class PyTorchModelEngine(ModelEngine):
                 sequence_lengths.append(1 + self.runtime_draft_len)
                 num_accepted_draft_tokens.append(
                     request.py_num_accepted_draft_tokens)
-                past_seen_token_num = request.max_beam_num_tokens - 1
+                past_seen_token_num = _max_beam_num_tokens - 1
                 draft_lens.append(self.runtime_draft_len)
                 gather_ids.extend(
                     list(
@@ -2456,6 +2458,8 @@ class PyTorchModelEngine(ModelEngine):
             for request in generation_requests:
                 _request_ids_append(request.py_request_id)
                 # beam=0 always; no beam loop needed
+                _max_beam_num_tokens = request.max_beam_num_tokens
+                request.py_max_beam_num_tokens = _max_beam_num_tokens
                 if _no_previous or request.is_dummy or request.py_batch_idx is None:
                     if not request.is_cuda_graph_dummy:
                         if _is_draft_model and num_accepted_tokens_device is not None:
@@ -2468,10 +2472,10 @@ class PyTorchModelEngine(ModelEngine):
                                 (start_idx, end_idx, slot_idx))
                         else:
                             input_ids.append(request.get_last_tokens(0))
-                    past_seen_token_num = request.max_beam_num_tokens - 1
+                    past_seen_token_num = _max_beam_num_tokens - 1
                 else:
                     _prev_append(request.py_batch_idx)
-                    past_seen_token_num = request.max_beam_num_tokens
+                    past_seen_token_num = _max_beam_num_tokens
 
                 _position_ids_append(past_seen_token_num)
                 _num_cached_append(past_seen_token_num)
@@ -2490,6 +2494,8 @@ class PyTorchModelEngine(ModelEngine):
             for request in generation_requests:
                 _request_ids_append(request.py_request_id)
                 beam_width = request.sampling_config.beam_width
+                _max_beam_num_tokens = request.max_beam_num_tokens
+                request.py_max_beam_num_tokens = _max_beam_num_tokens
                 for beam in range(beam_width):
                     # the request has no previous tensor:
                     # (1) new_tokens_device is None, which means overlap scheduler is disabled; or
@@ -2510,14 +2516,14 @@ class PyTorchModelEngine(ModelEngine):
                                     (start_idx, end_idx, slot_idx))
                             else:
                                 input_ids.append(request.get_last_tokens(beam))
-                        past_seen_token_num = request.max_beam_num_tokens - 1
+                        past_seen_token_num = _max_beam_num_tokens - 1
                     else:
                         # the request has previous tensor
                         # previous_batch_indices is used per request, not per beam
                         # Only append it once for the first beam of each request
                         if beam == 0:
                             previous_batch_indices.append(request.py_batch_idx)
-                        past_seen_token_num = request.max_beam_num_tokens
+                        past_seen_token_num = _max_beam_num_tokens
 
                     position_id = past_seen_token_num
                     if _has_cp_helix:
