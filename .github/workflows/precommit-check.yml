@@ -38,6 +38,18 @@ jobs:
           python-version: '3.12'
           cache: 'pip'
 
+      - name: Get changed files
+        id: changed-files
+        if: github.event_name == 'pull_request'
+        uses: tj-actions/changed-files@v45
+        with:
+          use_rest_api: true  # use GitHub API so base commit need not be in local repo
+
       - name: Run pre-commit checks
         run: |
-          python3 -u scripts/release_check.py
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "${{ steps.changed-files.outputs.all_modified_files }}" | tr ' ' '\n' | sed '/^$/d' > changed_files.txt
+            python3 -u scripts/release_check.py --files-from changed_files.txt
+          else
+            python3 -u scripts/release_check.py
+          fi
