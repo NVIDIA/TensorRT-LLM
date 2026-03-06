@@ -1527,6 +1527,8 @@ class KVCacheManagerV2(BaseResourceManager):
 
         assert kv_connector_manager is None, "kv_connector_manager is not supported for KVCacheManagerV2"
         assert max_beam_width == 1, "max_beam_width must be 1 for KVCacheManagerV2"
+        assert not (mapping.cp_config.get('cp_type') == CpType.STAR), \
+            "Star attention is not supported for KVCacheManagerV2"
 
         self.kv_cache_type = kv_cache_type
         self.pp_layers, self.num_layers = get_pp_layers(
@@ -1619,8 +1621,6 @@ class KVCacheManagerV2(BaseResourceManager):
                                              kv_head)
 
         self.is_vswa = len(set(self.max_attention_window_vec)) > 1
-
-        self.kv_connector_manager = kv_connector_manager
 
         quota = float('inf')
         if kv_cache_config.max_tokens is not None:
@@ -1986,10 +1986,6 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.suspend()
             return False
 
-        if req.is_first_context_chunk and self.kv_connector_manager is not None:
-            block_ids = self.get_cache_indices(req)
-            self.kv_connector_manager.update_state_after_alloc(req, block_ids)
-
         return True
 
     def suspend_request(self, req: LlmRequest) -> None:
@@ -2021,10 +2017,6 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.context_chunk_size = min(
                         chunk_size,
                         req.prompt_len - req.context_current_position)
-
-        if self.kv_connector_manager is not None:
-            self.kv_connector_manager.build_scheduler_output(
-                scheduled_batch, self)
 
     def get_kv_cache_stats(self):
 
