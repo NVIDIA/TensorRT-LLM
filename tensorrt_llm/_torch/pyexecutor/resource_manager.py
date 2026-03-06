@@ -130,7 +130,7 @@ def get_pp_layers(
         assert sum(layer_mask) == num_layers, (
             f"The number of enabled layers in layer_mask ({sum(layer_mask)}) "
             f"must match the number of layers ({num_layers}) "
-            f"in KV cache manager, but get layer_mask: {layer_mask}")
+            f"in KV cache manager, but got layer_mask: {layer_mask}")
         total_num_layers = len(layer_mask)
     pp_layers = mapping.pp_layers(total_num_layers)
     if layer_mask is not None:
@@ -602,6 +602,11 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
+                    # Chunked prefill may schedule the same request across multiple
+                    # context chunks. Sequence allocation must happen only once.
+                    if not req.is_first_context_chunk:
+                        continue
+
                     if self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                               req_beam_width, req):
                         for _ in range(self.num_extra_kv_tokens):
@@ -735,7 +740,7 @@ class KVCacheManager(BaseResourceManager):
                         for _ in range(max_num_draft_tokens):
                             draft_kv_cache_manager.impl.add_token(req_id)
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
                 dummy_mrope_position_ids = torch.arange(
                     0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
@@ -927,7 +932,7 @@ class KVCacheManager(BaseResourceManager):
         max_atten_window_upper_bound = max_token_num - sink_bubble_len
         if max_seq_len is not None and max_seq_len > max_atten_window_upper_bound and max_beam_width > 1:
             max_atten_window_upper_bound -= tokens_per_block
-        assert max_atten_window_upper_bound > 0, "Impossibe to fit in any sequence in kvCache"
+        assert max_atten_window_upper_bound > 0, "Impossible to fit in any sequence in kvCache"
         return max_atten_window_upper_bound
 
     def get_cache_indices(self,
@@ -2106,7 +2111,7 @@ class KVCacheManagerV2(BaseResourceManager):
                                 f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
                             )
 
-            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrop_config to the request here.
+            # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
                 dummy_mrope_position_ids = torch.arange(
                     0, token_num, dtype=torch.int32).expand(3, 1, -1).clone()
@@ -2208,7 +2213,7 @@ class KVCacheManagerV2(BaseResourceManager):
             if data_role in [Role.KEY_BLOCK_SCALE, Role.VALUE_BLOCK_SCALE]:
                 assert self.dtype == DataType.NVFP4, "NVFP4 is the only supported dtype for block quant data roles"
             if data_role == Role.VALUE:
-                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, "SELFKONLY is the only supported cache type for value data role"
+                assert self.kv_cache_type != CacheTypeCpp.SELFKONLY, "VALUE data role is not supported for SELFKONLY cache type"
             kv_factor = 1
         else:
             raise ValueError(f"Invalid data role: {data_role}")

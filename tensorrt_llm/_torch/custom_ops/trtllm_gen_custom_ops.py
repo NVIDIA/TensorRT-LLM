@@ -284,7 +284,7 @@ class FP4BlockScaleMoERunner(TunableRunner):
                                  ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-        MAX_PROFILE_BUCKET = 4096
+        MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
@@ -660,7 +660,7 @@ class FP8BlockScaleMoERunner(TunableRunner):
                                  ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-        MAX_PROFILE_BUCKET = 4096
+        MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
@@ -967,7 +967,7 @@ class MxE4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                                  ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-        MAX_PROFILE_BUCKET = 4096
+        MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
@@ -1273,7 +1273,7 @@ class E4m3MxE2m1BlockScaleMoERunner(TunableRunner):
                                  ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-        MAX_PROFILE_BUCKET = 4096
+        MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
@@ -1561,7 +1561,7 @@ class Bf16MxE2m1BlockScaleMoERunner(TunableRunner):
                                  ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-        MAX_PROFILE_BUCKET = 4096
+        MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 
@@ -1833,7 +1833,7 @@ class FP8FP4BlockScaleMoERunner(TunableRunner):
                                  ep_size: int) -> Tuple[DynamicTensorSpec, ...]:
         HIDDEN_STATES_IDX = 2
         TUNED_DIM = 0
-        MAX_PROFILE_BUCKET = 4096
+        MAX_PROFILE_BUCKET = 8192
 
         m_values = get_last_power_of_2_num_tokens_buckets(MAX_PROFILE_BUCKET)
 

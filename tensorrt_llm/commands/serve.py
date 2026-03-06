@@ -2,7 +2,7 @@ import asyncio
 import gc
 import json
 import os
-import signal  # Added import
+import signal
 import socket
 import subprocess  # nosec B404
 import sys
@@ -20,7 +20,8 @@ from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._utils import mpi_rank
 from tensorrt_llm.commands.utils import (get_is_diffusion_model,
-                                         get_visual_gen_model_type)
+                                         get_visual_gen_model_type,
+                                         get_visual_gen_num_gpus)
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -56,7 +57,6 @@ def _signal_handler_cleanup_child(signum, frame):
     """Signal handler to clean up the child process."""
     global _child_p_global
     if _child_p_global and _child_p_global.poll() is None:
-        # Using print for safety in signal handlers
         logger.info(
             f"Parent process (PID {os.getpid()}) received signal {signal.Signals(signum).name}. Terminating child process (PID {_child_p_global.pid})."
         )
@@ -466,11 +466,9 @@ def launch_visual_gen_server(
     model = visual_gen_config["model"]
     logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = 1
+    n_workers = get_visual_gen_num_gpus(visual_gen_config)
     parallel_config = visual_gen_config.get("parallel", {})
     if parallel_config:
-        n_workers = parallel_config.get(
-            "dit_cfg_size", 1) * parallel_config.get("dit_ulysses_size", 1)
         logger.info(f"World size: {n_workers}")
         logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
         logger.info(
@@ -952,7 +950,7 @@ def serve_encoder(model: str, host: str, port: int, log_level: str,
     """
     logger.set_level(log_level)
 
-    # TODO: expose more argument progressivly
+    # TODO: expose more arguments progressively
     llm_args, _ = get_llm_args(model=model,
                                max_batch_size=max_batch_size,
                                max_num_tokens=max_num_tokens,
@@ -1084,7 +1082,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
     if os.environ.get(DisaggLauncherEnvs.
                       TLLM_DISAGG_RUN_REMOTE_MPI_SESSION_CLIENT) != "1":
         set_cuda_device()
-    # Importing mpi4py after setting CUDA device. This is needed to war an issue with mpi4py and CUDA
+    # Importing mpi4py after setting CUDA device. This is needed to work around an issue with mpi4py and CUDA
     from mpi4py.futures import MPICommExecutor
 
     from tensorrt_llm._utils import global_mpi_rank, mpi_rank, set_mpi_comm
@@ -1117,7 +1115,7 @@ def disaggregated_mpi_worker(config_file: Optional[str], log_level: str):
         f"mpi_session is provided for LLM instance. Global MPI rank: {global_mpi_rank()}, sub-comm MPI rank: {mpi_rank()}"
     )
 
-    # Leader ranks will start the trtllm-server using it's own server config
+    # Leader ranks will start the trtllm-server using its own server config
     # and start a RemoteMPISessionServer to accept MPI tasks
     if is_leader:
         os.environ[DisaggLauncherEnvs.TLLM_DISAGG_INSTANCE_IDX] = str(
