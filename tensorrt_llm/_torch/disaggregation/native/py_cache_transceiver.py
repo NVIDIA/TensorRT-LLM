@@ -140,7 +140,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 total_blocks = (req.prompt_len + tokens_per_block - 1) // tokens_per_block
                 stale_end = max(0, (req.prompt_len + 1 - window_size) // tokens_per_block)
                 expected_valid = total_blocks - stale_end
-                if len(block_ids) > expected_valid:
+                if expected_valid <= 0:
+                    block_ids = []
+                elif len(block_ids) > expected_valid:
                     block_ids = block_ids[-expected_valid:]
 
             block_ids_per_layer_groups.append(list(block_ids))

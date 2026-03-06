@@ -784,10 +784,12 @@ def create_py_executor(
         # that NIXL-registered (pinned) GPU memory is deregistered first;
         # otherwise the old KV cache memory stays pinned and the subsequent
         # KV cache allocation will OOM.
-        if hasattr(py_executor, 'kv_cache_transceiver'
-                   ) and py_executor.kv_cache_transceiver is not None:
-            py_executor.kv_cache_transceiver.shutdown()
-        kv_cache_creator.teardown_managers(resources)
+        try:
+            if hasattr(py_executor, 'kv_cache_transceiver'
+                       ) and py_executor.kv_cache_transceiver is not None:
+                py_executor.kv_cache_transceiver.shutdown()
+        finally:
+            kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
         gc.collect()
 

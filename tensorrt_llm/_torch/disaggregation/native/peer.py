@@ -295,8 +295,8 @@ class PeerRegistrar:
         overlap_pp_size = len(tgt_pp_ranks)
         peer_end_pp = peer_start_pp + overlap_pp_size
 
-        self_tp_per_dp = self._attention_policy._tp_per_dp(self._ri)
-        peer_tp_per_dp = self._attention_policy._tp_per_dp(peer_ri)
+        self_tp_per_dp = self._ri.tp_size_per_dp_group
+        peer_tp_per_dp = peer_ri.tp_size_per_dp_group
         self_tp_rank_in_dp = self._ri.tp_rank % self_tp_per_dp
 
         overlap_tp_size, peer_start_tp, peer_end_tp = self._find_overlap(

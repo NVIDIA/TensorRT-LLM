@@ -528,7 +528,7 @@ def create_instance_transceivers(
 # ---------------------------------------------------------------------------
 # Verification helpers
 # ---------------------------------------------------------------------------
-def _get_block_data_for_layer(mgr, request_id, layer_idx, use_v2, expected_valid=None):
+def _get_block_data_for_layer(mgr, request_id, layer_idx, expected_valid=None):
     """Get block data for a specific layer and request in HND layout.
 
     Returns tensor of shape [num_blocks, kv_factor, num_kv_heads_per_rank, tokens_per_block, head_dim].
@@ -579,16 +579,12 @@ def _gather_full_layer_data(
         # Only one TP rank handled this request
         tp_rank = req_idx % tp
         rank = pp_rank * tp + tp_rank
-        return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
-        )
+        return _get_block_data_for_layer(managers[rank], request_id, layer_idx, expected_valid)
 
     if is_replicated:
         # All TP ranks have identical data; take from tp_rank=0
         rank = pp_rank * tp + 0
-        return _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
-        )
+        return _get_block_data_for_layer(managers[rank], request_id, layer_idx, expected_valid)
 
     # Gather from all TP ranks and concat along kv_heads dim.
     # In HND layout the shape is [blocks, kv_factor, heads, tpb, dim],
@@ -596,9 +592,7 @@ def _gather_full_layer_data(
     tp_data = []
     for tp_rank in range(tp):
         rank = pp_rank * tp + tp_rank
-        data = _get_block_data_for_layer(
-            managers[rank], request_id, layer_idx, use_v2, expected_valid
-        )
+        data = _get_block_data_for_layer(managers[rank], request_id, layer_idx, expected_valid)
         if data is not None:
             tp_data.append(data)
 
@@ -727,7 +721,9 @@ def verify_all_requests(
                 ctx_full,
                 rtol=0,
                 atol=0,
-                msg=lambda m: (f"Data mismatch at req={req_idx} layer={layer_idx}: {m}"),
+                msg=lambda m, req_idx=req_idx, layer_idx=layer_idx: (
+                    f"Data mismatch at req={req_idx} layer={layer_idx}: {m}"
+                ),
             )
 
 

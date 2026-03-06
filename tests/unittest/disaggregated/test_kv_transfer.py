@@ -406,7 +406,7 @@ def get_block_data(
     block_ids: List[int],
     layer_group_id: int,
     use_v2: bool,
-    request_id: int = None,
+    request_id: Optional[int] = None,
 ) -> torch.Tensor:
     """Unified block data retrieval for both V1 and V2 KVCacheManager."""
     if use_v2:
