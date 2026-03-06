@@ -2803,6 +2803,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
         """
         return next_positive_power_of_2(num_cols)
 
+    def _get_num_sms() -> int:
+        """Return the number of SMs on the current device (cached)."""
+        if not hasattr(_get_num_sms, "_value"):
+            _get_num_sms._value = (
+                torch.cuda.get_device_properties().multi_processor_count)
+        return _get_num_sms._value
+
     class CuteDSLTopKDecodeSingleCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (single CTA version).
 
@@ -2884,7 +2891,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_rows, num_cols = input_values.shape
             bucketed_num_cols = _bucket_num_cols(num_cols)
 
-            num_sms = torch.cuda.get_device_properties().multi_processor_count
+            num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
             load_balance = False
 
@@ -3168,7 +3175,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_rows, num_cols = input_values.shape
             bucketed_num_cols = _bucket_num_cols(num_cols)
 
-            num_sms = torch.cuda.get_device_properties().multi_processor_count
+            num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
             load_balance = False
 
@@ -3522,7 +3529,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         #    2-pass overhead (kernel launch + intermediate buffer I/O)
         #    outweighs the parallelism gain.
         if use_multi_cta:
-            num_sms = torch.cuda.get_device_properties().multi_processor_count
+            num_sms = _get_num_sms()
             num_ctas_per_row = math.ceil(num_tokens / chunk_size_per_cta)
             sm_util_low = num_rows < num_sms * 15 // 100  # < 15%
             multi_waves = math.ceil(num_rows * num_ctas_per_row / num_sms)
