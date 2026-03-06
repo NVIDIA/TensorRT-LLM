@@ -3338,7 +3338,12 @@ def use_cubin_header(sm,
         return False
     if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
         return False
-    return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+    # TODO: Restore SM90 cubin usage after regenerating SM90 cubin binaries.
+    # SM90 cubins were inadvertently disabled since commit a66eeab53 (Skip Softmax
+    # Attention). During that period, new SM90 kernel variants were added without
+    # corresponding cubin entries, causing CUDA_ERROR_NOT_FOUND at runtime.
+    # Original condition: (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+    return (sm == 89 and 'e4m3' in dtype)
 
 
 def get_cubin_header(kernel_traits, specs_names):
