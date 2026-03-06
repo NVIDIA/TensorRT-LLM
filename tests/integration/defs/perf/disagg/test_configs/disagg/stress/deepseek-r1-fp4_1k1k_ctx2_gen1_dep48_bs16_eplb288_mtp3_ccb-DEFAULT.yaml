@@ -26,7 +26,7 @@ slurm:
 benchmark:
   mode: gen_only
   use_nv_sa_benchmark: false
-  multi_round: 20
+  multi_round: 1
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: '12288'
