@@ -1,7 +1,7 @@
 linear:
   type: default
 teacache:
-   enable_teacache: false
+   enable_teacache: true
    teacache_thresh: 0.2
 attention:
    backend: VANILLA
