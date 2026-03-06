@@ -2421,13 +2421,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
             request.py_result.append_log_probs(token_log_probs)
 
+    _FINISH_REASONS = frozenset({FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS})
+
     def finish_if_reason(
         self, request: LlmRequest, finish_reasons: FinishReasonsList, *, step: int, beam_idx: int
     ) -> bool:
         assert request.py_seq_slot is not None
         reason = FinishReason(finish_reasons[request.py_seq_slot][step][beam_idx])
-        valid_reasons = {FinishReason.END_ID, FinishReason.LENGTH, FinishReason.STOP_WORDS}
-        if reason in valid_reasons:
+        if reason in TorchSampler._FINISH_REASONS:
             request.finish_by(reason, beam_idx)
             return True
         return False
@@ -3242,6 +3243,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
             req.py_decoding_iter += 1
 
+        # Cache method references for hot loop
+        _finish_if_reason = self.finish_if_reason
+        _handle_logprobs = self.handle_logprobs
+        _process_draft_tokens = self.process_draft_tokens
+        _handle_finish_reasons = self._handle_finish_reasons
+        _finish_reasons_handler_store = self._finish_reasons_handler.store
+        host_finish_reasons = state.host.finish_reasons
+
         for req_idx, req in enumerate(
             state.scheduled_requests.generation_requests,
             len(state.scheduled_requests.context_requests),
@@ -3256,32 +3265,37 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     for beam_idx in range(req.sampling_config.beam_width):
                         # Beam search does not support speculative decoding.
                         add_token(req, new_tokens_list, beam_idx=beam_idx)
-                    self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)
-                self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
+                    _handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)
+                _handle_finish_reasons(req, host_finish_reasons, finish_reasons)
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
             else:
-                processed = 1
-                num_accepted = self.process_draft_tokens(
-                    req,
-                    new_tokens_tensor=new_tokens,
-                    new_tokens_list=new_tokens_list,
-                    finish_reasons=finish_reasons,
-                    resource_manager=resource_manager,
-                )
-                if get_draft_token_length(req) > 0:
-                    req.py_num_accepted_draft_tokens = num_accepted
-                    actual_draft_len = get_draft_token_length(req)
-                    req.py_rewind_len = actual_draft_len - num_accepted
-                else:
+                draft_tokens = req.py_draft_tokens
+                if not draft_tokens:
+                    # Fast path: no speculative decoding — skip process_draft_tokens
+                    # call chain entirely. Inline add_token + finish_if_reason.
+                    add_token(req, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX)
+                    _finish_if_reason(req, finish_reasons, step=0, beam_idx=DEFAULT_BEAM_IDX)
                     req.py_num_accepted_draft_tokens = 0
                     req.py_rewind_len = 0
-                processed += num_accepted
-                self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=processed)
+                    _handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)
+                else:
+                    # Speculative decoding path
+                    num_accepted = _process_draft_tokens(
+                        req,
+                        new_tokens_tensor=new_tokens,
+                        new_tokens_list=new_tokens_list,
+                        finish_reasons=finish_reasons,
+                        resource_manager=resource_manager,
+                    )
+                    actual_draft_len = len(draft_tokens)
+                    req.py_num_accepted_draft_tokens = num_accepted
+                    req.py_rewind_len = actual_draft_len - num_accepted
+                    _handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1 + num_accepted)
             req.py_decoding_iter += 1
             # Check None or empty list
             if req.py_stop_words_list:
-                self._finish_reasons_handler.store.num_accepted_draft_tokens_host[
+                _finish_reasons_handler_store.num_accepted_draft_tokens_host[
                     req.py_seq_slot
                 ] = req.py_num_accepted_draft_tokens
 
