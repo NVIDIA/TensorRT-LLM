@@ -704,7 +704,7 @@ def _get_all_tp_groups(mapping: "Mapping") -> List[List[int]]:
     return groups
 
 
-class DraftMapping:
+class DraftMapping(Mapping):
     """Mapping for draft models with smaller TP than the target model.
 
     In one-model speculative decoding, the draft model (typically much smaller)
@@ -712,9 +712,13 @@ class DraftMapping:
     into groups of ``draft_tp_size``, each of which independently computes the
     same draft tokens with reduced communication overhead.
 
-    This object provides the subset of the Mapping interface that draft model
-    layers (Linear, Attention, etc.) and the weight loader need.
+    Inherits from Mapping so it passes ``isinstance(m, Mapping)`` checks, but
+    bypasses the normal ``__new__`` dispatch (MpiTopology / DeviceMeshTopology)
+    because it builds a *virtual* sub-topology over the target's physical ranks.
     """
+
+    def __new__(cls, *args, **kwargs):
+        return object.__new__(cls)
 
     def __init__(self, target_mapping: "Mapping", draft_tp_size: int):
         if draft_tp_size == target_mapping.tp_size:
@@ -737,10 +741,12 @@ class DraftMapping:
         self.gpus_per_node = target_mapping.gpus_per_node
 
         self.world_size = draft_tp_size * self.pp_size
-        self.rank = (self.pp_rank * draft_tp_size +
-                     target_mapping.tp_rank % draft_tp_size)
         self.enable_attention_dp = target_mapping.enable_attention_dp
         self.enable_lm_head_tp_in_adp = target_mapping.enable_lm_head_tp_in_adp
+        # rank setter (inherited from MappingBase) validates against
+        # world_size and enable_attention_dp, so those must be set first.
+        self.rank = (self.pp_rank * draft_tp_size +
+                     target_mapping.tp_rank % draft_tp_size)
 
         self.moe_tp_size = min(draft_tp_size, target_mapping.moe_tp_size)
         self.moe_ep_size = 1
@@ -815,14 +821,6 @@ class DraftMapping:
         return self._tp_rank % self.moe_tp_size
 
     @property
-    def moe_ep_rank(self):
-        return 0
-
-    @property
-    def moe_cluster_rank(self):
-        return 0
-
-    @property
     def moe_tp_group(self):
         return self._moe_tp_group
 
@@ -839,16 +837,6 @@ class DraftMapping:
         from tensorrt_llm._torch.device_mesh import SingleProcessGroup
         return SingleProcessGroup.get_group()
 
-    @property
-    def dp_size(self):
-        return self.tp_size if self.enable_attention_dp else 1
-
-    def has_tp(self):
-        return self.tp_size > 1
-
-    def has_pp(self):
-        return self.pp_size > 1
-
     def has_cp(self):
         return False
 
@@ -858,20 +846,11 @@ class DraftMapping:
     def has_cp_helix(self):
         return False
 
-    def has_moe_tp(self):
-        return self.moe_tp_size > 1
-
     def has_moe_ep(self):
         return False
 
     def has_moe_cluster(self):
         return False
-
-    def is_first_pp_rank(self):
-        return self.pp_rank == 0
-
-    def is_last_pp_rank(self):
-        return self.pp_rank == self.pp_size - 1
 
     @property
     def node_rank(self):
@@ -880,18 +859,6 @@ class DraftMapping:
     @property
     def local_rank(self):
         return self._global_rank % self.gpus_per_node
-
-    def get_node_rank(self, rank: int):
-        return rank // self.gpus_per_node
-
-    def get_local_rank(self, rank: int):
-        return rank % self.gpus_per_node
-
-    def is_multi_node(self):
-        return self.world_size > self.gpus_per_node
-
-    def is_second_last_pp_rank(self):
-        return self.pp_rank == self.pp_size - 2
 
     def pp_layers(self, num_layers):
         return self._target.pp_layers(num_layers)
@@ -907,21 +874,6 @@ class DraftMapping:
 
     def next_pp_rank(self):
         return self._target.next_pp_rank()
-
-    def to_dict(self):
-        return {
-            'world_size': self.world_size,
-            'rank': self.rank,
-            'gpus_per_node': self.gpus_per_node,
-            'cp_size': self.cp_size,
-            'tp_size': self.tp_size,
-            'pp_size': self.pp_size,
-            'moe_tp_size': self.moe_tp_size,
-            'moe_cluster_size': self.moe_cluster_size,
-            'moe_ep_size': self.moe_ep_size,
-            'enable_attention_dp': self.enable_attention_dp,
-            'enable_lm_head_tp_in_adp': self.enable_lm_head_tp_in_adp,
-        }
 
 
 def create_draft_mapping(target_mapping: "Mapping",
