@@ -1303,6 +1303,8 @@ class PyExecutor:
                 else:
                     logger.debug(f"microbatch {microbatch_id} can be queued")
 
+                    self._add_inflight_ids(scheduled_batch)
+
                     if self.kv_cache_transceiver:
                         # For generation requests which have completed KV cache transfer
                         self._prepare_disagg_gen_transmission_complete(
@@ -1379,8 +1381,6 @@ class PyExecutor:
                             if not self.disable_overlap_scheduler:
                                 self._update_generation_requests_that_will_complete_next_iteration(
                                     scheduled_batch.generation_requests)
-
-                    self._add_inflight_ids(scheduled_batch)
 
                     if self.enable_iter_perf_stats:
                         iter_stats.inflight_batching_stats.num_ctx_tokens = self.model_engine.iter_states[
