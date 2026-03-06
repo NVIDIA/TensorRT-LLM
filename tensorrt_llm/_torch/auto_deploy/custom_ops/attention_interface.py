@@ -987,7 +987,7 @@ class SequenceInfo:
 
         ### UPDATE REQUIRED INPUTS #################################################################
         # set new input_ids and make sure to flatten it
-        self._stage_arg("input_ids", input_ids)
+        self._stage_arg("input_ids", input_ids, reset_val=0)
 
         ### UPDATE EXTRA INPUTS ####################################################################
         self._extra_args = {}
@@ -1018,7 +1018,7 @@ class SequenceInfo:
             group_starts = np.repeat(np.cumsum(sl_np) - sl_np, sl_np)
             offsets = np.arange(sl_np.sum()) - group_starts
             position_ids = torch.from_numpy(base + offsets)  # zero-copy back
-            self._stage_arg("position_ids", position_ids)
+            self._stage_arg("position_ids", position_ids, reset_val=0)
 
         # update cumulative number of pages
         if self._is_required("pages_per_seq"):
