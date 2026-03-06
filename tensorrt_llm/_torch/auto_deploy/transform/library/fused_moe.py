@@ -2408,6 +2408,9 @@ def _stack_finegrained_fp8_moe_weights(gm: GraphModule) -> int:
         fc2_expert_weights = w2_stacked
         fc2_weight_scale = w2_scale_stacked
 
+        del w1_stacked, w2_stacked, w3_stacked
+        del w1_scale_stacked, w2_scale_stacked, w3_scale_stacked
+
         # Register stacked tensors as new parameters
         new_key_fc1_weights = f"finegrained_fp8_moe_fc1_stacked_{fused_key_counter}"
         new_key_fc2_weights = f"finegrained_fp8_moe_fc2_stacked_{fused_key_counter}"
@@ -2447,9 +2450,8 @@ def _stack_finegrained_fp8_moe_weights(gm: GraphModule) -> int:
         graph.erase_node(node)
         fused_key_counter += 1
 
-    # Clean up unused nodes and parameters
-    gm.graph.eliminate_dead_code()
-    gm.delete_all_unused_submodules()
+        eliminate_dead_code(gm)
+        delete_all_unused_submodules(gm)
 
     return fused_key_counter
 
