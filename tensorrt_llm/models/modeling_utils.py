@@ -159,6 +159,11 @@ class QuantConfig(StrictBaseModel):
         description="Module name patterns that are skipped in quantization.")
     mamba_ssm_cache_dtype: Optional[str] = Field(
         default=None, description="Data type for mamba SSM cache.")
+    mamba_ssm_stochastic_rounding: bool = Field(
+        default=False,
+        description=
+        "Enable stochastic rounding for Mamba SSM state updates. Requires fp16 cache."
+    )
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:
