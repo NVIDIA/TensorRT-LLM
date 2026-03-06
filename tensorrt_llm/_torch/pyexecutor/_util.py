@@ -572,6 +572,16 @@ class KvCacheCreator:
         back to the target model's config via _get_effective_draft_config().
         """
         if self._mapping.enable_attention_dp:
+            draft_tp = getattr(self._speculative_config, 'draft_tp_size',
+                               None)
+            if (draft_tp is not None
+                    and draft_tp < self._mapping.tp_size):
+                raise ValueError(
+                    f"draft_tp_size ({draft_tp}) < tp_size "
+                    f"({self._mapping.tp_size}) requires separate "
+                    "draft/target KV caches, which are not supported "
+                    "with attention data parallelism."
+                )
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
