@@ -812,10 +812,10 @@ size_t AttentionOp::getWorkspaceSizeForContext(nvinfer1::DataType type, int32_t 
     }
 
     size_t const sage_q_sfs_buffer_size = useSageAttnSeparateQkv
-        ? sizeof(float) * mNumAttnHeads * tc::divUp(input_seq_length, std::max(1, mSageAttnNumEltsPerBlkQ))
+        ? sizeof(float) * mNumAttnHeads * batch_size * tc::divUp(input_seq_length, std::max(1, mSageAttnNumEltsPerBlkQ))
         : 0;
     size_t const sage_k_sfs_buffer_size = useSageAttnSeparateQkv
-        ? sizeof(float) * mNumAttnKVHeads * tc::divUp(input_seq_length, std::max(1, mSageAttnNumEltsPerBlkK))
+        ? sizeof(float) * mNumAttnKVHeads * batch_size * tc::divUp(input_seq_length, std::max(1, mSageAttnNumEltsPerBlkK))
         : 0;
     size_t const sage_v_sfs_buffer_size = useSageAttnSeparateQkv
         ? sizeof(float) * tc::divUp(local_hidden_units_kv, std::max(1, mSageAttnNumEltsPerBlkV))
@@ -1496,10 +1496,12 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
         fp8_k_buf_size = params.total_kv_len * static_cast<size_t>(local_hidden_units_kv);
         fp8_v_buf_size = params.total_kv_len * static_cast<size_t>(local_hidden_units_kv);
     }
-    int32_t const q_max_n_blk
-        = mSageAttnNumEltsPerBlkQ > 0 ? tc::divUp(params.input_seq_length, mSageAttnNumEltsPerBlkQ) : 0;
-    int32_t const k_max_n_blk
-        = mSageAttnNumEltsPerBlkK > 0 ? tc::divUp(params.input_seq_length, mSageAttnNumEltsPerBlkK) : 0;
+    int32_t const q_max_n_blk = mSageAttnNumEltsPerBlkQ > 0
+        ? params.batch_size * tc::divUp(params.input_seq_length, mSageAttnNumEltsPerBlkQ)
+        : 0;
+    int32_t const k_max_n_blk = mSageAttnNumEltsPerBlkK > 0
+        ? params.batch_size * tc::divUp(params.input_seq_length, mSageAttnNumEltsPerBlkK)
+        : 0;
     // SageAttention V scales are shared across tokens and partitioned on the flattened hidden dimension (H * D).
     int32_t const v_max_n_blk
         = mSageAttnNumEltsPerBlkV > 0 ? tc::divUp(local_hidden_units_kv, mSageAttnNumEltsPerBlkV) : 0;
@@ -1826,7 +1828,6 @@ int AttentionOp::enqueueContext(EnqueueContextParams<T> const& params, cudaStrea
                 TLLM_CHECK_WITH_INFO(
                     mSageAttnNumEltsPerBlkQ > 0 && mSageAttnNumEltsPerBlkK > 0 && mSageAttnNumEltsPerBlkV == 1,
                     "SageQuant requires positive block sizes for Q and K while the block size for V must be 1.");
-                TLLM_CHECK_WITH_INFO(params.batch_size == 1, "SageAttention does not support batching requests yet.");
                 TLLM_CHECK_WITH_INFO(!params.kv_scale_quant_orig,
                     "SageAttention disregards the configured params.kv_scale_quant_orig, invalidating the result.");
                 check_cuda_error(cudaMemsetAsync(sage_v_sfs_buf, 0, sage_v_sfs_buffer_size, stream));
