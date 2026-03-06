@@ -448,6 +448,24 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         return
 
 
+def _next_positive_power_of_2(x: int) -> int:
+    """Round up to the next power of 2 (returns x if already a power of 2)."""
+    if x <= 0:
+        return 1
+    return 1 << (x - 1).bit_length()
+
+
+def _bucket_num_cols(num_cols: int) -> int:
+    """Bucket num_cols to the next power of 2 for compilation caching.
+
+    This reduces recompilations when num_cols changes slightly (e.g.,
+    KV cache length growing each decode step). Safe because num_cols
+    only affects compile-time config; actual data access is bounded
+    by seq_lens.
+    """
+    return _next_positive_power_of_2(num_cols)
+
+
 # This function is used for integration of framework, e.g. trtllm.
 compiled_filter_topk_dict = {}
 
@@ -469,6 +487,7 @@ def cute_dsl_topk_wrapper(
     }
     dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
     num_rows, num_cols = input_values.shape
+    bucketed_num_cols = _bucket_num_cols(num_cols)
 
     large_occupancy = num_rows > 148
     assert not load_balance
@@ -476,7 +495,7 @@ def cute_dsl_topk_wrapper(
     # Note: don't forget num_cols, which means the maximum columns.
     key = (
         dtype,
-        num_cols,
+        bucketed_num_cols,
         top_k,
         next_n,
         return_val,
@@ -520,7 +539,7 @@ def cute_dsl_topk_wrapper(
 
         filtered_topk_func = FilteredTopKKernelVarlenDecode(
             dtype,
-            num_cols,
+            bucketed_num_cols,
             top_k,
             next_n,
             num_copy_bits=num_copy_bits,
@@ -594,6 +613,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     }
     dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
     num_rows, num_cols = input_values.shape
+    bucketed_num_cols = _bucket_num_cols(num_cols)
 
     large_occupancy = num_rows > 148
     assert not load_balance
@@ -603,7 +623,7 @@ def cute_dsl_topk_multi_cta_wrapper(
     num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
     key = (
         dtype,
-        num_cols,
+        bucketed_num_cols,
         top_k,
         next_n,
         return_val,
@@ -612,6 +632,7 @@ def cute_dsl_topk_multi_cta_wrapper(
         large_occupancy,
         enable_multi_cta,
         chunk_size_per_cta,
+        num_ctas_per_row,
     )
     if key not in compiled_filter_topk_dict:
         # Create fake tensors for compilation

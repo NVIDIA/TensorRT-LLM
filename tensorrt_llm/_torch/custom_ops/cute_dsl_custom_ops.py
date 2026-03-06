@@ -14,7 +14,8 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import (fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2)
+                     last_positive_power_of_2,
+                     next_positive_power_of_2)
 
 try:
     from cuda.bindings import driver as cuda
@@ -2792,6 +2793,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
 
+    def _bucket_num_cols(num_cols: int) -> int:
+        """Bucket num_cols to the next power of 2 for compilation caching.
+
+        This reduces recompilations when num_cols changes slightly (e.g.,
+        KV cache length growing each decode step). Safe because num_cols
+        only affects compile-time config; actual data access is bounded
+        by seq_lens.
+        """
+        return next_positive_power_of_2(num_cols)
+
     class CuteDSLTopKDecodeSingleCTARunner:
         """Runner for CuTE DSL Top-K decode kernel (single CTA version).
 
@@ -2871,6 +2882,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             }
             dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
             num_rows, num_cols = input_values.shape
+            bucketed_num_cols = _bucket_num_cols(num_cols)
 
             num_sms = torch.cuda.get_device_properties().multi_processor_count
             large_occupancy = num_rows > num_sms
@@ -2879,7 +2891,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             # Compilation key
             key = (
                 dtype,
-                num_cols,
+                bucketed_num_cols,
                 top_k,
                 next_n,
                 return_val,
@@ -2924,7 +2936,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
                 filtered_topk_func = FilteredTopKKernelVarlenDecode(
                     dtype,
-                    num_cols,
+                    bucketed_num_cols,
                     top_k,
                     next_n,
                     num_copy_bits=num_copy_bits,
@@ -3154,6 +3166,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             }
             dtype = torch_dtype_to_cutlass_dtype[torch_dtype]
             num_rows, num_cols = input_values.shape
+            bucketed_num_cols = _bucket_num_cols(num_cols)
 
             num_sms = torch.cuda.get_device_properties().multi_processor_count
             large_occupancy = num_rows > num_sms
@@ -3161,10 +3174,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
 
-            # Compilation key
+            # Compilation key (use bucketed_num_cols to reduce recompilations;
+            # include num_ctas_per_row since it depends on actual num_cols)
             key = (
                 dtype,
-                num_cols,
+                bucketed_num_cols,
                 top_k,
                 next_n,
                 return_val,
@@ -3173,6 +3187,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 large_occupancy,
                 True,  # enable_multi_cta
                 chunk_size_per_cta,
+                num_ctas_per_row,
             )
 
             if key not in self.__class__.kernel_cache:
