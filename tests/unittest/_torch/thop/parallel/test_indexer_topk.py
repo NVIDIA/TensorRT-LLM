@@ -283,8 +283,7 @@ def skip_if_not_blackwell():
         pytest.skip("CuTE DSL top-k kernel requires Blackwell (SM100+)")
 
 
-def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype,
-                            run_fn):
+def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, run_fn):
     """Common test logic for CuTE DSL top-k kernels.
 
     Args:
@@ -316,13 +315,11 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype,
 
     max_row_len = row_ends.max().item()
     torch_indices = logits.topk(min(index_topk, max_row_len), dim=-1)[1]
-    mask = (torch_indices >= 0) & (
-        (torch_indices - (row_ends - row_starts)[:, None]) < 0)
+    mask = (torch_indices >= 0) & ((torch_indices - (row_ends - row_starts)[:, None]) < 0)
     torch_indices = torch_indices.masked_fill(~mask, -1)
 
     assert compare_top_k_results(
-        logits, cute_indices.to(torch.int32), torch_indices, row_starts,
-        row_ends, index_topk
+        logits, cute_indices.to(torch.int32), torch_indices, row_starts, row_ends, index_topk
     ), "CuTE DSL top-k results don't match torch.topk"
 
 
@@ -331,14 +328,21 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype,
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens,
-                              dtype):
+def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype):
     _run_cute_dsl_topk_test(
-        batch_size, next_n, index_topk, num_tokens, dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.
-        cute_dsl_topk_decode_blackwell(
-            input_values=logits, seq_lens=seq_lens, top_k=index_topk,
-            next_n=next_n, num_copy_bits=256))
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_blackwell(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            num_copy_bits=256,
+        ),
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 64])
@@ -347,27 +351,42 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens,
 @pytest.mark.parametrize("num_tokens", [32768, 65536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
-def test_cute_dsl_topk_decode_multi_cta(batch_size, next_n, index_topk,
-                                        num_tokens, dtype,
-                                        chunk_size_per_cta):
+def test_cute_dsl_topk_decode_multi_cta(
+    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta
+):
     _run_cute_dsl_topk_test(
-        batch_size, next_n, index_topk, num_tokens, dtype,
-        lambda logits, seq_lens: torch.ops.trtllm.
-        cute_dsl_topk_decode_multi_cta_blackwell(
-            input_values=logits, seq_lens=seq_lens, top_k=index_topk,
-            next_n=next_n, num_copy_bits=256,
-            chunk_size_per_cta=chunk_size_per_cta))
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_topk_decode_multi_cta_blackwell(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            num_copy_bits=256,
+            chunk_size_per_cta=chunk_size_per_cta,
+        ),
+    )
 
 
 @pytest.mark.parametrize("batch_size", [1, 4, 64, 128])
 @pytest.mark.parametrize("next_n", [1, 2])
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192, 65536, 131072])
-def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk,
-                                      num_tokens):
+def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens):
     _run_cute_dsl_topk_test(
-        batch_size, next_n, index_topk, num_tokens, torch.float32,
-        lambda logits, seq_lens: torch.ops.trtllm.
-        cute_dsl_indexer_topk_decode(
-            input_values=logits, seq_lens=seq_lens, top_k=index_topk,
-            next_n=next_n, num_copy_bits=256))
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        torch.float32,
+        lambda logits, seq_lens: torch.ops.trtllm.cute_dsl_indexer_topk_decode(
+            input_values=logits,
+            seq_lens=seq_lens,
+            top_k=index_topk,
+            next_n=next_n,
+            num_copy_bits=256,
+        ),
+    )
