@@ -2482,7 +2482,10 @@ class PyExecutor:
         if self.enable_iter_perf_stats and self.dist.rank == 0:
             self._update_new_active_requests_queue_latency(new_requests)
 
-        # 5. Schedule requests across ranks (DP only)
+        # 5. Update total fetch counter (used by benchmark fill loop)
+        self.num_fetch_requests += len(new_requests)
+
+        # 6. Schedule requests across ranks (DP only)
         if self.enable_attention_dp:
             all_ranks_new_requests, self.expected_num_active_requests = \
                 self.adp_router.route_requests(
@@ -2490,13 +2493,12 @@ class PyExecutor:
                     self.max_num_active_requests)
             new_requests_cur_rank = all_ranks_new_requests[self.dist.tp_rank]
 
-            # Update counters for DP
-            self.num_fetch_requests += len(new_requests)
+            # Update per-rank counter for DP
             self.num_fetch_requests_cur_rank += len(new_requests_cur_rank)
 
             new_requests = new_requests_cur_rank
 
-        # 6. Merge requests
+        # 7. Merge requests
         return merge_requests(new_requests,
                               cp_config=self.dist.cp_config,
                               cp_rank=self.dist.cp_rank,
