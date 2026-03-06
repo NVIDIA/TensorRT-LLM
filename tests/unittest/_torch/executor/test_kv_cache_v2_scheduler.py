@@ -18,8 +18,9 @@ All KVCacheManagerV2, LlmRequest, and PeftCacheManager objects are mocked.
 No GPU required.
 """
 
-import pytest
 from unittest.mock import Mock, patch
+
+import pytest
 
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequestState
 from tensorrt_llm.llmapi.llm_args import CapacitySchedulerPolicy
@@ -37,8 +38,9 @@ GEN_TO_COMPLETE = LlmRequestState.GENERATION_TO_COMPLETE.value  # 14
 # ---------------------------------------------------------------------------
 # Mock factories
 # ---------------------------------------------------------------------------
-def make_gen_request(request_id, beam_width=1, num_draft_tokens=0,
-                     lora_task_id=None, is_first_context_chunk=False):
+def make_gen_request(
+    request_id, beam_width=1, num_draft_tokens=0, lora_task_id=None, is_first_context_chunk=False
+):
     req = Mock()
     req.request_id = request_id
     req.state_value = GEN_IN_PROGRESS
@@ -52,11 +54,16 @@ def make_gen_request(request_id, beam_width=1, num_draft_tokens=0,
     return req
 
 
-def make_ctx_request(request_id, context_remaining_length,
-                     prompt_len=None, num_draft_tokens=0,
-                     is_first_context_chunk=True,
-                     is_last_context_chunk=True,
-                     lora_task_id=None, encoder_output_len=None):
+def make_ctx_request(
+    request_id,
+    context_remaining_length,
+    prompt_len=None,
+    num_draft_tokens=0,
+    is_first_context_chunk=True,
+    is_last_context_chunk=True,
+    lora_task_id=None,
+    encoder_output_len=None,
+):
     req = Mock()
     req.request_id = request_id
     req.state_value = CONTEXT_INIT
@@ -75,8 +82,7 @@ def make_ctx_request(request_id, context_remaining_length,
     return req
 
 
-def make_encoder_request(request_id, encoder_output_len,
-                         lora_task_id=None):
+def make_encoder_request(request_id, encoder_output_len, lora_task_id=None):
     req = Mock()
     req.request_id = request_id
     req.state_value = ENCODER_INIT
@@ -108,17 +114,17 @@ def make_filtered_request(request_id, state_value=0):
     return req
 
 
-def make_kv_cache_manager(tokens_per_block=64,
-                          prepare_context_fn=None,
-                          resize_context_fn=None,
-                          try_allocate_generation_fn=None):
+def make_kv_cache_manager(
+    tokens_per_block=64,
+    prepare_context_fn=None,
+    resize_context_fn=None,
+    try_allocate_generation_fn=None,
+):
     mgr = Mock()
     mgr.tokens_per_block = tokens_per_block
     mgr.prepare_context.side_effect = prepare_context_fn or (lambda req: True)
     mgr.resize_context.side_effect = resize_context_fn or (lambda req, n: True)
-    mgr.try_allocate_generation.side_effect = (
-        try_allocate_generation_fn or (lambda req: True)
-    )
+    mgr.try_allocate_generation.side_effect = try_allocate_generation_fn or (lambda req: True)
     mgr.suspend_request.return_value = None
     return mgr
 
@@ -130,10 +136,16 @@ def make_peft_cache_manager(max_device_pages, pages_per_task=1):
     return mgr
 
 
-def make_scheduler(kv_cache_manager, max_batch_size=100,
-                   max_num_tokens=1024, ctx_chunk_config=None,
-                   peft_cache_manager=None, scheduler_capacity=None,
-                   no_schedule_until_state=None, no_schedule_after_state=None):
+def make_scheduler(
+    kv_cache_manager,
+    max_batch_size=100,
+    max_num_tokens=1024,
+    ctx_chunk_config=None,
+    peft_cache_manager=None,
+    scheduler_capacity=None,
+    no_schedule_until_state=None,
+    no_schedule_after_state=None,
+):
     """Create KVCacheV2Scheduler, patching isinstance check for mock mgr."""
     from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
 
@@ -176,8 +188,8 @@ def ids(reqs):
 # Construction & Configuration
 # ===========================================================================
 
-class TestConstruction:
 
+class TestConstruction:
     def test_valid_construction(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr)
@@ -186,6 +198,7 @@ class TestConstruction:
 
     def test_reject_non_v2_manager(self):
         from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
         with pytest.raises(AssertionError, match="KVCacheManagerV2"):
             KVCacheV2Scheduler(
                 max_batch_size=10,
@@ -198,6 +211,7 @@ class TestConstruction:
         mgr = make_kv_cache_manager()
         with pytest.raises(AssertionError, match="MAX_UTILIZATION"):
             from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
+
             with patch(
                 "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerV2",
                 new=type(mgr),
@@ -234,8 +248,8 @@ class TestConstruction:
 # Token Budget Limits
 # ===========================================================================
 
-class TestTokenBudget:
 
+class TestTokenBudget:
     def test_gen_budget_exhausted(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=3)
@@ -321,8 +335,8 @@ class TestTokenBudget:
 # Draft Token Budget Interaction (Non-Chunked)
 # ===========================================================================
 
-class TestDraftTokenBudget:
 
+class TestDraftTokenBudget:
     def test_ctx_fits_draft_exceeds_budget(self):
         """ctx(80) fits in budget=100, but 80+30=110 > 100.
         Should schedule ctx and discard excess drafts via _fit_draft_tokens_single.
@@ -376,6 +390,7 @@ class TestDraftTokenBudget:
 # KV Cache Allocation Failures
 # ===========================================================================
 
+
 class TestKVCacheFailuresGen:
     """Generation KV failures."""
 
@@ -388,9 +403,11 @@ class TestKVCacheFailuresGen:
 
     def test_gen_alloc_fails_no_victim(self):
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] <= 1  # first succeeds, second fails
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         # gen0 ok, gen1 fails, gen2 is first-chunk ctx (not evictable)
@@ -406,12 +423,14 @@ class TestKVCacheFailuresGen:
     def test_gen_alloc_fails_evict_succeeds(self):
         """gen fails, started req at tail, retry succeeds after eviction."""
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             # First call (gen0): success
             # Second call (gen1): fail
             # Third call (gen1 retry after evict): success
             return call_count[0] != 2
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)  # started, at tail → evictable
@@ -424,9 +443,11 @@ class TestKVCacheFailuresGen:
     def test_gen_alloc_fails_evict_insufficient(self):
         """gen fails, evict victim, retry still fails, no more victims."""
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] <= 1  # only first succeeds
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
@@ -438,10 +459,12 @@ class TestKVCacheFailuresGen:
     def test_multiple_evictions_needed(self):
         """gen fails, 2 victims needed to free enough space."""
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             # gen0: ok(1), gen1: fail(2), retry: fail(3), retry2: ok(4)
             return call_count[0] not in (2, 3)
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         v1 = make_gen_request(98)
@@ -454,9 +477,11 @@ class TestKVCacheFailuresGen:
     def test_gen_fail_does_not_break_immediately(self):
         """[gen1_ok, gen2_fail(no victim)] → gen1 scheduled, gen2 causes break."""
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] <= 1
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         reqs = [make_gen_request(0), make_gen_request(1)]
@@ -497,9 +522,11 @@ class TestKVCacheFailuresCtx:
 
     def test_ctx_resize_fail_then_smaller_ctx(self):
         call_count = [0]
+
         def resize_fn(req, n):
             call_count[0] += 1
             return call_count[0] > 1  # first fails, second succeeds
+
         mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
         sched = make_scheduler(mgr, max_num_tokens=1000)
         reqs = [
@@ -512,9 +539,11 @@ class TestKVCacheFailuresCtx:
     def test_zero_waste_failed_ctx_budget(self):
         """Failed ctx doesn't consume budget — next ctx gets full budget."""
         call_count = [0]
+
         def resize_fn(req, n):
             call_count[0] += 1
             return call_count[0] > 1
+
         mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
         sched = make_scheduler(mgr, max_num_tokens=500)
         reqs = [
@@ -582,13 +611,15 @@ class TestKVCacheFailuresEncoder:
 # Eviction (MAX_UTILIZATION)
 # ===========================================================================
 
-class TestEviction:
 
+class TestEviction:
     def test_evict_gen_from_tail(self):
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] != 1  # first fails, retry succeeds
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)  # gen in progress → evictable
@@ -599,14 +630,15 @@ class TestEviction:
 
     def test_evict_nonfirst_ctx_chunk(self):
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] != 1
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         # Non-first ctx chunk is evictable (is_context_init_state=True, is_first=False)
-        victim = make_ctx_request(99, context_remaining_length=100,
-                                  is_first_context_chunk=False)
+        victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=False)
         reqs = [make_gen_request(0), victim]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
@@ -617,8 +649,7 @@ class TestEviction:
             try_allocate_generation_fn=lambda req: False,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
-        victim = make_ctx_request(99, context_remaining_length=100,
-                                  is_first_context_chunk=True)
+        victim = make_ctx_request(99, context_remaining_length=100, is_first_context_chunk=True)
         reqs = [make_gen_request(0), victim]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
@@ -626,9 +657,11 @@ class TestEviction:
 
     def test_evicted_in_paused_requests(self):
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] != 1
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
@@ -638,9 +671,11 @@ class TestEviction:
 
     def test_suspend_called_on_victim(self):
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] != 1
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(99)
@@ -663,10 +698,12 @@ class TestEviction:
     def test_multiple_evictions_order(self):
         """victim2 evicted first (tail), retry fail, victim1 evicted, retry success."""
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             # gen0: fail(1), retry after v2: fail(2), retry after v1: ok(3)
             return call_count[0] == 3
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         v1 = make_gen_request(98)
@@ -682,16 +719,17 @@ class TestEviction:
     def test_req_it_end_shrinks_after_eviction(self):
         """After eviction, requests beyond victim index not visited."""
         call_count = [0]
+
         def alloc_fn(req):
             call_count[0] += 1
             return call_count[0] != 1
+
         mgr = make_kv_cache_manager(try_allocate_generation_fn=alloc_fn)
         sched = make_scheduler(mgr, max_num_tokens=100)
         victim = make_gen_request(5)  # at index 1, evictable
         # index 2: first-chunk ctx is NOT evictable, so eviction search
         # skips it and finds victim at index 1 instead.
-        gen_after = make_ctx_request(6, context_remaining_length=100,
-                                     is_first_context_chunk=True)
+        gen_after = make_ctx_request(6, context_remaining_length=100, is_first_context_chunk=True)
         reqs = [make_gen_request(0), victim, gen_after]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
@@ -729,8 +767,8 @@ class TestEviction:
 # PEFT / LoRA
 # ===========================================================================
 
-class TestPEFT:
 
+class TestPEFT:
     def test_no_peft_manager(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, peft_cache_manager=None)
@@ -785,9 +823,11 @@ class TestPEFT:
     def test_peft_commit_only_after_kv_success(self):
         """If resize fails, PEFT pages NOT committed."""
         call_count = [0]
+
         def resize_fn(req, n):
             call_count[0] += 1
             return call_count[0] > 1  # first fails
+
         mgr = make_kv_cache_manager(resize_context_fn=resize_fn)
         peft = make_peft_cache_manager(max_device_pages=1, pages_per_task=1)
         sched = make_scheduler(mgr, peft_cache_manager=peft)
@@ -844,9 +884,11 @@ class TestPEFT:
         peft = make_peft_cache_manager(max_device_pages=5, pages_per_task=1)
         # Override to return different values per call
         call_count = [0]
+
         def determine_pages(req):
             call_count[0] += 1
             return 3 if call_count[0] == 1 else 3  # 3+3=6 > 5
+
         peft.determine_num_pages.side_effect = determine_pages
         sched = make_scheduler(mgr, peft_cache_manager=peft)
         reqs = [
@@ -875,8 +917,8 @@ class TestPEFT:
 # Encoder Requests
 # ===========================================================================
 
-class TestEncoder:
 
+class TestEncoder:
     def test_encoder_scheduled(self):
         mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(mgr, max_num_tokens=200)
@@ -891,12 +933,13 @@ class TestEncoder:
         out = sched.schedule_request(reqs, set())
         assert len(out.context_requests) == 0
 
-    def test_encoder_exceeds_max_context_length(self):
+    def test_encoder_exceeds_budget(self):
+        """encoder_output_len > max_num_tokens → break (not scheduled)."""
         mgr = make_kv_cache_manager()
         sched = make_encoder_scheduler(mgr, max_num_tokens=1000)
         reqs = [make_encoder_request(0, encoder_output_len=2000)]
-        with pytest.raises(AssertionError, match="exceeds"):
-            sched.schedule_request(reqs, set())
+        out = sched.schedule_request(reqs, set())
+        assert len(out.context_requests) == 0
 
     def test_encoder_plus_gen(self):
         mgr = make_kv_cache_manager()
@@ -949,8 +992,8 @@ class TestEncoder:
 # Disaggregated Serving
 # ===========================================================================
 
-class TestDisagg:
 
+class TestDisagg:
     def test_disagg_bypasses_state_gate(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -1012,8 +1055,8 @@ class TestDisagg:
 # Chunked Context
 # ===========================================================================
 
-class TestChunkedContext:
 
+class TestChunkedContext:
     def test_budget_enough_for_all(self):
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
@@ -1071,9 +1114,11 @@ class TestChunkedContext:
     def test_chunk_fail_flows_budget(self):
         """Chunked ctx fails → budget flows to next request."""
         call_count = [0]
+
         def resize_fn(req, n):
             call_count[0] += 1
             return call_count[0] > 1  # first fails
+
         mgr = make_kv_cache_manager(tokens_per_block=64, resize_context_fn=resize_fn)
         sched = make_scheduler(mgr, max_num_tokens=500, ctx_chunk_config=(None, 64))
         req1 = make_ctx_request(0, context_remaining_length=200)
@@ -1132,8 +1177,8 @@ class TestChunkedContext:
 # Draft Token Fitting (Chunked Last Chunk)
 # ===========================================================================
 
-class TestDraftTokenFitting:
 
+class TestDraftTokenFitting:
     def test_draft_fits_in_page_remainder(self):
         """chunk=100, tokens_per_block=64. 100%64=36, space=64-36=28. draft=5 fits."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
@@ -1199,8 +1244,9 @@ class TestDraftTokenFitting:
         """Non-last chunk should NOT call _fit_draft_tokens_single."""
         mgr = make_kv_cache_manager(tokens_per_block=64)
         sched = make_scheduler(mgr, max_num_tokens=200, ctx_chunk_config=(None, 64))
-        req = make_ctx_request(0, context_remaining_length=1000, num_draft_tokens=5,
-                               is_last_context_chunk=False)
+        req = make_ctx_request(
+            0, context_remaining_length=1000, num_draft_tokens=5, is_last_context_chunk=False
+        )
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
         req.discard_draft_tokens.assert_not_called()
@@ -1210,8 +1256,8 @@ class TestDraftTokenFitting:
 # Beam Width
 # ===========================================================================
 
-class TestBeamWidth:
 
+class TestBeamWidth:
     def test_all_same_beam(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -1256,8 +1302,8 @@ class TestBeamWidth:
 # State Filtering & Inflight
 # ===========================================================================
 
-class TestStateFiltering:
 
+class TestStateFiltering:
     def test_inflight_skipped(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -1327,8 +1373,8 @@ class TestStateFiltering:
 # Sorting (LoRA Task ID)
 # ===========================================================================
 
-class TestSorting:
 
+class TestSorting:
     def test_no_lora_stable_order(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=100)
@@ -1364,8 +1410,9 @@ class TestSorting:
         # req0: last chunk (remaining=100, fits in budget)
         req0 = make_ctx_request(0, context_remaining_length=100, lora_task_id=2)
         # req1: non-last chunk (remaining=1000, will be chunked)
-        req1 = make_ctx_request(1, context_remaining_length=1000, lora_task_id=1,
-                                is_last_context_chunk=False)
+        req1 = make_ctx_request(
+            1, context_remaining_length=1000, lora_task_id=1, is_last_context_chunk=False
+        )
         out = sched.schedule_request([req0, req1], set())
         assert len(out.context_requests) == 2
         # Non-last before last in sorted output
@@ -1387,8 +1434,8 @@ class TestSorting:
 # SchedulerOutput Structure
 # ===========================================================================
 
-class TestSchedulerOutput:
 
+class TestSchedulerOutput:
     def test_output_fields_correct(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=1000)
@@ -1429,16 +1476,16 @@ class TestSchedulerOutput:
 # Mixed Ordering & Interaction
 # ===========================================================================
 
-class TestMixedOrdering:
 
+class TestMixedOrdering:
     def test_mixed_gen_ctx_order(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=300)
         reqs = [
-            make_gen_request(0),         # 1
-            make_ctx_request(1, 100),    # 100
-            make_gen_request(2),         # 1
-            make_ctx_request(3, 100),    # 100
+            make_gen_request(0),  # 1
+            make_ctx_request(1, 100),  # 100
+            make_gen_request(2),  # 1
+            make_ctx_request(3, 100),  # 100
         ]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 2
@@ -1467,9 +1514,9 @@ class TestMixedOrdering:
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=102)
         reqs = [
-            make_gen_request(0),         # 1
-            make_ctx_request(1, 100),    # 100
-            make_gen_request(2),         # 1
+            make_gen_request(0),  # 1
+            make_ctx_request(1, 100),  # 100
+            make_gen_request(2),  # 1
         ]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 2
@@ -1512,8 +1559,8 @@ class TestMixedOrdering:
 # can_schedule
 # ===========================================================================
 
-class TestCanSchedule:
 
+class TestCanSchedule:
     def test_always_true(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr)
@@ -1529,13 +1576,15 @@ class TestCanSchedule:
 # Non-chunked Context: Prepare Before Budget
 # ===========================================================================
 
-class TestPrepareBeforeBudget:
 
+class TestPrepareBeforeBudget:
     def test_block_reuse_reduces_budget(self):
         """prepare_context reduces context_remaining_length via block reuse."""
+
         def prepare_with_reuse(req):
             req.context_remaining_length = 500  # reduced from 1000
             return True
+
         mgr = make_kv_cache_manager(prepare_context_fn=prepare_with_reuse)
         sched = make_scheduler(mgr, max_num_tokens=600)
         req = make_ctx_request(0, context_remaining_length=1000)
@@ -1544,9 +1593,11 @@ class TestPrepareBeforeBudget:
 
     def test_without_reuse_budget_would_fail(self):
         """Without block reuse, 1000 > 800 would fail. With reuse → 500 ≤ 800."""
+
         def prepare_with_reuse(req):
             req.context_remaining_length = 500
             return True
+
         mgr = make_kv_cache_manager(prepare_context_fn=prepare_with_reuse)
         sched = make_scheduler(mgr, max_num_tokens=800)
         req = make_ctx_request(0, context_remaining_length=1000)
@@ -1558,8 +1609,8 @@ class TestPrepareBeforeBudget:
 # Edge Cases
 # ===========================================================================
 
-class TestEdgeCases:
 
+class TestEdgeCases:
     def test_empty_active_requests(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_num_tokens=100)

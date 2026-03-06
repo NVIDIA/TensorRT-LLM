@@ -177,11 +177,11 @@ class KVCacheV2Scheduler(RequestScheduler):
             # --- Encoder ---
             if req_state_value == self._encoder_init_state_value:
                 req_tokens = req.encoder_output_len
+                if max_num_tokens is not None and (batch_num_tokens + req_tokens > max_num_tokens):
+                    break
                 assert self.max_context_length is None or req_tokens <= self.max_context_length, (
                     f"The number of encoder tokens ({req_tokens}) exceeds the limit value ({self.max_context_length})"
                 )
-                if max_num_tokens is not None and (batch_num_tokens + req_tokens > max_num_tokens):
-                    break
                 if not self.kv_cache_manager.prepare_context(req):
                     break
                 if self.kv_cache_manager.resize_context(req, req_tokens):
