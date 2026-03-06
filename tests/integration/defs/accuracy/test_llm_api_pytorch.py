@@ -4935,26 +4935,31 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
     def test_skip_softmax_attention_2gpus(self, target_sparsity: float,
                                           thr_prefill: float,
                                           thr_decode: float):
-        sparse_attention_config = SkipSoftmaxAttentionConfig(
-            threshold_scale_factor={
-                "prefill": thr_prefill,
-                "decode": thr_decode,
-            })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
-                                        enable_block_reuse=False)
+        import gc
+        try:
+            sparse_attention_config = SkipSoftmaxAttentionConfig(
+                threshold_scale_factor={
+                    "prefill": thr_prefill,
+                    "decode": thr_decode,
+                })
+            kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                            enable_block_reuse=False)
 
-        with LLM(self.MODEL_PATH,
-                 attn_backend="TRTLLM",
-                 max_batch_size=256,
-                 max_num_tokens=100000,
-                 tensor_parallel_size=2,
-                 moe_expert_parallel_size=2,
-                 enable_attention_dp=True,
-                 kv_cache_config=kv_cache_config,
-                 sparse_attention_config=sparse_attention_config) as llm:
-            task = LongBenchV1(self.MODEL_NAME)
-            task.evaluate(llm,
-                          extra_acc_spec=f"target_sparsity={target_sparsity}")
+            with LLM(self.MODEL_PATH,
+                     attn_backend="TRTLLM",
+                     max_batch_size=256,
+                     max_num_tokens=100000,
+                     tensor_parallel_size=2,
+                     moe_expert_parallel_size=2,
+                     enable_attention_dp=True,
+                     kv_cache_config=kv_cache_config,
+                     sparse_attention_config=sparse_attention_config) as llm:
+                task = LongBenchV1(self.MODEL_NAME)
+                task.evaluate(
+                    llm, extra_acc_spec=f"target_sparsity={target_sparsity}")
+        finally:
+            gc.collect()
+            torch.cuda.empty_cache()
 
 
 class TestPhi4MiniInstruct(LlmapiAccuracyTestHarness):
