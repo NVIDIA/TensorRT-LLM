@@ -139,7 +139,8 @@ def weight_dequant(x: torch.Tensor,
 @torch.compile(dynamic=True)
 def moe_reduce_add_shared_output(routed_output, shared_output):
     routed_output = torch.sum(routed_output, dim=1, keepdim=False)
-    return shared_output + routed_output
+    # In-place add to avoid allocating a temporary tensor, reducing peak memory
+    return shared_output.add_(routed_output)
 
 
 class DeepseekV3WeightLoader:
@@ -1204,7 +1205,8 @@ class Deepseekv3MoE(nn.Module):
             else:
                 assert shared_output.size() == routed_output.size(
                 ), 'unmatched tensor shape'
-                final_hidden_states = shared_output + routed_output
+                # In-place add to avoid allocating a temporary tensor, reducing peak memory
+                final_hidden_states = shared_output.add_(routed_output)
 
             if not self.use_dp and self.mapping.tp_size > 1:
                 final_hidden_states = self.allreduce(
