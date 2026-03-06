@@ -45,6 +45,10 @@ from tensorrt_llm._utils import get_sm_version, mpi_rank
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
+# NOTE: Most tests in this file are deprecated and skipped. They are now covered by the
+# unified MoE test framework in tests/unittest/_torch/modules/moe/test_moe_backend.py
+# and test_moe_module.py. Add new MoE tests there instead of here.
+
 cloudpickle.register_pickle_by_value(sys.modules[__name__])
 cloudpickle.register_pickle_by_value(_torch.helpers)
 MPI.pickle.__init__(
@@ -76,6 +80,10 @@ def round_up(x, alignment):
     return (x + alignment - 1) // alignment * alignment
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.parametrize(
     "moe_backend, dtype, experts, routing_cls, bias",
     product(["CUTLASS", "VANILLA", "TRITON"], [torch.float16, torch.bfloat16],
@@ -195,6 +203,10 @@ def test_fused_moe(moe_backend,
         m //= 2
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("moe_cls", ["CUTLASS", "VANILLA"])
@@ -215,6 +227,10 @@ def test_fused_moe_multi_gpu(moe_cls, ep_size):
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
@@ -328,6 +344,10 @@ def test_fused_moe_alltoall(alltoall_method_type):
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize("alltoall_method_type", [
@@ -510,6 +530,10 @@ def test_fused_moe_alltoall_fp4(alltoall_method_type):
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_hopper
 @pytest.mark.parametrize(
     "moe_backend",
@@ -698,6 +722,10 @@ def set_tensor_value_4(x, num_row, num_cols):
     x.copy_(repeated)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -853,6 +881,10 @@ def test_fused_moe_fp8_blockwise_wide_ep(alltoall_method_type):
             assert r is None
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls",
@@ -1038,6 +1070,10 @@ def test_fused_moe_fp8_blockwise_deepgemm(dtype,
     torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
@@ -1172,6 +1208,10 @@ def test_fused_moe_fp8_blockwise_cute_dsl(dtype,
     return True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_no_hopper
 @pytest.mark.parametrize(
     "dtype, num_experts, seq_len, hidden_size, RoutingMethodCls, WeightLoadingMode",
@@ -1304,6 +1344,10 @@ def test_fused_moe_fp8_blockwise_cutlass(dtype,
     return True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_no_hopper
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -1337,6 +1381,10 @@ def test_fused_moe_fp8_blockwise_cutlass_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.skipif(torch.cuda.device_count() < 4,
                     reason="needs 4 GPUs to run this test")
@@ -1370,6 +1418,10 @@ def test_fused_moe_fp8_blockwise_cute_dsl_multi_gpu(ep_size, routing_method,
             assert r is True
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("moe_backend", [
@@ -1383,6 +1435,10 @@ def test_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion):
     run_fused_moe_nvfp4(dtype, moe_backend, finalize_fusion)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize("hidden_size, intermediate_size", [(2880, 2880)])
 @pytest.mark.parametrize("swiglu_alpha", [1, 0.1], ids=lambda v: f"alpha{v}")
@@ -1645,6 +1701,10 @@ def run_fused_moe_nvfp4(dtype,
                                                atol=atol)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "moe_backend",
@@ -1782,6 +1842,10 @@ def test_fused_moe_w4a8_nvfp4_fp8(moe_backend):
                                            atol=0.5)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_neither_ada_nor_hopper_unittest
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize(
@@ -2057,6 +2121,10 @@ def test_fused_moe_w4afp8(dtype, weight_loading_mode):
         torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @skip_pre_blackwell
 @pytest.mark.parametrize(
     "moe_backend",
@@ -2308,6 +2376,10 @@ def test_fused_moe_mxfp4_mxfp8(moe_backend, hidden_unpadded, seq_len, bias):
             torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.15)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.parametrize("dtype", [torch.bfloat16])
 @pytest.mark.parametrize("hidden_size", [768, 2880])
 @pytest.mark.parametrize(
@@ -2615,6 +2687,10 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         check_accuracy(output, ref_output, rtol=0.6, atol=0.6, percent=0.945)
 
 
+@pytest.mark.skip(
+    reason=
+    "Deprecated: covered by tests/unittest/_torch/modules/moe/test_moe_backend.py and test_moe_module.py. Add new tests there."
+)
 @pytest.mark.parametrize("dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("weight_dtype", [torch.int8])
 def test_fused_moe_int8_woq_per_channel(dtype, weight_dtype):
