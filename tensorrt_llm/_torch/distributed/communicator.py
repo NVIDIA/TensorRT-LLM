@@ -228,10 +228,10 @@ class Distributed(ABC):
         return [entry for tp_group in obj for entry in tp_group]
 
 
-# Max payload size that can be inlined into the header Bcast (avoids a
-# second MPI.Bcast call for small/empty payloads).  The inline buffer is a
-# fixed-size allocation so all ranks agree on the Bcast size.
-_INLINE_DATA_MAX = 4096
+# Max payload size that can be inlined into the header Bcast.  Kept small
+# (256 bytes) to stay within MPI eager-send thresholds and avoid falling
+# into the slower rendezvous protocol.
+_INLINE_DATA_MAX = 256
 _HEADER_INTS = 3
 _HEADER_BYTES = _HEADER_INTS * 8  # 24 bytes (3 x int64)
 _INLINE_BUF_SIZE = _HEADER_BYTES + _INLINE_DATA_MAX
@@ -242,7 +242,7 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     Safely broadcasts potentially large objects by splitting into fixed-size chunks,
     using raw-byte MPI.Bcast to avoid pickle5's out-of-band buffer allocations.
 
-    For small payloads (<= 4096 bytes), the header and data are combined into a
+    For small payloads (<= 256 bytes), the header and data are combined into a
     single MPI.Bcast call to reduce latency.
 
     Args:
