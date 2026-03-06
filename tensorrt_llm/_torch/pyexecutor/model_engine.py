@@ -1093,8 +1093,7 @@ class PyTorchModelEngine(ModelEngine):
                           num_gen_requests)))
 
         result = ScheduledRequests()
-        for r in ctx_requests:
-            result.append_context_request(r)
+        result.reset_context_requests(ctx_requests)
         result.generation_requests = gen_requests
         return result
 

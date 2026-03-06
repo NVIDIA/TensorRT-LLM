@@ -2672,8 +2672,7 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         scheduled_requests = ScheduledRequests()
-        for req in scheduled_context_requests:
-            scheduled_requests.append_context_request(req)
+        scheduled_requests.reset_context_requests(scheduled_context_requests)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 
