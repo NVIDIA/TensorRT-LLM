@@ -1093,12 +1093,8 @@ class PyTorchModelEngine(ModelEngine):
                           num_gen_requests)))
 
         result = ScheduledRequests()
-        result.context_requests_chunking = [
-            r for r in ctx_requests if not r.is_last_context_chunk
-        ]
-        result.context_requests_last_chunk = [
-            r for r in ctx_requests if r.is_last_context_chunk
-        ]
+        for r in ctx_requests:
+            result.append_context_request(r)
         result.generation_requests = gen_requests
         return result
 

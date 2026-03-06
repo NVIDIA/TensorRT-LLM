@@ -2672,12 +2672,8 @@ class PyExecutor:
                 scheduler_output.generation_requests)
 
         scheduled_requests = ScheduledRequests()
-        scheduled_requests.context_requests_chunking = [
-            r for r in scheduled_context_requests if not r.is_last_context_chunk
-        ]
-        scheduled_requests.context_requests_last_chunk = [
-            r for r in scheduled_context_requests if r.is_last_context_chunk
-        ]
+        for req in scheduled_context_requests:
+            scheduled_requests.append_context_request(req)
         scheduled_requests.generation_requests = scheduler_output.generation_requests
         scheduled_requests.paused_requests = scheduler_output.paused_requests
 

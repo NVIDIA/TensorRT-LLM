@@ -264,12 +264,9 @@ class ModelDrafter(Drafter):
 
         # Add to appropriate batch based on request type
         if draft_request.state == LlmRequestState.GENERATION_IN_PROGRESS:
-            draft_batch.generation_requests.append(draft_request)
+            draft_batch.append_generation_request(draft_request)
         else:
-            if draft_request.is_last_context_chunk:
-                draft_batch.context_requests_last_chunk.append(draft_request)
-            else:
-                draft_batch.context_requests_chunking.append(draft_request)
+            draft_batch.append_context_request(draft_request)
 
     @nvtx_range("_prepare_draft_batch")
     def _prepare_draft_batch(

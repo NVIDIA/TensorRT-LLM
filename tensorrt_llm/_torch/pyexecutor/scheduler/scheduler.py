@@ -81,6 +81,15 @@ class ScheduledRequests:
     def all_requests(self) -> RequestList:
         return self.context_requests + self.generation_requests
 
+    def append_context_request(self, request: LlmRequest) -> None:
+        if request.is_last_context_chunk:
+            self.context_requests_last_chunk.append(request)
+        else:
+            self.context_requests_chunking.append(request)
+
+    def append_generation_request(self, request: LlmRequest) -> None:
+        self.generation_requests.append(request)
+
 
 class RequestScheduler(ABC):
     @abstractmethod
