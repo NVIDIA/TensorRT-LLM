@@ -140,20 +140,30 @@ class Mamba2Mixer(nn.Module):
         # Choose between flashinfer and native implementation. (default to flashinfer)
         self._mamba_ssm_cache_dtype = config.quant_config.mamba_ssm_cache_dtype
         supported_head_dim_in_flashinfer = [64, 128]
-        if head_dim in supported_head_dim_in_flashinfer:
-            logger.info_once(
-                "Using flashinfer for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
+        self._use_flashinfer = head_dim in supported_head_dim_in_flashinfer
+        # Stochastic rounding requires FlashInfer and fp16 cache
+        self._use_stochastic_rounding = (
+            config.quant_config.mamba_ssm_stochastic_rounding
+            and self._use_flashinfer
+            and self._mamba_ssm_cache_dtype == torch.float16)
+
+        if self._use_flashinfer:
+            logger.info_once("Using flashinfer for selective state update",
+                             key="selective_state_update")
             self.selective_state_update_func_no_mtp = selective_state_update_fi
+            self.selective_state_update_func_mtp = selective_state_update_fi
         else:
-            logger.info_once(
-                "Using native for selective state update for no MTP",
-                key="selective_state_update_no_mtp")
+            logger.info_once("Using native for selective state update",
+                             key="selective_state_update")
             self.selective_state_update_func_no_mtp = selective_state_update_native
-        # TODO: support MTP selective state update in flashinfer.
-        logger.info_once("Using native for selective state update for MTP",
-                         key="selective_state_update_mtp")
-        self.selective_state_update_func_mtp = selective_state_update_native
+            self.selective_state_update_func_mtp = selective_state_update_native
+
+        # Warn if stochastic rounding was requested but couldn't be enabled
+        if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
+            logger.warning_once(
+                f"Stochastic rounding requires FlashInfer and float16 SSM cache, "
+                f"but got head_dim={head_dim}, dtype={self._mamba_ssm_cache_dtype}. Disabled.",
+                key="stochastic_rounding_disabled")
 
         # D
         self.D = nn.Parameter(
@@ -409,6 +419,29 @@ class Mamba2Mixer(nn.Module):
             D = repeat(self.D, "h -> h p", p=self.head_dim)
             if is_target_verify:
                 intermediate_ssm_states = layer_cache.intermediate_ssm
+                # Build kwargs for MTP selective_state_update
+                mtp_kwargs = dict(
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=True,
+                    state_batch_indices=state_indices_d[:num_decodes],
+                    out=preallocated_ssm_out_d.view(
+                        num_decodes,
+                        draft_token_num,
+                        self.num_heads // self.tp_size,
+                        self.head_dim,
+                    ),
+                    disable_state_update=True,
+                    intermediate_states_buffer=intermediate_ssm_states,
+                    cache_steps=draft_token_num,
+                    intermediate_state_indices=self.intermediate_state_indices,
+                )
+                if self._use_stochastic_rounding:
+                    mtp_kwargs['rand_seed'] = torch.randint(0,
+                                                            2**62, (1, ),
+                                                            device=x_d.device,
+                                                            dtype=torch.int64)
+
                 self.selective_state_update_func_mtp(
                     ssm_states,
                     x_d.view(
@@ -427,22 +460,25 @@ class Mamba2Mixer(nn.Module):
                     B_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
                     C_d.view(num_decodes, draft_token_num, self.tp_ngroups, -1),
                     D,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=True,
-                    state_batch_indices=state_indices_d[:num_decodes],
-                    out=preallocated_ssm_out_d.view(
-                        num_decodes,
-                        draft_token_num,
-                        self.num_heads // self.tp_size,
-                        self.head_dim,
-                    ),
-                    disable_state_update=True,
-                    intermediate_states_buffer=intermediate_ssm_states,
-                    cache_steps=draft_token_num,
-                    intermediate_state_indices=self.intermediate_state_indices,
+                    **mtp_kwargs,
                 )
             else:
+                # Build kwargs for selective_state_update
+                ssu_kwargs = dict(
+                    z=None,
+                    dt_bias=dt_bias,
+                    dt_softplus=self.delta_softplus,
+                    state_batch_indices=state_indices_d,
+                    out=preallocated_ssm_out_d.view(num_decodes, -1,
+                                                    self.head_dim),
+                )
+
+                if self._use_stochastic_rounding:
+                    ssu_kwargs['rand_seed'] = torch.randint(0,
+                                                            2**62, (1, ),
+                                                            device=x_d.device,
+                                                            dtype=torch.int64)
+
                 self.selective_state_update_func_no_mtp(
                     ssm_states,
                     x_d,
@@ -451,12 +487,7 @@ class Mamba2Mixer(nn.Module):
                     B_d,
                     C_d,
                     D,
-                    z=None,
-                    dt_bias=dt_bias,
-                    dt_softplus=self.delta_softplus,
-                    state_batch_indices=state_indices_d,
-                    out=preallocated_ssm_out_d.view(num_decodes, -1,
-                                                    self.head_dim),
+                    **ssu_kwargs,
                 )
 
         # norm
