@@ -41,8 +41,6 @@ from .interface import MoEWeightLoadingMode
 from .moe_load_balancer import advise_tensor_pageout
 
 # The declarations aligns with moe_kernels.h
-# pack inputs into int64, e.g. 4 x bf16 input values
-FUSED_MOE_NVFP4_INPUT_DTYPE = torch.int64
 # pack weights into int64, e.g. 16 x nvfp4 weight values
 FUSED_MOE_NVFP4_WEIGHT_DTYPE = torch.int64
 FUSED_MOE_MXFP4_WEIGHT_DTYPE = torch.int64
