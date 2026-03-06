@@ -1,0 +1,114 @@
+metadata:
+  model_name: deepseek-v32-fp4
+  precision: fp4
+  model_dir_name: DeepSeek-V3.2-FP4-v2
+  supported_gpus:
+  - GB200
+  - GB300
+  script_file: disaggr_torch.slurm
+  benchmark_type: 8k1k
+  config_index: 5
+  dataset_file: disagg_datasets/deepseek-v32-8192-1024-200000-ratio-1_for_serve.json
+slurm:
+  script_file: disaggr_torch.slurm
+  partition: <partition>
+  account: <account>
+  job_time: 04:00:00
+  job_name: unified-benchmark
+  extra_args: "--gres=gpu:4"
+  numa_bind: true
+benchmark:
+  mode: gen_only
+  use_nv_sa_benchmark: false
+  multi_round: 8
+  benchmark_ratio: 0.8
+  streaming: true
+  concurrency_list: '1024'
+  input_length: 8192
+  output_length: 1024
+  dataset_file: <dataset_file>
+hardware:
+  gpus_per_node: 4
+  num_ctx_servers: 6
+  num_gen_servers: 1
+environment:
+  container_mount: <container_mount>
+  container_image: <container_image>
+  model_path: <model_path>
+  trtllm_repo: ''
+  build_wheel: false
+  work_dir: <full_path_to_work_dir>
+  worker_env_var: "TLLM_LOG_LEVEL=INFO TRTLLM_SERVER_DISABLE_GC=1 TRTLLM_WORKER_DISABLE_GC=1 TRTLLM_ENABLE_PDL=1 ENROOT_ALLOW_DEV=yes"
+  server_env_var: "TRTLLM_SERVER_DISABLE_GC=1"
+profiling:
+  nsys_on: false
+accuracy:
+  enable_accuracy_test: false
+worker_config:
+  gen:
+    tensor_parallel_size: 16
+    moe_expert_parallel_size: 16
+    enable_attention_dp: true
+    enable_lm_head_tp_in_adp: true
+    pipeline_parallel_size: 1
+    max_batch_size: 64
+    max_num_tokens: 64
+    max_seq_len: 9419
+    cuda_graph_config:
+      enable_padding: true
+      batch_sizes:
+      - 1
+      - 2
+      - 4
+      - 8
+      - 16
+      - 32
+      - 64
+      - 128
+      - 256
+      - 512
+      - 768
+      - 1024
+      - 2048
+    print_iter_log: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.7
+      dtype: fp8
+    moe_config:
+      backend: CUTEDSL
+      use_low_precision_moe_combine: true
+      load_balancer:
+        num_slots: 288
+        layer_updates_per_iter: 1
+    nvfp4_gemm_config:
+      allowed_backends:
+      - cutlass
+      - cublaslt
+      - cutedsl
+      - cuda_core
+    cache_transceiver_config:
+      max_tokens_in_buffer: 8448
+      backend: NIXL
+    stream_interval: 20
+    num_postprocess_workers: 4
+  ctx:
+    max_batch_size: 1
+    max_num_tokens: 8448
+    max_seq_len: 9419
+    tensor_parallel_size: 4
+    moe_expert_parallel_size: 4
+    enable_attention_dp: true
+    pipeline_parallel_size: 1
+    print_iter_log: true
+    cuda_graph_config: null
+    disable_overlap_scheduler: true
+    kv_cache_config:
+      enable_block_reuse: false
+      free_gpu_memory_fraction: 0.75
+      dtype: fp8
+    moe_config:
+      backend: TRTLLM
+    cache_transceiver_config:
+      max_tokens_in_buffer: 8448
+      backend: NIXL
