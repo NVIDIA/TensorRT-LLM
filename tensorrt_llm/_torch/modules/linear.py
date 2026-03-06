@@ -2168,11 +2168,14 @@ class Linear(nn.Module):
 
         device_supported = get_sm_version() >= 100
         nvls_supported = ipc_nvls_supported()
+        enable_gemm_allreduce_fusion_env = (os.environ.get(
+            "TRTLLM_GEMM_ALLREDUCE_FUSION_ENABLED", "0") == "1")
 
         self.use_fused_gemm_allreduce = all([
             self.reduce_output, mpi_enabled, dtype_supported,
             in_features_aligned, out_features_aligned, tp_valid, quant_valid,
-            device_supported, nvls_supported, enable_gemm_allreduce_fusion
+            device_supported, nvls_supported, enable_gemm_allreduce_fusion,
+            enable_gemm_allreduce_fusion_env
         ])
 
         self.enable_cuda_core = False
