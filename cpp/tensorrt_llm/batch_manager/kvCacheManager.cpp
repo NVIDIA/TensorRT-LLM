@@ -96,7 +96,8 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mRefCount(0)
     , mSchedulingRefCount(0)
     , mLookupNode{nullptr}
-    , mWindowSize{0} // 0 = unattached; valid sizes are >= 1 or kRecurrentStates (-1)
+    , mWindowSize{std::numeric_limits<int>::max()}
+    // sentinel: unattached; valid sizes are >= 1 or kRecurrentStates (-1)
     , mIsPlaceholder{false}
     , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
@@ -109,9 +110,11 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
 
 BlockPtr KVCacheBlock::createPlaceholder(IdType blockId)
 {
-    // Use a dummy KVCacheIndex{0}; callers must not submit this index to the GPU kernel.
-    // The mIsPlaceholder flag gates getCacheBlockIndices to return nil.
-    auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{0});
+    // Use an out-of-range pool index as sentinel; the mIsPlaceholder flag gates
+    // getCacheBlockIndices to return nil so this index is never submitted to the GPU.
+    // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
+    static constexpr auto kInvalidPoolIndex = std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max();
+    auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{kInvalidPoolIndex});
     block->mIsPlaceholder = true;
     return block;
 }
@@ -145,8 +148,7 @@ NextBlockMap KVCacheBlock::getNextBlocks() const
     return result;
 }
 
-void KVCacheBlock::attachToLookupNode(
-    radix_block_tree::LookupNodePtr node, int windowSize, std::shared_ptr<KVCacheBlock> self)
+void KVCacheBlock::attachToLookupNode(radix_block_tree::LookupNodePtr node, int windowSize)
 {
     // Detach from any previous node first.
     if (mLookupNode)
@@ -156,9 +158,9 @@ void KVCacheBlock::attachToLookupNode(
             "attachToLookupNode: block %d expected prior lookup slot to be occupied (clearValue returned false)",
             static_cast<int>(mBlockId));
     }
-    // Assign fields AFTER setValue so local state is only updated on success.
-    auto const hadExisting = node->setValue(windowSize, std::move(self), /*overwrite=*/false);
-    TLLM_CHECK_WITH_INFO(!hadExisting,
+    // Assign fields AFTER trySetValue so local state is only updated on success.
+    auto const wasInserted = node->trySetValue(windowSize, shared_from_this(), /*overwrite=*/false);
+    TLLM_CHECK_WITH_INFO(wasInserted,
         "attachToLookupNode: block %d found lookup slot already occupied by another block", static_cast<int>(mBlockId));
     mLookupNode = std::move(node);
     mWindowSize = windowSize;
@@ -176,17 +178,18 @@ void KVCacheBlock::detachFromLookupNode()
         "detachFromLookupNode: block %d expected lookup slot to be occupied (clearValue returned false)",
         static_cast<int>(mBlockId));
     mLookupNode = nullptr;
-    mWindowSize = 0;
+    mWindowSize = std::numeric_limits<int>::max();
 }
 
-void KVCacheBlock::setAsRoot(
-    radix_block_tree::LookupNodePtr rootNode, int windowSize, std::shared_ptr<KVCacheBlock> self)
+void KVCacheBlock::setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize)
 {
     mLookupNode = rootNode;
     mWindowSize = windowSize;
     // Store the root block itself in the root node so that direct children can find it
     // via getPrevBlock() (root->getParentNode() returns nullptr, so the chain stops here).
-    [[maybe_unused]] auto const wasSet = rootNode->setValue(windowSize, std::move(self), /*overwrite=*/true);
+    auto const wasUpdated = rootNode->trySetValue(windowSize, shared_from_this(), /*overwrite=*/true);
+    TLLM_LOG_DEBUG("setAsRoot: block %d wired to root slot for windowSize=%d (wasUpdated=%d)",
+        static_cast<int>(mBlockId), windowSize, static_cast<int>(wasUpdated));
 }
 
 tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
@@ -346,7 +349,7 @@ void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
     auto existing = childNode->getValue(mWindowSize);
     if (!existing.has_value())
     {
-        block->attachToLookupNode(childNode, mWindowSize, block);
+        block->attachToLookupNode(childNode, mWindowSize);
     }
 }
 
@@ -407,7 +410,12 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
     {
         // clearNode removes the child entry and fires cascade pruning upward if the child
         // node becomes empty after the removal.
-        [[maybe_unused]] auto const wasCleared = mLookupNode->clearNode(blockKey);
+        auto const wasCleared = mLookupNode->clearNode(blockKey);
+        if (!wasCleared)
+        {
+            TLLM_LOG_DEBUG("removeNextBlock: key not found for block %d; node may have been pruned already",
+                static_cast<int>(mBlockId));
+        }
     }
 }
 
@@ -419,11 +427,11 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 //   2. Detach in *reverse* order (children before parents).  This is
 //      required because detachFromLookupNode() triggers cascade pruning:
 //      when a node becomes empty (no value, no children) it is removed from
-//      its parent.  If we detached a parent first, the parent's node would
-//      be pruned before we had a chance to look up its children.  By
-//      detaching leaves first the cascade only propagates upward after all
-//      descendants are already gone.
-void KVCacheBlock::freeDescendantsRecursively()
+//      its parent.  If we detached in collection order (parents first), a
+//      parent node could be cascade-pruned away before we had a chance to
+//      look up its children in step 1.  By detaching leaves first, cascade
+//      propagation only moves upward after all descendants are already gone.
+void KVCacheBlock::detachDescendantsFromLookupTree()
 {
     if (!mLookupNode)
     {
@@ -446,7 +454,7 @@ void KVCacheBlock::freeDescendantsRecursively()
                 stack.push_back(block);
             }
         }
-        TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", current->getBlockId());
+        TLLM_LOG_DEBUG("KVCacheBlock::detachDescendantsFromLookupTree - detaching block %d", current->getBlockId());
         descendants.push_back(std::move(current));
     }
     // Detach leaves first so cascade-prune works correctly.
@@ -458,7 +466,7 @@ void KVCacheBlock::freeDescendantsRecursively()
 
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
-    freeDescendantsRecursively();
+    detachDescendantsFromLookupTree();
     detachFromLookupNode();
 }
 
@@ -648,7 +656,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mTokensPerBlock{tokensPerBlock}
     , mIsSWA{isSWA}
     , mLookupTree{&lookupTree}
-    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0})}
+    // Use an out-of-range pool index for the dummy root block; it is never submitted to the GPU.
+    // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
+    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId,
+          tk::KVCacheIndex{std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max()})}
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mLoopbackAgent{loopbackAgent}
@@ -738,7 +749,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
 
     // Wire the dummy root block into the shared lookup tree so that direct children
     // can navigate to it via getPrevBlock() and blockInRadixTree() returns true for them.
-    mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize, mCachedBlocksRoot);
+    mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
 }
 
 WindowBlockManager::~WindowBlockManager()

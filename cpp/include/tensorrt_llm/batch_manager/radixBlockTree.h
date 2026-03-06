@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/templatedTrie.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/logger.h"
 
 #include <optional>
 #include <vector>
@@ -81,8 +82,12 @@ public:
         auto nodeMatches = insertNodes(prefix);
         if (!nodeMatches.exactMatches.empty())
         {
-            [[maybe_unused]] auto const wasOverwritten
-                = nodeMatches.exactMatches.back().node->setValue(windowSize, block, /*overwrite=*/false);
+            auto const wasInserted
+                = nodeMatches.exactMatches.back().node->trySetValue(windowSize, block, /*overwrite=*/false);
+            if (!wasInserted)
+            {
+                TLLM_LOG_DEBUG("insertBlock: slot for windowSize=%d already occupied; insertion skipped", windowSize);
+            }
         }
     }
 
@@ -98,14 +103,25 @@ public:
         PrefixKey const& prefix, int windowSize, bool allowPartialMatch) const
     {
         auto valueMatches = lookupValues(prefix, allowPartialMatch, windowSize);
-        // When not allowing partial match, require that all prefix nodes exist in the trie.
-        // lookupValues stops early when a node is missing, so matches.size() < prefix.size()
-        // means the prefix chain is broken and no reliable deepest match can be returned.
-        if (!allowPartialMatch && valueMatches.matches.size() != prefix.size())
+        if (!allowPartialMatch)
         {
+            // Exact lookup: all prefix nodes must exist AND the target node must have a value.
+            // We must not fall back to an ancestor block even if one exists, because that
+            // would silently return a cached block for a shorter prefix than requested.
+            // lookupValues stops early when a node is missing, so matches.size() < prefix.size()
+            // means the prefix chain is broken.
+            if (valueMatches.matches.size() != prefix.size())
+            {
+                return std::nullopt;
+            }
+            auto const& exactMatch = valueMatches.matches.back();
+            if (exactMatch.isValid && exactMatch.value)
+            {
+                return exactMatch.value;
+            }
             return std::nullopt;
         }
-        // Return the deepest (last) valid match so callers get the most specific cached block.
+        // Partial match allowed: return the deepest (last) valid match.
         for (auto itr = valueMatches.matches.rbegin(); itr != valueMatches.matches.rend(); ++itr)
         {
             if (itr->isValid && itr->value)
@@ -175,8 +191,15 @@ public:
         {
             if (i < blocks.size() && blocks[i])
             {
-                [[maybe_unused]] auto const alreadyOccupied
-                    = nodeMatches.exactMatches[i].node->setValue(windowSize, blocks[i], /*overwrite=*/false);
+                auto const wasInserted
+                    = nodeMatches.exactMatches[i].node->trySetValue(windowSize, blocks[i], /*overwrite=*/false);
+                if (!wasInserted)
+                {
+                    TLLM_LOG_DEBUG(
+                        "insertBlocks: slot at index %zu for windowSize=%d already occupied; "
+                        "insertion skipped",
+                        i, windowSize);
+                }
             }
         }
     }

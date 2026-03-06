@@ -46,7 +46,7 @@ std::pair<BlockPtr, std::shared_ptr<UnifiedBlockTree>> makeRootedTree(int window
 {
     auto tree = std::make_shared<UnifiedBlockTree>();
     auto root = makeBlock(KVCacheBlock::kCachedBlocksRootId);
-    root->setAsRoot(tree->getRoot(), windowSize, root);
+    root->setAsRoot(tree->getRoot(), windowSize);
     return {root, tree};
 }
 
@@ -62,7 +62,7 @@ TEST(RadixBlockTreeTest, AttachDetachLifecycle)
     constexpr int kWindowSize = 64;
 
     auto root = makeBlock(KVCacheBlock::kCachedBlocksRootId);
-    root->setAsRoot(tree.getRoot(), kWindowSize, root);
+    root->setAsRoot(tree.getRoot(), kWindowSize);
 
     auto block = makeBlock(0);
     EXPECT_FALSE(block->isShared()); // not in tree yet
@@ -70,7 +70,7 @@ TEST(RadixBlockTreeTest, AttachDetachLifecycle)
     // Attach
     auto key = makeKey({1, 2, 3});
     auto childNode = tree.getRoot()->findOrInsertChild(key, tree.getRoot());
-    block->attachToLookupNode(childNode, kWindowSize, block);
+    block->attachToLookupNode(childNode, kWindowSize);
 
     EXPECT_TRUE(block->isShared());
 
@@ -175,10 +175,10 @@ TEST(RadixBlockTreeTest, MultiWindowSizeSameNode)
     constexpr int kWin512 = 512;
 
     auto root128 = makeBlock(KVCacheBlock::kCachedBlocksRootId);
-    root128->setAsRoot(tree.getRoot(), kWin128, root128);
+    root128->setAsRoot(tree.getRoot(), kWin128);
 
     auto root512 = makeBlock(KVCacheBlock::kCachedBlocksRootId);
-    root512->setAsRoot(tree.getRoot(), kWin512, root512);
+    root512->setAsRoot(tree.getRoot(), kWin512);
 
     auto block128 = makeBlock(0);
     auto block512 = makeBlock(1);
@@ -187,8 +187,8 @@ TEST(RadixBlockTreeTest, MultiWindowSizeSameNode)
 
     // Both blocks go to the same tree node (same key prefix) but different value slots
     auto childNode = tree.getRoot()->findOrInsertChild(key, tree.getRoot());
-    block128->attachToLookupNode(childNode, kWin128, block128);
-    block512->attachToLookupNode(childNode, kWin512, block512);
+    block128->attachToLookupNode(childNode, kWin128);
+    block512->attachToLookupNode(childNode, kWin512);
 
     EXPECT_EQ(tree.countNumberOfNodes(), 1);
 
@@ -245,12 +245,12 @@ TEST(RadixBlockTreeTest, ReAttachToDifferentNode)
 
     auto block = makeBlock(0);
 
-    block->attachToLookupNode(nodeA, kWindowSize, block);
+    block->attachToLookupNode(nodeA, kWindowSize);
     EXPECT_TRUE(nodeA->getValue(kWindowSize).has_value());
     EXPECT_FALSE(nodeB->getValue(kWindowSize).has_value());
 
     // Re-attach to nodeB: old slot in nodeA must be cleared
-    block->attachToLookupNode(nodeB, kWindowSize, block);
+    block->attachToLookupNode(nodeB, kWindowSize);
     EXPECT_FALSE(nodeA->getValue(kWindowSize).has_value());
     EXPECT_TRUE(nodeB->getValue(kWindowSize).has_value());
 
@@ -313,7 +313,7 @@ TEST(RadixBlockTreeTest, FreeLeafBlockRemovesFromTree)
 }
 
 // ---------------------------------------------------------------------------
-// 10. freeDescendantsRecursively clears entire subtree
+// 10. detachDescendantsFromLookupTree clears entire subtree
 // ---------------------------------------------------------------------------
 
 TEST(RadixBlockTreeTest, FreeDescendantsRecursively)
@@ -550,7 +550,7 @@ TEST(MambaTest, RegularBlockIsNotPlaceholder)
 // 20. insertBlocks / lookupBlock with kRecurrentStates
 // ---------------------------------------------------------------------------
 
-TEST(MambaTest, InsertBlocksLookupBlockDeepest)
+TEST(MambaTest, InsertBlocksLookupBlockExactPosition)
 {
     UnifiedBlockTree tree;
 
@@ -564,7 +564,7 @@ TEST(MambaTest, InsertBlocksLookupBlockDeepest)
     // Position 1 is nullptr (placeholder)
     tree.insertBlocks(prefix, kRecurrentStates, {b0, nullptr, b2});
 
-    // lookupBlock returns deepest valid block = b2
+    // lookupBlock returns the block at the exact last position = b2
     auto result = tree.lookupBlock(prefix, kRecurrentStates, /*allowPartialMatch=*/false);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, b2);
@@ -667,10 +667,10 @@ TEST(UnifiedBlockTreeTest, LookupBlockBrokenChainReturnsNullopt)
 }
 
 // ---------------------------------------------------------------------------
-// 25. lookupBlock returns deepest match when multiple positions have valid blocks
+// 25. lookupBlock returns exact match when multiple positions have valid blocks
 // ---------------------------------------------------------------------------
 
-TEST(UnifiedBlockTreeTest, LookupBlockReturnsDeepestMatch)
+TEST(UnifiedBlockTreeTest, LookupBlockReturnsExactMatch)
 {
     UnifiedBlockTree tree;
     constexpr int kWindowSize = 64;
@@ -685,8 +685,127 @@ TEST(UnifiedBlockTreeTest, LookupBlockReturnsDeepestMatch)
     tree.insertBlock(prefix1, kWindowSize, blockShallow);
     tree.insertBlock(prefix2, kWindowSize, blockDeep);
 
-    // Lookup the full 2-step prefix — should return blockDeep (most specific)
+    // Lookup the full 2-step prefix — should return the exact match at the last position
     auto result = tree.lookupBlock(prefix2, kWindowSize, /*allowPartialMatch=*/false);
     ASSERT_TRUE(result.has_value());
     EXPECT_EQ(*result, blockDeep);
+}
+
+// ---------------------------------------------------------------------------
+// 25b. lookupBlock returns nullopt when target node has no value, even if an
+//      ancestor does (exact-match semantics, not deepest-ancestor fallback)
+// ---------------------------------------------------------------------------
+
+TEST(UnifiedBlockTreeTest, LookupBlockExactMatchNoAncestorFallback)
+{
+    UnifiedBlockTree tree;
+    constexpr int kWindowSize = 64;
+
+    BlockKey k0 = makeKey({1, 2, 3});
+    BlockKey k1 = makeKey({4, 5, 6});
+    UnifiedBlockTree::PrefixKey prefix1 = {k0};
+    UnifiedBlockTree::PrefixKey prefix2 = {k0, k1};
+
+    // Insert a block only at depth-1, not at depth-2
+    auto blockShallow = makeBlock(1);
+    tree.insertBlock(prefix1, kWindowSize, blockShallow);
+
+    // Lookup depth-2: the chain is broken (depth-2 node doesn't exist) → nullopt
+    auto result = tree.lookupBlock(prefix2, kWindowSize, /*allowPartialMatch=*/false);
+    EXPECT_FALSE(result.has_value());
+
+    // Now insert a depth-2 node that exists but has NO value for kWindowSize
+    // (simulate by inserting for a different window size)
+    auto blockOther = makeBlock(2);
+    tree.insertBlock(prefix2, kWindowSize + 1, blockOther);
+
+    // Depth-2 node now exists (chain complete) but has no value for kWindowSize → nullopt
+    auto result2 = tree.lookupBlock(prefix2, kWindowSize, /*allowPartialMatch=*/false);
+    EXPECT_FALSE(result2.has_value());
+}
+
+// ---------------------------------------------------------------------------
+// 26. getEdges() returns ALL nodes with values, including nodes that are both
+//     terminal (have a value) and internal (have children).
+//     Regression test for the _getEdges `else` bug.
+// ---------------------------------------------------------------------------
+
+TEST(UnifiedBlockTreeTest, GetEdgesTerminalAndInternalNode)
+{
+    UnifiedBlockTree tree;
+    constexpr int kWindowSize = 64;
+
+    BlockKey k0 = makeKey({1, 2, 3});
+    BlockKey k1 = makeKey({4, 5, 6});
+    UnifiedBlockTree::PrefixKey prefix1 = {k0};
+    UnifiedBlockTree::PrefixKey prefix2 = {k0, k1};
+
+    auto blockShallow = makeBlock(1);
+    auto blockDeep = makeBlock(2);
+    // k0 node is both terminal (has blockShallow) and internal (has k1 child).
+    tree.insertBlock(prefix1, kWindowSize, blockShallow);
+    tree.insertBlock(prefix2, kWindowSize, blockDeep);
+
+    auto edges = tree.getEdges();
+    ASSERT_EQ(edges.size(), 2u);
+
+    // Both prefix paths should be present (order not guaranteed)
+    bool foundShallow = false;
+    bool foundDeep = false;
+    for (auto const& edge : edges)
+    {
+        if (edge.size() == 1 && edge[0] == k0)
+        {
+            foundShallow = true;
+        }
+        if (edge.size() == 2 && edge[0] == k0 && edge[1] == k1)
+        {
+            foundDeep = true;
+        }
+    }
+    EXPECT_TRUE(foundShallow) << "Expected edge [k0] in getEdges() output";
+    EXPECT_TRUE(foundDeep) << "Expected edge [k0, k1] in getEdges() output";
+}
+
+// ---------------------------------------------------------------------------
+// 27. BlockKey::numMatchingTokens returns 0 when usesExtraIds differs.
+//     Regression test for bug: the check previously omitted usesExtraIds.
+// ---------------------------------------------------------------------------
+
+TEST(BlockKeyTest, NumMatchingTokensUsesExtraIdsMismatch)
+{
+    VecUniqueTokens tokens = {UniqueToken{1, 0}, UniqueToken{2, 0}, UniqueToken{3, 0}};
+
+    // Two keys with identical token content but different usesExtraIds.
+    BlockKey keyWithExtra{/*usesExtraIds=*/true, /*loraTaskId=*/std::nullopt, tokens};
+    BlockKey keyWithoutExtra{/*usesExtraIds=*/false, /*loraTaskId=*/std::nullopt, tokens};
+
+    // Should return 0 because usesExtraIds differs.
+    EXPECT_EQ(keyWithExtra.numMatchingTokens(keyWithoutExtra), 0);
+    EXPECT_EQ(keyWithoutExtra.numMatchingTokens(keyWithExtra), 0);
+
+    // Identical keys should return full match.
+    EXPECT_EQ(keyWithExtra.numMatchingTokens(keyWithExtra), static_cast<int>(tokens.size()));
+}
+
+// ---------------------------------------------------------------------------
+// 28. detachFromLookupNode on an unattached block is a no-op (no crash).
+// ---------------------------------------------------------------------------
+
+TEST(RadixBlockTreeTest, DetachUnattachedBlockIsNoOp)
+{
+    auto block = makeBlock(0);
+    EXPECT_NO_THROW(block->detachFromLookupNode()); // must not crash or assert
+    EXPECT_FALSE(block->isShared());
+}
+
+// ---------------------------------------------------------------------------
+// 29. getNextBlocks() on an unattached block returns empty map.
+// ---------------------------------------------------------------------------
+
+TEST(RadixBlockTreeTest, GetNextBlocksUnattachedReturnsEmpty)
+{
+    auto block = makeBlock(0);
+    auto nextBlocks = block->getNextBlocks();
+    EXPECT_TRUE(nextBlocks.empty());
 }
