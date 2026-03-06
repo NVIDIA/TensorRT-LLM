@@ -906,13 +906,13 @@ def get_config_dir(benchmark_mode: Optional[str]) -> str:
         str: Absolute config directory path
     """
     if benchmark_mode in ("e2e", "gen_only", "ctx_only"):
-        config_folder = DISAGG_CONFIG_FOLDER
+        config_dir = DISAGG_CONFIG_FOLDER
     else:
-        config_folder = AGG_CONFIG_FOLDER
+        config_dir = AGG_CONFIG_FOLDER
     # If relative path, join with llm root
-    if not os.path.isabs(config_folder):
-        config_folder = os.path.join(get_llm_root(), config_folder)
-    return config_folder
+    if not os.path.isabs(config_dir):
+        config_dir = os.path.join(get_llm_root(), config_dir)
+    return config_dir
 
 
 class PerfSanityTestConfig:
