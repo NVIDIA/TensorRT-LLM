@@ -11,8 +11,8 @@ from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
 
 example_prompts = [
     "Hello, my name is",
-    "The capital of France is",
-    "The future of AI is",
+    # "The capital of France is",
+    # "The future of AI is",
 ]
 
 
@@ -42,7 +42,7 @@ def add_llm_args(parser):
     parser.add_argument(
         "--max_num_tokens",
         type=int,
-        default=8192,
+        default=2048,
         help=
         "The maximum total tokens (context + generation) across all sequences in a batch."
     )
@@ -148,7 +148,7 @@ def add_llm_args(parser):
                         action='store_true')
 
     # Sampling
-    parser.add_argument("--max_tokens", type=int, default=64)
+    parser.add_argument("--max_tokens", type=int, default=512)
     parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--top_k", type=int, default=None)
     parser.add_argument("--top_p", type=float, default=None)
@@ -176,6 +176,7 @@ def add_llm_args(parser):
                         default="llama3",
                         choices=["llama3", "mistral_large3"],
                         help="The model architecture of the eagle3 model.")
+    parser.add_argument('--max_total_draft_tokens', type=int, default=None)
 
     # Relaxed acceptance
     parser.add_argument('--use_relaxed_acceptance_for_thinking',
@@ -209,7 +210,12 @@ def parse_arguments():
     parser = argparse.ArgumentParser(
         description="LLM models with the PyTorch workflow.")
     parser = add_llm_args(parser)
-    parser.add_argument("--kv_cache_fraction", type=float, default=0.9)
+    parser.add_argument("--kv_cache_fraction", type=float, default=0.5)
+    parser.add_argument(
+        "--streaming",
+        action="store_true",
+        default=False,
+        help="Use streaming generate_async instead of generate.")
     args = parser.parse_args()
     return args
 
@@ -247,7 +253,11 @@ def setup_llm(args, **kwargs):
             use_dynamic_tree=args.use_dynamic_tree,
             dynamic_tree_max_topK=args.dynamic_tree_max_topK,
             allow_advanced_sampling=args.allow_advanced_sampling,
-            eagle3_model_arch=args.eagle3_model_arch)
+            eagle3_model_arch=args.eagle3_model_arch,
+            max_total_draft_tokens=args.max_total_draft_tokens)
+        print(
+            f"[DEBUG] spec_config.eagle3_one_model = {spec_config.eagle3_one_model}"
+        )
     elif spec_decode_algo == "DRAFT_TARGET":
         spec_config = DraftTargetDecodingConfig(
             max_draft_len=args.spec_decode_max_draft_len,
@@ -312,6 +322,9 @@ def setup_llm(args, **kwargs):
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
         **kwargs)
+    print(
+        f"[DEBUG] After LLM creation, llm.args.speculative_config = {llm.args.speculative_config}"
+    )
 
     use_beam_search = args.max_beam_width > 1
     best_of = args.best_of or args.n
@@ -350,44 +363,59 @@ def main():
             messages = [{"role": "user", "content": f"{prompt}"}]
             new_prompts.append(
                 llm.tokenizer.apply_chat_template(messages,
-                                                  tokenize=False,
+                                                  tokenize=True,
                                                   add_generation_prompt=True))
         prompts = new_prompts
-    outputs = llm.generate(prompts, sampling_params)
+    prompts = [[
+        128000, 32, 6369, 1990, 264, 22999, 1217, 323, 459, 21075, 11478, 18328,
+        13, 578, 18328, 6835, 11190, 11, 11944, 11, 323, 48887, 11503, 311, 279,
+        1217, 596, 4860, 13, 14194, 25, 22691, 36660, 3931, 2891, 25
+    ]]
 
-    for i, output in enumerate(outputs):
-        prompt = output.prompt
-        for sequence_idx, sequence in enumerate(output.outputs):
-            generated_text = sequence.text
-            # Skip printing the beam_idx if no beam search was used
-            sequence_id_text = f"[{sequence_idx}]" if args.max_beam_width > 1 or args.n > 1 else ""
+    args.spec_decode_max_draft_len
+
+    for i, prompt in enumerate(prompts):
+        num_tokens = 0
+        num_iterations = 0
+
+        if args.streaming:
+            for output in llm.generate_async(prompt,
+                                             sampling_params,
+                                             streaming=True):
+                new_tokens = output.outputs[0].token_ids
+                num_tokens = len(new_tokens)
+                num_iterations += 1
+        else:
+            output = llm.generate(prompt, sampling_params)
+
+        if args.streaming and num_iterations > 0:
+            accept_rate = num_tokens / num_iterations
+            print(f"[{i}] Accept rate: {accept_rate:.2f} "
+                  f"(tokens={num_tokens}, iterations={num_iterations})")
+
+        generated_text = output.outputs[0].text
+        print(f"[{i}] Prompt: {prompt!r}, Generated text: {generated_text!r}")
+
+        if args.return_context_logits:
+            print(f"[{i}] Context logits: {output.context_logits}")
+        if args.return_generation_logits:
             print(
-                f"[{i}]{sequence_id_text} Prompt: {prompt!r}, Generated text: {generated_text!r}"
+                f"[{i}] Generation logits: {output.outputs[0].generation_logits}"
             )
-            if args.return_context_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Context logits: {output.context_logits}"
-                )
-            if args.return_generation_logits:
-                print(
-                    f"[{i}]{sequence_id_text} Generation logits: {sequence.generation_logits}"
-                )
-            if args.prompt_logprobs is not None:
-                print(
-                    f"[{i}]{sequence_id_text} Prompt logprobs: {sequence.prompt_logprobs}"
-                )
-            if args.logprobs is not None:
-                print(f"[{i}]{sequence_id_text} Logprobs: {sequence.logprobs}")
+        if args.prompt_logprobs:
+            print(f"[{i}] Prompt logprobs: {output.outputs[0].prompt_logprobs}")
+        if args.logprobs:
+            print(f"[{i}] Logprobs: {output.outputs[0].logprobs}")
 
-            if args.additional_model_outputs:
-                for output_name in args.additional_model_outputs:
-                    if sequence.additional_context_outputs:
-                        print(
-                            f"[{i}]{sequence_id_text} Context {output_name}: {sequence.additional_context_outputs[output_name]}"
-                        )
+        if args.additional_model_outputs:
+            for output_name in args.additional_model_outputs:
+                if output.outputs[0].additional_context_outputs:
                     print(
-                        f"[{i}]{sequence_id_text} Generation {output_name}: {sequence.additional_generation_outputs[output_name]}"
+                        f"[{i}] Context {output_name}: {output.outputs[0].additional_context_outputs[output_name]}"
                     )
+                print(
+                    f"[{i}] Generation {output_name}: {output.outputs[0].additional_generation_outputs[output_name]}"
+                )
 
     if args.log_kv_cache_events:
         time.sleep(1)  # Wait for events to be dispatched

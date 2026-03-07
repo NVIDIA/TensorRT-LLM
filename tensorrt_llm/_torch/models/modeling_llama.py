@@ -1064,7 +1064,6 @@ class LlamaModel(DecoderModel):
                 spec_metadata=spec_metadata,
                 lora_params=lora_params,
             )
-
         return hidden_states
 
 
