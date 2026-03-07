@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2022-2024, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2022-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -34,6 +34,7 @@
 #include "tensorrt_llm/runtime/worldConfig.h"
 #include <NvInferRuntime.h>
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <limits>
@@ -653,7 +654,7 @@ public:
 
     [[nodiscard]] SizeType32 getNumAllocatedBlocks() const noexcept
     {
-        return getMaxNumBlocks() - getNumFreeBlocks();
+        return std::max(SizeType32{0}, getMaxNumBlocks() - getNumFreeBlocks());
     }
 
     [[nodiscard]] SizeType32 getNumMissedBlocks() const noexcept
