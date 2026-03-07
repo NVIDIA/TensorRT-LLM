@@ -85,7 +85,7 @@ class ParallelConfig(BaseModel):
            GPU 4-7: CFG group 1 (negative), Ulysses parallel
     """
 
-    disable_parallel_vae: bool = False
+    enable_parallel_vae: bool = True
     parallel_vae_split_dim: Literal["width", "height"] = "width"
 
     # DiT Parallelism
@@ -163,7 +163,7 @@ class TeaCacheConfig(BaseModel):
 
     enable_teacache: bool = False
     teacache_thresh: float = PydanticField(0.2, gt=0.0)
-    use_ret_steps: bool = True
+    use_ret_steps: bool = False
 
     coefficients: List[float] = PydanticField(default_factory=lambda: [1.0, 0.0])
 
@@ -548,6 +548,10 @@ class DiffusionModelConfig(BaseModel):
         with open(config_path) as f:
             config_dict = json.load(f)
         pretrained_config = SimpleNamespace(**config_dict)
+
+        # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
+        if not getattr(pretrained_config, "_name_or_path", None):
+            pretrained_config._name_or_path = str(checkpoint_path)
 
         model_index_path = checkpoint_path / "model_index.json"
         if model_index_path.exists():
