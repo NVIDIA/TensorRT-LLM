@@ -251,8 +251,74 @@ _torch_attention_schema = defs.OpSchema(
 )
 
 
+# ONNX Custom Op Registration for TRT FP4 Dynamic Quantize (EdgeLLM)
+_trt_fp4_dynamic_quantize_schema = defs.OpSchema(
+    name="TRT_FP4DynamicQuantize",
+    domain=_TRT_DOMAIN_NAME,
+    since_version=1,
+    doc="Dynamic FP4 quantization: input + scale -> (packed_fp4, per_block_scale).",
+    inputs=[
+        defs.OpSchema.FormalParameter(
+            name="x",
+            description="Input tensor",
+            type_str="T",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="scale",
+            description="Per-tensor scale",
+            type_str="T",
+        ),
+    ],
+    outputs=[
+        defs.OpSchema.FormalParameter(
+            name="packed",
+            description="Packed FP4 data (uint8)",
+            type_str="T1",
+        ),
+        defs.OpSchema.FormalParameter(
+            name="per_block_scale",
+            description="Per-block scale for dequant",
+            type_str="T",
+        ),
+    ],
+    type_constraints=[
+        (
+            "T",
+            ["tensor(float)", "tensor(float16)", "tensor(bfloat16)"],
+            "Input and scale.",
+        ),
+        (
+            "T1",
+            ["tensor(uint8)"],
+            "Packed output.",
+        ),
+    ],
+    attributes=[
+        defs.OpSchema.Attribute(
+            name="axis",
+            type=defs.OpSchema.AttrType.INT,
+            description="Axis for block layout.",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="block_size",
+            type=defs.OpSchema.AttrType.INT,
+            description="Block size for FP4 (e.g. 16).",
+            required=False,
+        ),
+        defs.OpSchema.Attribute(
+            name="scale_type",
+            type=defs.OpSchema.AttrType.INT,
+            description="Scale type (opaque to this module).",
+            required=False,
+        ),
+    ],
+)
+
+
 def register_onnx_schemas():
     """Register ONNX custom ops."""
     defs.register_schema(_torch_rope_with_explicit_cos_sin_schema)
     defs.register_schema(_torch_attention_schema)
     defs.register_schema(_attention_plugin_schema)
+    defs.register_schema(_trt_fp4_dynamic_quantize_schema)
