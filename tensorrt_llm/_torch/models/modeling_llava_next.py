@@ -88,7 +88,17 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
 
     def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
         """
-        Return minimal placeholder text for tokenized + MM path.
+        Return minimal placeholder text for the given multimodal item counts,
+        so that the HF processor can be called with (dummy_text, mm_data) without error.
+        Used when processing tokenized prompt + MM data.
+
+        Args:
+            mm_counts (Dict[str, int]): A mapping of each multimodal modality name (e.g., 'image', 'video')
+                to the count of items for that modality that need corresponding placeholders in the dummy text.
+
+        Returns:
+            str: A minimal placeholder string containing the correct number and type of multimodal placeholders,
+                suitable for passing along with mm_data to the Hugging Face processor.
         """
         num_images = mm_counts.get("image", 0)
         processor = self.processor
@@ -142,10 +152,25 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
     ) -> List[int]:
         """
-        Apply prompt update: replace each single image token in prompt_token_ids
-        with the corresponding number of MM placeholder tokens.
+        Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder
+        is replaced by the corresponding number of multimodal feature tokens.
 
-        hf_processor_mm_kwargs is optional; LLaVA does not use it for expansion.
+        This is used when processing a tokenized prompt plus multimodal data, without calling the full
+        HuggingFace processor.
+
+        Subclasses that require the HuggingFace processor or feature extractor (for example,
+        to determine image-size-dependent token counts) can use `hf_processor_mm_kwargs` if provided.
+
+        Args:
+            prompt_token_ids (List[int]): The input prompt token IDs with image placeholder tokens.
+            num_mm_tokens_per_placeholder (List[int]): For each MM placeholder in prompt_token_ids,
+                specifies the number of MM feature tokens to expand/repeat for that placeholder.
+            hf_processor_mm_kwargs (Optional[Dict[str, Any]]): Optional dictionary of arguments
+                to pass to the HuggingFace processor, if needed for token expansion.
+
+        Returns:
+            List[int]: The prompt token IDs where each MM placeholder token has been
+                replaced/expanded with the appropriate number of MM feature tokens.
         """
         expanded, _, _ = self._expand_image_placeholders_in_token_ids(
             prompt_token_ids, num_mm_tokens_per_placeholder)

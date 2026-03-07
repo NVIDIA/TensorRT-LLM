@@ -16,8 +16,10 @@ from tqdm import tqdm
 from transformers import PreTrainedTokenizerBase
 
 from tensorrt_llm._utils import mpi_disabled
+from tensorrt_llm.inputs.data import TextPrompt
 from tensorrt_llm.inputs.multimodal import MultimodalInput, MultimodalParams
-from tensorrt_llm.inputs.registry import BaseMultimodalInputProcessor
+from tensorrt_llm.inputs.registry import (BaseMultimodalInputProcessor,
+                                          DefaultInputProcessor)
 from tensorrt_llm.llmapi import tracing
 from tensorrt_llm.metrics.enums import MetricNames
 
@@ -480,6 +482,31 @@ class BaseLLM:
         """
         inputs = prompt_inputs(inputs)
 
+        # A fast path for token IDs & MM data is available for a VLM if the input processor has the following methods.
+        # TODO: Once all the VLMs support the fast path, remove this flag and modify the remaining logic accordingly.
+        vlm_fast_path_for_token_ids_and_mm_data_available = (
+            hasattr(self.input_processor, "get_text_with_mm_placeholders")
+            and hasattr(self.input_processor, "expand_prompt_token_ids_for_mm"))
+
+        if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
+                inputs.get("multi_modal_data")
+                or inputs.get("multi_modal_embeddings")) and not isinstance(
+                    self.input_processor, DefaultInputProcessor
+                ) and not vlm_fast_path_for_token_ids_and_mm_data_available:
+            # VLMs need to process/tokenize the prompt in their own way,
+            # if they don't have the fast path for token IDs & MM data implemented yet.
+            # TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.
+            prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
+            inputs = TextPrompt(
+                prompt=prompt,
+                multi_modal_data=inputs.get("multi_modal_data"),
+                mm_processor_kwargs=inputs.get("mm_processor_kwargs") or {})
+            if sampling_params.add_special_tokens:
+                logger.debug(
+                    "Setting add_special_tokens to False because prompt_token_ids were provided to generate. VLMs will re-encode the prompt."
+                )
+                sampling_params.add_special_tokens = False
+
         is_mm_disagg = (disaggregated_params is not None
                         and disaggregated_params.multimodal_embedding_handles
                         is not None)
@@ -497,7 +524,9 @@ class BaseLLM:
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
             prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
-                inputs["prompt_token_ids"], mm_handles)
+                inputs["prompt_token_ids"] if
+                vlm_fast_path_for_token_ids_and_mm_data_available else inputs,
+                mm_handles)
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
