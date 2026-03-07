@@ -256,7 +256,8 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
                  config: Optional[ModelConfig] = None,
                  overridden_tp_size: Optional[int] = None,
                  reduce_output: bool = True,
-                 layer_idx: Optional[int] = None):
+                 layer_idx: Optional[int] = None,
+                 is_shared_expert: bool = False):
 
         # First, initialize the base class.
         super().__init__(hidden_size=hidden_size,
@@ -267,7 +268,8 @@ class Llama4MinLatencyGatedMLP(GatedMLP):
                          config=config,
                          overridden_tp_size=overridden_tp_size,
                          reduce_output=reduce_output,
-                         layer_idx=layer_idx)
+                         layer_idx=layer_idx,
+                         is_shared_expert=is_shared_expert)
 
         # Override gate_up_proj and down_proj with Llama4Linear if we want to use special kernels.
         self.enable_fused_gemm_swiglu = False
@@ -509,17 +511,18 @@ class Llama4MinLatencyFusedMoE(CutlassFusedMoE):
 class Llama4MinLatencyMoE(Llama4MoE):
 
     def __init__(
-            self,
-            *,
-            num_experts: int,
-            top_k: int,
-            hidden_size: int,
-            intermediate_size: int,
-            shared_expert_intermediate_size: int,
-            aux_stream: torch.cuda.Stream,
-            dtype: Optional[torch.dtype] = None,
-            tune_max_num_tokens: int = 8192,
-            model_config: ModelConfig = ModelConfig(),
+        self,
+        *,
+        num_experts: int,
+        top_k: int,
+        hidden_size: int,
+        intermediate_size: int,
+        shared_expert_intermediate_size: int,
+        aux_stream: torch.cuda.Stream,
+        dtype: Optional[torch.dtype] = None,
+        tune_max_num_tokens: int = 8192,
+        model_config: ModelConfig = ModelConfig(),
+        layer_idx: Optional[int] = None,
     ):
 
         # First, initialize the base class.
@@ -533,9 +536,12 @@ class Llama4MinLatencyMoE(Llama4MoE):
             dtype=dtype,
             tune_max_num_tokens=tune_max_num_tokens,
             model_config=model_config,
+            layer_idx=layer_idx,
         )
 
         # Then, override modules with min-latency versions.
+        # Note: layer_idx may be None at this point if called from base __init__
+        # It will be set correctly when called from the actual layer creation
         self.shared_expert = Llama4MinLatencyGatedMLP(
             hidden_size=hidden_size,
             intermediate_size=shared_expert_intermediate_size,
@@ -543,7 +549,9 @@ class Llama4MinLatencyMoE(Llama4MoE):
             dtype=dtype,
             config=model_config,
             overridden_tp_size=1 if self.enable_attention_dp else None,
-            reduce_output=False)
+            reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True)
 
         self.experts = Llama4MinLatencyFusedMoE(
             routing_method=Llama4RenormalizeMoeRoutingMethod(top_k),
@@ -606,9 +614,10 @@ class Llama4MinLatencyMoE(Llama4MoE):
         # Optional input for routing gemm if experts and routing gemm require
         # different precisions for input hidden states.
         hidden_states_high: Optional[torch.Tensor] = None,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
 
-        fn0 = lambda: self.shared_expert(hidden_states)
+        fn0 = lambda: self.shared_expert(hidden_states, lora_params=lora_params)
         fn1 = lambda: self.compute_routed_output(
             hidden_states, all_rank_num_tokens, hidden_states_high)
         shared_output, routed_output = maybe_execute_in_parallel(
@@ -677,7 +686,8 @@ class Llama4MinLatencyDecoderLayer(Llama4DecoderLayer):
                 shared_expert_intermediate_size=config.intermediate_size,
                 model_config=model_config,
                 aux_stream=aux_stream,
-                dtype=config.torch_dtype)
+                dtype=config.torch_dtype,
+                layer_idx=layer_idx)
 
             self.fusion_config.PRE_MOE_FUSION = model_config.mapping.has_tp()
             self.fusion_config.POST_MOE_FUSION = model_config.mapping.has_tp()
