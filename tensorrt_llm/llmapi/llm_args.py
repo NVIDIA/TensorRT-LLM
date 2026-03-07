@@ -1917,6 +1917,13 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
         )
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_stochastic_rounding: bool = Field(
+        default=False,
+        description=
+        "Enable stochastic rounding for Mamba SSM state updates. Only applicable with float16 cache dtype."
+    )
+
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 
