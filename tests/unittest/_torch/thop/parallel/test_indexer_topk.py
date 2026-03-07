@@ -335,8 +335,10 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype)
 @pytest.mark.parametrize("num_tokens", [32768, 65536])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
+@pytest.mark.parametrize("dynamic", [False, True])
 def test_cute_dsl_topk_decode_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta
+    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta,
+    dynamic
 ):
     _run_cute_dsl_topk_test(
         batch_size,
@@ -351,6 +353,7 @@ def test_cute_dsl_topk_decode_multi_cta(
             next_n=next_n,
             num_copy_bits=256,
             chunk_size_per_cta=chunk_size_per_cta,
+            dynamic=dynamic,
         ),
     )
 
