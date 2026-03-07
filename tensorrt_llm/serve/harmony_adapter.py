@@ -1610,6 +1610,27 @@ def handle_streaming_response(tools: List[ChatCompletionToolsParam],
     try:
         res = []
         if done:
+            # Process any remaining tokens before sending final message
+            if output.token_ids_diff:
+                remaining_responses, _ = harmony_adapter.create_openai_streaming_response(
+                    request_id=request_id,
+                    tokens=output.token_ids_diff,
+                    available_tools=tools_for_parser,
+                    model_name=model,
+                    tool_choice=tool_choice)
+                if first_iteration and remaining_responses:
+                    first_delta = DeltaMessage(role="assistant")
+                    choice = ChatCompletionResponseStreamChoice(
+                        index=0, delta=first_delta)
+                    first_response = ChatCompletionStreamResponse(
+                        model=model,
+                        choices=[choice],
+                    )
+                    response_json = first_response.model_dump_json(
+                        exclude_none=True)
+                    res.append(f"data: {response_json}\n\n")
+                res.extend(remaining_responses)
+
             # Send final message with finish_reason
             final_response = ChatCompletionStreamResponse(
                 model=model,
