@@ -599,12 +599,12 @@ def main(*,
     if nvrtc_dynamic_linking:
         cmake_def_args.append(f"-DNVRTC_DYNAMIC_LINKING=ON")
 
-    # BOLT compatibility: Force dynamic linking for NVIDIA libraries
-    # Static NVIDIA libraries (libnvrtc_static.a, etc.) lack --emit-relocs,
-    # which BOLT requires for proper binary optimization.
-    bolt_enabled = any("ENABLE_BOLT_COMPATIBLE=ON" in var
-                       for var in extra_cmake_vars)
-    if bolt_enabled:
+    # BOLT compatibility (default ON): Force dynamic linking for NVIDIA
+    # libraries. Static NVIDIA libraries (libnvrtc_static.a, etc.) lack
+    # --emit-relocs, which BOLT requires for proper binary optimization.
+    bolt_disabled = any("ENABLE_BOLT_COMPATIBLE=OFF" in var
+                        for var in extra_cmake_vars)
+    if not bolt_disabled:
         if not nvrtc_dynamic_linking:
             cmake_def_args.append("-DNVRTC_DYNAMIC_LINKING=ON")
             print(
