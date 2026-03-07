@@ -5,7 +5,7 @@
 # Architecture ported from LTX-2,
 # with compute-heavy components replaced by TRT-LLM optimized modules:
 #   - Linear projections  → tensorrt_llm._torch.modules.linear.Linear
-#   - RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
+#   - (TODO) RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
 #   - FeedForward (MLP)    → tensorrt_llm._torch.modules.mlp.MLP
 #   - Attention backend    → tensorrt_llm._torch.visual_gen.attention_backend
 #
@@ -27,7 +27,6 @@ from tqdm import tqdm
 
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
-from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism

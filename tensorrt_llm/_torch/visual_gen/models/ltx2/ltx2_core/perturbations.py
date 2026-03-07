@@ -2,14 +2,13 @@
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
-"""Perturbation configs for STG (spatiotemporal guidance).
-
-A perturbation masks out the contribution of an attention sub-layer for
-selected transformer blocks and batch elements.  During the "perturbed"
-forward pass the mask zeros the attention output, producing a prediction
-that *lacks* that attention signal so the guider can amplify the
-difference.
-"""
+# Perturbation configs for STG (spatiotemporal guidance).
+#
+# A perturbation masks out the contribution of an attention sub-layer for
+# selected transformer blocks and batch elements. During the "perturbed"
+# forward pass the mask zeros the attention output, producing a prediction
+# that *lacks* that attention signal so the guider can amplify the
+# difference.
 
 from __future__ import annotations
 

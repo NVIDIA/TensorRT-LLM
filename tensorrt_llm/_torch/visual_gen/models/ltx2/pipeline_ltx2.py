@@ -70,18 +70,18 @@ def _assert_resolution(height: int, width: int) -> None:
         )
 
 
-# TeaCache polynomial coefficients for LTX-2.
-# Calibrated from the LTX-Video model family (see TeaCache paper).
+# TeaCache polynomial coefficients for LTX-0.9.1-HFIE. Calibrated from the LTX-Video model family.
 # Maps raw embedding L1 distances to rescaled distances for cache decisions.
 # Coefficients are from:
 # https://huggingface.co/jbilcke-hf/LTX-Video-0.9.1-HFIE/blob/main/teacache.py#L42
-# Needs to be verified for correctness.
-LTX2_TEACACHE_COEFFICIENTS = {
-    "ltx": {
-        "ret_steps": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
-        "standard": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
-    },
-}
+# TODO: Need to verifiy coefficients for correctness.
+
+# LTX2_TEACACHE_COEFFICIENTS = {
+#     "ltx": {
+#         "ret_steps": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
+#         "standard": [2.14700694e+01, -1.28016453e+01, 2.31279151e+00, 7.92487521e-01, 9.69274326e-03],
+#     },
+# }
 
 
 class LTX2TeaCacheExtractor:
@@ -534,11 +534,13 @@ class LTX2Pipeline(BasePipeline):
         """Finalize after weight loading: TeaCache, derived attributes."""
         super().post_load_weights()
 
-        register_extractor(
-            "LTXModel",
-            LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
-        )
-        self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
+        # TODO: TeaCache disabled: LTX2_TEACACHE_COEFFICIENTS are unverified.
+        # To re-enable, uncomment the following lines and verify coefficients.
+        # register_extractor(
+        #     "LTXModel",
+        #     LTX2TeaCacheExtractor(self._compute_ltx2_timestep_embedding),
+        # )
+        # self._setup_teacache(self.transformer, coefficients=LTX2_TEACACHE_COEFFICIENTS)
 
         # Compression ratios from native scale factors
         self.vae_spatial_compression_ratio = VIDEO_SCALE_FACTORS.width
