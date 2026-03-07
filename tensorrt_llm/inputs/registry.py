@@ -126,6 +126,12 @@ class BaseMultimodalInputProcessor(ABC):
 
     This class provides default implementations that work with most AutoProcessor-based
     models. Specific processors can override these methods if they need custom logic.
+
+    Optional tokenized+MM fast path: to support prompt_token_ids + multi_modal_data
+    without detokenizing, implement get_text_with_mm_placeholders(mm_counts) and
+    expand_prompt_token_ids_for_mm(prompt_token_ids, num_mm_tokens_per_placeholder, ...).
+    If these are not implemented, the pipeline detokenizes the text prompt first and then
+    processes the multimodal inputs.
     """
 
     def __init__(self,
@@ -253,65 +259,6 @@ class BaseMultimodalInputProcessor(ABC):
         so they need to be returned separately.
         """
         return getattr(self.processor, "mm_special_token_ids", None)
-
-    def get_text_with_mm_placeholders(self, mm_counts: Dict[str, int]) -> str:
-        """
-        Return minimal placeholder text for the given multimodal item counts,
-        so that the HF processor can be called with (dummy_text, mm_data) without error.
-        Used when processing tokenized prompt + MM data.
-
-        Args:
-            mm_counts (Dict[str, int]): A mapping of each multimodal modality name (e.g., 'image', 'video')
-                to the count of items for that modality that need corresponding placeholders in the dummy text.
-
-        Returns:
-            str: A minimal placeholder string containing the correct number and type of multimodal placeholders,
-                suitable for passing along with mm_data to the Hugging Face processor.
-
-        Default raises NotImplementedError. Override in model-specific processors
-        that support the token_ids + multi_modal_data path.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support token_ids + multi_modal_data "
-            "without detokenization. Implement get_text_with_mm_placeholders(mm_counts) to enable it."
-        )
-
-    def expand_prompt_token_ids_for_mm(
-        self,
-        prompt_token_ids: List[int],
-        num_mm_tokens_per_placeholder: List[int],
-        hf_processor_mm_kwargs: Optional[Dict[str, Any]] = None,
-    ) -> List[int]:
-        """
-        Expands MM placeholder tokens in `prompt_token_ids` so that each single placeholder
-        is replaced by the corresponding number of multimodal feature tokens.
-
-        This is used when processing a tokenized prompt plus multimodal data, without calling the full
-        HuggingFace processor.
-
-        Subclasses that require the HuggingFace processor or feature extractor (for example,
-        to determine image-size-dependent token counts) can use `hf_processor_mm_kwargs` if provided.
-
-        Args:
-            prompt_token_ids (List[int]): The input prompt token IDs with image placeholder tokens.
-            num_mm_tokens_per_placeholder (List[int]): For each MM placeholder in prompt_token_ids,
-                specifies the number of MM feature tokens to expand/repeat for that placeholder.
-            hf_processor_mm_kwargs (Optional[Dict[str, Any]]): Optional dictionary of arguments
-                to pass to the HuggingFace processor, if needed for token expansion.
-
-        Returns:
-            List[int]: The prompt token IDs where each MM placeholder token has been
-                replaced/expanded with the appropriate number of MM feature tokens.
-
-        Raises:
-            NotImplementedError: If the method is not implemented in the subclass.
-
-        Default implementation raises NotImplementedError. Override in model-specific processors.
-        """
-        raise NotImplementedError(
-            f"{self.__class__.__name__} does not support expand_prompt_token_ids_for_mm. "
-            "Implement it to enable token_ids + multi_modal_data without detokenization."
-        )
 
     @property
     def get_num_multimodal_tokens(self):
