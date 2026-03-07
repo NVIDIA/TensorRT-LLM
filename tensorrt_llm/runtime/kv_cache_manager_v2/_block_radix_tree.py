@@ -13,8 +13,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import hashlib
 from typing import TYPE_CHECKING, Iterator, Sequence, TypeVar, cast
+
+from tensorrt_llm.bindings.internal.common import Hasher
 
 from . import rawref
 from ._common import NDEBUG, BlockOrdinal, PageStatus, TokenId, TokenIdExt
@@ -42,42 +43,13 @@ def gen_multi_modal_tokens(
     ]
 
 
-class Hasher:
-    __slots__ = "_hasher"
-    _hasher: "hashlib._Hash"
-
-    def __init__(self, data: int | bytes | None | Sequence[int | bytes] = None) -> None:
-        self._hasher = hashlib.sha256()
-        if data is not None:
-            self.update(data)
-
-    # This function is perf-critical. Expect compromised code quality.
-    def update(self, data: int | bytes | Sequence[int | bytes]) -> "Hasher":
-        if type(data) is int:
-            assert NDEBUG or (data >= 0 and data < (1 << 64))
-            self._hasher.update(data.to_bytes(8, "little"))
-        elif type(data) is bytes:
-            self._hasher.update(data)
-        else:
-            for item in data:  # type: ignore
-                assert (
-                    NDEBUG or (type(item) is int and (0 <= item < (1 << 64))) or type(item) is bytes
-                )
-                self._hasher.update(item.to_bytes(8, "little") if (type(item) is int) else item)  # type: ignore
-        return self
-
-    @property
-    def digest(self) -> bytes:
-        return self._hasher.digest()
-
-
 TokenBlock = list[TokenIdExt]
 
 
 def sequence_to_blockchain_keys(
     tokens_per_block: int, lora_task_id: int | None, tokens: Sequence[TokenIdExt]
 ) -> Iterator[tuple[TokenBlock, BlockKey]]:
-    digest = Hasher(lora_task_id).digest
+    digest = (Hasher(lora_task_id) if lora_task_id is not None else Hasher()).digest
     yield [], digest
     for token_block in chunked(tokens, tokens_per_block):
         digest = Hasher(digest).update(token_block).digest
@@ -235,7 +207,7 @@ class RootBlock:
 
     @staticmethod
     def make_key(lora_task_id: int | None) -> BlockKey:
-        return Hasher(lora_task_id).digest
+        return (Hasher(lora_task_id) if lora_task_id is not None else Hasher()).digest
 
 
 class Block:
@@ -256,7 +228,7 @@ class Block:
 
     @staticmethod
     def make_key(prev_key: BlockKey, tokens: Sequence[TokenIdExt]) -> BlockKey:
-        return Hasher(prev_key).update(tokens).digest
+        return Hasher(prev_key).update(list(tokens)).digest
 
     def __init__(self, tokens: Sequence[TokenIdExt], prev: "Block | RootBlock") -> None:
         assert prev.tokens_per_block == prev.prev.tokens_per_block, "prev must be a full block"
