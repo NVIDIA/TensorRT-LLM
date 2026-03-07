@@ -1816,6 +1816,7 @@ class DeepseekV3Model(DecoderModel):
         return hidden_states
 
 
+@register_auto_model("GlmMoeDsaForCausalLM")
 @register_auto_model("DeepseekV32ForCausalLM")
 @register_auto_model("DeepseekV3ForCausalLM")
 class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
@@ -1823,6 +1824,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
 
     def __init__(self, model_config: ModelConfig[PretrainedConfig]):
         self.mapping_with_cp = None
+        # Deep-copy so we never mutate the caller's object: CP-helix rewrite and other
+        # edits (quant_config_dict, model_type) would otherwise leave their config mutated.
+        model_config = copy.deepcopy(model_config)
         # Note: Currently the usage of mapping is all over the place making its usage brittle
         # in this file. As a temporary WAR, we hold on to an original copy of mapping when CP
         # is in action. This shall be passed on to attention which is the only layer that's
@@ -1851,6 +1855,10 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config._frozen = False
             model_config.quant_config_dict = quant_config_dict
             model_config._frozen = True
+
+        if model_config.pretrained_config.model_type == 'glm_moe_dsa':
+            model_config = copy.deepcopy(model_config)
+            model_config.pretrained_config.model_type = 'deepseek_v32'
 
         super().__init__(model=DeepseekV3Model(
             model_config, mapping_with_cp=self.mapping_with_cp),
