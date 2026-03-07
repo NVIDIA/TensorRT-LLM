@@ -202,42 +202,68 @@ class HarmonyStreamState:
                                     self.parser.current_channel):
             return {"should_stop": "Repeated message"}
 
+        # Check for tool calls first, regardless of channel.
+        # The model may emit tool calls on either "commentary" or "analysis" channel.
+        if (self.parser.current_channel in ("commentary", "analysis")
+                and self.parser.current_recipient
+                and "functions." in str(self.parser.current_recipient)):
+            func_name = str(
+                self.parser.current_recipient).split("functions.")[-1]
+            self.current_channel_state = "commentary_tool"
+
+            # Check if tool is allowed
+            if self.should_filter_tools and func_name not in self.available_tools:
+                logger.debug(
+                    f"Request {self.request_id}: tool {func_name} not in available tools"
+                )
+                return None
+
+            # Get or create tool call
+            tool_id = self._get_or_create_tool_call(func_name)
+
+            # Accumulate arguments
+            self.tool_calls[tool_id][
+                "arguments"] += self.parser.last_content_delta
+
+            # Create tool call delta - return only the new content delta, not accumulated
+            return {
+                "tool_calls": [{
+                    "id": tool_id,
+                    "type": "function",
+                    "function": {
+                        "name": func_name,
+                        "arguments": self.parser.
+                        last_content_delta  # Only the new content delta
+                    },
+                    "index": self.tool_calls[tool_id]["index"]
+                }]
+            }
+
         if self.parser.current_channel == "analysis":
             # Analysis channel -> reasoning (no token wrapping needed)
             self.current_channel_state = "analysis"
             return {"reasoning": self.parser.last_content_delta}
 
         elif self.parser.current_channel == "commentary":
-            if self.parser.current_recipient and "functions." in str(
-                    self.parser.current_recipient):
-                # Tool call in commentary channel
-                func_name = str(
-                    self.parser.current_recipient).split("functions.")[-1]
+            if self.parser.current_recipient and self.parser.current_recipient != 'assistant':
+                # Non-functions tool call (e.g., browser, python)
+                func_name = str(self.parser.current_recipient)
                 self.current_channel_state = "commentary_tool"
 
-                # Check if tool is allowed
                 if self.should_filter_tools and func_name not in self.available_tools:
-                    logger.debug(
-                        f"Request {self.request_id}: tool {func_name} not in available tools"
-                    )
                     return None
 
-                # Get or create tool call
                 tool_id = self._get_or_create_tool_call(func_name)
-
-                # Accumulate arguments
                 self.tool_calls[tool_id][
                     "arguments"] += self.parser.last_content_delta
 
-                # Create tool call delta - return only the new content delta, not accumulated
                 return {
                     "tool_calls": [{
                         "id": tool_id,
                         "type": "function",
                         "function": {
                             "name": func_name,
-                            "arguments": self.parser.
-                            last_content_delta  # Only the new content delta
+                            "arguments": self.parser.last_content_delta
                         },
                         "index": self.tool_calls[tool_id]["index"]
                     }]
@@ -903,7 +929,7 @@ class HarmonyAdapter:
                 )
                 return None
         elif msg_content_type and "code" in msg_content_type:
-            function_name = str(msg_recipient)
+            function_name = str(msg_recipient).split("functions.")[-1]
             return {
                 "id": f"call_{uuid.uuid4().hex[:8]}",
                 "type": "function",
@@ -1050,7 +1076,20 @@ class HarmonyAdapter:
                 if not _check_channel_valid(generated_channels, msg_channel):
                     continue
 
-                if msg_channel == "analysis":
+                # Check for tool calls first, regardless of channel.
+                # The model may emit tool calls on either "commentary" or "analysis" channel
+                # (other frameworks handle both channels when recipient starts with "functions.")
+                if (msg_channel in ("commentary", "analysis") and msg_recipient
+                        and msg_recipient != 'assistant'
+                        and str(msg_recipient).startswith("functions.")):
+                    # Tool call
+                    tool_call = self._parse_tool_call_from_harmony_message(msg)
+                    if tool_call and self._is_tool_call_allowed(
+                            tool_call, external_tools,
+                            should_filter_external_tools):
+                        tool_calls.append(tool_call)
+
+                elif msg_channel == "analysis":
                     for content in msg_content:
                         if isinstance(content, TextContent):
                             analysis_content += content.text
@@ -1061,7 +1100,7 @@ class HarmonyAdapter:
 
                 elif msg_channel == "commentary":
                     if msg_recipient and msg_recipient != 'assistant':
-                        # Tool call
+                        # Non-functions tool call (e.g., browser, python)
                         tool_call = self._parse_tool_call_from_harmony_message(
                             msg)
                         if tool_call and self._is_tool_call_allowed(
