@@ -417,8 +417,6 @@ def runLLMBuild(pipeline, buildFlags, tarName, is_linux_x86_64)
     if (is_linux_x86_64) {
         pipArgs = ""
     }
-    //WAR: remove python3-pygments temporarily for testing
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
 
     // install python package
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pip3 install -r requirements-dev.txt ${pipArgs}")
