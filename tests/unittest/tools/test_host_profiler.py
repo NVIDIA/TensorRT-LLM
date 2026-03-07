@@ -17,7 +17,8 @@
 Tests cover:
 1. Core API functionality (add_*, clear_targets, chaining)
 2. Line profiler integration with report validation
-3. E2E test with actual model inference
+3. @host_profile_target decorator registration
+4. E2E test with actual model inference
 """
 
 import os
@@ -31,7 +32,13 @@ import pytest
 sys.path.append(os.path.join(os.path.dirname(__file__), ".."))
 from utils.llm_data import llm_models_root
 
-from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import HostProfiler, ProfileTarget
+from tensorrt_llm.tools.profiler.host_profile_tools.host_profiler import (
+    HostProfiler,
+    ProfileTarget,
+    _decorated_targets,
+    get_decorated_targets,
+    host_profile_target,
+)
 
 
 def _sample_function_to_profile(n: int) -> int:
@@ -191,6 +198,107 @@ def test_profiling_cycle_and_report_validation():
         print(f"Output size: {len(content)} bytes")
         print(f"Data lines: {len(data_lines)}")
 
+    finally:
+        if os.path.exists(output_path):
+            os.unlink(output_path)
+
+
+# ---------------------------------------------------------------------------
+# @host_profile_target decorator tests
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def _clean_decorated_targets():
+    """Save, clear, and restore the global decorator registry around a test."""
+    saved = _decorated_targets.copy()
+    _decorated_targets.clear()
+    yield
+    _decorated_targets.clear()
+    _decorated_targets.extend(saved)
+
+
+def test_host_profile_target_decorator_registration(_clean_decorated_targets):
+    """Test @host_profile_target registers functions correctly and is zero-overhead.
+
+    Covers: bare decorator, enabled=False, class methods, and identity preservation.
+    """
+
+    # 1. Bare decorator registers and returns the original function
+    @host_profile_target
+    def func_a():
+        return "a"
+
+    assert get_decorated_targets() == [func_a]
+    assert func_a() == "a"  # still callable, unchanged
+
+    # 2. enabled=False skips registration
+    @host_profile_target(enabled=False)
+    def func_skipped():
+        return "skip"
+
+    assert len(get_decorated_targets()) == 1  # still just func_a
+
+    # 3. Class method
+    class MyClass:
+        @host_profile_target
+        def my_method(self, x):
+            return x * 2
+
+    targets = get_decorated_targets()
+    assert len(targets) == 2
+    assert targets[1].__name__ == "my_method"
+    assert MyClass().my_method(5) == 10
+
+
+def test_host_profile_target_profiler_integration(_clean_decorated_targets):
+    """Test HostProfiler discovers decorator-registered targets and produces output.
+
+    Covers: decorator-only profiling, mixed config + decorator targets, deduplication.
+    """
+    try:
+        import line_profiler  # noqa: F401
+    except ImportError:
+        pytest.skip("line_profiler not installed")
+
+    @host_profile_target
+    def decorator_func(n):
+        total = 0
+        for i in range(n):
+            total += i
+        return total
+
+    with tempfile.NamedTemporaryFile(suffix=".txt", delete=False) as f:
+        output_path = f.name
+
+    try:
+        profiler = HostProfiler(output_path=output_path, use_defaults=False)
+        # Also add _sample_function_to_profile via config
+        profiler.add_standalone_function(__name__, "_sample_function_to_profile")
+        # Add decorator_func a second time via config — should be deduplicated
+        profiler.add_function(__name__, None, "decorator_func")
+
+        assert profiler.start() is True
+
+        for _ in range(50):
+            _sample_function_to_profile(10)
+            decorator_func(10)
+
+        assert profiler.stop() is True
+
+        with open(output_path) as f:
+            content = f.read()
+
+        assert "Timer unit:" in content
+        # Config-based target appears
+        assert "_sample_function_to_profile" in content
+        # Decorator-based target appears
+        assert "decorator_func" in content
+        # Deduplication: decorator_func appears exactly once despite double registration
+        matches = re.findall(r"Function:.*decorator_func\s+at line", content)
+        assert len(matches) == 1, (
+            f"Expected exactly 1 entry for decorator_func, found {len(matches)}"
+        )
     finally:
         if os.path.exists(output_path):
             os.unlink(output_path)

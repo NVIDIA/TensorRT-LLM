@@ -33,7 +33,7 @@ import os
 import threading
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Callable, Dict, List, Optional
+from typing import Callable, Dict, List, Optional, overload
 
 from tensorrt_llm.logger import logger
 
@@ -117,6 +117,106 @@ class ProfileTarget:
             logger.warning(f"Failed to resolve profile target {self.full_path}: {e}")
             return None
 
+
+# ---------------------------------------------------------------------------
+# Decorator-based registration
+# ---------------------------------------------------------------------------
+
+# Global registry for functions decorated with @host_profile_target.
+# Stores raw function objects (not ProfileTarget), so line_profiler can use
+# them directly without the module-path → resolve round-trip.
+_decorated_targets: List[Callable] = []
+
+
+@overload
+def host_profile_target(func: Callable) -> Callable: ...
+
+
+@overload
+def host_profile_target(*, enabled: bool = True) -> Callable: ...
+
+
+def host_profile_target(func: Optional[Callable] = None, *, enabled: bool = True):
+    """Decorator to register a function or method as a host profiling target.
+
+    This decorator has **zero runtime overhead** — it does not wrap or alter
+    the decorated function in any way.  It simply appends the raw function
+    object to a global registry that :class:`HostProfiler` queries when
+    profiling starts.
+
+    Supports all callable forms: regular methods, ``@staticmethod``,
+    ``@classmethod``, and standalone module-level functions.
+
+    Placement:
+        For best results, place ``@host_profile_target`` as the **innermost**
+        decorator (closest to the ``def`` keyword) so that the unwrapped
+        function is registered.  If placed after wrapping decorators (e.g.
+        ``@torch.inference_mode``), the profiler's existing unwrap logic
+        (``__wrapped__``) will still find the real function, but innermost
+        placement is preferred.
+
+    Args:
+        func: The function to register (used when called without parentheses).
+        enabled: If ``False``, the function is *not* registered. Useful for
+            temporarily disabling profiling on a target without removing the
+            decorator.
+
+    Returns:
+        The original function, unchanged.
+
+    Examples:
+        Register a standalone function::
+
+            @host_profile_target
+            def my_helper(): ...
+
+        Register a class method::
+
+            class MyClass:
+                @host_profile_target
+                def forward(self, x): ...
+
+        Combine with other decorators (innermost placement)::
+
+            class MyClass:
+                @torch.inference_mode()
+                @host_profile_target
+                def forward(self, x): ...
+
+        Conditionally disable registration::
+
+            @host_profile_target(enabled=False)
+            def experimental(): ...
+    """
+
+    def _register(fn: Callable) -> Callable:
+        if enabled:
+            # Unwrap descriptors so we store the raw function.
+            raw_fn = fn
+            if isinstance(fn, (staticmethod, classmethod)):
+                raw_fn = fn.__func__
+            _decorated_targets.append(raw_fn)
+        return fn  # Return unchanged — zero overhead
+
+    if func is not None:
+        # Called without parentheses: @host_profile_target
+        return _register(func)
+    # Called with parentheses: @host_profile_target(enabled=False)
+    return _register
+
+
+def get_decorated_targets() -> List[Callable]:
+    """Return a copy of all functions registered via ``@host_profile_target``.
+
+    Returns:
+        List of raw function objects.
+    """
+    return list(_decorated_targets)
+
+
+# ---------------------------------------------------------------------------
+# Static config-based registration (legacy / bulk registration)
+# ---------------------------------------------------------------------------
 
 # Default functions to profile for host overhead analysis
 # Hierarchical config: {module_path: {class_name: [method_names]}}
@@ -595,18 +695,43 @@ class HostProfiler:
 
             self._line_profiler = LineProfiler()
 
-            # Add all target functions
+            # Add all config-based target functions
             resolved_count = 0
+            # Track __code__ ids to avoid registering the same function twice
+            # (e.g. if it appears in both the config and the decorator registry).
+            registered_code_ids: set = set()
+
             for target in self.targets:
                 func = target.resolve()
                 if func is not None:
-                    logger.info(
-                        f"line profiler func code ID: {id(func.__code__)}, target: {target.full_path}"
-                    )
-                    self._line_profiler.add_function(func)
-                    resolved_count += 1
+                    code_id = id(func.__code__)
+                    if code_id not in registered_code_ids:
+                        logger.info(
+                            f"line profiler func code ID: {code_id}, target: {target.full_path}"
+                        )
+                        self._line_profiler.add_function(func)
+                        registered_code_ids.add(code_id)
+                        resolved_count += 1
 
-            if resolved_count == 0:
+            # Add decorator-registered targets (@host_profile_target)
+            decorator_count = 0
+            for func in get_decorated_targets():
+                # Unwrap in case decorator was not innermost
+                raw_func = func
+                while hasattr(raw_func, "__wrapped__"):
+                    raw_func = raw_func.__wrapped__
+                code_id = id(raw_func.__code__)
+                if code_id not in registered_code_ids:
+                    qualname = f"{raw_func.__module__}.{raw_func.__qualname__}"
+                    logger.info(
+                        f"line profiler func code ID: {code_id}, target (decorator): {qualname}"
+                    )
+                    self._line_profiler.add_function(raw_func)
+                    registered_code_ids.add(code_id)
+                    decorator_count += 1
+
+            total = resolved_count + decorator_count
+            if total == 0:
                 logger.warning("No profile targets could be resolved")
                 self._line_profiler = None
                 return False
@@ -615,7 +740,8 @@ class HostProfiler:
             self._enabled = True
             self._profiler_thread_id = threading.current_thread().ident
             logger.info(
-                f"Line profiler enabled with {resolved_count}/{len(self.targets)} targets. "
+                f"Line profiler enabled with {total} targets "
+                f"({resolved_count} config-based, {decorator_count} decorator-based). "
                 f"Thread ID: {self._profiler_thread_id}, Thread name: {threading.current_thread().name}. "
                 f"Results will be saved to: {self.output_path}"
             )
