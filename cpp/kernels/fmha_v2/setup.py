@@ -3338,7 +3338,12 @@ def use_cubin_header(sm,
         return False
     if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
         return False
-    return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+    # TODO: Restore SM90 cubin usage after regenerating SM90 cubin binaries.
+    # SM90 cubins were inadvertently disabled since commit a66eeab53 (Skip Softmax
+    # Attention). During that period, new SM90 kernel variants were added without
+    # corresponding cubin entries, causing CUDA_ERROR_NOT_FOUND at runtime.
+    # Original condition: (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
+    return (sm == 89 and 'e4m3' in dtype)
 
 
 def get_cubin_header(kernel_traits, specs_names):
@@ -3487,7 +3492,8 @@ def get_cubin_header(kernel_traits, specs_names):
         return_softmax_stats_flag = pythonBoolean2cpp[sm != '90' or (
             sm == '90' and '_softmax' in kname)]
 
-        enable_skip_softmax_flag = pythonBoolean2cpp['_skipSoftmax' in kname]
+        enable_skip_softmax = '_skipSoftmax' in kname
+        enable_skip_softmax_flag = pythonBoolean2cpp[enable_skip_softmax]
 
         # meta_unroll_step
         meta_unroll_step = unroll_step if ('_nl' in kname
@@ -3516,7 +3522,7 @@ def get_cubin_header(kernel_traits, specs_names):
                 def get_lname_from_kname(kname: str) -> str:
                     if use_cubin_header(int(sm), int(head_size), prec.lower(),
                                         output_prec.lower(),
-                                        enable_skip_softmax_flag):
+                                        enable_skip_softmax):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3539,7 +3545,7 @@ def get_cubin_header(kernel_traits, specs_names):
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
 '''.format(**locals()) if use_cubin_header(int(sm), int(head_size),
                                            prec.lower(), output_prec.lower(),
-                                           enable_skip_softmax_flag) else '''\
+                                           enable_skip_softmax) else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
