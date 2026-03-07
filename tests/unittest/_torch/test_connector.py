@@ -125,6 +125,56 @@ def test_connector_manager_num_matched_tokens(mpi_pool_executor):
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+        else:
+            scheduler = None
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        scheduled_requests = ScheduledRequests()
+
+        req0 = MagicMock()
+        req0.request_id = 0
+        req0.is_generation_only_request = False
+
+        req1 = MagicMock()
+        req1.request_id = 1
+        req1.is_generation_only_request = False
+
+        if mpi_rank() == 0:
+            scheduler.get_num_new_matched_tokens.return_value = (16, True)
+
+        assert manager.get_num_new_matched_tokens(req0, 0) == 16
+        if mpi_rank() == 0:
+            assert scheduler.get_num_new_matched_tokens.call_count == 1
+            assert scheduler.get_num_new_matched_tokens.call_args[0] == (req0,
+                                                                         0)
+
+            scheduler.get_num_new_matched_tokens.reset_mock()
+            scheduler.get_num_new_matched_tokens.return_value = (32, False)
+
+        assert manager.get_num_new_matched_tokens(req1, 0) == 32
+        if mpi_rank() == 0:
+            assert scheduler.get_num_new_matched_tokens.call_count == 1
+            assert scheduler.get_num_new_matched_tokens.call_args[0] == (req1,
+                                                                         0)
+
+        scheduled_requests.context_requests_last_chunk = [req0, req1]
+
+        manager.take_scheduled_requests_pending_load(scheduled_requests)
+
+        assert scheduled_requests.context_requests_last_chunk == [req1]
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3
