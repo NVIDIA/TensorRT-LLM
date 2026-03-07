@@ -26,6 +26,7 @@ from transformers import AutoProcessor
 
 from tensorrt_llm._tensorrt_engine import LLM
 from tensorrt_llm._torch.async_llm import AsyncLLM
+from tensorrt_llm._utils import EnergyMonitor
 # yapf: disable
 from tensorrt_llm.executor import CppExecutorError
 from tensorrt_llm.executor.postproc_worker import PostprocParams
@@ -129,6 +130,9 @@ class OpenAIServer:
         # The steady clock offset (in seconds) between this server and the disagg server
         self.disagg_server_steady_clock_offset = 0
 
+        # Energy monitoring
+        self.energy_monitor = None
+
         # as disagg-worker
         self.disagg_cluster_storage = None
         self.disagg_cluster_worker = None
@@ -164,6 +168,17 @@ class OpenAIServer:
                     self.server_role, self.host, self.port,
                     self.disagg_cluster_config, self.disagg_cluster_storage)
                 await self.disagg_cluster_worker.register_worker()
+
+            # Start energy monitoring if enabled
+            if getattr(self.generator.args, "enable_energy_metrics", False):
+                try:
+                    world_size = self.generator.args.parallel_config.world_size
+                    self.energy_monitor = EnergyMonitor(world_size)
+                    logger.info("Initialized GPU energy monitoring")
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to initialize GPU energy monitoring: {e}")
+                    self.energy_monitor = None
 
             # Start background iteration stats collector if metrics are enabled
             # The args for pytorch and autodeploy backend has attribute `enable_iter_perf_stats` while
@@ -351,6 +366,9 @@ class OpenAIServer:
                                methods=["GET"])
         self.app.add_api_route("/perf_metrics",
                                self.get_perf_metrics,
+                               methods=["GET"])
+        self.app.add_api_route("/energy_metrics",
+                               self.get_energy_metrics,
                                methods=["GET"])
         self.app.add_api_route("/steady_clock_offset",
                                self.get_steady_clock_offset,
@@ -552,6 +570,21 @@ class OpenAIServer:
         async for stat in self.generator.get_stats_async(2):
             stats.append(stat)
         return JSONResponse(content=stats)
+
+    async def get_energy_metrics(self) -> JSONResponse:
+        if self.energy_monitor is None:
+            return JSONResponse(
+                content={"error": "Energy monitoring is not available"},
+                status_code=503)
+        total_energy = self.energy_monitor.get_current_energy()
+        if total_energy is None:
+            return JSONResponse(content={"error": "Failed to read GPU energy"},
+                                status_code=503)
+        return JSONResponse(
+            content={
+                "total_energy_j": round(total_energy, 4),
+                "query_time": time.perf_counter(),
+            })
 
     async def set_steady_clock_offset(
             self, offset: Annotated[float, Body(embed=True)]) -> Response:
