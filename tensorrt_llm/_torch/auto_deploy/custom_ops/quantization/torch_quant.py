@@ -465,7 +465,9 @@ def _safe_act_quant(x: torch.Tensor, block_size: int = 128) -> tuple:
     assert x.is_contiguous()
     assert x.shape[-1] % block_size == 0
     y = torch.empty_like(x, dtype=torch.float8_e4m3fn)
-    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=torch.float32)
+    # Keep scale metadata in the model dtype to avoid FP32->BF16 cast kernels
+    # when the tensor is consumed by downstream MoE/quantized paths.
+    s = x.new_empty(*x.shape[:-1], x.shape[-1] // block_size, dtype=x.dtype)
 
     grid = lambda meta: (triton.cdiv(x.numel(), meta["BLOCK_SIZE"]),)  # noqa: E731
     _act_quant_kernel[grid](x, y, s, BLOCK_SIZE=block_size)
