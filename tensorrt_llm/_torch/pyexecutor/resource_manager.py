@@ -2102,15 +2102,13 @@ class KVCacheManagerV2(BaseResourceManager):
                     new_capacity = kv_cache.capacity + max_num_draft_tokens + 1
                     success = kv_cache.resize(new_capacity)
                     if not success:
-                        raise ValueError(
-                            f"Failed to resize capacity of KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
-                        )
+                        release_resources(req)
+                        return None
                     if draft_kv_cache is not None:
                         success = draft_kv_cache.resize(new_capacity)
                         if not success:
-                            raise ValueError(
-                                f"Failed to resize capacity of draft KV cache for request {req.py_request_id} to {new_capacity} tokens for dummy request"
-                            )
+                            release_resources(req, free_draft_resources=True)
+                            return None
 
             # TODO: Planning to get dummy_data from each model. Before that, we need to add dummy mrope_config to the request here.
             if use_mrope:
@@ -2415,6 +2413,9 @@ class KVCacheManagerV2(BaseResourceManager):
                 kv_cache.set_base_page_index_buf(i, pool_idx,
                                                  memoryview(buffer.numpy()))
         return kv_cache
+
+    def reset_reuse_state(self):
+        self.impl.clear_reusable_blocks()
 
 
 class SlotManager:

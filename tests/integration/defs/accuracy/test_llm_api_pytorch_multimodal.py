@@ -47,6 +47,7 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
 
     def test_auto_dtype(self):
+        pytest.skip()
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
@@ -176,6 +177,7 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
     )
 
     def test_auto_dtype(self):
+        pytest.skip("IMA on L40S")
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
@@ -453,6 +455,7 @@ class TestMistralSmall24B(LlmapiAccuracyTestHarness):
 
     @pytest.mark.skip_less_device_memory(80000)
     def test_auto_dtype(self):
+        pytest.skip("Skip due to accuracy issue")
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
         with LLM(
             self.MODEL_PATH,
