@@ -28,8 +28,8 @@ from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.models.flux.attention import (
-    Flux2ParallelSelfAttention,
-    FluxJointAttention,
+    create_joint_attention,
+    create_parallel_self_attention,
 )
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.models.flux.transformer_flux import (
@@ -229,7 +229,7 @@ class Flux2TransformerBlock(nn.Module):
         self.norm1_context = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
 
         # Joint attention
-        self.attn = FluxJointAttention(
+        self.attn = create_joint_attention(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,
@@ -364,7 +364,7 @@ class Flux2SingleTransformerBlock(nn.Module):
         self.norm = LayerNorm(hidden_size=dim, eps=eps, has_weights=False, has_bias=False)
 
         # Parallel attention with fused QKV+MLP
-        self.attn = Flux2ParallelSelfAttention(
+        self.attn = create_parallel_self_attention(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,

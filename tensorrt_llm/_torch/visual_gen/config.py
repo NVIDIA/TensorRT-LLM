@@ -48,6 +48,9 @@ class AttentionConfig(BaseModel):
     backend: Literal["VANILLA", "TRTLLM"] = PydanticField(
         "VANILLA", description="Attention backend: VANILLA (PyTorch SDPA), TRTLLM"
     )
+    fuse_qk_norm_rope: bool = PydanticField(
+        True, description="Use fused DiT QK Norm + RoPE CUDA kernel"
+    )
 
 
 class ParallelConfig(BaseModel):

@@ -30,7 +30,7 @@ from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import maybe_compile
-from tensorrt_llm._torch.visual_gen.models.flux.attention import FluxJointAttention
+from tensorrt_llm._torch.visual_gen.models.flux.attention import create_joint_attention
 from tensorrt_llm._torch.visual_gen.models.flux.pos_embed_flux import FluxPosEmbed
 from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
@@ -295,7 +295,7 @@ class FluxTransformerBlock(nn.Module):
         )
 
         # Joint attention
-        self.attn = FluxJointAttention(
+        self.attn = create_joint_attention(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,
@@ -472,7 +472,7 @@ class FluxSingleTransformerBlock(nn.Module):
         )
 
         # Attention (no added_kv_proj_dim since tokens are already concatenated)
-        self.attn = FluxJointAttention(
+        self.attn = create_joint_attention(
             hidden_size=dim,
             num_attention_heads=num_attention_heads,
             head_dim=attention_head_dim,
