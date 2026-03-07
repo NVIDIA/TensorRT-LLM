@@ -220,7 +220,10 @@ class PipelineLoader:
 
         if not skip_warmup:
             if config.torch_compile.enable_autotune:
-                with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
+                with autotune(
+                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
+                    skip_dynamic_tuning_buckets=True,
+                ):
                     pipeline.warmup()
             else:
                 pipeline.warmup()
