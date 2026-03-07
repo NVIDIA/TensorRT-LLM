@@ -765,12 +765,18 @@ def test_eagle3_cuda_graph_padding(disable_overlap_scheduler: bool):
     llm_spec.shutdown()
 
 
-@pytest.mark.parametrize("disable_overlap_scheduler", [True, False])
-def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
+@pytest.mark.parametrize("disable_overlap_scheduler,use_cuda_graph", [
+    [True, True],
+    [False, True],
+    [True, False],
+    [False, False],
+])
+def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool,
+                             use_cuda_graph: bool):
     """Test CDL sampling with 2 requests and max_batch_size=2."""
     attn_backend = "TRTLLM"
     enable_block_reuse = False
-    use_one_model = False
+    use_one_model = True
     enable_chunked_prefill = False
 
     total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
@@ -792,7 +798,7 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
         model=target_model_dir,
         attn_backend=attn_backend,
         disable_overlap_scheduler=disable_overlap_scheduler,
-        cuda_graph_config=cuda_graph_config,
+        cuda_graph_config=cuda_graph_config if use_cuda_graph else None,
         max_batch_size=max_batch_size,
         kv_cache_config=kv_cache_config,
         max_seq_len=8192,
@@ -800,6 +806,8 @@ def test_eagle3_cdl_sampling(disable_overlap_scheduler: bool):
     )
 
     spec_config = Eagle3DecodingConfig(
+        allow_advanced_sampling=True,
+        use_rejection_sampling=True,
         max_draft_len=max_draft_len,
         speculative_model=eagle_model_dir,
         eagle3_one_model=use_one_model,
