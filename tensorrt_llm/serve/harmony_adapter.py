@@ -1405,6 +1405,7 @@ class HarmonyAdapter:
             # Handle reasoning content
             if "reasoning" in harmony_delta:
                 delta_message.reasoning = harmony_delta["reasoning"]
+                delta_message.reasoning_content = harmony_delta["reasoning"]
                 # tool_calls will use default factory (empty list)
 
             # Handle regular content
@@ -1747,6 +1748,7 @@ def _create_response_message(parsed_output: dict[str, Any]) -> dict[str, Any]:
     # Add reasoning_content if present
     if "reasoning" in parsed_output:
         message["reasoning"] = parsed_output["reasoning"]
+        message["reasoning_content"] = parsed_output["reasoning"]
 
     return message
 
