@@ -84,6 +84,13 @@ def verify_l0_test_lists(llm_src):
         if cleaned_line:
             cleaned_lines.add(cleaned_line)
 
+    # Skip external repo tests (e.g., verl::) since they cannot be validated
+    # locally — the external repo is only available at Jenkins runtime.
+    cleaned_lines = {
+        line
+        for line in cleaned_lines if not line.startswith('verl::')
+    }
+
     with open(test_list, "w") as f:
         f.writelines(f"{line}\n" for line in sorted(cleaned_lines))
 
