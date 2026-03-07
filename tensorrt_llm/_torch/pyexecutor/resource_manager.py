@@ -87,10 +87,6 @@ class Role:
     ALL = DataRole("all")
 
 
-def compute_page_count(token_count: int, tokens_per_page: int) -> int:
-    return (token_count + tokens_per_page) // tokens_per_page
-
-
 class BaseResourceManager(ABC):
 
     @abstractmethod
@@ -2298,12 +2294,6 @@ class KVCacheManagerV2(BaseResourceManager):
 
     def get_needed_resource_to_completion(self, request: LlmRequest) -> int:
         # TODO: implement this
-        # context_token_count = request.orig_prompt_len
-        # num_context_blocks = context_token_count // self.tokens_per_block
-        # remaining_tokens = context_token_count + request.max_new_tokens - num_context_blocks * self.tokens_per_block
-        # need_blocks = num_context_blocks + math.ceil(
-        #     remaining_tokens / self.tokens_per_block)
-        # return need_blocks
         return 0
 
     # TODO: refactor get_cache_size_per_token and get_cache_bytes_per_token to use the same logic

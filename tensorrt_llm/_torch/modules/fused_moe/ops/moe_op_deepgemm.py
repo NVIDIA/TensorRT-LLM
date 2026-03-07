@@ -70,7 +70,7 @@ class DeepGemmMoEOp(MoEOp):
         Returns:
             Dictionary containing workspace tensors
         """
-        import tensorrt_llm.quantization.utils.fp8_utils as fp8_utils
+        fp8_utils = self.fp8_utils
 
         # Get dimensions from module
         hidden_size = module.hidden_size

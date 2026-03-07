@@ -279,41 +279,6 @@ class ConfigurableMoE(MoE):
                 "apply_router_weight_on_input only supports top-1 routing"
             )
 
-    def _create_comm_strategy(self, model_config: ModelConfig) -> Optional[Communication]:
-        """
-        Create communication strategy based on configuration
-
-        Default: None (will use factory to auto-select when needed)
-        Auto-selects best strategy based on hardware and configuration
-
-        """
-        # Communication strategy is None by default
-        # Will be created lazily in determine_communication_method() when first needed
-        # For now, return None and create on-demand
-        return None
-
-    def _get_quant_config_dict(self, model_config: ModelConfig) -> Optional[Dict]:
-        """
-        Extract quantization configuration from model_config
-
-        """
-        if model_config.quant_config is None:
-            return None
-
-        quant_mode = model_config.quant_config.layer_quant_mode
-        return {
-            "has_fp8_qdq": quant_mode.has_fp8_qdq()
-            if hasattr(quant_mode, "has_fp8_qdq")
-            else False,
-            "has_nvfp4": quant_mode.has_nvfp4() if hasattr(quant_mode, "has_nvfp4") else False,
-            "has_w4afp8": quant_mode.is_int4_weight_only_per_group()
-            if hasattr(quant_mode, "is_int4_weight_only_per_group")
-            else False,
-            "has_fp8_block_scales": quant_mode.has_fp8_block_scales()
-            if hasattr(quant_mode, "has_fp8_block_scales")
-            else False,
-        }
-
     def calculate_num_chunks(self, all_rank_num_tokens: List[int]) -> int:
         """
         Calculate how many chunks are needed

@@ -368,12 +368,6 @@ class Sm100BlockScaledContiguousGroupedGemmSwigluFusionKernel:
         self.is_b_mcast = self.num_mcast_ctas_b > 1
 
         # Compute epilogue subtile
-        # self.epi_tile = sm100_utils.compute_epilogue_tile_shape(
-        #     self.cta_tile_shape_mnk,
-        #     self.use_2cta_instrs,
-        #     self.c_layout,
-        #     self.c_dtype,
-        # )
         self.epi_tile = (128, 64)
         self.epi_tile_cnt = (
             self.cta_tile_shape_mnk_c[0] // self.epi_tile[0],

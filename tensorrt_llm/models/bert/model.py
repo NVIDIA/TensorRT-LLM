@@ -157,8 +157,6 @@ class BertBase(PretrainedModel):
         """
         Create a BertModel object from give parameters
         """
-        import transformers
-
         assert hf_model_or_dir is not None
         use_preloading = isinstance(hf_model_or_dir,
                                     transformers.PreTrainedModel)

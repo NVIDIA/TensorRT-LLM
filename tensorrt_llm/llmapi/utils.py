@@ -140,10 +140,6 @@ def file_with_glob_exists(directory, glob) -> bool:
     return False
 
 
-def file_with_suffix_exists(directory, suffix) -> bool:
-    return file_with_glob_exists(directory, f'*{suffix}')
-
-
 def get_device_count() -> int:
     return torch.cuda.device_count() if torch.cuda.is_available() else 0
 

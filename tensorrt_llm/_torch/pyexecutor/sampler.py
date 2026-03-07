@@ -3970,37 +3970,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         return sampling_requests_metadata, logits_cuda
 
-    @staticmethod
-    def _longest_stop_word_len(requests: Iterable[LlmRequest]) -> int:
-        max_stop_word_len = 0
-        for req in requests:
-            assert req.py_stop_words_list is not None
-            _, cumsum = req.py_stop_words_list
-            if -1 in cumsum:
-                cumsum = cumsum[: cumsum.index(-1)]
-            request_max_stop_word_len = np.max(np.diff(cumsum, prepend=0), initial=0)
-            max_stop_word_len = max(max_stop_word_len, request_max_stop_word_len)
-        return max_stop_word_len
-
-    @staticmethod
-    def _requests_with_stop_words(requests: list[LlmRequest]) -> list[LlmRequest]:
-        return [
-            r
-            for r in requests
-            if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-        ]
-
-    def _request_indices_with_stop_words(self, requests: list[LlmRequest]) -> torch.Tensor:
-        return torch.tensor(
-            [
-                ridx
-                for ridx, r in enumerate(requests)
-                if (r.py_stop_words_list is not None and len(r.py_stop_words_list[0]) > 0)
-            ],
-            dtype=torch.int32,
-            pin_memory=prefer_pinned(),
-        ).to(device="cuda", non_blocking=True)
-
     @nvtx_range("_process_logprobs")
     def _process_logprobs(
         self,

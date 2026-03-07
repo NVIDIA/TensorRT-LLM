@@ -737,7 +737,6 @@ class RPCServer:
                         f"[server] Expected shutdown error: {error_str}")
                 else:
                     # This is an unexpected RuntimeError - log full details
-                    import traceback
                     logger.error(f"Event loop error: {error_str}")
                     logger.error(f"Traceback: {traceback.format_exc()}")
             except Exception as e:

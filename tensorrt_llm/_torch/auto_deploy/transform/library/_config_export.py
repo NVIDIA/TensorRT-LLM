@@ -156,24 +156,6 @@ def _export_eagle_draft_config(config_dict: Dict[str, Any]) -> Dict[str, Any]:
     return draft_config
 
 
-def export_vision_config(config: Any) -> Dict[str, Any]:
-    """Export vision configuration without modification."""
-    config_dict = config.to_dict()
-
-    has_vision = "vision_config" in config_dict
-    has_phi4_vision = "image_embd_layer" in config_dict.get("embd_layer", {})
-    if not (has_vision or has_phi4_vision):
-        raise KeyError(
-            "Required field 'vision_config' or 'image_embd_layer' in 'embd_layer' not found in config"
-        )
-    # Add EdgeLLM API version
-    config_dict["edgellm_version"] = EDGELLM_VERSION
-
-    # Return the original config_dict as-is without any modification
-    # Since MRoPE needs LLM config, ViTRunner will use the LLM config.
-    return config_dict
-
-
 def export_llm_config(config: Any, model_type: str) -> Dict[str, Any]:
     """Export configuration based on model type and EAGLE version."""
     config_dict = config.to_dict()

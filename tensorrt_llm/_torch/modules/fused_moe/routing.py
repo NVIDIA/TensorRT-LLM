@@ -493,26 +493,6 @@ class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
         return RoutingMethodType.Llama4
 
 
-# TODO: re-enable this once the custom op is working.
-# class Llama4RenormalizeMoeRoutingMethod(BaseMoeRoutingMethod):
-
-#     def __init__(self, top_k: int, num_experts_total: int, ep_size: int,
-#                  ep_rank: int):
-#         super().__init__()
-#         self.top_k = top_k
-#         self.num_experts_total = num_experts_total
-#         self.num_experts_per_node = self.num_experts_total // ep_size
-#         self.start_expert = self.num_experts_per_node * ep_rank
-#         self.end_expert = self.start_expert + self.num_experts_per_node
-
-#     def apply(self,
-#               router_logits: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-#         unpermuted_scales, indices = torch.ops.trtllm.fused_topk_softmax(
-#             router_logits, self.top_k, self.num_experts_total,
-#             self.start_expert, self.end_expert)
-#         return indices, unpermuted_scales
-
-
 # TODO Test this for Phi models
 class SparseMixerMoeRoutingMethod(BaseMoeRoutingMethod):
 

@@ -42,7 +42,7 @@ Requirements: pip install graphviz
 
 import math
 import re
-from typing import Any, Dict, Optional
+from typing import Dict, Optional
 
 import graphviz
 import torch
@@ -542,49 +542,6 @@ def to_dot(
     return dot
 
 
-def analyze_graph_structure(graph_module: GraphModule) -> Dict[str, Any]:
-    """
-    Analyze structural statistics of GraphModule
-
-    Args:
-        graph_module: GraphModule to analyze
-
-    Returns:
-        Dictionary containing structural statistics
-    """
-    graph = graph_module.graph
-    nodes = list(graph.nodes)
-
-    # Count node types
-    op_counts = {}
-    for node in nodes:
-        op_type = node.op
-        op_counts[op_type] = op_counts.get(op_type, 0) + 1
-
-    # Analyze connections
-    total_connections = 0
-    for node in nodes:
-        if node.args:
-            for arg in node.args:
-                if isinstance(arg, fx.Node):
-                    total_connections += 1
-                elif isinstance(arg, (list, tuple)):
-                    for sub_arg in arg:
-                        if isinstance(sub_arg, fx.Node):
-                            total_connections += 1
-
-    # Calculate graph complexity
-    complexity_score = len(nodes) + total_connections
-
-    return {
-        "total_nodes": len(nodes),
-        "node_types": op_counts,
-        "total_connections": total_connections,
-        "complexity_score": complexity_score,
-        "graph_depth": _calculate_graph_depth(nodes),
-    }
-
-
 def _get_node_label(graph_module: GraphModule, node: fx.Node) -> str:
     """Get node label, including the dtype of the attribute if it is a tensor"""
     if node.op == "call_function":
@@ -665,40 +622,3 @@ def _get_module_name(graph_module: GraphModule, target) -> str:
         # If unable to get module, fall back to original logic
         module_name = str(target).split(".")[-1] if "." in str(target) else str(target)
         return module_name
-
-
-def _calculate_graph_depth(nodes) -> int:
-    """Calculate maximum depth of the graph"""
-    # Build dependency relationships
-    dependencies = {}
-    for node in nodes:
-        dependencies[node.name] = []
-        if node.args:
-            for arg in node.args:
-                if isinstance(arg, fx.Node):
-                    dependencies[node.name].append(arg.name)
-                elif isinstance(arg, (list, tuple)):
-                    for sub_arg in arg:
-                        if isinstance(sub_arg, fx.Node):
-                            dependencies[node.name].append(sub_arg.name)
-
-    # Calculate depth of each node
-    depths = {}
-
-    def calculate_depth(node_name):
-        """Calculate the depth of a node based on its dependencies (memoized)."""
-        if node_name in depths:
-            return depths[node_name]
-
-        if not dependencies[node_name]:
-            depths[node_name] = 0
-            return 0
-
-        max_dep_depth = max(calculate_depth(dep) for dep in dependencies[node_name])
-        depths[node_name] = max_dep_depth + 1
-        return depths[node_name]
-
-    for node in nodes:
-        calculate_depth(node.name)
-
-    return max(depths.values()) if depths else 0

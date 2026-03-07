@@ -55,8 +55,6 @@ class BERTConfig(PretrainedConfig):
             mapping: Optional[Mapping] = None,
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
-        import transformers
-
         if isinstance(hf_config_or_dir, transformers.PretrainedConfig):
             hf_config = hf_config_or_dir
         else:

@@ -436,16 +436,6 @@ def num_users_of_weight_node(node: Node) -> int:
     return len(weight_node.users)
 
 
-def get_op_overload_packet(node: Union[OpOverloadPacket, OpOverload]) -> OpOverloadPacket:
-    """Get the overload packet from the op overload."""
-    if isinstance(node, OpOverloadPacket):
-        return node
-    elif isinstance(node, OpOverload):
-        return node.overloadpacket
-    else:
-        raise ValueError(f"Expected OpOverloadPacket or OpOverload, got {type(node)}")
-
-
 def is_op(node: Node, ops: Union[OperatorLike, Iterable[OperatorLike]]) -> bool:
     """Check if the node is a call to one of the ops."""
     if not isinstance(node, Node):
@@ -1446,17 +1436,6 @@ def get_weight_tensor(node: Node) -> torch.Tensor:
     if len(weight_nodes.weights) == 0:
         raise ValueError(f"Node {node.name} has no weight")
     return weight_nodes.weights[0].tensor
-
-
-def draw_graph(gm: GraphModule, filename: str):
-    """
-    Dump graphmodule to SVG file using PyTorch's built-in drawer.
-    """
-    from torch.fx.passes.graph_drawer import FxGraphDrawer
-
-    drawer = FxGraphDrawer(gm, filename)
-    with open(f"{filename}.svg", "wb") as f:
-        f.write(drawer.get_dot_graph().create_svg())
 
 
 def sync_weight_meta_dtype(gm: GraphModule) -> int:

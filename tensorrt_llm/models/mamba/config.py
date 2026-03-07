@@ -70,8 +70,6 @@ class MambaConfig(PretrainedConfig):
             mapping: Optional[Mapping] = None,
             quant_config: Optional[QuantConfig] = None,
             **kwargs):
-        import transformers
-
         ckpt_type = get_ckpt_type(hf_config_or_dir)
 
         mamba_version = 'Mamba1'

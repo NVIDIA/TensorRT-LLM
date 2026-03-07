@@ -903,15 +903,6 @@ class SequenceInfo:
             else:
                 self._extra_args[name] = None
 
-    @nvtx_range("ad_get_unique_value")
-    def _get_unique_value(self, occupied: Set[int], max_val: int) -> int:
-        """Get un unoccupied value from the range indicated by max_val."""
-        # Return the smallest free value; fall back to 0 if none
-        for candidate in range(max_val):
-            if candidate not in occupied:
-                return candidate
-        return 0
-
     @nvtx_range("ad_nest_sequences")
     def nest_sequences(
         self,

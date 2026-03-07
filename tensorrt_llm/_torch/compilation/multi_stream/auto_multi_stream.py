@@ -1,4 +1,3 @@
-import time
 from dataclasses import dataclass, field
 from operator import getitem
 from queue import PriorityQueue
@@ -425,35 +424,3 @@ def multi_stream_schedule(gm: GraphModule, max_num_streams: int) -> int:
     """
     dag = MultiStreamDAG(gm)
     return dag.optimize(max_num_streams)
-
-
-# Following code is for debug purpose. Use print_dag_to_dot to print a MultiStreamDAG to dot file.
-
-
-def dump_dag_as_dot(dag: MultiStreamDAG, max_num_nodes: int = 500) -> None:
-    COLORS = [
-        "red", "chocolate", "cyan", "gold", "coral", "green", "blue", "orange",
-        "purple", "brown"
-    ]
-    filename = f"dag_{int(time.time())}.dot"
-    with open(filename, 'w') as f:
-        f.write("digraph G {\n")
-        f.write(
-            f"id_entry [label=\"node=entry, distance={dag.entry_node.distance}\"]\n"
-        )
-        cnt = 0
-        for node in dag.nodes.values():
-            color = "white" if node.stream is None else COLORS[node.stream.id]
-            f.write(
-                f"id_{dag.node_to_id[node.node]} [label=\"node={node.node}, "
-                f"distance={node.distance}, weight={node.weight}\", "
-                f"color={color}, shape=oval]\n")
-            for in_edge in node.in_edges.values():
-                id = str(dag.node_to_id[
-                    in_edge.node]) if in_edge.node is not None else "entry"
-                f.write(f"id_{id} -> id_{dag.node_to_id[node.node]}\n")
-            if cnt > max_num_nodes:
-                break
-            cnt += 1
-        f.write("}\n")
-        f.flush()

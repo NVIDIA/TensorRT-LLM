@@ -265,25 +265,6 @@ class DemoEngine(ADEngine):
 
         return outputs
 
-    @staticmethod
-    def _multinomial_sample_one_no_sync(probs_sort):
-        # Does multinomial sampling without a cuda synchronization
-        q = torch.randn_like(probs_sort).exponential_(1)
-        return torch.argmax(probs_sort / q, dim=-1, keepdim=False).to(dtype=torch.int)
-
-    @staticmethod
-    def _logits_to_probs(
-        logits: torch.Tensor, temperature: Optional[float] = None, top_k: Optional[int] = None
-    ):
-        logits = logits / max(1.0 if temperature is None else temperature, 1e-5)
-
-        if top_k is not None:
-            v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
-            pivot = v.select(-1, -1).unsqueeze(-1)
-            logits = torch.where(logits < pivot, -float("Inf"), logits)
-        probs = torch.nn.functional.softmax(logits, dim=-1)
-        return probs
-
     @classmethod
     def _sample(
         cls, logits: torch.Tensor, sampling_params: SamplingParams
