@@ -59,8 +59,10 @@ from ..models.modeling_utils import (PretrainedConfig, QuantAlgo, QuantConfig,
 from ..sampling_params import BatchedLogitsProcessor
 from .build_cache import BuildCacheConfig
 from .tokenizer import TokenizerBase, tokenizer_factory
-from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
-                    get_type_repr)
+from .utils import (StrictBaseModel, download_hf_pretrained_config,
+                    generate_api_docs_as_docstring, get_type_repr)
+
+# TODO[chunweiy]: move the following symbols back to utils scope, and remove the following import
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
 
@@ -3424,6 +3426,92 @@ class TorchLlmArgs(BaseLlmArgs):
         return executor_config
 
 
+def _compute_skip_softmax_thresholds_from_checkpoint(
+        model: str,
+        target_sparsity_ratio: float) -> Tuple[float, float]:
+    """Compute prefill and decode threshold scale factors from checkpoint config.
+
+    Reads config.json from the model path (local or HuggingFace). Expects
+    sparse_attention_config.threshold_scale_factor with prefill and decode
+    each containing 'a' and 'b'. Uses formula: threshold = a * exp(b * target_sparsity_ratio).
+
+    Returns:
+        (prefill_threshold, decode_threshold)
+
+    Raises:
+        ValueError: If checkpoint does not contain the required structure.
+    """
+    config_dir: Path
+    model_path = Path(model)
+    if model_path.is_dir() and (model_path / "config.json").exists():
+        config_dir = model_path
+    else:
+        config_dir = Path(download_hf_pretrained_config(model))
+
+    config_path = config_dir / "config.json"
+    if not config_path.exists():
+        raise ValueError(
+            "Checkpoint must contain config.json when using target_sparsity_ratio "
+            "for skip softmax attention. No config.json found.")
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    sparse_cfg = config.get("sparse_attention_config") or {}
+    tsf = sparse_cfg.get("threshold_scale_factor") or {}
+    prefill_params = tsf.get("prefill")
+    decode_params = tsf.get("decode")
+
+    if not isinstance(prefill_params, dict) or "a" not in prefill_params or "b" not in prefill_params:
+        raise ValueError(
+            "Checkpoint must contain sparse_attention_config.threshold_scale_factor "
+            "with prefill and decode (each with 'a' and 'b') when using target_sparsity_ratio.")
+    if not isinstance(decode_params, dict) or "a" not in decode_params or "b" not in decode_params:
+        raise ValueError(
+            "Checkpoint must contain sparse_attention_config.threshold_scale_factor "
+            "with prefill and decode (each with 'a' and 'b') when using target_sparsity_ratio.")
+
+    a_prefill, b_prefill = prefill_params["a"], prefill_params["b"]
+    a_decode, b_decode = decode_params["a"], decode_params["b"]
+
+    prefill_threshold = a_prefill * math.exp(b_prefill * target_sparsity_ratio)
+    decode_threshold = a_decode * math.exp(b_decode * target_sparsity_ratio)
+    return (prefill_threshold, decode_threshold)
+
+
+def _resolve_sparse_attention_config(
+        data: Dict,
+        model_path: Optional[str]) -> BaseSparseAttentionConfig:
+    """Build sparse attention config from YAML dict, resolving target_sparsity_ratio if needed.
+
+    If threshold_scale_factor is present, use it (ignore target_sparsity_ratio).
+    Else if algorithm is skip_softmax and target_sparsity_ratio is present, compute
+    prefill/decode thresholds from the checkpoint config.json and build SkipSoftmaxAttentionConfig.
+    """
+    if data.get("threshold_scale_factor") is not None:
+        return BaseSparseAttentionConfig.from_dict(data)
+
+    algorithm = (data.get("algorithm") or "").lower()
+    target_sparsity_ratio = data.get("target_sparsity_ratio")
+
+    if algorithm == "skip_softmax" and target_sparsity_ratio is not None:
+        if not model_path or not str(model_path).strip():
+            raise ValueError(
+                "Model path is required when using target_sparsity_ratio for skip softmax attention.")
+        prefill_threshold, decode_threshold = _compute_skip_softmax_thresholds_from_checkpoint(
+            model_path, float(target_sparsity_ratio))
+        resolved = {
+            "algorithm": "skip_softmax",
+            "threshold_scale_factor": {
+                "prefill": prefill_threshold,
+                "decode": decode_threshold,
+            },
+        }
+        return BaseSparseAttentionConfig.from_dict(resolved)
+
+    return BaseSparseAttentionConfig.from_dict(data)
+
+
 def update_llm_args_with_extra_dict(
         llm_args: Dict,
         llm_args_dict: Dict,
@@ -3452,7 +3540,19 @@ def update_llm_args_with_extra_dict(
     }
     for field_name, field_type in field_mapping.items():
         if field_name in llm_args_dict:
-            llm_args_dict[field_name] = field_type(**llm_args_dict[field_name])
+            # Some fields need to be converted manually.
+            if field_name in ["speculative_config", "sparse_attention_config"]:
+                if field_name == "speculative_config":
+                    backend = llm_args_dict.get("backend") or llm_args.get(
+                        "backend")
+                    llm_args_dict[field_name] = field_type.from_dict(
+                        llm_args_dict[field_name], backend=backend)
+                else:
+                    llm_args_dict[field_name] = _resolve_sparse_attention_config(
+                        llm_args_dict[field_name], llm_args.get("model"))
+            else:
+                llm_args_dict[field_name] = field_type(
+                    **llm_args_dict[field_name])
             extra_llm_str = f"because it's specified in {extra_llm_api_options}" if extra_llm_api_options else ""
             logger.warning(f"Overriding {field_name} {extra_llm_str}")
 
