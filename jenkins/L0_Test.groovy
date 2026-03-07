@@ -3667,6 +3667,16 @@ def launchTestJobs(pipeline, testFilter)
                             config = LINUX_AARCH64_CONFIG
                         }
                         withEnv(libEnv) {
+                            // run type-check hook (requires dependencies to be present)
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pre-commit mypy pytest")
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "git config --global --add safe.directory \$(pwd)/${LLM_ROOT}")
+
+                            // Run type checking (using mypy) only on one arch and using a more recent Python version
+                            if ((pyver != "3.10") && (cpu_arch != AARCH64_TRIPLE)) {
+                                // NB: 1st installs typing stubs, 2nd re-run generates the linting result
+                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${LLM_ROOT} && pre-commit run type-check -a || pre-commit run type-check -a")
+                            }
+
                             sh "env | sort"
                             runLLMTestlistOnPlatform(pipeline, gpu_type, "l0_sanity_check", config, false, toStageName(values[1], key), 1, 1, true, null, "-SubJob-RunTest")
                         }
