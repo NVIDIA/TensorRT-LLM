@@ -302,6 +302,9 @@ class MnnvlMemory:
 
     @classmethod
     def close_mnnvl_memory(cls, ptr: int):
+        # Idempotent: already released (e.g. after explicit release on failure path).
+        if ptr not in cls.allocated_map:
+            return
         mapping, aligned_size, mem_handles, start_address, rank_stride, address_offset = (
             cls.allocated_map.pop(ptr)
         )
