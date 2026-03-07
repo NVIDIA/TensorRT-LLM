@@ -438,16 +438,19 @@ class Attention(nn.Module):
             assert self.mapping.has_cp_helix(
             ), f"CP type must be HELIX for Attention, but got {self.mapping.cp_config['cp_type']}."
 
-        mapping = Mapping(
-            world_size=dp_size * tp_size * pp_size * cp_size,
-            tp_size=tp_size,
-            pp_size=pp_size * dp_size,
-            cp_size=cp_size,
-            cp_config=self.mapping.cp_config,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        if dp_size == 1 and cp_size == 1:
+            mapping = self.mapping
+        else:
+            mapping = Mapping(
+                world_size=dp_size * tp_size * pp_size * cp_size,
+                tp_size=tp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=cp_size,
+                cp_config=self.mapping.cp_config,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
         self.tp_size = tp_size
         self.cp_size = cp_size
         self.tp_rank = mapping.tp_rank
@@ -495,15 +498,18 @@ class Attention(nn.Module):
 
         # For Helix CP, combine TP and CP for the output projection so each
         # rank's o_proj input is num_heads_tp_cp * head_dim.
-        mapping_o = Mapping(
-            world_size=dp_size * tp_size * pp_size * cp_size,
-            tp_size=tp_size * cp_size,
-            pp_size=pp_size * dp_size,
-            cp_size=1,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        if dp_size == 1 and cp_size == 1:
+            mapping_o = self.mapping
+        else:
+            mapping_o = Mapping(
+                world_size=dp_size * tp_size * pp_size * cp_size,
+                tp_size=tp_size * cp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=1,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
         self.mapping_o = mapping_o
 
         self.o_proj = Linear(
@@ -1099,16 +1105,19 @@ class MLA(nn.Module):
             assert self.mapping.has_cp_helix(
             ), f"CP type must be HELIX for MLA, but got {self.mapping.cp_config['cp_type']}."
 
-        mapping = Mapping(
-            world_size=pp_size * dp_size * tp_size * cp_size,
-            tp_size=tp_size,
-            pp_size=pp_size * dp_size,
-            cp_size=cp_size,
-            cp_config=self.mapping.cp_config,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        if dp_size == 1 and cp_size == 1:
+            mapping = self.mapping
+        else:
+            mapping = Mapping(
+                world_size=pp_size * dp_size * tp_size * cp_size,
+                tp_size=tp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=cp_size,
+                cp_config=self.mapping.cp_config,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
 
         assert self.num_heads % (tp_size * cp_size) == 0
         self.num_heads_tp = self.num_heads // tp_size
@@ -1204,15 +1213,18 @@ class MLA(nn.Module):
             requires_grad=False,
         )
 
-        mapping_o = Mapping(
-            world_size=pp_size * dp_size * tp_size * cp_size,
-            tp_size=tp_size * cp_size,
-            pp_size=pp_size * dp_size,
-            cp_size=1,
-            rank=self.mapping.rank,
-            gpus_per_node=self.mapping.gpus_per_node,
-            enable_attention_dp=self.mapping.enable_attention_dp,
-        )
+        if dp_size == 1 and cp_size == 1:
+            mapping_o = self.mapping
+        else:
+            mapping_o = Mapping(
+                world_size=pp_size * dp_size * tp_size * cp_size,
+                tp_size=tp_size * cp_size,
+                pp_size=pp_size * dp_size,
+                cp_size=1,
+                rank=self.mapping.rank,
+                gpus_per_node=self.mapping.gpus_per_node,
+                enable_attention_dp=self.mapping.enable_attention_dp,
+            )
         self.mapping_o = mapping_o
         self.o_proj = Linear(
             self.num_key_value_heads * self.v_head_dim,

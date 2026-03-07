@@ -141,9 +141,10 @@ class KvCacheCreator:
         elif self._should_create_separate_draft_kv_cache():
             # One-model draft with separate KV cache layout
             effective_draft_config = self._get_effective_draft_config()
+            draft_mapping = effective_draft_config.mapping
             kv_size_per_token += self._kv_cache_manager_cls.get_cache_size_per_token(
                 effective_draft_config,
-                mapping,
+                draft_mapping,
                 tokens_per_block=self._tokens_per_block)
         return kv_size_per_token
 
@@ -571,6 +572,16 @@ class KvCacheCreator:
         back to the target model's config via _get_effective_draft_config().
         """
         if self._mapping.enable_attention_dp:
+            draft_tp = getattr(self._speculative_config, 'draft_tp_size',
+                               None)
+            if (draft_tp is not None
+                    and draft_tp < self._mapping.tp_size):
+                raise ValueError(
+                    f"draft_tp_size ({draft_tp}) < tp_size "
+                    f"({self._mapping.tp_size}) requires separate "
+                    "draft/target KV caches, which are not supported "
+                    "with attention data parallelism."
+                )
             logger.info(
                 "Attention DP is enabled, separate draft KV cache is not supported."
             )
@@ -637,11 +648,13 @@ class KvCacheCreator:
                     "Falling back to KVCacheManager for draft model.")
                 draft_kv_cache_manager_cls = KVCacheManager
 
+        draft_mapping = effective_draft_config.mapping
+
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
-            mapping=self._mapping,
+            mapping=draft_mapping,
             kv_cache_config=self._kv_cache_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,

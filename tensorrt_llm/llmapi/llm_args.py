@@ -703,6 +703,15 @@ class DecodingBaseConfig(StrictBaseModel):
     _allow_greedy_draft_tokens: bool = PrivateAttr(True)
     # Internal: record decoding_type alias used during parsing (for warnings).
     _decoding_type_alias: Optional[str] = PrivateAttr(default=None)
+    draft_tp_size: Optional[PositiveInt] = Field(
+        default=None,
+        description=
+        "Tensor parallelism size for the draft model in one-model speculative decoding. "
+        "When set, must divide the target model's TP size evenly. If None, the draft model "
+        "uses the same TP size as the target model. Smaller values reduce communication "
+        "overhead for the (typically small) draft model at the cost of redundant computation."
+    )
+
     # If set, drafting will use separate KV cache in one-model speculative decoding.
     _allow_separate_draft_kv_cache: bool = PrivateAttr(True)
 
@@ -3293,6 +3302,18 @@ class TorchLlmArgs(BaseLlmArgs):
                 assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
                 if self.backend == "_autodeploy":
                     self.speculative_config._draft_target_one_model = False
+
+            draft_tp = self.speculative_config.draft_tp_size
+            if draft_tp is not None:
+                target_tp = self.parallel_config.tp_size
+                if draft_tp > target_tp:
+                    raise ValueError(
+                        f"draft_tp_size ({draft_tp}) must be <= target tp_size ({target_tp})."
+                    )
+                if target_tp % draft_tp != 0:
+                    raise ValueError(
+                        f"target tp_size ({target_tp}) must be divisible by "
+                        f"draft_tp_size ({draft_tp}).")
 
         else:
             self.decoding_config = None

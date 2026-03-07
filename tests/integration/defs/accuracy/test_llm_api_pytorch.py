@@ -55,10 +55,10 @@ from tensorrt_llm._torch.model_config import MoeLoadBalancerConfig
 # isort: off
 from tensorrt_llm.llmapi import (
     AutoDecodingConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
-    Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
-    NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SamplingParams, SkipSoftmaxAttentionConfig, SADecodingConfig,
-    TorchCompileConfig)
+    DraftTargetDecodingConfig, Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
+    MTPDecodingConfig, NGramDecodingConfig, PARDDecodingConfig,
+    RocketSparseAttentionConfig, SamplingParams, SkipSoftmaxAttentionConfig,
+    SADecodingConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -608,6 +608,60 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm,
                           sampling_params=sampling_params,
                           extra_acc_spec="beam_width=2")
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    def test_eagle3_draft_tp_size(self):
+        pytorch_config = dict(
+            max_batch_size=1,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=True,
+                                        free_gpu_memory_fraction=0.8)
+
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        spec_config = Eagle3DecodingConfig(max_draft_len=4,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=True,
+                                           draft_tp_size=1)
+
+        with LLM(model=self.MODEL_PATH,
+                 tensor_parallel_size=2,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = CnnDailymail(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @skip_pre_hopper
+    @pytest.mark.skip_less_device(2)
+    def test_draft_target_draft_tp_size(self):
+        draft_model_dir = f"{llm_models_root()}/llama-3.2-models/Llama-3.2-1B"
+        pytorch_config = dict(
+            max_batch_size=1,
+            disable_overlap_scheduler=True,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1),
+        )
+        kv_cache_config = KvCacheConfig(enable_block_reuse=False,
+                                        free_gpu_memory_fraction=0.8)
+
+        spec_config = DraftTargetDecodingConfig(
+            max_draft_len=4,
+            speculative_model=draft_model_dir,
+            draft_tp_size=1,
+        )
+
+        with LLM(model=self.MODEL_PATH,
+                 tensor_parallel_size=2,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 class TestLlama3_2_1B(LlmapiAccuracyTestHarness):
@@ -1511,6 +1565,23 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
+    @pytest.mark.skip_less_device(4)
+    def test_mtp_draft_tp_size_4gpus(self):
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(),
+        )
+        mtp_config = MTPDecodingConfig(num_nextn_predict_layers=2,
+                                       draft_tp_size=1)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=4,
+                 kv_cache_config=kv_cache_config,
+                 **pytorch_config,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
     @pytest.mark.skip_less_device(4)
     @parametrize_with_ids("torch_compile", [False, True])

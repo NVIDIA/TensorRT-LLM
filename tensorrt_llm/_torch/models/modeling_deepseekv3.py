@@ -322,10 +322,14 @@ class DeepseekV3WeightLoader:
         v_head_dim = self.config.v_head_dim
         kv_lora_rank = self.config.kv_lora_rank
 
-        tp_rank = self.model_config.mapping.tp_rank
-        tp_size = self.model_config.mapping.tp_size
+        target_tp_rank = self.model_config.mapping.tp_rank
+        target_tp_size = self.model_config.mapping.tp_size
+        tp_rank = target_tp_rank
+        tp_size = target_tp_size
         cp_rank = self.model_config.mapping.cp_rank
         cp_size = self.model_config.mapping.cp_size
+
+        draft_mapping = getattr(self.model, '_draft_mapping', None)
 
         params_map = {'gate_up_proj': ['gate_proj', 'up_proj']}
         all_named_modules = dict(self.model.named_modules())
@@ -342,6 +346,16 @@ class DeepseekV3WeightLoader:
             else:
                 names = name.split('.')
                 parent_module_name = '.'.join(names[:-1])
+                is_mtp_layer = ("model.layers" in name and len(names) > 2
+                                and names[2].isdigit()
+                                and int(names[2])
+                                >= self.config.num_hidden_layers)
+                if is_mtp_layer and draft_mapping is not None:
+                    tp_rank = draft_mapping.tp_rank
+                    tp_size = draft_mapping.tp_size
+                else:
+                    tp_rank = target_tp_rank
+                    tp_size = target_tp_size
                 if "model.layers" in name and int(
                         names[2]) >= self.config.num_hidden_layers:
                     mtp_layer_idx = int(
