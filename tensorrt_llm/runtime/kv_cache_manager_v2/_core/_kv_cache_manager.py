@@ -256,7 +256,7 @@ class KVCacheManager:
         lora_task_id: int | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
         id: Any = None,
-        custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
+        custom_priority_callback: Callable[[BlockOrdinal, "LifeCycle"], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
     ) -> _KVCache:
         """
