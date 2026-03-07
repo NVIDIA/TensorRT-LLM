@@ -344,6 +344,7 @@ exclude = [
     "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/__init__.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/custom_pipeline.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_persistent.py",
+    "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/dense_blockscaled_gemm_swiglu_fusion.py",
     "tensorrt_llm/_torch/cute_dsl_kernels/blackwell/utils.py",
     "tensorrt_llm/_torch/cute_dsl_utils.py",
     "tensorrt_llm/_torch/debug/__init__.py",
