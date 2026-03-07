@@ -20,7 +20,7 @@ Delta Rule is based on this paper: https://arxiv.org/abs/2406.06484
 Kernels are based on this repo: https://github.com/fla-org/flash-linear-attention
 """
 
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -41,7 +41,7 @@ from .delta_rule.chunk import chunk_delta_rule_fwd
 from .delta_rule.fused_recurrent import fused_recurrent_delta_rule_fwd
 
 
-@torch.library.custom_op("auto_deploy::fla_cached_delta_rule", mutates_args=())
+@torch.library.custom_op("auto_deploy::fla_cached_delta_rule", mutates_args=("out",))
 def fla_cached_delta_rule(
     # INPUTS (dense but may be flattened across sequences)
     q: torch.Tensor,
@@ -59,6 +59,7 @@ def fla_cached_delta_rule(
     delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
     # CONSTANTS
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     b, s, num_heads, _ = q.shape
 
@@ -74,6 +75,7 @@ def fla_cached_delta_rule(
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
+    num_total_tokens = num_prefill_tokens + num_decode
 
     # clean up metadata
     cu_seqlen_prefill = cu_seqlen[: num_prefill + 1]
@@ -123,6 +125,13 @@ def fla_cached_delta_rule(
 
         del y_decode, final_state
 
+    if out is not None:
+        out_flat = out.view(b * s, num_heads, -1)
+        out_flat[:num_total_tokens].copy_(y_flat[:num_total_tokens])
+        if num_total_tokens < b * s:
+            out_flat[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y
 
 
@@ -144,7 +153,10 @@ def fla_cached_delta_rule_fake(
     delta_cache: torch.Tensor,  # [max_batch_size, H, K, V]
     # CONSTANTS
     scale: float,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
+    if out is not None:
+        return out
     return torch.empty_like(v)
 
 

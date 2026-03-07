@@ -21,7 +21,7 @@ This file contains two kinds of functionality:
    indexed SSM state caches per the auto_deploy attention interface.
 """
 
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 import torch
 from torch._ops import OpOverloadPacket
@@ -124,7 +124,7 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
 # ---------------------------------------------------------------
 
 
-@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args={})
+@torch.library.custom_op("auto_deploy::torch_cached_ssm", mutates_args=("out",))
 def _torch_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
@@ -147,6 +147,7 @@ def _torch_cached_ssm(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Flattened cached SSM transform op that respects slot-indexed state caches.
 
@@ -160,6 +161,7 @@ def _torch_cached_ssm(
 
     # get cleaned up metadata
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_total_tokens = num_prefill_tokens + num_decode
     num_seq = num_prefill + num_decode
     seq_len = seq_len[:num_seq]
     seq_start = cu_seqlen[:num_seq]
@@ -186,6 +188,16 @@ def _torch_cached_ssm(
 
         # Scatter updated states back to global cache
         ssm_state_cache.index_copy_(0, slot_idx_long, updated_state.to(ssm_state_cache.dtype))
+
+        if out is not None:
+            num_heads_out = hidden_states.shape[2]
+            head_dim_out = hidden_states.shape[3]
+            flat_out = out.view(b * s, num_heads_out, head_dim_out)
+            flat_y = y.view(b * s, num_heads_out, head_dim_out)
+            flat_out[:num_total_tokens].copy_(flat_y[:num_total_tokens].to(hidden_states.dtype))
+            if num_total_tokens < b * s:
+                flat_out[num_total_tokens:].zero_()
+            return out.new_empty(0)
 
         # return in the same dtype as the input
         return y.to(hidden_states.dtype)
@@ -246,6 +258,13 @@ def _torch_cached_ssm(
         slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
         ssm_state_cache.index_copy_(0, slot_i, ssm_state_i.to(ssm_state_cache.dtype))
 
+    if out is not None:
+        flat_out = out.view(b * s, *y.shape[2:])
+        flat_out[:num_total_tokens].copy_(y_flat[:num_total_tokens])
+        if num_total_tokens < b * s:
+            flat_out[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y
 
 
@@ -272,7 +291,10 @@ def _torch_cached_ssm_fake(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ):
+    if out is not None:
+        return out
     return torch.empty_like(
         hidden_states,
         memory_format=torch.contiguous_format,

@@ -30,7 +30,6 @@ from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
 from ...utils.cuda_graph import cuda_graph_state
-from ...utils.logger import ad_logger
 from ..attention_interface import (
     AttentionDescriptor,
     AttentionLayout,
@@ -445,7 +444,7 @@ def prepare_flashinfer_mla_metadata_host(
         )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_mla_with_cache", mutates_args=())
+@torch.library.custom_op("auto_deploy::flashinfer_mla_with_cache", mutates_args=("out",))
 def flashinfer_mla_with_cache(
     # 5 tensor args (matching torch_mla source op)
     q_nope: torch.Tensor,  # [B, S, N, qk_nope_head_dim]
@@ -471,6 +470,7 @@ def flashinfer_mla_with_cache(
     # Constants
     scale: Optional[float],
     kv_lora_rank: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FlashInfer MLA attention with paged cache.
 
@@ -527,15 +527,16 @@ def flashinfer_mla_with_cache(
     compressed_kv_flat = compressed_kv.contiguous().view(bs, kv_lora_rank)
     kpe_flat = kpe.contiguous().view(bs, qk_rope_head_dim)
 
-    # Cast to cache dtype for writes (no-op when dtypes already match).
-    compressed_kv_for_cache = compressed_kv_flat.to(ckv_cache.dtype)
-    kpe_for_cache = kpe_flat.to(kpe_cache.dtype)
+    # Convert cache dtype if needed
+    if ckv_cache.dtype == torch.float8_e4m3fn:
+        compressed_kv_flat = compressed_kv_flat.to(torch.float8_e4m3fn)
+        kpe_flat = kpe_flat.to(torch.float8_e4m3fn)
 
     # Append to paged cache using FlashInfer's append function
     # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
     flashinfer.page.append_paged_mla_kv_cache(
-        compressed_kv_for_cache[:num_total_tokens],
-        kpe_for_cache[:num_total_tokens],
+        compressed_kv_flat[:num_total_tokens],
+        kpe_flat[:num_total_tokens],
         flashinfer_batch_indices[:num_total_tokens],
         flashinfer_positions[:num_total_tokens],
         ckv_cache,
@@ -545,8 +546,10 @@ def flashinfer_mla_with_cache(
         last_page_len[:num_seq],
     )
 
-    # Pre-allocate output as zeros so padding positions are clean
-    y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
+    if out is not None:
+        y = out.view(bs, num_heads, v_head_dim)
+    else:
+        y = torch.zeros(bs, num_heads, v_head_dim, dtype=q_nope.dtype, device=q_nope.device)
 
     # =========================================================================
     # PREFILL phase: Use BatchPrefillWithRaggedKVCacheWrapper for regular prefill
@@ -748,6 +751,13 @@ def flashinfer_mla_with_cache(
 
         y[num_prefill_tokens:num_total_tokens] = y_decode
 
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
+        if num_total_tokens < bs:
+            y[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
     return y.view(b, s, num_heads, v_head_dim)
 
 
@@ -772,8 +782,12 @@ def flashinfer_mla_with_cache_fake(
     kpe_cache: torch.Tensor,
     scale: Optional[float],
     kv_lora_rank: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for flashinfer_mla_with_cache."""
+    if out is not None:
+        return out
+
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]
     out_features = kv_b_proj_weight.shape[0]
@@ -923,17 +937,7 @@ class FlashInferMLAAttention(AttentionDescriptor):
         if qk_rope_head_dim != 64:
             raise ValueError("qk_rope_head_dim must be 64 for flashinfer_mla")
 
-        model_dtype = compressed_kv_fake.dtype
-        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, model_dtype)
-
-        # FlashInfer MLA kernels currently require BF16 cache dtype.
-        if cache_dtype != torch.bfloat16:
-            ad_logger.warning(
-                "FlashInfer MLA requires BF16 KV cache; overriding %s to %s.",
-                cache_dtype,
-                torch.bfloat16,
-            )
-            cache_dtype = torch.bfloat16
+        cache_dtype = cls.resolve_cache_dtype(cache_config.dtype, compressed_kv_fake.dtype)
 
         # FlashInfer MLA uses two separate paged caches with no num_heads dimension
         return {

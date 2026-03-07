@@ -297,7 +297,9 @@ def prepare_trtllm_metadata_fake(
 # =============================================================================
 
 
-@torch.library.custom_op("auto_deploy::trtllm_attention_mha_with_cache", mutates_args=("kv_cache",))
+@torch.library.custom_op(
+    "auto_deploy::trtllm_attention_mha_with_cache", mutates_args=("kv_cache", "out")
+)
 def trtllm_mha_with_cache(
     # Q, K, V inputs
     q: torch.Tensor,
@@ -317,6 +319,7 @@ def trtllm_mha_with_cache(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """TRT-LLM attention with paged KV cache for Auto-Deploy.
 
@@ -367,9 +370,13 @@ def trtllm_mha_with_cache(
     v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
-    # Prepare output (pre-allocate at full padded size so padding positions are clean zeros)
+    # Prepare output: if caller provided an `out` buffer, write directly into it
     total_padded_tokens = q_shape_og[0] * q_shape_og[1]
-    output = torch.zeros(total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
+    if out is not None:
+        out_flat = out.view(-1, num_heads * head_dim)
+        output = out_flat[:num_tokens]
+    else:
+        output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
@@ -477,6 +484,17 @@ def trtllm_mha_with_cache(
         None,  # quant_q_buffer
     )
 
+    if out is not None:
+        if total_padded_tokens > num_tokens:
+            out_flat[num_tokens:].zero_()
+        return out.new_empty(0)
+
+    if total_padded_tokens > num_tokens:
+        padded_output = torch.zeros(
+            total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device
+        )
+        padded_output[:num_tokens] = output
+        return padded_output.view(*q_shape_og)
     return output.view(*q_shape_og)
 
 
@@ -500,8 +518,11 @@ def trtllm_mha_with_cache_fake(
     sliding_window: Optional[int] = None,
     kv_scale_orig_quant: float = 1.0,
     kv_scale_quant_orig: float = 1.0,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Fake implementation for torch.compile tracing."""
+    if out is not None:
+        return out.new_empty(0)
     return torch.empty_like(q.contiguous())
 
 
