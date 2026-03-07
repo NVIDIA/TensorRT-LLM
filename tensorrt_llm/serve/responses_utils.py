@@ -1415,7 +1415,7 @@ def _should_send_done_events(
     tool_parser_dict: Optional[dict[int, BaseToolParser]] = None,
     streaming_events_helper: Optional[ResponsesStreamingEventsHelper] = None,
     finished_generation: bool = False,
-) -> Tuple[bool, bool, Optional[str], Optional[str]]:
+) -> Tuple[bool, bool, Optional[str], Optional[str], List[ToolCallItem]]:
     """
     Determine if done events should be sent for text or reasoning items.
 
@@ -1434,7 +1434,9 @@ def _should_send_done_events(
 
     Returns:
         Tuple of (should_send_reasoning_done, should_send_text_done,
-                  reasoning_content, text_content)
+                  reasoning_content, text_content, tool_calls)
+        tool_calls is non-empty when should_send_text_done is True due to
+        text -> tool call transition (so caller can emit tool call output items).
     """
     should_send_reasoning_done = False
     should_send_text_done = False
@@ -1490,7 +1492,7 @@ def _should_send_done_events(
             should_send_reasoning_done = True
             reasoning_content = full_reasoning
 
-    return should_send_reasoning_done, should_send_text_done, reasoning_content, text_content
+    return should_send_reasoning_done, should_send_text_done, reasoning_content, text_content, tool_calls
 
 
 def _generate_streaming_event(
@@ -1528,7 +1530,6 @@ def _generate_streaming_event(
     )
 
     if delta_text:
-        # TODO(JunyiXu-nv): handle tool calls in streaming mode
         delta_text, calls = _apply_tool_parser(
             tool_parser_id=tool_parser_id,
             tools=available_tools,
@@ -1544,17 +1545,18 @@ def _generate_streaming_event(
         ))
 
     # Check if we need to send done events for completed sections
-    should_send_reasoning_done, should_send_text_done, reasoning_full_content, text_full_content = _should_send_done_events(
-        output=output,
-        output_index=output_idx,
-        reasoning_parser_id=reasoning_parser_id,
-        tool_parser_id=tool_parser_id,
-        tools=available_tools,
-        reasoning_parser_dict=reasoning_parser_dict,
-        tool_parser_dict=tool_parser_dict,
-        streaming_events_helper=streaming_events_helper,
-        finished_generation=finished_generation,
-    )
+    (should_send_reasoning_done, should_send_text_done, reasoning_full_content,
+     text_full_content, done_tool_calls) = _should_send_done_events(
+         output=output,
+         output_index=output_idx,
+         reasoning_parser_id=reasoning_parser_id,
+         tool_parser_id=tool_parser_id,
+         tools=available_tools,
+         reasoning_parser_dict=reasoning_parser_dict,
+         tool_parser_dict=tool_parser_dict,
+         streaming_events_helper=streaming_events_helper,
+         finished_generation=finished_generation,
+     )
 
     # Send done events if needed
     if should_send_reasoning_done and reasoning_full_content:
@@ -1594,6 +1596,24 @@ def _generate_streaming_event(
         streaming_events_helper.output_index_increment()
         streaming_events_helper.is_output_item_added_sent = False
         streaming_events_helper.is_text_sent = False
+
+        # Emit streaming tool call output items when text is done due to tool calls
+        if done_tool_calls:
+            for call in done_tool_calls:
+                streaming_events_helper.item_id = f"fc_{_random_uuid()}"
+                tool_call_item = ResponseFunctionToolCall(
+                    arguments=call.parameters,
+                    call_id=f"call_{_random_uuid()}",
+                    name=call.name or "",
+                    type="function_call",
+                    id=streaming_events_helper.item_id,
+                )
+                yield streaming_events_helper.get_output_item_added_event(
+                    tool_call_item)
+                yield streaming_events_helper.get_output_item_done_event(
+                    tool_call_item)
+                streaming_events_helper.output_index_increment()
+            streaming_events_helper.is_output_item_added_sent = False
 
     # Send delta events for ongoing content
     if delta_text:
