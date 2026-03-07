@@ -34,8 +34,8 @@ from tensorrt_llm.inputs.data import TokensPrompt, visual_gen_inputs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.inputs.utils import ConversationMessage, apply_chat_template
 from tensorrt_llm.llmapi import DisaggregatedParams as LlmDisaggregatedParams
-from tensorrt_llm.llmapi import (MultimodalEncoder, VisualGen, VisualGenParams,
-                                 tracing)
+from tensorrt_llm.llmapi import (MultimodalEncoder, SchedulingParams, VisualGen,
+                                 VisualGenParams, tracing)
 from tensorrt_llm.llmapi.disagg_utils import (DisaggClusterConfig,
                                               MetadataServerConfig, ServerRole)
 from tensorrt_llm.llmapi.llm import RequestOutput
@@ -56,7 +56,7 @@ from tensorrt_llm.serve.openai_protocol import (ChatCompletionRequest,
                                                 ErrorResponse, ImageEditRequest,
                                                 ImageGenerationRequest,
                                                 ImageGenerationResponse,
-                                                ImageObject,
+                                                ImageObject, KVCacheHintRequest,
                                                 MemoryUpdateRequest, ModelCard,
                                                 ModelList, PromptTokensDetails,
                                                 ResponsesRequest,
@@ -363,6 +363,10 @@ class OpenAIServer:
         self.app.add_api_route("/kv_cache_events",
                                self.get_kv_cache_events,
                                methods=["POST"])
+        self.app.add_api_route("/v1/kv_cache_hints",
+                               self.set_kv_cache_hints if not self.use_harmony
+                               else self.set_kv_cache_hints_harmony,
+                               methods=["POST"])
         self.app.add_api_route("/v1/completions",
                                self.openai_completion,
                                methods=["POST"])
@@ -653,6 +657,120 @@ class OpenAIServer:
             pass
         return JSONResponse(content=events)
 
+    async def set_kv_cache_hints(self, request: KVCacheHintRequest) -> Response:
+        # Currently only support truncate action
+        if request.action != "truncate":
+            return self.create_error_response(
+                message=f"Invalid action: {request.action}",
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST)
+
+        sampling_params = request.to_sampling_params(
+            vocab_size=self.tokenizer.tokenizer.vocab_size,
+            gather_generation_logits=self.generator.args.
+            gather_generation_logits,
+            backend=self.generator.args.backend)
+
+        tool_dicts = None if request.tools is None else [
+            tool.model_dump() for tool in request.tools
+        ]
+        add_generation_prompt = request.add_generation_prompt
+        documents = request.documents
+        chat_template = request.chat_template
+        chat_template_kwargs = request.chat_template_kwargs or {}
+
+        from openai.types.chat import ChatCompletionMessageParam
+
+        def convert_messages(
+                messages: List[ChatCompletionMessageParam]) -> List[int]:
+            try:
+                conversation: List[ConversationMessage] = []
+                conversation, _, __ = parse_chat_messages_coroutines(
+                    messages, self.model_config, None)
+                prompt: str = apply_chat_template(
+                    model_type=self.model_config.model_type,
+                    tokenizer=self.tokenizer,
+                    processor=self.processor,
+                    conversation=conversation,
+                    add_generation_prompt=add_generation_prompt,
+                    mm_placeholder_counts=[],
+                    tools=tool_dicts,
+                    documents=documents,
+                    chat_template=chat_template,
+                    chat_template_kwargs=chat_template_kwargs,
+                )
+                return prompt
+            except Exception as e:
+                logger.error(traceback.format_exc())
+                return self.create_error_response(str(e))
+
+        messages_to_retain = convert_messages(
+            request.messages_to_retain) if request.messages_to_retain else []
+        messages = convert_messages(
+            request.messages) if request.messages else []
+
+        self.generator.set_kv_cache_hints(
+            action="truncate",
+            messages_to_retain=messages_to_retain,
+            messages=messages,
+            sampling_params=sampling_params,
+        )
+
+        return Response(status_code=200)
+
+    def set_kv_cache_hints_harmony(self,
+                                   request: KVCacheHintRequest) -> Response:
+        if request.action != "truncate":
+            return self.create_error_response(
+                message=f"Invalid action: {request.action}",
+                err_type="InvalidRequestError",
+                status_code=HTTPStatus.BAD_REQUEST)
+
+        if not self.harmony_adapter:
+            self.harmony_adapter = get_harmony_adapter()
+
+        tools_dict = None
+        if request.tools:
+            tools_dict = [tool.model_dump() for tool in request.tools]
+        reasoning_effort = maybe_transform_reasoning_effort(
+            request.reasoning_effort)
+        tool_choice = getattr(request, 'tool_choice', None)
+
+        from openai.types.chat import ChatCompletionMessageParam
+
+        def convert_messages(
+                messages: List[ChatCompletionMessageParam]) -> List[int]:
+            try:
+                harmony_tokens = self.harmony_adapter.openai_to_harmony_tokens(
+                    messages,
+                    tools_dict,
+                    reasoning_effort=reasoning_effort,
+                    tool_choice=tool_choice)
+                return harmony_tokens
+            except Exception as e:
+                raise e
+
+        messages_to_retain = convert_messages(request.messages_to_retain)
+        messages = convert_messages(request.messages)
+
+        harmony_stop_tokens = self.harmony_adapter.get_stop_tokens()
+        if request.stop_token_ids:
+            request.stop_token_ids.extend(harmony_stop_tokens)
+        else:
+            request.stop_token_ids = harmony_stop_tokens
+
+        sampling_params = request.to_sampling_params(
+            vocab_size=self.tokenizer.tokenizer.vocab_size)
+        sampling_params.detokenize = False
+
+        self.generator.set_kv_cache_hints(
+            action="truncate",
+            messages_to_retain=messages_to_retain,
+            messages=messages,
+            sampling_params=sampling_params,
+        )
+        return Response(status_code=200)
+
     async def _extract_metrics(self, res: RequestOutput, raw_request: Request):
         if not res.finished:
             return
@@ -858,6 +976,9 @@ class OpenAIServer:
             trace_headers = (None if raw_request is None else
                              tracing.extract_trace_headers(raw_request.headers))
 
+            scheduling_params = SchedulingParams(
+                agent_hierarchy=request.agent_hierarchy)
+
             generate_inputs = prompt
             preprocess_fn = getattr(self.generator, "preprocess", None)
             if preprocess_fn is not None:
@@ -875,6 +996,7 @@ class OpenAIServer:
                 disaggregated_params=disaggregated_params,
                 cache_salt=request.cache_salt,
                 trace_headers=trace_headers,
+                scheduling_params=scheduling_params,
             )
             asyncio.create_task(self.await_disconnected(raw_request, promise))
             if not self.postproc_worker_enabled:
@@ -1241,6 +1363,9 @@ class OpenAIServer:
                 postproc_args=postproc_args,
             )
 
+            scheduling_params = SchedulingParams(
+                agent_hierarchy=request.agent_hierarchy)
+
             # Generate
             promise = self.generator.generate_async(
                 inputs=harmony_tokens,
@@ -1249,6 +1374,7 @@ class OpenAIServer:
                 if self.postproc_worker_enabled else None,
                 streaming=bool(request.stream),
                 lora_request=request.lora_request,
+                scheduling_params=scheduling_params,
                 disaggregated_params=disaggregated_params,
                 trace_headers=trace_headers,
             )
@@ -1256,6 +1382,7 @@ class OpenAIServer:
 
             if not self.postproc_worker_enabled:
                 postproc_args.num_prompt_tokens = len(promise.prompt_token_ids)
+                postproc_args.tokenizer = self.tokenizer
 
             # Disconnect cancellation
             asyncio.create_task(self.await_disconnected(raw_request, promise))

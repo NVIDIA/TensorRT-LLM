@@ -739,6 +739,19 @@ class ChoiceWithAlias(click.Choice):
               help=help_info_with_stability_tag(
                   "Path to a YAML file with extra VISUAL_GEN model options.",
                   "prototype"))
+@click.option(
+    "--agent_percentage",
+    type=float,
+    default=0.0,
+    help=
+    "The percentage of agent requests to schedule. Defaults to 0.0. Should be between 0.0 and 1.0."
+)
+@click.option(
+    "--agent_types",
+    type=str,
+    default=None,
+    help=
+    "Types of agents to schedule. Now Only Support Open Deep Research agent.")
 def serve(
         model: str, tokenizer: Optional[str], custom_tokenizer: Optional[str],
         host: str, port: int, log_level: str, backend: str, max_beam_width: int,
@@ -754,6 +767,7 @@ def serve(
         fail_fast_on_attention_window_too_large: bool,
         otlp_traces_endpoint: Optional[str], enable_chunked_prefill: bool,
         disagg_cluster_uri: Optional[str], media_io_kwargs: Optional[str],
+        agent_percentage: float, agent_types: Optional[str],
         custom_module_dirs: list[Path], chat_template: Optional[str],
         grpc: bool, served_model_name: Optional[str],
         extra_visual_gen_options: Optional[str]):
@@ -797,7 +811,9 @@ def serve(
             fail_fast_on_attention_window_too_large=
             fail_fast_on_attention_window_too_large,
             otlp_traces_endpoint=otlp_traces_endpoint,
-            enable_chunked_prefill=enable_chunked_prefill)
+            enable_chunked_prefill=enable_chunked_prefill,
+            agent_percentage=agent_percentage,
+            agent_types=agent_types)
 
         llm_args_extra_dict = {}
         if extra_llm_api_options is not None:

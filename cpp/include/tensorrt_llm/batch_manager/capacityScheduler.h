@@ -18,9 +18,11 @@
 
 #include "common.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h"
+#include "tensorrt_llm/batch_manager/reorderPolicy.h"
 #include "tensorrt_llm/common/algorithm.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/runtime/common.h"
+#include <memory>
 #include <variant>
 
 namespace tensorrt_llm::batch_manager
@@ -30,6 +32,7 @@ namespace kv_cache_manager
 class BaseKVCacheManager;
 }
 class BasePeftCacheManager;
+
 } // namespace tensorrt_llm::batch_manager
 
 namespace tensorrt_llm::batch_manager
@@ -167,10 +170,20 @@ public:
         OptionalRef<BasePeftCacheManager const> peftCacheManager = std::nullopt,
         OptionalRef<kv_cache_manager::BaseKVCacheManager const> crossKvCacheManager = std::nullopt) const;
 
+    /// @brief Sets the reorder policy to use AgentTreePolicy with the given configuration.
+    /// @param agentPercentage The ratio of agent requests to schedule (0.0-1.0, -1.0 for random).
+    /// @param agentTypes The list of agent types to schedule.
+    /// @param agentInflightSeqNum The maximum number of inflight sequences for agent requests.
+    void setAgentTreeReorderPolicy(
+        float agentPercentage, std::optional<std::vector<std::string>> agentTypes, SizeType32 agentInflightSeqNum);
+
 private:
     std::variant<std::monostate, MaxRequestsScheduler, MaxUtilizationScheduler, GuaranteedNoEvictScheduler,
         StaticBatchScheduler>
         mScheduler;
+
+    /// Optional reorder policy for reordering requests before scheduling.
+    std::unique_ptr<ReorderPolicy> mReorderPolicy;
 };
 
 } // namespace tensorrt_llm::batch_manager

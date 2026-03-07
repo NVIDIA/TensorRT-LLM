@@ -11,8 +11,9 @@ import sys
 import pytest
 from llmapi.apps.openai_server import RemoteOpenAIServer
 
-from tensorrt_llm.scaffolding import (GenerationTask, TaskStatus, TRTLLMWorker,
-                                      TRTOpenaiWorker)
+from tensorrt_llm.scaffolding import (ChatTask, GenerationTask, TaskStatus,
+                                      TRTLLMWorker, TRTOpenaiWorker,
+                                      UserMessage)
 
 sys.path.append(os.path.join(os.path.dirname(__file__), '..'))
 from llmapi.test_llm import get_model_path
@@ -32,7 +33,8 @@ def default_prompt():
 
 @pytest.fixture(scope="module")
 def model_name():
-    return "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
+    #return "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-7B"
+    return "gpt-oss-20b"
 
 
 @pytest.fixture(scope="module", params=['pytorch'])
@@ -74,6 +76,16 @@ def test_trtoai_worker_generation(default_prompt, model_name, server):
         worker.shutdown()
         server.__exit__(None, None, None)
         raise e
+
+
+@pytest.mark.asyncio(loop_scope="module")
+def test_trtoai_worker_chat(default_prompt, model_name, server):
+    worker = create_trtoai_worker(model_name, server.get_async_client())
+    task = ChatTask.create_from_messages([UserMessage(default_prompt)])
+    task.max_tokens = 100
+    status = asyncio.run(worker.run_task(task))
+    assert status == TaskStatus.SUCCESS, "Chat Task is not successful with TRTOpenaiWorker"
+    worker.shutdown()
 
 
 def create_trtllm_worker(model_path):

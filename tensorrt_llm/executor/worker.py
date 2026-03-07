@@ -24,7 +24,7 @@ from .base_worker import BaseWorker, _init_hf_modules
 from .ipc import FusedIpcQueue, IpcQueue
 from .postproc_worker import (PostprocWorker, PostprocWorkerConfig,
                               postproc_worker_main)
-from .request import CancellingRequest, GenerationRequest
+from .request import CancellingRequest, GenerationRequest, KVCacheHintRequest
 from .rpc_worker_mixin import RpcWorkerMixin
 from .utils import ErrorResponse, RequestError, WorkerCommIpcAddrs
 
@@ -331,6 +331,8 @@ def worker_main(
                             logger.error(traceback.format_exc())
                             worker._await_response_helper.temp_error_responses.put(
                                 ErrorResponse(req.id, e, req.id))
+                    elif isinstance(req, KVCacheHintRequest):
+                        worker.set_kv_cache_hints(req)
                     else:
                         raise ValueError(f"Unknown request type: {type(req)}")
 

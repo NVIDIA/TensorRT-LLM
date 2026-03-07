@@ -836,6 +836,33 @@ void WindowBlockManager::freeChildren(BlockPtr const& block)
     block->freeBlockAndAllDescendants();
 }
 
+void WindowBlockManager::releaseChildren(BlockPtr const& block, bool toFront)
+{
+    // Release all descendants of block
+    for (auto const& p : block->getNextBlocks())
+    {
+        auto childBlock = p.second;
+        releaseChildren(childBlock, toFront);
+    }
+
+    // Free block from radix tree
+    if (mEventManager && blockInRadixTree(block))
+    {
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
+    }
+    freeLeafBlock(block);
+
+    if (!block->hasRefs())
+    {
+        mEvictionPolicy->claimBlock(block, executor::KvCacheRetentionConfig::kMinRetentionPriority, std::nullopt);
+        mEvictionPolicy->releaseBlock(block, toFront);
+    }
+    else
+    {
+        block->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+    }
+}
+
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -1281,6 +1308,57 @@ void WindowBlockManager::refreshBlocks()
 {
     mEvictionPolicy->refresh();
     mTransferManager->syncTransfers();
+}
+
+void BlockManager::truncateBlocks(
+    LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep, SizeType32 windowSize)
+{
+    mWindowBlockManagers.at(windowSize).truncateBlocks(targetTokens, numTokensToKeep);
+}
+
+void WindowBlockManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    auto numTokens = static_cast<SizeType32>(targetTokens.size());
+    auto blockedTokens = chopVectorIntoBlocks<TokenIdType>(targetTokens, numTokens, mTokensPerBlock, true);
+    SizeType32 numMatchedTokens = 0;
+
+    std::vector<BlockKey> blockKeys;
+    for (auto const& blockedTokensList : blockedTokens)
+    {
+        blockKeys.emplace_back(blockedTokensList, std::nullopt);
+    }
+
+    auto searchRoot = mCachedBlocksRoot;
+    for (auto const& blockKey : blockKeys)
+    {
+        // dump the tokens of the block key by loop
+        std::string tokenStr;
+        for (auto const& token : blockKey.uniqueTokens)
+        {
+            tokenStr += std::to_string(token.tokenId) + " ";
+        }
+        TLLM_LOG_DEBUG("%s::truncateBlocks - Tokens: %s", mLogPrefix.c_str(), tokenStr.c_str());
+
+        auto [partialMatch, numMatched, matchingBlock] = searchRoot != nullptr
+            ? searchRoot->findMatchingBlock(blockKey, mEnablePartialReuse, mCopyOnPartialReuse)
+            : std::make_tuple(false, 0, nullptr);
+        if (matchingBlock != nullptr)
+        {
+            if (numMatchedTokens > numTokensToKeep)
+            {
+                releaseChildren(matchingBlock);
+                break;
+            }
+
+            numMatchedTokens += numMatched > 0 ? numMatched : blockKey.uniqueTokens.size();
+            searchRoot = matchingBlock;
+        }
+        else
+        {
+            break;
+        }
+    }
 }
 
 // There are two versions of BlockManager::addSequence function.
@@ -2628,6 +2706,14 @@ std::map<SizeType32, std::vector<SizeType32>> BaseKVCacheManager::groupLayersByW
         uniqueWindowSizeToLayers[windowSize].push_back(layerIdx);
     }
     return uniqueWindowSizeToLayers;
+}
+
+void KVCacheManager::truncateBlocks(LlmRequest::VecTokens const& targetTokens, SizeType32 numTokensToKeep)
+{
+    for (auto const& [windowSize, metadata] : mBlockManager.getWindowSizesMetadata())
+    {
+        mBlockManager.truncateBlocks(targetTokens, numTokensToKeep, windowSize);
+    }
 }
 
 std::tuple<uint64_t, uint64_t> BaseKVCacheManager::calculateFreeMemBytes(
