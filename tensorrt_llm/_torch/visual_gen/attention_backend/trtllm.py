@@ -248,30 +248,26 @@ class TrtllmAttention(BaseTrtllmAttention):
         kv_seq_len = seq_len_kv if seq_len_kv is not None else seq_len
 
         if self.sage_attention_config is not None:
-            # SageAttention kernel only supports single-request metadata,
-            # and requires contiguous Q/K/V tensors.
+            # SageAttention kernel requires separate Q/K/V tensors.
             sage_cfg = self.sage_attention_config
-            prepared_metadata = self.metadata.prepare(1, seq_len)
-            outputs = []
-            for i in range(batch_size):
-                qi = q[i].contiguous().view(seq_len, -1)
-                ki = k[i].contiguous().view(kv_seq_len, -1)
-                vi = v[i].contiguous().view(kv_seq_len, -1)
-                out_i = super().forward(
-                    q=qi,
-                    k=ki,
-                    v=vi,
-                    metadata=prepared_metadata,
-                    attention_mask=attention_mask,
-                    sage_attn_num_elts_per_blk_q=sage_cfg.num_elts_per_blk_q,
-                    sage_attn_num_elts_per_blk_k=sage_cfg.num_elts_per_blk_k,
-                    sage_attn_num_elts_per_blk_v=sage_cfg.num_elts_per_blk_v,
-                    sage_attn_qk_int8=sage_cfg.qk_int8,
-                )
-                outputs.append(out_i)
-            output = torch.stack(outputs, dim=0)  # [B, S, H*D]
+            q = q.reshape(batch_size * seq_len, -1).contiguous()
+            k = k.reshape(batch_size * kv_seq_len, -1).contiguous()
+            v = v.reshape(batch_size * kv_seq_len, -1).contiguous()
+            prepared_metadata = self.metadata.prepare(batch_size, seq_len)
+            output = super().forward(
+                q=q,
+                k=k,
+                v=v,
+                metadata=prepared_metadata,
+                attention_mask=attention_mask,
+                sage_attn_num_elts_per_blk_q=sage_cfg.num_elts_per_blk_q,
+                sage_attn_num_elts_per_blk_k=sage_cfg.num_elts_per_blk_k,
+                sage_attn_num_elts_per_blk_v=sage_cfg.num_elts_per_blk_v,
+                sage_attn_qk_int8=sage_cfg.qk_int8,
+            )
+            output = output.view(batch_size, seq_len, -1)
         else:
-            # Standard path: fuse QKV — supports multi-request metadata.
+            # Standard path: fuse QKV.
             q = q.view(batch_size * seq_len, -1)
             k = k.view(batch_size * kv_seq_len, -1)
             v = v.view(batch_size * kv_seq_len, -1)

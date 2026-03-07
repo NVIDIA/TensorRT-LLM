@@ -135,6 +135,7 @@ def _test_attention_trtllm_sage(
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for TRTLLM attention.")
+@pytest.mark.parametrize("batch_size", [1, 2, 4])
 @pytest.mark.parametrize("gqa_groups", [1, 2, 4])
 @pytest.mark.parametrize("num_heads", [4, 12, 16])
 @pytest.mark.parametrize("seq_len", [128, 256, 1024, 8192])
@@ -147,9 +148,10 @@ def _test_attention_trtllm_sage(
     ],
 )
 def test_attention_trtllm_sage(
+    seq_len: int,
     num_heads: int,
     gqa_groups: int,
-    seq_len: int,
+    batch_size: int,
     out_dtype: torch.dtype,
     sage_attn_qk_int8: bool,
     atol: float,
@@ -165,6 +167,7 @@ def test_attention_trtllm_sage(
         num_kv_heads=num_heads // gqa_groups,
         head_dim=128,
         seq_len=seq_len,
+        batch_size=batch_size,
         amp_mul=3.2,
         sage_attn_qk_int8=sage_attn_qk_int8,
         out_dtype=out_dtype,
