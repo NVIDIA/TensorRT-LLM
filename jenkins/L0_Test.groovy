@@ -3058,7 +3058,7 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
     }
     // Test preview installation
-    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest==9.0.2 tensorrt_llm-*.whl'")
     if (env.alternativeTRT) {
         sh "bash -c 'pip3 show tensorrt || true'"
     }
