@@ -26,7 +26,9 @@
 #include "tensorrt_llm/plugins/gemmPlugin/gemmPlugin.h"
 #include "tensorrt_llm/plugins/gemmSwigluPlugin/gemmSwigluPlugin.h"
 #include "tensorrt_llm/plugins/gptAttentionPlugin/gptAttentionPlugin.h"
+#include "tensorrt_llm/plugins/aetherSparseAttentionPlugin/aetherSparseAttentionPlugin.h"
 #include "tensorrt_llm/plugins/identityPlugin/identityPlugin.h"
+
 #include "tensorrt_llm/plugins/layernormQuantizationPlugin/layernormQuantizationPlugin.h"
 #include "tensorrt_llm/plugins/lookupPlugin/lookupPlugin.h"
 #include "tensorrt_llm/plugins/loraPlugin/loraPlugin.h"
@@ -206,7 +208,9 @@ extern "C"
 
     [[maybe_unused]] nvinfer1::IPluginCreator* const* getPluginCreators(std::int32_t& nbCreators)
     {
+        static tensorrt_llm::plugins::AetherSparseAttentionPluginCreator aetherSparseAttentionPluginCreator;
         static tensorrt_llm::plugins::IdentityPluginCreator identityPluginCreator;
+
         static tensorrt_llm::plugins::BertAttentionPluginCreator bertAttentionPluginCreator;
         static tensorrt_llm::plugins::FusedLayernormPluginCreator fusedLayernormPluginCreator;
         static tensorrt_llm::plugins::GPTAttentionPluginCreator gptAttentionPluginCreator;
@@ -248,8 +252,10 @@ extern "C"
         static tensorrt_llm::plugins::CudaStreamPluginCreator cudaStreamPluginCreator;
 
         static std::array pluginCreators
-            = { creatorPtr(identityPluginCreator),
+            = { creatorPtr(aetherSparseAttentionPluginCreator),
+                  creatorPtr(identityPluginCreator),
                   creatorPtr(bertAttentionPluginCreator),
+
                   creatorPtr(gptAttentionPluginCreator),
                   creatorPtr(gemmPluginCreator),
                   creatorPtr(gemmSwigluPluginCreator),
