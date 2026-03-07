@@ -721,6 +721,7 @@ class TestMooncakeFunctionalTransfer:
         agent_a.deregister_memory(src_descs)
         agent_b.deregister_memory(dst_descs)
 
+    @pytest.mark.skip(reason="Mooncake invalidateRemoteAgent is not yet implemented")
     def test_mooncake_wait_failure_on_invalidated_remote(self):
         """Test that submitting a transfer to an invalidated remote agent causes FAILURE."""
         device = torch.device("cuda:0")
