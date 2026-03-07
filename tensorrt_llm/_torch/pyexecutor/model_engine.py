@@ -2245,8 +2245,7 @@ class PyTorchModelEngine(ModelEngine):
         # next_draft_tokens, all generation requests go to generation_requests
         # directly — skip per-request classification.
         if not self.enable_spec_decode and next_draft_tokens_device is None:
-            generation_requests = list(
-                scheduled_requests.generation_requests)
+            generation_requests = list(scheduled_requests.generation_requests)
         else:
             extend_dummy_requests = []
             generation_requests = []
@@ -2563,9 +2562,9 @@ class PyTorchModelEngine(ModelEngine):
                             mrope_position_deltas = multimodal_params.multimodal_data[
                                 'mrope_config']['mrope_position_deltas']
                             # NOTE: Expanding position_ids to 3D tensor who is using mrope
-                            gen_mrope_position_ids = (past_seen_token_num +
-                                                      mrope_position_deltas).expand(
-                                                          3, 1, 1)
+                            gen_mrope_position_ids = (
+                                past_seen_token_num +
+                                mrope_position_deltas).expand(3, 1, 1)
                             mrope_position_ids.append(gen_mrope_position_ids)
                             if mrope_position_deltas.device.type == "cpu":
                                 multimodal_params.to_device(

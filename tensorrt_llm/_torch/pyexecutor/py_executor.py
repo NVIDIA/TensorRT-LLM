@@ -3288,7 +3288,8 @@ class PyExecutor:
                     responses = gather_responses
         if logger.level in ("debug", "verbose", "trace"):
             logger.debug(
-                f'after gather, rank = {self.dist.rank}, responses = {responses}')
+                f'after gather, rank = {self.dist.rank}, responses = {responses}'
+            )
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
@@ -3377,7 +3378,8 @@ class PyExecutor:
                         requests=[request])
                 continue
 
-            if kv_cache_transceiver is not None and request.is_generation_only_request() and not request.is_finished:
+            if kv_cache_transceiver is not None and request.is_generation_only_request(
+            ) and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
@@ -3396,8 +3398,9 @@ class PyExecutor:
                     request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            perf_manager.append_step_metrics(
-                request, iter_counter, batch_token_time=batch_token_time)
+            perf_manager.append_step_metrics(request,
+                                             iter_counter,
+                                             batch_token_time=batch_token_time)
 
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
@@ -3416,8 +3419,8 @@ class PyExecutor:
                     new_responses.append((req_id, response))
 
             if request_done:
-                if (has_drafter and getattr(
-                        self.model_engine, 'enable_spec_decode', False)
+                if (has_drafter and getattr(self.model_engine,
+                                            'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled
                         and not request.is_dummy and not self.is_warmup):
                     if self.speculation_gate is not None:

@@ -3290,7 +3290,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         actual_draft_len = len(draft_tokens)
                         req.py_num_accepted_draft_tokens = num_accepted
                         req.py_rewind_len = actual_draft_len - num_accepted
-                        _handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1 + num_accepted)
+                        _handle_logprobs(
+                            req, logprobs_state_list=logprobs_state_list, count=1 + num_accepted
+                        )
                 req.py_decoding_iter += 1
                 if req.py_stop_words_list:
                     _finish_reasons_handler_store.num_accepted_draft_tokens_host[
@@ -3339,12 +3341,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     actual_draft_len = len(draft_tokens)
                     req.py_num_accepted_draft_tokens = num_accepted
                     req.py_rewind_len = actual_draft_len - num_accepted
-                    _handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1 + num_accepted)
+                    _handle_logprobs(
+                        req, logprobs_state_list=logprobs_state_list, count=1 + num_accepted
+                    )
                 req.py_decoding_iter += 1
                 if req.py_stop_words_list:
-                    _finish_reasons_handler_store.num_accepted_draft_tokens_host[
-                        seq_slot
-                    ] = req.py_num_accepted_draft_tokens
+                    _finish_reasons_handler_store.num_accepted_draft_tokens_host[seq_slot] = (
+                        req.py_num_accepted_draft_tokens
+                    )
 
     def _return_log_probs(self, requests: list[LlmRequest]) -> bool:
         return any(req.py_return_log_probs for req in requests)
@@ -3392,8 +3396,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Use py_max_beam_num_tokens (cached during _prepare_tp_inputs) to
         # avoid C++ boundary crossings; fall back to C++ for context requests.
         seq_lens_host = torch.tensor(
-            [r.py_max_beam_num_tokens if r.py_max_beam_num_tokens is not None
-             else r.max_beam_num_tokens for r in requests],
+            [
+                r.py_max_beam_num_tokens
+                if r.py_max_beam_num_tokens is not None
+                else r.max_beam_num_tokens
+                for r in requests
+            ],
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
