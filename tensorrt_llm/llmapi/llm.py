@@ -482,11 +482,20 @@ class BaseLLM:
         """
         inputs = prompt_inputs(inputs)
 
+        # A fast path for token IDs & MM data is available for a VLM if the input processor has the following methods.
+        # TODO: Once all the VLMs support the fast path, remove this flag and modify the remaining logic accordingly.
+        vlm_fast_path_for_token_ids_and_mm_data_available = (
+            hasattr(self.input_processor, "get_text_with_mm_placeholders")
+            and hasattr(self.input_processor, "expand_prompt_token_ids_for_mm"))
+
         if not inputs.get("prompt") and inputs.get("prompt_token_ids") and (
                 inputs.get("multi_modal_data")
                 or inputs.get("multi_modal_embeddings")) and not isinstance(
-                    self.input_processor, DefaultInputProcessor):
-            # VLMs need to process/tokenize the prompt in their own way
+                    self.input_processor, DefaultInputProcessor
+                ) and not vlm_fast_path_for_token_ids_and_mm_data_available:
+            # VLMs need to process/tokenize the prompt in their own way,
+            # if they don't have the fast path for token IDs & MM data implemented yet.
+            # TODO: Once all the VLMs support the fast path, we can remove this detokenization step entirely.
             prompt = self.tokenizer.decode(inputs['prompt_token_ids'])
             inputs = TextPrompt(
                 prompt=prompt,
@@ -515,7 +524,9 @@ class BaseLLM:
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
             prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
-                inputs, mm_handles)
+                inputs["prompt_token_ids"] if
+                vlm_fast_path_for_token_ids_and_mm_data_available else inputs,
+                mm_handles)
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
@@ -540,7 +551,9 @@ class BaseLLM:
                     multimodal_input=multimodal_input,
                     multimodal_data=multimodal_data,
                 )
-        elif "prompt_token_ids" in inputs:
+        elif ("prompt_token_ids" in inputs
+              and inputs.get("multi_modal_data") is None
+              and inputs.get("multi_modal_embeddings") is None):
             prompt_token_ids = inputs['prompt_token_ids']
             query_token_ids = inputs.get("query_token_ids", None)
             multimodal_data = {}
@@ -560,7 +573,9 @@ class BaseLLM:
             if multimodal_data:
                 multimodal_params = MultimodalParams(
                     multimodal_data=multimodal_data)
-        elif "prompt" in inputs:
+        elif "prompt" in inputs or ("prompt_token_ids" in inputs and
+                                    (("multi_modal_data" in inputs
+                                      or "multi_modal_embeddings" in inputs))):
             if 'multi_modal_data' in inputs:
                 # TODO: The current design uses a wrapper for existing input processor (input_processor_with_hash)
                 # to handle/add multimodal hashes, positions, and lengths. Now we only support image modality.
@@ -582,7 +597,7 @@ class BaseLLM:
                 with nvtx_range_debug("input_processor"):
                     prompt_token_ids, extra_processed_inputs = self.input_processor(
                         inputs, sampling_params)
-            prompt = inputs['prompt']
+            prompt = inputs.get("prompt")
             if extra_processed_inputs is not None:
                 query_token_ids = extra_processed_inputs.get('query_token_ids')
                 # Create unified MultimodalParams
