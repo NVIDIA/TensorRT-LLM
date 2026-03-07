@@ -202,7 +202,9 @@ find_package(NCCL 2 REQUIRED)
 set(NCCL_LIB NCCL::nccl)
 
 # TRT dependencies
-set(TensorRT_ROOT /usr/local/tensorrt)
+if(EXISTS /usr/local/tensorrt)
+  set(TensorRT_ROOT /usr/local/tensorrt)
+endif()
 find_package(TensorRT 10 REQUIRED)
 add_definitions("-DTRT_LLM_USE_DIM64")
 
