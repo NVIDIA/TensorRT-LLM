@@ -27,6 +27,9 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 * [01/09] Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs)
 
+<details>
+<summary>Previous Blogs</summary>
+
 * [10/13] Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html)
 
@@ -63,7 +66,14 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 * [05/16] Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs
 ✨ [➡️ link](https://nvidia.github.io/TensorRT-LLM/blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html)
 
+</details>
+
 ## Latest News
+* [2026/03/05] Suffix Automaton, contributed by Baseten, adds further acceleration to MTP, Eagle, and PARD [➡️ link](https://www.baseten.co/blog/boosting-mtp-acceptance-rates-in-baseten-speculation-engine/)
+
+<details close>
+<summary>Previous News</summary>
+
 * [08/05] 🌟 TensorRT LLM delivers Day-0 support for OpenAI's latest open-weights models: GPT-OSS-120B [➡️ link](https://huggingface.co/openai/gpt-oss-120b) and GPT-OSS-20B [➡️ link](https://huggingface.co/openai/gpt-oss-20b)
 * [07/15] 🌟 TensorRT LLM delivers Day-0 support for LG AI Research's latest model, EXAONE 4.0 [➡️ link](https://huggingface.co/LGAI-EXAONE/EXAONE-4.0-32B)
 * [06/17] Join NVIDIA and DeepInfra for a developer meetup on June 26 ✨ [➡️ link](https://events.nvidia.com/scaletheunscalablenextgenai)
@@ -92,10 +102,6 @@ state-of-the-art optimizations to perform inference efficiently on NVIDIA GPUs.<
 
 * [02/12] 🌟 How Scaling Laws Drive Smarter, More Powerful AI
 [➡️ link](https://blogs.nvidia.com/blog/ai-scaling-laws/?ncid=so-link-889273&linkId=100000338837832)
-
-
-<details close>
-<summary>Previous News</summary>
 
 * [2025/01/25] Nvidia moves AI focus to inference cost, efficiency [➡️ link](https://www.fierceelectronics.com/ai/nvidia-moves-ai-focus-inference-cost-efficiency?linkId=100000332985606)
 
