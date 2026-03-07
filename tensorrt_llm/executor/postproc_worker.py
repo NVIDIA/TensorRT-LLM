@@ -13,7 +13,8 @@ from ..llmapi.tokenizer import TransformersTokenizer, load_hf_tokenizer
 from ..llmapi.utils import print_traceback_on_error
 from ..sampling_params import SamplingParams
 from .ipc import ZeroMqQueue
-from .utils import is_llm_response
+from .utils import is_llm_response, ErrorResponse
+from ..llmapi.utils import print_colored
 
 if TYPE_CHECKING:
     from .result import (DetokenizedGenerationResultBase, GenerationResult,
@@ -124,6 +125,19 @@ class PostprocWorker:
         self, input: Union["PostprocWorker.Input", "ResponseWrapper"]
     ) -> [Any, Optional[dict[str, float]]]:
         ''' Handle a single response from await_response worker. '''
+        
+        # Check if input.rsp is an ErrorResponse before accessing its result
+        if hasattr(input, 'rsp') and isinstance(input.rsp, ErrorResponse):
+            # Handle error response appropriately
+            # req_id = input.rsp.client_id
+            # # If record exists for this request, handle the error response
+            # if req_id in self._records:
+            #     record = self._records[req_id]
+            #     record._handle_response(input.rsp)
+            print_colored(
+                f"Error response received for request {input.rsp.request_id} and message {input.rsp.error_msg}\n","yellow")
+            return input.rsp, {}, None, None
+
         if input.rsp.result.context_logits is not None or \
               input.rsp.result.generation_logits is not None:
             raise ValueError(
@@ -131,8 +145,8 @@ class PostprocWorker:
                 "sent to postprocessing workers.")
 
         with nvtx_range_debug("handle_input",
-                              color="yellow",
-                              category="Postproc"):
+                          color="yellow",
+                          category="Postproc"):
             req_id = input.rsp.client_id
             if req_id not in self._records:
                 # TODO: support variant creation later
@@ -180,22 +194,45 @@ class PostprocWorker:
             assert isinstance(
                 inp, PostprocWorker.Input
             ), f"Expect PostprocWorker.Input, got {type(inp)}."
-            client_id = inp.rsp.client_id
-            is_final = inp.rsp.result.is_final if is_llm_response(
-                inp.rsp) else True
-            res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
-                inp)
-            batch.append(
-                PostprocWorker.Output(
-                    client_id=client_id,
-                    res=res,
-                    is_final=is_final,
-                    metrics=metrics,
-                    request_perf_metrics=perf_metrics,
-                    disaggregated_params=disaggregated_params,
-                ))
-            if is_final:
-                self._records.pop(client_id)
+            
+            # Check if the response is an error response
+            if isinstance(inp.rsp, ErrorResponse):
+                # Create an error response to handle
+                client_id = inp.rsp.client_id
+                is_final = True  # Error responses are always final
+                
+                # Handle the error response in _handle_input
+                res, metrics, perf_metrics, disaggregated_params = await self._handle_input(inp)
+                
+                batch.append(
+                    PostprocWorker.Output(
+                        client_id=client_id,
+                        res=res,
+                        is_final=is_final,
+                        metrics=metrics,
+                        request_perf_metrics=perf_metrics,
+                        disaggregated_params=disaggregated_params,
+                    ))
+                # Remove the record since error responses are final
+                if client_id in self._records:
+                    self._records.pop(client_id)
+            else:
+                client_id = inp.rsp.client_id
+                is_final = inp.rsp.result.is_final if is_llm_response(
+                    inp.rsp) else True
+                res, metrics, perf_metrics, disaggregated_params = await self._handle_input(
+                    inp)
+                batch.append(
+                    PostprocWorker.Output(
+                        client_id=client_id,
+                        res=res,
+                        is_final=is_final,
+                        metrics=metrics,
+                        request_perf_metrics=perf_metrics,
+                        disaggregated_params=disaggregated_params,
+                    ))
+                if is_final:
+                    self._records.pop(client_id)
 
         while not self._to_stop.is_set():
             batch = []
