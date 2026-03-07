@@ -239,6 +239,13 @@ class KvCacheConnectorScheduler(ABC):
             block_ids: The KV cacheblock IDs that were allocated.
         """
 
+    def wait_for_initialization(self):
+        """
+        Some connectors need to wait for some resources to be initialized.
+        For example, FlexKV needs to wait for the FlexKV manager to be initialized.
+        """
+        return
+
 
 # An internal dataclass to handle async saving/loading requests.
 @dataclass
@@ -476,6 +483,9 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
         return ready_requests
 
     def handle_metadata(self) -> object:
+        if self._scheduler_output is None:
+            return
+
         metadata = self._run_on_leader(
             lambda: self.scheduler.build_connector_meta(self._scheduler_output))
 
@@ -567,3 +577,7 @@ class KvCacheConnectorManager(KvCacheConnectorManagerCpp):
 
     def layer_post_hook(self, module, *args):
         self.worker.save_kv_layer(module.layer_idx, torch.cuda.current_stream())
+
+    def wait_for_initialization(self):
+        if self.scheduler is not None:
+            self.scheduler.wait_for_initialization()
