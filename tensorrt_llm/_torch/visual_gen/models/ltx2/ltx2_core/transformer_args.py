@@ -1,5 +1,7 @@
-# Ported from https://github.com/Lightricks/LTX-2
-# packages/ltx-core/src/ltx_core/model/transformer/transformer_args.py
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
+
 # Orchestration logic that wires patchify, AdaLN, caption projection, and RoPE
 # generation into a unified TransformerArgs dataclass for the transformer blocks.
 

@@ -1,6 +1,8 @@
-# LTX-2 Transformer built from TRT-LLM primitives.
-#
-# Architecture ported from https://github.com/Lightricks/LTX-2 (ltx-core),
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
+
+# Architecture ported from LTX-2,
 # with compute-heavy components replaced by TRT-LLM optimized modules:
 #   - Linear projections  → tensorrt_llm._torch.modules.linear.Linear
 #   - RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
@@ -8,7 +10,7 @@
 #   - Attention backend    → tensorrt_llm._torch.visual_gen.attention_backend
 #
 # Architecture-specific components (RoPE, AdaLN, timestep/text embeddings,
-# modality dataclass, transformer args) are ported from Lightricks and live
+# modality dataclass, transformer args) are ported from LTX-2 and live
 # in the ltx2_core/ subpackage.
 
 from __future__ import annotations

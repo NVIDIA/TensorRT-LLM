@@ -1,4 +1,7 @@
-# Copyright 2025 Lightricks. Ported from https://github.com/Lightricks/LTX-2
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
+
 # LTX-2 sigma schedulers (token-count-dependent shift).
 
 import math

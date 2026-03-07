@@ -1,5 +1,6 @@
-# Copyright 2025 Lightricks. Ported from https://github.com/Lightricks/LTX-2
-# Protocols for schedulers, guiders, diffusion steps, patchifiers.
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
 from typing import Protocol, Tuple
 

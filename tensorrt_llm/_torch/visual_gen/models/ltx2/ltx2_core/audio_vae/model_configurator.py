@@ -1,5 +1,6 @@
-# Ported from https://github.com/Lightricks/LTX-2
-# Simplified configurators (decoder-only: encoder removed).
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
 from ..normalization import NormType
 from .audio_vae import AudioDecoder

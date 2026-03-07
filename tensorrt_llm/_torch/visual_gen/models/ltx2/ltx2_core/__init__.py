@@ -1,5 +1,6 @@
-# LTX-2 core components ported from https://github.com/Lightricks/LTX-2
-# Native implementations replacing diffusers dependencies.
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
 from .adaln import AdaLayerNormSingle
 from .attention import Attention, FeedForward, GELUApprox

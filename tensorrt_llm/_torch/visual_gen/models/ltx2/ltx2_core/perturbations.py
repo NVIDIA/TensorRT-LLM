@@ -1,7 +1,8 @@
-"""Perturbation configs for STG (spatiotemporal guidance).
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
-Ported from the Lightricks reference:
-  packages/ltx-core/src/ltx_core/guidance/perturbations.py
+"""Perturbation configs for STG (spatiotemporal guidance).
 
 A perturbation masks out the contribution of an attention sub-layer for
 selected transformer blocks and batch elements.  During the "perturbed"

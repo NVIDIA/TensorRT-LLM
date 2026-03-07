@@ -1,14 +1,14 @@
-"""Multi-modal guidance for LTX-2 diffusion.
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
-Ported from the Lightricks reference:
-  packages/ltx-core/src/ltx_core/components/guiders.py
-
-Supports three guidance modes combined additively:
-  - **CFG** (classifier-free guidance): positive vs. negative text conditioning
-  - **STG** (spatiotemporal guidance): positive vs. attention-perturbed
-  - **Modality guidance**: positive vs. cross-modal-attention-isolated
-Plus optional variance-preserving *rescale*.
-"""
+# Multi-modal guidance for LTX-2 diffusion.
+#
+# Supports three guidance modes combined additively:
+#   - CFG (classifier-free guidance): positive vs. negative text conditioning
+#   - STG (spatiotemporal guidance): positive vs. attention-perturbed
+#   - Modality guidance: positive vs. cross-modal-attention-isolated
+# Plus optional variance-preserving rescale.
 
 from __future__ import annotations
 

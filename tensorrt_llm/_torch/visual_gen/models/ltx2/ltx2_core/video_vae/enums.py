@@ -1,5 +1,6 @@
-# Ported from https://github.com/Lightricks/LTX-2
-# packages/ltx-core/src/ltx_core/model/video_vae/enums.py
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
 from enum import Enum
 

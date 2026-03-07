@@ -1,4 +1,6 @@
-# Ported from https://github.com/Lightricks/LTX-2
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 
 from .enums import NormLayerType, PaddingModeType
 from .video_vae import VideoDecoder, VideoEncoder

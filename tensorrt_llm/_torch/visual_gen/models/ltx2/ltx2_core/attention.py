@@ -1,8 +1,6 @@
-# Ported from https://github.com/Lightricks/LTX-2
-#
-# Pure-PyTorch Attention, FeedForward, GELUApprox used exclusively by the
-# Embeddings1DConnector (see connector.py) — a small (2-layer) text-embedding
-# preprocessor that runs once per inference call.
+# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
+# SPDX-License-Identifier: LicenseRef-LTX-2
 #
 # This is NOT the attention used by the main denoising transformer.  The 48-layer
 # transformer blocks use LTX2Attention (in transformer_ltx2.py), which is backed
