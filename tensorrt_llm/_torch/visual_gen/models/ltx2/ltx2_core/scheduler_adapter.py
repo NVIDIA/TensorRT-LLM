@@ -22,8 +22,8 @@ from .schedulers import LTX2Scheduler
 
 
 class NativeSchedulerAdapter:
-    """Adapts native LTX-2 scheduler to the diffusers-like interface
-    expected by ``BasePipeline._scheduler_step()``.
+    """Adapts native LTX-2 scheduler to the interface expected by
+    ``BasePipeline._scheduler_step()``.
 
     Usage::
 
@@ -51,7 +51,7 @@ class NativeSchedulerAdapter:
         self._stretch = stretch
         self._terminal = terminal
 
-    # -- diffusers-compatible properties -----------------------------------
+    # -- properties ---------------------------------------------------------
 
     @property
     def timesteps(self) -> torch.Tensor:

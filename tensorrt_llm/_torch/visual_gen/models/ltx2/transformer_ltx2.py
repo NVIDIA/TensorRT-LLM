@@ -644,8 +644,7 @@ class LTXModelType(Enum):
 class LTXModel(nn.Module):
     """LTX-2 transformer built from TRT-LLM primitives.
 
-    Replaces the diffusers ``LTX2VideoTransformer3DModel`` with a native
-    implementation that uses optimized TRT-LLM Linear, RMSNorm, MLP, and
+    Native implementation using optimized TRT-LLM Linear, RMSNorm, MLP, and
     attention backends for all compute-heavy operations.
 
     The architecture-specific wiring (RoPE, AdaLN, dual-stream blocks, etc.)
@@ -1125,7 +1124,7 @@ class LTXModel(nn.Module):
         )
         return vx, ax
 
-    # -- Weight loading (from Lightricks / diffusers checkpoint) -------------
+    # -- Weight loading (from a single LTX-2 .safetensors checkpoint) -------------------------
 
     def load_weights(self, weights: dict) -> None:
         """Load checkpoint weights with key remapping.
