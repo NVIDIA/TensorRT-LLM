@@ -228,10 +228,22 @@ class Distributed(ABC):
         return [entry for tp_group in obj for entry in tp_group]
 
 
+# Max payload size that can be inlined into the header Bcast.  Kept small
+# (256 bytes) to stay within MPI eager-send thresholds and avoid falling
+# into the slower rendezvous protocol.
+_INLINE_DATA_MAX = 4096
+_HEADER_INTS = 3
+_HEADER_BYTES = _HEADER_INTS * 8  # 24 bytes (3 x int64)
+_INLINE_BUF_SIZE = _HEADER_BYTES + _INLINE_DATA_MAX
+
+
 def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     """
     Safely broadcasts potentially large objects by splitting into fixed-size chunks,
     using raw-byte MPI.Bcast to avoid pickle5's out-of-band buffer allocations.
+
+    For small payloads (<= 256 bytes), the header and data are combined into a
+    single MPI.Bcast call to reduce latency.
 
     Args:
         comm: communicator to broadcast
@@ -252,65 +264,78 @@ def safe_broadcast(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
     rank = comm.Get_rank()
 
     # ---- Serialization phase (root only) ----
-    # Header layout: [ok_flag, total_size, num_chunks] as int64
-    header = np.zeros(3, dtype=np.int64)
+    # Header layout (3 x int64 = 24 bytes): [ok_flag, total_size, num_chunks]
+    # When total_size <= _INLINE_DATA_MAX, num_chunks is set to 0 and the
+    # serialized data is packed directly after the header in the same buffer,
+    # requiring only a single MPI.Bcast call.
+    inline_buf = np.empty(_INLINE_BUF_SIZE, dtype=np.uint8)
+    header = inline_buf[:_HEADER_BYTES].view(np.int64)
+
     if rank == root:
         try:
             serialized = pickle.dumps(obj, protocol=pickle.HIGHEST_PROTOCOL)
             total_size = len(serialized)
-            num_chunks = math.ceil(total_size /
-                                   chunk_size) if total_size > 0 else 0
-            header[:] = (1, total_size, num_chunks)
+            if total_size <= _INLINE_DATA_MAX:
+                # Inline path: embed data after header
+                header[:] = (1, total_size, 0)
+                inline_buf[_HEADER_BYTES:_HEADER_BYTES +
+                           total_size] = np.frombuffer(serialized,
+                                                       dtype=np.uint8)
+            else:
+                num_chunks = math.ceil(total_size / chunk_size)
+                header[:] = (1, total_size, num_chunks)
         except Exception as e:
             # Signal failure to all ranks, then raise
             header[:] = (0, 0, 0)
-            comm.Bcast([header, MPI.INT64_T], root=root)
+            comm.Bcast([inline_buf, MPI.BYTE], root=root)
             raise RuntimeError(f"Serialization failed: {str(e)}") from e
     else:
-        serialized = None  # not used on non-root before Bcast
+        serialized = None
 
-    # ---- Metadata broadcast (Bcast the fixed-size header) ----
-    comm.Bcast([header, MPI.INT64_T], root=root)
-    ok_flag, total_size, num_chunks = int(header[0]), int(header[1]), int(
-        header[2])
+    # ---- Single Bcast for header (+ possibly inlined data) ----
+    comm.Bcast([inline_buf, MPI.BYTE], root=root)
+    ok_flag, total_size, num_chunks = (int(header[0]), int(header[1]),
+                                       int(header[2]))
     if not ok_flag:
         raise RuntimeError("Root rank failed during serialization")
 
-    # ---- Allocate receive buffer (non-root) or build a view (root) ----
-    # We broadcast raw bytes chunk by chunk.
+    # ---- Inline fast path: data already received in inline_buf ----
+    if num_chunks == 0:
+        if rank == root:
+            return obj
+        try:
+            return pickle.loads(
+                bytes(inline_buf[_HEADER_BYTES:_HEADER_BYTES +
+                                 total_size]))  # nosec B301
+        except Exception as e:
+            raise RuntimeError(f"Deserialization failed: {str(e)}") from e
+
+    # ---- Chunked path for large payloads ----
     if rank == root:
         src_view = memoryview(serialized)
         dst_buf = None
         dst_view = None
     else:
-        # Pre-allocate a contiguous byte buffer to receive the payload
         dst_buf = bytearray(total_size)
         dst_view = memoryview(dst_buf)
-        src_view = None  # not used on non-root
+        src_view = None
 
-    # ---- Chunked raw-byte broadcast with MPI.Bcast ----
-    # Each round sends exactly `cur` bytes of the global payload.
     offset = 0
     for i in range(num_chunks):
         cur = min(chunk_size, total_size - offset)
         if cur <= 0:
-            break  # safety guard for zero-size payloads
+            break
 
         if rank == root:
-            # Root sends a slice of the source view
             part = src_view[offset:offset + cur]
             comm.Bcast([part, MPI.BYTE], root=root)
         else:
-            # Non-root receives directly into the destination view
             part = dst_view[offset:offset + cur]
             comm.Bcast([part, MPI.BYTE], root=root)
 
         offset += cur
 
-    # ---- Reconstruction and deserialization ----
-    # Validate the received byte count and unpickle.
     if rank == root:
-        # Root already has `serialized`
         if len(serialized) != total_size:
             raise RuntimeError(
                 f"Data size mismatch at root: expected {total_size}, got {len(serialized)}"

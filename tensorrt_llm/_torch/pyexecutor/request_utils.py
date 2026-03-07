@@ -471,7 +471,8 @@ class RequestBroadcaster:
     def broadcast(self, new_requests: List) -> Tuple[List, Optional[Tuple]]:
         """Broadcast requests and Python objects across ranks."""
         if self.dist.rank == 0:
-            py_request_objects = self._collect_py_objects(new_requests)
+            # Skip 5 collect_py_objects calls when there are no new requests
+            py_request_objects = self._collect_py_objects(new_requests) if new_requests else None
         else:
             py_request_objects = None
 

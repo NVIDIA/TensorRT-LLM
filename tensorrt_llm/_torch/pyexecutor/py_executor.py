@@ -1314,13 +1314,14 @@ class PyExecutor:
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    # made in model_engine.py::_forward_step. This is only
+                    # needed for disaggregated serving; for non-disaggregated
+                    # serving, generation requests always have batch_idx.
+                    if self.kv_cache_transceiver is not None:
+                        scheduled_batch.generation_requests = sorted(  # stable sort
+                            scheduled_batch.generation_requests,
+                            key=lambda req: int(req.py_batch_idx is not None),
+                        )
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -2087,13 +2088,14 @@ class PyExecutor:
 
                     # The generation requests that do not have batch_idx
                     # need to be in front of the batch due to the assumptions
-                    # made in model_engine.py::_forward_step. This is only important
-                    # for disaggregated serving. For non-disaggregated serving,
-                    # the generation requests always have batch_idx.
-                    scheduled_batch.generation_requests = sorted(  # stable sort
-                        scheduled_batch.generation_requests,
-                        key=lambda req: int(req.py_batch_idx is not None),
-                    )
+                    # made in model_engine.py::_forward_step. This is only
+                    # needed for disaggregated serving; for non-disaggregated
+                    # serving, generation requests always have batch_idx.
+                    if self.kv_cache_transceiver is not None:
+                        scheduled_batch.generation_requests = sorted(  # stable sort
+                            scheduled_batch.generation_requests,
+                            key=lambda req: int(req.py_batch_idx is not None),
+                        )
 
                     if self.kv_cache_transceiver:
                         # Return the first token to the client
@@ -3284,8 +3286,10 @@ class PyExecutor:
                         if resp is not None:
                             gather_responses.extend(resp)
                     responses = gather_responses
-        logger.debug(
-            f'after gather, rank = {self.dist.rank}, responses = {responses}')
+        if logger.level in ("debug", "verbose", "trace"):
+            logger.debug(
+                f'after gather, rank = {self.dist.rank}, responses = {responses}'
+            )
 
         if self.dist.rank == 0 or self.gather_all_responses:
             with self.response_cv:
@@ -3342,11 +3346,21 @@ class PyExecutor:
         new_responses = []
         requests_to_terminate = []
         new_active_requests = []
-        logger.debug(
-            f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
-        )
+        if logger.level in ("debug", "verbose", "trace"):
+            logger.debug(
+                f'------before _handle_responses, rank = {self.dist.rank}, output = {self.active_requests}'
+            )
 
-        batch_token_time = self.perf_manager.get_timestamp()
+        # Cache instance attributes as locals for the hot loop
+        perf_manager = self.perf_manager
+        batch_token_time = perf_manager.get_timestamp()
+        has_drafter = self.drafter is not None
+        kv_cache_transceiver = self.kv_cache_transceiver
+        disable_overlap_scheduler = self.disable_overlap_scheduler
+        stream_interval = self.stream_interval
+        always_create_response = stream_interval == 1
+        iter_counter = self.iter_counter
+        dist_rank = self.dist.rank
 
         for request in self.active_requests:
             req_id = request.py_request_id
@@ -3356,53 +3370,57 @@ class PyExecutor:
                 continue
 
             # Check if generation request needs cleanup due to KV cache transfer timeout
-            if request.py_kv_transfer_timed_out:
-                is_cancelled = self.kv_cache_transceiver.cancel_request(request)
+            if kv_cache_transceiver is not None and request.py_kv_transfer_timed_out:
+                is_cancelled = kv_cache_transceiver.cancel_request(request)
                 if is_cancelled:
                     self._handle_errors(
                         error_msg=f"Request {request.py_request_id} timed out",
                         requests=[request])
                 continue
 
-            if request.is_generation_only_request() and not request.is_finished:
+            if kv_cache_transceiver is not None and request.is_generation_only_request(
+            ) and not request.is_finished:
                 # If request is in transmission, so we don't need to emit a response
                 # Also, for the first iteration with overlap, we should skip since first
                 # token has already been emitted previously
                 if request.is_disagg_generation_transmission_in_progress or (
-                        not self.disable_overlap_scheduler
+                        not disable_overlap_scheduler
                         and request.py_decoding_iter <= 1):
-                    self.perf_manager.append_step_metrics(
+                    perf_manager.append_step_metrics(
                         request,
-                        self.iter_counter,
+                        iter_counter,
                         batch_token_time=batch_token_time)
                     new_active_requests.append(request)
                     continue
 
-            request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
-                request) > 0 else []
+            if has_drafter:
+                request.draft_tokens = request.py_draft_tokens if get_draft_token_length(
+                    request) > 0 else []
             request.decoding_iter = request.py_decoding_iter
 
-            self.perf_manager.append_step_metrics(
-                request, self.iter_counter, batch_token_time=batch_token_time)
+            perf_manager.append_step_metrics(request,
+                                             iter_counter,
+                                             batch_token_time=batch_token_time)
 
             # Ensure C++ perf metrics (lastTokenTime, etc.) are always updated
             # independently of whether append_step_metrics early-returned.
             # This is critical for E2E latency computation in tracing/Prometheus.
             if request.return_perf_metrics and request.py_decoding_iter >= 1:
-                request.update_perf_metrics(self.iter_counter)
+                request.update_perf_metrics(iter_counter)
 
             request_done = False
-            if request.py_decoding_iter == 1 or request.is_finished or \
-                    request.py_decoding_iter % self.stream_interval == 0:
-                response = request.create_response(False, self.dist.rank)
+            if always_create_response or request.py_decoding_iter == 1 \
+                    or request.is_finished \
+                    or request.py_decoding_iter % stream_interval == 0:
+                response = request.create_response(False, dist_rank)
                 if response:
                     request_done = request.is_finished
                     response.result.cached_tokens = request.cached_tokens
                     new_responses.append((req_id, response))
 
             if request_done:
-                if (self.drafter is not None and getattr(
-                        self.model_engine, 'enable_spec_decode', False)
+                if (has_drafter and getattr(self.model_engine,
+                                            'enable_spec_decode', False)
                         and not self.speculation_permanently_disabled
                         and not request.is_dummy and not self.is_warmup):
                     if self.speculation_gate is not None:

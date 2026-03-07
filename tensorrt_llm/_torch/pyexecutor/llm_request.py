@@ -670,6 +670,8 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
         self.py_decoding_iter = 0
         self.is_attention_dp_dummy = False
         self.is_cuda_graph_dummy = False
+        self.py_is_dummy_request = False
+        self.py_max_beam_num_tokens = None
         self.py_kv_transfer_start_time = None
         self.py_kv_transfer_timed_out = False
 
@@ -849,7 +851,7 @@ class LlmRequest(tensorrt_llm.bindings.internal.batch_manager.LlmRequest):
 
     @property
     def is_dummy(self):
-        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.is_dummy_request
+        return self.is_attention_dp_dummy or self.is_cuda_graph_dummy or self.py_is_dummy_request
 
     def finish_by(self, reason: FinishReason, beam: int) -> None:
         """CPP finish by reason does not support beam_width > 1"""
