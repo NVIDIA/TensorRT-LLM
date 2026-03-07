@@ -44,28 +44,31 @@ class TestTritonKernelsVendoring(unittest.TestCase):
         self.assertTrue(license_file.exists(), f"LICENSE file not found at {license_file}.")
 
     def test_version_matches_requirements(self):
-        """Verify vendored triton_kernels VERSION matches triton version in requirements.txt."""
+        """Verify vendored triton_kernels VERSION is within the triton range in requirements.txt."""
         import re
+
+        from packaging.requirements import Requirement
+        from packaging.version import Version
 
         repo_root = Path(__file__).parent.parent.parent.parent
 
         version_file = repo_root / "triton_kernels" / "VERSION"
-        vendored_version = version_file.read_text().strip().split()[0].lstrip("v")
+        vendored_version = Version(version_file.read_text().strip().split()[0].lstrip("v"))
 
         requirements_file = repo_root / "requirements.txt"
         requirements_text = requirements_file.read_text()
 
-        match = re.search(r"^triton==([^\s#]+)", requirements_text, re.MULTILINE)
-        self.assertIsNotNone(match, "Could not find triton version in requirements.txt")
-        requirements_version = match.group(1)
+        match = re.search(r"^(triton[><=!~][^\s#]+)", requirements_text, re.MULTILINE)
+        self.assertIsNotNone(match, "Could not find triton requirement in requirements.txt")
+        req = Requirement(match.group(1))
 
-        self.assertEqual(
+        self.assertIn(
             vendored_version,
-            requirements_version,
-            f"Vendored triton_kernels version ({vendored_version}) does not match "
-            f"triton version in requirements.txt ({requirements_version}). "
+            req.specifier,
+            f"Vendored triton_kernels version ({vendored_version}) is outside "
+            f"the triton requirement in requirements.txt ({req.specifier}). "
             "To update the vendored triton_kernels, run: python scripts/vendor_triton_kernels.py "
-            f"--tag v{requirements_version}",
+            f"--tag v{vendored_version}",
         )
 
 
