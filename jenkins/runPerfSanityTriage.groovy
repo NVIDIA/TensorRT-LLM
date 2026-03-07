@@ -1,4 +1,4 @@
-@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@main']) _
+@Library(['bloom-jenkins-shared-lib@main', 'trtllm-jenkins-shared-lib@add-sparse-checkout']) _
 
 import java.lang.InterruptedException
 
@@ -93,7 +93,7 @@ pipeline {
                     script {
                         sh "pwd && ls -alh"
                         sh "env | sort"
-                        trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, false, false)
+                        trtllm_utils.checkoutSource(LLM_REPO, params.BRANCH, LLM_ROOT, false, false, ["jenkins/scripts"])
                         sh "pip install slack_sdk"
                         sh """
                             cd ${LLM_ROOT}/jenkins/scripts/perf && ls -alh && python3 perf_sanity_triage.py \
