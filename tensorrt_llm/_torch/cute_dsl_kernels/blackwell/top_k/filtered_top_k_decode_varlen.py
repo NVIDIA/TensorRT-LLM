@@ -24,6 +24,7 @@ import torch
 from cutlass.torch import dtype as torch_dtype
 from cutlass.utils.distributed import atomicAdd
 
+from .block_scan import block_prefix_sum_kernel
 from .filtered_top_k_varlen_util import (
     FilteredTopKKernelVarlen,
     compare_top_k_results,
@@ -66,28 +67,26 @@ class ComputeDynamicCTAOffsets:
     Replaces ~20 small PyTorch tensor ops (arange, indexing, arithmetic,
     cumsum, etc.) with a single GPU kernel launch.
 
-    Uses NUM_THREADS threads in two phases:
-      Phase 1 (parallel): Each thread computes per_row_ctas for its rows,
-              writes to shared memory.
-      Phase 2 (thread 0): Sequential prefix sum from shared memory,
-              writes to global memory.
+    Uses 512 threads: each thread computes the CTA count for one row,
+    then a block-wide parallel prefix sum (via block_prefix_sum_kernel)
+    produces the exclusive scan in a single pass.
 
     Inputs:
         seq_lens:  (batch_size,) int32
     Outputs (pre-allocated by caller):
-        row_cta_offsets:    (num_rows + 1,) int32  — prefix sum of per-row CTAs
-        row_output_offsets: (num_rows + 1,) int32  — prefix sum of per-row output elems
+        row_cta_offsets:    (num_rows + 1,) int32  — exclusive prefix sum of per-row CTAs
+        row_output_offsets: (num_rows + 1,) int32  — exclusive prefix sum of per-row output elems
     """
 
-    NUM_THREADS = 128
-    # Max supported num_rows (batch_size * next_n). Covers batch_size up to
-    # ~340 with next_n=3 or 512 with next_n=2.
-    MAX_NUM_ROWS = 1024
+    # Max supported num_rows (batch_size * next_n). Must equal NUM_THREADS
+    # since each thread handles one row.
+    MAX_NUM_ROWS = 512
 
     def __init__(self, next_n: int, chunk_size_per_cta: int, top_k: int):
         self.next_n = next_n
         self.chunk_size_per_cta = chunk_size_per_cta
         self.top_k = top_k
+        self.NUM_THREADS = 512
 
     @cute.kernel
     def compute_offsets_kernel(
@@ -97,45 +96,38 @@ class ComputeDynamicCTAOffsets:
         row_output_offsets: cute.Tensor,
     ):
         smem = utils.SmemAllocator()
-        s_ctas = smem.allocate_tensor(
+        num_warps = cutlass.const_expr(self.NUM_THREADS // 32)
+        s_warp_sums = smem.allocate_tensor(
             element_type=cutlass.Int32,
-            layout=cute.make_ordered_layout(
-                (self.MAX_NUM_ROWS,), order=(0,)),
+            layout=cute.make_ordered_layout((num_warps,), order=(0,)),
             byte_alignment=128,
         )
 
         tidx, _, _ = cute.arch.thread_idx()
         num_rows = seq_lens.shape[0] * self.next_n
 
-        # Phase 1: Parallel per-row CTA count computation
-        i = tidx
-        while i < num_rows:
-            batch_idx = i // self.next_n
-            next_n_off = i % self.next_n
+        # Each thread computes CTA count for its row (0 if out of bounds)
+        ctas = 0
+        if tidx < num_rows:
+            batch_idx = tidx // self.next_n
+            next_n_off = tidx % self.next_n
             eff_len = seq_lens[batch_idx] - self.next_n + next_n_off + 1
             ctas = (eff_len + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
             if ctas < 1:
                 ctas = 1
-            s_ctas[i] = ctas
-            i = i + self.NUM_THREADS
 
-        cute.arch.barrier()
+        # Block-wide inclusive prefix sum
+        prefix_ctas, _ = block_prefix_sum_kernel(
+            ctas, s_warp_sums, tidx,
+            self.NUM_THREADS, num_warps, barrier_id=1)
 
-        # Phase 2: Thread 0 sequential prefix sum from shared memory
+        # Write exclusive prefix sum (shifted by 1)
         if tidx == 0:
-            cta_sum = 0
-            out_sum = 0
             row_cta_offsets[0] = 0
             row_output_offsets[0] = 0
-
-            j = 0
-            while j < num_rows:
-                c = s_ctas[j]
-                cta_sum = cta_sum + c
-                out_sum = out_sum + c * self.top_k
-                row_cta_offsets[j + 1] = cta_sum
-                row_output_offsets[j + 1] = out_sum
-                j = j + 1
+        if tidx < num_rows:
+            row_cta_offsets[tidx + 1] = prefix_ctas
+            row_output_offsets[tidx + 1] = prefix_ctas * self.top_k
 
     @cute.jit
     def __call__(
@@ -322,8 +314,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         seqlen: cute.Tensor,
         output_indices: cute.Tensor,
         output_values: cute.Tensor,
-        row_cta_offsets: cute.Tensor,
-        row_output_offsets: cute.Tensor,
         tiler_mn: cute.Shape,
         copy_atom: cute.CopyAtom,
         tiled_copy: cute.TiledCopy,
@@ -392,18 +382,70 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             byte_alignment=128,
         )
 
+        # Shared memory for in-kernel dynamic CTA offset computation.
+        # All threads compute the prefix sum of per-row CTA counts via
+        # block_prefix_sum_kernel, then binary-search the result.
+        if cutlass.const_expr(self.enable_dynamic_multi_cta):
+            _DYNAMIC_MAX_NUM_ROWS = 512
+            s_row_cta_offsets = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout(
+                    (_DYNAMIC_MAX_NUM_ROWS + 1,), order=(0,)),
+                byte_alignment=128,
+            )
+            _num_warps_prefix = cutlass.const_expr(
+                self.num_threads_per_cta // 32)
+            s_prefix_warp_sums = smem.allocate_tensor(
+                element_type=cutlass.Int32,
+                layout=cute.make_ordered_layout(
+                    (_num_warps_prefix,), order=(0,)),
+                byte_alignment=128,
+            )
+
         if cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             # Thread and block indexing
             bidx, bidy, _ = cute.arch.block_idx()
 
             if cutlass.const_expr(self.enable_dynamic_multi_cta):
-                # 1D grid: bidx = task_id. Binary search -> row_id, chunk_id.
-                # Grid is launched with upper-bound size to avoid DtoH sync;
-                # padding CTAs (task_id >= total_ctas) are skipped below.
+                # 1D grid: bidx = task_id.  Each CTA computes
+                # row_cta_offsets in shared memory via parallel prefix
+                # sum, then binary-searches to find (row_id, chunk_id).
                 task_id = bidx
                 num_rows_val = seqlen.shape[0] * self.next_n
-                bidx = self._binary_search_row(row_cta_offsets, task_id, num_rows_val)
-                bidy = task_id - row_cta_offsets[bidx]
+                tidx, _, _ = cute.arch.thread_idx()
+
+                _num_passes = cutlass.const_expr(
+                    (_DYNAMIC_MAX_NUM_ROWS + self.num_threads_per_cta - 1)
+                    // self.num_threads_per_cta)
+                previous_sum = 0
+                for _pass in cutlass.range(_num_passes, unroll_full=True):
+                    row_idx = tidx + _pass * self.num_threads_per_cta
+                    ctas_val = 0
+                    if row_idx < num_rows_val:
+                        _batch = row_idx // self.next_n
+                        _off = row_idx % self.next_n
+                        _eff = seqlen[_batch] - self.next_n + _off + 1
+                        ctas_val = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
+                        if ctas_val < 1:
+                            ctas_val = 1
+
+                    _psum, _tsum = block_prefix_sum_kernel(
+                        ctas_val, s_prefix_warp_sums, tidx,
+                        self.num_threads_per_cta, _num_warps_prefix,
+                        barrier_id=2, need_total_sum=True)
+
+                    if row_idx < num_rows_val:
+                        s_row_cta_offsets[row_idx + 1] = _psum + previous_sum
+                    previous_sum = previous_sum + _tsum
+
+                if tidx == 0:
+                    s_row_cta_offsets[0] = 0
+                cute.arch.barrier()
+
+                # Binary search from shared memory
+                bidx = self._binary_search_row(
+                    s_row_cta_offsets, task_id, num_rows_val)
+                bidy = task_id - s_row_cta_offsets[bidx]
                 # Clamp to valid range so all pointer arithmetic below is safe.
                 # Padding CTAs are skipped via the _should_run guard later.
                 bidx = min(bidx, num_rows_val - 1)
@@ -433,10 +475,14 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
 
             if cutlass.const_expr(self.merge_blocks):
                 if cutlass.const_expr(self.varlen_merge_input):
-                    # Varlen merge: read per-row valid length from offset table.
-                    # Input is still 2D (num_rows, max_merge_cols); only the
-                    # first `merge_width` elements per row are valid.
-                    merge_width = row_output_offsets[bidx + 1] - row_output_offsets[bidx]
+                    # Varlen merge: compute per-row valid length from seqlen.
+                    _batch = bidx // self.next_n
+                    _off = bidx % self.next_n
+                    _eff = seqlen[_batch] - self.next_n + _off + 1
+                    _num_ctas = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
+                    if _num_ctas < 1:
+                        _num_ctas = 1
+                    merge_width = _num_ctas * self.top_k
                     row_end = merge_width
                     length = merge_width
                 else:
@@ -449,7 +495,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             # Skip padding CTAs launched beyond actual total_ctas.
             _should_run = True
             if cutlass.const_expr(self.enable_dynamic_multi_cta):
-                _should_run = task_id < row_cta_offsets[num_rows_val]
+                _should_run = task_id < s_row_cta_offsets[num_rows_val]
 
             if _should_run:
                 self.filtered_topk_kernel_per_row(
@@ -549,8 +595,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         seqlen,
         output_indices,
         output_values,
-        row_cta_offsets,
-        row_output_offsets,
         stream: cuda.CUstream,
         enable_persistent_dynamic_scheduling: cutlass.Constexpr[bool] = False,
         min_blocks_per_mp: cutlass.Constexpr[int] = 1,
@@ -584,8 +628,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             seqlen,
             output_indices,
             output_values,
-            row_cta_offsets,
-            row_output_offsets,
             tiler_mn,
             copy_atom,
             tiled_copy,
@@ -711,8 +753,7 @@ def cute_dsl_topk_wrapper(
             seqlen_fake,
             output_indices_fake,
             output_values_fake,
-            None,  # row_cta_offsets
-            None,  # row_output_offsets
+
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,  # TODO: do we need this one?
@@ -745,8 +786,7 @@ def cute_dsl_topk_wrapper(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-        None,  # row_cta_offsets
-        None,  # row_output_offsets
+
     )
     return output_indices_torch, output_values_torch
 
@@ -847,8 +887,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             # output_values_fake,
             first_kernel_output_indices_fake,
             first_kernel_output_values_fake,
-            None,  # row_cta_offsets
-            None,  # row_output_offsets
+
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
@@ -894,8 +933,7 @@ def cute_dsl_topk_multi_cta_wrapper(
             seqlen_fake,
             output_indices_fake,
             output_values_fake,
-            None,  # row_cta_offsets
-            None,  # row_output_offsets
+
             stream=fake_stream,
             enable_persistent_dynamic_scheduling=load_balance,
             min_blocks_per_mp=1,
@@ -940,8 +978,7 @@ def cute_dsl_topk_multi_cta_wrapper(
         seq_lens,
         first_kernel_output_indices_torch,
         first_kernel_output_values_torch,
-        None,  # row_cta_offsets
-        None,  # row_output_offsets
+
     )
 
     compiled_kernel_second(
@@ -952,8 +989,7 @@ def cute_dsl_topk_multi_cta_wrapper(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-        None,  # row_cta_offsets
-        None,  # row_output_offsets
+
     )
     return output_indices_torch, output_values_torch
 
@@ -1091,8 +1127,7 @@ def run_filtered_topk_decode(
         seqlen_fake,
         output_indices_fake,
         output_values_fake,
-        None,  # row_cta_offsets
-        None,  # row_output_offsets
+
         stream=fake_stream,
         enable_persistent_dynamic_scheduling=load_balance,
         # TODO: confirm this parameter.
@@ -1143,8 +1178,7 @@ def run_filtered_topk_decode(
         seq_lens,
         output_indices_torch,
         output_values_torch,
-        None,  # row_cta_offsets
-        None,  # row_output_offsets
+
     )
 
     if do_ref_check and top_k <= max_num_cols and return_val:
@@ -1255,8 +1289,6 @@ def run_filtered_topk_decode(
                 seq_lens,
                 output_indices_tensor,
                 output_values_tensor,
-                None,  # row_cta_offsets
-                None,  # row_output_offsets
             )
 
         workspace_count = 1

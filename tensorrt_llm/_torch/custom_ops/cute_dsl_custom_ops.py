@@ -318,10 +318,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
-    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import (
-        ComputeDynamicCTAOffsets,
-        FilteredTopKKernelVarlenDecode,
-    )
+    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
+        FilteredTopKKernelVarlenDecode
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -2903,8 +2901,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
-                None,  # row_cta_offsets
-                None,  # row_output_offsets
+
                 stream=fake_stream,
                 enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
@@ -2996,8 +2993,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
-                None,  # row_cta_offsets
-                None,  # row_output_offsets
+
             )
 
             return output_indices_torch, output_values_torch
@@ -3176,15 +3172,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             fake_stream = cute.runtime.make_fake_stream(
                 use_tvm_ffi_env_stream=True)
 
-            # Dynamic mode: 1D grid with binary search; needs row_cta_offsets
-            row_cta_offsets_fake = None
-            if dynamic:
-                row_cta_offsets_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(),),
-                    stride_order=(0,),
-                )
-
             # First kernel: process each chunk independently
             filtered_topk_func_first = FilteredTopKKernelVarlenDecode(
                 dtype,
@@ -3209,8 +3196,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seqlen_fake,
                 first_kernel_output_indices_fake,
                 first_kernel_output_values_fake,
-                row_cta_offsets_fake,
-                None,  # row_output_offsets
                 stream=fake_stream,
                 enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
@@ -3238,15 +3223,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             else:
                 output_values_fake = None
 
-            # Dynamic mode: varlen merge with per-row offset table
-            row_output_offsets_fake = None
-            if dynamic:
-                row_output_offsets_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(),),
-                    stride_order=(0,),
-                )
-
             filtered_topk_func_second = FilteredTopKKernelVarlenDecode(
                 dtype,
                 merge_num_cols,  # num_cols
@@ -3268,43 +3244,13 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
-                None,  # row_cta_offsets
-                row_output_offsets_fake,
                 stream=fake_stream,
                 enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=1,
                 options="--enable-tvm-ffi",
             )
-            # Compile offset computation kernel for dynamic mode
-            compiled_offsets_kernel = None
-            if dynamic:
-                offsets_func = ComputeDynamicCTAOffsets(
-                    next_n=next_n,
-                    chunk_size_per_cta=chunk_size_per_cta,
-                    top_k=top_k,
-                )
-                offsets_row_cta_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(),),
-                    stride_order=(0,),
-                )
-                offsets_row_output_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32,
-                    (cute.sym_int(),),
-                    stride_order=(0,),
-                )
-                compiled_offsets_kernel = cute.compile(
-                    offsets_func,
-                    seqlen_fake,
-                    offsets_row_cta_fake,
-                    offsets_row_output_fake,
-                    stream=fake_stream,
-                    options="--enable-tvm-ffi",
-                )
-
             cls.kernel_cache[key] = (compiled_kernel_first,
-                                     compiled_kernel_second,
-                                     compiled_offsets_kernel)
+                                     compiled_kernel_second)
 
         @classmethod
         def forward(
@@ -3362,8 +3308,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_ctas_per_row,
                     dynamic,
                 )
-            compiled_kernel_first, compiled_kernel_second, \
-                compiled_offsets_kernel = cls.kernel_cache[key]
+            compiled_kernel_first, compiled_kernel_second = \
+                cls.kernel_cache[key]
 
             if dtype == cutlass.Float32:
                 buffer_numbers = 2
@@ -3371,13 +3317,14 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 1
 
             if dynamic:
-                # Compute offsets with a single CuTE DSL kernel
-                row_cta_offsets = torch.empty(
-                    num_rows + 1, dtype=torch.int32, device="cuda")
-                row_output_offsets = torch.empty(
-                    num_rows + 1, dtype=torch.int32, device="cuda")
-                compiled_offsets_kernel(
-                    seq_lens, row_cta_offsets, row_output_offsets)
+                # Bounds check: num_rows must fit in the in-kernel prefix sum
+                _DYNAMIC_MAX_NUM_ROWS = 512
+                if num_rows > _DYNAMIC_MAX_NUM_ROWS:
+                    raise ValueError(
+                        f"dynamic multi-CTA top-k: num_rows ({num_rows}) "
+                        f"exceeds limit ({_DYNAMIC_MAX_NUM_ROWS}). "
+                        f"Reduce batch_size * next_n to "
+                        f"<= {_DYNAMIC_MAX_NUM_ROWS}.")
 
                 # Use upper-bound allocation to avoid DtoH sync (.item()).
                 # The first kernel early-exits CTAs beyond actual total_ctas.
@@ -3404,6 +3351,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     output_values_torch = None
 
                 # Execute first kernel: dynamic per-chunk top-k
+                # Offsets are computed in-kernel via shared memory prefix sum.
                 compiled_kernel_first(
                     input_values,
                     None,  # indices
@@ -3412,8 +3360,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens,
                     first_output_indices,
                     first_output_values,
-                    row_cta_offsets,
-                    None,  # row_output_offsets
                 )
 
                 # Merge buffer (one per row)
@@ -3422,6 +3368,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     dtype=torch.int32, device="cuda")
 
                 # Execute second kernel: varlen merge
+                # merge_width computed in-kernel from seqlen.
                 compiled_kernel_second(
                     first_output_values,
                     first_output_indices,
@@ -3430,8 +3377,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens,
                     output_indices_torch,
                     output_values_torch,
-                    None,  # row_cta_offsets
-                    row_output_offsets,
                 )
             else:
                 # Static mode: fixed grid (num_rows, num_ctas_per_row)
@@ -3465,8 +3410,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens,
                     first_kernel_output_indices_torch,
                     first_kernel_output_values_torch,
-                    None,  # row_cta_offsets
-                    None,  # row_output_offsets
                 )
 
                 # Execute second kernel: merge partial results
@@ -3478,8 +3421,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     seq_lens,
                     output_indices_torch,
                     output_values_torch,
-                    None,  # row_cta_offsets
-                    None,  # row_output_offsets
                 )
 
             return output_indices_torch, output_values_torch
@@ -3592,6 +3533,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        dynamic: bool = True,
     ) -> torch.Tensor:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
 
@@ -3650,7 +3592,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 return_val=False,
                 num_copy_bits=num_copy_bits,
                 chunk_size_per_cta=chunk_size_per_cta,
-                dynamic=True,
+                dynamic=dynamic,
             )
         else:
             indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
@@ -3670,6 +3612,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        dynamic: bool = True,
     ):
         num_rows = input_values.shape[0]
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
