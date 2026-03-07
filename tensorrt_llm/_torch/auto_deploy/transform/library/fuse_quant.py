@@ -1,3 +1,4 @@
+import math
 from typing import Tuple, Type
 
 import torch
@@ -6,6 +7,7 @@ from torch.fx import GraphModule
 
 from ...models.factory import ModelFactory
 from ...shim.interface import CachedSequenceInterface
+from ...utils.node_utils import is_op
 from ...utils.pattern_matcher import ADPatternMatcherPass, register_ad_pattern
 from ..interface import (
     BaseTransform,
@@ -85,7 +87,7 @@ def _fp4_ref_repl_1(
         bias=None,
         input_scale=input_scale,
         weight_scale=weight_scale,
-        weight_scale_2=weight_scale_2,
+        alpha=weight_scale_2,
     )
 
 
@@ -123,7 +125,7 @@ def _fp4_ref_repl_2(
         bias=bias,
         input_scale=input_scale,
         weight_scale=weight_scale,
-        weight_scale_2=weight_scale_2,
+        alpha=weight_scale_2,
     )
 
 
@@ -297,6 +299,81 @@ class FuseFP8Linear(BaseTransform):
         return gm, info
 
 
+def _collect_nvfp4_scale_keys(gm: GraphModule):
+    """Collect (input_scale, weight_scale, weight_scale_2) buffer keys from fused nvfp4 nodes."""
+    scale_keys = []
+    for node in gm.graph.nodes:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_nvfp4_linear):
+            continue
+        scale_map = {}
+        for inp in node.all_input_nodes:
+            if inp.op != "get_attr":
+                continue
+            t = inp.target
+            if t.endswith(".weight_scale_2"):
+                scale_map["ws2"] = t
+            elif t.endswith(".weight_scale"):
+                scale_map["ws"] = t
+            elif t.endswith(".input_scale"):
+                scale_map["is"] = t
+        if len(scale_map) == 3:
+            scale_keys.append((scale_map["is"], scale_map["ws"], scale_map["ws2"]))
+    return scale_keys
+
+
+def _process_nvfp4_scales_inplace(gm: GraphModule, scale_keys):
+    """Pre-process raw NVFP4 scale buffers in-place into the format expected by the kernel.
+
+    Converts:
+      - weight_scale_2 * input_scale -> alpha (clamped)
+      - input_scale -> 1 / input_scale (clamped then inverted)
+      - weight_scale -> CUTLASS-swizzled flat uint8 via block_scale_interleave
+    """
+    try:
+        from .....quantization.utils.fp4_utils import float4_sf_dtype
+    except ImportError:
+        float4_sf_dtype = None
+
+    if not float4_sf_dtype:
+        return
+
+    for is_key, ws_key, ws2_key in scale_keys:
+        is_mod_path, _, is_attr = is_key.rpartition(".")
+        ws_mod_path, _, ws_attr = ws_key.rpartition(".")
+        ws2_mod_path, _, ws2_attr = ws2_key.rpartition(".")
+
+        is_submod = gm.get_submodule(is_mod_path)
+        ws_submod = gm.get_submodule(ws_mod_path)
+        ws2_submod = gm.get_submodule(ws2_mod_path)
+
+        raw_is = getattr(is_submod, is_attr)
+        raw_ws = getattr(ws_submod, ws_attr)
+        raw_ws2 = getattr(ws2_submod, ws2_attr)
+        device = raw_ws.device
+
+        alpha = torch.clamp(raw_ws2 * raw_is, min=1e-30)
+
+        inv_input_scale = 1 / torch.clamp(raw_is, min=1e-30)
+
+        weight_scale = raw_ws.view(float4_sf_dtype)
+        weight_scale_swizzled = torch.ops.trtllm.block_scale_interleave(
+            weight_scale.view(torch.uint8).cpu().contiguous()
+        ).view(float4_sf_dtype)
+
+        m, n = weight_scale.shape
+        padded_m = math.ceil(m / 128) * 128
+        padded_n = math.ceil(n / 4) * 4
+        swizzled_shape = (padded_m, padded_n)
+
+        new_ws = (
+            weight_scale_swizzled.reshape(swizzled_shape).view(torch.uint8).reshape(-1).to(device)
+        )
+
+        is_submod.register_buffer(is_attr, inv_input_scale)
+        ws_submod.register_buffer(ws_attr, new_ws)
+        ws2_submod.register_buffer(ws2_attr, alpha)
+
+
 class FuseNVFP4LinearConfig(TransformConfig):
     """Configuration for NVFP4 linear fusion transform."""
 
@@ -329,6 +406,11 @@ class FuseNVFP4Linear(BaseTransform):
         patterns = ADPatternMatcherPass()
         _register_quant_fp4_linear_patterns(patterns)
         cnt = patterns.apply(gm.graph)
+
+        if cnt > 0:
+            scale_keys = _collect_nvfp4_scale_keys(gm)
+            if scale_keys:
+                _process_nvfp4_scales_inplace(gm, scale_keys)
 
         info = TransformInfo(
             skipped=(cnt == 0),

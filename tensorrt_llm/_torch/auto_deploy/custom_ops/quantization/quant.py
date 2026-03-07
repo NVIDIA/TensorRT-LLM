@@ -373,9 +373,9 @@ def _pad_nvfp4_weight(
     weight_fp4 and weight_scale are padded independently because they have
     different alignment requirements:
       - weight_fp4 has shape [n, k/2] (packed uint8) — padded along both dims.
-      - weight_scale is in modelopt row-major FP8 format with shape [n, k/16]
-        (or already padded to [padded_n, padded_k/16]). Padded directly along
-        both dims.
+      - weight_scale is 1D in cutlass format (swizzled/padded). It is converted
+        to modelopt row-major [n, k/16] for correct padding, then converted
+        back. The cutlass conversion handles 128x4 alignment internally.
       - alpha has shape [n] or is a scalar — padded along dim 0 when 1-D.
 
     Returns (weight_fp4, weight_scale, alpha, n_padded, k_padded).
@@ -392,13 +392,20 @@ def _pad_nvfp4_weight(
     if alpha.ndim >= 1 and pad_n > 0:
         alpha = torch.nn.functional.pad(alpha, (0, pad_n))
 
-    # weight_scale is in modelopt FP8 row-major format. Pad directly.
-    # The caller is responsible for CUTLASS conversion after padding.
+    # weight_scale is in cutlass format (swizzled/padded). Convert to
+    # modelopt row-major [n, k/16] so the reshape/pad operates on the correct
+    # logical layout, then convert back. modelopt_fp4_scale_to_cutlass_fp4_scale
+    # handles the 128x4 alignment internally.
+    from ...utils.quantization_utils import (
+        cutlass_fp4_scale_to_modelopt_fp4_scale,
+        modelopt_fp4_scale_to_cutlass_fp4_scale,
+    )
+
     bsv = TRTLLM_NVFP4_SCALING_VECTOR_SIZE
     blocks_per_row_padded = k_padded // bsv
-    ws = weight_scale.reshape(n, -1)
+    ws = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale, (n, k))
     ws = torch.nn.functional.pad(ws, (0, blocks_per_row_padded - ws.shape[1], 0, pad_n))
-    weight_scale = ws
+    weight_scale = modelopt_fp4_scale_to_cutlass_fp4_scale(ws)
 
     return weight_fp4, weight_scale, alpha, n_padded, k_padded
 
@@ -411,16 +418,20 @@ def nvfp4_linear(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
-    weight_scale_2: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """FP4 linear op similar to torch.nn.linear.
+
+    All scale arguments are expected to be pre-processed at load time by the fuse transform's
+    load hook (see FuseNVFP4Linear in fuse_quant.py).
 
     Args:
         input: unquantized input tensor
         weight_fp4: pre-quantized weight tensor, with dtype torch.uint8 (1 uint8 == 2 elements)
-        input_scale: per-tensor input scale_2 = input_amax / FP4_GLOBAL_SCALE_MAX.
-        weight_scale: per-block scale in torch FP8 (float8_e4m3fn), shape (out_dim, in_dim/16) or padded.
-        weight_scale_2: per-tensor weight scale_2 = weight_amax / FP4_GLOBAL_SCALE_MAX.
+        input_scale: inverted per-tensor input scale = FP4_GLOBAL_SCALE_MAX / input_amax.
+        weight_scale: flat uint8 tensor of CUTLASS-swizzled per-block weight scales,
+            ready to pass directly to nvfp4_gemm.
+        alpha: pre-computed product of raw per-tensor scales (input_s2 * weight_s2).
 
     Returns:
         The linear output with the original dtype as the input.
@@ -437,39 +448,29 @@ def nvfp4_linear(
 
     assert input_scale is not None
     assert weight_scale is not None
-    assert weight_scale_2 is not None
+    assert alpha is not None
 
     # nvfp4_gemm requires both n and k to be divisible by 32. TP sharding can
     # misalign either: column-sharding affects n (e.g. Mamba2 in_proj 10304/8=1288),
     # row-sharding affects k (e.g. shared experts down_proj 3712/8=464).
     need_pad = n % 32 != 0 or k % 32 != 0
     if need_pad:
-        weight_fp4, weight_scale, weight_scale_2, n_padded, k_padded = _pad_nvfp4_weight(
-            weight_fp4, weight_scale, weight_scale_2, n, k, align_to=32
+        weight_fp4, weight_scale, alpha, n_padded, k_padded = _pad_nvfp4_weight(
+            weight_fp4, weight_scale, alpha, n, k, align_to=32
         )
         if k_padded != k:
             input = torch.nn.functional.pad(input, (0, k_padded - k))
 
-    # Convert torch-compatible FP8 per-block scale to CUTLASS (padded, swizzled) for the kernel.
-    from tensorrt_llm._torch.auto_deploy.utils.quantization_utils import (
-        modelopt_fp4_scale_to_cutlass_fp4_scale,
-    )
-
-    weight_scale_cutlass = modelopt_fp4_scale_to_cutlass_fp4_scale(weight_scale)
-    assert weight_scale_cutlass.numel() % (128 * 4) == 0
-
-    # Derive kernel values from raw per-tensor scales
-    fp4_input_scale = 1.0 / torch.clamp(input_scale, min=1e-30)
-    kernel_alpha = torch.clamp(input_scale * weight_scale_2, min=1e-30)
+    assert weight_scale.numel() % (128 * 4) == 0
 
     input = input.reshape(-1, input.shape[-1])
 
     x_fp4, x_sf_block = torch.ops.trtllm.fp4_quantize(
-        input, fp4_input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
+        input, input_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False
     )
 
     output = torch.ops.trtllm.nvfp4_gemm(
-        x_fp4, weight_fp4, x_sf_block, weight_scale_cutlass, kernel_alpha, input.dtype
+        x_fp4, weight_fp4, x_sf_block, weight_scale, alpha, input.dtype
     )
 
     if need_pad and n % 32 != 0:
@@ -488,7 +489,7 @@ def fp4_linear_fake(
     bias: Optional[torch.Tensor] = None,
     input_scale: Optional[torch.Tensor] = None,
     weight_scale: Optional[torch.Tensor] = None,
-    weight_scale_2: Optional[torch.Tensor] = None,
+    alpha: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     return torch.ops.aten.linear(input, weight_fp4.repeat(1, 2).to(input.dtype), bias)
 

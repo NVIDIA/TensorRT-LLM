@@ -66,15 +66,18 @@ def test_fp4_linear():
     weight_fp4, weight_scale_cutlass = torch.ops.trtllm.fp4_quantize(
         weight, weight_gs, SCALING_VECTOR_SIZE, False
     )
-    weight_scale_fp8 = cutlass_fp4_scale_to_modelopt_fp4_scale(weight_scale_cutlass, weight.shape)
+
+    raw_input_s2 = 1.0 / input_gs
+    raw_weight_s2 = 1.0 / weight_gs
+    alpha = torch.clamp(raw_input_s2 * raw_weight_s2, min=1e-30)
 
     output_fp4_gemm = torch.ops.auto_deploy.torch_quant_nvfp4_linear(
         input,
         weight_fp4,
         bias=None,
-        input_scale=1.0 / input_gs,
-        weight_scale=weight_scale_fp8,
-        weight_scale_2=1.0 / weight_gs,
+        input_scale=input_gs,
+        weight_scale=weight_scale_cutlass,
+        alpha=alpha,
     )
     output_fp16_gemm = torch.ops.aten.linear.default(input, weight, bias=None)
 
@@ -188,6 +191,8 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
     input_s2 = (1.0 / s_in_gs).to(torch.float32)
     weight_s2 = (1.0 / s_w_gs).to(torch.float32)
 
+    alpha = torch.clamp(input_s2 * weight_s2, min=1e-30)
+
     if bias is not None and bias.dtype != x.dtype:
         bias = bias.to(x.dtype)
 
@@ -195,9 +200,9 @@ def test_quant_linear_nvfp4_matches_fused_op(bias):
         x,
         weight_fp4,
         bias=bias,
-        input_scale=input_s2,
-        weight_scale=weight_scale_fp8,
-        weight_scale_2=weight_s2,
+        input_scale=s_in_gs,
+        weight_scale=weight_scale_cutlass,
+        alpha=alpha,
     )
     out_unified = torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear(
         x,
