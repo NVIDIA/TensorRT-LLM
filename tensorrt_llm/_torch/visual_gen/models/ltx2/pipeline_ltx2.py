@@ -70,6 +70,58 @@ def _assert_resolution(height: int, width: int) -> None:
         )
 
 
+def _load_ltx2_transformer_weights(
+    checkpoint_dir: str,
+    prefix: str,
+    exclude_prefixes: Optional[List[str]] = None,
+) -> Dict[str, torch.Tensor]:
+    """Read transformer weights from an LTX-2 single-safetensor checkpoint.
+
+    Scans all ``.safetensors`` files in *checkpoint_dir* for keys starting
+    with *prefix*, strips the prefix, and returns the resulting state dict.
+
+    Args:
+        checkpoint_dir: Path to the checkpoint directory (or single file).
+        prefix: Key prefix for transformer weights
+            (e.g. ``model.diffusion_model.``).
+        exclude_prefixes: Sub-prefixes (after stripping *prefix*) to skip.
+            Used to filter out non-transformer components that share the
+            same checkpoint prefix (e.g. ``audio_embeddings_connector.``).
+    """
+    d = Path(checkpoint_dir)
+    if d.is_file() and d.suffix == ".safetensors":
+        sft_paths = [str(d)]
+    else:
+        sft_paths = sorted(str(f) for f in d.glob("*.safetensors"))
+
+    if not sft_paths:
+        raise ValueError(f"No safetensors files found in {checkpoint_dir}")
+
+    exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
+
+    weights: Dict[str, torch.Tensor] = {}
+    for path in sft_paths:
+        with safetensors.torch.safe_open(path, framework="pt") as f:
+            for key in f.keys():
+                if key.startswith(prefix):
+                    stripped = key[len(prefix):]
+                    if stripped.startswith(exclude_prefixes):
+                        continue
+                    weights[stripped] = f.get_tensor(key)
+
+    if not weights:
+        raise ValueError(
+            f"No transformer weights found with prefix '{prefix}' "
+            f"in {sft_paths}"
+        )
+
+    logger.info(
+        f"Loaded {len(weights)} transformer weight tensors from "
+        f"LTX-2 checkpoint ({prefix}*)"
+    )
+    return weights
+
+
 # TeaCache polynomial coefficients for LTX-0.9.1-HFIE. Calibrated from the LTX-Video model family.
 # Maps raw embedding L1 distances to rescaled distances for cache decisions.
 # Coefficients are from:
@@ -263,11 +315,20 @@ class LTX2Pipeline(BasePipeline):
     # Transformer weight loading
     # ------------------------------------------------------------------
 
-    TRANSFORMER_PREFIX = "model.diffusion_model."
-    TRANSFORMER_EXCLUDE_PREFIXES = [
+    _TRANSFORMER_PREFIX = "model.diffusion_model."
+    _TRANSFORMER_EXCLUDE_PREFIXES = [
         "audio_embeddings_connector.",
         "video_embeddings_connector.",
     ]
+
+    def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+        """Load transformer weights from LTX-2 native checkpoint format."""
+        logger.info("Loading transformer weights via LTX-2 native checkpoint")
+        return _load_ltx2_transformer_weights(
+            checkpoint_dir,
+            self._TRANSFORMER_PREFIX,
+            exclude_prefixes=self._TRANSFORMER_EXCLUDE_PREFIXES,
+        )
 
     def load_weights(self, weights: Dict[str, torch.Tensor]) -> None:
         """Load transformer weights.

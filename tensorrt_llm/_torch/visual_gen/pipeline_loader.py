@@ -16,10 +16,8 @@ Dynamic Quantization:
 
 import os
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional
+from typing import TYPE_CHECKING, Optional
 
-import safetensors.torch
 import torch
 
 from tensorrt_llm._torch.autotuner import autotune
@@ -34,57 +32,6 @@ from .models import AutoPipeline
 
 if TYPE_CHECKING:
     from .models import BasePipeline
-
-
-def _load_LTX_2_transformer_weights(
-    checkpoint_dir: str,
-    prefix: str,
-    exclude_prefixes: Optional[List[str]] = None,
-) -> Dict[str, torch.Tensor]:
-    """Read transformer weights from a LTX-2 specific single-safetensor checkpoint.
-
-    Scans all ``.safetensors`` files in *checkpoint_dir* for keys starting
-    with *prefix*, strips the prefix, and returns the resulting state dict.
-
-    Args:
-        checkpoint_dir: Path to the checkpoint directory.
-        prefix: Key prefix for transformer weights (e.g. ``model.diffusion_model.``).
-        exclude_prefixes: Sub-prefixes (after stripping *prefix*) to skip.
-            Used to filter out non-transformer components that share the
-            same checkpoint prefix (e.g. ``audio_embeddings_connector.``).
-    """
-    d = Path(checkpoint_dir)
-    if d.is_file() and d.suffix == ".safetensors":
-        sft_paths = [str(d)]
-    else:
-        sft_paths = sorted(str(f) for f in d.glob("*.safetensors"))
-
-    if not sft_paths:
-        raise ValueError(f"No safetensors files found in {checkpoint_dir}")
-
-    exclude_prefixes = tuple(exclude_prefixes) if exclude_prefixes else ()
-
-    weights: Dict[str, torch.Tensor] = {}
-    for path in sft_paths:
-        with safetensors.torch.safe_open(path, framework="pt") as f:
-            for key in f.keys():
-                if key.startswith(prefix):
-                    stripped = key[len(prefix):]
-                    if stripped.startswith(exclude_prefixes):
-                        continue
-                    weights[stripped] = f.get_tensor(key)
-
-    if not weights:
-        raise ValueError(
-            f"No transformer weights found with prefix '{prefix}' "
-            f"in {sft_paths}"
-        )
-
-    logger.info(
-        f"Loaded {len(weights)} transformer weight tensors from "
-        f"LTX_2 specific checkpoint ({prefix}*)"
-    )
-    return weights
 
 
 class PipelineLoader:
@@ -174,8 +121,8 @@ class PipelineLoader:
         1. Resolve checkpoint_dir (local path or HuggingFace Hub model ID)
         2. Load config via DiffusionModelConfig.from_pretrained()
         3. Create pipeline via AutoPipeline.from_config() with MetaInit
-        4. Load transformer weights via pipeline.load_weights()
-        5. Load auxiliary components (VAE, text_encoder) via diffusers
+        4. Load transformer weights via pipeline.load_transformer_weights()
+        5. Load auxiliary components (VAE, text_encoder)
         6. Call pipeline.post_load_weights()
 
         Args:
@@ -190,28 +137,6 @@ class PipelineLoader:
         if not checkpoint_dir:
             raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
-
-        # Single-file checkpoints are only supported for LTX-2 specific format.
-        # Other pipelines (Wan, Flux, etc.) expect a directory layout.
-        if os.path.isfile(checkpoint_dir):  
-            if not checkpoint_dir.endswith(".safetensors"):
-                raise ValueError(
-                    f"Single-file checkpoint must be a .safetensors file, "
-                    f"got: {checkpoint_dir}"
-                )
-            native_cfg = DiffusionModelConfig._try_load_safetensors_config(
-                Path(checkpoint_dir),
-            ) or {}
-            is_ltx2 = "transformer" in native_cfg and (
-                "vae" in native_cfg or "audio_vae" in native_cfg
-            )
-            if not is_ltx2:
-                raise ValueError(
-                    f"Single-file checkpoint is only supported for LTX-2 "
-                    f"specific format (safetensors with embedded config metadata). "
-                    f"For other models, provide a checkpoint directory. "
-                    f"Got: {checkpoint_dir}"
-                )
 
         # Get loading options from args
         skip_components = self.args.skip_components if self.args else []
@@ -251,62 +176,27 @@ class PipelineLoader:
 
         # =====================================================================
         # STEP 3: Load Transformer Weights
-        # Two code paths:
-        #   A) LTX_2 specific single-safetensor — pipeline exposes a
-        #      ``TRANSFORMER_PREFIX`` class attribute; weights are read from
-        #      the checkpoint with that prefix stripped.
-        #   B) Diffusers-compatible — uses the generic ``WeightLoader`` which
-        #      expects a ``transformer/`` sub-directory (or ``transformer.``
-        #      prefixed keys).
+        # Each pipeline implements load_transformer_weights() for its own
+        # checkpoint format.  The default (BasePipeline) uses WeightLoader
+        # for diffusers-compatible checkpoints with a transformer/ subdir.
         # If dynamic_weight_quant=True:
         #   - BF16 checkpoint weights are loaded
         #   - Quantized on-the-fly to FP8/NVFP4 by DynamicLinearWeightLoader
         #   - Copied into model's quantized buffers
         # =====================================================================
-        LTX_2_specific_prefix = getattr(pipeline, "TRANSFORMER_PREFIX", None)
-        if LTX_2_specific_prefix is not None:
-            logger.info("Loading transformer weights via LTX_2 specific checkpoint path")
-            exclude = getattr(pipeline, "TRANSFORMER_EXCLUDE_PREFIXES", None)
-            weights = _load_LTX_2_transformer_weights(
-                checkpoint_dir, LTX_2_specific_prefix, exclude_prefixes=exclude,
-            )
-        else:
-            # --- Path B: diffusers-compatible (WeightLoader) -----------------
-            if pipeline.transformer is None:
-                raise ValueError("Pipeline has no transformer component")
-
-            transformer_components = pipeline.transformer_components
-            logger.info(f"Transformer components: {transformer_components}")
-
-            transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
-            if not os.path.exists(transformer_path):
-                raise FileNotFoundError(
-                    f"Transformer path does not exist: {transformer_path}. "
-                    f"Checkpoint directory must contain a 'transformer' subdirectory."
-                )
-
-            weight_loader = WeightLoader(components=transformer_components)
-            # TODO: accelerate the cpu loading w/ multiprocessing
-            weights = weight_loader.load_weights(checkpoint_dir, self.mapping)
-
+        weights = pipeline.load_transformer_weights(checkpoint_dir)
         pipeline.load_weights(weights)
 
         # =====================================================================
-        # STEP 4: Load Standard Components (VAE, TextEncoder via diffusers)
+        # STEP 4: Load Standard Components (VAE, TextEncoder, etc.)
         # These are NOT quantized - loaded as-is from checkpoint
-        #
-        # For LTX-2, Text encoder loads from a separate path (e.g. Gemma3 directory).
-        # All other LTX_2 specific components load from the checkpoint safetensors.
         # =====================================================================
-        if LTX_2_specific_prefix is not None:
-            pipeline.load_standard_components(
-                checkpoint_dir, self.device, skip_components,
-                text_encoder_path=text_encoder_path,
-            )
-        else:
-            pipeline.load_standard_components(
-                checkpoint_dir, self.device, skip_components,
-            )
+        extra_kwargs = {}
+        if text_encoder_path:
+            extra_kwargs["text_encoder_path"] = text_encoder_path
+        pipeline.load_standard_components(
+            checkpoint_dir, self.device, skip_components, **extra_kwargs,
+        )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================

@@ -411,16 +411,16 @@ class BasicAVTransformerBlock(nn.Module):
         gate_chunks = [t.squeeze(2) for t in gate_vals]
         return (*ss_chunks, *gate_chunks)
 
-    # -- Ulysses helpers for AV cross-attention --------------------------------
+    # -- Sequence-parallel helpers for AV cross-attention ----------------------
 
-    def _ulysses_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
-        """All-gather *x* along *dim* across Ulysses ranks."""
+    def _sp_all_gather(self, x: torch.Tensor, dim: int = 1) -> torch.Tensor:
+        """All-gather *x* along *dim* across sequence-parallel ranks."""
         x = x.contiguous()
         gathered = [torch.empty_like(x) for _ in range(self._ulysses_size)]
         dist.all_gather(gathered, x, group=self._ulysses_pg)
         return torch.cat(gathered, dim=dim)
 
-    def _gather_pe(self, pe):
+    def _sp_gather_pe(self, pe):
         """All-gather RoPE (cos, sin) tuple along the sequence dim."""
         if pe is None:
             return None
@@ -428,8 +428,8 @@ class BasicAVTransformerBlock(nn.Module):
         # Split RoPE: [B, H, S, D] — sequence at dim 2
         # Interleaved RoPE: [B, S, D] — sequence at dim 1
         seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._ulysses_gather(cos, dim=seq_dim),
-                self._ulysses_gather(sin, dim=seq_dim))
+        return (self._sp_all_gather(cos, dim=seq_dim),
+                self._sp_all_gather(sin, dim=seq_dim))
 
     # -- Forward -------------------------------------------------------------
 
@@ -553,8 +553,8 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
 
                 if self._audio_is_sharded:
-                    ax_context = self._ulysses_gather(ax_scaled)
-                    k_pe_a2v = self._gather_pe(audio.cross_positional_embeddings)
+                    ax_context = self._sp_all_gather(ax_scaled)
+                    k_pe_a2v = self._sp_gather_pe(audio.cross_positional_embeddings)
                 else:
                     ax_context = ax_scaled
                     k_pe_a2v = audio.cross_positional_embeddings
@@ -580,8 +580,8 @@ class BasicAVTransformerBlock(nn.Module):
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
 
                 if self._use_ulysses:
-                    vx_context = self._ulysses_gather(vx_scaled)
-                    k_pe_v2a = self._gather_pe(video.cross_positional_embeddings)
+                    vx_context = self._sp_all_gather(vx_scaled)
+                    k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
                 else:
                     vx_context = vx_scaled
                     k_pe_v2a = video.cross_positional_embeddings

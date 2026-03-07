@@ -1,3 +1,4 @@
+import os
 import time
 from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
@@ -116,6 +117,30 @@ class BasePipeline(nn.Module):
 
     def forward(self, *args, **kwargs):
         raise NotImplementedError
+
+    def load_transformer_weights(self, checkpoint_dir: str) -> Dict[str, torch.Tensor]:
+        """Load transformer weights from checkpoint.
+
+        Default implementation reads from a ``transformer/`` sub-directory
+        using :class:`WeightLoader`.  Override for custom checkpoint formats
+        (e.g. LTX-2 single-safetensor with embedded prefix).
+        """
+        if self.transformer is None:
+            raise ValueError("Pipeline has no transformer component")
+
+        transformer_components = self.transformer_components
+        logger.info(f"Transformer components: {transformer_components}")
+
+        transformer_path = os.path.join(checkpoint_dir, PipelineComponent.TRANSFORMER)
+        if not os.path.exists(transformer_path):
+            raise FileNotFoundError(
+                f"Transformer path does not exist: {transformer_path}. "
+                f"Checkpoint directory must contain a 'transformer' subdirectory."
+            )
+
+        from .checkpoints import WeightLoader
+        weight_loader = WeightLoader(components=transformer_components)
+        return weight_loader.load_weights(checkpoint_dir, self.mapping)
 
     def load_standard_components(
         self,
