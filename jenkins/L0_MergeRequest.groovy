@@ -879,7 +879,7 @@ def collectTestResults(pipeline, testFilter)
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add python3")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "apk add py3-pip")
                 trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 config set global.break-system-packages true")
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml")
+                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install pyyaml requests")
                 sh """
                     python3 llm/jenkins/scripts/perf/get_pre_merge_html.py \
                     --input-files=${yamlFileList} \
