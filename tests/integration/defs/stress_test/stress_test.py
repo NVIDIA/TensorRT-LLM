@@ -920,29 +920,53 @@ def run_aiperf_process(cmd,
     Returns:
         Boolean indicating whether the process completed successfully
     """
-    # Start aiperf process with our context manager
-    with launch_process(cmd,
-                        start_new_session=True,
-                        filter_pattern=None,
-                        request_counter=request_counter) as process:
-        # Set monitoring parameters
+    stdout_lines = []
+    stderr_lines = []
+    stdout_lock = threading.Lock()
+    stderr_lock = threading.Lock()
+
+    def _capture_and_print(pipe, line_buffer, lock):
+        try:
+            for line in iter(pipe.readline, ''):
+                print(line, end='', flush=True)
+                with lock:
+                    line_buffer.append(line)
+        except (BrokenPipeError, IOError, ValueError):
+            pass
+
+    process = Popen(cmd,
+                    start_new_session=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    bufsize=1,
+                    universal_newlines=True)
+    print_info(f"Process started with PID: {process.pid}")
+
+    stdout_reader = threading.Thread(target=_capture_and_print,
+                                     args=(process.stdout, stdout_lines,
+                                           stdout_lock),
+                                     daemon=True)
+    stderr_reader = threading.Thread(target=_capture_and_print,
+                                     args=(process.stderr, stderr_lines,
+                                           stderr_lock),
+                                     daemon=True)
+    stdout_reader.start()
+    stderr_reader.start()
+
+    try:
         last_health_check = time.time()
         process_completed = False
 
-        # Monitor both the server and aiperf process
         while process.poll() is None:
             current_time = time.time()
 
-            # Check if aiperf is still running but exceeded timeout
             elapsed_time = current_time - test_start_time
             if elapsed_time > test_timeout:
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
                     f"aiperf test timed out after {test_timeout} seconds")
 
-            # Check server health periodically
             if current_time - last_health_check > server_config.health_check_timeout:
-
                 is_healthy, error_msg = check_server_health(
                     server_config.url, server_config.health_check_timeout)
 
@@ -951,24 +975,32 @@ def run_aiperf_process(cmd,
                         f"Server health check passed after {elapsed_time:.1f} seconds of test"
                     )
                 else:
-                    # Raise an exception to stop the test
                     print_warning(f"Server health check failed: {error_msg}")
                     cleanup_process_tree(process, has_session=True)
                     raise RuntimeError(
                         f"Server health check failed during test: {error_msg}")
 
-                # Update last health check time
                 last_health_check = current_time
 
             time.sleep(0.5)
 
-        # Check final status of aiperf process
+        stdout_reader.join(timeout=5)
+        stderr_reader.join(timeout=5)
+
         retcode = process.poll()
         if retcode is not None:
             if retcode != 0:
+                with stderr_lock:
+                    captured_stderr = ''.join(stderr_lines[-50:])
+                with stdout_lock:
+                    captured_stdout = ''.join(stdout_lines[-50:])
                 cleanup_process_tree(process, has_session=True)
                 raise RuntimeError(
-                    f"aiperf exited with non-zero code: {retcode}")
+                    f"aiperf exited with non-zero code: {retcode}\n"
+                    f"--- aiperf stdout (last 50 lines) ---\n"
+                    f"{captured_stdout}\n"
+                    f"--- aiperf stderr (last 50 lines) ---\n"
+                    f"{captured_stderr}")
             else:
                 print_info("aiperf completed successfully")
                 process_completed = True
@@ -976,6 +1008,11 @@ def run_aiperf_process(cmd,
             cleanup_process_tree(process, has_session=True)
             raise RuntimeError(
                 "aiperf did not complete normally, will terminate")
+    finally:
+        if process.stdout:
+            process.stdout.close()
+        if process.stderr:
+            process.stderr.close()
 
     return process_completed
 
