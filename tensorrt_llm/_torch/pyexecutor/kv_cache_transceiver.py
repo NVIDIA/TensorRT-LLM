@@ -152,6 +152,9 @@ class KvCacheTransceiver(ABC):
         """
         ...
 
+    def shutdown(self):
+        """Shut down the transceiver and release registered resources."""
+
 
 class BindKvCacheTransceiver(KvCacheTransceiver):
 
