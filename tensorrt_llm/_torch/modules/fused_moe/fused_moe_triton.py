@@ -183,9 +183,8 @@ class TritonEPRouter():
                 slice_end)
 
         metadata = bitmatrix.mask_metadata
-        n_total_rows = metadata.col_sum.sum().item()
 
-        expt_data = make_ragged_tensor_metadata(metadata.col_sum, n_total_rows)
+        expt_data = make_ragged_tensor_metadata(metadata.col_sum, logits.shape[0] * n_expts_act)
         gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
 
         rdata = RoutingData(
