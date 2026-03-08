@@ -74,13 +74,9 @@ class TransformerArgsPreprocessor:
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         timestep = timestep * self.timestep_scale_multiplier
-        timestep, embedded_timestep = self.adaln(
-            timestep.flatten(), hidden_dtype=hidden_dtype
-        )
+        timestep, embedded_timestep = self.adaln(timestep.flatten(), hidden_dtype=hidden_dtype)
         timestep = timestep.view(batch_size, -1, timestep.shape[-1])
-        embedded_timestep = embedded_timestep.view(
-            batch_size, -1, embedded_timestep.shape[-1]
-        )
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.shape[-1])
         return timestep, embedded_timestep
 
     def _prepare_context(
@@ -99,12 +95,9 @@ class TransformerArgsPreprocessor:
     ) -> torch.Tensor | None:
         if attention_mask is None or torch.is_floating_point(attention_mask):
             return attention_mask
-        return (
-            (attention_mask - 1)
-            .to(x_dtype)
-            .reshape((attention_mask.shape[0], 1, -1, attention_mask.shape[-1]))
-            * torch.finfo(x_dtype).max
-        )
+        return (attention_mask - 1).to(x_dtype).reshape(
+            (attention_mask.shape[0], 1, -1, attention_mask.shape[-1])
+        ) * torch.finfo(x_dtype).max
 
     def _prepare_positional_embeddings(
         self,
@@ -116,9 +109,7 @@ class TransformerArgsPreprocessor:
         x_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         freq_grid_generator = (
-            _generate_freq_grid_np
-            if self.double_precision_rope
-            else _generate_freq_grid_pytorch
+            _generate_freq_grid_np if self.double_precision_rope else _generate_freq_grid_pytorch
         )
         return precompute_freqs_cis(
             positions,
@@ -137,12 +128,8 @@ class TransformerArgsPreprocessor:
         timestep, embedded_timestep = self._prepare_timestep(
             modality.timesteps, x.shape[0], modality.latent.dtype
         )
-        context, attention_mask = self._prepare_context(
-            modality.context, x, modality.context_mask
-        )
-        attention_mask = self._prepare_attention_mask(
-            attention_mask, modality.latent.dtype
-        )
+        context, attention_mask = self._prepare_context(modality.context, x, modality.context_mask)
+        attention_mask = self._prepare_attention_mask(attention_mask, modality.latent.dtype)
         pe = self._prepare_positional_embeddings(
             positions=modality.positions,
             inner_dim=self.inner_dim,
@@ -216,13 +203,11 @@ class MultiModalTransformerArgsPreprocessor:
             num_attention_heads=self.simple_preprocessor.num_attention_heads,
             x_dtype=modality.latent.dtype,
         )
-        cross_scale_shift_timestep, cross_gate_timestep = (
-            self._prepare_cross_attention_timestep(
-                timestep=modality.timesteps,
-                timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
-                batch_size=transformer_args.x.shape[0],
-                hidden_dtype=modality.latent.dtype,
-            )
+        cross_scale_shift_timestep, cross_gate_timestep = self._prepare_cross_attention_timestep(
+            timestep=modality.timesteps,
+            timestep_scale_multiplier=self.simple_preprocessor.timestep_scale_multiplier,
+            batch_size=transformer_args.x.shape[0],
+            hidden_dtype=modality.latent.dtype,
         )
         return replace(
             transformer_args,
@@ -239,9 +224,7 @@ class MultiModalTransformerArgsPreprocessor:
         hidden_dtype: torch.dtype,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         timestep = timestep * timestep_scale_multiplier
-        av_ca_factor = (
-            self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
-        )
+        av_ca_factor = self.av_ca_timestep_scale_multiplier / timestep_scale_multiplier
 
         scale_shift_timestep, _ = self.cross_scale_shift_adaln(
             timestep.flatten(), hidden_dtype=hidden_dtype

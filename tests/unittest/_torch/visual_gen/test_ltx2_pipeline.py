@@ -19,13 +19,8 @@ import torch
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import (
-    AttentionConfig,
-    DiffusionArgs,
-    PipelineComponent,
-)
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs, PipelineComponent
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
-
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
@@ -374,7 +369,6 @@ class TestLTX2AttentionBackend:
             output_baseline = transformer_baseline(video=video_input, audio=audio_input)
         vout_baseline, aout_baseline = _extract_output(output_baseline)
         vout_baseline_cpu = vout_baseline.cpu() if vout_baseline is not None else None
-        aout_baseline_cpu = aout_baseline.cpu() if aout_baseline is not None else None
 
         del pipeline_baseline, transformer_baseline
         gc.collect()

@@ -93,9 +93,7 @@ class DepthToSpaceUpsample(nn.Module):
     ):
         super().__init__()
         self.stride = stride
-        self.out_channels = (
-            math.prod(stride) * in_channels // out_channels_reduction_factor
-        )
+        self.out_channels = math.prod(stride) * in_channels // out_channels_reduction_factor
         self.conv = make_conv_nd(
             dims=dims,
             in_channels=in_channels,

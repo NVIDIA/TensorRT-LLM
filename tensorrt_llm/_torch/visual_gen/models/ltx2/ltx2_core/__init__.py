@@ -13,11 +13,7 @@ from .diffusion_steps import EulerDiffusionStep
 from .modality import Modality
 from .normalization import NormType, PixelNorm, build_normalization_layer
 from .patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
-from .protocols import (
-    DiffusionStepProtocol,
-    Patchifier,
-    SchedulerProtocol,
-)
+from .protocols import DiffusionStepProtocol, Patchifier, SchedulerProtocol
 from .rope import LTXRopeType, apply_rotary_emb, precompute_freqs_cis
 from .scheduler_adapter import NativeSchedulerAdapter
 from .schedulers import LTX2Scheduler
@@ -33,9 +29,9 @@ from .transformer_args import (
     TransformerArgsPreprocessor,
 )
 from .types import (
+    VIDEO_SCALE_FACTORS,
     AudioLatentShape,
     SpatioTemporalScaleFactors,
-    VIDEO_SCALE_FACTORS,
     VideoLatentShape,
     VideoPixelShape,
 )

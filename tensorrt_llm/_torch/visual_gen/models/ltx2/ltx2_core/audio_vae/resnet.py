@@ -24,32 +24,56 @@ class ResBlock1(torch.nn.Module):
         self.convs1 = torch.nn.ModuleList(
             [
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=dilation[0], padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=dilation[0],
+                    padding="same",
                 ),
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=dilation[1], padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=dilation[1],
+                    padding="same",
                 ),
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=dilation[2], padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=dilation[2],
+                    padding="same",
                 ),
             ]
         )
         self.convs2 = torch.nn.ModuleList(
             [
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=1, padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=1,
+                    padding="same",
                 ),
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=1, padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=1,
+                    padding="same",
                 ),
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=1, padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=1,
+                    padding="same",
                 ),
             ]
         )
@@ -75,12 +99,20 @@ class ResBlock2(torch.nn.Module):
         self.convs = torch.nn.ModuleList(
             [
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=dilation[0], padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=dilation[0],
+                    padding="same",
                 ),
                 torch.nn.Conv1d(
-                    channels, channels, kernel_size, 1,
-                    dilation=dilation[1], padding="same",
+                    channels,
+                    channels,
+                    kernel_size,
+                    1,
+                    dilation=dilation[1],
+                    padding="same",
                 ),
             ]
         )
@@ -119,7 +151,10 @@ class ResnetBlock(torch.nn.Module):
         self.norm1 = build_normalization_layer(in_channels, normtype=norm_type)
         self.non_linearity = torch.nn.SiLU()
         self.conv1 = make_conv2d(
-            in_channels, out_channels, kernel_size=3, stride=1,
+            in_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
             causality_axis=causality_axis,
         )
         if temb_channels > 0:
@@ -127,18 +162,27 @@ class ResnetBlock(torch.nn.Module):
         self.norm2 = build_normalization_layer(out_channels, normtype=norm_type)
         self.dropout = torch.nn.Dropout(dropout)
         self.conv2 = make_conv2d(
-            out_channels, out_channels, kernel_size=3, stride=1,
+            out_channels,
+            out_channels,
+            kernel_size=3,
+            stride=1,
             causality_axis=causality_axis,
         )
         if self.in_channels != self.out_channels:
             if self.use_conv_shortcut:
                 self.conv_shortcut = make_conv2d(
-                    in_channels, out_channels, kernel_size=3, stride=1,
+                    in_channels,
+                    out_channels,
+                    kernel_size=3,
+                    stride=1,
                     causality_axis=causality_axis,
                 )
             else:
                 self.nin_shortcut = make_conv2d(
-                    in_channels, out_channels, kernel_size=1, stride=1,
+                    in_channels,
+                    out_channels,
+                    kernel_size=1,
+                    stride=1,
                     causality_axis=causality_axis,
                 )
 
@@ -157,9 +201,5 @@ class ResnetBlock(torch.nn.Module):
         h = self.dropout(h)
         h = self.conv2(h)
         if self.in_channels != self.out_channels:
-            x = (
-                self.conv_shortcut(x)
-                if self.use_conv_shortcut
-                else self.nin_shortcut(x)
-            )
+            x = self.conv_shortcut(x) if self.use_conv_shortcut else self.nin_shortcut(x)
         return x + h

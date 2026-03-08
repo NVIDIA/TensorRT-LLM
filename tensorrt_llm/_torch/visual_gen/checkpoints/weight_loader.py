@@ -97,7 +97,7 @@ class WeightLoader(BaseWeightLoader):
                 if prefix_filter is not None:
                     for key, tensor in raw.items():
                         if key.startswith(prefix_filter):
-                            component_weights[key[len(prefix_filter):]] = tensor
+                            component_weights[key[len(prefix_filter) :]] = tensor
                 else:
                     component_weights.update(raw)
 

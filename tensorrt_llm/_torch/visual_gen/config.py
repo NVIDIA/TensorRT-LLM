@@ -526,7 +526,8 @@ class DiffusionModelConfig(BaseModel):
 
     @staticmethod
     def _convert_quantization_metadata(
-        qmeta: Dict, tensor_keys: List[str],
+        qmeta: Dict,
+        tensor_keys: List[str],
     ) -> Dict:
         """Convert per-layer ``_quantization_metadata`` to ModelOpt format.
 
@@ -553,17 +554,13 @@ class DiffusionModelConfig(BaseModel):
 
         formats = {info.get("format") for info in layers.values()}
         if len(formats) != 1:
-            logger.warning(
-                f"_quantization_metadata has mixed formats {formats}; skipping"
-            )
+            logger.warning(f"_quantization_metadata has mixed formats {formats}; skipping")
             return {}
 
         fmt = formats.pop()
         quant_algo = _FORMAT_TO_ALGO.get(fmt)
         if quant_algo is None:
-            logger.warning(
-                f"_quantization_metadata format '{fmt}' is not supported; skipping"
-            )
+            logger.warning(f"_quantization_metadata format '{fmt}' is not supported; skipping")
             return {}
 
         quantized_layers = set(layers.keys())
@@ -623,14 +620,10 @@ class DiffusionModelConfig(BaseModel):
                 if meta and "config" in meta:
                     config = json.loads(meta["config"])
                     if "quantization_config" in meta:
-                        config["quantization_config"] = json.loads(
-                            meta["quantization_config"]
-                        )
+                        config["quantization_config"] = json.loads(meta["quantization_config"])
                     elif "_quantization_metadata" in meta:
                         qmeta = json.loads(meta["_quantization_metadata"])
-                        converted = cls._convert_quantization_metadata(
-                            qmeta, list(f.keys())
-                        )
+                        converted = cls._convert_quantization_metadata(qmeta, list(f.keys()))
                         if converted:
                             config["quantization_config"] = converted
                     return config

@@ -73,9 +73,9 @@ def _init_all_weights(model: torch.nn.Module, std: float = 0.02):
                 torch.nn.init.normal_(p, mean=0.0, std=std)
 
 
-def _make_video_positions(batch: int, n_patches: int, n_frames: int,
-                          grid_h: int, grid_w: int,
-                          device: torch.device) -> torch.Tensor:
+def _make_video_positions(
+    batch: int, n_patches: int, n_frames: int, grid_h: int, grid_w: int, device: torch.device
+) -> torch.Tensor:
     """Construct video position tensor (B, 3, T, 2) for RoPE.
 
     Each patch has 3D start/end coordinates: (frame, height, width).
@@ -92,8 +92,7 @@ def _make_video_positions(batch: int, n_patches: int, n_frames: int,
     return positions
 
 
-def _make_audio_positions(batch: int, n_patches: int,
-                          device: torch.device) -> torch.Tensor:
+def _make_audio_positions(batch: int, n_patches: int, device: torch.device) -> torch.Tensor:
     """Construct audio position tensor (B, 1, T, 2) for RoPE.
 
     Audio positions are 1D (time axis only).
@@ -158,11 +157,15 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         dtype = torch.bfloat16
         model_config = _create_model_config()
 
-        model = LTXModel(
-            model_type=LTXModelType.VideoOnly,
-            model_config=model_config,
-            **VIDEO_ONLY_CONFIG,
-        ).to(self.DEVICE, dtype=dtype).eval()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.VideoOnly,
+                model_config=model_config,
+                **VIDEO_ONLY_CONFIG,
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
         _init_all_weights(model)
 
         batch = 1
@@ -173,10 +176,14 @@ class TestLTX2VideoOnlyModel(unittest.TestCase):
         text_len = 8
 
         video_modality = Modality(
-            latent=torch.randn(batch, n_patches, in_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            latent=torch.randn(batch, n_patches, in_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
-            positions=_make_video_positions(batch, n_patches, n_frames, grid_h, grid_w, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            positions=_make_video_positions(
+                batch, n_patches, n_frames, grid_h, grid_w, self.DEVICE
+            ),
+            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
         )
 
         with torch.no_grad():
@@ -244,11 +251,15 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         dtype = torch.bfloat16
         model_config = _create_model_config()
 
-        model = LTXModel(
-            model_type=LTXModelType.AudioVideo,
-            model_config=model_config,
-            **AUDIO_VIDEO_CONFIG,
-        ).to(self.DEVICE, dtype=dtype).eval()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=model_config,
+                **AUDIO_VIDEO_CONFIG,
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
         _init_all_weights(model)
 
         batch = 1
@@ -260,18 +271,22 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         text_len = 8
 
         video_modality = Modality(
-            latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
             positions=_make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
         )
 
         audio_in_channels = AUDIO_VIDEO_CONFIG["audio_in_channels"]
         audio_modality = Modality(
-            latent=torch.randn(batch, a_patches, audio_in_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            latent=torch.randn(batch, a_patches, audio_in_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
             positions=_make_audio_positions(batch, a_patches, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
         )
 
         with torch.no_grad():
@@ -301,11 +316,15 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         dtype = torch.bfloat16
         model_config = _create_model_config()
 
-        model = LTXModel(
-            model_type=LTXModelType.AudioVideo,
-            model_config=model_config,
-            **AUDIO_VIDEO_CONFIG,
-        ).to(self.DEVICE, dtype=dtype).eval()
+        model = (
+            LTXModel(
+                model_type=LTXModelType.AudioVideo,
+                model_config=model_config,
+                **AUDIO_VIDEO_CONFIG,
+            )
+            .to(self.DEVICE, dtype=dtype)
+            .eval()
+        )
         _init_all_weights(model)
 
         batch = 1
@@ -316,10 +335,12 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         text_len = 8
 
         video_modality = Modality(
-            latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            latent=torch.randn(batch, v_patches, in_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
             timesteps=torch.tensor([0.5], device=self.DEVICE),
             positions=_make_video_positions(batch, v_patches, v_frames, v_h, v_w, self.DEVICE),
-            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype) * 0.02,
+            context=torch.randn(batch, text_len, caption_channels, device=self.DEVICE, dtype=dtype)
+            * 0.02,
         )
 
         with torch.no_grad():

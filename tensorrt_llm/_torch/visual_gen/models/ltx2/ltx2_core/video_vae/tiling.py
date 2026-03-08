@@ -54,11 +54,17 @@ class SpatialTilingConfig:
 
     def __post_init__(self) -> None:
         if self.tile_size_in_pixels < 64:
-            raise ValueError(f"tile_size_in_pixels must be at least 64, got {self.tile_size_in_pixels}")
+            raise ValueError(
+                f"tile_size_in_pixels must be at least 64, got {self.tile_size_in_pixels}"
+            )
         if self.tile_size_in_pixels % 32 != 0:
-            raise ValueError(f"tile_size_in_pixels must be divisible by 32, got {self.tile_size_in_pixels}")
+            raise ValueError(
+                f"tile_size_in_pixels must be divisible by 32, got {self.tile_size_in_pixels}"
+            )
         if self.tile_overlap_in_pixels % 32 != 0:
-            raise ValueError(f"tile_overlap_in_pixels must be divisible by 32, got {self.tile_overlap_in_pixels}")
+            raise ValueError(
+                f"tile_overlap_in_pixels must be divisible by 32, got {self.tile_overlap_in_pixels}"
+            )
         if self.tile_overlap_in_pixels >= self.tile_size_in_pixels:
             raise ValueError(
                 f"Overlap must be less than tile size, got {self.tile_overlap_in_pixels} and {self.tile_size_in_pixels}"
@@ -72,11 +78,17 @@ class TemporalTilingConfig:
 
     def __post_init__(self) -> None:
         if self.tile_size_in_frames < 16:
-            raise ValueError(f"tile_size_in_frames must be at least 16, got {self.tile_size_in_frames}")
+            raise ValueError(
+                f"tile_size_in_frames must be at least 16, got {self.tile_size_in_frames}"
+            )
         if self.tile_size_in_frames % 8 != 0:
-            raise ValueError(f"tile_size_in_frames must be divisible by 8, got {self.tile_size_in_frames}")
+            raise ValueError(
+                f"tile_size_in_frames must be divisible by 8, got {self.tile_size_in_frames}"
+            )
         if self.tile_overlap_in_frames % 8 != 0:
-            raise ValueError(f"tile_overlap_in_frames must be divisible by 8, got {self.tile_overlap_in_frames}")
+            raise ValueError(
+                f"tile_overlap_in_frames must be divisible by 8, got {self.tile_overlap_in_frames}"
+            )
         if self.tile_overlap_in_frames >= self.tile_size_in_frames:
             raise ValueError(
                 f"Overlap must be less than tile size, got {self.tile_overlap_in_frames} and {self.tile_size_in_frames}"
@@ -175,7 +187,9 @@ def create_tiles_from_intervals_and_mappers(
     tile_in_coords = list(itertools.product(*full_dim_input_slices))
     tile_out_coords = list(itertools.product(*full_dim_output_slices))
     tile_mask_1ds = list(itertools.product(*full_dim_masks_1d))
-    for in_coord, out_coord, mask_1d in zip(tile_in_coords, tile_out_coords, tile_mask_1ds, strict=True):
+    for in_coord, out_coord, mask_1d in zip(
+        tile_in_coords, tile_out_coords, tile_mask_1ds, strict=True
+    ):
         tiles.append(Tile(in_coords=in_coord, out_coords=out_coord, masks_1d=mask_1d))
     return tiles
 
@@ -194,5 +208,7 @@ def create_tiles(
             f"Number of mappers must equal number of dimensions, got {len(mappers)} and {len(tensor_shape)}"
         )
     intervals = [splitter(length) for splitter, length in zip(splitters, tensor_shape, strict=True)]
-    tiling_spec = TensorTilingSpec(original_shape=tensor_shape, dimension_intervals=tuple(intervals))
+    tiling_spec = TensorTilingSpec(
+        original_shape=tensor_shape, dimension_intervals=tuple(intervals)
+    )
     return create_tiles_from_intervals_and_mappers(tiling_spec, mappers)

@@ -12,6 +12,7 @@ from torch import nn
 
 from ..normalization import PixelNorm
 from ..timestep_embedding import PixArtAlphaCombinedTimestepSizeEmbeddings
+from ..types import SpatioTemporalScaleFactors, VideoLatentShape
 from .convolution import make_conv_nd
 from .enums import NormLayerType, PaddingModeType
 from .ops import PerChannelStatistics, patchify, unpatchify
@@ -28,7 +29,6 @@ from .tiling import (
     compute_trapezoidal_mask_1d,
     create_tiles,
 )
-from ..types import VIDEO_SCALE_FACTORS, SpatioTemporalScaleFactors, VideoLatentShape
 
 logger: logging.Logger = logging.getLogger(__name__)
 
@@ -47,18 +47,24 @@ def _make_encoder_block(
     out_channels = in_channels
     if block_name == "res_x":
         block = UNetMidBlock3D(
-            dims=convolution_dimensions, in_channels=in_channels,
-            num_layers=block_config["num_layers"], resnet_eps=1e-6,
-            resnet_groups=norm_num_groups, norm_layer=norm_layer,
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            num_layers=block_config["num_layers"],
+            resnet_eps=1e-6,
+            resnet_groups=norm_num_groups,
+            norm_layer=norm_layer,
             inject_noise=block_config.get("inject_noise", False),
             timestep_conditioning=timestep_conditioning,
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "attn_res_x":
         block = UNetMidBlock3D(
-            dims=convolution_dimensions, in_channels=in_channels,
-            num_layers=block_config["num_layers"], resnet_groups=norm_num_groups,
-            norm_layer=norm_layer, inject_noise=block_config.get("inject_noise", False),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            num_layers=block_config["num_layers"],
+            resnet_groups=norm_num_groups,
+            norm_layer=norm_layer,
+            inject_noise=block_config.get("inject_noise", False),
             timestep_conditioning=timestep_conditioning,
             attention_head_dim=block_config["attention_head_dim"],
             spatial_padding_mode=spatial_padding_mode,
@@ -66,52 +72,69 @@ def _make_encoder_block(
     elif block_name == "res_x_y":
         out_channels = in_channels * block_config.get("multiplier", 2)
         block = ResnetBlock3D(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=out_channels, eps=1e-6, groups=norm_num_groups,
-            norm_layer=norm_layer, inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=False, spatial_padding_mode=spatial_padding_mode,
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            eps=1e-6,
+            groups=norm_num_groups,
+            norm_layer=norm_layer,
+            inject_noise=block_config.get("inject_noise", False),
+            timestep_conditioning=False,
+            spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_time":
         block = SpaceToDepthDownsample(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=in_channels, stride=(2, 1, 1),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=in_channels,
+            stride=(2, 1, 1),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_space":
         block = SpaceToDepthDownsample(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=in_channels, stride=(1, 2, 2),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=in_channels,
+            stride=(1, 2, 2),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_all":
         out_channels = in_channels * block_config.get("multiplier", 1)
         block = SpaceToDepthDownsample(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=out_channels, stride=(2, 2, 2),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=(2, 2, 2),
             residual=block_config.get("residual", False),
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_space_res":
         out_channels = in_channels * block_config.get("multiplier", 2)
         block = SpaceToDepthDownsample(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=out_channels, stride=(1, 2, 2),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=(1, 2, 2),
             residual=True,
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_time_res":
         out_channels = in_channels * block_config.get("multiplier", 2)
         block = SpaceToDepthDownsample(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=out_channels, stride=(2, 1, 1),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=(2, 1, 1),
             residual=True,
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_all_res":
         out_channels = in_channels * block_config.get("multiplier", 2)
         block = SpaceToDepthDownsample(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=out_channels, stride=(2, 2, 2),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            stride=(2, 2, 2),
             residual=True,
             spatial_padding_mode=spatial_padding_mode,
         )
@@ -144,7 +167,7 @@ class VideoEncoder(nn.Module):
         super().__init__()
         self.patch_size = patch_size
         self.out_channels = out_channels
-        patched_in_channels = in_channels * patch_size ** 2
+        patched_in_channels = in_channels * patch_size**2
         self.causal = causal
         self.timestep_conditioning = timestep_conditioning
         self._norm_num_groups = self._DEFAULT_NORM_NUM_GROUPS
@@ -152,19 +175,24 @@ class VideoEncoder(nn.Module):
 
         feature_channels = out_channels
         self.conv_in = make_conv_nd(
-            dims=convolution_dimensions, in_channels=patched_in_channels,
-            out_channels=feature_channels, kernel_size=3, stride=1, padding=1,
-            causal=True, spatial_padding_mode=encoder_spatial_padding_mode,
+            dims=convolution_dimensions,
+            in_channels=patched_in_channels,
+            out_channels=feature_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            causal=True,
+            spatial_padding_mode=encoder_spatial_padding_mode,
         )
 
         self.down_blocks = nn.ModuleList([])
         for block_name, block_params in encoder_blocks:
             block_config = (
-                {"num_layers": block_params} if isinstance(block_params, int)
-                else block_params
+                {"num_layers": block_params} if isinstance(block_params, int) else block_params
             )
             block, feature_channels = _make_encoder_block(
-                block_name=block_name, block_config=block_config,
+                block_name=block_name,
+                block_config=block_config,
                 in_channels=feature_channels,
                 convolution_dimensions=convolution_dimensions,
                 norm_layer=norm_layer,
@@ -177,16 +205,21 @@ class VideoEncoder(nn.Module):
         if norm_layer == NormLayerType.GROUP_NORM:
             self.conv_norm_out = nn.GroupNorm(
                 num_channels=feature_channels,
-                num_groups=self._norm_num_groups, eps=1e-6,
+                num_groups=self._norm_num_groups,
+                eps=1e-6,
             )
         elif norm_layer == NormLayerType.PIXEL_NORM:
             self.conv_norm_out = PixelNorm()
 
         self.conv_act = nn.SiLU()
         self.conv_out = make_conv_nd(
-            dims=convolution_dimensions, in_channels=feature_channels,
-            out_channels=out_channels + 1, kernel_size=3, padding=1,
-            causal=True, spatial_padding_mode=encoder_spatial_padding_mode,
+            dims=convolution_dimensions,
+            in_channels=feature_channels,
+            out_channels=out_channels + 1,
+            kernel_size=3,
+            padding=1,
+            causal=True,
+            spatial_padding_mode=encoder_spatial_padding_mode,
         )
 
     def forward(self, sample: torch.Tensor) -> torch.Tensor:
@@ -209,7 +242,7 @@ class VideoEncoder(nn.Module):
         sample = self.conv_act(sample)
         sample = self.conv_out(sample, causal=self.causal)
 
-        mean = sample[:, :self.out_channels, ...]
+        mean = sample[:, : self.out_channels, ...]
         return self.per_channel_statistics.normalize(mean)
 
 
@@ -226,18 +259,24 @@ def _make_decoder_block(
     out_channels = in_channels
     if block_name == "res_x":
         block = UNetMidBlock3D(
-            dims=convolution_dimensions, in_channels=in_channels,
-            num_layers=block_config["num_layers"], resnet_eps=1e-6,
-            resnet_groups=norm_num_groups, norm_layer=norm_layer,
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            num_layers=block_config["num_layers"],
+            resnet_eps=1e-6,
+            resnet_groups=norm_num_groups,
+            norm_layer=norm_layer,
             inject_noise=block_config.get("inject_noise", False),
             timestep_conditioning=timestep_conditioning,
             spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "attn_res_x":
         block = UNetMidBlock3D(
-            dims=convolution_dimensions, in_channels=in_channels,
-            num_layers=block_config["num_layers"], resnet_groups=norm_num_groups,
-            norm_layer=norm_layer, inject_noise=block_config.get("inject_noise", False),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            num_layers=block_config["num_layers"],
+            resnet_groups=norm_num_groups,
+            norm_layer=norm_layer,
+            inject_noise=block_config.get("inject_noise", False),
             timestep_conditioning=timestep_conditioning,
             attention_head_dim=block_config["attention_head_dim"],
             spatial_padding_mode=spatial_padding_mode,
@@ -245,21 +284,36 @@ def _make_decoder_block(
     elif block_name == "res_x_y":
         out_channels = in_channels // block_config.get("multiplier", 2)
         block = ResnetBlock3D(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=out_channels, eps=1e-6, groups=norm_num_groups,
-            norm_layer=norm_layer, inject_noise=block_config.get("inject_noise", False),
-            timestep_conditioning=False, spatial_padding_mode=spatial_padding_mode,
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=out_channels,
+            eps=1e-6,
+            groups=norm_num_groups,
+            norm_layer=norm_layer,
+            inject_noise=block_config.get("inject_noise", False),
+            timestep_conditioning=False,
+            spatial_padding_mode=spatial_padding_mode,
         )
     elif block_name == "compress_time":
-        block = DepthToSpaceUpsample(dims=convolution_dimensions, in_channels=in_channels,
-            stride=(2, 1, 1), spatial_padding_mode=spatial_padding_mode)
+        block = DepthToSpaceUpsample(
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            stride=(2, 1, 1),
+            spatial_padding_mode=spatial_padding_mode,
+        )
     elif block_name == "compress_space":
-        block = DepthToSpaceUpsample(dims=convolution_dimensions, in_channels=in_channels,
-            stride=(1, 2, 2), spatial_padding_mode=spatial_padding_mode)
+        block = DepthToSpaceUpsample(
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            stride=(1, 2, 2),
+            spatial_padding_mode=spatial_padding_mode,
+        )
     elif block_name == "compress_all":
         out_channels = in_channels // block_config.get("multiplier", 1)
         block = DepthToSpaceUpsample(
-            dims=convolution_dimensions, in_channels=in_channels, stride=(2, 2, 2),
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            stride=(2, 2, 2),
             residual=block_config.get("residual", False),
             out_channels_reduction_factor=block_config.get("multiplier", 1),
             spatial_padding_mode=spatial_padding_mode,
@@ -302,29 +356,46 @@ class VideoDecoder(nn.Module):
             if block_name == "compress_all":
                 feature_channels = feature_channels * block_config.get("multiplier", 1)
         self.conv_in = make_conv_nd(
-            dims=convolution_dimensions, in_channels=in_channels,
-            out_channels=feature_channels, kernel_size=3, stride=1, padding=1,
-            causal=True, spatial_padding_mode=decoder_spatial_padding_mode,
+            dims=convolution_dimensions,
+            in_channels=in_channels,
+            out_channels=feature_channels,
+            kernel_size=3,
+            stride=1,
+            padding=1,
+            causal=True,
+            spatial_padding_mode=decoder_spatial_padding_mode,
         )
         self.up_blocks = nn.ModuleList([])
         for block_name, block_params in list(reversed(decoder_blocks)):
-            block_config = {"num_layers": block_params} if isinstance(block_params, int) else block_params
+            block_config = (
+                {"num_layers": block_params} if isinstance(block_params, int) else block_params
+            )
             block, feature_channels = _make_decoder_block(
-                block_name=block_name, block_config=block_config,
-                in_channels=feature_channels, convolution_dimensions=convolution_dimensions,
-                norm_layer=norm_layer, timestep_conditioning=timestep_conditioning,
-                norm_num_groups=self._norm_num_groups, spatial_padding_mode=decoder_spatial_padding_mode,
+                block_name=block_name,
+                block_config=block_config,
+                in_channels=feature_channels,
+                convolution_dimensions=convolution_dimensions,
+                norm_layer=norm_layer,
+                timestep_conditioning=timestep_conditioning,
+                norm_num_groups=self._norm_num_groups,
+                spatial_padding_mode=decoder_spatial_padding_mode,
             )
             self.up_blocks.append(block)
         if norm_layer == NormLayerType.GROUP_NORM:
-            self.conv_norm_out = nn.GroupNorm(num_channels=feature_channels, num_groups=self._norm_num_groups, eps=1e-6)
+            self.conv_norm_out = nn.GroupNorm(
+                num_channels=feature_channels, num_groups=self._norm_num_groups, eps=1e-6
+            )
         elif norm_layer == NormLayerType.PIXEL_NORM:
             self.conv_norm_out = PixelNorm()
         self.conv_act = nn.SiLU()
         self.conv_out = make_conv_nd(
-            dims=convolution_dimensions, in_channels=feature_channels,
-            out_channels=out_channels, kernel_size=3, padding=1,
-            causal=True, spatial_padding_mode=decoder_spatial_padding_mode,
+            dims=convolution_dimensions,
+            in_channels=feature_channels,
+            out_channels=out_channels,
+            kernel_size=3,
+            padding=1,
+            causal=True,
+            spatial_padding_mode=decoder_spatial_padding_mode,
         )
         if timestep_conditioning:
             self.timestep_scale_multiplier = nn.Parameter(torch.tensor(1000.0))
@@ -342,13 +413,17 @@ class VideoDecoder(nn.Module):
         batch_size = sample.shape[0]
         if self.timestep_conditioning:
             noise = (
-                torch.randn(sample.size(), generator=generator, dtype=sample.dtype, device=sample.device)
+                torch.randn(
+                    sample.size(), generator=generator, dtype=sample.dtype, device=sample.device
+                )
                 * self.decode_noise_scale
             )
             sample = noise + (1.0 - self.decode_noise_scale) * sample
         sample = self.per_channel_statistics.un_normalize(sample)
         if timestep is None and self.timestep_conditioning:
-            timestep = torch.full((batch_size,), self.decode_timestep, device=sample.device, dtype=sample.dtype)
+            timestep = torch.full(
+                (batch_size,), self.decode_timestep, device=sample.device, dtype=sample.dtype
+            )
         sample = self.conv_in(sample, causal=self.causal)
         scaled_timestep = None
         if self.timestep_conditioning:
@@ -358,7 +433,8 @@ class VideoDecoder(nn.Module):
         for up_block in self.up_blocks:
             if isinstance(up_block, UNetMidBlock3D):
                 sample = up_block(
-                    sample, causal=self.causal,
+                    sample,
+                    causal=self.causal,
                     timestep=scaled_timestep if self.timestep_conditioning else None,
                     generator=generator,
                 )
@@ -371,11 +447,18 @@ class VideoDecoder(nn.Module):
             embedded_timestep = self.last_time_embedder(
                 timestep=scaled_timestep.flatten(), hidden_dtype=sample.dtype
             )
-            embedded_timestep = embedded_timestep.view(batch_size, embedded_timestep.shape[-1], 1, 1, 1)
+            embedded_timestep = embedded_timestep.view(
+                batch_size, embedded_timestep.shape[-1], 1, 1, 1
+            )
             ada_values = self.last_scale_shift_table[None, ..., None, None, None].to(
                 device=sample.device, dtype=sample.dtype
             ) + embedded_timestep.reshape(
-                batch_size, 2, -1, embedded_timestep.shape[-3], embedded_timestep.shape[-2], embedded_timestep.shape[-1],
+                batch_size,
+                2,
+                -1,
+                embedded_timestep.shape[-3],
+                embedded_timestep.shape[-2],
+                embedded_timestep.shape[-1],
             )
             shift, scale = ada_values.unbind(dim=1)
             sample = sample * (1 + scale) + shift
@@ -384,12 +467,15 @@ class VideoDecoder(nn.Module):
         sample = unpatchify(sample, patch_size_hw=self.patch_size, patch_size_t=1)
         return sample
 
-    def _prepare_tiles(self, latent: torch.Tensor, tiling_config: TilingConfig | None = None) -> List[Tile]:
+    def _prepare_tiles(
+        self, latent: torch.Tensor, tiling_config: TilingConfig | None = None
+    ) -> List[Tile]:
         splitters = [DEFAULT_SPLIT_OPERATION] * len(latent.shape)
         mappers = [DEFAULT_MAPPING_OPERATION] * len(latent.shape)
         if tiling_config is not None and tiling_config.spatial_config is not None:
             cfg = tiling_config.spatial_config
             long_side = max(latent.shape[3], latent.shape[4])
+
             def enable_on_axis(axis_idx: int, factor: int) -> None:
                 size = cfg.tile_size_in_pixels // factor
                 overlap = cfg.tile_overlap_in_pixels // factor
@@ -397,7 +483,10 @@ class VideoDecoder(nn.Module):
                 lower_threshold = max(2, overlap + 1)
                 tile_size = max(lower_threshold, round(size * axis_length / long_side))
                 splitters[axis_idx] = split_with_symmetric_overlaps(tile_size, overlap)
-                mappers[axis_idx] = make_mapping_operation(map_spatial_interval_to_pixel, scale=factor)
+                mappers[axis_idx] = make_mapping_operation(
+                    map_spatial_interval_to_pixel, scale=factor
+                )
+
             enable_on_axis(3, self.video_downscale_factors.height)
             enable_on_axis(4, self.video_downscale_factors.width)
         if tiling_config is not None and tiling_config.temporal_config is not None:
@@ -405,7 +494,9 @@ class VideoDecoder(nn.Module):
             tile_size = cfg.tile_size_in_frames // self.video_downscale_factors.time
             overlap = cfg.tile_overlap_in_frames // self.video_downscale_factors.time
             splitters[2] = split_temporal_latents(tile_size, overlap)
-            mappers[2] = make_mapping_operation(map_temporal_interval_to_frame, scale=self.video_downscale_factors.time)
+            mappers[2] = make_mapping_operation(
+                map_temporal_interval_to_frame, scale=self.video_downscale_factors.time
+            )
         return create_tiles(latent.shape, splitters, mappers)
 
     def tiled_decode(
@@ -415,7 +506,9 @@ class VideoDecoder(nn.Module):
         timestep: torch.Tensor | None = None,
         generator: torch.Generator | None = None,
     ) -> Iterator[torch.Tensor]:
-        full_video_shape = VideoLatentShape.from_torch_shape(latent.shape).upscale(self.video_downscale_factors)
+        full_video_shape = VideoLatentShape.from_torch_shape(latent.shape).upscale(
+            self.video_downscale_factors
+        )
         tiles = self._prepare_tiles(latent, tiling_config)
         temporal_groups = self._group_tiles_by_temporal_slice(tiles)
         previous_chunk = None
@@ -426,19 +519,36 @@ class VideoDecoder(nn.Module):
             temporal_tile_buffer_shape = full_video_shape._replace(
                 frames=curr_temporal_slice.stop - curr_temporal_slice.start,
             )
-            buffer = torch.zeros(temporal_tile_buffer_shape.to_torch_shape(), device=latent.device, dtype=latent.dtype)
+            buffer = torch.zeros(
+                temporal_tile_buffer_shape.to_torch_shape(),
+                device=latent.device,
+                dtype=latent.dtype,
+            )
             curr_weights = self._accumulate_temporal_group_into_buffer(
-                group_tiles=temporal_group_tiles, buffer=buffer,
-                latent=latent, timestep=timestep, generator=generator,
+                group_tiles=temporal_group_tiles,
+                buffer=buffer,
+                latent=latent,
+                timestep=timestep,
+                generator=generator,
             )
             if previous_chunk is not None:
                 if previous_temporal_slice.stop > curr_temporal_slice.start:
                     overlap_len = previous_temporal_slice.stop - curr_temporal_slice.start
-                    temporal_overlap_slice = slice(curr_temporal_slice.start - previous_temporal_slice.start, None)
-                    previous_chunk[:, :, temporal_overlap_slice, :, :] += buffer[:, :, slice(0, overlap_len), :, :]
-                    previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[:, :, slice(0, overlap_len), :, :]
-                    buffer[:, :, slice(0, overlap_len), :, :] = previous_chunk[:, :, temporal_overlap_slice, :, :]
-                    curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[:, :, temporal_overlap_slice, :, :]
+                    temporal_overlap_slice = slice(
+                        curr_temporal_slice.start - previous_temporal_slice.start, None
+                    )
+                    previous_chunk[:, :, temporal_overlap_slice, :, :] += buffer[
+                        :, :, slice(0, overlap_len), :, :
+                    ]
+                    previous_weights[:, :, temporal_overlap_slice, :, :] += curr_weights[
+                        :, :, slice(0, overlap_len), :, :
+                    ]
+                    buffer[:, :, slice(0, overlap_len), :, :] = previous_chunk[
+                        :, :, temporal_overlap_slice, :, :
+                    ]
+                    curr_weights[:, :, slice(0, overlap_len), :, :] = previous_weights[
+                        :, :, temporal_overlap_slice, :, :
+                    ]
                 previous_weights = previous_weights.clamp(min=1e-8)
                 yield_len = curr_temporal_slice.start - previous_temporal_slice.start
                 yield (previous_chunk / previous_weights)[:, :, :yield_len, :, :]
@@ -468,8 +578,11 @@ class VideoDecoder(nn.Module):
         return groups
 
     def _accumulate_temporal_group_into_buffer(
-        self, group_tiles: List[Tile], buffer: torch.Tensor,
-        latent: torch.Tensor, timestep: torch.Tensor | None,
+        self,
+        group_tiles: List[Tile],
+        buffer: torch.Tensor,
+        latent: torch.Tensor,
+        timestep: torch.Tensor | None,
         generator: torch.Generator | None,
     ) -> torch.Tensor:
         temporal_slice = group_tiles[0].out_coords[2]
@@ -480,11 +593,15 @@ class VideoDecoder(nn.Module):
             temporal_offset = tile.out_coords[2].start - temporal_slice.start
             expected_temporal_len = tile.out_coords[2].stop - tile.out_coords[2].start
             decoded_temporal_len = decoded_tile.shape[2]
-            actual_temporal_len = min(expected_temporal_len, decoded_temporal_len, buffer.shape[2] - temporal_offset)
+            actual_temporal_len = min(
+                expected_temporal_len, decoded_temporal_len, buffer.shape[2] - temporal_offset
+            )
             chunk_coords = (
-                slice(None), slice(None),
+                slice(None),
+                slice(None),
                 slice(temporal_offset, temporal_offset + actual_temporal_len),
-                tile.out_coords[3], tile.out_coords[4],
+                tile.out_coords[3],
+                tile.out_coords[4],
             )
             decoded_slice = decoded_tile[:, :, :actual_temporal_len, :, :]
             mask_slice = mask[:, :, :actual_temporal_len, :, :] if mask.shape[2] > 1 else mask
@@ -503,6 +620,7 @@ def decode_video(
         frames = (((frames + 1.0) / 2.0).clamp(0.0, 1.0) * 255.0).to(torch.uint8)
         frames = rearrange(frames[0], "c f h w -> f h w c")
         return frames
+
     if tiling_config is not None:
         for frames in video_decoder.tiled_decode(latent, tiling_config, generator=generator):
             yield convert_to_uint8(frames)
@@ -529,12 +647,16 @@ def split_with_symmetric_overlaps(size: int, overlap: int) -> SplitOperation:
         ends[-1] = dimension_size
         left_ramps = [0] + [overlap] * (amount - 1)
         right_ramps = [overlap] * (amount - 1) + [0]
-        return DimensionIntervals(starts=starts, ends=ends, left_ramps=left_ramps, right_ramps=right_ramps)
+        return DimensionIntervals(
+            starts=starts, ends=ends, left_ramps=left_ramps, right_ramps=right_ramps
+        )
+
     return split
 
 
 def split_temporal_latents(size: int, overlap: int) -> SplitOperation:
     non_causal_split = split_with_symmetric_overlaps(size, overlap)
+
     def split(dimension_size: int) -> DimensionIntervals:
         if dimension_size <= size:
             return DEFAULT_SPLIT_OPERATION(dimension_size)
@@ -544,6 +666,7 @@ def split_temporal_latents(size: int, overlap: int) -> SplitOperation:
         left_ramps = intervals.left_ramps
         left_ramps[1:] = [r + 1 for r in left_ramps[1:]]
         return replace(intervals, starts=starts, left_ramps=left_ramps)
+
     return split
 
 
@@ -563,11 +686,16 @@ def make_mapping_operation(
             output_slices.append(output_slice)
             masks_1d.append(mask_1d)
         return output_slices, masks_1d
+
     return map_op
 
 
 def map_temporal_interval_to_frame(
-    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int,
+    begin: int,
+    end: int,
+    left_ramp: int,
+    right_ramp: int,
+    scale: int,
 ) -> Tuple[slice, torch.Tensor]:
     start = begin * scale
     stop = 1 + (end - 1) * scale
@@ -578,9 +706,15 @@ def map_temporal_interval_to_frame(
 
 
 def map_spatial_interval_to_pixel(
-    begin: int, end: int, left_ramp: int, right_ramp: int, scale: int,
+    begin: int,
+    end: int,
+    left_ramp: int,
+    right_ramp: int,
+    scale: int,
 ) -> Tuple[slice, torch.Tensor]:
     start = begin * scale
     stop = end * scale
-    mask_1d = compute_trapezoidal_mask_1d(stop - start, left_ramp * scale, right_ramp * scale, False)
+    mask_1d = compute_trapezoidal_mask_1d(
+        stop - start, left_ramp * scale, right_ramp * scale, False
+    )
     return slice(start, stop), mask_1d

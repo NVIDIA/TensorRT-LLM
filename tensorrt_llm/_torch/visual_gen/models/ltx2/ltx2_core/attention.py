@@ -110,9 +110,7 @@ class Attention(torch.nn.Module):
     ) -> torch.Tensor:
         b, _, _ = q.shape
         dim_head = q.shape[-1] // self.heads
-        q, k, v = (
-            t.view(b, -1, self.heads, dim_head).transpose(1, 2) for t in (q, k, v)
-        )
+        q, k, v = (t.view(b, -1, self.heads, dim_head).transpose(1, 2) for t in (q, k, v))
         if mask is not None:
             if mask.ndim == 2:
                 mask = mask.unsqueeze(0)

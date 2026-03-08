@@ -25,7 +25,10 @@ class Upsample(torch.nn.Module):
         self.causality_axis = causality_axis
         if self.with_conv:
             self.conv = make_conv2d(
-                in_channels, in_channels, kernel_size=3, stride=1,
+                in_channels,
+                in_channels,
+                kernel_size=3,
+                stride=1,
                 causality_axis=causality_axis,
             )
 
@@ -43,9 +46,7 @@ class Upsample(torch.nn.Module):
                 case CausalityAxis.WIDTH_COMPATIBILITY:
                     pass
                 case _:
-                    raise ValueError(
-                        f"Invalid causality_axis: {self.causality_axis}"
-                    )
+                    raise ValueError(f"Invalid causality_axis: {self.causality_axis}")
         return x
 
 
@@ -87,14 +88,10 @@ def build_upsampling_path(
             )
             block_in = block_out
             if curr_res in attn_resolutions:
-                stage.attn.append(
-                    AttnBlock(block_in, norm_type=norm_type)
-                )
+                stage.attn.append(AttnBlock(block_in, norm_type=norm_type))
 
         if level != 0:
-            stage.upsample = Upsample(
-                block_in, resamp_with_conv, causality_axis=causality_axis
-            )
+            stage.upsample = Upsample(block_in, resamp_with_conv, causality_axis=causality_axis)
             curr_res *= 2
 
         up_modules.insert(0, stage)

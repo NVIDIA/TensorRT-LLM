@@ -27,9 +27,7 @@ def make_conv_nd(
     temporal_padding_mode: PaddingModeType = PaddingModeType.ZEROS,
 ) -> nn.Module:
     if not (spatial_padding_mode == temporal_padding_mode or causal):
-        raise NotImplementedError(
-            "spatial and temporal padding modes must be equal"
-        )
+        raise NotImplementedError("spatial and temporal padding modes must be equal")
     if dims == 2:
         return nn.Conv2d(
             in_channels=in_channels,
@@ -118,9 +116,7 @@ class DualConv3d(nn.Module):
         if isinstance(kernel_size, int):
             kernel_size = (kernel_size, kernel_size, kernel_size)
         if kernel_size == (1, 1, 1):
-            raise ValueError(
-                "kernel_size must be greater than 1. Use make_linear_nd instead."
-            )
+            raise ValueError("kernel_size must be greater than 1. Use make_linear_nd instead.")
         if isinstance(stride, int):
             stride = (stride, stride, stride)
         if isinstance(padding, int):
@@ -131,9 +127,7 @@ class DualConv3d(nn.Module):
         self.groups = groups
         self.bias = bias
 
-        intermediate_channels = (
-            out_channels if in_channels < out_channels else in_channels
-        )
+        intermediate_channels = out_channels if in_channels < out_channels else in_channels
 
         self.weight1 = nn.Parameter(
             torch.Tensor(
@@ -153,9 +147,7 @@ class DualConv3d(nn.Module):
             self.register_parameter("bias1", None)
 
         self.weight2 = nn.Parameter(
-            torch.Tensor(
-                out_channels, intermediate_channels // groups, kernel_size[0], 1, 1
-            )
+            torch.Tensor(out_channels, intermediate_channels // groups, kernel_size[0], 1, 1)
         )
         self.stride2 = (stride[0], 1, 1)
         self.padding2 = (padding[0], 0, 0)
@@ -189,9 +181,7 @@ class DualConv3d(nn.Module):
         else:
             return self.forward_with_2d(x=x, skip_time_conv=skip_time_conv)
 
-    def forward_with_3d(
-        self, x: torch.Tensor, skip_time_conv: bool = False
-    ) -> torch.Tensor:
+    def forward_with_3d(self, x: torch.Tensor, skip_time_conv: bool = False) -> torch.Tensor:
         x = F.conv3d(
             x,
             self.weight1,
@@ -214,9 +204,7 @@ class DualConv3d(nn.Module):
         )
         return x
 
-    def forward_with_2d(
-        self, x: torch.Tensor, skip_time_conv: bool = False
-    ) -> torch.Tensor:
+    def forward_with_2d(self, x: torch.Tensor, skip_time_conv: bool = False) -> torch.Tensor:
         b, _, _, h, w = x.shape
         x = rearrange(x, "b c d h w -> (b d) c h w")
         weight1 = self.weight1.squeeze(2)
@@ -280,9 +268,7 @@ class CausalConv3d(nn.Module):
 
     def forward(self, x: torch.Tensor, causal: bool = True) -> torch.Tensor:
         if causal:
-            first_frame_pad = x[:, :, :1, :, :].repeat(
-                (1, 1, self.time_kernel_size - 1, 1, 1)
-            )
+            first_frame_pad = x[:, :, :1, :, :].repeat((1, 1, self.time_kernel_size - 1, 1, 1))
             x = torch.concatenate((first_frame_pad, x), dim=2)
         else:
             first_frame_pad = x[:, :, :1, :, :].repeat(

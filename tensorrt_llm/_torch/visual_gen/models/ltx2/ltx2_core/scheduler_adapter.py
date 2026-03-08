@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import copy
 
 import torch
 
@@ -74,9 +73,7 @@ class NativeSchedulerAdapter:
             terminal=self._terminal,
         )
         merged.update(kwargs)
-        self.sigmas = self._scheduler.execute(
-            steps=num_inference_steps, latent=latent, **merged
-        )
+        self.sigmas = self._scheduler.execute(steps=num_inference_steps, latent=latent, **merged)
         self._step_index = 0
 
     def step(

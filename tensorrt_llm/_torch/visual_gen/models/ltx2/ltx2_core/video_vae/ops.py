@@ -12,9 +12,7 @@ def patchify(x: torch.Tensor, patch_size_hw: int, patch_size_t: int = 1) -> torc
     if patch_size_hw == 1 and patch_size_t == 1:
         return x
     if x.dim() == 4:
-        x = rearrange(
-            x, "b c (h q) (w r) -> b (c r q) h w", q=patch_size_hw, r=patch_size_hw
-        )
+        x = rearrange(x, "b c (h q) (w r) -> b (c r q) h w", q=patch_size_hw, r=patch_size_hw)
     elif x.dim() == 5:
         x = rearrange(
             x,
@@ -30,9 +28,7 @@ def unpatchify(x: torch.Tensor, patch_size_hw: int, patch_size_t: int = 1) -> to
     if patch_size_hw == 1 and patch_size_t == 1:
         return x
     if x.dim() == 4:
-        x = rearrange(
-            x, "b (c r q) h w -> b c (h q) (w r)", q=patch_size_hw, r=patch_size_hw
-        )
+        x = rearrange(x, "b (c r q) h w -> b c (h q) (w r)", q=patch_size_hw, r=patch_size_hw)
     elif x.dim() == 5:
         x = rearrange(
             x,
@@ -52,18 +48,16 @@ class PerChannelStatistics(nn.Module):
         self.register_buffer("std-of-means", torch.empty(latent_channels))
         self.register_buffer("mean-of-means", torch.empty(latent_channels))
         self.register_buffer("mean-of-stds", torch.empty(latent_channels))
-        self.register_buffer(
-            "mean-of-stds_over_std-of-means", torch.empty(latent_channels)
-        )
+        self.register_buffer("mean-of-stds_over_std-of-means", torch.empty(latent_channels))
         self.register_buffer("channel", torch.empty(latent_channels))
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
         """Normalize encoder output to standard latent distribution."""
-        return (
-            x - self.get_buffer("mean-of-means").view(1, -1, 1, 1, 1).to(x)
-        ) / self.get_buffer("std-of-means").view(1, -1, 1, 1, 1).to(x)
+        return (x - self.get_buffer("mean-of-means").view(1, -1, 1, 1, 1).to(x)) / self.get_buffer(
+            "std-of-means"
+        ).view(1, -1, 1, 1, 1).to(x)
 
     def un_normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (
-            x * self.get_buffer("std-of-means").view(1, -1, 1, 1, 1).to(x)
-        ) + self.get_buffer("mean-of-means").view(1, -1, 1, 1, 1).to(x)
+        return (x * self.get_buffer("std-of-means").view(1, -1, 1, 1, 1).to(x)) + self.get_buffer(
+            "mean-of-means"
+        ).view(1, -1, 1, 1, 1).to(x)

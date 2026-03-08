@@ -43,19 +43,25 @@ class Vocoder(torch.nn.Module):
         resblock_class = ResBlock1 if resblock == "1" else ResBlock2
 
         self.ups = nn.ModuleList()
-        for i, (stride, kernel_size) in enumerate(zip(upsample_rates, upsample_kernel_sizes, strict=True)):
+        for i, (stride, kernel_size) in enumerate(
+            zip(upsample_rates, upsample_kernel_sizes, strict=True)
+        ):
             self.ups.append(
                 nn.ConvTranspose1d(
                     upsample_initial_channel // (2**i),
                     upsample_initial_channel // (2 ** (i + 1)),
-                    kernel_size, stride, padding=(kernel_size - stride) // 2,
+                    kernel_size,
+                    stride,
+                    padding=(kernel_size - stride) // 2,
                 )
             )
 
         self.resblocks = nn.ModuleList()
         for i, _ in enumerate(self.ups):
             ch = upsample_initial_channel // (2 ** (i + 1))
-            for kernel_size, dilations in zip(resblock_kernel_sizes, resblock_dilation_sizes, strict=True):
+            for kernel_size, dilations in zip(
+                resblock_kernel_sizes, resblock_dilation_sizes, strict=True
+            ):
                 self.resblocks.append(resblock_class(ch, kernel_size, dilations))
 
         out_channels = 2 if stereo else 1
@@ -75,7 +81,8 @@ class Vocoder(torch.nn.Module):
             start = i * self.num_kernels
             end = start + self.num_kernels
             block_outputs = torch.stack(
-                [self.resblocks[idx](x) for idx in range(start, end)], dim=0,
+                [self.resblocks[idx](x) for idx in range(start, end)],
+                dim=0,
             )
             x = block_outputs.mean(dim=0)
         x = self.conv_post(F.leaky_relu(x))

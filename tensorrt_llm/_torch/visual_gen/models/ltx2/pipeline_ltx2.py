@@ -4,7 +4,6 @@
 
 import copy
 import json
-import os
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
@@ -18,45 +17,29 @@ from tensorrt_llm._torch.visual_gen.config import PipelineComponent
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
-from tensorrt_llm._torch.visual_gen.teacache import CacheContext, register_extractor
+from tensorrt_llm._torch.visual_gen.teacache import CacheContext
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
 
-from .ltx2_core.audio_vae import (
-    AudioDecoder,
-    AudioDecoderConfigurator,
-    Vocoder,
-    VocoderConfigurator,
-    decode_audio,
-)
-from .ltx2_core.connector import (
-    Embeddings1DConnector,
-    Embeddings1DConnectorConfigurator,
-    GemmaFeaturesExtractorProjLinear,
-)
+from .ltx2_core.audio_vae import AudioDecoderConfigurator, VocoderConfigurator, decode_audio
+from .ltx2_core.connector import Embeddings1DConnectorConfigurator, GemmaFeaturesExtractorProjLinear
 from .ltx2_core.guiders import MultiModalGuider, MultiModalGuiderParams
 from .ltx2_core.modality import Modality
 from .ltx2_core.patchifier import AudioPatchifier, VideoLatentPatchifier, get_pixel_coords
-from .ltx2_core.rope import LTXRopeType
 from .ltx2_core.perturbations import (
     BatchedPerturbationConfig,
     PerturbationConfig,
     build_stg_perturbation_config,
 )
+from .ltx2_core.rope import LTXRopeType
 from .ltx2_core.scheduler_adapter import NativeSchedulerAdapter
 from .ltx2_core.types import (
-    AudioLatentShape,
     VIDEO_SCALE_FACTORS,
+    AudioLatentShape,
     VideoLatentShape,
     VideoPixelShape,
 )
-from .ltx2_core.video_vae import (
-    TilingConfig,
-    VideoDecoder,
-    VideoDecoderConfigurator,
-    VideoEncoder,
-    VideoEncoderConfigurator,
-)
+from .ltx2_core.video_vae import TilingConfig, VideoDecoderConfigurator, VideoEncoderConfigurator
 from .transformer_ltx2 import LTXModel, LTXModelType
 
 
@@ -104,20 +87,16 @@ def _load_ltx2_transformer_weights(
         with safetensors.torch.safe_open(path, framework="pt") as f:
             for key in f.keys():
                 if key.startswith(prefix):
-                    stripped = key[len(prefix):]
+                    stripped = key[len(prefix) :]
                     if stripped.startswith(exclude_prefixes):
                         continue
                     weights[stripped] = f.get_tensor(key)
 
     if not weights:
-        raise ValueError(
-            f"No transformer weights found with prefix '{prefix}' "
-            f"in {sft_paths}"
-        )
+        raise ValueError(f"No transformer weights found with prefix '{prefix}' in {sft_paths}")
 
     logger.info(
-        f"Loaded {len(weights)} transformer weight tensors from "
-        f"LTX-2 checkpoint ({prefix}*)"
+        f"Loaded {len(weights)} transformer weight tensors from LTX-2 checkpoint ({prefix}*)"
     )
     return weights
 
@@ -126,7 +105,7 @@ def _load_ltx2_transformer_weights(
 # Maps raw embedding L1 distances to rescaled distances for cache decisions.
 # Coefficients are from:
 # https://huggingface.co/jbilcke-hf/LTX-Video-0.9.1-HFIE/blob/main/teacache.py#L42
-# TODO: Need to verifiy coefficients for correctness.
+# TODO: Need to verify coefficients for correctness.
 
 # LTX2_TEACACHE_COEFFICIENTS = {
 #     "ltx": {
@@ -209,6 +188,7 @@ class LTX2TeaCacheExtractor:
 # Weight-loading helpers
 # ---------------------------------------------------------------------------
 
+
 def _find_safetensors_files(directory: str) -> List[str]:
     """Return sorted list of .safetensors files in *directory*."""
     d = Path(directory)
@@ -249,7 +229,7 @@ def _load_component_weights(
             for key in f.keys():
                 for pfx in prefixes:
                     if key.startswith(pfx):
-                        stripped = key[len(pfx):]
+                        stripped = key[len(pfx) :]
                         state_dict[stripped] = f.get_tensor(key)
                         break
 
@@ -274,6 +254,7 @@ def _load_component_weights(
 # Pipeline
 # ---------------------------------------------------------------------------
 
+
 @register_pipeline("LTX2Pipeline")
 class LTX2Pipeline(BasePipeline):
     """Pipeline for text-to-video generation with audio using LTX2 model.
@@ -296,9 +277,7 @@ class LTX2Pipeline(BasePipeline):
     def _run_warmup(self, warmup_steps: int) -> None:
         """Run warmup inference to trigger torch.compile and CUDA init."""
         for height, width, num_frames in self.common_warmup_shapes:
-            logger.info(
-                f"Warmup: LTX2 {height}x{width}, {num_frames} frames, {warmup_steps} steps"
-            )
+            logger.info(f"Warmup: LTX2 {height}x{width}, {num_frames} frames, {warmup_steps} steps")
             self.forward(
                 prompt="warmup",
                 negative_prompt="",
@@ -385,9 +364,7 @@ class LTX2Pipeline(BasePipeline):
             cross_attention_dim=getattr(cfg, "cross_attention_dim", 4096),
             norm_eps=float(getattr(cfg, "norm_eps", 1e-6)),
             caption_channels=getattr(cfg, "caption_channels", 3840),
-            positional_embedding_theta=float(
-                getattr(cfg, "positional_embedding_theta", 10000.0)
-            ),
+            positional_embedding_theta=float(getattr(cfg, "positional_embedding_theta", 10000.0)),
             positional_embedding_max_pos=getattr(
                 cfg, "positional_embedding_max_pos", [20, 2048, 2048]
             ),
@@ -401,9 +378,7 @@ class LTX2Pipeline(BasePipeline):
             audio_positional_embedding_max_pos=getattr(
                 cfg, "audio_positional_embedding_max_pos", [20]
             ),
-            av_ca_timestep_scale_multiplier=getattr(
-                cfg, "av_ca_timestep_scale_multiplier", 1
-            ),
+            av_ca_timestep_scale_multiplier=getattr(cfg, "av_ca_timestep_scale_multiplier", 1),
             rope_type=rope_type,
             double_precision_rope=double_precision_rope,
             apply_gated_attention=apply_gated_attention,
@@ -466,7 +441,8 @@ class LTX2Pipeline(BasePipeline):
         if PipelineComponent.TEXT_ENCODER not in skip_components:
             logger.info(f"Loading text encoder (Gemma3) from {text_encoder_path}...")
             self.text_encoder = Gemma3ForConditionalGeneration.from_pretrained(
-                text_encoder_path, torch_dtype=dtype,
+                text_encoder_path,
+                torch_dtype=dtype,
             ).to(device)
 
         # --- Resolve native config ----------------------------------------
@@ -512,7 +488,8 @@ class LTX2Pipeline(BasePipeline):
             logger.info("Loading native video decoder...")
             self.video_decoder = VideoDecoderConfigurator.from_config(config)
             _load_component_weights(
-                sft_paths, self.video_decoder,
+                sft_paths,
+                self.video_decoder,
                 ["vae.decoder.", "vae."],
             )
             self.video_decoder = self.video_decoder.to(device=device, dtype=dtype)
@@ -522,7 +499,8 @@ class LTX2Pipeline(BasePipeline):
             logger.info("Loading native audio decoder...")
             self.audio_decoder = AudioDecoderConfigurator.from_config(config)
             _load_component_weights(
-                sft_paths, self.audio_decoder,
+                sft_paths,
+                self.audio_decoder,
                 ["audio_vae.decoder.", "audio_vae."],
             )
             self.audio_decoder = self.audio_decoder.to(device=device, dtype=dtype)
@@ -541,20 +519,24 @@ class LTX2Pipeline(BasePipeline):
             logger.info("Loading native text connectors...")
             self.feature_extractor = GemmaFeaturesExtractorProjLinear.from_config(config)
             _load_component_weights(
-                sft_paths, self.feature_extractor, "text_embedding_projection.",
+                sft_paths,
+                self.feature_extractor,
+                "text_embedding_projection.",
             )
             self.feature_extractor = self.feature_extractor.to(device=device, dtype=dtype)
 
             self.video_connector = Embeddings1DConnectorConfigurator.from_config(config)
             _load_component_weights(
-                sft_paths, self.video_connector,
+                sft_paths,
+                self.video_connector,
                 "model.diffusion_model.video_embeddings_connector.",
             )
             self.video_connector = self.video_connector.to(device=device, dtype=dtype)
 
             self.audio_connector = Embeddings1DConnectorConfigurator.from_config(config)
             _load_component_weights(
-                sft_paths, self.audio_connector,
+                sft_paths,
+                self.audio_connector,
                 "model.diffusion_model.audio_embeddings_connector.",
             )
             self.audio_connector = self.audio_connector.to(device=device, dtype=dtype)
@@ -566,7 +548,8 @@ class LTX2Pipeline(BasePipeline):
                 logger.info("Loading native video encoder (for i2v)...")
                 self.video_encoder = VideoEncoderConfigurator.from_config(config)
                 _load_component_weights(
-                    sft_paths, self.video_encoder,
+                    sft_paths,
+                    self.video_encoder,
                     ["vae.encoder.", "vae."],
                 )
                 self.video_encoder = self.video_encoder.to(device=device, dtype=dtype)
@@ -729,9 +712,7 @@ class LTX2Pipeline(BasePipeline):
 
         Returns (video_embeds, audio_embeds, connector_mask).
         """
-        additive_mask = (
-            (1 - attention_mask.to(prompt_embeds.dtype)) * -1000000.0
-        )
+        additive_mask = (1 - attention_mask.to(prompt_embeds.dtype)) * -1000000.0
         additive_mask = additive_mask.unsqueeze(1).unsqueeze(1)  # [B, 1, 1, S]
 
         projected = self.feature_extractor(prompt_embeds)
@@ -763,9 +744,11 @@ class LTX2Pipeline(BasePipeline):
         """
         if isinstance(image, str):
             from PIL import Image
+
             pil_img = Image.open(image).convert("RGB")
             pil_img = pil_img.resize((width, height), Image.LANCZOS)
             import numpy as np
+
             img_np = np.array(pil_img).astype(np.float32) / 255.0
             img_tensor = torch.from_numpy(img_np).permute(2, 0, 1)  # (3, H, W)
         else:
@@ -781,8 +764,13 @@ class LTX2Pipeline(BasePipeline):
                 ).squeeze(0)
 
         img_tensor = img_tensor * 2.0 - 1.0
-        return img_tensor.unsqueeze(0).unsqueeze(2).to(
-            device=self.device, dtype=self.dtype,
+        return (
+            img_tensor.unsqueeze(0)
+            .unsqueeze(2)
+            .to(
+                device=self.device,
+                dtype=self.dtype,
+            )
         )
 
     @torch.inference_mode()
@@ -880,10 +868,14 @@ class LTX2Pipeline(BasePipeline):
             {"role": "user", "content": [{"type": "text", "text": f"User prompt: {prompt}"}]},
         ]
         text = self.tokenizer.apply_chat_template(
-            messages, tokenize=False, add_generation_prompt=True,
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
         )
         model_inputs = self.tokenizer(
-            text, return_tensors="pt", padding=True,
+            text,
+            return_tensors="pt",
+            padding=True,
         ).to(self.device)
         with torch.inference_mode(), torch.random.fork_rng(devices=[self.device]):
             torch.manual_seed(seed)
@@ -893,7 +885,7 @@ class LTX2Pipeline(BasePipeline):
                 do_sample=True,
                 temperature=0.7,
             )
-            generated_ids = outputs[0][len(model_inputs.input_ids[0]):]
+            generated_ids = outputs[0][len(model_inputs.input_ids[0]) :]
             enhanced = self.tokenizer.decode(generated_ids, skip_special_tokens=True)
         logger.info(f"Enhanced prompt: {enhanced}")
         return enhanced.strip()
@@ -1002,7 +994,8 @@ class LTX2Pipeline(BasePipeline):
         if do_cfg:
             negative_prompt = negative_prompt or ""
             neg_prompt_embeds, neg_prompt_attention_mask = self._encode_prompt(
-                negative_prompt, num_videos_per_prompt=1,
+                negative_prompt,
+                num_videos_per_prompt=1,
                 max_sequence_length=max_sequence_length,
             )
 
@@ -1011,9 +1004,7 @@ class LTX2Pipeline(BasePipeline):
         # ---- 2. Process through connectors ------------------------------
         if do_cfg:
             combined_embeds = torch.cat([neg_prompt_embeds, prompt_embeds], dim=0)
-            combined_mask = torch.cat(
-                [neg_prompt_attention_mask, prompt_attention_mask], dim=0
-            )
+            combined_mask = torch.cat([neg_prompt_attention_mask, prompt_attention_mask], dim=0)
             (
                 video_embeds_combined,
                 audio_embeds_combined,
@@ -1025,7 +1016,8 @@ class LTX2Pipeline(BasePipeline):
             neg_connector_mask, connector_mask = connector_mask_combined.chunk(2, dim=0)
         else:
             video_embeds, audio_embeds, connector_mask = self._process_connectors(
-                prompt_embeds, prompt_attention_mask,
+                prompt_embeds,
+                prompt_attention_mask,
             )
             neg_video_embeds = None
             neg_audio_embeds = None
@@ -1034,7 +1026,11 @@ class LTX2Pipeline(BasePipeline):
         # ---- 3. Prepare latent shapes -----------------------------------
         logger.info("Preparing latents...")
         pixel_shape = VideoPixelShape(
-            batch=1, frames=num_frames, height=height, width=width, fps=frame_rate,
+            batch=1,
+            frames=num_frames,
+            height=height,
+            width=width,
+            fps=frame_rate,
         )
         video_shape = VideoLatentShape.from_pixel_shape(
             pixel_shape,
@@ -1042,7 +1038,9 @@ class LTX2Pipeline(BasePipeline):
         )
         audio_shape = AudioLatentShape.from_video_pixel_shape(
             pixel_shape,
-            channels=getattr(self.audio_decoder, "z_channels", 8) if hasattr(self, "audio_decoder") else 8,
+            channels=getattr(self.audio_decoder, "z_channels", 8)
+            if hasattr(self, "audio_decoder")
+            else 8,
             mel_bins=getattr(self, "audio_mel_bins", 64) // 4,
             sample_rate=getattr(self, "audio_sampling_rate", 16000),
             hop_length=getattr(self, "audio_hop_length", 160),
@@ -1053,7 +1051,9 @@ class LTX2Pipeline(BasePipeline):
         # ---- 4. Generate initial noise / image conditioning ---------------
         latents = torch.randn(
             video_shape.to_torch_shape(),
-            generator=generator, device=self.device, dtype=torch.float32,
+            generator=generator,
+            device=self.device,
+            dtype=torch.float32,
         )
 
         denoise_mask: Optional[torch.Tensor] = None
@@ -1069,8 +1069,13 @@ class LTX2Pipeline(BasePipeline):
             # 5D mask for mixing noise with clean latents (before patchification)
             cond_strength = image_cond_strength
             mask_5d = torch.ones(
-                1, 1, video_shape.frames, video_shape.height, video_shape.width,
-                device=self.device, dtype=torch.float32,
+                1,
+                1,
+                video_shape.frames,
+                video_shape.height,
+                video_shape.width,
+                device=self.device,
+                dtype=torch.float32,
             )
             mask_5d[:, :, :1, :, :] = 1.0 - cond_strength
 
@@ -1079,7 +1084,9 @@ class LTX2Pipeline(BasePipeline):
 
             # Token-space mask for per-token timesteps (after patchification)
             denoise_mask = self._build_denoise_mask(
-                video_shape, num_cond_latent_frames=1, strength=cond_strength,
+                video_shape,
+                num_cond_latent_frames=1,
+                strength=cond_strength,
             )
             # Full-size clean latent in patchified form for post-step blending.
             # Non-conditioned positions are zero (masked out by denoise_mask).
@@ -1097,26 +1104,33 @@ class LTX2Pipeline(BasePipeline):
 
         audio_latents = torch.randn(
             audio_shape.to_torch_shape(),
-            generator=generator, device=self.device, dtype=torch.float32,
+            generator=generator,
+            device=self.device,
+            dtype=torch.float32,
         )
         audio_latents = self.audio_patchifier.patchify(audio_latents)
 
         # ---- 5. Position embeddings (RoPE) ------------------------------
         video_positions = self.video_patchifier.get_patch_grid_bounds(
-            video_shape, device=self.device,
+            video_shape,
+            device=self.device,
         )
         video_positions = get_pixel_coords(
-            video_positions.float(), VIDEO_SCALE_FACTORS, causal_fix=True,
+            video_positions.float(),
+            VIDEO_SCALE_FACTORS,
+            causal_fix=True,
         )
         video_positions[:, 0, ...] = video_positions[:, 0, ...] / frame_rate
         video_positions = video_positions.to(self.dtype)
         audio_positions = self.audio_patchifier.get_patch_grid_bounds(
-            audio_shape, device=self.device,
+            audio_shape,
+            device=self.device,
         )
 
         # ---- 6. Prepare scheduler / timesteps ---------------------------
         latents_5d = torch.randn(
-            video_shape.to_torch_shape(), device=self.device,
+            video_shape.to_torch_shape(),
+            device=self.device,
         )
         self.scheduler.set_timesteps(num_inference_steps, latent=latents_5d)
         audio_scheduler = copy.deepcopy(self.scheduler)
@@ -1130,8 +1144,12 @@ class LTX2Pipeline(BasePipeline):
 
         # ---- 8. Denoising loop ------------------------------------------
         def _run_transformer(
-            v_latents, a_latents, timestep_val,
-            v_context, a_context, mask,
+            v_latents,
+            a_latents,
+            timestep_val,
+            v_context,
+            a_context,
+            mask,
             perturbations=None,
         ):
             """Single transformer pass → (denoised_video, denoised_audio).
@@ -1154,18 +1172,34 @@ class LTX2Pipeline(BasePipeline):
             else:
                 v_timestep = timestep_val
 
-            video_mod = Modality(
-                latent=v_latents_bf, timesteps=v_timestep,
-                positions=video_positions, context=v_context, context_mask=mask,
-            ) if v_latents_bf is not None else None
+            video_mod = (
+                Modality(
+                    latent=v_latents_bf,
+                    timesteps=v_timestep,
+                    positions=video_positions,
+                    context=v_context,
+                    context_mask=mask,
+                )
+                if v_latents_bf is not None
+                else None
+            )
 
-            audio_mod = Modality(
-                latent=a_latents_bf, timesteps=timestep_val,
-                positions=audio_positions, context=a_context, context_mask=mask,
-            ) if a_latents_bf is not None else None
+            audio_mod = (
+                Modality(
+                    latent=a_latents_bf,
+                    timesteps=timestep_val,
+                    positions=audio_positions,
+                    context=a_context,
+                    context_mask=mask,
+                )
+                if a_latents_bf is not None
+                else None
+            )
 
             vel_v, vel_a = self.transformer(
-                video=video_mod, audio=audio_mod, perturbations=perturbations,
+                video=video_mod,
+                audio=audio_mod,
+                perturbations=perturbations,
             )
 
             dn_v = None
@@ -1191,8 +1225,11 @@ class LTX2Pipeline(BasePipeline):
         step_counter = [0]
 
         def forward_fn(
-            video_latents, extra_stream_latents, timestep,
-            encoder_hidden_states, extra_tensors,
+            video_latents,
+            extra_stream_latents,
+            timestep,
+            encoder_hidden_states,
+            extra_tensors,
         ):
             audio_latents_in = extra_stream_latents.get("audio")
             cur_step = step_counter[0]
@@ -1200,7 +1237,9 @@ class LTX2Pipeline(BasePipeline):
 
             if not use_multi_modal_guidance or video_guider.should_skip_step(cur_step):
                 dn_v, dn_a = _run_transformer(
-                    video_latents, audio_latents_in, timestep,
+                    video_latents,
+                    audio_latents_in,
+                    timestep,
                     encoder_hidden_states,
                     extra_tensors.get("audio_embeds", audio_embeds),
                     extra_tensors.get("attention_mask", connector_mask),
@@ -1212,13 +1251,21 @@ class LTX2Pipeline(BasePipeline):
                 # CFG parallel: split cond/uncond across GPUs, all-gather
                 if cfg_group == 0:
                     local_v, local_a = _run_transformer(
-                        video_latents, audio_latents_in, timestep,
-                        video_embeds, audio_embeds, connector_mask,
+                        video_latents,
+                        audio_latents_in,
+                        timestep,
+                        video_embeds,
+                        audio_embeds,
+                        connector_mask,
                     )
                 else:
                     local_v, local_a = _run_transformer(
-                        video_latents, audio_latents_in, timestep,
-                        neg_video_embeds, neg_audio_embeds, neg_connector_mask,
+                        video_latents,
+                        audio_latents_in,
+                        timestep,
+                        neg_video_embeds,
+                        neg_audio_embeds,
+                        neg_connector_mask,
                     )
 
                 local_v = local_v.contiguous()
@@ -1238,15 +1285,23 @@ class LTX2Pipeline(BasePipeline):
                     uncond_a = 0.0
             else:
                 cond_v, cond_a = _run_transformer(
-                    video_latents, audio_latents_in, timestep,
-                    video_embeds, audio_embeds, connector_mask,
+                    video_latents,
+                    audio_latents_in,
+                    timestep,
+                    video_embeds,
+                    audio_embeds,
+                    connector_mask,
                 )
                 uncond_v = 0.0
                 uncond_a = 0.0
                 if do_cfg and neg_video_embeds is not None:
                     uncond_v, uncond_a = _run_transformer(
-                        video_latents, audio_latents_in, timestep,
-                        neg_video_embeds, neg_audio_embeds, neg_connector_mask,
+                        video_latents,
+                        audio_latents_in,
+                        timestep,
+                        neg_video_embeds,
+                        neg_audio_embeds,
+                        neg_connector_mask,
                     )
 
             # STG: perturbed attention pass
@@ -1257,8 +1312,12 @@ class LTX2Pipeline(BasePipeline):
                     perturbations=[stg_perturbation] * video_latents.shape[0]
                 )
                 perturbed_v, perturbed_a = _run_transformer(
-                    video_latents, audio_latents_in, timestep,
-                    video_embeds, audio_embeds, connector_mask,
+                    video_latents,
+                    audio_latents_in,
+                    timestep,
+                    video_embeds,
+                    audio_embeds,
+                    connector_mask,
                     perturbations=batched,
                 )
 
@@ -1267,13 +1326,21 @@ class LTX2Pipeline(BasePipeline):
             iso_a: torch.Tensor | float = 0.0
             if do_modality:
                 iso_v, _ = _run_transformer(
-                    video_latents, None, timestep,
-                    video_embeds, None, connector_mask,
+                    video_latents,
+                    None,
+                    timestep,
+                    video_embeds,
+                    None,
+                    connector_mask,
                 )
                 if audio_latents_in is not None:
                     _, iso_a = _run_transformer(
-                        None, audio_latents_in, timestep,
-                        None, audio_embeds, connector_mask,
+                        None,
+                        audio_latents_in,
+                        timestep,
+                        None,
+                        audio_embeds,
+                        connector_mask,
                     )
 
             guided_v = video_guider.calculate(cond_v, uncond_v, perturbed_v, iso_v)
@@ -1329,7 +1396,9 @@ class LTX2Pipeline(BasePipeline):
             tiling_config = TilingConfig.default()
             chunks = list(
                 self.video_decoder.tiled_decode(
-                    vid_latents, tiling_config, generator=generator,
+                    vid_latents,
+                    tiling_config,
+                    generator=generator,
                 )
             )
             video = torch.cat(chunks, dim=2)

@@ -80,17 +80,13 @@ class ResnetBlock3D(nn.Module):
             self.per_channel_scale2 = nn.Parameter(torch.zeros((in_channels, 1, 1)))
 
         self.conv_shortcut = (
-            make_linear_nd(
-                dims=dims, in_channels=in_channels, out_channels=out_channels
-            )
+            make_linear_nd(dims=dims, in_channels=in_channels, out_channels=out_channels)
             if in_channels != out_channels
             else nn.Identity()
         )
 
         self.norm3 = (
-            nn.GroupNorm(
-                num_groups=1, num_channels=in_channels, eps=eps, affine=True
-            )
+            nn.GroupNorm(num_groups=1, num_channels=in_channels, eps=eps, affine=True)
             if in_channels != out_channels
             else nn.Identity()
         )
@@ -108,9 +104,9 @@ class ResnetBlock3D(nn.Module):
         spatial_shape = hidden_states.shape[-2:]
         device = hidden_states.device
         dtype = hidden_states.dtype
-        spatial_noise = torch.randn(
-            spatial_shape, device=device, dtype=dtype, generator=generator
-        )[None]
+        spatial_noise = torch.randn(spatial_shape, device=device, dtype=dtype, generator=generator)[
+            None
+        ]
         scaled_noise = (spatial_noise * per_channel_scale)[None, :, None, ...]
         hidden_states = hidden_states + scaled_noise
         return hidden_states
@@ -128,12 +124,8 @@ class ResnetBlock3D(nn.Module):
         hidden_states = self.norm1(hidden_states)
         if self.timestep_conditioning:
             if timestep is None:
-                raise ValueError(
-                    "'timestep' must be provided when 'timestep_conditioning' is True"
-                )
-            ada_values = self.scale_shift_table[
-                None, ..., None, None, None
-            ].to(
+                raise ValueError("'timestep' must be provided when 'timestep_conditioning' is True")
+            ada_values = self.scale_shift_table[None, ..., None, None, None].to(
                 device=hidden_states.device, dtype=hidden_states.dtype
             ) + timestep.reshape(
                 batch_size,
@@ -152,9 +144,7 @@ class ResnetBlock3D(nn.Module):
         if self.inject_noise:
             hidden_states = self._feed_spatial_noise(
                 hidden_states,
-                self.per_channel_scale1.to(
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                ),
+                self.per_channel_scale1.to(device=hidden_states.device, dtype=hidden_states.dtype),
                 generator=generator,
             )
 
@@ -169,9 +159,7 @@ class ResnetBlock3D(nn.Module):
         if self.inject_noise:
             hidden_states = self._feed_spatial_noise(
                 hidden_states,
-                self.per_channel_scale2.to(
-                    device=hidden_states.device, dtype=hidden_states.dtype
-                ),
+                self.per_channel_scale2.to(device=hidden_states.device, dtype=hidden_states.dtype),
                 generator=generator,
             )
 
@@ -197,11 +185,7 @@ class UNetMidBlock3D(nn.Module):
         **_kwargs,
     ):
         super().__init__()
-        resnet_groups = (
-            resnet_groups
-            if resnet_groups is not None
-            else min(in_channels // 4, 32)
-        )
+        resnet_groups = resnet_groups if resnet_groups is not None else min(in_channels // 4, 32)
         self.timestep_conditioning = timestep_conditioning
 
         if timestep_conditioning:
@@ -237,16 +221,12 @@ class UNetMidBlock3D(nn.Module):
         timestep_embed = None
         if self.timestep_conditioning:
             if timestep is None:
-                raise ValueError(
-                    "'timestep' must be provided when 'timestep_conditioning' is True"
-                )
+                raise ValueError("'timestep' must be provided when 'timestep_conditioning' is True")
             batch_size = hidden_states.shape[0]
             timestep_embed = self.time_embedder(
                 timestep=timestep.flatten(), hidden_dtype=hidden_states.dtype
             )
-            timestep_embed = timestep_embed.view(
-                batch_size, timestep_embed.shape[-1], 1, 1, 1
-            )
+            timestep_embed = timestep_embed.view(batch_size, timestep_embed.shape[-1], 1, 1, 1)
 
         for resnet in self.res_blocks:
             hidden_states = resnet(

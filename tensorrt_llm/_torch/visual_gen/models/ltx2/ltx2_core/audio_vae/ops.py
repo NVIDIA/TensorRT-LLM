@@ -15,11 +15,7 @@ class PerChannelStatistics(nn.Module):
         self.register_buffer("mean-of-means", torch.empty(latent_channels))
 
     def un_normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x * self.get_buffer("std-of-means").to(x)) + self.get_buffer(
-            "mean-of-means"
-        ).to(x)
+        return (x * self.get_buffer("std-of-means").to(x)) + self.get_buffer("mean-of-means").to(x)
 
     def normalize(self, x: torch.Tensor) -> torch.Tensor:
-        return (x - self.get_buffer("mean-of-means").to(x)) / self.get_buffer(
-            "std-of-means"
-        ).to(x)
+        return (x - self.get_buffer("mean-of-means").to(x)) / self.get_buffer("std-of-means").to(x)

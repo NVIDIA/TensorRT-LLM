@@ -30,26 +30,37 @@ class CausalConv2d(torch.nn.Module):
         match self.causality_axis:
             case CausalityAxis.NONE:
                 self.padding = (
-                    pad_w // 2, pad_w - pad_w // 2,
-                    pad_h // 2, pad_h - pad_h // 2,
+                    pad_w // 2,
+                    pad_w - pad_w // 2,
+                    pad_h // 2,
+                    pad_h - pad_h // 2,
                 )
             case CausalityAxis.WIDTH | CausalityAxis.WIDTH_COMPATIBILITY:
                 self.padding = (
-                    pad_w, 0,
-                    pad_h // 2, pad_h - pad_h // 2,
+                    pad_w,
+                    0,
+                    pad_h // 2,
+                    pad_h - pad_h // 2,
                 )
             case CausalityAxis.HEIGHT:
                 self.padding = (
-                    pad_w // 2, pad_w - pad_w // 2,
-                    pad_h, 0,
+                    pad_w // 2,
+                    pad_w - pad_w // 2,
+                    pad_h,
+                    0,
                 )
             case _:
                 raise ValueError(f"Invalid causality_axis: {causality_axis}")
 
         self.conv = torch.nn.Conv2d(
-            in_channels, out_channels, kernel_size,
-            stride=stride, padding=0, dilation=dilation,
-            groups=groups, bias=bias,
+            in_channels,
+            out_channels,
+            kernel_size,
+            stride=stride,
+            padding=0,
+            dilation=dilation,
+            groups=groups,
+            bias=bias,
         )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -68,6 +79,12 @@ def make_conv2d(
     causality_axis: CausalityAxis = CausalityAxis.HEIGHT,
 ) -> CausalConv2d:
     return CausalConv2d(
-        in_channels, out_channels, kernel_size, stride,
-        dilation, groups, bias, causality_axis,
+        in_channels,
+        out_channels,
+        kernel_size,
+        stride,
+        dilation,
+        groups,
+        bias,
+        causality_axis,
     )

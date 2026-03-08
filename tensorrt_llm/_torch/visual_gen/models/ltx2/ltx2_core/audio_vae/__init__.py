@@ -3,10 +3,7 @@
 # SPDX-License-Identifier: LicenseRef-LTX-2
 
 from .audio_vae import AudioDecoder, decode_audio
-from .model_configurator import (
-    AudioDecoderConfigurator,
-    VocoderConfigurator,
-)
+from .model_configurator import AudioDecoderConfigurator, VocoderConfigurator
 from .ops import PerChannelStatistics
 from .vocoder import Vocoder
 

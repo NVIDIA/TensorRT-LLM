@@ -20,9 +20,7 @@ class VideoLatentPatchifier:
         return self._patch_size
 
     def get_token_count(self, tgt_shape: VideoLatentShape) -> int:
-        return math.prod(tgt_shape.to_torch_shape()[2:]) // math.prod(
-            self._patch_size
-        )
+        return math.prod(tgt_shape.to_torch_shape()[2:]) // math.prod(self._patch_size)
 
     def patchify(self, latents: torch.Tensor) -> torch.Tensor:
         latents = einops.rearrange(
@@ -34,9 +32,7 @@ class VideoLatentPatchifier:
         )
         return latents
 
-    def unpatchify(
-        self, latents: torch.Tensor, output_shape: VideoLatentShape
-    ) -> torch.Tensor:
+    def unpatchify(self, latents: torch.Tensor, output_shape: VideoLatentShape) -> torch.Tensor:
         assert self._patch_size[0] == 1, "Temporal patch size must be 1"
         patch_grid_frames = output_shape.frames // self._patch_size[0]
         patch_grid_height = output_shape.height // self._patch_size[1]
@@ -58,24 +54,16 @@ class VideoLatentPatchifier:
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         if not isinstance(output_shape, VideoLatentShape):
-            raise ValueError(
-                "VideoLatentPatchifier expects VideoLatentShape"
-            )
+            raise ValueError("VideoLatentPatchifier expects VideoLatentShape")
         frames = output_shape.frames
         height = output_shape.height
         width = output_shape.width
         batch_size = output_shape.batch
 
         grid_coords = torch.meshgrid(
-            torch.arange(
-                start=0, end=frames, step=self._patch_size[0], device=device
-            ),
-            torch.arange(
-                start=0, end=height, step=self._patch_size[1], device=device
-            ),
-            torch.arange(
-                start=0, end=width, step=self._patch_size[2], device=device
-            ),
+            torch.arange(start=0, end=frames, step=self._patch_size[0], device=device),
+            torch.arange(start=0, end=height, step=self._patch_size[1], device=device),
+            torch.arange(start=0, end=width, step=self._patch_size[2], device=device),
             indexing="ij",
         )
         patch_starts = torch.stack(grid_coords, dim=0)
@@ -100,14 +88,10 @@ def get_pixel_coords(
 ) -> torch.Tensor:
     broadcast_shape = [1] * latent_coords.ndim
     broadcast_shape[1] = -1
-    scale_tensor = torch.tensor(
-        scale_factors, device=latent_coords.device
-    ).view(*broadcast_shape)
+    scale_tensor = torch.tensor(scale_factors, device=latent_coords.device).view(*broadcast_shape)
     pixel_coords = latent_coords * scale_tensor
     if causal_fix:
-        pixel_coords[:, 0, ...] = (
-            pixel_coords[:, 0, ...] + 1 - scale_factors[0]
-        ).clamp(min=0)
+        pixel_coords[:, 0, ...] = (pixel_coords[:, 0, ...] + 1 - scale_factors[0]).clamp(min=0)
     return pixel_coords
 
 
@@ -144,9 +128,7 @@ class AudioPatchifier:
     ) -> torch.Tensor:
         if device is None:
             device = torch.device("cpu")
-        audio_latent_frame = torch.arange(
-            start_latent, end_latent, dtype=dtype, device=device
-        )
+        audio_latent_frame = torch.arange(start_latent, end_latent, dtype=dtype, device=device)
         audio_mel_frame = audio_latent_frame * self.audio_latent_downsample_factor
         if self.is_causal:
             causal_offset = 1
@@ -198,9 +180,5 @@ class AudioPatchifier:
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
         if not isinstance(output_shape, AudioLatentShape):
-            raise ValueError(
-                "AudioPatchifier expects AudioLatentShape"
-            )
-        return self._compute_audio_timings(
-            output_shape.batch, output_shape.frames, device
-        )
+            raise ValueError("AudioPatchifier expects AudioLatentShape")
+        return self._compute_audio_timings(output_shape.batch, output_shape.frames, device)

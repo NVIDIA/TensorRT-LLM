@@ -35,7 +35,6 @@ from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelis
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
 
-
 from .ltx2_core.adaln import AdaLayerNormSingle
 from .ltx2_core.modality import Modality
 from .ltx2_core.perturbations import BatchedPerturbationConfig, PerturbationType
@@ -134,8 +133,12 @@ class LTX2Attention(Attention):
 
         if apply_gated_attention:
             self.to_gate_logits = Linear(
-                query_dim, heads, bias=True, dtype=self.dtype,
-                mapping=self.mapping, quant_config=self.quant_config,
+                query_dim,
+                heads,
+                bias=True,
+                dtype=self.dtype,
+                mapping=self.mapping,
+                quant_config=self.quant_config,
                 skip_create_weights_in_init=self.skip_create_weights_in_init,
                 force_dynamic_quantization=self.force_dynamic_quantization,
             )
@@ -162,26 +165,39 @@ class LTX2Attention(Attention):
             super()._init_qkv_proj()
             return
         self.to_q = Linear(
-            self.hidden_size, self.q_dim, bias=self.bias, dtype=self.dtype,
-            mapping=self.mapping, quant_config=self.quant_config,
+            self.hidden_size,
+            self.q_dim,
+            bias=self.bias,
+            dtype=self.dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
         self.to_k = Linear(
-            self._context_dim, self.kv_dim, bias=self.bias, dtype=self.dtype,
-            mapping=self.mapping, quant_config=self.quant_config,
+            self._context_dim,
+            self.kv_dim,
+            bias=self.bias,
+            dtype=self.dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
         self.to_v = Linear(
-            self._context_dim, self.kv_dim, bias=self.bias, dtype=self.dtype,
-            mapping=self.mapping, quant_config=self.quant_config,
+            self._context_dim,
+            self.kv_dim,
+            bias=self.bias,
+            dtype=self.dtype,
+            mapping=self.mapping,
+            quant_config=self.quant_config,
             skip_create_weights_in_init=self.skip_create_weights_in_init,
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
 
     def project_kv(
-        self, context: torch.Tensor,
+        self,
+        context: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Project and normalize K/V from context.
 
@@ -289,76 +305,100 @@ class BasicAVTransformerBlock(nn.Module):
             self._init_audio_modules(audio, rope_type, norm_eps, config, idx)
 
         if audio is not None and video is not None:
-            self._init_av_cross_modules(
-                video, audio, rope_type, norm_eps, config, idx
-            )
+            self._init_av_cross_modules(video, audio, rope_type, norm_eps, config, idx)
 
     @staticmethod
     def _make_mlp(cfg, model_config, idx):
         dtype = model_config.torch_dtype if model_config else None
         return MLP(
-            hidden_size=cfg.dim, intermediate_size=cfg.dim * 4, bias=True,
+            hidden_size=cfg.dim,
+            intermediate_size=cfg.dim * 4,
+            bias=True,
             activation=lambda x: F.gelu(x, approximate="tanh"),
-            dtype=dtype, config=model_config, layer_idx=idx,
+            dtype=dtype,
+            config=model_config,
+            layer_idx=idx,
         )
 
     def _init_video_modules(self, cfg, rope_type, eps, model_config, idx):
         self.attn1 = LTX2Attention(
-            query_dim=cfg.dim, heads=cfg.heads, dim_head=cfg.d_head,
-            context_dim=None, rope_type=rope_type, norm_eps=eps,
+            query_dim=cfg.dim,
+            heads=cfg.heads,
+            dim_head=cfg.d_head,
+            context_dim=None,
+            rope_type=rope_type,
+            norm_eps=eps,
             apply_gated_attention=cfg.apply_gated_attention,
-            config=model_config, layer_idx=idx,
+            config=model_config,
+            layer_idx=idx,
             use_ulysses=True,
         )
         self.attn2 = LTX2Attention(
-            query_dim=cfg.dim, context_dim=cfg.context_dim,
-            heads=cfg.heads, dim_head=cfg.d_head,
-            rope_type=rope_type, norm_eps=eps,
+            query_dim=cfg.dim,
+            context_dim=cfg.context_dim,
+            heads=cfg.heads,
+            dim_head=cfg.d_head,
+            rope_type=rope_type,
+            norm_eps=eps,
             apply_gated_attention=cfg.apply_gated_attention,
-            config=model_config, layer_idx=idx,
+            config=model_config,
+            layer_idx=idx,
         )
         self.ff = self._make_mlp(cfg, model_config, idx)
         self.scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_audio_modules(self, cfg, rope_type, eps, model_config, idx):
         self.audio_attn1 = LTX2Attention(
-            query_dim=cfg.dim, heads=cfg.heads, dim_head=cfg.d_head,
-            context_dim=None, rope_type=rope_type, norm_eps=eps,
+            query_dim=cfg.dim,
+            heads=cfg.heads,
+            dim_head=cfg.d_head,
+            context_dim=None,
+            rope_type=rope_type,
+            norm_eps=eps,
             apply_gated_attention=cfg.apply_gated_attention,
-            config=model_config, layer_idx=idx,
+            config=model_config,
+            layer_idx=idx,
             use_ulysses=True,
         )
         self.audio_attn2 = LTX2Attention(
-            query_dim=cfg.dim, context_dim=cfg.context_dim,
-            heads=cfg.heads, dim_head=cfg.d_head,
-            rope_type=rope_type, norm_eps=eps,
+            query_dim=cfg.dim,
+            context_dim=cfg.context_dim,
+            heads=cfg.heads,
+            dim_head=cfg.d_head,
+            rope_type=rope_type,
+            norm_eps=eps,
             apply_gated_attention=cfg.apply_gated_attention,
-            config=model_config, layer_idx=idx,
+            config=model_config,
+            layer_idx=idx,
         )
         self.audio_ff = self._make_mlp(cfg, model_config, idx)
         self.audio_scale_shift_table = nn.Parameter(torch.empty(6, cfg.dim))
 
     def _init_av_cross_modules(self, v_cfg, a_cfg, rope_type, eps, model_config, idx):
         self.audio_to_video_attn = LTX2Attention(
-            query_dim=v_cfg.dim, context_dim=a_cfg.dim,
-            heads=a_cfg.heads, dim_head=a_cfg.d_head,
-            rope_type=rope_type, norm_eps=eps,
+            query_dim=v_cfg.dim,
+            context_dim=a_cfg.dim,
+            heads=a_cfg.heads,
+            dim_head=a_cfg.d_head,
+            rope_type=rope_type,
+            norm_eps=eps,
             apply_gated_attention=v_cfg.apply_gated_attention,
-            config=model_config, layer_idx=idx,
+            config=model_config,
+            layer_idx=idx,
         )
         self.video_to_audio_attn = LTX2Attention(
-            query_dim=a_cfg.dim, context_dim=v_cfg.dim,
-            heads=a_cfg.heads, dim_head=a_cfg.d_head,
-            rope_type=rope_type, norm_eps=eps,
+            query_dim=a_cfg.dim,
+            context_dim=v_cfg.dim,
+            heads=a_cfg.heads,
+            dim_head=a_cfg.d_head,
+            rope_type=rope_type,
+            norm_eps=eps,
             apply_gated_attention=a_cfg.apply_gated_attention,
-            config=model_config, layer_idx=idx,
+            config=model_config,
+            layer_idx=idx,
         )
-        self.scale_shift_table_a2v_ca_audio = nn.Parameter(
-            torch.empty(5, a_cfg.dim)
-        )
-        self.scale_shift_table_a2v_ca_video = nn.Parameter(
-            torch.empty(5, v_cfg.dim)
-        )
+        self.scale_shift_table_a2v_ca_audio = nn.Parameter(torch.empty(5, a_cfg.dim))
+        self.scale_shift_table_a2v_ca_video = nn.Parameter(torch.empty(5, v_cfg.dim))
 
     # -- AdaLN helpers -------------------------------------------------------
 
@@ -372,11 +412,10 @@ class BasicAVTransformerBlock(nn.Module):
         num_ada_params = scale_shift_table.shape[0]
         ada_values = (
             scale_shift_table[indices]
-            .unsqueeze(0).unsqueeze(0)
+            .unsqueeze(0)
+            .unsqueeze(0)
             .to(device=timestep.device, dtype=timestep.dtype)
-            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[
-                :, :, indices, :
-            ]
+            + timestep.reshape(batch_size, timestep.shape[1], num_ada_params, -1)[:, :, indices, :]
         ).unbind(dim=2)
         return ada_values
 
@@ -393,7 +432,8 @@ class BasicAVTransformerBlock(nn.Module):
         gate_table = scale_shift_table[num_scale_shift_values:, :]
 
         ss_vals = (
-            ss_table.unsqueeze(0).unsqueeze(0)
+            ss_table.unsqueeze(0)
+            .unsqueeze(0)
             .to(device=scale_shift_timestep.device, dtype=scale_shift_timestep.dtype)
             + scale_shift_timestep.reshape(
                 batch_size, scale_shift_timestep.shape[1], num_scale_shift_values, -1
@@ -401,11 +441,11 @@ class BasicAVTransformerBlock(nn.Module):
         ).unbind(dim=2)
 
         gate_vals = (
-            gate_table.unsqueeze(0).unsqueeze(0)
+            gate_table.unsqueeze(0)
+            .unsqueeze(0)
             .to(device=gate_timestep.device, dtype=gate_timestep.dtype)
             + gate_timestep.reshape(
-                batch_size, gate_timestep.shape[1],
-                num_ada_params - num_scale_shift_values, -1
+                batch_size, gate_timestep.shape[1], num_ada_params - num_scale_shift_values, -1
             )
         ).unbind(dim=2)
 
@@ -430,8 +470,7 @@ class BasicAVTransformerBlock(nn.Module):
         # Split RoPE: [B, H, S, D] — sequence at dim 2
         # Interleaved RoPE: [B, S, D] — sequence at dim 1
         seq_dim = 2 if cos.ndim == 4 else 1
-        return (self._sp_all_gather(cos, dim=seq_dim),
-                self._sp_all_gather(sin, dim=seq_dim))
+        return (self._sp_all_gather(cos, dim=seq_dim), self._sp_all_gather(sin, dim=seq_dim))
 
     # -- Forward -------------------------------------------------------------
 
@@ -464,9 +503,8 @@ class BasicAVTransformerBlock(nn.Module):
 
         # --- Video self-attention + text cross-attention ---
         if run_vx:
-            skip_v_self = (
-                has_perturbations
-                and perturbations.all_in_batch(PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx)
+            skip_v_self = has_perturbations and perturbations.all_in_batch(
+                PerturbationType.SKIP_VIDEO_SELF_ATTN, self.idx
             )
             vshift_msa, vscale_msa, vgate_msa = self._get_ada_values(
                 self.scale_shift_table, vx.shape[0], video.timesteps, slice(0, 3)
@@ -483,15 +521,15 @@ class BasicAVTransformerBlock(nn.Module):
                 vx = vx + v_self_out
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
-                context=video.context, mask=video.context_mask,
+                context=video.context,
+                mask=video.context_mask,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
         # --- Audio self-attention + text cross-attention ---
         if run_ax:
-            skip_a_self = (
-                has_perturbations
-                and perturbations.all_in_batch(PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx)
+            skip_a_self = has_perturbations and perturbations.all_in_batch(
+                PerturbationType.SKIP_AUDIO_SELF_ATTN, self.idx
             )
             ashift_msa, ascale_msa, agate_msa = self._get_ada_values(
                 self.audio_scale_shift_table, ax.shape[0], audio.timesteps, slice(0, 3)
@@ -508,27 +546,28 @@ class BasicAVTransformerBlock(nn.Module):
                 ax = ax + a_self_out
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
-                context=audio.context, mask=audio.context_mask,
+                context=audio.context,
+                mask=audio.context_mask,
             )
             del ashift_msa, ascale_msa, agate_msa
 
         # --- Bidirectional audio ↔ video cross-attention ---
         if run_a2v or run_v2a:
-            skip_a2v = (
-                has_perturbations
-                and perturbations.all_in_batch(PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx)
+            skip_a2v = has_perturbations and perturbations.all_in_batch(
+                PerturbationType.SKIP_A2V_CROSS_ATTN, self.idx
             )
-            skip_v2a = (
-                has_perturbations
-                and perturbations.all_in_batch(PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx)
+            skip_v2a = has_perturbations and perturbations.all_in_batch(
+                PerturbationType.SKIP_V2A_CROSS_ATTN, self.idx
             )
 
             vx_norm3 = rms_norm(vx, eps=self.norm_eps)
             ax_norm3 = rms_norm(ax, eps=self.norm_eps)
 
             (
-                scale_ca_audio_a2v, shift_ca_audio_a2v,
-                scale_ca_audio_v2a, shift_ca_audio_v2a,
+                scale_ca_audio_a2v,
+                shift_ca_audio_a2v,
+                scale_ca_audio_v2a,
+                shift_ca_audio_v2a,
                 gate_out_v2a,
             ) = self._get_av_ca_ada_values(
                 self.scale_shift_table_a2v_ca_audio,
@@ -538,8 +577,10 @@ class BasicAVTransformerBlock(nn.Module):
             )
 
             (
-                scale_ca_video_a2v, shift_ca_video_a2v,
-                scale_ca_video_v2a, shift_ca_video_v2a,
+                scale_ca_video_a2v,
+                shift_ca_video_a2v,
+                scale_ca_video_v2a,
+                shift_ca_video_v2a,
                 gate_out_a2v,
             ) = self._get_av_ca_ada_values(
                 self.scale_shift_table_a2v_ca_video,
@@ -712,9 +753,7 @@ class LTXModel(nn.Module):
             self.audio_positional_embedding_max_pos = audio_positional_embedding_max_pos
             self.audio_num_attention_heads = audio_num_attention_heads
             self.audio_inner_dim = audio_num_attention_heads * audio_attention_head_dim
-            self._init_audio(
-                audio_in_channels, audio_out_channels, caption_channels, norm_eps
-            )
+            self._init_audio(audio_in_channels, audio_out_channels, caption_channels, norm_eps)
 
         if model_type.is_video_enabled() and model_type.is_audio_enabled():
             cross_pe_max_pos = max(
@@ -730,13 +769,13 @@ class LTXModel(nn.Module):
         # Ulysses sequence parallelism — must run before block/attention init
         # so that model_config.ulysses_process_group is available.
         primary_heads = (
-            num_attention_heads if model_type.is_video_enabled()
-            else audio_num_attention_heads
+            num_attention_heads if model_type.is_video_enabled() else audio_num_attention_heads
         )
-        (self.use_ulysses, self.ulysses_size,
-         self.ulysses_pg, self.ulysses_rank) = setup_sequence_parallelism(
-            model_config=model_config,
-            num_attention_heads=primary_heads,
+        (self.use_ulysses, self.ulysses_size, self.ulysses_pg, self.ulysses_rank) = (
+            setup_sequence_parallelism(
+                model_config=model_config,
+                num_attention_heads=primary_heads,
+            )
         )
         # Audio is sharded by Ulysses only when its sequence length is
         # divisible by ulysses_size (checked at runtime in forward).
@@ -800,16 +839,16 @@ class LTXModel(nn.Module):
         """Create a Linear layer using the TRT-LLM backend."""
         dtype = self.model_config.torch_dtype if self.model_config else None
         quant_config = self.model_config.quant_config if self.model_config else None
-        skip_create = (
-            self.model_config.skip_create_weights_in_init if self.model_config else False
-        )
-        force_dq = (
-            self.model_config.force_dynamic_quantization if self.model_config else False
-        )
+        skip_create = self.model_config.skip_create_weights_in_init if self.model_config else False
+        force_dq = self.model_config.force_dynamic_quantization if self.model_config else False
         mapping = getattr(self.model_config, "mapping", None) if self.model_config else None
         return Linear(
-            in_features, out_features, bias=bias, dtype=dtype,
-            mapping=mapping, quant_config=quant_config,
+            in_features,
+            out_features,
+            bias=bias,
+            dtype=dtype,
+            mapping=mapping,
+            quant_config=quant_config,
             skip_create_weights_in_init=skip_create,
             force_dynamic_quantization=force_dq,
         )
@@ -817,30 +856,30 @@ class LTXModel(nn.Module):
     def _init_video(self, in_channels, out_channels, caption_channels, norm_eps):
         self.patchify_proj = self._make_linear(in_channels, self.inner_dim)
         self.adaln_single = AdaLayerNormSingle(
-            self.inner_dim, make_linear=self._make_linear,
+            self.inner_dim,
+            make_linear=self._make_linear,
         )
         self.caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels, hidden_size=self.inner_dim,
+            in_features=caption_channels,
+            hidden_size=self.inner_dim,
             make_linear=self._make_linear,
         )
         self.scale_shift_table = nn.Parameter(torch.empty(2, self.inner_dim))
-        self.norm_out = nn.LayerNorm(
-            self.inner_dim, elementwise_affine=False, eps=norm_eps
-        )
+        self.norm_out = nn.LayerNorm(self.inner_dim, elementwise_affine=False, eps=norm_eps)
         self.proj_out = self._make_linear(self.inner_dim, out_channels)
 
     def _init_audio(self, in_channels, out_channels, caption_channels, norm_eps):
         self.audio_patchify_proj = self._make_linear(in_channels, self.audio_inner_dim)
         self.audio_adaln_single = AdaLayerNormSingle(
-            self.audio_inner_dim, make_linear=self._make_linear,
-        )
-        self.audio_caption_projection = PixArtAlphaTextProjection(
-            in_features=caption_channels, hidden_size=self.audio_inner_dim,
+            self.audio_inner_dim,
             make_linear=self._make_linear,
         )
-        self.audio_scale_shift_table = nn.Parameter(
-            torch.empty(2, self.audio_inner_dim)
+        self.audio_caption_projection = PixArtAlphaTextProjection(
+            in_features=caption_channels,
+            hidden_size=self.audio_inner_dim,
+            make_linear=self._make_linear,
         )
+        self.audio_scale_shift_table = nn.Parameter(torch.empty(2, self.audio_inner_dim))
         self.audio_norm_out = nn.LayerNorm(
             self.audio_inner_dim, elementwise_affine=False, eps=norm_eps
         )
@@ -848,19 +887,23 @@ class LTXModel(nn.Module):
 
     def _init_audio_video(self, num_scale_shift_values):
         self.av_ca_video_scale_shift_adaln_single = AdaLayerNormSingle(
-            self.inner_dim, embedding_coefficient=num_scale_shift_values,
+            self.inner_dim,
+            embedding_coefficient=num_scale_shift_values,
             make_linear=self._make_linear,
         )
         self.av_ca_audio_scale_shift_adaln_single = AdaLayerNormSingle(
-            self.audio_inner_dim, embedding_coefficient=num_scale_shift_values,
+            self.audio_inner_dim,
+            embedding_coefficient=num_scale_shift_values,
             make_linear=self._make_linear,
         )
         self.av_ca_a2v_gate_adaln_single = AdaLayerNormSingle(
-            self.inner_dim, embedding_coefficient=1,
+            self.inner_dim,
+            embedding_coefficient=1,
             make_linear=self._make_linear,
         )
         self.av_ca_v2a_gate_adaln_single = AdaLayerNormSingle(
-            self.audio_inner_dim, embedding_coefficient=1,
+            self.audio_inner_dim,
+            embedding_coefficient=1,
             make_linear=self._make_linear,
         )
 
@@ -932,14 +975,21 @@ class LTXModel(nn.Module):
             )
 
     def _init_transformer_blocks(
-        self, num_layers, attention_head_dim, cross_attention_dim,
-        audio_attention_head_dim, audio_cross_attention_dim,
-        norm_eps, apply_gated_attention,
+        self,
+        num_layers,
+        attention_head_dim,
+        cross_attention_dim,
+        audio_attention_head_dim,
+        audio_cross_attention_dim,
+        norm_eps,
+        apply_gated_attention,
     ):
         video_config = (
             TransformerConfig(
-                dim=self.inner_dim, heads=self.num_attention_heads,
-                d_head=attention_head_dim, context_dim=cross_attention_dim,
+                dim=self.inner_dim,
+                heads=self.num_attention_heads,
+                d_head=attention_head_dim,
+                context_dim=cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
             )
             if self.model_type.is_video_enabled()
@@ -947,7 +997,8 @@ class LTXModel(nn.Module):
         )
         audio_config = (
             TransformerConfig(
-                dim=self.audio_inner_dim, heads=self.audio_num_attention_heads,
+                dim=self.audio_inner_dim,
+                heads=self.audio_num_attention_heads,
                 d_head=audio_attention_head_dim,
                 context_dim=audio_cross_attention_dim,
                 apply_gated_attention=apply_gated_attention,
@@ -955,14 +1006,19 @@ class LTXModel(nn.Module):
             if self.model_type.is_audio_enabled()
             else None
         )
-        self.transformer_blocks = nn.ModuleList([
-            BasicAVTransformerBlock(
-                idx=idx, video=video_config, audio=audio_config,
-                rope_type=self.rope_type, norm_eps=norm_eps,
-                config=self.model_config,
-            )
-            for idx in range(num_layers)
-        ])
+        self.transformer_blocks = nn.ModuleList(
+            [
+                BasicAVTransformerBlock(
+                    idx=idx,
+                    video=video_config,
+                    audio=audio_config,
+                    rope_type=self.rope_type,
+                    norm_eps=norm_eps,
+                    config=self.model_config,
+                )
+                for idx in range(num_layers)
+            ]
+        )
 
     # -- Ulysses sequence sharding / gathering --------------------------------
 
@@ -1019,7 +1075,7 @@ class LTXModel(nn.Module):
             self._audio_is_sharded = False
             return
 
-        self._audio_is_sharded = (audio_seq_len % self.ulysses_size == 0)
+        self._audio_is_sharded = audio_seq_len % self.ulysses_size == 0
         for block in self.transformer_blocks:
             block._audio_is_sharded = self._audio_is_sharded
             if hasattr(block, "audio_attn1"):
@@ -1067,16 +1123,8 @@ class LTXModel(nn.Module):
         if not self.model_type.is_audio_enabled() and audio is not None:
             raise ValueError("Audio is not enabled for this model")
 
-        video_args = (
-            self.video_args_preprocessor.prepare(video)
-            if video is not None
-            else None
-        )
-        audio_args = (
-            self.audio_args_preprocessor.prepare(audio)
-            if audio is not None
-            else None
-        )
+        video_args = self.video_args_preprocessor.prepare(video) if video is not None else None
+        audio_args = self.audio_args_preprocessor.prepare(audio) if audio is not None else None
 
         # Shard sequences for Ulysses parallelism.
         # Video is always sharded.  Audio sharding is decided once by
@@ -1089,7 +1137,9 @@ class LTXModel(nn.Module):
 
         for block in self.transformer_blocks:
             video_args, audio_args = block(
-                video=video_args, audio=audio_args, perturbations=perturbations,
+                video=video_args,
+                audio=audio_args,
+                perturbations=perturbations,
             )
 
         # Gather sequences back to full length for output processing.
@@ -1103,7 +1153,9 @@ class LTXModel(nn.Module):
                 if v_et.shape[1] == video_args.x.shape[1]:
                     v_et = self._gather_sequence(v_et)
                 video_args = replace(
-                    video_args, x=gathered_vx, embedded_timestep=v_et,
+                    video_args,
+                    x=gathered_vx,
+                    embedded_timestep=v_et,
                 )
             if self._audio_is_sharded and audio_args is not None:
                 gathered_ax = self._gather_sequence(audio_args.x)
@@ -1111,21 +1163,29 @@ class LTXModel(nn.Module):
                 if a_et.shape[1] == audio_args.x.shape[1]:
                     a_et = self._gather_sequence(a_et)
                 audio_args = replace(
-                    audio_args, x=gathered_ax, embedded_timestep=a_et,
+                    audio_args,
+                    x=gathered_ax,
+                    embedded_timestep=a_et,
                 )
 
         vx = (
             self._process_output(
-                self.scale_shift_table, self.norm_out, self.proj_out,
-                video_args.x, video_args.embedded_timestep,
+                self.scale_shift_table,
+                self.norm_out,
+                self.proj_out,
+                video_args.x,
+                video_args.embedded_timestep,
             )
             if video_args is not None
             else None
         )
         ax = (
             self._process_output(
-                self.audio_scale_shift_table, self.audio_norm_out,
-                self.audio_proj_out, audio_args.x, audio_args.embedded_timestep,
+                self.audio_scale_shift_table,
+                self.audio_norm_out,
+                self.audio_proj_out,
+                audio_args.x,
+                audio_args.embedded_timestep,
             )
             if audio_args is not None
             else None
@@ -1146,13 +1206,9 @@ class LTXModel(nn.Module):
             new_key = key
             for ff_prefix in (".ff.", ".audio_ff."):
                 if ff_prefix + "net.0.proj." in new_key:
-                    new_key = new_key.replace(
-                        ff_prefix + "net.0.proj.", ff_prefix + "up_proj."
-                    )
+                    new_key = new_key.replace(ff_prefix + "net.0.proj.", ff_prefix + "up_proj.")
                 elif ff_prefix + "net.2." in new_key:
-                    new_key = new_key.replace(
-                        ff_prefix + "net.2.", ff_prefix + "down_proj."
-                    )
+                    new_key = new_key.replace(ff_prefix + "net.2.", ff_prefix + "down_proj.")
             new_key = new_key.replace(".q_norm.", ".norm_q.")
             new_key = new_key.replace(".k_norm.", ".norm_k.")
             remapped[new_key] = value
@@ -1187,12 +1243,10 @@ class LTXModel(nn.Module):
         missing = (model_keys - checkpoint_keys) - fused_model_params
         unexpected = (checkpoint_keys - model_keys) - fused_ckpt_params
         quantized = (
-            self.model_config is not None
-            and self.model_config.quant_config.quant_algo is not None
+            self.model_config is not None and self.model_config.quant_config.quant_algo is not None
         )
         dynamic_weight_quant = (
-            self.model_config is not None
-            and self.model_config.dynamic_weight_quant
+            self.model_config is not None and self.model_config.dynamic_weight_quant
         )
         if missing:
             logger.warning(
@@ -1248,9 +1302,7 @@ class LTXModel(nn.Module):
                 module_weights = loader.filter_weights(name, weights)
                 for param_name, param in module._parameters.items():
                     if param is not None and param_name in module_weights:
-                        param.data.copy_(
-                            module_weights[param_name].to(target_dtype)
-                        )
+                        param.data.copy_(module_weights[param_name].to(target_dtype))
 
     def post_load_weights(self) -> None:
         """Post-load hooks: finalize quantized Linear layers."""

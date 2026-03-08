@@ -118,13 +118,10 @@ def _generate_freq_grid_pytorch(
     return indices.to(dtype=torch.float32) * (math.pi / 2)
 
 
-def _get_fractional_positions(
-    indices_grid: torch.Tensor, max_pos: list[int]
-) -> torch.Tensor:
+def _get_fractional_positions(indices_grid: torch.Tensor, max_pos: list[int]) -> torch.Tensor:
     n_pos_dims = indices_grid.shape[1]
     assert n_pos_dims == len(max_pos), (
-        f"Number of position dimensions ({n_pos_dims}) must match "
-        f"max_pos length ({len(max_pos)})"
+        f"Number of position dimensions ({n_pos_dims}) must match max_pos length ({len(max_pos)})"
     )
     fractional_positions = torch.stack(
         [indices_grid[:, i] / max_pos[i] for i in range(n_pos_dims)],
@@ -150,11 +147,7 @@ def _generate_freqs(
 
     fractional_positions = _get_fractional_positions(indices_grid, max_pos)
     indices = indices.to(device=fractional_positions.device)
-    freqs = (
-        (indices * (fractional_positions.unsqueeze(-1) * 2 - 1))
-        .transpose(-1, -2)
-        .flatten(2)
-    )
+    freqs = (indices * (fractional_positions.unsqueeze(-1) * 2 - 1)).transpose(-1, -2).flatten(2)
     return freqs
 
 
@@ -176,9 +169,7 @@ def _split_freqs_cis(
     return cos_freq, sin_freq
 
 
-def _interleaved_freqs_cis(
-    freqs: torch.Tensor, pad_size: int
-) -> Tuple[torch.Tensor, torch.Tensor]:
+def _interleaved_freqs_cis(freqs: torch.Tensor, pad_size: int) -> Tuple[torch.Tensor, torch.Tensor]:
     cos_freq = freqs.cos().repeat_interleave(2, dim=-1)
     sin_freq = freqs.sin().repeat_interleave(2, dim=-1)
     if pad_size != 0:
@@ -198,9 +189,7 @@ def precompute_freqs_cis(
     use_middle_indices_grid: bool = False,
     num_attention_heads: int = 32,
     rope_type: LTXRopeType = LTXRopeType.INTERLEAVED,
-    freq_grid_generator: Callable[
-        [float, int, int], torch.Tensor
-    ] = _generate_freq_grid_pytorch,
+    freq_grid_generator: Callable[[float, int, int], torch.Tensor] = _generate_freq_grid_pytorch,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Precompute cos/sin RoPE embeddings for the given position indices.
 

@@ -16,15 +16,9 @@ class AttnBlock(torch.nn.Module):
         super().__init__()
         self.in_channels = in_channels
         self.norm = build_normalization_layer(in_channels, normtype=norm_type)
-        self.q = torch.nn.Conv2d(
-            in_channels, in_channels, kernel_size=1, stride=1, padding=0
-        )
-        self.k = torch.nn.Conv2d(
-            in_channels, in_channels, kernel_size=1, stride=1, padding=0
-        )
-        self.v = torch.nn.Conv2d(
-            in_channels, in_channels, kernel_size=1, stride=1, padding=0
-        )
+        self.q = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.k = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        self.v = torch.nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
         self.proj_out = torch.nn.Conv2d(
             in_channels, in_channels, kernel_size=1, stride=1, padding=0
         )

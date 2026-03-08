@@ -15,9 +15,7 @@ class VocoderConfigurator:
         return Vocoder(
             resblock_kernel_sizes=config.get("resblock_kernel_sizes", [3, 7, 11]),
             upsample_rates=config.get("upsample_rates", [6, 5, 2, 2, 2]),
-            upsample_kernel_sizes=config.get(
-                "upsample_kernel_sizes", [16, 15, 8, 4, 4]
-            ),
+            upsample_kernel_sizes=config.get("upsample_kernel_sizes", [16, 15, 8, 4, 4]),
             resblock_dilation_sizes=config.get(
                 "resblock_dilation_sizes", [[1, 3, 5], [1, 3, 5], [1, 3, 5]]
             ),

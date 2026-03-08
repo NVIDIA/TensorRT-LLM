@@ -42,9 +42,7 @@ class VideoLatentShape(NamedTuple):
     width: int
 
     def to_torch_shape(self) -> torch.Size:
-        return torch.Size(
-            [self.batch, self.channels, self.frames, self.height, self.width]
-        )
+        return torch.Size([self.batch, self.channels, self.frames, self.height, self.width])
 
     @staticmethod
     def from_torch_shape(shape: torch.Size) -> "VideoLatentShape":
@@ -94,9 +92,7 @@ class AudioLatentShape(NamedTuple):
     mel_bins: int
 
     def to_torch_shape(self) -> torch.Size:
-        return torch.Size(
-            [self.batch, self.channels, self.frames, self.mel_bins]
-        )
+        return torch.Size([self.batch, self.channels, self.frames, self.mel_bins])
 
     @staticmethod
     def from_torch_shape(shape: torch.Size) -> "AudioLatentShape":

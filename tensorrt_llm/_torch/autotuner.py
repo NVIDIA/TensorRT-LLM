@@ -1305,9 +1305,10 @@ class AutoTuner:
                 # Still include the bucketed value of the actual shape so the
                 # cache key used during profiling (raw) aligns with the key
                 # used during inference (bucketed via map_to_tuning_buckets).
-                actual_val = base_profile.shapes[spec.input_idx][spec.dim_idx].val
+                actual_val = base_profile.shapes[spec.input_idx][
+                    spec.dim_idx].val
                 if spec.map_to_tuning_buckets is not None:
-                    opt_shapes = (spec.map_to_tuning_buckets(actual_val),)
+                    opt_shapes = (spec.map_to_tuning_buckets(actual_val), )
                 else:
                     opt_shapes = ()
             elif callable(spec.gen_tuning_buckets):
