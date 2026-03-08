@@ -367,6 +367,26 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::call_guard<nb::gil_scoped_release>())
         .def("get_remaining_blocks_to_completion", &BaseKVCacheManager::getRemainingBlocksToCompletion,
             nb::call_guard<nb::gil_scoped_release>())
+        .def("get_remaining_blocks_to_completion_batch",
+            [](tbk::BaseKVCacheManager& self, nb::list const& pyRequests, SizeType32 windowSize)
+            {
+                // Extract C++ request pointers while GIL is held
+                std::vector<tb::LlmRequest const*> requests;
+                requests.reserve(nb::len(pyRequests));
+                for (auto const& item : pyRequests)
+                {
+                    requests.push_back(&nb::cast<tb::LlmRequest const&>(item));
+                }
+                // Release GIL for the C++ computation
+                nb::gil_scoped_release release;
+                std::vector<SizeType32> result;
+                result.reserve(requests.size());
+                for (auto const* req : requests)
+                {
+                    result.push_back(self.getRemainingBlocksToCompletion(*req, windowSize));
+                }
+                return result;
+            })
         .def("add_token", &BaseKVCacheManager::addToken, nb::call_guard<nb::gil_scoped_release>())
         .def("add_sequence", &BaseKVCacheManager::addSequence, nb::call_guard<nb::gil_scoped_release>())
         .def("remove_sequence", &BaseKVCacheManager::removeSequence, nb::call_guard<nb::gil_scoped_release>())
