@@ -416,7 +416,7 @@ def test_fused_relu2_quant_nvfp4_wrapper_matches_trtllm_op():
     reason="Requires NVFP4 and trtllm fused_relu2_quantize kernel",
 )
 def test_nvfp4_prequant_linear_wrapper_matches_direct_gemm(use_bias, input_dtype):
-    """validates wrapper matches direct gemm"""
+    """Validates wrapper matches direct gemm."""
     m, k, n = 8, 64, 32
     x = torch.randn(m, k, dtype=input_dtype, device="cuda")
     w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
