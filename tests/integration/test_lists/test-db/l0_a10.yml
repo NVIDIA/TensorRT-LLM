@@ -174,6 +174,7 @@ l0_a10:
   - unittest/trt/quantization
   - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - unittest/api_stability
   - unittest/bindings
   - unittest/test_model_runner_cpp.py
