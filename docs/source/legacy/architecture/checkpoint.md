@@ -1,5 +1,10 @@
 # TensorRT LLM Checkpoint
 
+> [!WARNING]
+> This page describes the **legacy** TensorRT engine-build workflow.
+> For new projects, use [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 ## Overview
 
 The earlier versions (pre-0.8 version) of TensorRT LLM were developed with a very aggressive timeline. For those versions, emphasis was not put on defining a unified workflow. Now that TensorRT LLM has reached some level of feature richness, the development team has decided to put more effort into unifying the APIs and workflow of TensorRT LLM. This file documents the workflow around TensorRT LLM checkpoint and the set of CLI tools to generate checkpoint, build engines, and evaluate engines.

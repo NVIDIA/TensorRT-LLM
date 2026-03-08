@@ -1,5 +1,11 @@
 # Mixtral
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a Mixtral model in TensorRT LLM on both single GPU, single node multi-GPU and
 multi-node multi-GPU.  Mixtral 8x22B is also supported and can be replace Mixtral 8x7B below as long as GPU memory is
 sufficient.

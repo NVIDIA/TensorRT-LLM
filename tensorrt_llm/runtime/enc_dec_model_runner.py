@@ -6,8 +6,9 @@ from pathlib import Path
 import torch
 import tensorrt as trt
 
-from ..logger import logger
+from .._deprecation import emit_engine_arch_deprecation
 from .._utils import torch_to_numpy, trt_dtype_to_torch, mpi_world_size, mpi_rank
+from ..logger import logger
 from ..plugin.plugin import CustomAllReduceHelper
 from .generation import ModelConfig, SamplingConfig, LoraManager, GenerationSession
 from ..mapping import Mapping
@@ -110,6 +111,7 @@ class EncDecModelRunner:
                  skip_encoder=False,
                  stream: torch.cuda.Stream = None,
                  enable_context_fmha_fp32_acc: bool = None):
+        emit_engine_arch_deprecation("EncDecModelRunner")
         # in multi-node setup, it's important to set_device at the very beginning so .to('cuda') refers to current device
         # accordingly, all input & output tensors should be moved to current device
         # otherwise, it's default to 'cuda:0'

@@ -7,6 +7,7 @@ from pathlib import Path
 
 import tensorrt_llm
 from tensorrt_llm import logger
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models import MambaForCausalLM
 from tensorrt_llm.models.modeling_utils import QuantConfig
@@ -187,6 +188,7 @@ def args_to_quant_config(args: argparse.Namespace) -> QuantConfig:
 
 
 def main():
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     print(tensorrt_llm.__version__)
 
     args = parse_arguments()

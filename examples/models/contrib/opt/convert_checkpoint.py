@@ -10,6 +10,7 @@ import torch
 from transformers import AutoModelForCausalLM, Blip2ForConditionalGeneration
 
 import tensorrt_llm
+from tensorrt_llm._deprecation import emit_engine_arch_deprecation
 from tensorrt_llm._utils import pad_vocab_size
 from tensorrt_llm.models.convert_utils import (get_weight, get_weight_and_bias,
                                                split, split_matrix_tp,
@@ -261,6 +262,7 @@ def convert_hf_opt(hf_model,
 
 
 if __name__ == '__main__':
+    emit_engine_arch_deprecation("convert_checkpoint.py")
     # TODO(qijun): Currently, the convert script depends on a torch op:
     # torch.ops.trtllm.symmetric_quantize_last_axis_of_batched_matrix,
     # which is included in tensorrt_llm Python package. Otherwise, the convert

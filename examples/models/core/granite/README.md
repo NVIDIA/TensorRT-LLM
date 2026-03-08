@@ -1,5 +1,11 @@
 # Granite
 
+> [!WARNING]
+> The `convert_checkpoint.py` / `trtllm-build` / `run.py` workflow described
+> below is **legacy** and will not receive new features. New projects should use
+> [`trtllm-serve`](https://nvidia.github.io/TensorRT-LLM/quick-start-guide.html)
+> or the [LLM Python API](https://nvidia.github.io/TensorRT-LLM/llm-api/index.html) instead.
+
 This document shows how to build and run a [Granite 3.0](https://huggingface.co/collections/ibm-granite/granite-30-language-models-66fdb59bbb54785c3512114f) model in TensorRT-LLM.
 
 The TensorRT LLM Granite implementation is based on the LLaMA model, with Mixture of Experts (MoE) enabled. The implementation can be found in [`llama/model.py`](../../../../tensorrt_llm/models/llama/model.py). See the LLaMA example [`examples/models/core/llama`](../llama) for details.
