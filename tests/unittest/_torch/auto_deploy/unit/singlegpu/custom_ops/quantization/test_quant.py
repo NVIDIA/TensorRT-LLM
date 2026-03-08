@@ -371,3 +371,76 @@ def test_finegrained_fp8_linear(M, N, K, bias):
         output_fg_fp8.reshape(-1).float(), output_ref.reshape(-1).float(), dim=0
     )
     assert cos > 0.95, f"Cosine similarity too low: {cos}"
+
+
+def _fused_relu2_quantize_available():
+    return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_relu2_quantize")
+
+
+@pytest.mark.skipif(
+    not (fp4_compatible() and trtllm_ops_available() and _fused_relu2_quantize_available()),
+    reason="Requires NVFP4 and trtllm fused_relu2_quantize kernel",
+)
+def test_fused_relu2_quant_nvfp4_wrapper_matches_trtllm_op():
+    x = torch.randn(8, 64, dtype=torch.bfloat16, device="cuda")
+    input_scale = fp4_global_scale(x).to(torch.float32)
+
+    fp4_wrapped, sf_wrapped = torch.ops.auto_deploy.trtllm_fused_relu2_quant_nvfp4(x, input_scale)
+    fp4_ref, sf_ref = torch.ops.trtllm.fused_relu2_quantize(x, input_scale, 16)
+
+    assert fp4_wrapped.shape == fp4_ref.shape
+    assert sf_wrapped.shape == sf_ref.shape
+    assert fp4_wrapped.dtype == fp4_ref.dtype == torch.uint8
+    assert sf_wrapped.dtype == sf_ref.dtype == torch.uint8
+    torch.testing.assert_close(fp4_wrapped, fp4_ref, rtol=0, atol=0)
+
+    # sf buffers can contain non-deterministic bytes in padding/unused regions.
+    # Validate functional equivalence via nvfp4_gemm instead of raw byte equality.
+    w = torch.randn(32, 64, dtype=torch.bfloat16, device="cuda")
+    weight_scale_2 = fp4_global_scale(w).to(torch.float32)
+    alpha = (1.0 / (input_scale * weight_scale_2)).to(torch.float32)
+    w_fp4, w_scale = torch.ops.trtllm.fp4_quantize(w, weight_scale_2, 16, False)
+
+    out_wrapped = torch.ops.trtllm.nvfp4_gemm(
+        fp4_wrapped, w_fp4, sf_wrapped, w_scale, alpha, torch.bfloat16
+    )
+    out_ref = torch.ops.trtllm.nvfp4_gemm(fp4_ref, w_fp4, sf_ref, w_scale, alpha, torch.bfloat16)
+    torch.testing.assert_close(out_wrapped, out_ref, rtol=1e-3, atol=5e-3)
+
+
+@pytest.mark.parametrize("use_bias", [True, False])
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
+@pytest.mark.skipif(
+    not (fp4_compatible() and trtllm_ops_available() and _fused_relu2_quantize_available()),
+    reason="Requires NVFP4 and trtllm fused_relu2_quantize kernel",
+)
+def test_nvfp4_prequant_linear_wrapper_matches_direct_gemm(use_bias, input_dtype):
+    """validates wrapper matches direct gemm"""
+    m, k, n = 8, 64, 32
+    x = torch.randn(m, k, dtype=input_dtype, device="cuda")
+    w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
+    bias = torch.randn(n, dtype=input_dtype, device="cuda") if use_bias else None
+
+    input_scale = fp4_global_scale(x).to(torch.float32)
+    weight_scale_2 = fp4_global_scale(w).to(torch.float32)
+    alpha = (1.0 / (input_scale * weight_scale_2)).to(torch.float32)
+
+    x_fp4, x_sf = torch.ops.trtllm.fused_relu2_quantize(x, input_scale, 16)
+    w_fp4, w_scale = torch.ops.trtllm.fp4_quantize(w, weight_scale_2, 16, False)
+
+    out_wrapped = torch.ops.auto_deploy.trtllm_nvfp4_prequant_linear(
+        x_fp4,
+        w_fp4,
+        x_sf,
+        w_scale,
+        alpha,
+        bias=bias,
+        out_dtype=input_dtype,
+    )
+    out_ref = torch.ops.trtllm.nvfp4_gemm(x_fp4, w_fp4, x_sf, w_scale, alpha, input_dtype)
+    if bias is not None:
+        out_ref = out_ref + bias
+
+    assert out_wrapped.shape == out_ref.shape
+    assert out_wrapped.dtype == input_dtype
+    torch.testing.assert_close(out_wrapped, out_ref, rtol=1e-3, atol=5e-3)

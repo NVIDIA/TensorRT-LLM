@@ -149,6 +149,9 @@ transforms:
   fuse_nvfp4_linear:
     stage: post_load_fusion
     backend: trtllm
+  fuse_relu2_quant_nvfp4:
+    stage: post_load_fusion
+    enabled: true
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
   fuse_finegrained_fp8_linear:
