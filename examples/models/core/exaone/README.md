@@ -284,7 +284,6 @@ cat > ctx_extra-llm-api-config.yaml << EOF
 backend: pytorch
 trust_remote_code: true
 disable_overlap_scheduler: true
-enable_chunked_prefill: true
 
 tensor_parallel_size: $TP_SIZE
 moe_expert_parallel_size: $MOE_EP_SIZE
@@ -304,7 +303,6 @@ cat > gen_extra-llm-api-config.yaml << EOF
 backend: pytorch
 trust_remote_code: true
 disable_overlap_scheduler: false
-enable_chunked_prefill: true
 
 tensor_parallel_size: $TP_SIZE
 moe_expert_parallel_size: $MOE_EP_SIZE
@@ -342,12 +340,12 @@ Start all components in the following order:
 ```bash
 # 1. Start context server (GPUs 0-3)
 CUDA_VISIBLE_DEVICES=0,1,2,3 trtllm-serve $HF_MODEL_DIR \
-    --host localhost --port 8001 --enable_chunked_prefill \
+    --host localhost --port 8001 \
     --extra_llm_api_options ./ctx_extra-llm-api-config.yaml &> log_ctx.log &
 
 # 2. Start generation server (GPUs 4-7)
 CUDA_VISIBLE_DEVICES=4,5,6,7 trtllm-serve $HF_MODEL_DIR \
-    --host localhost --port 8002 --enable_chunked_prefill \
+    --host localhost --port 8002 \
     --extra_llm_api_options ./gen_extra-llm-api-config.yaml &> log_gen.log &
 
 # 3. Start disaggregated orchestrator

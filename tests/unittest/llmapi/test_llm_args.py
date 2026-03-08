@@ -4,6 +4,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Annotated, Any, Literal, get_args, get_origin
 
+import click
 import pydantic_core
 import pytest
 import yaml
@@ -19,7 +20,8 @@ from tensorrt_llm._torch.auto_deploy.llm_args import \
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
 from tensorrt_llm.builder import LoraConfig
-from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
+from tensorrt_llm.commands.serve import (_resolve_chunked_prefill, get_llm_args,
+                                         is_non_default_or_required)
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
                                  SchedulerConfig)
 # fmt: off
@@ -1501,3 +1503,33 @@ class TestPydanticBestPractices:
                 + "\n".join(violations) +
                 "\n\nThese should be replaced with alternatives like validators, model_post_init, or classmethods. See this test's docstring for more details."
             )
+
+
+class TestResolveChunkedPrefill:
+    """Tests for the _resolve_chunked_prefill CLI flag resolver."""
+
+    @pytest.mark.part0
+    def test_default_returns_true(self):
+        """Neither flag passed: chunked prefill is enabled by default."""
+        assert _resolve_chunked_prefill(enable=None, disable=False) is True
+
+    @pytest.mark.part0
+    def test_enable_flag_returns_true(self):
+        """--enable_chunked_prefill passed explicitly."""
+        assert _resolve_chunked_prefill(enable=True, disable=False) is True
+
+    @pytest.mark.part0
+    def test_disable_flag_returns_false(self):
+        """--disable_chunked_prefill passed."""
+        assert _resolve_chunked_prefill(enable=None, disable=True) is False
+
+    @pytest.mark.part0
+    def test_both_flags_raises_error(self):
+        """Both --enable and --disable passed: should raise UsageError."""
+        with pytest.raises(click.UsageError, match="mutually exclusive"):
+            _resolve_chunked_prefill(enable=True, disable=True)
+
+    @pytest.mark.part0
+    def test_enable_false_disable_false(self):
+        """enable=False (not typical from Click, but defensive check)."""
+        assert _resolve_chunked_prefill(enable=False, disable=False) is True
