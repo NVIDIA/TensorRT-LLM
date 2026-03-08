@@ -26,7 +26,7 @@ import triton_kernels.swiglu
 from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
                                        PrecisionConfig, matmul_ogs)
 from triton_kernels.numerics import InFlexData
-from triton_kernels.numerics_details.mxfp import downcast_to_mxfp_torch
+from triton_kernels.numerics_details.mxfp import downcast_to_mxfp
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
 from triton_kernels.tensor_details import layout
 
@@ -906,7 +906,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
 
     def _permute_mxfp4_quantize(self, tensor):
         tensor = tensor.transpose(-2, -1).contiguous()
-        tensor_fp4, tensor_scales = downcast_to_mxfp_torch(tensor,
+        tensor_fp4, tensor_scales = downcast_to_mxfp(tensor,
                                                            torch.uint8,
                                                            axis=-2)
         return tensor_fp4, tensor_scales
