@@ -19,7 +19,7 @@ from collections.abc import Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from itertools import chain
-from typing import TYPE_CHECKING, Any, Callable, ClassVar, Iterable, Iterator, Type, cast
+from typing import TYPE_CHECKING, Callable, ClassVar, Iterable, Iterator, Type, cast
 
 from .. import rawref
 from .._block_radix_tree import Block, RootBlock, UselessBlockError
@@ -184,7 +184,7 @@ class _KVCache:
     Status: ClassVar[Type[_Status]] = _Status
     CommitState: ClassVar[Type[_CommitState]] = _CommitState
 
-    id: Any
+    id: int | None
     _manager: "KVCacheManager"
     _lora_task_id: int | None
     _get_priority: Callable[[BlockOrdinal, LifeCycle], Priority]
@@ -222,7 +222,7 @@ class _KVCache:
         manager: "KVCacheManager",
         lora_task_id: int | None,
         input_tokens: Sequence[TokenIdExt] | None,
-        id: Any,
+        id: int | None,
         custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority],
     ):
         self.id = id

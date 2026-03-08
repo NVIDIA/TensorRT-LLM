@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, cast
+from typing import Iterable, Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree
@@ -255,8 +255,8 @@ class KVCacheManager:
         self,
         lora_task_id: int | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
-        id: Any = None,
-        custom_priority_callback: Callable[[BlockOrdinal, "LifeCycle"], Priority] = lambda _,
+        id: int | None = None,
+        custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
     ) -> _KVCache:
         """
