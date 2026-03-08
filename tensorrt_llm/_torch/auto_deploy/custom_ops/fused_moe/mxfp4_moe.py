@@ -124,7 +124,7 @@ def _run_mxfp4_mlp_core(
     )
 
     act = FusedActivation(
-        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (float(alpha), float(limit)), 2
+        FnSpecs("swiglu", swiglu_fn, ("alpha", "limit")), (float(alpha), float(limit))
     )
 
     # gate_up (with SWiGLU fused)
