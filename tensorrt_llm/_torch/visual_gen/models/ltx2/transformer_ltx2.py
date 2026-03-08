@@ -27,7 +27,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tqdm import tqdm
 
-from tensorrt_llm._torch.modules.linear import Linear
+from tensorrt_llm._torch.modules.linear import Linear, WeightMode
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.visual_gen.attention_backend.utils import create_attention
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
@@ -95,11 +95,16 @@ class LTX2Attention(Attention):
         self.rope_type = rope_type
         self._is_cross_attn = context_dim is not None
 
+        # Self-attention: FUSE_QKV enables the optimized backend + auto Ulysses
+        # wrapping from the base class.
+        # Cross-attention: SEPARATE_QKV since K/V come from a different source.
+        qkv_mode = QKVMode.SEPARATE_QKV if self._is_cross_attn else QKVMode.FUSE_QKV
+
         super().__init__(
             hidden_size=query_dim,
             num_attention_heads=heads,
             head_dim=dim_head,
-            qkv_mode=QKVMode.SEPARATE_QKV,
+            qkv_mode=qkv_mode,
             qk_norm=True,
             qk_norm_mode="full",
             eps=norm_eps,
@@ -108,61 +113,24 @@ class LTX2Attention(Attention):
             layer_idx=layer_idx,
         )
 
-        # Base class forces VANILLA backend for SEPARATE_QKV and skips
-        # Ulysses wrapping.  For self-attention we override both: use the
-        # configured backend and, when Ulysses is enabled, create the inner
-        # backend with sharded head counts and wrap with UlyssesAttention.
-        _apply_ulysses = (
-            use_ulysses
-            and not self._is_cross_attn
-            and config.parallel.dit_ulysses_size > 1
-        )
+        # For audio self-attention that may need a runtime Ulysses toggle
+        # (sequence length not always divisible by ulysses_size), create a
+        # plain backend as fallback.  The base class already set self.attn
+        # to UlyssesAttention(inner_backend=sharded_backend).
         self._has_dual_attn = False
-        if not self._is_cross_attn:
-            backend_name = config.attention.backend
-            ulysses_size = config.parallel.dit_ulysses_size if _apply_ulysses else 1
-
-            if ulysses_size > 1:
-                inner_num_heads = self.num_attention_heads // ulysses_size
-                inner_num_kv_heads = self.num_key_value_heads // ulysses_size
-            else:
-                inner_num_heads = self.num_attention_heads
-                inner_num_kv_heads = self.num_key_value_heads
-
-            if backend_name != self.attn_backend or ulysses_size > 1:
-                self.attn_backend = backend_name
-                # Base class registered a VanillaAttention (nn.Module) for
-                # SEPARATE_QKV.  De-register it before replacing with a
-                # backend that may not be an nn.Module (e.g. TrtllmAttention).
-                self._modules.pop("attn", None)
-                self.attn = create_attention(
-                    backend=backend_name,
-                    layer_idx=self.layer_idx,
-                    num_heads=inner_num_heads,
-                    head_dim=self.head_dim,
-                    num_kv_heads=inner_num_kv_heads,
-                    quant_config=self.quant_config,
-                    dtype=self.dtype,
-                )
-
-            if _apply_ulysses:
-                from tensorrt_llm._torch.visual_gen.attention_backend.parallel import UlyssesAttention
-                process_group = getattr(config, "ulysses_process_group", None)
-                self._ulysses_attn = UlyssesAttention(
-                    inner_backend=self.attn,
-                    process_group=process_group,
-                )
-                self._plain_attn = create_attention(
-                    backend=backend_name,
-                    layer_idx=self.layer_idx,
-                    num_heads=self.num_attention_heads,
-                    head_dim=self.head_dim,
-                    num_kv_heads=self.num_key_value_heads,
-                    quant_config=self.quant_config,
-                    dtype=self.dtype,
-                )
-                self.attn = self._ulysses_attn
-                self._has_dual_attn = True
+        ulysses_size = config.parallel.dit_ulysses_size
+        if use_ulysses and not self._is_cross_attn and ulysses_size > 1:
+            self._ulysses_attn = self.attn
+            self._plain_attn = create_attention(
+                backend=self.attn_backend,
+                layer_idx=self.layer_idx,
+                num_heads=self.num_attention_heads,
+                head_dim=self.head_dim,
+                num_kv_heads=self.num_key_value_heads,
+                quant_config=self.quant_config,
+                dtype=self.dtype,
+            )
+            self._has_dual_attn = True
 
         if apply_gated_attention:
             self.to_gate_logits = Linear(
@@ -185,7 +153,14 @@ class LTX2Attention(Attention):
         self.attn = self._ulysses_attn if active else self._plain_attn
 
     def _init_qkv_proj(self):
-        """Override: use _context_dim for K/V input (cross-attention support)."""
+        """Override for cross-attention: use _context_dim for K/V input.
+
+        Self-attention delegates to the base class which creates a fused
+        qkv_proj (FUSE_QKV).
+        """
+        if not self._is_cross_attn:
+            super()._init_qkv_proj()
+            return
         self.to_q = Linear(
             self.hidden_size, self.q_dim, bias=self.bias, dtype=self.dtype,
             mapping=self.mapping, quant_config=self.quant_config,
@@ -205,6 +180,21 @@ class LTX2Attention(Attention):
             force_dynamic_quantization=self.force_dynamic_quantization,
         )
 
+    def project_kv(
+        self, context: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Project and normalize K/V from context.
+
+        Used by the project-before-gather pattern in AV cross-attention:
+        project K/V on sharded data, then all-gather the smaller projected
+        tensors instead of all-gathering the full context first.
+        """
+        k = self.to_k(context)
+        v = self.to_v(context)
+        if self.qk_norm:
+            k = self.norm_k(k)
+        return k, v
+
     def forward(
         self,
         x: torch.Tensor,
@@ -212,6 +202,7 @@ class LTX2Attention(Attention):
         mask: torch.Tensor | None = None,
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
+        pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward pass.
 
@@ -221,9 +212,17 @@ class LTX2Attention(Attention):
             mask: Attention mask (currently unused by TRT-LLM backends).
             pe: (cos, sin) RoPE embeddings for Q (and K when k_pe is None).
             k_pe: Separate (cos, sin) RoPE embeddings for K (for AV cross-attn).
+            pre_projected_kv: Pre-projected (k, v) tuple from project_kv().
+                When provided, skips K/V projection and K-norm (already done).
         """
-        q, k, v = self.get_qkv(x, context)
-        q, k = self.apply_qk_norm(q, k)
+        if pre_projected_kv is not None:
+            k, v = pre_projected_kv
+            q = self.to_q(x)
+            if self.qk_norm:
+                q = self.norm_q(q)
+        else:
+            q, k, v = self.get_qkv(x, context)
+            q, k = self.apply_qk_norm(q, k)
 
         if pe is not None:
             q = apply_rotary_emb(q, pe, self.rope_type)
@@ -553,16 +552,21 @@ class BasicAVTransformerBlock(nn.Module):
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_a2v) + shift_ca_video_a2v
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_a2v) + shift_ca_audio_a2v
 
+                # Project-before-gather: K/V projections run on sharded data
+                # so they benefit from Ulysses scaling.  Only the smaller
+                # projected tensors are all-gathered.
+                k_a2v, v_a2v = self.audio_to_video_attn.project_kv(ax_scaled)
                 if self._audio_is_sharded:
-                    ax_context = self._sp_all_gather(ax_scaled)
+                    k_a2v = self._sp_all_gather(k_a2v)
+                    v_a2v = self._sp_all_gather(v_a2v)
                     k_pe_a2v = self._sp_gather_pe(audio.cross_positional_embeddings)
                 else:
-                    ax_context = ax_scaled
                     k_pe_a2v = audio.cross_positional_embeddings
 
                 a2v_out = (
                     self.audio_to_video_attn(
-                        vx_scaled, context=ax_context,
+                        vx_scaled,
+                        pre_projected_kv=(k_a2v, v_a2v),
                         pe=video.cross_positional_embeddings,
                         k_pe=k_pe_a2v,
                     )
@@ -580,16 +584,19 @@ class BasicAVTransformerBlock(nn.Module):
                 ax_scaled = ax_norm3 * (1 + scale_ca_audio_v2a) + shift_ca_audio_v2a
                 vx_scaled = vx_norm3 * (1 + scale_ca_video_v2a) + shift_ca_video_v2a
 
+                # Project-before-gather (video → audio direction).
+                k_v2a, v_v2a = self.video_to_audio_attn.project_kv(vx_scaled)
                 if self._use_ulysses:
-                    vx_context = self._sp_all_gather(vx_scaled)
+                    k_v2a = self._sp_all_gather(k_v2a)
+                    v_v2a = self._sp_all_gather(v_v2a)
                     k_pe_v2a = self._sp_gather_pe(video.cross_positional_embeddings)
                 else:
-                    vx_context = vx_scaled
                     k_pe_v2a = video.cross_positional_embeddings
 
                 v2a_out = (
                     self.video_to_audio_attn(
-                        ax_scaled, context=vx_context,
+                        ax_scaled,
+                        pre_projected_kv=(k_v2a, v_v2a),
                         pe=audio.cross_positional_embeddings,
                         k_pe=k_pe_v2a,
                     )
@@ -1160,8 +1167,25 @@ class LTXModel(nn.Module):
             if p is not None
         }
         checkpoint_keys = set(weights.keys())
-        missing = model_keys - checkpoint_keys
-        unexpected = checkpoint_keys - model_keys
+
+        # FUSE_QKV self-attention: model has qkv_proj, checkpoint has
+        # to_q/to_k/to_v.  The weight loader fuses them via params_map.
+        # Exclude these from mismatch warnings.
+        fused_model_params = set()
+        fused_ckpt_params = set()
+        for name, mod in self.named_modules():
+            if isinstance(mod, Linear):
+                wlc = getattr(mod, "weights_loading_config", None)
+                if wlc and getattr(wlc, "weight_mode", None) == WeightMode.FUSED_QKV_LINEAR:
+                    parent = ".".join(name.split(".")[:-1])
+                    for pname, p in mod._parameters.items():
+                        if p is not None:
+                            fused_model_params.add(f"{name}.{pname}")
+                            for src in ("to_q", "to_k", "to_v"):
+                                fused_ckpt_params.add(f"{parent}.{src}.{pname}")
+
+        missing = (model_keys - checkpoint_keys) - fused_model_params
+        unexpected = (checkpoint_keys - model_keys) - fused_ckpt_params
         quantized = (
             self.model_config is not None
             and self.model_config.quant_config.quant_algo is not None
@@ -1207,7 +1231,10 @@ class LTXModel(nn.Module):
 
     def _load_weights_trtllm(self, weights: dict, target_dtype: torch.dtype) -> None:
         """TRT-LLM weight loading with dynamic quantization support."""
-        loader = DynamicLinearWeightLoader(self.model_config)
+        params_map = {
+            "qkv_proj": ["to_q", "to_k", "to_v"],
+        }
+        loader = DynamicLinearWeightLoader(self.model_config, params_map=params_map)
 
         for name, module in tqdm(self.named_modules(), desc="Loading LTXModel weights"):
             if len(module._parameters) == 0:
