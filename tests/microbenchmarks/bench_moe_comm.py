@@ -492,10 +492,6 @@ def _time_dispatch_and_combine_cuda_graph(
         l2_flush_size = (l2_size * 2) // 4
         l2_buffer = torch.empty(l2_flush_size, dtype=torch.int32, device=device)
 
-    def _l2_flush():
-        if l2_buffer is not None:
-            l2_buffer.zero_()
-
     # ---- 1. Shape discovery: one eager run ----
     recv_hidden_states, _, _, _ = backend.dispatch(
         hidden_states,
@@ -539,8 +535,23 @@ def _time_dispatch_and_combine_cuda_graph(
         evt.record()
     torch.cuda.synchronize()
 
+    # Graph contains warmup + timed iters. Warmup iters have no events (unmeasured).
+    # Timed iters have 4 external events each. One replay() runs everything back-to-back,
+    # eliminating rank desync between warmup and timed sections.
     big_graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(big_graph):
+        for _ in range(warmup):
+            if l2_buffer is not None:
+                l2_buffer.zero_()
+            backend.dispatch(
+                hidden_states,
+                hidden_states_sf,
+                token_selected_slots,
+                token_final_scales,
+                all_rank_num_tokens,
+            )
+            static_moe_out.zero_()
+            backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
         for i in range(iters):
             if l2_buffer is not None:
                 l2_buffer.zero_()
@@ -558,20 +569,7 @@ def _time_dispatch_and_combine_cuda_graph(
             backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
             _record_external(c_ends[i])
 
-    # ---- 3. Warmup: eager iterations ----
-    for _ in range(warmup):
-        _l2_flush()
-        backend.dispatch(
-            hidden_states,
-            hidden_states_sf,
-            token_selected_slots,
-            token_final_scales,
-            all_rank_num_tokens,
-        )
-        static_moe_out.zero_()
-        backend.combine(static_moe_out, all_rank_max_num_tokens=max_tokens)
-
-    # ---- 4. Timed replay + kernel breakdown in one pass ----
+    # ---- 3. Timed replay + kernel breakdown ----
     with torch.profiler.profile(
         activities=[torch.profiler.ProfilerActivity.CUDA, torch.profiler.ProfilerActivity.CPU],
         record_shapes=False,
@@ -579,7 +577,8 @@ def _time_dispatch_and_combine_cuda_graph(
     ) as prof:
         _sync()
         big_graph.replay()
-    torch.cuda.synchronize()
+
+    _sync()
 
     dispatch_times_us = [d_starts[i].elapsed_time(d_ends[i]) * 1e3 for i in range(iters)]
     combine_times_us = [c_starts[i].elapsed_time(c_ends[i]) * 1e3 for i in range(iters)]
