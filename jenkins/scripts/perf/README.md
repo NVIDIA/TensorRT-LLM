@@ -15,8 +15,7 @@ jenkins/scripts/perf/
     submit.py                # Local submit script (aggregated and disaggregated)
     slurm_install.sh         # Build wheel + pip install inside container
     slurm_run.sh             # Run pytest inside container
-  perf_utils.py              # Shared utilities (regression detection, baseline, charts, OpenSearch queries)
-  get_pre_merge_html.py      # Pre-merge HTML report with history, baseline, and threshold
+  get_pre_merge_html.py      # Self-contained pre-merge HTML report (match_keys grouping, inline baseline, interactive dashboard)
   perf_sanity_triage.py      # Query/update OpenSearch data and send Slack notifications
 ```
 
@@ -61,44 +60,34 @@ Used by the **CI pipeline** (called from `jenkins/L0_Test.groovy`'s
 script prefix and srun args from the CI pipeline and combines them with disagg-specific
 environment variables and hardware configuration to generate `slurm_launch.sh`.
 
-## Shared Utilities
-
-### `perf_utils.py`
-
-Shared module imported by `get_post_merge_html.py`, `get_pre_merge_html.py`, and
-`perf_sanity_triage.py`. Contains:
-
-- **Constants**: `CHART_METRICS` (4 key throughput metrics), `METRIC_LABELS`,
-  algorithm parameters, curve type colors/labels.
-- **Baseline computation**: Rolling smooth (window=3) + P95 percentile algorithm.
-  Replaces the previous `max(daily_values)` approach which was vulnerable to
-  occasional spikes inflating the baseline.
-- **Regression detection**: Two-step classification (regression check + subtype
-  pattern matching). Supports per-metric thresholds from baseline data
-  (`d_threshold_pre_merge_*` fields, defaulting to 5%).
-- **OpenSearch query + grouping**: `get_history_data()` queries both baseline and
-  non-baseline data, groups by `(s_test_case_name, s_gpu_type)`.
-- **SVG chart generation**: Unified chart function supporting history lines,
-  new data points, baseline line, threshold line, curve type badges, and jump
-  interval shading.
-- **HTML dashboard**: `generate_post_merge_html()` produces a full interactive
-  report with three-way cascading filters and click-to-inspect data-point popups.
-
 ## Post-Processing and Triage
 
 ### `get_pre_merge_html.py`
 
-Triggered at the end of the CI pipeline in `jenkins/L0_MergeRequest.groovy`. It has
-3 main functions:
+Triggered at the end of the CI pipeline in `jenkins/L0_MergeRequest.groovy`. This is
+a self-contained script (no external `perf_utils` dependency) that:
+
+- **Groups test cases by match_keys** (from `test_perf_sanity.py`) including
+  `s_branch`, instead of simple `(s_test_case_name, s_gpu_type)` tuples.
+- **Computes baselines locally** using rolling smooth (trailing window = 3 data
+  points, no daily aggregation) + P95 percentile algorithm.
+- **Generates an interactive HTML dashboard** with:
+  - Baseline calculation explanation block
+  - Per test case titles: `{test_case_name} [{branch}] [{gpu_type}]`
+  - SVG charts with dashed lines for baseline, threshold, and latest perf value
+  - Clickable data points showing all fields in a popup
+  - "Show Latest Data" button to display all fields of the latest pre-merge data
+
+It has 3 main entry points:
 
 1. **`load_perf_data`**: Reads perf_data.yaml files produced by test stages and
    gathers all new perf data together.
 2. **`get_pre_merge_history_data`**: Queries OpenSearch for post-merge history data
-   (both baseline and non-baseline), grouped by `(s_test_case_name, s_gpu_type)`.
-3. **`generate_pre_merge_html`**: Generates an HTML report visualizing each test
-   case's key metrics (`d_seq_throughput`, `d_token_throughput`,
+   (both baseline and non-baseline), grouped by match_keys.
+3. **`generate_pre_merge_html`**: Generates the interactive HTML report visualizing
+   each test case's key metrics (`d_seq_throughput`, `d_token_throughput`,
    `d_total_token_throughput`, `d_user_throughput`) with history curve, new data
-   points, baseline line, and threshold line for regression comparison.
+   points, baseline line, threshold line, and latest value line.
 
 ### `perf_sanity_triage.py`
 
