@@ -2891,20 +2891,26 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 num_copy_bits=num_copy_bits,
                 return_val=return_val,
                 large_occupancy=large_occupancy,
+                num_sms=_get_num_sms(),
             )
+            if load_balance:
+                g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (1,), stride_order=(0,))
+            else:
+                g_global_counter_fake = None
             compiled_kernel = cute.compile(
                 filtered_topk_func,
                 input_fake,
                 None,  # indices_fake
                 buffer_fake,
-                None,  # g_global_counter_fake
+                g_global_counter_fake,
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
 
                 stream=fake_stream,
                 enable_persistent_dynamic_scheduling=load_balance,
-                min_blocks_per_mp=1,
+                min_blocks_per_mp=4 if large_occupancy else 1,
                 options="--enable-tvm-ffi",
             )
             cls.kernel_cache[key] = compiled_kernel
@@ -2918,6 +2924,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n: int,
             return_val: bool = False,
             num_copy_bits: int = 256,
+            load_balance: bool = False,
         ):
             """Execute filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -2927,7 +2934,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             num_sms = _get_num_sms()
             large_occupancy = num_rows > num_sms
-            load_balance = False
 
             # Compilation key
             key = (
@@ -2984,12 +2990,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                                        dtype=torch.int32,
                                        device="cuda")
 
+            # Prepare global counter for persistent dynamic scheduling
+            if load_balance:
+                g_global_counter_torch = torch.zeros(
+                    1, dtype=torch.int32, device="cuda")
+            else:
+                g_global_counter_torch = None
+
             # Execute kernel (TVM FFI uses env stream automatically)
             compiled_kernel(
                 input_values,
                 None,  # indices
                 buffer_torch,
-                None,  # g_global_counter_torch
+                g_global_counter_torch,
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
@@ -3007,6 +3020,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        load_balance: bool = False,
     ) -> torch.Tensor:
         """CuteDSL-based Top-K selection optimized for Blackwell decode phase.
 
@@ -3016,6 +3030,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: Number of top elements to select (max 2048)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+            load_balance: Enable persistent dynamic scheduling for load balancing
 
         Returns:
             indices: Top-k indices [batch_size * next_n, top_k]
@@ -3065,6 +3080,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             next_n=next_n,
             return_val=False,  # Only return indices
             num_copy_bits=num_copy_bits,
+            load_balance=load_balance,
         )
         return indices
 
@@ -3075,6 +3091,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         top_k: int,
         next_n: int = 1,
         num_copy_bits: int = 256,
+        load_balance: bool = False,
     ):
         num_rows = input_values.shape[0]
         input_values.dtype

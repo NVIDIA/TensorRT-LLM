@@ -165,6 +165,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         merge_blocks: bool = False,
         enable_dynamic_multi_cta: bool = False,
         varlen_merge_input: bool = False,
+        num_sms: int = 148,
         debug: bool = False,
     ):
         super().__init__(
@@ -185,6 +186,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         self.num_ctas_per_row = num_ctas_per_row
         self.enable_dynamic_multi_cta = enable_dynamic_multi_cta
         self.varlen_merge_input = varlen_merge_input
+        self.num_sms = num_sms
 
         if cutlass.const_expr(large_occupancy):
             # tuned value, could be tuned further.
@@ -466,20 +468,56 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             length = cutlass.Int32(0)
             seq_len = cutlass.Int32(0)
 
-            # dynamic scheduler.
-            work_remaining = True
-
+            # Persistent dynamic scheduler.
+            # First task: use bidx directly (no atomic needed).
+            # Subsequent tasks: use atomicAdd (counter pre-initialized
+            # to grid_size on host, so values start from grid_size).
             s_row_id = smem.allocate_tensor(
                 element_type=cute.Int32,
                 layout=cute.make_ordered_layout((1,), order=(0,)),
                 byte_alignment=128,
             )
 
-            # version-1: dynamic scheduler.
+            # First task: deterministic assignment by block index.
+            task_id = bidx
+            if task_id < num_rows:
+                row_start = 0
+                seq_len = seqlen[task_id // self.next_n]
+                row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
+                length = row_end - row_start
+
+                self.filtered_topk_kernel_per_row(
+                    input,
+                    indices,
+                    extra_buffer,
+                    output_indices,
+                    output_values,
+                    tiler_mn,
+                    copy_atom,
+                    tiled_copy,
+                    row_start,
+                    length,
+                    task_id,
+                    s_histogram,
+                    s_counter,
+                    s_threshold_bin_id,
+                    s_num_input,
+                    g_num_input,
+                    s_indices,
+                    s_input_idx,
+                    s_last_remain,
+                    num_warps,
+                    s_warp_sums,
+                )
+
+            # Subsequent tasks: dynamic work stealing via atomic counter.
+            # Counter starts at 0, so offset by grid_size to skip
+            # the first-round tasks already handled by bidx.
+            grid_size_x, _, _ = cute.arch.grid_dim()
+            work_remaining = task_id < num_rows
             while work_remaining:
-                # let tidx 0 dynamic get the next task
                 if tidx == 0:
-                    s_row_id[0] = atomicAdd(g_global_counter.iterator, 1)
+                    s_row_id[0] = atomicAdd(g_global_counter.iterator, cutlass.Int32(1)) + grid_size_x
                 cute.arch.barrier()
 
                 row_id = s_row_id[0]
@@ -487,11 +525,9 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
 
                 if has_work:
                     task_id = row_id
-
                     row_start = 0
                     seq_len = seqlen[task_id // self.next_n]
                     row_end = seq_len - self.next_n + (task_id % self.next_n) + 1
-
                     length = row_end - row_start
 
                     self.filtered_topk_kernel_per_row(
@@ -517,7 +553,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                         num_warps,
                         s_warp_sums,
                     )
-                # use the result of the task to update the while loop condition
                 work_remaining = has_work
 
     @cute.jit
@@ -547,7 +582,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         elif cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             blocks = (num_rows, self.num_ctas_per_row, 1)
         else:
-            blocks = (min(148 * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
+            blocks = (min(self.num_sms * min_blocks_per_mp, num_rows), self.num_ctas_per_row, 1)
 
         (
             copy_atom,

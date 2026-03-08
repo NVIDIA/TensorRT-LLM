@@ -310,7 +310,9 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 @pytest.mark.parametrize("index_topk", [2048])
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
-def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype):
+@pytest.mark.parametrize("load_balance", [False, True])
+def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype,
+                              load_balance):
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -323,6 +325,7 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype)
             top_k=index_topk,
             next_n=next_n,
             num_copy_bits=256,
+            load_balance=load_balance,
         ),
     )
 
