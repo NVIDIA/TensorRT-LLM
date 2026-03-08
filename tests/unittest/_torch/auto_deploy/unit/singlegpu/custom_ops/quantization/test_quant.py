@@ -347,16 +347,17 @@ def test_fused_relu2_quant_nvfp4_wrapper_matches_trtllm_op():
 
 
 @pytest.mark.parametrize("use_bias", [True, False])
+@pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
 @pytest.mark.skipif(
     not (fp4_compatible() and trtllm_ops_available() and _fused_relu2_quantize_available()),
     reason="Requires NVFP4 and trtllm fused_relu2_quantize kernel",
 )
-def test_nvfp4_prequant_linear_wrapper_matches_direct_gemm(use_bias):
+def test_nvfp4_prequant_linear_wrapper_matches_direct_gemm(use_bias, input_dtype):
     """validates wrapper matches direct gemm"""
     m, k, n = 8, 64, 32
-    x = torch.randn(m, k, dtype=torch.bfloat16, device="cuda")
+    x = torch.randn(m, k, dtype=input_dtype, device="cuda")
     w = torch.randn(n, k, dtype=torch.bfloat16, device="cuda")
-    bias = torch.randn(n, dtype=torch.bfloat16, device="cuda") if use_bias else None
+    bias = torch.randn(n, dtype=input_dtype, device="cuda") if use_bias else None
 
     input_scale = fp4_global_scale(x).to(torch.float32)
     weight_scale_2 = fp4_global_scale(w).to(torch.float32)
@@ -372,11 +373,12 @@ def test_nvfp4_prequant_linear_wrapper_matches_direct_gemm(use_bias):
         w_scale,
         alpha,
         bias=bias,
-        out_dtype=torch.bfloat16,
+        out_dtype=input_dtype,
     )
-    out_ref = torch.ops.trtllm.nvfp4_gemm(x_fp4, w_fp4, x_sf, w_scale, alpha, torch.bfloat16)
+    out_ref = torch.ops.trtllm.nvfp4_gemm(x_fp4, w_fp4, x_sf, w_scale, alpha, input_dtype)
     if bias is not None:
         out_ref = out_ref + bias
 
     assert out_wrapped.shape == out_ref.shape
+    assert out_wrapped.dtype == input_dtype
     torch.testing.assert_close(out_wrapped, out_ref, rtol=1e-3, atol=5e-3)
