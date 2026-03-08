@@ -235,4 +235,10 @@ l0_b200:
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-1-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-1-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronSuperV3::test_accuracy[nvfp4-1-attn_dp_off-trtllm]
-  - unittest/_torch/auto_deploy/unit/singlegpu
+  - unittest/auto_deploy/singlegpu/compile
+  - unittest/auto_deploy/singlegpu/custom_ops
+  - unittest/auto_deploy/singlegpu/models
+  - unittest/auto_deploy/singlegpu/shim
+  - unittest/auto_deploy/singlegpu/smoke
+  - unittest/auto_deploy/singlegpu/transformations
+  - unittest/auto_deploy/singlegpu/utils
