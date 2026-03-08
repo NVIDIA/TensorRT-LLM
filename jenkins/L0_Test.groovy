@@ -3000,13 +3000,13 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
     if (reinstall_dependencies == true) {
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
-        def pip_keep = "-e pip torch torchvision"
+        def pip_keep = "-e pip -e torch -e torchvision"
         def remove_trt = "rm -rf /usr/local/tensorrt"
         if (env.alternativeTRT) {
             pip_keep += " -e tensorrt"
             remove_trt = "echo keep /usr/local/tensorrt"
         }
-        sh "#!/bin/bash \n" + "pip3 list --format=freeze | egrep -v ${pip_keep} | xargs pip3 uninstall -y"
+        sh "#!/bin/bash \n" + "pip3 list --format=freeze | egrep -v ${pip_keep} | xargs -r pip3 uninstall -y"
         sh "#!/bin/bash \n" + "yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}"
     }
     // Test preview installation
@@ -3050,13 +3050,13 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     if (reinstall_dependencies) {
         // Test installation in the new environment
         // Reserve CUDA 13.0 torch and torchvision packages
-        def pip_keep = "-e pip torch torchvision"
+        def pip_keep = "-e pip -e torch -e torchvision"
         def remove_trt = "rm -rf /usr/local/tensorrt"
         if (env.alternativeTRT) {
             pip_keep += " -e tensorrt"
             remove_trt = "echo keep /usr/local/tensorrt"
         }
-        sh "bash -c 'pip3 list --format=freeze | egrep -v ${pip_keep} | xargs pip3 uninstall -y'"
+        sh "bash -c 'pip3 list --format=freeze | egrep -v ${pip_keep} | xargs -r pip3 uninstall -y'"
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
     }
     // Test preview installation
