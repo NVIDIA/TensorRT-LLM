@@ -2585,21 +2585,14 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE),
                               dtype=dtype).cuda()
 
-        from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp,
-                                                          upcast_from_mxfp_torch
-                                                          )
+        from triton_kernels.numerics_details.mxfp import (
+            downcast_to_mxfp_torch, upcast_from_mxfp_torch)
 
         def fp32_to_mxfp4(tensor):
             tensor = tensor.transpose(1, 2).contiguous()
-            # Use the Triton kernel (downcast_to_mxfp) instead of the PyTorch
-            # reference (downcast_to_mxfp_torch) to avoid OOM on large tensors
-            # (e.g. [128 experts, 2880, 2880]). In triton_kernels 3.6.0, the RTNE
-            # rounding fix in downcast_to_mxfp_torch materializes ~13 full-size fp32
-            # intermediate tensors, causing ~4 GiB peak allocation. The Triton kernel
-            # is numerically equivalent and memory-efficient.
-            tensor_fp4, tensor_scales = downcast_to_mxfp(tensor,
-                                                         torch.uint8,
-                                                         axis=1)
+            tensor_fp4, tensor_scales = downcast_to_mxfp_torch(tensor,
+                                                               torch.uint8,
+                                                               axis=1)
             tensor_fp4 = tensor_fp4.transpose(1, 2).contiguous()
             tensor_scales = tensor_scales.transpose(1, 2).contiguous()
             return tensor_fp4, tensor_scales
