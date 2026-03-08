@@ -3000,13 +3000,14 @@ def runLLMBuild(pipeline, cpu_arch, reinstall_dependencies=false, wheel_path="",
 
     if (reinstall_dependencies == true) {
         // Test installation in the new environment
-        def pip_keep = "-e 'pip'"
+        // Reserve CUDA 13.0 torch and torchvision packages
+        def pip_keep = "-e pip -e torch -e torchvision"
         def remove_trt = "rm -rf /usr/local/tensorrt"
         if (env.alternativeTRT) {
             pip_keep += " -e tensorrt"
             remove_trt = "echo keep /usr/local/tensorrt"
         }
-        sh "#!/bin/bash \n" + "pip3 list --format=freeze | egrep -v ${pip_keep} | xargs pip3 uninstall -y"
+        sh "#!/bin/bash \n" + "pip3 list --format=freeze | egrep -v ${pip_keep} | xargs -r pip3 uninstall -y"
         sh "#!/bin/bash \n" + "yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}"
     }
     // Test preview installation
@@ -3049,13 +3050,14 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
     }
     if (reinstall_dependencies) {
         // Test installation in the new environment
-        def pip_keep = "-e 'pip'"
+        // Reserve CUDA 13.0 torch and torchvision packages
+        def pip_keep = "-e pip -e torch -e torchvision"
         def remove_trt = "rm -rf /usr/local/tensorrt"
         if (env.alternativeTRT) {
             pip_keep += " -e tensorrt"
             remove_trt = "echo keep /usr/local/tensorrt"
         }
-        sh "bash -c 'pip3 list --format=freeze | egrep -v ${pip_keep} | xargs pip3 uninstall -y'"
+        sh "bash -c 'pip3 list --format=freeze | egrep -v ${pip_keep} | xargs -r pip3 uninstall -y'"
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
     }
     // Test preview installation
@@ -3635,11 +3637,7 @@ def launchTestJobs(pipeline, testFilter)
                             echo "###### Extra PyTorch CUDA 13.0 install Start ######"
                             // Use internal mirror instead of https://download.pytorch.org/whl/cu130 for better network stability.
                             // PyTorch CUDA 13.0 package and torchvision package can be installed as expected.
-                            if (k8s_arch == "amd64") {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1+cu130 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
-                            } else {
-                                trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.9.1+cu130 torchvision==0.24.1 --extra-index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
-                            }
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install torch==2.10.0+cu130 torchvision==0.25.0+cu130 --index-url https://urm.nvidia.com/artifactory/api/pypi/pytorch-cu128-remote/simple")
                         }
 
                         def libEnv = []

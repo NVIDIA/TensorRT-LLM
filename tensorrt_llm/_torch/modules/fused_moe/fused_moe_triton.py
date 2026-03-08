@@ -174,11 +174,13 @@ class TritonEPRouter():
         from triton_kernels.topk import topk
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
-        expt_scal, expt_indx, bitmatrix = topk(logits,
-                                               n_expts_act,
-                                               apply_softmax=not sm_first,
-                                               y_indx=expt_indx,
-                                               n_rows=n_rows)
+        bitmatrix = topk(logits,
+                         n_expts_act,
+                         apply_softmax=not sm_first,
+                         y_indx=expt_indx,
+                         n_rows=n_rows)
+        expt_scal = bitmatrix.expt_scal
+        expt_indx = bitmatrix.expt_indx
         # mutate bitmatrix
         if ep > 1:
             expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
