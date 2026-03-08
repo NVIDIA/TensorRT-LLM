@@ -106,12 +106,12 @@ protected:
     static constexpr int kWindowSWA = 128;
     static constexpr int kWindowFull = 4096;
 
-    // Call setValue on a slot that must not already hold a value.
-    // setValue returns false when no prior value existed.
+    // Call trySetValue on a slot that must not already hold a value.
+    // trySetValue returns true when the node was updated (key was absent and inserted).
     template <class NodePtr>
     static void setFresh(NodePtr node, int vkey, int val)
     {
-        EXPECT_FALSE(node->setValue(vkey, val, /*overwrite=*/false));
+        EXPECT_TRUE(node->trySetValue(vkey, val, /*overwrite=*/false));
     }
 
     // Call clearValue and assert the value was found and removed.
@@ -427,8 +427,8 @@ TEST_F(RadixTreeTest, OverwriteValue)
     IntTree tree;
     auto node = singleNode(tree, 5);
     setFresh(node, /*vkey=*/0, /*val=*/42);
-    // Overwrite=true returns true when a prior value existed.
-    EXPECT_TRUE(node->setValue(0, 99, /*overwrite=*/true));
+    // trySetValue returns true when the node was updated (overwrite=true always updates).
+    EXPECT_TRUE(node->trySetValue(0, 99, /*overwrite=*/true));
     auto val = node->getValue(0);
     ASSERT_TRUE(val.has_value());
     EXPECT_EQ(*val, 99);
@@ -440,7 +440,8 @@ TEST_F(RadixTreeTest, NoOverwrite)
     auto node = singleNode(tree, 5);
     setFresh(node, /*vkey=*/0, /*val=*/42);
     // Overwrite=false must not replace an existing value.
-    EXPECT_FALSE(node->setValue(0, 999, /*overwrite=*/false));
+    // trySetValue returns false when no update was made (key existed, insertion blocked).
+    EXPECT_FALSE(node->trySetValue(0, 999, /*overwrite=*/false));
     auto val = node->getValue(0);
     ASSERT_TRUE(val.has_value());
     EXPECT_EQ(*val, 42); // original value preserved
@@ -693,7 +694,8 @@ TEST_F(RadixTreeTest, LookupValuesPartialHit)
     // isValid=true when the matched node carries a value.
     PartialTree tree;
     auto inserted = tree.insertNodes({TokensKey{{1, 2, 3}}});
-    [[maybe_unused]] auto wasSet = inserted.exactMatches[0].node->setValue(/*vkey=*/0, /*val=*/42, /*overwrite=*/false);
+    auto const wasInserted = inserted.exactMatches[0].node->trySetValue(/*vkey=*/0, /*val=*/42, /*overwrite=*/false);
+    EXPECT_TRUE(wasInserted);
 
     auto vm = tree.lookupValues({TokensKey{{1, 2, 4}}}, /*allowPartialMatch=*/true, /*vkey=*/0);
 
