@@ -907,8 +907,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
     def _permute_mxfp4_quantize(self, tensor):
         tensor = tensor.transpose(-2, -1).contiguous()
         tensor_fp4, tensor_scales = downcast_to_mxfp(tensor,
-                                                           torch.uint8,
-                                                           axis=-2)
+                                                     torch.uint8,
+                                                     axis=-2)
         return tensor_fp4, tensor_scales
 
     def load_expert_w3_w1_weight(self,
