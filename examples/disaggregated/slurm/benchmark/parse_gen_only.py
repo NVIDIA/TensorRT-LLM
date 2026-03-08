@@ -834,7 +834,7 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
 
     ax.set_xlabel("Output Throughput per User (tok/s)", fontsize=12)
     ax.set_ylabel("Output Throughput per GPU (tok/s/gpu)", fontsize=12)
-    ax.set_title("Kimi K2 FP4 250k/8k TRTLLM Pareto, GB300 NVL72, Gen-Only SOL, #Gen GPUs Per Instance<=64", fontsize=10)
+    ax.set_title("Kimi K2.5 Text FP4 250k/8k TRTLLM Pareto, GB300 NVL72, Gen-Only SOL, #Gen GPUs Per Instance<=64", fontsize=10)
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
 
@@ -879,7 +879,7 @@ def plot_pareto(results: List[Dict], output_dir: str) -> Optional[str]:
 
     ax.set_xlabel("Output Throughput per User (tok/s)", fontsize=12)
     ax.set_ylabel("Output Throughput per GPU (tok/s/gpu)", fontsize=12)
-    ax.set_title("Kimi K2 FP4 250k/8k TRTLLM Pareto, GB300 NVL72, Gen-Only SOL, #Gen GPUs Per Instance<=64 (Denoised)", fontsize=10)
+    ax.set_title("Kimi K2.5 Text FP4 250k/8k TRTLLM Pareto, GB300 NVL72, Gen-Only SOL, #Gen GPUs Per Instance<=64 (Denoised)", fontsize=10)
     ax.legend(loc="best")
     ax.grid(True, alpha=0.3)
 

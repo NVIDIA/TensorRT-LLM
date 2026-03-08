@@ -1930,7 +1930,6 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
                 layer.next_layer_layernorm = self.model.layers[
                     idx + 1].input_layernorm
 
-
 @register_auto_model("KimiK25ForConditionalGeneration")
 class KimiK25ForConditionalGeneration(DeepseekV3ForCausalLM):
     """Kimi-K2.5 multimodal model (text-only path).

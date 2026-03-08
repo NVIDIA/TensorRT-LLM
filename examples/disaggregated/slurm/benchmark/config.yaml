@@ -16,7 +16,7 @@ benchmark:
   multi_round: 1  # Number of benchmark rounds
   benchmark_ratio: 1.0  # Benchmark ratio
   streaming: true  # Enable streaming mode
-  concurrency_list: "16"
+  concurrency_list: "32"
   input_length: 252928  # Input sequence length
   output_length: 8192  # Output sequence length
   dataset_file: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/datasets/kimi-k2-fp4-252928-8192-8192-ratio-1_for_serve.json"
@@ -31,7 +31,7 @@ hardware:
 environment:
   container_mount: "/lustre/fsw/coreai_comparch_trtllm:/lustre/fsw/coreai_comparch_trtllm"  # Format: path1:path1,path2:path2
   container_image: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/sqsh/trtllm-pytorch-25.12-py3-aarch64-ubuntu24.04-trt10.14.1.48-20260201-10901.sqsh"
-  model_path: "/lustre/fsw/coreai_comparch_trtllm/common/Kimi-K2-Thinking-NVFP4/"
+  model_path: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/Kimi-K2.5-NVFP4/"
   trtllm_repo: "/lustre/fsw/coreai_comparch_trtllm/bbuddharaju/TensorRT-LLM/"
   build_wheel: false  # Don't build the wheel when launching multiple jobs
   cuda_architectures: "100-real;103-real"  # Optional CUDA architectures to build for (e.g. "90-real;100-real"). If empty, builds for all architectures
@@ -58,25 +58,25 @@ accuracy:
 
 worker_config:
   gen:
-    tensor_parallel_size: 1
-    moe_expert_parallel_size: 4
+    tensor_parallel_size: 64
+    moe_expert_parallel_size: 64
     enable_attention_dp: false
     enable_lm_head_tp_in_adp: false
     pipeline_parallel_size: 1
-    context_parallel_size: 4
+    context_parallel_size: 1
     enable_autotuner: false
     cp_config:
       cp_type: "HELIX"
       tokens_per_block: 32
       use_nccl_for_alltoall: false
       fifo_version: 2
-    max_batch_size: 8
-    max_num_tokens: 16
+    max_batch_size: 16
+    max_num_tokens: 32
     max_seq_len: 261632
     max_input_len: 252928
     cuda_graph_config:
       enable_padding: true
-      max_batch_size: 8
+      max_batch_size: 16
     print_iter_log: true
     trust_remote_code: true
     kv_cache_config:
