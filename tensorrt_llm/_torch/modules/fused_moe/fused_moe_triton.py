@@ -157,7 +157,8 @@ class TritonEPRouter():
                  ep=1,
                  node_idx=0,
                  n_rows=None):
-        from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+        from triton_kernels.matmul_ogs import (GatherIndx, RoutingData,
+                                               ScatterIndx)
         from triton_kernels.tensor import make_ragged_tensor_metadata
         from triton_kernels.topk import topk
 
@@ -184,7 +185,8 @@ class TritonEPRouter():
 
         metadata = bitmatrix.mask_metadata
 
-        expt_data = make_ragged_tensor_metadata(metadata.col_sum, logits.shape[0] * n_expts_act)
+        expt_data = make_ragged_tensor_metadata(metadata.col_sum,
+                                                logits.shape[0] * n_expts_act)
         gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
 
         rdata = RoutingData(
