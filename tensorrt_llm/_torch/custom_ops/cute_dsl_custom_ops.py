@@ -3262,7 +3262,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             return_val: bool = False,
             num_copy_bits: int = 256,
             chunk_size_per_cta: int = 16384,
-            dynamic: bool = False,
+            dynamic: bool = True,
         ):
             """Execute multi-CTA filtered top-k selection on input logits."""
             torch_dtype = input_values.dtype
@@ -3317,28 +3317,19 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 buffer_numbers = 1
 
             if dynamic:
-                # Bounds check: num_rows must fit in the in-kernel prefix sum
-                _DYNAMIC_MAX_NUM_ROWS = 512
-                if num_rows > _DYNAMIC_MAX_NUM_ROWS:
-                    raise ValueError(
-                        f"dynamic multi-CTA top-k: num_rows ({num_rows}) "
-                        f"exceeds limit ({_DYNAMIC_MAX_NUM_ROWS}). "
-                        f"Reduce batch_size * next_n to "
-                        f"<= {_DYNAMIC_MAX_NUM_ROWS}.")
-
-                # Use upper-bound allocation to avoid DtoH sync (.item()).
-                # The first kernel early-exits CTAs beyond actual total_ctas.
-                max_total_ctas = num_rows * num_ctas_per_row
-
+                # Dynamic mode: 2D grid (num_rows, num_ctas_per_row) with
+                # per-CTA early exit for rows needing fewer chunks.
                 # Intermediate buffers: 2D (num_rows, merge_cols)
                 first_output_indices = torch.empty(
                     num_rows, merge_cols, dtype=torch.int32, device="cuda")
                 first_output_values = torch.empty(
                     num_rows, merge_cols, dtype=torch_dtype, device="cuda")
 
-                # Buffer sized by upper bound
+                # Shared buffer for both kernels (they run sequentially)
+                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
                 buffer_torch = torch.empty(
-                    max_total_ctas, buffer_numbers, chunk_size_per_cta,
+                    num_rows * num_ctas_per_row, buffer_numbers,
+                    buffer_dim2,
                     dtype=torch.int32, device="cuda")
 
                 # Final output tensors
@@ -3350,8 +3341,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 else:
                     output_values_torch = None
 
-                # Execute first kernel: dynamic per-chunk top-k
-                # Offsets are computed in-kernel via shared memory prefix sum.
+                # Execute first kernel: per-chunk top-k with early exit
                 compiled_kernel_first(
                     input_values,
                     None,  # indices
@@ -3362,17 +3352,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     first_output_values,
                 )
 
-                # Merge buffer (one per row)
-                merge_buffer_torch = torch.empty(
-                    num_rows, buffer_numbers, merge_cols,
-                    dtype=torch.int32, device="cuda")
-
-                # Execute second kernel: varlen merge
+                # Execute second kernel: varlen merge (reuses buffer_torch)
                 # merge_width computed in-kernel from seqlen.
                 compiled_kernel_second(
                     first_output_values,
                     first_output_indices,
-                    merge_buffer_torch,
+                    buffer_torch,
                     None,  # g_global_counter_torch
                     seq_lens,
                     output_indices_torch,
@@ -3435,7 +3420,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         num_copy_bits: int = 256,
         chunk_size_per_cta: int = 16384,
-        dynamic: bool = False,
+        dynamic: bool = True,
     ) -> torch.Tensor:
         """CuteDSL-based multi-CTA Top-K selection optimized for Blackwell decode phase.
 
@@ -3517,7 +3502,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         num_copy_bits: int = 256,
         chunk_size_per_cta: int = 16384,
-        dynamic: bool = False,
+        dynamic: bool = True,
     ):
         num_rows = input_values.shape[0]
 
@@ -3537,17 +3522,15 @@ if IS_CUTLASS_DSL_AVAILABLE:
     ) -> torch.Tensor:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
 
-        Automatically chooses the faster kernel based on a dual-condition:
-          1. dtype threshold: fp16/bf16 >= 32768, fp32 >= 65536
-          2. SM utilization < 15% AND multi-CTA waves <= 2
+        Automatically chooses the faster kernel based on:
+          1. dtype threshold: fp16/bf16 >= 131072, fp32 >= 65536
+          2. SM utilization < 25% (num_rows < num_sms // 4)
         Multi-CTA is only used when both conditions are met, ensuring it
-        only activates when single-CTA occupancy is genuinely low and
-        multi-CTA overhead is bounded.
+        only activates when single-CTA occupancy is genuinely low.
         Uses chunk_size_per_cta=16384 for multi-CTA.
 
         Based on benchmark results (Blackwell SM100, top_k=2048).
-        See bench_cute_dsl_multi_cta_vs_single_cta_topk_results.txt
-        and bench_cute_dsl_indexer_topk_results.txt.
+        See bench_cute_dsl_single_vs_multi_cta_topk.py.
 
         Args:
             input_values: Input logits tensor [batch_size * next_n, vocab_size]
@@ -3563,25 +3546,20 @@ if IS_CUTLASS_DSL_AVAILABLE:
         num_tokens = input_values.shape[1]
         chunk_size_per_cta = 16384
 
-        # Multi-CTA thresholds by dtype (num_tokens above which multi-CTA is faster)
+        # Multi-CTA vocab thresholds by dtype.
+        # fp32: multi-CTA wins at vocab >= 65536 (4+ CTAs per row)
+        # fp16/bf16: multi-CTA wins at vocab >= 131072 (8+ CTAs per row)
         if input_values.dtype == torch.float32:
             use_multi_cta = num_tokens >= 65536
         else:
-            # fp16 / bf16
-            use_multi_cta = num_tokens >= 32768
+            use_multi_cta = num_tokens >= 131072
 
-        # Only use multi-CTA when both conditions are met:
-        # 1. Single CTA SM utilization is low (< 15%) — not enough rows
-        #    to keep SMs busy with one block each.
-        # 2. Multi-CTA total blocks fit within 2 waves — beyond that the
-        #    2-pass overhead (kernel launch + intermediate buffer I/O)
-        #    outweighs the parallelism gain.
+        # Only use multi-CTA when SM utilization from single-CTA is low
+        # (< 25%). Beyond this, single-CTA already saturates the SMs and
+        # multi-CTA 2-pass overhead hurts.
         if use_multi_cta:
             num_sms = _get_num_sms()
-            num_ctas_per_row = math.ceil(num_tokens / chunk_size_per_cta)
-            sm_util_low = num_rows < num_sms * 15 // 100  # < 15%
-            multi_waves = math.ceil(num_rows * num_ctas_per_row / num_sms)
-            use_multi_cta = sm_util_low and multi_waves <= 2
+            use_multi_cta = num_rows < num_sms // 4
 
         if use_multi_cta:
             indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(

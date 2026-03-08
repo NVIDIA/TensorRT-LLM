@@ -237,19 +237,6 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             )
 
     @cute.jit
-    def _binary_search_row(self, row_cta_offsets, task_id, num_rows):
-        """Binary search: find largest row_id where row_cta_offsets[row_id] <= task_id."""
-        lo = 0
-        hi = num_rows
-        while lo < hi:
-            mid = (lo + hi + 1) // 2
-            if row_cta_offsets[mid] <= task_id:
-                lo = mid
-            else:
-                hi = mid - 1
-        return lo
-
-    @cute.jit
     def run_kernel(
         self,
         input,
@@ -382,74 +369,16 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
             byte_alignment=128,
         )
 
-        # Shared memory for in-kernel dynamic CTA offset computation.
-        # All threads compute the prefix sum of per-row CTA counts via
-        # block_prefix_sum_kernel, then binary-search the result.
-        if cutlass.const_expr(self.enable_dynamic_multi_cta):
-            _DYNAMIC_MAX_NUM_ROWS = 512
-            s_row_cta_offsets = smem.allocate_tensor(
-                element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout(
-                    (_DYNAMIC_MAX_NUM_ROWS + 1,), order=(0,)),
-                byte_alignment=128,
-            )
-            _num_warps_prefix = cutlass.const_expr(
-                self.num_threads_per_cta // 32)
-            s_prefix_warp_sums = smem.allocate_tensor(
-                element_type=cutlass.Int32,
-                layout=cute.make_ordered_layout(
-                    (_num_warps_prefix,), order=(0,)),
-                byte_alignment=128,
-            )
-
         if cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             # Thread and block indexing
             bidx, bidy, _ = cute.arch.block_idx()
 
             if cutlass.const_expr(self.enable_dynamic_multi_cta):
-                # 1D grid: bidx = task_id.  Each CTA computes
-                # row_cta_offsets in shared memory via parallel prefix
-                # sum, then binary-searches to find (row_id, chunk_id).
-                task_id = bidx
+                # 2D grid with early exit: bidx = row_id, bidy = chunk_id.
+                # Each CTA computes how many chunks its row actually needs
+                # from seqlen and exits early if bidy >= num_needed_ctas.
+                # This avoids prefix sum + binary search overhead entirely.
                 num_rows_val = seqlen.shape[0] * self.next_n
-                tidx, _, _ = cute.arch.thread_idx()
-
-                _num_passes = cutlass.const_expr(
-                    (_DYNAMIC_MAX_NUM_ROWS + self.num_threads_per_cta - 1)
-                    // self.num_threads_per_cta)
-                previous_sum = 0
-                for _pass in cutlass.range(_num_passes, unroll_full=True):
-                    row_idx = tidx + _pass * self.num_threads_per_cta
-                    ctas_val = 0
-                    if row_idx < num_rows_val:
-                        _batch = row_idx // self.next_n
-                        _off = row_idx % self.next_n
-                        _eff = seqlen[_batch] - self.next_n + _off + 1
-                        ctas_val = (_eff + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
-                        if ctas_val < 1:
-                            ctas_val = 1
-
-                    _psum, _tsum = block_prefix_sum_kernel(
-                        ctas_val, s_prefix_warp_sums, tidx,
-                        self.num_threads_per_cta, _num_warps_prefix,
-                        barrier_id=2, need_total_sum=True)
-
-                    if row_idx < num_rows_val:
-                        s_row_cta_offsets[row_idx + 1] = _psum + previous_sum
-                    previous_sum = previous_sum + _tsum
-
-                if tidx == 0:
-                    s_row_cta_offsets[0] = 0
-                cute.arch.barrier()
-
-                # Binary search from shared memory
-                bidx = self._binary_search_row(
-                    s_row_cta_offsets, task_id, num_rows_val)
-                bidy = task_id - s_row_cta_offsets[bidx]
-                # Clamp to valid range so all pointer arithmetic below is safe.
-                # Padding CTAs are skipped via the _should_run guard later.
-                bidx = min(bidx, num_rows_val - 1)
-                bidy = min(bidy, self.num_ctas_per_row - 1)
 
             row_start = 0
             row_end = 0
@@ -492,10 +421,16 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
                     row_end = self.max_num_cols
                     length = self.max_num_cols
 
-            # Skip padding CTAs launched beyond actual total_ctas.
+            # Skip CTAs that exceed this row's actual chunk count.
             _should_run = True
             if cutlass.const_expr(self.enable_dynamic_multi_cta):
-                _should_run = task_id < s_row_cta_offsets[num_rows_val]
+                _batch_check = bidx // self.next_n
+                _off_check = bidx % self.next_n
+                _eff_check = seqlen[_batch_check] - self.next_n + _off_check + 1
+                _needed_ctas = (_eff_check + self.chunk_size_per_cta - 1) // self.chunk_size_per_cta
+                if _needed_ctas < 1:
+                    _needed_ctas = 1
+                _should_run = (bidx < num_rows_val) and (bidy < _needed_ctas)
 
             if _should_run:
                 self.filtered_topk_kernel_per_row(
@@ -608,8 +543,7 @@ class FilteredTopKKernelVarlenDecode(FilteredTopKKernelVarlen):
         num_rows = input_values.shape[0]
         # each cta processes one row of input.
         if cutlass.const_expr(self.enable_dynamic_multi_cta):
-            total_ctas = extra_buffer.shape[0]
-            blocks = (total_ctas, 1, 1)
+            blocks = (num_rows, self.num_ctas_per_row, 1)
         elif cutlass.const_expr(not enable_persistent_dynamic_scheduling):
             blocks = (num_rows, self.num_ctas_per_row, 1)
         else:
