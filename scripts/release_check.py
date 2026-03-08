@@ -19,8 +19,7 @@ import sys
 
 
 def run_cmd(cmd):
-    """Run a command and return output, raising error by default if command fails"""
-
+    """Run a command and return output, raising error by default if command fails."""
     print(f"Running command: {cmd}")
     result = sp.run(cmd,
                     shell=True,
@@ -34,8 +33,7 @@ def run_cmd(cmd):
 
 
 def handle_check_failure(error_msg):
-    """Helper function to handle check failures with consistent messaging"""
-
+    """Handle check failures with consistent messaging."""
     print(f"\nError: {error_msg}")
     print(
         "Please refer to our coding style guidelines at: https://github.com/NVIDIA/TensorRT-LLM/blob/main/CONTRIBUTING.md#coding-style to fix this issue"
@@ -57,8 +55,11 @@ def main():
     run_cmd("pre-commit install")
 
     # Run pre-commit on all files
+    # Skip supplemental ruff-legacy hook in --all-files mode to avoid failing
+    # on pre-existing violations in legacy files. Supplemental lint runs
+    # locally on staged files only (pre-commit run).
     try:
-        run_cmd("pre-commit run -a --show-diff-on-failure")
+        run_cmd("SKIP=ruff-legacy pre-commit run -a --show-diff-on-failure")
     except SystemExit:
         handle_check_failure("pre-commit checks failed")
 
