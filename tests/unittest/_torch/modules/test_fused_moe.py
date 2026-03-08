@@ -2586,13 +2586,13 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
                               dtype=dtype).cuda()
 
         from triton_kernels.numerics_details.mxfp import (
-            downcast_to_mxfp_torch, upcast_from_mxfp_torch)
+            downcast_to_mxfp, upcast_from_mxfp_torch)
 
         def fp32_to_mxfp4(tensor):
             tensor = tensor.transpose(1, 2).contiguous()
-            tensor_fp4, tensor_scales = downcast_to_mxfp_torch(tensor,
-                                                               torch.uint8,
-                                                               axis=1)
+            tensor_fp4, tensor_scales = downcast_to_mxfp(tensor,
+                                                         torch.uint8,
+                                                         axis=1)
             tensor_fp4 = tensor_fp4.transpose(1, 2).contiguous()
             tensor_scales = tensor_scales.transpose(1, 2).contiguous()
             return tensor_fp4, tensor_scales
