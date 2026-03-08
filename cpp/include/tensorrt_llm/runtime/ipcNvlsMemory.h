@@ -96,12 +96,13 @@ public:
         if (_capacity > 0)
         {
             ipcNvlsFree(_handle);
+            _handle = nullptr;
             _capacity = 0;
         }
     }
 
 private:
     size_t _capacity = 0;
-    IpcNvlsHandle* _handle;
+    IpcNvlsHandle* _handle{nullptr};
 };
 } // namespace tensorrt_llm::runtime
