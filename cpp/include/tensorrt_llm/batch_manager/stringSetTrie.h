@@ -36,8 +36,8 @@ public:
         std::vector<char> prefix(str.begin(), str.end());
         auto matches = insertNodes(prefix);
         auto last_match = matches.exactMatches.back();
-        [[maybe_unused]] auto wasOverwritten = last_match.node->setValue(1, static_cast<int>(str.size()),
-            /*overwrite*/ true); // store value for last node so nodes don't get deleted.
+        [[maybe_unused]] auto wasUpdated = last_match.node->trySetValue(1, static_cast<int>(str.size()),
+            /*overwrite=*/true); // store value for last node so nodes don't get deleted.
     }
 
     void erase(std::string str)
@@ -51,8 +51,11 @@ public:
         if (matches.exactMatches.size() == prefix.size())
         {
             auto last_match = matches.exactMatches.back();
-            [[maybe_unused]] auto wasCleared
-                = last_match.node->clearValue(1); // clearing value should delete all empty nodes.
+            if (last_match.node->getValue(1).has_value())
+            {
+                auto const wasCleared = last_match.node->clearValue(1); // clearing value should delete all empty nodes.
+                TLLM_CHECK_WITH_INFO(wasCleared, "StringSetTrie::erase: clearValue failed on a node we just found");
+            }
         }
     }
 

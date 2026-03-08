@@ -93,7 +93,8 @@ struct BlockKey
     int numMatchingTokens(BlockKey const& other) const noexcept
     {
         SizeType32 numMatched{0};
-        if (loraTaskId == other.loraTaskId && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID)
+        if (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && extraKeys == other.extraKeys
+            && cacheSaltID == other.cacheSaltID)
         {
             auto [matchEnd, otherMatchEnd] = std::mismatch(
                 uniqueTokens.begin(), uniqueTokens.end(), other.uniqueTokens.begin(), other.uniqueTokens.end());
