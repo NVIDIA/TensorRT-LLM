@@ -825,14 +825,11 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
-    mapping_config: str = "",
+    mapping_config: str = "",  # https://github.com/NVIDIA/TensorRT-LLM/issues/12008 Add mapping config support
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
-
-    if mapping_config:
-        raise ValueError("trtllm_nvfp4_trtllm_gen_moe_fused does not support mapping_config yet.")
 
     x_shape = x.shape
     x2d = x.view(-1, x_shape[-1])

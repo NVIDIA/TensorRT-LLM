@@ -1580,13 +1580,6 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(hidden_size, intermedia
     with torch.inference_mode():
         output_baseline = gm(x)
 
-    def _first_30_str(tensor, name):
-        flat = tensor.detach().float().flatten()
-        vals = flat[:30].tolist()
-        return f"{name}: [" + ", ".join(f"{v:.3g}" for v in vals) + "]"
-
-    print(_first_30_str(output_baseline, "output_baseline"))
-
     # Cutlass path: fuse_nvfp4_moe -> trtllm_quant_nvfp4_moe_fused
     gm_cutlass = torch_export_to_gm(model, args=(x,), clone=True)
     gm_cutlass = InferenceOptimizer(
@@ -1595,8 +1588,6 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(hidden_size, intermedia
     )(None, gm_cutlass)
     with torch.inference_mode():
         output_cutlass = gm_cutlass(x)
-
-    print(_first_30_str(output_cutlass, "output_cutlass"))
 
     # AD TRTLLM-Gen path: fuse_nvfp4_moe(backend="trtllm_gen")
     # -> trtllm_nvfp4_trtllm_gen_moe_fused (SM100+)
@@ -1615,7 +1606,6 @@ def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(hidden_size, intermedia
     if has_trtllm_gen:
         with torch.inference_mode():
             output_trtllm_gen = gm_trtllm_gen(x)
-        print(_first_30_str(output_trtllm_gen, "output_trtllm_gen"))
 
     # All paths should match baseline within NVFP4 tolerance (same weights, same math).
     # Use scale-dependent atol so the test is meaningful when outputs are small.

@@ -2325,6 +2325,8 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     def _round_up(x, alignment):
         return (x + alignment - 1) // alignment * alignment
 
+    EPILOGUE_TILE_M = 128
+
     def _reverse_interleave_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
         if scale_3d_u8.numel() == 0 or scale_3d_u8.shape[0] == 0:
             return scale_3d_u8
@@ -2334,7 +2336,6 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     def _shuffle_weight_stack(weight_3d: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if weight_3d.numel() == 0:
             return weight_3d
-        epilogue_tile_m = 128
         single_expert_weight = weight_3d[0]
         if is_gated:
             perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_weight).to(
@@ -2345,7 +2346,7 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 single_expert_weight.shape[0], dtype=torch.long, device=single_expert_weight.device
             )
         perm1 = get_shuffle_matrix_a_row_indices(
-            single_expert_weight, epilogue_tile_m=epilogue_tile_m
+            single_expert_weight, epilogue_tile_m=EPILOGUE_TILE_M
         )
         if perm1.device != single_expert_weight.device:
             perm1 = perm1.to(single_expert_weight.device)
@@ -2356,11 +2357,15 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
     def _shuffle_scale_stack(scale_3d_u8: torch.Tensor, is_gated: bool) -> torch.Tensor:
         if scale_3d_u8.numel() == 0:
             return scale_3d_u8.view(torch.float8_e4m3fn)
-        epilogue_tile_m = 128
         num_elts_per_sf = 16
+        scale_k_alignment = 4
         e_count, m_dim, k_dim = scale_3d_u8.shape
-        if m_dim % 128 != 0 or k_dim % 4 != 0:
-            return scale_3d_u8.view(torch.float8_e4m3fn)
+        if m_dim % EPILOGUE_TILE_M != 0 or k_dim % scale_k_alignment != 0:
+            raise ValueError(
+                "TRTLLM-Gen NVFP4 scale shuffle requires the scale stack shape "
+                f"[E, M, K] to satisfy M % {EPILOGUE_TILE_M} == 0 and "
+                f"K % {scale_k_alignment} == 0, but got {tuple(scale_3d_u8.shape)}."
+            )
 
         single_expert_scale = scale_3d_u8[0]
         if is_gated:
@@ -2372,7 +2377,7 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 single_expert_scale.shape[0], dtype=torch.long, device=single_expert_scale.device
             )
         perm1 = get_shuffle_matrix_sf_a_row_indices(
-            single_expert_scale, epilogue_tile_m=epilogue_tile_m, num_elts_per_sf=num_elts_per_sf
+            single_expert_scale, epilogue_tile_m=EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf
         )
         if perm1.device != single_expert_scale.device:
             perm1 = perm1.to(single_expert_scale.device)
@@ -2388,6 +2393,14 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
 
     matched_nodes = [node for node in graph.nodes if is_op(node, replaced_op)]
     for node in matched_nodes:
+        mapping_config = node.kwargs.get("mapping_config", "") if node.kwargs else ""
+        if mapping_config:
+            ad_logger.debug_once(
+                "Skip TRTLLM-Gen NVFP4 fusion: mapping_config is not supported.",
+                key="trtllm_gen_nvfp4_skip_mapping_config",
+            )
+            continue
+
         (
             hidden_states,
             selected_experts,
@@ -2506,8 +2519,15 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
                 fc2_bs_u8, (0, 0, 0, fc1_w_k_padded - fc2_bs_u8.shape[1]), value=0
             )
 
-        fc1_weight_blockscale = _shuffle_scale_stack(fc1_bs_u8, is_gated=is_gated_mlp)
-        fc2_weight_blockscale = _shuffle_scale_stack(fc2_bs_u8, is_gated=False)
+        try:
+            fc1_weight_blockscale = _shuffle_scale_stack(fc1_bs_u8, is_gated=is_gated_mlp)
+            fc2_weight_blockscale = _shuffle_scale_stack(fc2_bs_u8, is_gated=False)
+        except ValueError as exc:
+            ad_logger.debug_once(
+                f"Skip TRTLLM-Gen NVFP4 fusion: {exc}",
+                key="trtllm_gen_nvfp4_skip_unshuffleable_scale_layout",
+            )
+            continue
 
         w1_input_scale_stacked = _stack(w1_input_scale, dim=0).reshape(-1).to(torch.float32)
         w2_input_scale_stacked = _stack(w2_input_scale, dim=0).reshape(-1).to(torch.float32)
