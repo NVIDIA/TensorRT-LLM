@@ -203,6 +203,9 @@ class PipelineLoader:
         # =====================================================================
         pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
 
+        if config.parallel.enable_parallel_vae:
+            pipeline.setup_parallel_vae()
+
         # =====================================================================
         # STEP 5: Post-load Hooks (TeaCache setup, etc.)
         # =====================================================================
@@ -217,7 +220,10 @@ class PipelineLoader:
 
         if not skip_warmup:
             if config.torch_compile.enable_autotune:
-                with autotune(cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH")):
+                with autotune(
+                    cache_path=os.environ.get("TLLM_AUTOTUNER_CACHE_PATH"),
+                    skip_dynamic_tuning_buckets=True,
+                ):
                     pipeline.warmup()
             else:
                 pipeline.warmup()

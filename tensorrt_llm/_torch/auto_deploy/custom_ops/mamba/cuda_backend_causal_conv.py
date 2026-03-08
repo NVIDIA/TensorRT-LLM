@@ -77,6 +77,10 @@ def _cuda_cached_causal_conv1d(
     bs = b * s
     inp_flat = input.reshape(bs, *input.shape[2:])  # [total_s, C_in]
 
+    # Zero padding positions beyond valid tokens upfront
+    if num_total_tokens < bs:
+        inp_flat[num_total_tokens:].zero_()
+
     # Prepare weight as [dim, width] (depthwise)
     if weight.ndim == 3:
         assert weight.shape[-2] == 1

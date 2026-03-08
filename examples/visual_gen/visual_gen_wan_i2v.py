@@ -90,6 +90,12 @@ def parse_args():
         default=0.2,
         help="TeaCache similarity threshold (rel_l1_thresh)",
     )
+    parser.add_argument(
+        "--use_ret_steps",
+        action="store_true",
+        help="Use ret_steps mode for TeaCache. "
+        "Using Retention Steps will result in faster generation speed and better generation quality.",
+    )
 
     # Quantization
     parser.add_argument(
@@ -127,6 +133,7 @@ def parse_args():
         default=1,
         help="Ulysses (sequence) parallel size within each CFG group.",
     )
+    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
     # CUDA graph
     parser.add_argument(
@@ -136,13 +143,6 @@ def parse_args():
     # torch.compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
-    )
-    parser.add_argument(
-        "--torch_compile_models",
-        type=str,
-        nargs="+",
-        default=[],
-        help="Components to torch.compile (empty = auto detect transformer components)",
     )
     parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
@@ -183,14 +183,15 @@ def main():
         "teacache": {
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,
+            "use_ret_steps": args.use_ret_steps,
         },
         "parallel": {
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "enable_parallel_vae": not args.disable_parallel_vae,
         },
         "torch_compile": {
             "enable_torch_compile": not args.disable_torch_compile,
-            "torch_compile_models": args.torch_compile_models,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },

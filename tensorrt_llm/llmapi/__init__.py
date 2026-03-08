@@ -15,9 +15,10 @@ from .llm_args import (AttentionDpConfig, AutoDecodingConfig, BatchingType,
                        LookaheadDecodingConfig, MedusaDecodingConfig, MoeConfig,
                        MTPDecodingConfig, NGramDecodingConfig,
                        PARDDecodingConfig, RocketSparseAttentionConfig,
-                       SaveHiddenStatesDecodingConfig, SchedulerConfig,
-                       SkipSoftmaxAttentionConfig, TorchCompileConfig,
-                       TorchLlmArgs, TrtLlmArgs, UserProvidedDecodingConfig)
+                       SADecodingConfig, SaveHiddenStatesDecodingConfig,
+                       SchedulerConfig, SkipSoftmaxAttentionConfig,
+                       TorchCompileConfig, TorchLlmArgs, TrtLlmArgs,
+                       UserProvidedDecodingConfig)
 from .llm_utils import (BuildConfig, KvCacheRetentionConfig, QuantAlgo,
                         QuantConfig)
 from .mm_encoder import MultimodalEncoder
@@ -61,6 +62,7 @@ __all__ = [
     'CacheTransceiverConfig',
     'NGramDecodingConfig',
     'PARDDecodingConfig',
+    'SADecodingConfig',
     'UserProvidedDecodingConfig',
     'TorchCompileConfig',
     'DraftTargetDecodingConfig',

@@ -72,14 +72,20 @@ def test_engine(engine_cls: Type[ADEngine], tokens_per_block: int):
     # Test basic token generation
     with torch.inference_mode():
         # Test logits
-        input_ids = [torch.tensor([0, 1, 2], device=device)]
+        input_ids_list = [0, 1, 2]
         cache_seq_interface.info.reset()
-        cache_seq_interface.info.nest_sequences(input_ids)
+        cache_seq_interface.info.nest_sequences(
+            input_ids=input_ids_list,
+            cu_seqlen=[0, len(input_ids_list)],
+            input_pos=[0],
+        )
         logits = engine._compute_logits()
         assert logits is not None, "Logits are None"
 
         mock_input = None
-        original_logits = get_inference_model(mock_input)(input_ids[0].unsqueeze(0))[0]
+        original_logits = get_inference_model(mock_input)(
+            torch.tensor(input_ids_list, device=device).unsqueeze(0)
+        )[0]
         assert torch.allclose(logits, original_logits, atol=1e-5), "Generated Token ID mismatch"
 
     cache_seq_interface.shutdown()
@@ -110,9 +116,13 @@ def test_demo_engine_sampling(tokens_per_block: int):
     engine = DemoEngine(get_inference_model, cache_seq_interface)
 
     with torch.inference_mode():
-        input_ids = [torch.tensor([1, 2, 3, 4], device=device)]
+        input_ids_list = [1, 2, 3, 4]
         cache_seq_interface.info.reset()
-        cache_seq_interface.info.nest_sequences(input_ids)
+        cache_seq_interface.info.nest_sequences(
+            input_ids=input_ids_list,
+            cu_seqlen=[0, len(input_ids_list)],
+            input_pos=[0],
+        )
         logits = engine._compute_logits()
 
         vocab_size = logits.size(-1)
@@ -212,7 +222,7 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     # No-chunk: whole prompt in one request
     req_full = _DummyRequest(tokens=tokens, begin=0, size=len(tokens), seq_slot=0)
     scheduled_requests = ScheduledRequests()
-    scheduled_requests.context_requests.append(req_full)
+    scheduled_requests.context_requests_last_chunk.append(req_full)
     logits_full_last = engine.forward(scheduled_requests, resource_manager)["logits"][-1]
 
     # Chunked: split into two context chunks
@@ -221,9 +231,9 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     req_part2 = _DummyRequest(tokens=tokens, begin=split, size=len(tokens) - split, seq_slot=0)
 
     scheduled_requests_part1 = ScheduledRequests()
-    scheduled_requests_part1.context_requests.append(req_part1)
+    scheduled_requests_part1.context_requests_chunking.append(req_part1)
     scheduled_requests_part2 = ScheduledRequests()
-    scheduled_requests_part2.context_requests.append(req_part2)
+    scheduled_requests_part2.context_requests_last_chunk.append(req_part2)
 
     # Run first chunk (ignored output), then compare second chunk logits to full
     _ = engine.forward(scheduled_requests_part1, resource_manager)
@@ -337,14 +347,14 @@ def test_ad_engine_prepare_inputs_with_hybrid_cache_manager():
     )
 
     scheduled = ScheduledRequests()
-    scheduled.context_requests.append(req)
+    scheduled.context_requests_last_chunk.append(req)
 
     # Call _prepare_inputs
     engine._prepare_inputs(scheduled, resource_manager, new_tokens=None)
 
     # Verify slot_idx was taken from mamba_cache_index, not seq_slot
     expected_slot_idx = hybrid_manager.mamba_cache_index[request_id]
-    actual_slot_idx = cache_seq_interface.info._args_list["slot_idx"][0]
+    actual_slot_idx = cache_seq_interface.info.get_arg("slot_idx_host", truncate=True)[0].item()
     assert actual_slot_idx == expected_slot_idx
 
     cache_seq_interface.shutdown()
@@ -417,7 +427,7 @@ def test_ad_engine_prepare_inputs_generation_with_hybrid_cache():
 
     # Verify slot_idx was taken from mamba_cache_index
     expected_slot_idx = hybrid_manager.mamba_cache_index[request_id]
-    actual_slot_idx = cache_seq_interface.info._args_list["slot_idx"][0]
+    actual_slot_idx = cache_seq_interface.info.get_arg("slot_idx_host", truncate=True)[0].item()
     assert actual_slot_idx == expected_slot_idx
 
     cache_seq_interface.shutdown()
@@ -461,13 +471,13 @@ def test_ad_engine_with_regular_kv_cache_manager():
     )
 
     scheduled = ScheduledRequests()
-    scheduled.context_requests.append(req)
+    scheduled.context_requests_last_chunk.append(req)
 
     # Call _prepare_inputs
     engine._prepare_inputs(scheduled, resource_manager, new_tokens=None)
 
     # Verify slot_idx falls back to seq_slot
-    actual_slot_idx = cache_seq_interface.info._args_list["slot_idx"][0]
+    actual_slot_idx = cache_seq_interface.info.get_arg("slot_idx_host", truncate=True)[0].item()
     assert actual_slot_idx == expected_seq_slot
 
     cache_seq_interface.shutdown()

@@ -72,6 +72,10 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_linear_from_config:
     stage: pattern_matcher
+  quantize_finegrained_fp8_linear_from_config:
+    stage: pattern_matcher
+  quantize_finegrained_fp8_moe:
+    stage: pattern_matcher
   quantize_fp8_bmm_from_config:
     stage: pattern_matcher
   quantize_fp8_from_graph:
@@ -127,6 +131,9 @@ transforms:
   ############################################################################################
   # RUN POST-LOAD FUSION AND OPTIMIZATIONS
   ############################################################################################
+  fuse_gemms_mixed_children:
+    stage: post_load_fusion
+    enabled: false
   fuse_gemms:
     stage: post_load_fusion
     enabled: false # TODO: https://github.com/NVIDIA/TensorRT-LLM/issues/4674 this is causing OOMs
@@ -144,6 +151,9 @@ transforms:
     backend: trtllm
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
+  fuse_finegrained_fp8_linear:
+    stage: post_load_fusion
+    backend: trtllm
   fuse_moe:
     stage: post_load_fusion
     expect_mem_change: true
@@ -152,6 +162,10 @@ transforms:
     stage: post_load_fusion
     expect_mem_change: true
     backend: trtllm
+    allow_different_input_scales: false
+  fuse_finegrained_fp8_moe:
+    stage: post_load_fusion
+    expect_mem_change: true
     allow_different_input_scales: false
   fuse_nvfp4_moe:
     stage: post_load_fusion
@@ -235,3 +249,5 @@ transforms:
     run_per_gm: false
     cuda_graph_batch_sizes: null
     backend: torch-compile
+    piecewise_enabled: false
+    piecewise_num_tokens: null

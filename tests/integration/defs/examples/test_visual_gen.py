@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,8 @@ import os
 
 import pytest
 import torch
+from defs import conftest
 from defs.common import venv_check_call
-from defs.conftest import llm_models_root
 from defs.trt_test_alternative import check_call
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
@@ -163,7 +163,7 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     is not found under LLM_MODELS_ROOT.
     """
-    scratch_space = llm_models_root()
+    scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, model_subpath)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -372,4 +372,20 @@ def test_vbench_dimension_score_wan22_a14b_nvfp4(
         title="WAN 2.2 A14B NVFP4",
         golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
         max_score_diff=0.05,
+    )
+
+
+def test_visual_gen_benchmark_serving(llm_venv):
+    """Run benchmark_visual_gen.py against a live trtllm-serve visual-gen server."""
+    test_root = conftest.unittest_path() / "_torch" / "visual_gen"
+    llm_venv.run_cmd(
+        [
+            "-m",
+            "pytest",
+            "-v",
+            str(
+                test_root / "_test_trtllm_serve_visual_gen_benchmark.py"
+                "::test_visual_gen_benchmark_video[openai-videos]"
+            ),
+        ]
     )

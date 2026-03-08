@@ -299,6 +299,12 @@ class Decoder:
                 return True
         return False
 
+    def _is_exclude_input_in_output(self, request: Request,
+                                    excluded_from_output: bool) -> bool:
+        if request.exclude_input_in_output is not None:
+            return request.exclude_input_in_output[0][0]
+        return excluded_from_output
+
     def _spec_generate(
             self, preproc: PreprocResponse,
             request: Request) -> Generator[GenerationResponse, None, None]:
@@ -316,14 +322,31 @@ class Decoder:
 
         target_response: GenerationResponse = None
 
+        is_input_excluded_from_output_for_draft: bool = self._is_exclude_input_in_output(
+            request,
+            self.is_input_excluded_from_output_for_draft(assume_loaded=True))
+        is_input_excluded_from_output_for_target: bool = self._is_exclude_input_in_output(
+            request,
+            self.is_input_excluded_from_output_for_target(assume_loaded=True))
+
+        output_len_limit: int = 0
+        if is_input_excluded_from_output_for_target:
+            # When `exclude_input_in_output` for target or
+            # entire request is True, output should be managed
+            # only by given max length.
+            output_len_limit = output_len
+        else:
+            # Otherwise, output should be managed by
+            # the length of input prompt and given max length.
+            output_len_limit = len(prompt_input_ids) + output_len
+
         cur_preproc = preproc
 
         counter = 0
         while True:
             counter += 1
-            num_draft_tokens = min(
-                request.num_draft_tokens[0][0],
-                len(prompt_input_ids) + output_len - len(input_ids) - 1)
+            num_draft_tokens = min(request.num_draft_tokens[0][0],
+                                   output_len_limit - len(input_ids) - 1)
 
             draft_request = None
             if num_draft_tokens > 0:
@@ -340,7 +363,13 @@ class Decoder:
                     if draft_response.generation_logits is not None:
                         draft_logits = draft_response.generation_logits[0][0]
 
-                input_draft_tokens = draft_output_ids[len(input_ids):seq_len]
+                draft_output_id_head_index = len(input_ids)
+                if is_input_excluded_from_output_for_draft:
+                    # Input is excluded from draft output
+                    # when `exclude_input_in_output` is specified.
+                    draft_output_id_head_index = 0
+                input_draft_tokens = draft_output_ids[
+                    draft_output_id_head_index:seq_len]
                 if len(input_draft_tokens) > 0:
                     draft_request = DraftRequest(
                         draft_input_ids=np.expand_dims(input_draft_tokens, 0))
@@ -355,15 +384,34 @@ class Decoder:
                 draft_request = DraftRequest()
             target_response = self._generate_non_streaming(
                 cur_preproc, request, draft_request)
-            last_input_ids = input_ids
-            input_ids = target_response.output_ids[0][0]
+            if is_input_excluded_from_output_for_target:
+
+                if last_input_ids is None:
+                    last_input_ids = input_ids
+                    input_ids = target_response.output_ids[0][0]
+                else:
+                    last_input_ids = input_ids
+                    # Input is excluded from target output
+                    # when `exclude_input_in_output` is specified.
+                    input_ids = np.concatenate(
+                        (last_input_ids, target_response.output_ids[0][0]))
+
+                # Replace values with merged information.
+                # This is required for the output of this function.
+                target_response.output_ids = np.expand_dims(input_ids,
+                                                            axis=(0, 1))
+                target_response.sequence_length[0][0] = len(
+                    target_response.output_ids[0][0])
+            else:
+                last_input_ids = input_ids
+                input_ids = target_response.output_ids[0][0]
             cur_preproc = PreprocResponse.with_new_inputs(
                 cur_preproc, np.expand_dims(input_ids, 0),
                 np.array([[len(input_ids)]], dtype=np.int32))
 
             # Evaluate criteria to stop generation loop.
             # If we've hit or exceeded the max output length, should stop
-            length_stop = (len(input_ids) >= len(prompt_input_ids) + output_len)
+            length_stop = (len(input_ids) >= output_len_limit)
             if length_stop:
                 break
             # If draft and target have same outputs, should stop. Normally target should return 1 more token.
@@ -464,3 +512,21 @@ class Decoder:
 
     def reset_decoder(self):
         self._accumulated_tokens = []
+
+    def load_model_configs_for_spec_decoding(
+            self,
+            target_model_config_api_url: Optional[str] = None,
+            draft_model_config_api_url: Optional[str] = None,
+            n_retries: Optional[int] = 5,
+            retry_interval_sec: Optional[int] = 3):
+        raise NotImplementedError()
+
+    def is_input_excluded_from_output_for_target(self,
+                                                 assume_loaded: bool = False
+                                                 ) -> bool:
+        raise NotImplementedError()
+
+    def is_input_excluded_from_output_for_draft(self,
+                                                assume_loaded: bool = False
+                                                ) -> bool:
+        raise NotImplementedError()
