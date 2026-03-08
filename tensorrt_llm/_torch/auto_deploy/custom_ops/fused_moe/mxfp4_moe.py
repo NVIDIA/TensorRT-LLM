@@ -39,7 +39,6 @@ def _swizzle_mxfp4(w, w_scale):
     return w, w_scale
 
 
-from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
 RouteFn = Callable[[torch.Tensor], Tuple[RoutingData, GatherIndx, ScatterIndx]]
 
 
