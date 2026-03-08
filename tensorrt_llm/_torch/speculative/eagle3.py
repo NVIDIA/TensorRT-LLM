@@ -296,7 +296,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     # The dtype of the hidden states
     dtype: torch.dtype = torch.bfloat16
-    # The index of the batche inputs
+    # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
 
     def __post_init__(self):
@@ -335,7 +335,7 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
-        # update batch indeices
+        # update batch indices
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
@@ -505,7 +505,7 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                     attn_metadata._seq_lens[:batch_size].fill_(1)
                     attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
                     attn_metadata.on_update()
-                    # cannot run generation if their is no kv cache
+                    # cannot run generation if there is no kv cache
                     if inputs["attn_metadata"].kv_cache_manager is not None:
                         attn_metadata.host_request_types[:attn_metadata.
                                                          num_contexts].fill_(1)

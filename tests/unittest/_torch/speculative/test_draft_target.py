@@ -30,7 +30,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
     max_draft_len = 4
     kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
     cuda_graph_config = CudaGraphConfig(
-        batch_sizes=[1]) if use_cuda_graph else None
+        batch_sizes=[1, max_batch_size]) if use_cuda_graph else None
 
     llm_common_config = dict(
         model=target_model_dir,
@@ -52,7 +52,7 @@ def test_llama_draft_target(use_cuda_graph: bool, attn_backend: str):
         "The capital of France is",
         "The president of the United States is",
     ]
-    sampling_params = SamplingParams(max_tokens=32)
+    sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
 
     llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
     results_spec = llm_spec.generate(prompts, sampling_params)

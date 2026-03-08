@@ -181,7 +181,7 @@ def generate_rst(yaml_path, output_file=None):
         lines.append(".. list-table::")
         lines.append("   :width: 100%")
         lines.append("   :header-rows: 1")
-        lines.append("   :widths: 12 15 15 13 20 25")
+        lines.append("   :widths: 10 15 15 13 18 29")
         lines.append("")
         lines.append("   * - GPU")
         lines.append("     - Performance Profile")

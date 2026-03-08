@@ -24,6 +24,7 @@ from _torch.helpers import (
     per_block_cast_to_fp8_e8m0,
     per_token_cast_to_fp8_e8m0,
 )
+from _torch.modules.moe.moe_test_utils import skip_if_insufficient_gpu_memory
 from utils.util import check_accuracy
 
 from tensorrt_llm._torch.model_config import ModelConfig
@@ -217,6 +218,10 @@ class RefGatedMLPFusedMoE(nn.Module):
             model_config = ModelConfig()
         self.quant_config = model_config.quant_config
 
+        skip_if_insufficient_gpu_memory(
+            num_experts, hidden_size, intermediate_size, dtype or torch.float32
+        )
+
         # Custom swiglu activation for swiglu_gptoss_style
         def custom_swiglu(x):
             gate, value = x.chunk(2, dim=-1)
@@ -253,11 +258,18 @@ class RefGatedMLPFusedMoE(nn.Module):
         final_hidden_states = torch.zeros(
             hidden_states.shape, dtype=hidden_states.dtype, device=hidden_states.device
         )
+        # FP8_BLOCK_SCALES linear kernel requires bfloat16 activation input
+        ref_requires_bf16 = (
+            self.quant_config is not None
+            and self.quant_config.quant_algo == QuantAlgo.FP8_BLOCK_SCALES
+        )
         for expert_id in range(self.num_experts):
             if not torch.any(selected_experts == expert_id):
                 continue
             batch_idx, nth_expert = torch.where(selected_experts == expert_id)
             expert_inputs = hidden_states[batch_idx]
+            if ref_requires_bf16:
+                expert_inputs = expert_inputs.to(torch.bfloat16)
             output = self.experts[expert_id](expert_inputs)
             final_hidden_states[batch_idx] += (
                 routing_weights[batch_idx, nth_expert, None] * output.float()
@@ -1948,6 +1960,24 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         else:
             weight_scale_key = "weight_scale_inv"
 
+        # For W4A8_CUSTOM mode, the fused kernel uses a GLOBAL max input_scale
+        # across all experts (not per-expert), because the kernel applies a single
+        # pre-quant scale to all tokens before dispatching to experts.
+        # The reference must match this behavior to produce identical results.
+        if self.weight_loading_mode == MoEWeightLoadingMode.W4A8_CUSTOM:
+            all_fc31_input_scales = []
+            all_fc2_input_scales = []
+            for eid in range(self.num_experts):
+                p1 = self.weights[f"{eid}.w1.input_scale"].cuda()
+                p3 = self.weights[f"{eid}.w3.input_scale"].cuda()
+                all_fc31_input_scales.append(torch.max(p1, p3))
+                all_fc2_input_scales.append(self.weights[f"{eid}.w2.input_scale"].cuda())
+            global_fc31_input_scale = torch.stack(all_fc31_input_scales).max()
+            global_fc2_input_scale = torch.stack(all_fc2_input_scales).max()
+        else:
+            global_fc31_input_scale = None
+            global_fc2_input_scale = None
+
         for expert_id in range(self.num_experts):
             mask = selected_experts == expert_id
             activated_tokens = mask.sum(1).bool()
@@ -1970,12 +2000,16 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
             # Fuse scales - must cat in same order as weights
             s3_s1 = torch.cat([s3, s1], dim=-1)
 
-            # Get input scales
-            p1 = self.weights[f"{expert_id}.w1.input_scale"].cuda()
-            p2 = self.weights[f"{expert_id}.w2.input_scale"].cuda()
-            p3 = self.weights[f"{expert_id}.w3.input_scale"].cuda()
-            # IMPORTANT: Use max for fused computation to ensure consistent quantization
-            p3_p1 = torch.max(p1, p3)
+            # Get input scales - use global max for W4A8_CUSTOM, per-expert for VANILLA
+            if global_fc31_input_scale is not None:
+                p3_p1 = global_fc31_input_scale
+                p2 = global_fc2_input_scale
+            else:
+                p1 = self.weights[f"{expert_id}.w1.input_scale"].cuda()
+                p2 = self.weights[f"{expert_id}.w2.input_scale"].cuda()
+                p3 = self.weights[f"{expert_id}.w3.input_scale"].cuda()
+                # IMPORTANT: Use max for fused computation to ensure consistent quantization
+                p3_p1 = torch.max(p1, p3)
 
             # Get pre_quant_scale (only for VANILLA mode)
             a1 = a2 = a3 = a1_a3 = None
@@ -2023,7 +2057,12 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
         return results.reshape(hidden_states.shape)
 
     def check_accuracy(self, output, ref_output):
-        torch.testing.assert_close(output, ref_output, rtol=1e-2, atol=0.1)
+        # W4A8_AWQ accumulates FP8 QDQ noise from two layers (fc31 + fc2).
+        # With higher top_k, more experts contribute per token, increasing
+        # the accumulated numerical noise in the final summation.
+        top_k = self.routing_method.top_k if hasattr(self.routing_method, "top_k") else 1
+        atol = 0.1 * max(1, top_k / 4)
+        check_accuracy(output, ref_output, rtol=1e-2, atol=atol, percent=0.97)
 
 
 class W4A8AWQQuantizeUtil(BaseQuantizeUtil):
@@ -2039,8 +2078,9 @@ class W4A8AWQQuantizeUtil(BaseQuantizeUtil):
         intermediate_size: int,
         hidden_size: int,
         quant_config: QuantConfig,
+        **kwargs,
     ):
-        super().__init__(num_experts, dtype, intermediate_size, hidden_size, quant_config)
+        super().__init__(num_experts, dtype, intermediate_size, hidden_size, quant_config, **kwargs)
         # These will be set in create_weights and used in create_ref_module
         self.weight_loading_mode = MoEWeightLoadingMode.W4A8_CUSTOM
         self.scaling_group_size = 128

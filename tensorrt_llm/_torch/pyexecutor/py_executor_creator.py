@@ -322,12 +322,20 @@ def create_py_executor(
             )
             llm_args.disable_overlap_scheduler = True
 
-    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine(
-    ) and not spec_config.allow_advanced_sampling:
-        logger.warning(
-            f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
-            "want to use non-greedy sampling, please set allow_advanced_sampling=True."
-        )
+    if spec_config is not None and spec_config.spec_dec_mode.use_one_engine():
+        if not spec_config.allow_advanced_sampling:
+            logger.warning(
+                f"Falling back to greedy decoding for {spec_config.decoding_type}. If you "
+                "want to use non-greedy sampling, please set allow_advanced_sampling=True."
+            )
+        # Check FLASHINFER compatibility with one-engine speculative decoding
+        if llm_args.attn_backend == "FLASHINFER":
+            raise ValueError(
+                f"FLASHINFER attention backend is not supported with one-engine speculative "
+                f"decoding mode '{spec_config.spec_dec_mode.name}'. The FLASHINFER backend's "
+                f"decode path expects exactly 1 token per sequence, but one-engine speculative "
+                f"decoding requires multiple tokens per sequence. Please use 'TRTLLM' attention "
+                f"backend instead by setting attn_backend='TRTLLM'.")
 
     if mm_encoder_only:
         llm_args.mm_encoder_only = True

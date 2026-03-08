@@ -341,8 +341,8 @@ def torch_backend_mha_with_cache(
 
     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
 
-    # Create output tensor
-    y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
+    # Preallocate output tensor (zeros so padding positions are clean)
+    y = q.new_zeros(*bs_view, num_heads, v_head_dim).contiguous()
 
     # Compute attention
     if s == 1:
