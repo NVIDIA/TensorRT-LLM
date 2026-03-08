@@ -524,7 +524,7 @@ class DiffusionModelConfig(BaseModel):
 
     @classmethod
     def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
-        """Try to read embedded config from a single-safetensors checkpoint (LTX-2 specific).
+        """Try to read embedded config from a single-safetensors checkpoint.
 
         Accepts either a directory (globs for ``*.safetensors``) or a direct
         path to a ``.safetensors`` file.
@@ -576,12 +576,11 @@ class DiffusionModelConfig(BaseModel):
         Supports two checkpoint formats:
         * **Diffusers directory layout** -- ``model_index.json`` with
           component sub-directories each containing ``config.json``.
-        * **LTX-2 specific single-safetensors** -- no ``model_index.json``;
-          config embedded in the safetensors metadata header under a
-          ``"config"`` key.  The transformer section is extracted as
-          ``pretrained_config`` and the full dict is stored in
-          ``extra_attrs["ltx2_native_config"]`` for use by component
-          configurators.
+        * **Single-safetensors** -- no ``model_index.json``; config embedded
+          in the safetensors metadata header under a ``"config"`` key.  The
+          transformer section is extracted as ``pretrained_config`` and the
+          full dict is stored in ``extra_attrs["monolithic_safetensors_config"]``
+          for use by component configurators.
 
         Args:
             checkpoint_dir: Path to checkpoint
@@ -633,13 +632,13 @@ class DiffusionModelConfig(BaseModel):
                     if transformer_2_spec and transformer_2_spec[0] is not None:
                         pretrained_config.boundary_ratio = model_index["boundary_ratio"]
         else:
-            # ---------- Single safetensors (LTX-2 specific) ----------
+            # ---------- Single safetensors ----------
             native_config = cls._try_load_safetensors_config(checkpoint_path)
 
             if native_config is not None:
                 transformer_dict = native_config.get("transformer", {})
                 pretrained_config = SimpleNamespace(**transformer_dict)
-                extra_attrs["ltx2_native_config"] = native_config
+                extra_attrs["monolithic_safetensors_config"] = native_config
 
                 # quantization_config lives as a separate safetensors metadata
                 # key, not inside the transformer section. Propagate it so

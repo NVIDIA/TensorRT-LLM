@@ -5,13 +5,15 @@
 # Architecture ported from LTX-2,
 # with compute-heavy components replaced by TRT-LLM optimized modules:
 #   - Linear projections  → tensorrt_llm._torch.modules.linear.Linear
-#   - (TODO) RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
+#   - RMSNorm (QK norm)   → tensorrt_llm._torch.modules.rms_norm.RMSNorm
 #   - FeedForward (MLP)    → tensorrt_llm._torch.modules.mlp.MLP
 #   - Attention backend    → tensorrt_llm._torch.visual_gen.attention_backend
 #
 # Architecture-specific components (RoPE, AdaLN, timestep/text embeddings,
 # modality dataclass, transformer args) are ported from LTX-2 and live
 # in the ltx2_core/ subpackage.
+
+# TODO: replace torch rms_norm with TRT-LLM RMSNorm (no weights)
 
 from __future__ import annotations
 
@@ -36,6 +38,7 @@ from tensorrt_llm.logger import logger
 
 from .ltx2_core.adaln import AdaLayerNormSingle
 from .ltx2_core.modality import Modality
+from .ltx2_core.perturbations import BatchedPerturbationConfig, PerturbationType
 from .ltx2_core.rope import LTXRopeType, apply_rotary_emb
 from .ltx2_core.text_projection import PixArtAlphaTextProjection
 from .ltx2_core.transformer_args import (
@@ -445,8 +448,6 @@ class BasicAVTransformerBlock(nn.Module):
             perturbations: Optional ``BatchedPerturbationConfig`` that masks
                 attention outputs for selected blocks/modalities.
         """
-        from .ltx2_core.perturbations import BatchedPerturbationConfig, PerturbationType
-
         if video is None and audio is None:
             raise ValueError("At least one of video or audio must be provided")
 

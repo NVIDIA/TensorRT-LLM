@@ -53,9 +53,9 @@ class WeightLoader(BaseWeightLoader):
 
         * **Pipeline (diffusers)** -- ``model_index.json`` with component
           sub-directories, each containing weight files.
-        * **Single safetensors (specific to LTX-2 models)** -- no ``model_index.json``;
-          weight files sit in the root directory with prefixed keys
-          (e.g. ``transformer.``, ``video_vae.``).  Only keys matching the
+        * **Monolithic safetensors** -- no ``model_index.json``; weight files
+          sit in the root directory with prefixed keys (e.g.
+          ``transformer.``, ``video_vae.``).  Only keys matching the
           requested component prefix are returned (prefix stripped).
 
         Args:

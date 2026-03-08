@@ -299,17 +299,16 @@ class LTX2Pipeline(BasePipeline):
             logger.info(
                 f"Warmup: LTX2 {height}x{width}, {num_frames} frames, {warmup_steps} steps"
             )
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    negative_prompt="",
-                    height=height,
-                    width=width,
-                    num_frames=num_frames,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=4.0,
-                    seed=0,
-                )
+            self.forward(
+                prompt="warmup",
+                negative_prompt="",
+                height=height,
+                width=width,
+                num_frames=num_frames,
+                num_inference_steps=warmup_steps,
+                guidance_scale=4.0,
+                seed=0,
+            )
 
     # ------------------------------------------------------------------
     # Transformer weight loading
@@ -471,7 +470,7 @@ class LTX2Pipeline(BasePipeline):
             ).to(device)
 
         # --- Resolve native config ----------------------------------------
-        native_config = self.model_config.extra_attrs.get("ltx2_native_config")
+        native_config = self.model_config.extra_attrs.get("monolithic_safetensors_config")
         sft_paths = _find_safetensors_files(checkpoint_dir)
 
         if native_config is None and sft_paths:
@@ -950,6 +949,10 @@ class LTX2Pipeline(BasePipeline):
             modality_scale=modality_scale,
             skip_step=guidance_skip_step,
         )
+        # Audio CFG scale is floored at 7.0 when classifier-free guidance is
+        # active (guidance_scale > 1).  This matches the reference LTX-2
+        # implementation where the audio stream requires a stronger guidance
+        # signal than video to maintain audio-visual coherence.
         audio_guider_params = MultiModalGuiderParams(
             cfg_scale=max(guidance_scale, 7.0) if guidance_scale > 1.0 else 1.0,
             stg_scale=stg_scale,
