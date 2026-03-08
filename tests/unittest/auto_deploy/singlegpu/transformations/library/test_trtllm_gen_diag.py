@@ -22,9 +22,10 @@ def _run_three_paths(model, x, label):
         out_cut = gm_c(x)
 
     gm_t = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_t = InferenceOptimizer(None, {"fuse_nvfp4_trtllm_gen_moe": {"stage": "post_load_fusion"}})(
-        None, gm_t
-    )
+    gm_t = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm_t)
     with torch.inference_mode():
         out_trt = gm_t(x)
 
@@ -347,9 +348,10 @@ def test_direct_kernel_call():
 
     # Also run through AD custom op for comparison
     gm_t = torch_export_to_gm(model, args=(x,), clone=True)
-    gm_t = InferenceOptimizer(None, {"fuse_nvfp4_trtllm_gen_moe": {"stage": "post_load_fusion"}})(
-        None, gm_t
-    )
+    gm_t = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm_t)
     with torch.inference_mode():
         out_ad = gm_t(x)
 
@@ -399,9 +401,10 @@ def test_verify_actual_ad_tensors():
 
     # Fuse with TRTLLM-Gen
     gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm = InferenceOptimizer(None, {"fuse_nvfp4_trtllm_gen_moe": {"stage": "post_load_fusion"}})(
-        None, gm
-    )
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm)
 
     # Extract actual tensors from graph
     actual_tensors = {}
@@ -542,9 +545,10 @@ def test_trtllm_gen_determinism():
     x = torch.randn(2, 256, device=device, dtype=dtype) * 0.1
 
     gm = torch_export_to_gm(model, args=(x,), clone=True)
-    gm = InferenceOptimizer(None, {"fuse_nvfp4_trtllm_gen_moe": {"stage": "post_load_fusion"}})(
-        None, gm
-    )
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm)
     with torch.inference_mode():
         out1 = gm(x)
         out2 = gm(x)
