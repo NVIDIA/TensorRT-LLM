@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,6 +20,7 @@
 #include "tensorrt_llm/batch_manager/common.h"
 #include "tensorrt_llm/batch_manager/evictionPolicy.h"
 #include "tensorrt_llm/batch_manager/kvCacheTransferManager.h"
+#include "tensorrt_llm/batch_manager/radixBlockTree.h"
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
@@ -94,7 +95,10 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mMemoryPoolBlockIndex{blockIdx}
     , mRefCount(0)
     , mSchedulingRefCount(0)
-    , mPrevBlock(nullptr)
+    , mLookupNode{nullptr}
+    , mWindowSize{std::numeric_limits<int>::max()}
+    // sentinel: unattached; valid sizes are >= 1 or kRecurrentStates (-1)
+    , mIsPlaceholder{false}
     , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
     , mPriority{executor::KvCacheRetentionConfig::kDefaultRetentionPriority}
@@ -102,6 +106,22 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mExpirationTime{std::nullopt}
     , mHash{0}
 {
+}
+
+BlockPtr KVCacheBlock::createPlaceholder(IdType blockId)
+{
+    // Use an out-of-range pool index as sentinel; the mIsPlaceholder flag gates
+    // getCacheBlockIndices to return nil so this index is never submitted to the GPU.
+    // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
+    static constexpr auto kInvalidPoolIndex = std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max();
+    auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{kInvalidPoolIndex});
+    block->mIsPlaceholder = true;
+    return block;
+}
+
+bool KVCacheBlock::isPlaceholder() const
+{
+    return mIsPlaceholder;
 }
 
 void KVCacheBlock::startScheduling()
@@ -116,7 +136,60 @@ KVCacheBlock::IdType KVCacheBlock::getBlockId() const
 
 NextBlockMap KVCacheBlock::getNextBlocks() const
 {
-    return mNextBlocks;
+    if (!mLookupNode)
+    {
+        return {};
+    }
+    NextBlockMap result;
+    for (auto const& [key, block] : mLookupNode->getChildKeyValues(mWindowSize))
+    {
+        result.emplace(key, block);
+    }
+    return result;
+}
+
+void KVCacheBlock::attachToLookupNode(radix_block_tree::LookupNodePtr node, int windowSize)
+{
+    // Detach from any previous node first.
+    if (mLookupNode)
+    {
+        auto const wasCleared = mLookupNode->clearValue(mWindowSize);
+        TLLM_CHECK_WITH_INFO(wasCleared,
+            "attachToLookupNode: block %d expected prior lookup slot to be occupied (clearValue returned false)",
+            static_cast<int>(mBlockId));
+    }
+    // Assign fields AFTER trySetValue so local state is only updated on success.
+    auto const wasInserted = node->trySetValue(windowSize, shared_from_this(), /*overwrite=*/false);
+    TLLM_CHECK_WITH_INFO(wasInserted,
+        "attachToLookupNode: block %d found lookup slot already occupied by another block", static_cast<int>(mBlockId));
+    mLookupNode = std::move(node);
+    mWindowSize = windowSize;
+}
+
+void KVCacheBlock::detachFromLookupNode()
+{
+    if (!mLookupNode)
+    {
+        return;
+    }
+    // clearValue triggers the cascade-prune up through empty ancestor nodes automatically.
+    auto const wasCleared = mLookupNode->clearValue(mWindowSize);
+    TLLM_CHECK_WITH_INFO(wasCleared,
+        "detachFromLookupNode: block %d expected lookup slot to be occupied (clearValue returned false)",
+        static_cast<int>(mBlockId));
+    mLookupNode = nullptr;
+    mWindowSize = std::numeric_limits<int>::max();
+}
+
+void KVCacheBlock::setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize)
+{
+    mLookupNode = rootNode;
+    mWindowSize = windowSize;
+    // Store the root block itself in the root node so that direct children can find it
+    // via getPrevBlock() (root->getParentNode() returns nullptr, so the chain stops here).
+    auto const wasUpdated = rootNode->trySetValue(windowSize, shared_from_this(), /*overwrite=*/true);
+    TLLM_LOG_DEBUG("setAsRoot: block %d wired to root slot for windowSize=%d (wasUpdated=%d)",
+        static_cast<int>(mBlockId), windowSize, static_cast<int>(wasUpdated));
 }
 
 tk::KVCacheIndex::UnderlyingType KVCacheBlock::getMemoryPoolBlockIndex() const
@@ -164,8 +237,11 @@ bool KVCacheBlock::hasRefs() const
 
 bool KVCacheBlock::isShared() const
 {
-    // block is considered shared if ready for reuse
-    return mRefCount > 1 || mPrevBlock != nullptr;
+    // Block is considered shared if it has multiple references or is registered in the
+    // lookup tree (i.e., it is cached for reuse by future requests).
+    // Note: mCachedBlocksRoot also has mLookupNode set (via setAsRoot), but it is never
+    // placed in the eviction queue — enforced by an assertion in LRUEvictionPolicy::releaseBlock.
+    return mRefCount > 1 || mLookupNode != nullptr;
 }
 
 bool KVCacheBlock::hasSchedulingRefs() const
@@ -234,14 +310,25 @@ VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
     return mBlockKey.uniqueTokens;
 }
 
-BlockPtr const& KVCacheBlock::getPrevBlock() const
+BlockPtr KVCacheBlock::getPrevBlock() const
 {
-    return mPrevBlock;
+    if (!mLookupNode)
+    {
+        return nullptr;
+    }
+    auto parentNode = mLookupNode->getParentNode();
+    if (!parentNode)
+    {
+        // This block is the root (no parent node), so it has no parent block.
+        return nullptr;
+    }
+    auto optBlock = parentNode->getValue(mWindowSize);
+    return optBlock.value_or(nullptr);
 }
 
-void KVCacheBlock::setPrevBlock(BlockPtr prevBlock)
+bool KVCacheBlock::isInLookupTree() const
 {
-    mPrevBlock = std::move(prevBlock);
+    return mLookupNode != nullptr;
 }
 
 BlockPtr const& KVCacheBlock::getPrevBlockInSeq() const
@@ -256,95 +343,136 @@ void KVCacheBlock::setPrevBlockInSeq(BlockPtr prevBlock)
 
 void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
-    if (mNextBlocks.find(blockKey) == mNextBlocks.end())
+    if (!mLookupNode)
     {
-        mNextBlocks[blockKey] = std::move(block);
+        return;
+    }
+    // Find existing child node or create a new one, then wire the block into it.
+    auto childNode = mLookupNode->findOrInsertChild(blockKey, mLookupNode);
+    // Only attach if there is no block already stored for this window size (matches old
+    // behaviour: addNextBlock was a no-op when the key already existed in mNextBlocks).
+    auto existing = childNode->getValue(mWindowSize);
+    if (!existing.has_value())
+    {
+        block->attachToLookupNode(childNode, mWindowSize);
     }
 }
 
 std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
     BlockKey const& blockKey, bool enablePartialReuse, bool copyOnPartialReuse) const
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
-
-    if (blockKey.uniqueTokens.size() == 0 || mNextBlocks.size() == 0)
+    if (!mLookupNode || blockKey.uniqueTokens.empty())
     {
         return {false, 0, nullptr};
     }
-    auto itr = mNextBlocks.find(blockKey);
-    if (itr == mNextBlocks.end())
+
+    // Exact match
+    auto exactMatch = mLookupNode->findMatchingNode(blockKey);
+    if (exactMatch.has_value())
     {
-        if (enablePartialReuse)
+        auto optBlock = exactMatch->node->getValue(mWindowSize);
+        if (optBlock.has_value() && *optBlock)
         {
-            SizeType32 bestNumMatched{0};
-            BlockPtr bestBlock{nullptr};
-            for (auto const& [key, block] : mNextBlocks)
-            {
-                if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
-                {
-                    SizeType32 numMatched = key.numMatchingTokens(blockKey);
-                    if (numMatched > bestNumMatched)
-                    {
-                        bestNumMatched = numMatched;
-                        bestBlock = block;
-                    }
-                }
-            }
-            if (bestNumMatched > 0)
-            {
-                return {true, bestNumMatched, bestBlock};
-            }
+            auto block = *optBlock;
+            return {!block->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), block};
         }
         return {false, 0, nullptr};
     }
-    auto block = itr->second;
-    return {!block->isFull(), static_cast<SizeType32>(blockKey.uniqueTokens.size()), block};
+
+    // Partial match (sorted longest-first by findPartiallyMatchingNodes)
+    if (enablePartialReuse)
+    {
+        auto partialMatches = mLookupNode->findPartiallyMatchingNodes(blockKey);
+        for (auto const& match : partialMatches)
+        {
+            auto optBlock = match.node->getValue(mWindowSize);
+            if (!optBlock.has_value() || !(*optBlock))
+            {
+                continue;
+            }
+            auto block = *optBlock;
+            if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
+            {
+                return {true, static_cast<SizeType32>(match.key.uniqueTokens.size()), block};
+            }
+        }
+    }
+
+    return {false, 0, nullptr};
 }
 
 void KVCacheBlock::freeLeafBlock()
 {
     // assure that this is a leaf block
     TLLM_CHECK(isLeaf());
-
-    // free from previous block
-    if (mPrevBlock != nullptr)
-    {
-        mPrevBlock->removeNextBlock(mBlockKey);
-        mPrevBlock = nullptr;
-    }
+    // Detach from the lookup tree; cascade pruning removes empty ancestor nodes.
+    detachFromLookupNode();
 }
 
 void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 {
-    std::lock_guard<std::mutex> lock(mNextBlocksMutex);
-    mNextBlocks.erase(blockKey);
-}
-
-void KVCacheBlock::freeDescendantsRecursively()
-{
-    bool hasChildren = !mNextBlocks.empty();
-    if (hasChildren)
+    if (mLookupNode)
     {
-        for (auto it = mNextBlocks.begin(); it != mNextBlocks.end();)
+        // clearNode removes the child entry and fires cascade pruning upward if the child
+        // node becomes empty after the removal.
+        auto const wasCleared = mLookupNode->clearNode(blockKey);
+        if (!wasCleared)
         {
-            it->second->freeDescendantsRecursively();
-            TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", it->second->getBlockId());
-            it = mNextBlocks.erase(it);
+            TLLM_LOG_DEBUG("removeNextBlock: key not found for block %d; node may have been pruned already",
+                static_cast<int>(mBlockId));
         }
     }
-    mPrevBlock = nullptr;
+}
+
+// Iterative DFS over the subtree rooted at this block's children.
+//
+// Algorithm:
+//   1. Push immediate children onto a stack and do DFS, collecting every
+//      reachable descendant in pre-order (parent before children).
+//   2. Detach in *reverse* order (children before parents).  This is
+//      required because detachFromLookupNode() triggers cascade pruning:
+//      when a node becomes empty (no value, no children) it is removed from
+//      its parent.  If we detached in collection order (parents first), a
+//      parent node could be cascade-pruned away before we had a chance to
+//      look up its children in step 1.  By detaching leaves first, cascade
+//      propagation only moves upward after all descendants are already gone.
+void KVCacheBlock::detachDescendantsFromLookupTree()
+{
+    if (!mLookupNode)
+    {
+        return;
+    }
+    std::vector<BlockPtr> descendants;
+    std::vector<BlockPtr> stack;
+    for (auto const& [key, block] : mLookupNode->getChildKeyValues(mWindowSize))
+    {
+        stack.push_back(block);
+    }
+    while (!stack.empty())
+    {
+        auto current = std::move(stack.back());
+        stack.pop_back();
+        if (current->mLookupNode)
+        {
+            for (auto const& [key, block] : current->mLookupNode->getChildKeyValues(current->mWindowSize))
+            {
+                stack.push_back(block);
+            }
+        }
+        TLLM_LOG_DEBUG("KVCacheBlock::detachDescendantsFromLookupTree - detaching block %d", current->getBlockId());
+        descendants.push_back(std::move(current));
+    }
+    // Detach leaves first so cascade-prune works correctly.
+    for (auto it = descendants.rbegin(); it != descendants.rend(); ++it)
+    {
+        (*it)->detachFromLookupNode();
+    }
 }
 
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
-    // free from previous block
-    if (mPrevBlock != nullptr)
-    {
-        mPrevBlock->removeNextBlock(mBlockKey);
-        mPrevBlock = nullptr;
-    }
-    freeDescendantsRecursively();
+    detachDescendantsFromLookupTree();
+    detachFromLookupNode();
 }
 
 bool KVCacheBlock::isFull() const
@@ -354,7 +482,7 @@ bool KVCacheBlock::isFull() const
 
 bool KVCacheBlock::isLeaf() const
 {
-    return mNextBlocks.empty();
+    return !mLookupNode || !mLookupNode->hasChildren();
 }
 
 // This function calculates the number of block a layer should have, given
@@ -463,7 +591,7 @@ BlockManager::BlockManager(std::vector<SizeType32> const& numKvHeadsPerLayer, Si
         mWindowBlockManagers.try_emplace(windowSize, dtype, windowSize, layersWithWindowSize, numKvHeadsPerLayer,
             sizePerHead, tokensPerBlock, /*isSWA=*/windowSize < maxSequenceLength, allottedPrimaryBlocks,
             allottedSecondaryBlocks, maxNumSequences, stream, onboardBlocks, cacheType, secondaryOffloadMinPriority,
-            mEventManager, enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLoopbackAgent,
+            mEventManager, enablePartialReuse, copyOnPartialReuse, kvCacheConnectorManager, mLookupTree, mLoopbackAgent,
             enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim);
     }
 
@@ -521,8 +649,8 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     bool onboardBlocks, CacheType cacheType, std::optional<executor::RetentionPriority> secondaryOffloadMinPriority,
     std::shared_ptr<KVCacheEventManager> eventManager, bool enablePartialReuse, bool copyOnPartialReuse,
     std::shared_ptr<kv_connector::KvCacheConnectorManager> kvCacheConnectorManager,
-    std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent, bool enableIndexerKCache,
-    SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim)
+    radix_block_tree::UnifiedBlockTree& lookupTree, std::shared_ptr<kvc::BaseLoopbackAgent> loopbackAgent,
+    bool enableIndexerKCache, SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim)
     : mDataType{dtype}
     , mWindowSize{windowSize}
     , mNumPrimaryBlocks{blocksInPrimaryPool}
@@ -532,7 +660,11 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mSchedulingNumFreeBlocks{0}
     , mTokensPerBlock{tokensPerBlock}
     , mIsSWA{isSWA}
-    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0})}
+    , mLookupTree{&lookupTree}
+    // Use an out-of-range pool index for the dummy root block; it is never submitted to the GPU.
+    // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
+    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId,
+          tk::KVCacheIndex{std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max()})}
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mLoopbackAgent{loopbackAgent}
@@ -619,6 +751,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     {
         mEventManager->enqueueCreatedEvent({blocksInPrimaryPool, blocksInSecondaryPool}, mWindowSize);
     }
+
+    // Wire the dummy root block into the shared lookup tree so that direct children
+    // can navigate to it via getPrevBlock() and blockInRadixTree() returns true for them.
+    mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
 }
 
 WindowBlockManager::~WindowBlockManager()
@@ -642,12 +778,12 @@ WindowBlockManager::~WindowBlockManager()
         100.0 * mReusedTokens / mTotalInputTokens);
 }
 
-bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize)
+bool BlockManager::verifyQueueIntegrity(SizeType32 windowSize) const
 {
     return mWindowBlockManagers.at(windowSize).verifyQueueIntegrity();
 }
 
-bool WindowBlockManager::verifyQueueIntegrity()
+bool WindowBlockManager::verifyQueueIntegrity() const
 {
     return mEvictionPolicy->verifyQueueIntegrity();
 }
@@ -824,18 +960,6 @@ void WindowBlockManager::freeLeafBlock(BlockPtr const& block)
     block->freeLeafBlock();
 }
 
-void WindowBlockManager::freeChildren(BlockPtr const& block)
-{
-    // Tell event manager we are freeing block
-    if (mEventManager && blockInRadixTree(block))
-    {
-        mEventManager->enqueueRemovedEvent(block, mWindowSize);
-    }
-
-    // Free block and all it's descendants from radix tree
-    block->freeBlockAndAllDescendants();
-}
-
 BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor::RetentionPriority priority,
     std::optional<std::chrono::milliseconds> durationMs, executor::KvCacheTransferMode mode,
     std::string const& directory)
@@ -875,36 +999,18 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
         block = offloadBlock;
     }
 
-    // Removes children of the block from the search tree
-    freeChildren(block);
+    // True priority eviction: detach ONLY this block from the lookup tree.
+    // Descendants remain in the tree and free queue, where they can be evicted
+    // independently according to their own priority.  Previously, freeChildren()
+    // also detached all descendants, which prevented high-priority interior blocks
+    // from surviving eviction pressure on their low-priority leaf children.
+    if (mEventManager && blockInRadixTree(block))
+    {
+        mEventManager->enqueueRemovedEvent(block, mWindowSize);
+    }
+    block->detachFromLookupNode();
     // Claim the block in primary block queue
     mEvictionPolicy->claimBlock(block, priority, durationMs);
-
-    // Deal with invalidating block save for reuse for the sequence
-    if (mBlockToSequence.count(block->getBlockId()) > 0)
-    {
-        auto const& originalOwnerSequenceId = mBlockToSequence[block->getBlockId()];
-        if (mIsValidStoreForReuseSequence.count(originalOwnerSequenceId) > 0
-            && sequence.getRequestId() != originalOwnerSequenceId)
-        {
-            TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d was originally held but released from sequence %d",
-                mLogPrefix.c_str(), block->getBlockId(), originalOwnerSequenceId);
-            if (mIsValidStoreForReuseSequence[originalOwnerSequenceId])
-            {
-                TLLM_LOG_DEBUG("%s::getFreeBlock - Invalidate store block for reuse for sequence %d",
-                    mLogPrefix.c_str(), originalOwnerSequenceId);
-            }
-            else
-            {
-                TLLM_LOG_DEBUG("%s::getFreeBlock - Store block for reuse for sequence %d is already invalid",
-                    mLogPrefix.c_str(), originalOwnerSequenceId);
-            }
-            mIsValidStoreForReuseSequence[originalOwnerSequenceId] = false;
-        }
-    }
-
-    // Record which sequence is using the block
-    mBlockToSequence[block->getBlockId()] = sequence.getRequestId();
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
         block->getBlockId(), sequence.getRequestId());
 
@@ -1476,7 +1582,8 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
-    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks)
+    std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds, bool pinBlocks,
+    SizeType32 numOowBlocks)
 {
     SizeType32 numBlocksStoredForReuse = 0;
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
@@ -1522,6 +1629,34 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             }
             else
             {
+                // No match — for OOW blocks (first numOowBlocks entries), check whether the
+                // block was stolen by another sequence.  detachFrontBlock has already
+                // decremented an OOW block's ref count, so ref=0 means "free" and ref>0
+                // means the block was claimed by another sequence.  Storing such a block
+                // under this sequence's token prefix would corrupt the trie for the
+                // acquiring sequence, so we stop here.  Subsequent blocks also cannot be
+                // stored because they require this block as their prefix anchor.
+                //
+                // Additionally, if the OOW block is already in the lookup tree at some
+                // position (isInLookupTree()), another sequence has already finished,
+                // reallocated this block, and stored it in the trie with different token
+                // content.  Re-storing it here under this sequence's prefix would plant
+                // wrong KV-cache content in the trie, causing future reuse to produce
+                // incorrect model outputs.
+                //
+                // In-window blocks still hold ref=1 from their own sequence at this point
+                // (the ref-decrement loop runs after storeBlocks), so we must NOT apply
+                // the stolen check to them.
+                if (static_cast<SizeType32>(blockCnt) < numOowBlocks && (block->hasRefs() || block->isInLookupTree()))
+                {
+                    TLLM_LOG_DEBUG(
+                        "%s::storeBlocks - OOW block %d stolen or relocated (hasRefs=%d, inTree=%d), stopping chain "
+                        "store",
+                        mLogPrefix.c_str(), bid, static_cast<int>(block->hasRefs()),
+                        static_cast<int>(block->isInLookupTree()));
+                    break;
+                }
+
                 // No match
                 TLLM_LOG_DEBUG("%s::storeBlocks - No match, inserting block %d into search structure",
                     mLogPrefix.c_str(), block->getBlockId());
@@ -1529,14 +1664,17 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
                 needMatch = false; // no matching needed for following blocks
 
-                if (block->getPrevBlock() != nullptr)
-                {
-                    block->getPrevBlock()->removeNextBlock(block->getBlockKey());
-                }
+                block->detachFromLookupNode();
                 block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
-                block->setPrevBlock(searchRoot);
                 block->setPrevBlockInSeq(searchRoot);
                 searchRoot->addNextBlock(blockKey, block);
+
+                // If addNextBlock could not attach (trie slot already occupied by another block),
+                // stop — remaining blocks in this sequence cannot be stored for reuse.
+                if (block->getPrevBlock() == nullptr)
+                {
+                    break;
+                }
 
                 // Sanity check. The list of stored blocks should be connected.
                 TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
@@ -1677,21 +1815,9 @@ std::optional<KVCacheBlock::IdType> BlockManager::releaseBlocks(
     // Reuse is implied to be enabled if llmRequest is provided.
     std::optional<KVCacheBlock::IdType> lastStoredId = std::nullopt;
 
-    // For now, the attention kernel only accepts a single
-    // "prepopulatedPromptLen", that is, all window sizes will use the same
-    // prepopulated prompt length, so it is meaningless right now to save
-    // blocks only for a certain window size while blocks in the other
-    // window size are not valid for saving for reuse.
-    bool isAllWindowSizesValidForStoreForReuse = true;
-    for (auto& [windowSize, manager] : mWindowBlockManagers)
-    {
-        isAllWindowSizesValidForStoreForReuse &= manager.isSequenceValidForStoreForReuse(sequence.getRequestId());
-    }
-
     for (auto& [_, manager] : mWindowBlockManagers)
     {
-        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1
-            || !isAllWindowSizesValidForStoreForReuse)
+        if (!llmRequest.has_value() || llmRequest->isDummyRequest() || sequence.getBeamWidth() > 1)
         {
             lastStoredId = manager.releaseBlocks(sequence, std::nullopt);
         }
@@ -1849,35 +1975,32 @@ std::optional<KVCacheBlock::IdType> WindowBlockManager::releaseBlocks(
     if (llmRequest.has_value())
     {
         // If llmRequest is provided, block store for reuse is enabled.
-        if (!isSequenceValidForStoreForReuse(requestId))
+        // storeBlocks handles stolen OOW blocks per-block via the hasRefs() check —
+        // no sequence-level validity gate is needed.
+        if (mIsSWA)
         {
-            TLLM_LOG_DEBUG(
-                "%s::releaseBlocks - sequence %lu does not have all blocks valid, block is not saved for reuse",
-                mLogPrefix.c_str(), sequence.getRequestId());
+            TLLM_LOG_DEBUG("%s::releaseBlocks - SWA sequence %lu, storing blocks for reuse", mLogPrefix.c_str(),
+                sequence.getRequestId());
         }
-        else
-        {
-            if (mIsSWA)
-            {
-                TLLM_LOG_DEBUG("%s::releaseBlocks - sequence %lu is valid for store for reuse", mLogPrefix.c_str(),
-                    sequence.getRequestId());
-            }
-            auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
-            // Only (length - 1) tokens of the sequence have their kv-state
-            // recorded in kv-cache. We assume the last token's state is not filled yet.
-            auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
-            auto blockedUniqueTokens
-                = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, /*allowPartial=*/true);
-            auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
+        auto const& uniqueTokens = llmRequest->getUniqueTokens(/*beamIdx=*/0);
+        // Only (length - 1) tokens of the sequence have their kv-state
+        // recorded in kv-cache. We assume the last token's state is not filled yet.
+        auto const usableSize = static_cast<runtime::SizeType32>(uniqueTokens.size()) - 1;
+        auto blockedUniqueTokens
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, usableSize, mTokensPerBlock, /*allowPartial=*/true);
+        auto blockKeys = buildBlockKeys(blockedUniqueTokens, *llmRequest);
 
-            std::vector<KVCacheBlock::IdType> cacheBlockIds(allocatedBlocks.size());
-            std::transform(allocatedBlocks.begin(), allocatedBlocks.end(), cacheBlockIds.begin(),
-                [](BlockPtr const& block) { return block->getBlockId(); });
+        std::vector<KVCacheBlock::IdType> cacheBlockIds(allocatedBlocks.size());
+        std::transform(allocatedBlocks.begin(), allocatedBlocks.end(), cacheBlockIds.begin(),
+            [](BlockPtr const& block) { return block->getBlockId(); });
 
-            auto [numBlocksStoredForReuse, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds);
-            TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
-                sequence.getRequestId(), numBlocksStoredForReuse);
-        }
+        // Pass numFrontBlocksRemoved so storeBlocks can apply the stolen-block check
+        // only for OOW positions (in-window blocks still have ref=1 from own sequence).
+        auto const numOowBlocks = sequence.getNumFrontBlocksRemoved();
+        auto [numBlocksStoredForReuse, pinnedBlockIds] = storeBlocks(std::move(blockKeys), cacheBlockIds,
+            /*pinBlocks=*/false, numOowBlocks);
+        TLLM_LOG_DEBUG("%s::releaseBlocks Request %lu, %d blocks stored for reuse", mLogPrefix.c_str(),
+            sequence.getRequestId(), numBlocksStoredForReuse);
     }
     for (auto it = allocatedBlocks.rbegin(); it != allocatedBlocks.rend() - sequence.getNumFrontBlocksRemoved(); ++it)
     {
@@ -2329,6 +2452,11 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
         }
         if (!outOfWindowBlock->hasRefs())
         {
+            // OOW blocks have scrolled outside the attention window and are no longer
+            // reusable for the current sequence.  Override their user-assigned priority
+            // to MIN so they are evicted before in-window blocks regardless of what
+            // priority was set at context time.
+            outOfWindowBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
             mEvictionPolicy->releaseBlock(outOfWindowBlock);
         }
     }
@@ -2378,19 +2506,6 @@ bool KVCacheManager::addSequence(
     SizeType32 const numReusedBlocksPreRequest = mBlockManager.getNumReusedBlocks();
     SizeType32 const numMissedBlocksPreRequest = mBlockManager.getNumMissedBlocks();
 
-    if (!mBlockManager.isSequenceHeld(requestId))
-    {
-        mBlockManager.holdSequence(requestId);
-        TLLM_LOG_DEBUG(
-            "[kv cache manager] Encounter new sequence %d, initialize sequence storage validity for all window sizes",
-            requestId);
-    }
-    else
-    {
-        TLLM_LOG_DEBUG(
-            "[kv cache manager] Encounter existing sequence %d, skip sequence storage validity initialization",
-            requestId);
-    }
     // Track the minimum prepopulated length across all windows (for VSWA with mixed isSWA flags)
     SizeType32 minPrepopulatedPromptLen = std::numeric_limits<SizeType32>::max();
 
@@ -2506,12 +2621,6 @@ std::optional<KVCacheBlock::IdType> KVCacheManager::removeSequence(
             lastStoredId = mBlockManager.releaseBlocks(sequenceNode.mapped(), std::nullopt, pinBlocks);
         }
     }
-    if (mBlockManager.isSequenceHeld(requestId))
-    {
-        mBlockManager.releaseSequence(requestId);
-        TLLM_LOG_DEBUG("Remove sequence %d, release sequence storage validity for all window sizes", requestId);
-    }
-    TLLM_CHECK(!mBlockManager.isSequenceHeld(requestId));
     TLLM_LOG_TRACE("[%s]::%s stop", isCrossKv() ? "CROSS" : "SELF", __PRETTY_FUNCTION__);
     return lastStoredId;
 }

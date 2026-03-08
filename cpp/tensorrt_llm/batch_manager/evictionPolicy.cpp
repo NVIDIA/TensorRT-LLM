@@ -75,7 +75,7 @@ void LRUEvictionPolicy::initialize(std::vector<BlockPtr>& mAllBlocksById, std::v
     mSecondaryOffloadMinPriority = secondaryOffloadMinPriority.value_or(kDefaultSecondaryOffloadMinPriority);
 }
 
-bool LRUEvictionPolicy::verifyQueueIntegrity()
+bool LRUEvictionPolicy::verifyQueueIntegrity() const
 {
     bool queueCompromised = false;
     for (SizeType32 cacheLevel = 0; cacheLevel < 2; cacheLevel++)
@@ -112,10 +112,12 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
         {
             auto block = mFreeQueues[cacheLevel][level].front();
 
-            // mFreeQueues only contains leaf blocks, so no need to iterate through the next block pointers.
-            // It's possible to have a primary block with children in secondary memory. We handle this
-            // by freeing all descendants in WindowBlockManager::getFreeBlock. This is done either by
-            // offloading (preferred method) or explicitly.
+            // mFreeQueues may contain both leaf and interior blocks. Interior blocks whose
+            // descendants were separately evicted at lower priority are evicted here when
+            // their own priority level is reached. getFreeBlock detaches only this block via
+            // detachFromLookupNode(); any remaining descendants are detached when their own
+            // turn comes in the free queue.  Offloading (preferred) or explicit detach handles
+            // the case where a primary block still has children in secondary memory.
             return std::make_tuple(block, cacheLevel == 0 && level >= mSecondaryOffloadMinPriority);
         }
     }
@@ -129,6 +131,13 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
+    // The dummy root block (kCachedBlocksRootId) is permanently attached to the lookup tree
+    // via setAsRoot() and must never enter the eviction queue — it is not a real cache block.
+    TLLM_CHECK_WITH_INFO(
+        block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
+        "Attempted to release the cached-blocks root into the eviction queue");
+    // Placeholder blocks have no physical GPU memory and must never enter the eviction queue.
+    TLLM_CHECK_WITH_INFO(!block->isPlaceholder(), "Attempted to release a placeholder block into the eviction queue");
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 
