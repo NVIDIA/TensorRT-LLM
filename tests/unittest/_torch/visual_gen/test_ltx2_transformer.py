@@ -354,5 +354,170 @@ class TestLTX2AudioVideoModel(unittest.TestCase):
         )
 
 
+class TestLTX2QuantExcludeModuleRemapping(unittest.TestCase):
+    """Tests for _remap_exclude_modules and _apply_quant_config_exclude_modules.
+
+    Verifies that LTX2 FP8 checkpoint-convention exclude names (to_q/to_k/to_v,
+    ff.net.0.proj, ff.net.2) are correctly translated to model-convention
+    names (qkv_proj, up_proj, down_proj) so that non-quantized layers in
+    pre-quantized FP8 checkpoints are properly excluded from quantization.
+    """
+
+    def test_remap_qkv_fusion(self):
+        """to_q/to_k/to_v should produce a qkv_proj entry."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
+
+        exclude = [
+            "transformer_blocks.0.attn1.to_q",
+            "transformer_blocks.0.attn1.to_k",
+            "transformer_blocks.0.attn1.to_v",
+        ]
+        remapped = LTXModel._remap_exclude_modules(exclude)
+        self.assertIn("transformer_blocks.0.attn1.qkv_proj", remapped)
+
+    def test_remap_ff(self):
+        """ff.net.0.proj / ff.net.2 should produce up_proj / down_proj."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
+
+        exclude = [
+            "transformer_blocks.0.ff.net.0.proj",
+            "transformer_blocks.0.ff.net.2",
+        ]
+        remapped = LTXModel._remap_exclude_modules(exclude)
+        self.assertIn("transformer_blocks.0.ff.up_proj", remapped)
+        self.assertIn("transformer_blocks.0.ff.down_proj", remapped)
+
+    def test_remap_audio_ff(self):
+        """audio_ff.net.* should produce audio_ff.up_proj / down_proj."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
+
+        exclude = [
+            "transformer_blocks.0.audio_ff.net.0.proj",
+            "transformer_blocks.0.audio_ff.net.2",
+        ]
+        remapped = LTXModel._remap_exclude_modules(exclude)
+        self.assertIn("transformer_blocks.0.audio_ff.up_proj", remapped)
+        self.assertIn("transformer_blocks.0.audio_ff.down_proj", remapped)
+
+    def test_remap_preserves_originals(self):
+        """Original entries (to_out.0, to_q for cross-attn) must survive."""
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import LTXModel
+
+        exclude = [
+            "transformer_blocks.0.attn1.to_out.0",
+            "transformer_blocks.0.attn2.to_q",
+        ]
+        remapped = LTXModel._remap_exclude_modules(exclude)
+        self.assertIn("transformer_blocks.0.attn1.to_out.0", remapped)
+        self.assertIn("transformer_blocks.0.attn2.to_q", remapped)
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_exclude_modules_applied_to_fused_qkv(self):
+        """Fused qkv_proj should be excluded when checkpoint names to_q/to_k/to_v are excluded."""
+        from tensorrt_llm._torch.modules.linear import Linear
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        exclude = [
+            "transformer_blocks.0.attn1.to_q",
+            "transformer_blocks.0.attn1.to_k",
+            "transformer_blocks.0.attn1.to_v",
+            "transformer_blocks.0.ff.net.0.proj",
+            "transformer_blocks.0.ff.net.2",
+        ]
+        quant_config = QuantConfig(quant_algo=QuantAlgo.FP8, exclude_modules=exclude)
+        model_config = DiffusionModelConfig(
+            quant_config=quant_config,
+            mapping=Mapping(),
+            attention=AttentionConfig(backend="VANILLA"),
+            skip_create_weights_in_init=False,
+        )
+        model = LTXModel(
+            model_type=LTXModelType.VideoOnly,
+            model_config=model_config,
+            **VIDEO_ONLY_CONFIG,
+        ).to("cuda")
+
+        excluded_names = []
+        quantized_names = []
+        for name, module in model.named_modules():
+            if isinstance(module, Linear):
+                if module.quant_config is None or module.quant_config.quant_algo is None:
+                    excluded_names.append(name)
+                else:
+                    quantized_names.append(name)
+
+        self.assertIn(
+            "transformer_blocks.0.attn1.qkv_proj",
+            excluded_names,
+            "Fused qkv_proj should be excluded via to_q/to_k/to_v remapping",
+        )
+        self.assertIn(
+            "transformer_blocks.0.ff.up_proj",
+            excluded_names,
+            "FF up_proj should be excluded via ff.net.0.proj remapping",
+        )
+        self.assertIn(
+            "transformer_blocks.0.ff.down_proj",
+            excluded_names,
+            "FF down_proj should be excluded via ff.net.2 remapping",
+        )
+
+        # Cross-attention uses separate to_q/to_k/to_v -- they should NOT be
+        # excluded since they weren't in the list (only block 0's attn1 was).
+        self.assertIn(
+            "transformer_blocks.0.attn2.to_q",
+            quantized_names,
+            "Cross-attention to_q (not excluded) should remain quantized",
+        )
+
+    @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
+    def test_nvfp4_exclude_modules_no_remap(self):
+        """NVFP4 should NOT apply checkpoint-name remapping (only FP8 does)."""
+        from tensorrt_llm._torch.modules.linear import Linear
+        from tensorrt_llm._torch.visual_gen.models.ltx2.transformer_ltx2 import (
+            LTXModel,
+            LTXModelType,
+        )
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        exclude = [
+            "transformer_blocks.0.attn1.to_q",
+            "transformer_blocks.0.attn1.to_k",
+            "transformer_blocks.0.attn1.to_v",
+        ]
+        quant_config = QuantConfig(
+            quant_algo=QuantAlgo.NVFP4,
+            group_size=16,
+            exclude_modules=exclude,
+        )
+        model_config = DiffusionModelConfig(
+            quant_config=quant_config,
+            mapping=Mapping(),
+            attention=AttentionConfig(backend="VANILLA"),
+            skip_create_weights_in_init=False,
+        )
+        model = LTXModel(
+            model_type=LTXModelType.VideoOnly,
+            model_config=model_config,
+            **VIDEO_ONLY_CONFIG,
+        ).to("cuda")
+
+        for name, module in model.named_modules():
+            if isinstance(module, Linear) and name == "transformer_blocks.0.attn1.qkv_proj":
+                self.assertIsNotNone(module.quant_config, "qkv_proj quant_config should exist")
+                self.assertEqual(
+                    module.quant_config.quant_algo,
+                    QuantAlgo.NVFP4,
+                    "NVFP4 should NOT remap to_q/to_k/to_v → qkv_proj",
+                )
+                return
+
+        self.fail("transformer_blocks.0.attn1.qkv_proj not found in model")
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

@@ -815,6 +815,47 @@ class LTXModel(nn.Module):
             if callable(getattr(module, "create_weights", None)):
                 module.create_weights()
 
+    # ==================== FP8 static checkpoint workaround ====================
+    # Pre-quantized FP8 checkpoints (HuggingFace _quantization_metadata format)
+    # embed layer names using the original checkpoint convention, which diverges
+    # from TRT-LLM model names after QKV fusion and FF remapping.
+    #
+    # _remap_exclude_modules translates those names so that non-quantized layers
+    # are correctly excluded from FP8 quantization.
+    #
+    # TODO: Remove this block once checkpoint tooling emits model-convention
+    # names directly (i.e. qkv_proj, up_proj, down_proj instead of
+    # to_q/to_k/to_v, ff.net.0.proj, ff.net.2).
+    # ========================================================================
+
+    @staticmethod
+    def _remap_exclude_modules(exclude_modules: list[str]) -> list[str]:
+        """Translate checkpoint-convention exclude names to model-convention names.
+
+        The checkpoint uses naming conventions that differ from the TRT-LLM
+        model after QKV fusion and FF remapping:
+          - Self-attention QKV: ``to_q / to_k / to_v`` → fused ``qkv_proj``
+          - FeedForward:        ``ff.net.0.proj / ff.net.2`` → ``ff.up_proj / ff.down_proj``
+
+        Returns a combined list containing both original and remapped patterns
+        so that ``fnmatch`` can match either convention.
+        """
+        remapped: set[str] = set()
+        for entry in exclude_modules:
+            for qkv_suffix in (".to_q", ".to_k", ".to_v"):
+                if entry.endswith(qkv_suffix):
+                    remapped.add(entry[: -len(qkv_suffix)] + ".qkv_proj")
+            for ff_prefix in (".ff.", ".audio_ff."):
+                old_up = ff_prefix + "net.0.proj"
+                old_down = ff_prefix + "net.2"
+                if old_up in entry:
+                    remapped.add(entry.replace(old_up, ff_prefix + "up_proj"))
+                elif old_down in entry:
+                    remapped.add(entry.replace(old_down, ff_prefix + "down_proj"))
+        return list(exclude_modules) + sorted(remapped)
+
+    # ==================== End FP8 static checkpoint workaround ===============
+
     def _apply_quant_config_exclude_modules(self):
         if self.model_config is None:
             return
@@ -827,9 +868,21 @@ class LTXModel(nn.Module):
         kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
         no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
 
+        # ====== FP8 static checkpoint: remap exclude names (see above) ======
+        import fnmatch
+
+        from tensorrt_llm.quantization.mode import QuantAlgo
+
+        needs_remap = quant_config.quant_algo in (QuantAlgo.FP8,)
+        if needs_remap:
+            all_patterns = self._remap_exclude_modules(quant_config.exclude_modules)
+        else:
+            all_patterns = list(quant_config.exclude_modules)
+        # ====================================================================
+
         for name, module in self.named_modules():
             if isinstance(module, Linear):
-                is_excluded = quant_config.is_module_excluded_from_quantization(name)
+                is_excluded = any(fnmatch.fnmatchcase(name, pat) for pat in all_patterns)
                 if is_excluded and getattr(module, "quant_config", None) is not None:
                     module.quant_config = no_quant_config
 
