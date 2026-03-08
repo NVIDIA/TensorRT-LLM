@@ -36,8 +36,8 @@ TRTLLM_NAMESPACE_BEGIN
 namespace torch_ext
 {
 
-void indexer_topk_decode(
-    th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices, int64_t next_n, int64_t index_topk)
+void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, th::Tensor const& indices,
+    int64_t next_n, int64_t index_topk, std::optional<th::Tensor> const& pre_idx)
 {
 
     TORCH_CHECK(logits.is_cuda() && seq_lens.is_cuda() && indices.is_cuda(),
@@ -68,6 +68,21 @@ void indexer_topk_decode(
     TORCH_CHECK(logits_stride_0 >= 0, "logits_stride_0 must be greater than or equal to 0");
     TORCH_CHECK(logits_stride_1 >= 0, "logits_stride_1 must be greater than or equal to 0");
 
+    int32_t const* preIdxPtr = nullptr;
+    int32_t preIdxStride = 0;
+    int32_t preIdxCount = 0;
+    if (pre_idx.has_value())
+    {
+        auto const& preIdxTensor = pre_idx.value();
+        TORCH_CHECK(preIdxTensor.is_cuda(), "pre_idx must be a CUDA tensor");
+        TORCH_CHECK(preIdxTensor.is_contiguous(), "pre_idx must be contiguous");
+        TORCH_CHECK(preIdxTensor.dim() == 2, "pre_idx must be a 2D Tensor");
+        TORCH_CHECK(preIdxTensor.size(0) == numRows64, "pre_idx first dimension must match logits.size(0)");
+        preIdxPtr = preIdxTensor.data_ptr<int32_t>();
+        preIdxStride = static_cast<int32_t>(preIdxTensor.stride(0));
+        preIdxCount = static_cast<int32_t>(preIdxTensor.size(1));
+    }
+
     int32_t splitWorkThreshold = 200 * 1000;
     th::Tensor aux_indices = th::empty({0}, th::TensorOptions().dtype(th::kInt32).device(logits.device()));
     th::Tensor aux_logits = th::empty({0}, th::TensorOptions().dtype(th::kFloat32).device(logits.device()));
@@ -82,7 +97,8 @@ void indexer_topk_decode(
     auto stream = at::cuda::getCurrentCUDAStream(logits.get_device());
     tk::invokeIndexerTopKDecode(logits.data_ptr<float>(), seq_lens.data_ptr<int32_t>(), indices.data_ptr<int32_t>(),
         aux_logits.data_ptr<float>(), aux_indices.data_ptr<int32_t>(), splitWorkThreshold, num_rows, num_columns,
-        logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), stream);
+        logits_stride_0, logits_stride_1, static_cast<int32_t>(next_n), static_cast<int32_t>(index_topk), preIdxPtr,
+        preIdxStride, preIdxCount, stream);
 }
 
 void indexer_topk_prefill(th::Tensor const& logits, th::Tensor const& row_starts, th::Tensor const& row_ends,
@@ -128,8 +144,8 @@ TRTLLM_NAMESPACE_END
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
     m.def(
-        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048) -> "
-        "()");
+        "indexer_topk_decode(Tensor logits, Tensor seq_lens, Tensor indices, int next_n, int index_topk=2048, "
+        "Tensor? pre_idx=None) -> ()");
 }
 
 TORCH_LIBRARY_IMPL(trtllm, CUDA, m)

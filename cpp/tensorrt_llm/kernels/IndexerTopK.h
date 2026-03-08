@@ -29,7 +29,8 @@ namespace kernels
 {
 void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indices, float* outLogitsAux,
     int* outIndicesAux, int const splitWorkThreshold, int const numRows, int const numColumns, int const stride0,
-    int const stride1, int const next_n, int const topK = 2048, cudaStream_t const stream = 0);
+    int const stride1, int const next_n, int const topK = 2048, int const* preIdx = nullptr,
+    int const preIdxStride = 0, int const preIdxCount = 0, cudaStream_t const stream = 0);
 
 void invokeIndexerTopKPrefill(float const* logits, int const* rowStarts, int const* rowEnds, int* indices,
     int const numRows, int const numColumns, int const stride0, int const stride1, int const topK = 2048,
