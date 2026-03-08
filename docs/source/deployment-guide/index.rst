@@ -124,7 +124,6 @@ Recipe selector
 Recipe database
 ^^^^^^^^^^^^^^^
 
-The table below lists all available pre-configured model scenarios in the TensorRT LLM configuration database. Each row represents a specific model, GPU, and performance profile combination with recommended request settings.
-
-.. include:: config_table.rst
-   :start-after: .. end-config-table-note
+For a complete listing of all pre-configured model scenarios, browse the
+`configuration database on GitHub <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs/database>`_
+or use the interactive recipe selector above.
