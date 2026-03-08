@@ -311,7 +311,6 @@ def test_fake_quant_int4_linear_matches_fp_reference(bias_opt, input_dtype):
     assert cos > 0.98
 
 
-
 @pytest.mark.parametrize("M", [3, 12])
 @pytest.mark.parametrize("N", [128, 256])  # Must be divisible by block_size
 @pytest.mark.parametrize("K", [128, 256])  # Must be divisible by block_size
@@ -373,7 +372,8 @@ def test_finegrained_fp8_linear(M, N, K, bias):
     )
     assert cos > 0.95, f"Cosine similarity too low: {cos}"
 
- def _fused_relu2_quantize_available():
+
+def _fused_relu2_quantize_available():
     return hasattr(torch.ops, "trtllm") and hasattr(torch.ops.trtllm, "fused_relu2_quantize")
 
 
@@ -406,6 +406,7 @@ def test_fused_relu2_quant_nvfp4_wrapper_matches_trtllm_op():
     )
     out_ref = torch.ops.trtllm.nvfp4_gemm(fp4_ref, w_fp4, sf_ref, w_scale, alpha, torch.bfloat16)
     torch.testing.assert_close(out_wrapped, out_ref, rtol=1e-3, atol=5e-3)
+
 
 @pytest.mark.parametrize("use_bias", [True, False])
 @pytest.mark.parametrize("input_dtype", [torch.float16, torch.bfloat16])
