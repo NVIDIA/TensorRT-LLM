@@ -1,4 +1,5 @@
 import json
+import logging
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -14,6 +15,8 @@ from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
+
+logger = logging.getLogger(__name__)
 
 # =============================================================================
 # Pipeline component identifiers
@@ -521,6 +524,77 @@ class DiffusionModelConfig(BaseModel):
 
         return quant_config, layer_quant_config, dynamic_weight_quant, dynamic_activation_quant
 
+    @staticmethod
+    def _convert_quantization_metadata(
+        qmeta: Dict, tensor_keys: List[str],
+    ) -> Dict:
+        """Convert per-layer ``_quantization_metadata`` to ModelOpt format.
+
+        Some checkpoints (e.g. HuggingFace-quantized FP8) embed per-layer
+        quantization info as::
+
+            {"format_version": "1.0",
+             "layers": {"model.diffusion_model.block.attn.to_q": {"format": "float8_e4m3fn"}, ...}}
+
+        This converts it to the ModelOpt-compatible dict that
+        :meth:`load_diffusion_quant_config` understands::
+
+            {"quant_algo": "FP8",
+             "config_groups": {"default": {"weights": {"dynamic": false}, ...}},
+             "ignore": ["proj_in", "proj_out", ...]}
+        """
+        _FORMAT_TO_ALGO = {
+            "float8_e4m3fn": "FP8",
+        }
+
+        layers = qmeta.get("layers", {})
+        if not layers:
+            return {}
+
+        formats = {info.get("format") for info in layers.values()}
+        if len(formats) != 1:
+            logger.warning(
+                f"_quantization_metadata has mixed formats {formats}; skipping"
+            )
+            return {}
+
+        fmt = formats.pop()
+        quant_algo = _FORMAT_TO_ALGO.get(fmt)
+        if quant_algo is None:
+            logger.warning(
+                f"_quantization_metadata format '{fmt}' is not supported; skipping"
+            )
+            return {}
+
+        quantized_layers = set(layers.keys())
+
+        # Build ignore list: weight-bearing layers NOT in the quantized set.
+        # Tensor keys ending with ".weight" (but not ".weight_scale") indicate
+        # layers that own learnable weights.
+        non_quantized = []
+        for key in tensor_keys:
+            if key.endswith(".weight") and not key.endswith("_scale.weight"):
+                layer_name = key[: -len(".weight")]
+                if layer_name not in quantized_layers:
+                    non_quantized.append(layer_name)
+
+        result = {
+            "quant_algo": quant_algo,
+            "config_groups": {
+                "default": {
+                    "weights": {"dynamic": False},
+                    "input_activations": {"dynamic": False},
+                }
+            },
+            "ignore": sorted(non_quantized),
+        }
+        logger.info(
+            f"Converted _quantization_metadata: algo={quant_algo}, "
+            f"{len(quantized_layers)} quantized layers, "
+            f"{len(non_quantized)} excluded layers"
+        )
+        return result
+
     @classmethod
     def _try_load_safetensors_config(cls, checkpoint_path: Path) -> Optional[Dict]:
         """Try to read embedded config from a single-safetensors checkpoint.
@@ -549,7 +623,16 @@ class DiffusionModelConfig(BaseModel):
                 if meta and "config" in meta:
                     config = json.loads(meta["config"])
                     if "quantization_config" in meta:
-                        config["quantization_config"] = json.loads(meta["quantization_config"])
+                        config["quantization_config"] = json.loads(
+                            meta["quantization_config"]
+                        )
+                    elif "_quantization_metadata" in meta:
+                        qmeta = json.loads(meta["_quantization_metadata"])
+                        converted = cls._convert_quantization_metadata(
+                            qmeta, list(f.keys())
+                        )
+                        if converted:
+                            config["quantization_config"] = converted
                     return config
         except Exception:
             pass
@@ -647,6 +730,7 @@ class DiffusionModelConfig(BaseModel):
                     # attribute (e.g. "velocity_model.proj_out"). Strip that
                     # wrapper prefix so the ignore list matches TRT-LLM names.
                     _MODELOPT_WRAPPER_PREFIXES = (
+                        "model.diffusion_model.",
                         "velocity_model.",
                         "denoiser.",
                         "unet.",
