@@ -361,11 +361,120 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
     v_head_dim = 128
     prefill_len = 16
     num_decode_steps = 4
+    _run_multi_step(
+        num_heads,
+        batch_size,
+        qk_nope_head_dim,
+        qk_rope_head_dim,
+        kv_lora_rank,
+        v_head_dim,
+        prefill_len,
+        num_decode_steps,
+        dtype,
+        device,
+    )
+
+
+@pytest.mark.parametrize("batch_size", [1, 64, 128])
+@pytest.mark.parametrize("dtype", [torch.bfloat16])
+@pytest.mark.parametrize("device", ["cuda"])
+def test_trtllm_mla_multi_step_glm4(batch_size, dtype, device):
+    """Test multi-step with GLM-4 Flash exact dimensions and large batch."""
+    _run_multi_step(
+        num_heads=20,
+        batch_size=batch_size,
+        qk_nope_head_dim=192,
+        qk_rope_head_dim=64,
+        kv_lora_rank=512,
+        v_head_dim=256,
+        prefill_len=32,
+        num_decode_steps=8,
+        dtype=dtype,
+        device=device,
+    )
+
+
+def _build_metadata_with_pages(
+    batch_size,
+    kv_cache,
+    page_size,
+    page_assignments,
+    seq_lengths,
+    input_positions,
+    kv_lora_rank,
+    qk_rope_head_dim,
+    dtype,
+    device,
+):
+    """Build TRT-LLM metadata using explicit page assignments.
+
+    Unlike _create_trtllm_paged_metadata (which assigns pages sequentially from
+    scratch), this function takes pre-computed page assignments so that page
+    mappings remain consistent across prefill and decode steps.
+    """
+    kv_lengths = [pos + slen for pos, slen in zip(input_positions, seq_lengths)]
+    total_tokens = sum(seq_lengths)
+    is_decode = all(s == 1 for s in seq_lengths)
+
+    if is_decode:
+        batch_info_host = torch.tensor([0, 0, batch_size], dtype=torch.int32, device="cpu")
+    else:
+        batch_info_host = torch.tensor(
+            [batch_size, total_tokens, 0], dtype=torch.int32, device="cpu"
+        )
+
+    cache_loc_list, page_seq_list, page_in_seq_list = [], [], []
+    pages_per_seq = []
+    for seq_idx, pages in enumerate(page_assignments):
+        pages_per_seq.append(len(pages))
+        for pg_idx, pg in enumerate(pages):
+            cache_loc_list.append(pg)
+            page_seq_list.append(seq_idx)
+            page_in_seq_list.append(pg_idx)
+
+    cu_num_pages = torch.zeros(batch_size + 1, dtype=torch.int32, device="cpu")
+    for i, n in enumerate(pages_per_seq):
+        cu_num_pages[i + 1] = cu_num_pages[i] + n
+
+    max_blocks_per_seq = max(pages_per_seq) if pages_per_seq else 1
+    max_context_length = max(kv_lengths) if kv_lengths else 1
+
+    return {
+        "kv_cache": kv_cache,
+        "batch_info_host": batch_info_host,
+        "seq_len": torch.tensor(seq_lengths, dtype=torch.int32, device=device),
+        "seq_len_host": torch.tensor(seq_lengths, dtype=torch.int32, device="cpu"),
+        "input_pos_host": torch.tensor(input_positions, dtype=torch.int32, device="cpu"),
+        "seq_len_with_cache": torch.tensor(kv_lengths, dtype=torch.int32, device=device),
+        "seq_len_with_cache_host": torch.tensor(kv_lengths, dtype=torch.int32, device="cpu"),
+        "max_seq_info_host": torch.tensor(
+            [max_context_length, max_blocks_per_seq, 2, batch_size],
+            dtype=torch.int32,
+            device="cpu",
+        ),
+        "cu_num_pages_host": cu_num_pages,
+        "cache_loc": torch.tensor(cache_loc_list, dtype=torch.int32, device=device),
+        "page_seq_indices": torch.tensor(page_seq_list, dtype=torch.int32, device=device),
+        "page_in_seq": torch.tensor(page_in_seq_list, dtype=torch.int32, device=device),
+    }
+
+
+def _run_multi_step(
+    num_heads,
+    batch_size,
+    qk_nope_head_dim,
+    qk_rope_head_dim,
+    kv_lora_rank,
+    v_head_dim,
+    prefill_len,
+    num_decode_steps,
+    dtype,
+    device,
+):
     page_size = _MLA_TOKENS_PER_BLOCK
     max_seq_len = prefill_len + num_decode_steps + 8
     max_num_pages = batch_size * (max_seq_len // page_size + 2)
 
-    # Generate all tokens upfront for reference
     total_len = prefill_len + num_decode_steps
     all_inputs = _create_mla_inputs(
         batch_size,
@@ -379,35 +488,46 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
         device,
     )
 
-    # --- Step 1: Prefill ---
-    prefill_inputs = {
-        "q_nope": all_inputs["q_nope"][:, :prefill_len],
-        "q_pe": all_inputs["q_pe"][:, :prefill_len],
-        "compressed_kv": all_inputs["compressed_kv"][:, :prefill_len],
-        "kpe": all_inputs["kpe"][:, :prefill_len],
-        "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
-    }
+    latent_dim = kv_lora_rank + qk_rope_head_dim
+    kv_cache = torch.zeros(
+        max_num_pages,
+        2,
+        1,
+        page_size,
+        latent_dim,
+        dtype=dtype,
+        device=device,
+    )
 
+    # Persistent page assignments: allocate pages once and grow as needed
+    prefill_pages_per_seq = max(1, (prefill_len - 1) // page_size + 1)
+    page_assignments = [
+        list(range(i * prefill_pages_per_seq, (i + 1) * prefill_pages_per_seq))
+        for i in range(batch_size)
+    ]
+    next_free_page = batch_size * prefill_pages_per_seq
+
+    # --- Step 1: Prefill ---
     total_prefill_tokens = batch_size * prefill_len
     trtllm_prefill_inputs = {
-        "q_nope": prefill_inputs["q_nope"].reshape(
+        "q_nope": all_inputs["q_nope"][:, :prefill_len].reshape(
             1,
             total_prefill_tokens,
             num_heads,
             qk_nope_head_dim,
         ),
-        "q_pe": prefill_inputs["q_pe"].reshape(
+        "q_pe": all_inputs["q_pe"][:, :prefill_len].reshape(
             1,
             total_prefill_tokens,
             num_heads,
             qk_rope_head_dim,
         ),
-        "compressed_kv": prefill_inputs["compressed_kv"].reshape(
+        "compressed_kv": all_inputs["compressed_kv"][:, :prefill_len].reshape(
             1,
             total_prefill_tokens,
             kv_lora_rank,
         ),
-        "kpe": prefill_inputs["kpe"].reshape(
+        "kpe": all_inputs["kpe"][:, :prefill_len].reshape(
             1,
             total_prefill_tokens,
             1,
@@ -416,23 +536,31 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
         "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
     }
 
-    prefill_meta = _create_trtllm_paged_metadata(
+    prefill_meta = _build_metadata_with_pages(
         batch_size,
-        max_num_pages,
+        kv_cache,
         page_size,
+        page_assignments,
+        [prefill_len] * batch_size,
+        [0] * batch_size,
         kv_lora_rank,
         qk_rope_head_dim,
         dtype,
         device,
-        [prefill_len] * batch_size,
-        [0] * batch_size,
     )
-
     _run_trtllm_mla(trtllm_prefill_inputs, prefill_meta, kv_lora_rank)
 
     # --- Step 2: Decode steps ---
     for step in range(num_decode_steps):
         token_idx = prefill_len + step
+        kv_len = token_idx + 1
+        pages_needed = max(1, (kv_len - 1) // page_size + 1)
+
+        for i in range(batch_size):
+            while len(page_assignments[i]) < pages_needed:
+                page_assignments[i].append(next_free_page)
+                next_free_page += 1
+
         decode_inputs = {
             "q_nope": all_inputs["q_nope"][:, token_idx : token_idx + 1],
             "q_pe": all_inputs["q_pe"][:, token_idx : token_idx + 1],
@@ -441,41 +569,28 @@ def test_trtllm_mla_multi_step(num_heads, batch_size, dtype, device):
             "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
         }
 
-        decode_meta = _create_trtllm_paged_metadata(
+        decode_meta = _build_metadata_with_pages(
             batch_size,
-            max_num_pages,
+            kv_cache,
             page_size,
+            page_assignments,
+            [1] * batch_size,
+            [token_idx] * batch_size,
             kv_lora_rank,
             qk_rope_head_dim,
             dtype,
             device,
-            [1] * batch_size,
-            [token_idx] * batch_size,
         )
-        # Reuse the same kv_cache across steps
-        decode_meta["kv_cache"] = prefill_meta["kv_cache"]
 
         trtllm_decode_out = _run_trtllm_mla(decode_inputs, decode_meta, kv_lora_rank)
 
-        # Reference: run source op on the full sequence up to this point
-        ref_inputs = {
-            "q_nope": all_inputs["q_nope"][:, token_idx : token_idx + 1],
-            "q_pe": all_inputs["q_pe"][:, token_idx : token_idx + 1],
-            "compressed_kv": all_inputs["compressed_kv"][:, : token_idx + 1],
-            "kpe": all_inputs["kpe"][:, : token_idx + 1],
-            "kv_b_proj_weight": all_inputs["kv_b_proj_weight"],
-        }
-
-        # torch_mla expects matching Q and KV seq lengths for non-causal,
-        # but for generate (Q_len=1, KV_len>1) we need to handle this specially.
-        # Use the source op with full KV to get the expected output.
         ref_output = torch.ops.auto_deploy.torch_mla(
-            ref_inputs["q_nope"],
-            ref_inputs["q_pe"],
-            ref_inputs["compressed_kv"],
-            ref_inputs["kpe"],
-            ref_inputs["kv_b_proj_weight"],
-            False,  # is_causal=False since Q_len != KV_len
+            all_inputs["q_nope"][:, token_idx : token_idx + 1],
+            all_inputs["q_pe"][:, token_idx : token_idx + 1],
+            all_inputs["compressed_kv"][:, : token_idx + 1],
+            all_inputs["kpe"][:, : token_idx + 1],
+            all_inputs["kv_b_proj_weight"],
+            False,
             None,
             "bsnd",
         )

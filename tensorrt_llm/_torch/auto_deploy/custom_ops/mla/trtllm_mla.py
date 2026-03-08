@@ -517,11 +517,40 @@ def _handle_prefill(
     return torch.cat(outputs, dim=0).contiguous()
 
 
+def _write_decode_latent_to_cache(
+    latent_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
+    block_ids_per_seq: torch.Tensor,
+    sequence_length: torch.Tensor,
+    num_prefill: int,
+    num_decode: int,
+    tokens_per_block: int,
+) -> None:
+    """Write decode tokens' latent_cache to the paged KV cache.
+
+    Uses GPU tensor operations so it is safe for CUDA graph capture.
+    The thop.attention MLA generation kernel reads from the KV cache
+    but does NOT write to it; the standard TRT-LLM backend relies on
+    mla_rope_generation to do the write. Since auto-deploy skips that
+    kernel (RoPE is pre-applied), we must write the cache explicitly.
+    """
+    positions = sequence_length[num_prefill : num_prefill + num_decode] - 1
+    page_idx = positions // tokens_per_block
+    slot_idx = positions % tokens_per_block
+
+    seq_indices = torch.arange(num_prefill, num_prefill + num_decode, device=latent_cache.device)
+    page_ids = block_ids_per_seq[seq_indices, page_idx]
+
+    kv_cache[page_ids, 0, 0, slot_idx] = latent_cache
+    kv_cache[page_ids, 1, 0, slot_idx] = latent_cache
+
+
 def _handle_decode(
     q_nope_flat: torch.Tensor,
     q_pe_flat: torch.Tensor,
     kv_b_proj_weight: torch.Tensor,
     latent_cache: torch.Tensor,
+    kv_cache: torch.Tensor,
     num_tokens: int,
     num_prefill: int,
     num_heads: int,
@@ -548,6 +577,20 @@ def _handle_decode(
     host_kv_cache_pool_mapping: torch.Tensor,
 ) -> torch.Tensor:
     """Handle decode: weight absorption + latent-space attention + output projection."""
+    # Write the current decode token to the paged KV cache BEFORE running
+    # attention. The thop.attention MLA generation kernel only reads from
+    # the cache; the standard backend relies on mla_rope_generation for
+    # the write, which we skip because RoPE is pre-applied.
+    _write_decode_latent_to_cache(
+        latent_cache,
+        kv_cache,
+        _GlobalTrtllmMLAPlanner.block_ids_per_seq,
+        sequence_length,
+        num_prefill,
+        num_tokens,
+        tokens_per_block,
+    )
+
     weight_reshaped = kv_b_proj_weight.view(
         num_heads,
         qk_nope_head_dim + v_head_dim,
@@ -615,6 +658,7 @@ def _handle_decode(
 
     # Project from latent space back to v_head_dim
     output_latent = output_latent.view(num_tokens, num_heads, kv_lora_rank)
+
     output = torch.einsum("bnk,nvk->bnv", output_latent, w_v)
     return output.reshape(num_tokens, num_heads * v_head_dim).contiguous()
 
@@ -710,12 +754,13 @@ def trtllm_mla_with_cache(
     kv_cache_block_offsets = _GlobalTrtllmMLAPlanner.block_offsets
     host_kv_cache_pool_mapping = _GlobalTrtllmMLAPlanner.host_pool_mapping
 
-    # thop.attention applies q_scaling / sqrt(head_size) internally, where
-    # head_size = gen_head_size = kv_lora_rank + qk_rope_head_dim.
-    # The correct MLA scale is 1/sqrt(qk_head_dim), so we compensate:
-    #   q_scaling / sqrt(gen_head_size) = 1/sqrt(qk_head_dim)
-    #   => q_scaling = sqrt(gen_head_size / qk_head_dim)
-    thop_q_scaling = math.sqrt(gen_head_size / qk_head_dim)
+    # thop.attention's MLA generation runners compute the effective softmax
+    # scale from q_scaling and qk_head_dim (NOT gen_head_size):
+    #   FlashMLA / XQA: softmax_scale = 1 / (q_scaling * sqrt(qk_head_dim))
+    #   trtllm-gen:     mScaleQ = q_scaling * sqrt(qk_head_dim) / sqrt(gen_head_size)
+    # To get effective softmax_scale == model's `scale`:
+    #   q_scaling = 1 / (scale * sqrt(qk_head_dim))
+    thop_q_scaling = 1.0 / (scale * math.sqrt(qk_head_dim))
 
     def _make_decode_shared():
         return (
@@ -796,6 +841,7 @@ def trtllm_mla_with_cache(
             q_pe_flat[num_prefill_tokens:num_tokens],
             kv_b_proj_weight,
             latent_cache[num_prefill_tokens:num_tokens],
+            kv_cache,
             num_decode,
             num_prefill,
             *_make_decode_shared(),
@@ -814,6 +860,7 @@ def trtllm_mla_with_cache(
             q_pe_flat,
             kv_b_proj_weight,
             latent_cache,
+            kv_cache,
             num_tokens,
             0,
             *_make_decode_shared(),
