@@ -19,7 +19,9 @@ from typing import Callable, Tuple
 
 import torch
 import torch.nn.functional as F
-from triton_kernels.matmul_ogs import FlexCtx, FnSpecs, FusedActivation, PrecisionConfig, RoutingData, matmul_ogs
+from triton_kernels.matmul_ogs import (FlexCtx, FnSpecs, FusedActivation,
+                                       GatherIndx, PrecisionConfig, RoutingData,
+                                       ScatterIndx, matmul_ogs)
 from triton_kernels.numerics import InFlexData
 from triton_kernels.swiglu import swiglu_fn
 from triton_kernels.tensor import FP4, convert_layout, wrap_torch_tensor
