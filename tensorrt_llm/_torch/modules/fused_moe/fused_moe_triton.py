@@ -366,7 +366,7 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                        ("alpha", "limit")), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -601,7 +601,7 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                        ("alpha", "limit")), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -1234,7 +1234,7 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit), 2)
+                        ("alpha", "limit")), (alpha, module.swiglu_limit))
 
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
