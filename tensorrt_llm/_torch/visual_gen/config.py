@@ -619,9 +619,9 @@ class DiffusionModelConfig(BaseModel):
                 config_dict = json.load(f)
             pretrained_config = SimpleNamespace(**config_dict)
 
-        # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
-        if not getattr(pretrained_config, "_name_or_path", None):
-            pretrained_config._name_or_path = str(checkpoint_path)
+            # Ensure _name_or_path is set so coefficient matching in _setup_teacache works.
+            if not getattr(pretrained_config, "_name_or_path", None):
+                pretrained_config._name_or_path = str(checkpoint_path)
 
             model_index_path = checkpoint_path / "model_index.json"
             if model_index_path.exists():

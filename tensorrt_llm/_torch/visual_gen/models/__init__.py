@@ -20,7 +20,7 @@ Example structure:
 from ..pipeline import BasePipeline
 from ..pipeline_registry import AutoPipeline, register_pipeline
 from .flux import Flux2Pipeline, FluxPipeline
-from . import ltx2  # noqa: F401 - register LTX2Pipeline
+from .ltx2 import LTX2Pipeline  # noqa: F401
 from .wan import WanImageToVideoPipeline, WanPipeline
 
 __all__ = [
