@@ -2585,8 +2585,9 @@ def test_fused_moe_triton_mxfp4(experts, hidden_size, intermediate_size,
         w3_bias = torch.randn((NUM_EXPERTS, INTERMEDIATE_SIZE),
                               dtype=dtype).cuda()
 
-        from triton_kernels.numerics_details.mxfp import (
-            downcast_to_mxfp, upcast_from_mxfp_torch)
+        from triton_kernels.numerics_details.mxfp import (downcast_to_mxfp,
+                                                          upcast_from_mxfp_torch
+                                                          )
 
         def fp32_to_mxfp4(tensor):
             tensor = tensor.transpose(1, 2).contiguous()
