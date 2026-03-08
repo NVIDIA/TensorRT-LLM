@@ -96,7 +96,7 @@ class AutoPipeline:
                 return "Flux2Pipeline"
             if "Flux" in class_name:
                 return "FluxPipeline"
-        
+
         #########################################################
         # 2. Single-safetensors with embedded metadata (LTX-2)
         #########################################################
@@ -142,4 +142,3 @@ class AutoPipeline:
             return "LTX2Pipeline"
 
         return None
-

@@ -308,7 +308,6 @@ class VisualGenArgs(StrictBaseModel):
     dynamic_weight_quant: bool = False
     force_dynamic_quantization: bool = False
 
-
     @model_validator(mode="before")
     @classmethod
     def _parse_quant_config_dict(cls, data: Any) -> Any:
@@ -550,8 +549,7 @@ class DiffusionModelConfig(BaseModel):
                 if meta and "config" in meta:
                     config = json.loads(meta["config"])
                     if "quantization_config" in meta:
-                        config["quantization_config"] = json.loads(
-                            meta["quantization_config"])
+                        config["quantization_config"] = json.loads(meta["quantization_config"])
                     return config
         except Exception:
             pass
@@ -649,14 +647,17 @@ class DiffusionModelConfig(BaseModel):
                     # attribute (e.g. "velocity_model.proj_out"). Strip that
                     # wrapper prefix so the ignore list matches TRT-LLM names.
                     _MODELOPT_WRAPPER_PREFIXES = (
-                        "velocity_model.", "denoiser.", "unet.", "dit.",
+                        "velocity_model.",
+                        "denoiser.",
+                        "unet.",
+                        "dit.",
                     )
                     if "ignore" in qc and qc["ignore"]:
                         cleaned = []
                         for entry in qc["ignore"]:
                             for wp in _MODELOPT_WRAPPER_PREFIXES:
                                 if entry.startswith(wp):
-                                    entry = entry[len(wp):]
+                                    entry = entry[len(wp) :]
                                     break
                             cleaned.append(entry)
                         qc["ignore"] = cleaned

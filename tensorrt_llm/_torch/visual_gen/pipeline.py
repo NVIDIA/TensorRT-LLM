@@ -139,6 +139,7 @@ class BasePipeline(nn.Module):
             )
 
         from .checkpoints import WeightLoader
+
         weight_loader = WeightLoader(components=transformer_components)
         return weight_loader.load_weights(checkpoint_dir, self.mapping)
 

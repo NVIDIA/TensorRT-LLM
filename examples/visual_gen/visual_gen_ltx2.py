@@ -11,6 +11,7 @@ from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
 
 logger.set_level("info")
 
+
 def parse_args():
     parser = argparse.ArgumentParser(
         description="TRTLLM VisualGen - LTX2 Text-to-Video with Audio Inference Example"
@@ -37,7 +38,8 @@ def parse_args():
         help="Negative prompt to guide generation away from undesired content",
     )
     parser.add_argument(
-        "--output_path", "--output-path",
+        "--output_path",
+        "--output-path",
         type=str,
         default="output.mp4",
         help="Path to save the output video with audio (supports .mp4, .gif, .png)",
@@ -51,7 +53,8 @@ def parse_args():
         help="Path to input image for image-to-video conditioning",
     )
     parser.add_argument(
-        "--image_cond_strength", "--image-cond-strength",
+        "--image_cond_strength",
+        "--image-cond-strength",
         type=float,
         default=1.0,
         help="Conditioning strength for the input image (0.0 to 1.0, default: 1.0)",
@@ -60,12 +63,20 @@ def parse_args():
     # Generation Params
     parser.add_argument("--height", type=int, default=512, help="Video height (divisible by 32)")
     parser.add_argument("--width", type=int, default=768, help="Video width (divisible by 32)")
-    parser.add_argument("--num_frames", "--num-frames", type=int, default=121, help="Number of frames to generate")
+    parser.add_argument(
+        "--num_frames", "--num-frames", type=int, default=121, help="Number of frames to generate"
+    )
     parser.add_argument(
         "--frame_rate", type=float, default=24.0, help="Frames per second for the video"
     )
-    parser.add_argument("--steps", "--num-inference-steps", "--num_inference_steps",
-                        type=int, default=40, help="Number of denoising steps")
+    parser.add_argument(
+        "--steps",
+        "--num-inference-steps",
+        "--num_inference_steps",
+        type=int,
+        default=40,
+        help="Number of denoising steps",
+    )
     parser.add_argument(
         "--guidance_scale",
         type=float,
@@ -88,27 +99,39 @@ def parse_args():
 
     # Multi-modal guidance (STG / modality)
     parser.add_argument(
-        "--stg_scale", type=float, default=0.0,
+        "--stg_scale",
+        type=float,
+        default=0.0,
         help="Spatiotemporal guidance scale (0=disabled). Reference default: 1.0",
     )
     parser.add_argument(
-        "--stg_blocks", type=int, nargs="*", default=None,
+        "--stg_blocks",
+        type=int,
+        nargs="*",
+        default=None,
         help="Transformer block indices for STG perturbation (e.g., 29). Reference default: [29]",
     )
     parser.add_argument(
-        "--modality_scale", type=float, default=1.0,
+        "--modality_scale",
+        type=float,
+        default=1.0,
         help="Cross-modal guidance scale (1=disabled). Reference default: 3.0",
     )
     parser.add_argument(
-        "--rescale_scale", type=float, default=0.0,
+        "--rescale_scale",
+        type=float,
+        default=0.0,
         help="Variance-preserving rescale factor (0=disabled). Reference default: 0.7",
     )
     parser.add_argument(
-        "--guidance_skip_step", type=int, default=0,
+        "--guidance_skip_step",
+        type=int,
+        default=0,
         help="Skip guidance every N+1 steps (0=never skip)",
     )
     parser.add_argument(
-        "--enhance_prompt", action="store_true",
+        "--enhance_prompt",
+        action="store_true",
         help="Use Gemma3 to enhance the text prompt before encoding",
     )
 

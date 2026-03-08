@@ -195,7 +195,10 @@ class PipelineLoader:
         if text_encoder_path:
             extra_kwargs["text_encoder_path"] = text_encoder_path
         pipeline.load_standard_components(
-            checkpoint_dir, self.device, skip_components, **extra_kwargs,
+            checkpoint_dir,
+            self.device,
+            skip_components,
+            **extra_kwargs,
         )
         logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
