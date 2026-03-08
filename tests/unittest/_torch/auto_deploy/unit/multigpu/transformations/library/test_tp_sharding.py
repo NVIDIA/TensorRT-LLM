@@ -287,14 +287,10 @@ class GDN_Block(nn.Module):
         k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
         v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
 
-        # Repeat q, k to match num_v_heads when num_v_heads > num_k_heads (GQA)
-        if self.num_v_heads // self.num_k_heads > 1:
-            q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        beta = b_tensor.sigmoid()
-        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
+        # L2 norm, GQA repeat-interleave, and gating are handled inside the op
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q_conv, k_conv, v_conv, a, b_tensor, self.A_log, self.dt_bias
+        )
 
         # Gated norm on head_v_dim, then project
         attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
@@ -373,21 +369,33 @@ class GDN_Block_Unfused(nn.Module):
         k_conv = k_conv.reshape(b, s, k_conv.shape[-1] // self.head_k_dim, self.head_k_dim)
         v_conv = v_conv.reshape(b, s, v_conv.shape[-1] // self.head_v_dim, self.head_v_dim)
 
-        # 4. Repeat q, k to match num_v_heads when num_v_heads > num_k_heads (GQA)
-        if self.num_v_heads // self.num_k_heads > 1:
-            q_conv = q_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            k_conv = k_conv.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
+        # 4. Gated delta rule (L2 norm, GQA expand, gating handled inside the op)
+        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            q_conv, k_conv, v_conv, a, b_tensor, self.A_log, self.dt_bias
+        )
 
-        # 5. Gated delta rule
-        beta = b_tensor.sigmoid()
-        g = -self.A_log.exp() * F.softplus(a + self.dt_bias)
-        attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(q_conv, k_conv, v_conv, g, beta)
-
-        # 6. Gated norm on head_v_dim, then project
+        # 5. Gated norm on head_v_dim, then project
         attn_out_flat = attn_out.reshape(-1, self.head_v_dim)
         z_flat = z.reshape(-1, self.head_v_dim)
         normed = self.norm(attn_out_flat) * z_flat
         return self.out_proj(normed.reshape(b, s, -1))
+
+
+class FineGrainedFP8MLP(nn.Module):
+    """MLP using FineGrainedFP8 quantization for testing."""
+
+    def __init__(self, in_features, out_features, bias=False):
+        super().__init__()
+        self.in_features = in_features
+        self.out_features = out_features
+        # Use larger features divisible by block size (128)
+        hidden_features = max(4 * in_features, 128)
+        self.linear1 = FakeFineGrainedFP8Linear(in_features, hidden_features, bias=bias)
+        self.linear2 = FakeFineGrainedFP8Linear(hidden_features, out_features, bias=bias)
+
+    def forward(self, x):
+        y = F.relu(self.linear1(x))
+        return self.linear2(y)
 
 
 def _run_sharding_execution_job(
@@ -505,7 +513,6 @@ def _run_sharding_execution_job(
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
         )
-        # update the tp_plan in predefined_config to force simple sharding of the single linear layer
         predefined_config = {"tp_plan": {"*": "gather"}}
     elif model_cls == FineGrainedFP8MLP:
         # FineGrainedFP8MLP needs features divisible by 128 (block size)
@@ -728,7 +735,6 @@ def _run_pattern_detection_job(
         model = model_cls(num_features, num_features, bias=bias).to(
             device="cuda", dtype=torch.float16
         )
-        # update the tp_plan in predefined_config to force simple sharding of the single linear layer
         predefined_config = {"tp_plan": {"*": "gather"}}
     elif model_cls == FineGrainedFP8MLP:
         # FineGrainedFP8MLP needs features divisible by 128 (block size)

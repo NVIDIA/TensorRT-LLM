@@ -1,38 +1,15 @@
 runtime: trtllm
 compile_backend: torch-cudagraph
-max_seq_len: 4096
+max_seq_len: 8192
 max_num_tokens: 4096
 max_batch_size: 512
-world_size: 2
+world_size: 4
+cuda_graph_batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 512]
 enable_chunked_prefill: true
 model_factory: AutoModelForCausalLM
 kv_cache_config:
   enable_block_reuse: false
-  free_gpu_memory_fraction: 0.95
+  free_gpu_memory_fraction: 0.8
   tokens_per_block: 64
 model_kwargs:
   torch_dtype: bfloat16
-  # text_config:
-  #   num_hidden_layers: 6
-  # vision_config:
-  #   depth: 2
-transforms:
-  detect_sharding:
-    sharding_dims: ['tp','ep', 'bmm']
-    # use only manual config for TP sharding
-    sharding_source: ['manual']
-    manual_config:
-      tp_plan:
-        # GDN layer
-        "in_proj_qkv": "delta"
-        # attention layer
-        "q_proj": "colwise"
-        "k_proj": "colwise"
-        "v_proj": "colwise"
-        "o_proj": "rowwise"
-        # replicating shared experts (keep them commented out)
-        # "shared_expert_gate_proj": "colwise"
-        # "shared_expert_up_proj": "colwise"
-        # "shared_expert_down_proj": "rowwise"
-        # gating layer should be replicated as well
-        # "gate": "gather"

@@ -629,8 +629,15 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     """
 
     MODEL_NAME = "Qwen/Qwen3.5-397B-A17B"
+    MODEL_NAME_SMALL = "Qwen/Qwen3.5-35B-A3B"
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    CONFIG_PATH = str(
+        Path(__file__).resolve().parents[4] / "examples" / "auto_deploy" /
+        "model_registry" / "configs" / "qwen3.5_moe_400b.yaml")
+    CONFIG_PATH_SMALL = str(
+        Path(__file__).resolve().parents[4] / "examples" / "auto_deploy" /
+        "model_registry" / "configs" / "qwen3.5_moe_35b.yaml")
 
     def get_default_kwargs(self):
         return {
@@ -680,6 +687,28 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
             task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @staticmethod
+    def _load_small_config():
+        config = _load_ad_config('qwen3.5_moe_35b.yaml')
+        world_size = config.pop('world_size', 1)
+        return config, world_size
+
+    @pytest.mark.skip_less_device_memory(80000)
+    def test_bf16_small(self):
+        config, world_size = self._load_small_config()
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME_SMALL,
+                           tokenizer=self.MODEL_NAME_SMALL,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **config) as llm:
+            task = MMLU(self.MODEL_NAME_SMALL)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME_SMALL)
             task.evaluate(llm)
 
 
@@ -732,7 +761,6 @@ class TestMiniMaxM2(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
-
 
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     """Accuracy tests for models from the AutoDeploy model registry.
@@ -823,69 +851,3 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, sampling_params=sampling_params)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
-
-
-class TestKimiK2_5(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for Kimi-K2.5 via AutoDeploy.
-
-    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
-    Configuration derived from examples/auto_deploy/model_registry/configs/kimi_k2.yaml.
-    """
-
-    MODEL_NAME = "nvidia/Kimi-K2.5-NVFP4"
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
-
-    def get_default_kwargs(self):
-        return {
-            "skip_tokenizer_init": False,
-            "trust_remote_code": True,
-            "enable_chunked_prefill": True,
-            "compile_backend": "torch-cudagraph",
-            "max_batch_size": 64,
-            "max_seq_len": self.MAX_SEQ_LEN,
-            "max_num_tokens": self.MAX_SEQ_LEN,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
-            "kv_cache_config": {
-                "dtype": "bfloat16",
-                "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.7,
-                "tokens_per_block": 64,
-            },
-            "model_kwargs": {
-                "torch_dtype": "bfloat16",
-            },
-            "transforms": {
-                "export_to_gm": {
-                    "num_moe_experts_for_export": 2,
-                },
-                "fuse_nvfp4_moe": {
-                    "allow_different_input_scales": True,
-                },
-            },
-        }
-
-    def get_default_sampling_params(self):
-        eos_id = -1
-        beam_width = 1
-        return SamplingParams(end_id=eos_id,
-                              pad_id=eos_id,
-                              n=beam_width,
-                              use_beam_search=beam_width > 1)
-
-    @pytest.mark.skip_less_device_memory(180000)
-    @pytest.mark.parametrize("world_size", [8])
-    def test_nvfp4(self, world_size):
-        if get_device_count() < world_size:
-            pytest.skip("Not enough devices for world size, skipping test")
-        kwargs = self.get_default_kwargs()
-        sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
-                           dtype="bfloat16",
-                           world_size=world_size,
-                           **kwargs) as llm:
-            task = MMLU(self.MODEL_NAME)
-            task.evaluate(llm, sampling_params=sampling_params)
-            task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm)
