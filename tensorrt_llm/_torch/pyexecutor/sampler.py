@@ -2567,23 +2567,87 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         return num_accepted_draft_tokens - 1
 
+    def _batch_verify_dynamic_tree(
+        self,
+        generation_requests: list[LlmRequest],
+        new_tokens: torch.Tensor,
+        spec_tree_manager: SpecTreeManager,
+    ) -> dict[int, tuple[int, torch.Tensor]]:
+        """Batch verify dynamic tree using CUDA kernel."""
+        N = spec_tree_manager.max_total_draft_tokens + 1
+        num_trees = spec_tree_manager.retrieve_index.shape[0]
+
+        eligible_slots = []
+        eligible_drafts = []
+        for req in generation_requests:
+            if (
+                req.state == LlmRequestState.GENERATION_COMPLETE
+                or req.sampling_config.beam_width > 1
+                or get_draft_token_length(req) == 0
+            ):
+                continue
+            eligible_slots.append(req.py_seq_slot)
+            eligible_drafts.append([int(t) for t in req.py_draft_tokens])
+
+        if not eligible_slots:
+            return {}
+
+        candidates = torch.zeros(num_trees, N, dtype=torch.int64, device="cuda")
+        slots_t = torch.tensor(eligible_slots, dtype=torch.long, device="cuda")
+        candidates[slots_t, 1:] = torch.tensor(eligible_drafts, dtype=torch.int64, device="cuda")
+
+        target_predict = (
+            new_tokens[:, :num_trees, 0].T.contiguous().to(dtype=torch.int64, device="cuda")
+        )
+        candidates[:, 0] = target_predict[:, 0]
+
+        _, accept_index, accept_token_num = torch.ops.trtllm.verify_dynamic_tree_greedy_op(
+            candidates,
+            spec_tree_manager.retrieve_index,
+            spec_tree_manager.retrieve_next_token,
+            spec_tree_manager.retrieve_next_sibling,
+            target_predict,
+            spec_tree_manager.max_draft_len + 1,
+        )
+
+        return {
+            slot: (int(accept_token_num[slot].item()), accept_index[slot])
+            for slot in eligible_slots
+        }
+
+    def _process_draft_tokens_dynamic_tree(
+        self,
+        request: LlmRequest,
+        new_tokens_list: list[list[list[int]]],
+        finish_reasons: FinishReasonsList,
+        verify_result: tuple[int, torch.Tensor],
+    ) -> int:
+        """Process a single request using pre-computed CUDA kernel verification result."""
+        num_accepted, accept_index = verify_result
+        num_added = 0
+        for j in range(num_accepted + 1):
+            step = int(accept_index[j].item())
+            add_token(request, new_tokens_list, beam_idx=DEFAULT_BEAM_IDX, step=step)
+            num_added += 1
+            if self.finish_if_reason(request, finish_reasons, step=step, beam_idx=DEFAULT_BEAM_IDX):
+                break
+        request.py_num_accepted_draft_tokens_indices = [
+            int(accept_index[j].item()) - 1 for j in range(1, min(num_added, num_accepted + 1))
+        ]
+        return num_added - 1
+
     @staticmethod
     def _is_new_request(request: LlmRequest) -> bool:
         return (
             not request.is_finished
             and not request.py_is_draft
             and (
-                # NB: sample_async currently receives logits corresponding to other prefill chunks,
-                #     not only the last chunk. Therefore, this cannot be conditioned on
-                #     request.is_last_context_chunk. Instead, each context chunk is treated as a
-                #     "new" request.
                 request.is_context_init_state or request.is_disagg_generation_transmission_complete
             )
         )
 
     @classmethod
     def _filter_new_requests(cls, scheduled_requests: ScheduledRequests) -> Iterable[LlmRequest]:
-        # list is faster than generator
         return [
             request
             for request in scheduled_requests.context_requests
@@ -2853,6 +2917,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     spec_tree_manager=spec_tree_manager,
                 )
             else:
+                # come here
                 num_accepted = self._process_draft_tokens_greedy(
                     request, new_tokens=new_tokens_list, finish_reasons=finish_reasons
                 )
@@ -3206,7 +3271,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             state.sampler_event.synchronize()
 
         assert state.host is not None
-        new_tokens = state.host.new_tokens
+        new_tokens = state.host.new_tokens  # torch.Size([5, 2048, 1])
         finish_reasons = state.host.finish_reasons_list()
 
         new_tokens_list = new_tokens.tolist()
@@ -3242,6 +3307,14 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._handle_finish_reasons(req, state.host.finish_reasons, finish_reasons)
             req.py_decoding_iter += 1
 
+        # Batch verify dynamic tree before per-request loop
+        spec_tree_manager = self.get_spec_tree_manager(resource_manager)
+        dynamic_tree_results: dict[int, tuple[int, torch.Tensor]] = {}
+        if spec_tree_manager is not None and spec_tree_manager.use_dynamic_tree:
+            dynamic_tree_results = self._batch_verify_dynamic_tree(
+                state.scheduled_requests.generation_requests, new_tokens, spec_tree_manager
+            )
+
         for req_idx, req in enumerate(
             state.scheduled_requests.generation_requests,
             len(state.scheduled_requests.context_requests),
@@ -3262,13 +3335,19 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 req.py_rewind_len = 0
             else:
                 processed = 1
-                num_accepted = self.process_draft_tokens(
-                    req,
-                    new_tokens_tensor=new_tokens,
-                    new_tokens_list=new_tokens_list,
-                    finish_reasons=finish_reasons,
-                    resource_manager=resource_manager,
-                )
+                if req.py_seq_slot in dynamic_tree_results:
+                    num_accepted = self._process_draft_tokens_dynamic_tree(
+                        req, new_tokens_list, finish_reasons, dynamic_tree_results[req.py_seq_slot]
+                    )
+
+                else:
+                    num_accepted = self.process_draft_tokens(
+                        req,
+                        new_tokens_tensor=new_tokens,
+                        new_tokens_list=new_tokens_list,
+                        finish_reasons=finish_reasons,
+                        resource_manager=resource_manager,
+                    )
                 if get_draft_token_length(req) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
                     actual_draft_len = get_draft_token_length(req)
