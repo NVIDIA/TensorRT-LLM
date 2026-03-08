@@ -128,33 +128,25 @@ class TritonEPRouter():
     def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
                          slice_start, slice_end):
         from triton_kernels.compaction import compaction
-        from triton_kernels.routing import _routing_clear_bitmatrix
         n_tokens_pad = expt_scal.shape[0]
         _routing_shift_bitmatrix_range[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
+            bitmatrix.mask.storage.data,
+            bitmatrix.mask.storage.data.stride(0),
+            bitmatrix.mask.storage.data.stride(1),
             expt_indx,
             expt_indx.stride(0),
             expt_indx.stride(1),
-            bitmatrix.storage.data.shape[1],
+            bitmatrix.mask.storage.data.shape[1],
             expt_indx.shape[1],
             slice_start,
             slice_end,
             BLOCK_N=512,
         )
-        _routing_clear_bitmatrix[(n_tokens_pad, )](
-            bitmatrix.storage.data,
-            bitmatrix.storage.data.stride(0),
-            bitmatrix.storage.data.stride(1),
-            bitmatrix.storage.data.shape[1],
-            slice_end - slice_start,
-            BLOCK_N=512,
-        )
-        # perform compaction to update expt_scal / expt_indx
-        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix)
+        # _routing_clear_bitmatrix removed in triton_kernels 3.6.0
+        # compaction handles inactive entries via sentinel values
+        expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix.mask)
         n_expts_tot = slice_end - slice_start
-        bitmatrix.shape[-1] = n_expts_tot
+        bitmatrix.mask.shape[-1] = n_expts_tot
         return expt_scal, expt_indx, bitmatrix
 
     def __call__(self,
@@ -165,29 +157,53 @@ class TritonEPRouter():
                  ep=1,
                  node_idx=0,
                  n_rows=None):
+        from triton_kernels.matmul_ogs import GatherIndx, RoutingData, ScatterIndx
+        from triton_kernels.tensor import make_ragged_tensor_metadata
+        from triton_kernels.topk import topk
+
         n_expts_tot = logits.shape[-1]
         n_expts_local = n_expts_tot // ep
         slice_start = node_idx * n_expts_local
         slice_end = slice_start + n_expts_local
 
-        from triton_kernels.routing import routing_from_bitmatrix
-        from triton_kernels.topk import topk
         if sm_first:
             logits = torch.softmax(logits, dim=-1)
+
         bitmatrix = topk(logits,
                          n_expts_act,
                          apply_softmax=not sm_first,
                          y_indx=expt_indx,
                          n_rows=n_rows)
-        expt_scal = bitmatrix.expt_scal
-        expt_indx = bitmatrix.expt_indx
-        # mutate bitmatrix
+        expt_scal = bitmatrix.vals
+        expt_indx = bitmatrix.indx
+
         if ep > 1:
             expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
                 expt_scal, expt_indx, bitmatrix, n_expts_tot, slice_start,
                 slice_end)
-        return routing_from_bitmatrix(bitmatrix, expt_scal, expt_indx,
-                                      n_expts_local, n_expts_act)
+
+        metadata = bitmatrix.mask_metadata
+        n_total_rows = metadata.col_sum.sum().item()
+
+        expt_data = make_ragged_tensor_metadata(metadata.col_sum, n_total_rows)
+        gate_scal_sorted = expt_scal.reshape(-1)[metadata.col_sorted_indx]
+
+        rdata = RoutingData(
+            gate_scal=gate_scal_sorted,
+            expt_hist=metadata.col_sum,
+            n_expts_tot=n_expts_local,
+            n_expts_act=n_expts_act,
+            expt_data=expt_data,
+        )
+        gather_indx = GatherIndx(
+            src_indx=metadata.col_sorted_indx,
+            dst_indx=metadata.row_sorted_indx,
+        )
+        scatter_indx = ScatterIndx(
+            src_indx=metadata.row_sorted_indx,
+            dst_indx=metadata.col_sorted_indx,
+        )
+        return rdata, gather_indx, scatter_indx
 
 
 def maybe_update_stride(weight):
