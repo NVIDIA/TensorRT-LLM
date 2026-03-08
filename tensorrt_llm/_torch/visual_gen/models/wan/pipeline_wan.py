@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import Optional, Type
 
 import diffusers
 import torch
@@ -17,6 +17,7 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
+from .parallel_vae import WanParallelVAEAdapter
 from .transformer_wan import WanTransformer3DModel
 
 # Supported Wan T2V models:
@@ -86,21 +87,12 @@ class WanPipeline(BasePipeline):
 
         super().__init__(model_config)
 
-    def _compute_wan_timestep_embedding(self, module, timestep, guidance=None):
+    def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for WAN transformer.
 
         WAN uses a condition_embedder with timesteps_proj and time_embedder layers.
-        Handles dtype casting to match the embedder's dtype.
-
-        Args:
-            module: WanTransformer3DModel instance
-            timestep: Timestep tensor (shape: [batch_size])
-            guidance: Unused for WAN (no guidance embedding)
-
-        Returns:
-            Timestep embedding tensor used by TeaCache for distance calculation.
-            Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
-            calibration), or temb when use_ret_steps=False (standard mode).
+        Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
+        calibration), or temb when use_ret_steps=False (standard mode).
         """
         ce = module.condition_embedder
         t_freq = ce.timesteps_proj(timestep)
@@ -136,6 +128,10 @@ class WanPipeline(BasePipeline):
     def common_warmup_shapes(self) -> list:
         """Return list of common warmup shapes for the pipeline."""
         return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
+
+    @property
+    def vae_adapter_class(self) -> Type[WanParallelVAEAdapter]:
+        return WanParallelVAEAdapter
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
