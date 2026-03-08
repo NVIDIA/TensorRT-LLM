@@ -77,8 +77,7 @@ void indexer_topk_decode(th::Tensor const& logits, th::Tensor const& seq_lens, t
         TORCH_CHECK(preIdxTensor.is_cuda(), "pre_idx must be a CUDA tensor");
         TORCH_CHECK(preIdxTensor.is_contiguous(), "pre_idx must be contiguous");
         TORCH_CHECK(preIdxTensor.dim() == 2, "pre_idx must be a 2D Tensor");
-        TORCH_CHECK(preIdxTensor.size(0) * next_n == numRows64 || preIdxTensor.size(0) == numRows64,
-            "pre_idx first dimension must match logits.size(0) or logits.size(0)/next_n");
+        TORCH_CHECK(preIdxTensor.size(0) == numRows64, "pre_idx first dimension must match logits.size(0)");
         preIdxPtr = preIdxTensor.data_ptr<int32_t>();
         preIdxStride = static_cast<int32_t>(preIdxTensor.stride(0));
         preIdxCount = static_cast<int32_t>(preIdxTensor.size(1));
