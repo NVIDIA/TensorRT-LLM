@@ -7,6 +7,7 @@ import tensorrt_llm  # noqa: F401
 
 # Import CuTE DSL utils
 from tensorrt_llm._torch.cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
+from tensorrt_llm._torch.custom_ops import cute_dsl_custom_ops
 
 if not torch.cuda.is_available():
     pytest.skip("CUDA is required for indexer_topk tests", allow_module_level=True)
@@ -286,6 +287,11 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
     next_n_offset = torch.arange(num_gen_tokens, device="cuda") % next_n
 
     seq_lens = generate_seq_lens(batch_size, index_topk, num_tokens)
+    # Clamp seq_lens so that every effective row length >= index_topk.
+    # With next_n > 1, effective length = seq_len - next_n + offset + 1,
+    # and the minimum (offset=0) is seq_len - next_n + 1.
+    # Ensure seq_len >= next_n so effective length is at least 1.
+    seq_lens = seq_lens.clamp(min=next_n)
     row_ends = seq_lens[row_indices] - next_n + next_n_offset + 1
 
     logits = create_random_logits(row_starts, row_ends, dtype, 42)
@@ -382,3 +388,33 @@ def test_cute_dsl_indexer_topk_decode(batch_size, next_n, index_topk, num_tokens
             num_copy_bits=256,
         ),
     )
+
+
+@pytest.mark.skipif(not IS_CUTLASS_DSL_AVAILABLE, reason="CuTE DSL not available")
+@skip_pre_blackwell
+@pytest.mark.parametrize("batch_size", [1, 4, 8, 16, 32,64])
+@pytest.mark.parametrize("next_n", [1, 2, 3])
+@pytest.mark.parametrize("index_topk", [2048])
+@pytest.mark.parametrize("num_tokens", [32768, 65536, 131072, 262144])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+def test_cute_dsl_topk_decode_distributed(
+    batch_size, next_n, index_topk, num_tokens, dtype
+):
+    _run_cute_dsl_topk_test(
+        batch_size,
+        next_n,
+        index_topk,
+        num_tokens,
+        dtype,
+        lambda logits, seq_lens: cute_dsl_custom_ops.CuteDSLTopKDecodeDistributedRunner.forward(
+                input_values=logits,
+                seq_lens=seq_lens,
+                top_k=index_topk,
+                next_n=next_n,
+                return_val=False,
+                num_copy_bits=256,
+        )[0],
+    )
+
+test_cute_dsl_topk_decode_distributed(batch_size=16, next_n=3, index_topk=2048, num_tokens=65536, dtype=torch.float32)
+test_cute_dsl_topk_decode_distributed(batch_size=16, next_n=3, index_topk=2048, num_tokens=262144, dtype=torch.float32)

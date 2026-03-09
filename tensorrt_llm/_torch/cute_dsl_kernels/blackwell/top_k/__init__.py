@@ -14,10 +14,12 @@
 
 """CuTE DSL Top-K kernels for Blackwell architecture."""
 
+from .distributed_radix_topk import DistributedRadixTopKKernel
 from .filtered_top_k_decode_varlen import FilteredTopKKernelVarlenDecode
 from .filtered_top_k_varlen_util import FilteredTopKKernelVarlen
 
 __all__ = [
+    "DistributedRadixTopKKernel",
     "FilteredTopKKernelVarlen",
     "FilteredTopKKernelVarlenDecode",
 ]

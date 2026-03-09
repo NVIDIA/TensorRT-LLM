@@ -318,6 +318,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.top_k.distributed_radix_topk import (
+        STATE_SIZE as DISTRIBUTED_TOPK_STATE_SIZE,
+        DistributedRadixTopKKernel,
+    )
     from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
         FilteredTopKKernelVarlenDecode
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
@@ -3427,6 +3431,166 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             return output_indices_torch, output_values_torch
 
+    class CuteDSLTopKDecodeDistributedRunner:
+        """Runner for distributed radix top-k (FlashInfer-style fused multi-CTA).
+
+        All CTAs in a group cooperatively find the global pivot via multi-round
+        radix select with global histogram merging, then each CTA collects
+        results from its own chunk.  Single kernel launch, no intermediate
+        buffer, no merge kernel.
+
+        All methods are class-level — no instantiation needed.
+
+        Attributes:
+            kernel_cache: Class-level dict mapping config tuples to compiled
+                         kernels.
+        """
+        kernel_cache = dict()
+
+        @classmethod
+        def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
+                     ctas_per_group, num_sms, return_val):
+            """Compile and cache a distributed radix top-k kernel."""
+            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
+                   ctas_per_group, num_sms, return_val)
+            if key in cls.kernel_cache:
+                return
+            n_rows = cute.sym_int()
+            n_cols = cute.sym_int()
+            n_batch = cute.sym_int()
+            n_groups = cute.sym_int()
+
+            input_fake = cute.runtime.make_fake_compact_tensor(
+                dtype,
+                (n_rows, n_cols),
+                stride_order=(1, 0),
+                assumed_align=32,
+            )
+            row_states_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_groups, DISTRIBUTED_TOPK_STATE_SIZE),
+                stride_order=(1, 0),
+                assumed_align=32,
+            )
+            seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch,),
+                stride_order=(0,),
+            )
+            output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, top_k),
+                stride_order=(1, 0),
+            )
+            if return_val:
+                output_values_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype,
+                    (n_rows, top_k),
+                    stride_order=(1, 0),
+                )
+            else:
+                output_values_fake = None
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
+            kernel_obj = DistributedRadixTopKKernel(
+                dtype=dtype,
+                chunk_size=chunk_size,
+                top_k=top_k,
+                next_n=next_n,
+                num_copy_bits=num_copy_bits,
+                ctas_per_group=ctas_per_group,
+                num_sms=num_sms,
+            )
+            compiled_kernel = cute.compile(
+                kernel_obj,
+                input_fake,
+                row_states_fake,
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                options="--enable-tvm-ffi",
+            )
+            cls.kernel_cache[key] = compiled_kernel
+
+        @classmethod
+        def forward(
+            cls,
+            input_values: torch.Tensor,
+            seq_lens: torch.Tensor,
+            top_k: int,
+            next_n: int,
+            return_val: bool = False,
+            num_copy_bits: int = 256,
+        ):
+            """Execute distributed radix top-k selection."""
+            torch_dtype = input_values.dtype
+            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+            num_rows, num_cols = input_values.shape
+            num_sms = _get_num_sms()
+
+            # Compute chunk_size and ctas_per_group from smem capacity
+            max_smem = 48 * 1024  # 48 KB default
+            overhead = 256 * 4 * 2 + 16 + 8 * 4  # histograms + suffix + scalars + warp_sums
+            if dtype == cutlass.Float32:
+                ordered_elem_size = 4
+            else:
+                ordered_elem_size = 2
+            vec_size = num_copy_bits // dtype.width
+            max_chunk = (max_smem - overhead) // ordered_elem_size
+            # Align down to vec_size
+            max_chunk = (max_chunk // vec_size) * vec_size
+
+            ctas_per_group = math.ceil(num_cols / max_chunk)
+            if ctas_per_group < 1:
+                ctas_per_group = 1
+            chunk_size = math.ceil(num_cols / ctas_per_group)
+            # Align up to vec_size
+            chunk_size = ((chunk_size + vec_size - 1) // vec_size) * vec_size
+            # Cap at max_chunk
+            if chunk_size > max_chunk:
+                chunk_size = max_chunk
+
+            num_groups = min(num_sms // ctas_per_group, num_rows)
+            if num_groups < 1:
+                num_groups = 1
+            
+            logger.info(f"limin: num_rows: {num_rows}, num_cols: {num_cols}, num_groups: {num_groups}, ctas_per_group: {ctas_per_group}, chunk_size: {chunk_size}, max_chunk: {max_chunk}")
+            logger.info(f"seq_lens: {seq_lens}")
+
+            # Compile key
+            key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
+                   ctas_per_group, num_sms, return_val)
+            if key not in cls.kernel_cache:
+                cls._compile(dtype, chunk_size, top_k, next_n, num_copy_bits,
+                             ctas_per_group, num_sms, return_val)
+            compiled_kernel = cls.kernel_cache[key]
+
+            # Allocate row_states
+            row_states = torch.zeros(
+                num_groups, DISTRIBUTED_TOPK_STATE_SIZE,
+                dtype=torch.int32, device="cuda")
+
+            # Allocate outputs
+            output_indices = torch.empty(
+                num_rows, top_k, dtype=torch.int32, device="cuda")
+            if return_val:
+                output_values = torch.empty(
+                    num_rows, top_k, dtype=torch_dtype, device="cuda")
+            else:
+                output_values = None
+
+            compiled_kernel(
+                input_values,
+                row_states,
+                seq_lens,
+                output_indices,
+                output_values,
+            )
+
+            return output_indices, output_values
+
     @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
                              mutates_args=(),
                              device_types="cuda")
@@ -3536,6 +3700,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
+        distributed: bool = False,
     ) -> torch.Tensor:
         """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
 
@@ -3546,6 +3711,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
         only activates when single-CTA occupancy is genuinely low.
         Uses chunk_size_per_cta=16384 for multi-CTA.
 
+        When ``distributed=True``, uses the FlashInfer-style fused multi-CTA
+        distributed radix top-k kernel instead of the 2-pass multi-CTA approach.
+
         Based on benchmark results (Blackwell SM100, top_k=2048).
         See bench_cute_dsl_single_vs_multi_cta_topk.py.
 
@@ -3555,6 +3723,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
             top_k: Number of top elements to select (max 2048)
             next_n: Number of candidates per sequence (for speculative decoding)
             num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+            dynamic: Use dynamic multi-CTA scheduling (for 2-pass multi-CTA)
+            distributed: Use distributed radix top-k (fused single-pass multi-CTA)
 
         Returns:
             indices: Top-k indices [batch_size * next_n, top_k]
@@ -3578,7 +3748,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
             use_multi_cta = num_rows < num_sms // 4
 
-        if use_multi_cta:
+        if use_multi_cta and distributed:
+            indices, _ = CuteDSLTopKDecodeDistributedRunner.forward(
+                input_values=input_values,
+                seq_lens=seq_lens,
+                top_k=top_k,
+                next_n=next_n,
+                return_val=False,
+                num_copy_bits=num_copy_bits,
+            )
+        elif use_multi_cta:
             indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
                 input_values=input_values,
                 seq_lens=seq_lens,
@@ -3608,6 +3787,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
         next_n: int = 1,
         num_copy_bits: int = 256,
         dynamic: bool = True,
+        distributed: bool = False,
     ):
         num_rows = input_values.shape[0]
         indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
