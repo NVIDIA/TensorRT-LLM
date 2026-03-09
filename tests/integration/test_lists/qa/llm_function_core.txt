@@ -448,6 +448,8 @@ test_e2e.py::test_eagle3_output_repetition_4gpus[Qwen3/saved_models_Qwen3-235B-A
 unittest/llmapi/test_llm_pytorch.py::test_gemma3_1b_instruct_multi_lora
 llmapi/test_llm_examples.py::test_llmapi_server_example
 
+unittest/llmapi/test_tokenizer_multinode.py::test_trust_remote_code_tokenizer_pickle_roundtrip_multinode
+
 # e2e serve test
 examples/serve/test_serve.py::test_config_file_loading[--extra_llm_api_options]
 examples/serve/test_serve.py::test_config_file_loading[--config]
