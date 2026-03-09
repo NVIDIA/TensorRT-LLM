@@ -66,7 +66,7 @@ class ExtractorConfig:
 
     Attributes:
         model_class_name: Model class name (e.g., "LTX2VideoTransformer3DModel")
-        timestep_embed_fn: Callable(module, timestep, guidance=None) -> Tensor
+        timestep_embed_fn: Callable(module, **forward_kwargs) -> Tensor
         timestep_param_name: Parameter name for timestep in forward() (default: "timestep")
         guidance_param_name: Parameter name for guidance if used (default: None)
         forward_params: List of parameter names (None = auto-introspect from forward signature)
@@ -115,25 +115,16 @@ class GenericExtractor:
         return extracted
 
     def _compute_timestep_embedding(self, module: torch.nn.Module, params: Dict) -> torch.Tensor:
-        """Compute timestep embedding using configured callable."""
+        """Compute timestep embedding using configured callable.
+
+        Unpacks the forward params as kwargs to the model-specific embed function,
+        which declares only the parameters it needs (e.g., timestep, hidden_states).
+        """
         timestep = params.get(self.config.timestep_param_name)
         if timestep is None:
             raise ValueError(f"Missing required parameter: {self.config.timestep_param_name}")
 
-        # Flatten timestep if needed (common pattern)
-        timestep_flat = timestep.flatten() if timestep.ndim == 2 else timestep
-        guidance = (
-            params.get(self.config.guidance_param_name) if self.config.guidance_param_name else None
-        )
-
-        # Call configured timestep embedding function
-        try:
-            return self.config.timestep_embed_fn(module, timestep_flat, guidance)
-        except Exception as e:
-            logger.error(f"Timestep embedder failed: {e}")
-            # Last resort: use timestep as-is
-            logger.warning("Using timestep fallback")
-            return timestep_flat.unsqueeze(-1) if timestep_flat.ndim == 1 else timestep_flat
+        return self.config.timestep_embed_fn(module, **params)
 
     def __call__(self, module: torch.nn.Module, *args, **kwargs) -> CacheContext:
         """Main extractor logic - called by TeaCacheHook.

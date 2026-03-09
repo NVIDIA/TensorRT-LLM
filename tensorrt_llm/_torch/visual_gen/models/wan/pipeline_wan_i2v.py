@@ -109,7 +109,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         super().__init__(model_config)
 
-    def _compute_wan_timestep_embedding(self, module, timestep, guidance=None):
+    def _compute_wan_timestep_embedding(self, module, timestep=None, **kwargs):
         """Compute timestep embedding for Wan I2V transformer.
 
         Returns timestep_proj when use_ret_steps=True (matches ret_steps coefficient
