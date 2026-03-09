@@ -12,13 +12,13 @@ from .checkpoints import WeightLoader
 from .config import (
     AttentionConfig,
     CudaGraphConfig,
-    DiffusionArgs,
     DiffusionModelConfig,
     ParallelConfig,
     PipelineComponent,
     PipelineConfig,
     TeaCacheConfig,
     TorchCompileConfig,
+    VisualGenArgs,
     discover_pipeline_components,
 )
 from .models import AutoPipeline, BasePipeline, WanPipeline
@@ -28,7 +28,7 @@ __all__ = [
     # Config classes
     "TorchCompileConfig",
     "CudaGraphConfig",
-    "DiffusionArgs",
+    "VisualGenArgs",
     "DiffusionModelConfig",
     "ParallelConfig",
     "PipelineComponent",

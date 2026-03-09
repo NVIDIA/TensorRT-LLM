@@ -67,7 +67,6 @@ _SMALL_GEN_PARAMS = {
 def _make_visual_gen_options(**extra) -> dict:
     """Build a minimal VisualGen YAML config dict."""
     config = {
-        "linear": {"type": "default"},
         "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
     }
     config.update(extra)

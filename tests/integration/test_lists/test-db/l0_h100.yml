@@ -240,6 +240,7 @@ l0_h100:
   - unittest/llmapi/test_llm_quant.py # 5.5 mins on H100
   - test_e2e.py::test_mistral_large_hidden_vocab_size
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - unittest/trt/attention/test_gpt_attention_IFB.py
   - accuracy/test_cli_flow.py::TestLlama3_1_8BInstruct::test_fp8_prequantized
   - accuracy/test_cli_flow.py::TestLlama2_7B::test_fp8

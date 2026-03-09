@@ -20,11 +20,11 @@ from parameterized import parameterized
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
-    DiffusionArgs,
     DiffusionModelConfig,
     ParallelConfig,
     PipelineComponent,
     TeaCacheConfig,
+    VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.transformer_wan import WanTransformer3DModel
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -149,11 +149,11 @@ def _run_cfg_worker(rank, world_size, checkpoint_path, inputs_list, return_dict)
     try:
         setup_distributed(rank, world_size)
 
-        from tensorrt_llm._torch.visual_gen.config import DiffusionArgs, ParallelConfig
+        from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
         # Load pipeline with CFG parallel
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -253,7 +253,7 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_list
         setup_distributed(rank, world_size)
 
         # Load pipeline with ALL optimizations
-        args_full = DiffusionArgs(
+        args_full = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -768,7 +768,7 @@ class TestWanPipeline:
                 "This test requires Wan 2.1 checkpoint (single-stage). Use DIFFUSION_MODEL_PATH with '2.1' in the path."
             )
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -821,7 +821,7 @@ class TestWanPipeline:
                 "This test requires Wan 2.1 checkpoint. Use DIFFUSION_MODEL_PATH with '2.1' in the path."
             )
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -856,7 +856,7 @@ class TestWanPipeline:
 
         from tensorrt_llm.quantization.utils import fp4_utils
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -910,7 +910,7 @@ class TestWanPipeline:
         # =====================================================================
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
 
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -922,7 +922,7 @@ class TestWanPipeline:
         # =====================================================================
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
 
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1028,7 +1028,7 @@ class TestWanPipeline:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1047,7 +1047,7 @@ class TestWanPipeline:
         # Load FP8
         torch.cuda.reset_peak_memory_stats()
 
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1098,7 +1098,7 @@ class TestWanPipeline:
         # =====================================================================
         print("\n[E2E] Loading BF16 transformer...")
 
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1111,7 +1111,7 @@ class TestWanPipeline:
         # =====================================================================
         print(f"[E2E] Loading {quant_algo} transformer...")
 
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1268,7 +1268,7 @@ class TestWanPipeline:
 
         from tensorrt_llm._torch.visual_gen.config import AttentionConfig
 
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1282,7 +1282,7 @@ class TestWanPipeline:
         # =====================================================================
         print("[Attention Backend Test] Loading VANILLA transformer (explicit)...")
 
-        args_vanilla = DiffusionArgs(
+        args_vanilla = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1395,7 +1395,7 @@ class TestWanPipeline:
         # =====================================================================
         print("\n[Attention Backend Test] Loading TRTLLM transformer...")
 
-        args_trtllm = DiffusionArgs(
+        args_trtllm = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1505,7 +1505,7 @@ class TestWanPipeline:
         # Load Models
         # =====================================================================
         print("\n[Mixed Quant Accuracy] Loading BF16 model (reference)...")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1514,7 +1514,7 @@ class TestWanPipeline:
         pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         print(f"[Mixed Quant Accuracy] Loading mixed {quant_algo} model...")
-        args_fp8_mixed = DiffusionArgs(
+        args_fp8_mixed = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1630,7 +1630,7 @@ class TestWanPipeline:
 
         # Load BF16 reference model
         print(f"\n[BF16] Loading from {CHECKPOINT_PATH_WAN22_BF16}")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -1640,7 +1640,7 @@ class TestWanPipeline:
 
         # Load FP8 static quantized model (from pre-quantized checkpoint)
         print(f"\n[FP8 Static] Loading from {CHECKPOINT_PATH_WAN22_FP8}")
-        args_fp8_static = DiffusionArgs(
+        args_fp8_static = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_FP8,
             device="cuda",
             dtype="bfloat16",
@@ -1650,7 +1650,7 @@ class TestWanPipeline:
 
         # Load FP8 dynamic quantized model (from BF16 checkpoint with on-the-fly quant)
         print(f"\n[FP8 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_BF16} with dynamic quant")
-        args_fp8_dynamic = DiffusionArgs(
+        args_fp8_dynamic = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -1839,7 +1839,7 @@ class TestWanPipeline:
 
         # Load BF16 reference model
         print(f"\n[BF16] Loading from {CHECKPOINT_PATH_WAN22_BF16}")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -1849,7 +1849,7 @@ class TestWanPipeline:
 
         # Load NVFP4 static quantized model (from pre-quantized checkpoint)
         print(f"\n[NVFP4 Static] Loading from {CHECKPOINT_PATH_WAN22_NVFP4}")
-        args_nvfp4_static = DiffusionArgs(
+        args_nvfp4_static = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_NVFP4,
             device="cuda",
             dtype="bfloat16",
@@ -1859,7 +1859,7 @@ class TestWanPipeline:
 
         # Load NVFP4 dynamic quantized model (from BF16 checkpoint with on-the-fly quant)
         print(f"\n[NVFP4 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_BF16} with dynamic quant")
-        args_nvfp4_dynamic = DiffusionArgs(
+        args_nvfp4_dynamic = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -2076,7 +2076,7 @@ class TestWanPipeline:
 
         # Load BF16 reference model
         print(f"\n[BF16] Loading from {CHECKPOINT_PATH_WAN22_T2V}")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -2090,7 +2090,7 @@ class TestWanPipeline:
         static_bf16_modules = 0
         if have_nvfp4_static:
             print(f"\n[NVFP4 Static] Loading from {CHECKPOINT_PATH_WAN22_T2V_NVFP4}")
-            args_nvfp4_static = DiffusionArgs(
+            args_nvfp4_static = VisualGenArgs(
                 checkpoint_path=CHECKPOINT_PATH_WAN22_T2V_NVFP4,
                 device="cuda",
                 dtype="bfloat16",
@@ -2124,7 +2124,7 @@ class TestWanPipeline:
             f"\n[NVFP4 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_T2V} "
             f"with dynamic quant + ignore patterns"
         )
-        args_nvfp4_dynamic = DiffusionArgs(
+        args_nvfp4_dynamic = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -2435,7 +2435,7 @@ class TestWanOptimizations(unittest.TestCase):
 
         # Load HuggingFace baseline
         print("\n[1/4] Loading HuggingFace baseline...")
-        args_trtllm = DiffusionArgs(
+        args_trtllm = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -2479,7 +2479,7 @@ class TestWanOptimizations(unittest.TestCase):
 
         # Load TeaCache-enabled pipeline
         print("\n[2/4] Loading TeaCache-enabled TRT-LLM pipeline...")
-        args_teacache = DiffusionArgs(
+        args_teacache = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -2625,7 +2625,7 @@ class TestWanParallelism(unittest.TestCase):
 
         # Load standard CFG baseline on GPU 0
         print("\n[1/3] Loading standard CFG baseline (cfg_size=1) on GPU 0...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
@@ -2819,7 +2819,7 @@ class TestWanCombinedOptimizations(unittest.TestCase):
 
         # Load baseline on GPU 0 (no optimizations, standard CFG)
         print("\n[1/3] Loading baseline on GPU 0 (standard CFG, no optimizations)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
@@ -2988,7 +2988,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("WAN 2.2 TWO-STAGE PIPELINE INITIALIZATION TEST")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3036,7 +3036,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("WAN 2.2 TRANSFORMER SELECTION LOGIC TEST")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3132,7 +3132,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("WAN 2.2 CUSTOM BOUNDARY_RATIO TEST")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3183,7 +3183,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("WAN 2.2 GUIDANCE_SCALE_2 SUPPORT TEST")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3219,7 +3219,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("WAN 2.2 TWO-STAGE + FP8 QUANTIZATION TEST")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3271,7 +3271,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("WAN 2.2 TWO-STAGE + TRTLLM ATTENTION TEST")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3338,7 +3338,7 @@ class TestWanTwoStageTransformer(unittest.TestCase):
         print("FP8 + TRTLLM Attention (TeaCache not supported for Wan 2.2)")
         print("=" * 80)
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
             device="cuda",
             dtype="bfloat16",
@@ -3422,7 +3422,7 @@ class TestWanRobustness(unittest.TestCase):
     def test_invalid_quant_config(self):
         """Test that invalid quantization config raises appropriate error."""
         with pytest.raises((ValueError, KeyError)):
-            args = DiffusionArgs(
+            args = VisualGenArgs(
                 checkpoint_path=CHECKPOINT_PATH,
                 device="cuda",
                 dtype="bfloat16",

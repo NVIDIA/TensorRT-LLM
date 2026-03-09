@@ -1,5 +1,3 @@
-linear:
-  type: default
 teacache:
    enable_teacache: true
    teacache_thresh: 0.2

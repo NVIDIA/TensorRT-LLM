@@ -18,10 +18,9 @@ from torch.cuda import device_count
 from tensorrt_llm import LLM as PyTorchLLM
 from tensorrt_llm import MultimodalEncoder
 from tensorrt_llm._tensorrt_engine import LLM
+from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._utils import mpi_rank
-from tensorrt_llm.commands.utils import (get_is_diffusion_model,
-                                         get_visual_gen_model_type,
-                                         get_visual_gen_num_gpus)
+from tensorrt_llm.commands.utils import get_is_diffusion_model
 from tensorrt_llm.executor.utils import LlmLauncherEnvs
 from tensorrt_llm.inputs.multimodal import MultimodalServerConfig
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -452,7 +451,8 @@ def launch_mm_encoder_server(
 def launch_visual_gen_server(
     host: str,
     port: int,
-    visual_gen_config: dict,
+    model: str,
+    diffusion_args: Optional[VisualGenArgs] = None,
     metadata_server_cfg: Optional[MetadataServerConfig] = None,
 ):
     """Launch a VISUAL_GEN model server for image/video generation.
@@ -460,23 +460,22 @@ def launch_visual_gen_server(
     Args:
         host: Server hostname.
         port: Server port.
-        visual_gen_config: Arguments for VISUAL_GEN model initialization.
+        model: Model path or HuggingFace Hub model ID.
+        diffusion_args: Optional validated VisualGenArgs for model configuration.
         metadata_server_cfg: Optional metadata server configuration.
     """
-    model = visual_gen_config["model"]
     logger.info(f"Initializing VisualGen ({model})")
 
-    n_workers = get_visual_gen_num_gpus(visual_gen_config)
-    parallel_config = visual_gen_config.get("parallel", {})
-    if parallel_config:
-        logger.info(f"World size: {n_workers}")
-        logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
-        logger.info(
-            f"Ulysses size: {parallel_config.get('dit_ulysses_size', 1)}")
-
     visual_gen_model = VisualGen(model_path=model,
-                                 n_workers=n_workers,
-                                 diffusion_config=visual_gen_config)
+                                 diffusion_args=diffusion_args)
+
+    n_workers = visual_gen_model.diffusion_args.parallel.n_workers
+    logger.info(f"World size: {n_workers}")
+    logger.info(
+        f"CFG size: {visual_gen_model.diffusion_args.parallel.dit_cfg_size}")
+    logger.info(
+        f"Ulysses size: {visual_gen_model.diffusion_args.parallel.dit_ulysses_size}"
+    )
 
     server = OpenAIServer(generator=visual_gen_model,
                           model=model,
@@ -873,22 +872,17 @@ def serve(
                           served_model_name=served_model_name)
 
     def _serve_visual_gen():
-        visual_gen_config = {
-            "model": model,
-            "model_type": get_visual_gen_model_type(model),
-        }
-
-        visual_gen_extra_args = {}
+        extra_args = {}
         if extra_visual_gen_options is not None:
             with open(extra_visual_gen_options, 'r') as f:
-                visual_gen_extra_args = yaml.safe_load(f)
+                extra_args = yaml.safe_load(f) or {}
 
-        visual_gen_config.update(visual_gen_extra_args)
+        diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
 
         metadata_server_cfg = parse_metadata_server_config_file(
             metadata_server_config_file)
 
-        launch_visual_gen_server(host, port, visual_gen_config,
+        launch_visual_gen_server(host, port, model, diffusion_args,
                                  metadata_server_cfg)
 
     if get_is_diffusion_model(model):

@@ -33,10 +33,10 @@ from PIL import Image
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
-    DiffusionArgs,
     DiffusionModelConfig,
     ParallelConfig,
     TeaCacheConfig,
+    VisualGenArgs,
 )
 from tensorrt_llm._torch.visual_gen.models.wan.pipeline_wan_i2v import WanImageToVideoPipeline
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
@@ -103,7 +103,7 @@ def wan21_i2v_pipeline_bf16():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -123,7 +123,7 @@ def wan21_i2v_pipeline_fp8():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -144,7 +144,7 @@ def wan21_i2v_pipeline_fp8_blockwise():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -165,7 +165,7 @@ def wan21_i2v_pipeline_with_image_encoder():
     if not is_wan21_checkpoint():
         pytest.skip("This fixture requires Wan 2.1 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -185,7 +185,7 @@ def wan22_i2v_pipeline_bf16():
     if not is_wan22_checkpoint():
         pytest.skip("This fixture requires Wan 2.2 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -205,7 +205,7 @@ def wan22_i2v_pipeline_fp8():
     if not is_wan22_checkpoint():
         pytest.skip("This fixture requires Wan 2.2 checkpoint")
 
-    args = DiffusionArgs(
+    args = VisualGenArgs(
         checkpoint_path=CHECKPOINT_PATH,
         device="cuda",
         dtype="bfloat16",
@@ -269,11 +269,11 @@ def _run_cfg_worker_i2v(rank, world_size, checkpoint_path, inputs_list, return_d
     try:
         setup_distributed(rank, world_size)
 
-        from tensorrt_llm._torch.visual_gen.config import DiffusionArgs, ParallelConfig
+        from tensorrt_llm._torch.visual_gen.config import ParallelConfig, VisualGenArgs
         from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
         # Load I2V pipeline with CFG parallel
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -376,7 +376,7 @@ def _run_all_optimizations_worker_i2v(rank, world_size, checkpoint_path, inputs_
         setup_distributed(rank, world_size)
 
         # Load I2V pipeline with ALL optimizations
-        args_full = DiffusionArgs(
+        args_full = VisualGenArgs(
             checkpoint_path=checkpoint_path,
             device=f"cuda:{rank}",
             dtype="bfloat16",
@@ -641,7 +641,7 @@ class TestWanI2VIntegration:
         if not is_wan21_checkpoint():
             pytest.skip("This test requires Wan 2.1 checkpoint")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -693,7 +693,7 @@ class TestWanI2VIntegration:
         if not is_wan21_checkpoint():
             pytest.skip("This test requires Wan 2.1 checkpoint")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -738,7 +738,7 @@ class TestWanI2VIntegration:
         if not is_wan21_checkpoint():
             pytest.skip("This test requires Wan 2.1 checkpoint")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -973,8 +973,8 @@ class TestWanI2VTwoStage:
         ):
             pytest.skip("Not a two-stage checkpoint")
 
-        # Load pipeline with all supported optimizations (no TeaCache for Wan 2.2)
-        args = DiffusionArgs(
+        # Load pipeline with all optimizations
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1021,7 +1021,7 @@ class TestWanI2VRobustness:
     def test_invalid_quant_config(self):
         """Test that invalid quantization config raises appropriate error."""
         with pytest.raises((ValueError, KeyError)):
-            args = DiffusionArgs(
+            args = VisualGenArgs(
                 checkpoint_path=CHECKPOINT_PATH,
                 device="cuda",
                 dtype="bfloat16",
@@ -1036,7 +1036,7 @@ class TestWanI2VRobustness:
         if not CHECKPOINT_PATH or not os.path.exists(CHECKPOINT_PATH):
             pytest.skip("DIFFUSION_MODEL_PATH not set")
 
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
@@ -1115,7 +1115,7 @@ class TestWanI2VParallelism(unittest.TestCase):
 
         # Load standard CFG baseline on GPU 0
         print("\n[1/3] Loading standard CFG I2V baseline (cfg_size=1) on GPU 0...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",
@@ -1326,7 +1326,7 @@ class TestWanI2VCombinedOptimizations(unittest.TestCase):
 
         # Load baseline on GPU 0 (no optimizations, standard CFG)
         print("\n[1/3] Loading I2V baseline on GPU 0 (standard CFG, no optimizations)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda:0",
             dtype="bfloat16",

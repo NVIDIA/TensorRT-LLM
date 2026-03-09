@@ -183,7 +183,6 @@ def _ffmpeg_available() -> bool:
 def _make_visual_gen_options(**extra) -> dict:
     """Build the YAML dict passed via ``--extra_visual_gen_options``."""
     config = {
-        "linear": {"type": "default"},
         "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
     }
     config.update(extra)

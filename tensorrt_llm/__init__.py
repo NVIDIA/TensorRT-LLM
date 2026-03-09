@@ -114,6 +114,7 @@ import tensorrt_llm.tools as tools
 
 from ._common import _init, default_net, default_trtnet, precision
 from ._mnnvl_utils import MnnvlMemory, MnnvlMoe, MoEAlltoallInfo
+from ._torch.visual_gen.config import VisualGenArgs
 from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
                      mpi_barrier, mpi_comm, mpi_rank, mpi_world_size,
                      set_mpi_comm, str_dtype_to_torch, str_dtype_to_trt,
@@ -121,7 +122,7 @@ from ._utils import (default_gpus_per_node, local_mpi_rank, local_mpi_size,
 from .builder import BuildConfig, Builder, BuilderConfig, build
 from .disaggregated_params import DisaggregatedParams
 from .functional import Tensor, constant
-from .llmapi import LLM, AsyncLLM, MultimodalEncoder
+from .llmapi import LLM, AsyncLLM, MultimodalEncoder, VisualGen, VisualGenParams
 from .llmapi.llm_args import LlmArgs, TorchLlmArgs, TrtLlmArgs
 from .logger import logger
 from .mapping import Mapping
@@ -179,9 +180,12 @@ __all__ = [
     'TorchLlmArgs',
     'TrtLlmArgs',
     'SamplingParams',
+    'VisualGenArgs',
     'DisaggregatedParams',
     'KvCacheConfig',
     'math_utils',
+    'VisualGen',
+    'VisualGenParams',
     '__version__',
 ]
 

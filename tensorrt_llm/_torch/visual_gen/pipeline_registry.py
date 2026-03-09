@@ -1,6 +1,6 @@
 """Pipeline registry for unified config flow.
 
-Follows: DiffusionArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
+Follows: VisualGenArgs → PipelineLoader → DiffusionModelConfig → AutoPipeline → BasePipeline
 
 All pipelines (Wan, Flux, Flux2, LTX2) register via @register_pipeline decorator.
 """
