@@ -277,6 +277,8 @@ TRTLLM_PRECOMPILED_FROM_MAIN=<commit_sha> pip install -e .
 
 Both short and full commit SHAs are supported.
 
+If `TRTLLM_PRECOMPILED_LOCATION` or `TRTLLM_USE_PRECOMPILED` are also set, they takes precedence over `TRTLLM_PRECOMPILED_FROM_MAIN`.
+
 #### Known Limitations
 
 When using `TRTLLM_PRECOMPILED_LOCATION`, ensure that your wheel is compiled based on the same version of C++ code as your current directory; any discrepancies may lead to compatibility issues.

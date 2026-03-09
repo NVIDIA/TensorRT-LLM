@@ -19,7 +19,7 @@ import subprocess
 import sys
 from pathlib import Path
 from typing import List
-from urllib.error import URLError
+from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
 
 from setuptools import find_packages, setup
@@ -265,7 +265,7 @@ def resolve_precompiled_from_main(from_main_value: str) -> str:
     try:
         with urlopen(storage_url) as resp:
             data = json.loads(resp.read())
-    except URLError as e:
+    except (URLError, json.JSONDecodeError) as e:
         raise SetupError(f"Failed to reach Artifactory at {storage_url}. "
                          "Ensure you are on the NVIDIA network or VPN.") from e
 
@@ -290,8 +290,15 @@ def resolve_precompiled_from_main(from_main_value: str) -> str:
         try:
             with urlopen(info_url) as resp:
                 info_text = resp.read().decode("utf-8")
-        except Exception:
-            continue  # build_info.txt missing for this build, skip
+        except HTTPError as e:
+            if e.code == 404:
+                continue  # build_info.txt missing for this build, skip
+            raise SetupError(f"Failed to fetch build metadata from {info_url}: "
+                             f"HTTP {e.code}") from e
+        except URLError as e:
+            raise SetupError(
+                f"Failed to fetch build metadata from {info_url}. "
+                "Ensure you are on the NVIDIA network or VPN.") from e
 
         for line in info_text.splitlines():
             if line.startswith("commit="):
@@ -458,6 +465,12 @@ def extract_from_precompiled(precompiled_location: str, package_data: List[str],
 precompiled: str | None = os.getenv("TRTLLM_USE_PRECOMPILED")
 precompiled_location: str | None = os.getenv("TRTLLM_PRECOMPILED_LOCATION")
 precompiled_from_main: str | None = os.getenv("TRTLLM_PRECOMPILED_FROM_MAIN")
+if precompiled_from_main is not None:
+    precompiled_from_main = precompiled_from_main.strip()
+    if precompiled_from_main == "":
+        raise SetupError(
+            "TRTLLM_PRECOMPILED_FROM_MAIN must be '1' or a commit SHA, "
+            "not an empty string.")
 use_precompiled: bool = (precompiled is not None and precompiled != "0") or (
     precompiled_location is not None) or (precompiled_from_main is not None
                                           and precompiled_from_main != "0")
