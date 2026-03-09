@@ -222,6 +222,11 @@ class GenerationResultBase:
         self._aborted = True
 
     def aborted(self) -> bool:
+        """Return whether the generation request is aborted.
+
+        Returns:
+            bool: whether the generation request is aborted.
+        """
         return self._aborted
 
     @property
