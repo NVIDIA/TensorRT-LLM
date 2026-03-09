@@ -22,10 +22,13 @@ from tensorrt_llm.logger import logger
 from .transformer_flux import FluxTransformer2DModel
 
 # TeaCache coefficients for FLUX.1 variants
+# Source: https://github.com/ali-vilab/TeaCache/blob/main/TeaCache4FLUX/teacache_flux.py
+# Official default threshold: 0.6 (~2x speedup), range: 0.25 (~1.5x) to 0.8 (~2.25x)
 FLUX_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "standard": [4.98651651e02, -2.83781631e02, 5.58554382e01, -3.82021401e00, 2.64230861e-01],
+        "default_thresh": 0.6,
     },
     "schnell": {
         "ret_steps": [1.0, 0.0],  # Schnell is already fast, minimal caching
