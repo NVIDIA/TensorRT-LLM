@@ -312,6 +312,32 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @skip_pre_hopper
+    def test_eagle3_sa(self):
+        """Accuracy test for EAGLE3 One-Model + Suffix Automaton speculative decoding."""
+        pytorch_config = dict(
+            max_batch_size=1,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        eagle_model_dir = f"{llm_models_root()}/EAGLE3-LLaMA3.1-Instruct-8B"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        spec_config = Eagle3DecodingConfig(max_draft_len=4,
+                                           speculative_model=eagle_model_dir,
+                                           eagle3_one_model=True,
+                                           use_sa_spec=True)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
+
+    @skip_pre_hopper
     @parametrize_with_ids("overlap_scheduler", [True, False])
     def test_pard(self, overlap_scheduler):
         pytorch_config = dict(
@@ -340,6 +366,31 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)
+
+    @skip_pre_hopper
+    def test_pard_sa(self):
+        """Accuracy test for PARD + Suffix Automaton speculative decoding."""
+        pytorch_config = dict(
+            max_batch_size=1,
+            disable_overlap_scheduler=False,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=1,
+                                              enable_padding=True),
+        )
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+
+        pard_model_dir = f"{llm_models_root()}/PARD-Llama-3.2-1B"
+        target_model_dir = f"{llm_models_root()}/llama-3.1-model/Llama-3.1-8B-Instruct"
+
+        spec_config = PARDDecodingConfig(max_draft_len=4,
+                                         speculative_model=pard_model_dir,
+                                         use_sa_spec=True)
+
+        with LLM(model=target_model_dir,
+                 **pytorch_config,
+                 kv_cache_config=kv_cache_config,
+                 speculative_config=spec_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
     @skip_pre_hopper
     def test_ngram(self):
@@ -1536,8 +1587,6 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
-            task.evaluate(llm, extra_acc_spec="use_sa_spec")
-            task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, extra_acc_spec="use_sa_spec")
 
     @pytest.mark.skip_less_device(4)

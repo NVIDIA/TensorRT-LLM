@@ -14,6 +14,7 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
+from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -27,14 +28,21 @@ class Eagle3ResourceManager(BaseResourceManager):
     and one for the draft model. Use this class to manage the hidden states.
     """
 
-    def __init__(self, config: "EagleDecodingConfig", dtype: torch.dtype,
-                 hidden_size: int, max_num_requests: int, max_seq_len: int,
-                 max_num_tokens: int):
+    def __init__(self,
+                 config: "EagleDecodingConfig",
+                 dtype: torch.dtype,
+                 hidden_size: int,
+                 max_num_requests: int,
+                 max_seq_len: int,
+                 max_num_tokens: int,
+                 sa_manager=None):
         self.dtype = dtype
         self.max_draft_len = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
+        # Optional SA manager for EAGLE3+SA mode
+        self.sa_manager = sa_manager
         # There could be dummy request for padding batch when using CUDA graph.
         # Reserve one more slot for the dummy request.
         slot_size = self.max_seq_len + 1
@@ -94,13 +102,18 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.seq_lens[slot_id] = 0
         self.start_indices[slot_id] = 0
         self.slot_manager.remove_slot(request.request_id)
+        if self.sa_manager is not None:
+            self.sa_manager.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
             self.slot_manager.add_slot(rid)
+        if self.sa_manager is not None:
+            self.sa_manager.add_dummy_requests(request_ids)
 
     def shutdown(self):
-        pass
+        if self.sa_manager is not None:
+            self.sa_manager.shutdown()
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
@@ -298,6 +311,8 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     dtype: torch.dtype = torch.bfloat16
     # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
+    # Optional resource manager (used to access SA manager for EAGLE3+SA)
+    spec_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -345,6 +360,12 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
                                                  non_blocking=True)
         self.num_tokens -= (self.num_generations) * self.max_draft_len
 
+        sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
+        if sa_manager is not None:
+            gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
+            if gen_request_ids:
+                sa_manager.prepare(gen_request_ids, self.max_draft_len)
+
     def maybe_capture_hidden_states(
             self,
             layer_id: int,
@@ -375,6 +396,9 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
 
     @property
     def max_draft_len(self) -> int:
@@ -423,6 +447,19 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata)
+
+        sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
+                             None)
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                request_ids=spec_metadata.request_ids,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                num_gens=num_gens,
+                num_contexts=num_contexts,
+                max_draft_len=self.max_draft_len,
+            )
 
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
@@ -528,6 +565,14 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
 
+        # Override with SA draft tokens after all draft layers have run,
+        # so that draft layers never see SA tokens in their inputs.
+        if self.sa_enhancer is not None:
+            gen_draft_tokens = next_draft_tokens[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            next_draft_tokens[num_contexts:] = gen_draft_tokens
+
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         # restore all_rank_num_tokens for attention DP
@@ -588,11 +633,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 Draft token ids. Flattened.
         '''
 
-        # Note: using greedy for draft tokens is a bit easier to implement and
-        # faster. It doesn't affect the final output and seems to have a negligible
-        # impact on AR.
         d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
+        draft_tokens = self._draft_sampler_greedy(logits, d2t)
+
+        return draft_tokens
 
     def prepare_1st_drafter_inputs(
         self,

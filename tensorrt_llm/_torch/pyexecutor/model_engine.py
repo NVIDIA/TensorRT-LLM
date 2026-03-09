@@ -3,7 +3,6 @@ import contextlib
 import functools
 import gc
 import inspect
-import itertools
 import math
 import os
 import weakref
@@ -3489,21 +3488,28 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        # Initialize SA state for new requests (MTP+SA path)
+        # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)
         use_sa_spec = (self.spec_config is not None
                        and getattr(self.spec_config, 'use_sa_spec', False))
-        if (use_sa_spec and spec_metadata is not None
-                and hasattr(spec_metadata, 'sa_manager')
-                and spec_metadata.sa_manager is not None
-                and self.mapping.is_last_pp_rank()):
-            sa_manager = spec_metadata.sa_manager
-            for request in itertools.chain(
-                    scheduled_requests.context_requests,
-                    scheduled_requests.generation_requests):
-                if request.py_request_id not in sa_manager._initialized_requests:
-                    sa_manager.add_request(request.py_request_id,
-                                           request.get_tokens(0))
-                    sa_manager._initialized_requests.add(request.py_request_id)
+        if use_sa_spec and resource_manager is not None and self.mapping.is_last_pp_rank(
+        ):
+            from tensorrt_llm._torch.speculative.suffix_automaton import \
+                SuffixAutomatonManager
+            spec_rm = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            sa_manager = None
+            if spec_rm is not None:
+                if isinstance(spec_rm, SuffixAutomatonManager):
+                    sa_manager = spec_rm
+                else:
+                    sa_manager = getattr(spec_rm, 'sa_manager', None)
+            if sa_manager is not None:
+                for request in scheduled_requests.all_requests():
+                    if request.py_request_id not in sa_manager._initialized_requests:
+                        sa_manager.add_request(request.py_request_id,
+                                               request.get_tokens(0))
+                        sa_manager._initialized_requests.add(
+                            request.py_request_id)
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,
