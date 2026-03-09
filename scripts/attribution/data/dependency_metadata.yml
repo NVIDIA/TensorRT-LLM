@@ -90,7 +90,7 @@ ucx/1.20:
 ucxx/16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5:
   license: 759cb066f14805ef4068f633d9071e1d
   source: https://github.com/rapidsai/ucxx/tree/16eaa57c8d98c8ef54d666a2d2b11e76cfa565f5
-xgrammar/v0.1.25:
+xgrammar/v0.1.32:
   copyright: 989a9441d689f61fba9f797cc253e51b
   license: 8e1c96809a7467593130ecc62ae12be9
 zeromq/4.3.4-3.el8:
