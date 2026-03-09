@@ -73,6 +73,10 @@ from ..interface import (
     TransformRegistry,
 )
 
+########################################################
+#  Helper functions
+########################################################
+
 
 ########################################################
 #  Helper enums
@@ -493,6 +497,63 @@ class FP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
         return
 
 
+class FineGrainedFP8WeightShardingInfo(QuantizationShardingMixin, WeightShardingInfo):
+    """Tensor-parallel sharding for FineGrainedFP8 quantized linears.
+
+    FineGrained FP8 uses per-block weight scales (weight_scale_inv) with shape [N/block_n, K/block_k].
+    When sharding the weight along a dimension, we also need to shard the scale tensor.
+    """
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    @staticmethod
+    def _split_scale(scale: torch.Tensor, dim: int, rank: int, world_size: int) -> torch.Tensor:
+        """Split a block-scale tensor along *dim*, handling the edge case where
+        ``scale.shape[dim] < world_size``.
+
+        When the scale dimension is smaller than world_size (e.g. a 2-row scale
+        shared across 8 GPUs), we group ranks that share the same scale row:
+        ``group = rank // (world_size // scale_dim)``.
+        """
+        scale_dim = scale.shape[dim]
+        if scale_dim >= world_size:
+            return torch.tensor_split(scale, world_size, dim=dim)[rank]
+        # More ranks than scale rows → group ranks that share a row
+        group = rank // (world_size // scale_dim)
+        return torch.tensor_split(scale, scale_dim, dim=dim)[group]
+
+    def shard_scales(
+        self,
+        dim: int,
+        rank: int,
+        world_size: int,
+        weight_shape: torch.Size,
+        *,
+        weight_scale_inv: torch.Tensor,
+    ) -> Dict[str, torch.Tensor]:
+        # weight_scale_inv has shape [N/block_n, K/block_k]
+        # When we shard weight along dim, we need to shard scale along the same dim
+        sharded_scale = self._split_scale(weight_scale_inv, dim, rank, world_size)
+        return {"weight_scale_inv": sharded_scale}
+
+    def shard_load_hook(
+        self,
+        state_dict,
+        prefix,
+        *args,
+        weight_name: str,
+        weight_shape: torch.Size,
+        dim: int,
+        rank: int,
+        world_size: int,
+    ) -> None:
+        scale_key = weight_name + "_scale_inv"
+        if scale_key in state_dict:
+            scale = state_dict[scale_key]
+            state_dict[scale_key] = self._split_scale(scale, dim, rank, world_size)
+
+
 def _shard_fp4_weight_scale(weight_scale, sharded_uint8_weight_shape, dim, rank, world_size):
     # assert weight_scale.dim() == 1
     weight_shape_original = list(sharded_uint8_weight_shape)
@@ -723,9 +784,37 @@ class NVFP4EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
         _insert_sharded_moe(gm, node, self.config, scale_names=self.scale_names())
 
 
+class FineGrainedFP8EPShardingInfo(EPShardingInfo, QuantizationShardingMixin):
+    """FineGrainedFP8-specific EP sharding behavior.
+
+    FineGrained FP8 MoE uses per-block weight scales (weight_scale_inv) for each expert's weights.
+    """
+
+    def validate(self, gm: GraphModule = None, node: Node = None) -> bool:
+        if not is_op(node, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe):
+            ad_logger.warning(f"EP sharding is only supported for MOE nodes. Skipping {self}.")
+            return False
+        return True
+
+    def scale_names(self) -> List[str]:
+        return ["weight_scale_inv"]
+
+    def apply(self, gm: GraphModule, node: Node) -> None:
+        _insert_sharded_moe(
+            gm,
+            node,
+            self.config,
+            scale_names=self.scale_names(),
+        )
+
+
 EP_SHARDING_RULES = [
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_fp8_moe), FP8EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_nvfp4_moe), NVFP4EPShardingInfo),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_quant_finegrained_fp8_moe),
+        FineGrainedFP8EPShardingInfo,
+    ),
     (lambda n: is_op(n, torch.ops.auto_deploy.torch_moe), EPShardingInfo),
     (lambda n: is_op(n, torch.ops.auto_deploy.triton_mxfp4_moe), MXFP4EPShardingInfo),
 ]
@@ -1222,6 +1311,10 @@ TP_SHARDING_RULES = [
         lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_nvfp4_linear),
         FP4WeightShardingInfo,
     ),
+    (
+        lambda n: is_op(n, torch.ops.auto_deploy.torch_fake_quant_finegrained_fp8_linear),
+        FineGrainedFP8WeightShardingInfo,
+    ),
 ]
 
 
@@ -1276,7 +1369,10 @@ def shard_weight_tensor(
         min_d_shape: int = min_local_shape,
     ) -> torch.Tensor:
         # The local tensor shape has to be divisible by min_d_shape
-        max_split_size = t.shape[d] // min_d_shape
+        max_split_size = t.shape[d] // min_d_shape if min_d_shape > 0 else 0
+        if max_split_size == 0:
+            # Tensor dimension is smaller than min_d_shape; replicate instead of splitting
+            return t
         if ws > max_split_size:
             num_groups = math.ceil(ws / max_split_size)
             ad_logger.debug(

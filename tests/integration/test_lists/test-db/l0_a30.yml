@@ -257,5 +257,10 @@ l0_a30:
       stage: pre_merge
       backend: autodeploy
   tests:
-  # TODO (lucaslie): consider more fine-grained split
-  - unittest/_torch/auto_deploy/unit/singlegpu
+  - unittest/auto_deploy/singlegpu/compile
+  - unittest/auto_deploy/singlegpu/custom_ops
+  - unittest/auto_deploy/singlegpu/models
+  - unittest/auto_deploy/singlegpu/shim
+  - unittest/auto_deploy/singlegpu/smoke
+  - unittest/auto_deploy/singlegpu/transformations
+  - unittest/auto_deploy/singlegpu/utils
