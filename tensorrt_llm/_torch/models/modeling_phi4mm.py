@@ -18,11 +18,19 @@ from types import MethodType
 from typing import Dict, List, Optional, Tuple, Union
 
 import torch
-import torchvision
+try:
+    import torchvision
+except (ImportError, RuntimeError, AttributeError, Exception):
+    torchvision = None
+
 import transformers
 from einops import rearrange
 from PIL import Image
-from torchvision.transforms.functional import get_image_size, pad, resize
+try:
+    from torchvision.transforms.functional import get_image_size, pad, resize
+except (ImportError, RuntimeError, AttributeError, Exception):
+    get_image_size = pad = resize = None
+
 from transformers.image_processing_utils import BatchFeature
 from transformers.image_utils import (ImageInput, is_pil_image,
                                       make_list_of_images, valid_images)
