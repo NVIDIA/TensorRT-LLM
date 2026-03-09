@@ -191,6 +191,15 @@ for concurrency in ${concurrency_list}; do
         --percentile-metrics "ttft,tpot,itl,e2el" \
         $([ "${streaming}" = "false" ] && echo "--non-streaming")
 
+    # Print failed request count (consistent with non-nv_sa benchmark format)
+    python - "${output_dir}/result.json" <<-'PYEOF' 2>/dev/null || true
+	import json, sys
+	with open(sys.argv[1]) as f:
+	    d = json.load(f)
+	failed = d['num_prompts'] - d['completed']
+	print(f'Total failed requests: {failed}')
+	PYEOF
+
     echo "Benchmark with concurrency ${concurrency} done"
     do_process_all_logs ${log_path}/ ${log_path}/concurrency_${concurrency} "log"
 done
