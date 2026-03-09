@@ -37,3 +37,7 @@ def postprocess_video_tensor(video: torch.Tensor, remove_batch_dim: bool = True)
         video = video[0]  # (B, T, H, W, C) -> (T, H, W, C)
 
     return video
+
+
+def as_tuple(x):
+    return x if isinstance(x, tuple) else (x, x)

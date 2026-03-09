@@ -82,10 +82,21 @@ class LogParser(object):
 
         if not os.path.exists(log_file_name):
             logger.error(f"Log file not found: {log_file_name}")
-            return {"status": False, "df": None}
+            return {"status": False, "df": None, "failed_requests": 0, "total_requests": 0}
 
         with open(log_file_name, "r", encoding="utf-8", errors="replace") as log_file:
             log_content = log_file.read()
+
+        # Extract failed/total request counts from log (for executor to mark failed cases)
+        # Use findall + last match to handle multi-concurrency logs correctly
+        failed_requests = 0
+        total_requests = 0
+        failed_matches = re.findall(r"Total failed requests:\s*(\d+)", log_content)
+        total_matches = re.findall(r"Total requests:\s*(\d+)", log_content)
+        if failed_matches:
+            failed_requests = int(failed_matches[-1])
+        if total_matches:
+            total_requests = int(total_matches[-1])
 
         # Use metrics_config for extraction
         raw_results = self._extract_log(
@@ -93,12 +104,22 @@ class LogParser(object):
         )
         if len(raw_results) == 0:
             logger.warning("No metrics extracted from log file")
-            return {"status": False, "df": None}
+            return {
+                "status": False,
+                "df": None,
+                "failed_requests": failed_requests,
+                "total_requests": total_requests,
+            }
 
         # Convert to perf result format
         df = self._convert_to_perf_result_format(raw_results, model_name, timestamps, test_name)
 
-        return {"status": True, "df": df}
+        return {
+            "status": True,
+            "df": df,
+            "failed_requests": failed_requests,
+            "total_requests": total_requests,
+        }
 
     def _convert_to_perf_result_format(
         self,
