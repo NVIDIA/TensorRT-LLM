@@ -21,6 +21,7 @@ pytest-mock
 pytest-threadleak
 rouge_score
 cloudpickle
+typeguard==4.4.4
 typing-extensions==4.12.2
 bandit==1.7.7
 jsonlines==4.0.0
