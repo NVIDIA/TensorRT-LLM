@@ -172,6 +172,16 @@ class BasePipeline(nn.Module):
                         if mode in coeff_data:
                             teacache_cfg.coefficients = coeff_data[mode]
                             logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                        # Apply model-specific default threshold if user didn't explicitly set one
+                        default_thresh = coeff_data.get("default_thresh")
+                        if (
+                            default_thresh is not None
+                            and "teacache_thresh" not in teacache_cfg.model_fields_set
+                        ):
+                            teacache_cfg.teacache_thresh = default_thresh
+                            logger.info(
+                                f"TeaCache: Using {model_size} default threshold {default_thresh}"
+                            )
                     else:
                         # Single coefficient list (no mode distinction)
                         teacache_cfg.coefficients = coeff_data

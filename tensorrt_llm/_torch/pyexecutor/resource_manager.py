@@ -1629,21 +1629,20 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_connector_manager = kv_connector_manager
 
         quota = float('inf')
-        if kv_cache_config.max_tokens is not None:
-            quota = int(
-                math.ceil(
-                    self._get_cache_quota(kv_cache_config.max_tokens) /
-                    kv_cache_config.max_util_for_resume))
-            if kv_cache_config.free_gpu_memory_fraction is not None:
-                logger.warning(
-                    f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens} and {kv_cache_config.free_gpu_memory_fraction}, the smaller value will be used."
-                )
         if kv_cache_config.max_gpu_total_bytes is not None and kv_cache_config.max_gpu_total_bytes > 0:
-            if quota > int(kv_cache_config.max_gpu_total_bytes):
-                logger.warning(
-                    f"max_gpu_total_bytes {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB is smaller than the calculated quota {quota / (1 << 30)}GiB, clamping quota to {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB"
-                )
-            quota = min(quota, int(kv_cache_config.max_gpu_total_bytes))
+            quota = int(kv_cache_config.max_gpu_total_bytes)
+            logger.info(
+                f"max_gpu_total_bytes is provided. New quota is {quota / (1 << 30)}GiB"
+            )
+        if kv_cache_config.max_tokens is not None:
+            quota_from_max_tokens = int(
+                math.ceil(
+                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
+                    / kv_cache_config.max_util_for_resume))
+            quota = min(quota, quota_from_max_tokens)
+            logger.info(
+                f"max_tokens {kv_cache_config.max_tokens} is provided. Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. New quota is {quota / (1 << 30)}GiB"
+            )
 
         assert quota != float(
             'inf'
@@ -1735,7 +1734,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
-    def _get_cache_quota(self, max_tokens: int) -> int:
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:

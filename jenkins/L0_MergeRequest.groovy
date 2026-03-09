@@ -157,7 +157,9 @@ def globalVars = [
 ]
 
 // If not running all test stages in the L0 pre-merge, we will not update the GitLab status at the end.
+// GenPostMergeBuilds pipelines do not update GitLab status.
 boolean enableUpdateGitlabStatus =
+    !GEN_POST_MERGE_BUILDS_ONLY &&
     !testFilter[ENABLE_SKIP_TEST] &&
     !testFilter[ONLY_MULTI_GPU_TEST] &&
     !testFilter[DISABLE_MULTI_GPU_TEST] &&
@@ -312,7 +314,9 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
     sh "env | sort"
-    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    if (!GEN_POST_MERGE_BUILDS_ONLY) {
+        updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
+    }
     echo "Using GitLab repo: ${LLM_REPO}."
     sh "git config --global --add safe.directory \"*\""
     // NB: getContainerURIs reads files in ${LLM_ROOT}/jenkins/
@@ -731,7 +735,7 @@ def getMultiGpuFileChanged(pipeline, testFilter, globalVars)
         "tests/integration/defs/cpp/test_multi_gpu.py",
         "tests/integration/test_lists/test-db/l0_dgx_h100.yml",
         "tests/integration/test_lists/test-db/l0_dgx_h200.yml",
-        "tests/unittest/_torch/auto_deploy/unit/multigpu",
+        "tests/unittest/auto_deploy/multigpu",
         "tests/unittest/_torch/multi_gpu/",
         "tests/unittest/_torch/multi_gpu_modeling/",
         "tests/unittest/disaggregated/",
@@ -1333,24 +1337,32 @@ pipeline {
     }
     post {
         unsuccessful {
-            updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "failed"
+            script {
+                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "failed"
+                }
+            }
         }
         success {
             script {
                 if (enableUpdateGitlabStatus) {
                     updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "success"
-                } else {
+                } else if (!GEN_POST_MERGE_BUILDS_ONLY) {
                     updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: "canceled"
                     updateGitlabCommitStatus name: "Custom Jenkins build", state: "success"
                 }
             }
         }
         aborted {
-            updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'canceled'
+            script {
+                if (!GEN_POST_MERGE_BUILDS_ONLY) {
+                    updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'canceled'
+                }
+            }
         }
         always {
             script {
-                if (!isReleaseCheckMode) {
+                if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter)
                 }
             }

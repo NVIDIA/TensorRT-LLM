@@ -1,15 +1,16 @@
 import json
-import os
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, List, Literal, Optional, Tuple
+from typing import Any, Dict, List, Literal, Optional, Tuple, Union
 
 import torch
+import yaml
 from pydantic import BaseModel, ConfigDict, model_validator
 from pydantic import Field as PydanticField
 
 from tensorrt_llm.functional import AllReduceStrategy
+from tensorrt_llm.llmapi.utils import StrictBaseModel, set_api_status
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
 from tensorrt_llm.quantization.mode import QuantAlgo
@@ -38,11 +39,11 @@ class PipelineComponent(str, Enum):
 
 
 # =============================================================================
-# Sub-configuration classes for DiffusionArgs
+# Sub-configuration classes for VisualGenArgs
 # =============================================================================
 
 
-class AttentionConfig(BaseModel):
+class AttentionConfig(StrictBaseModel):
     """Configuration for Attention layers."""
 
     backend: Literal["VANILLA", "TRTLLM"] = PydanticField(
@@ -50,7 +51,7 @@ class AttentionConfig(BaseModel):
     )
 
 
-class ParallelConfig(BaseModel):
+class ParallelConfig(StrictBaseModel):
     """Configuration for distributed parallelism.
 
     Currently Supported:
@@ -122,27 +123,31 @@ class ParallelConfig(BaseModel):
             cp_size=self.dit_cp_size,
         )
 
-    @model_validator(mode="after")
-    def validate_parallel_sizes(self) -> "ParallelConfig":
-        """Validate configuration against current environment."""
-        if torch.cuda.is_available():
-            world_size = int(os.environ.get("WORLD_SIZE", 1))
-            total_parallel = (
-                self.dit_tp_size
-                * self.dit_ulysses_size
-                * self.dit_ring_size
-                * self.dit_cp_size
-                * self.dit_dp_size
-                * self.dit_cfg_size
+    @property
+    def total_parallel_size(self) -> int:
+        """Total parallelism across all DiT dimensions."""
+        return (
+            self.dit_tp_size
+            * self.dit_ulysses_size
+            * self.dit_ring_size
+            * self.dit_cp_size
+            * self.dit_dp_size
+            * self.dit_cfg_size
+        )
+
+    def validate_world_size(self, world_size: int) -> None:
+        """Validate that the parallel config is compatible with the given world size.
+
+        Called at launch time when WORLD_SIZE is known (not at config construction).
+        """
+        if self.total_parallel_size > world_size:
+            raise ValueError(
+                f"Total DiT parallel size ({self.total_parallel_size}) "
+                f"exceeds world_size ({world_size})"
             )
-            if total_parallel > world_size:
-                raise ValueError(
-                    f"Total DiT parallel size ({total_parallel}) exceeds WORLD_SIZE ({world_size})"
-                )
-        return self
 
 
-class TeaCacheConfig(BaseModel):
+class TeaCacheConfig(StrictBaseModel):
     """Configuration for TeaCache runtime optimization.
 
     TeaCache speeds up diffusion by caching transformer outputs when timestep
@@ -198,7 +203,7 @@ class TeaCacheConfig(BaseModel):
         return self
 
 
-class TorchCompileConfig(BaseModel):
+class TorchCompileConfig(StrictBaseModel):
     """Configuration for torch.compile and autotuning."""
 
     enable_torch_compile: bool = True
@@ -206,13 +211,13 @@ class TorchCompileConfig(BaseModel):
     enable_autotune: bool = True
 
 
-class CudaGraphConfig(BaseModel):
+class CudaGraphConfig(StrictBaseModel):
     """Configuration for CUDA graph capture/replay."""
 
     enable_cuda_graph: bool = False
 
 
-class PipelineConfig(BaseModel):
+class PipelineConfig(StrictBaseModel):
     """Model-specific pipeline configuration."""
 
     fuse_qkv: bool = True
@@ -225,18 +230,18 @@ class PipelineConfig(BaseModel):
 
 
 # =============================================================================
-# DiffusionArgs - User-facing configuration (CLI / YAML)
+# VisualGenArgs - User-facing configuration (CLI / YAML)
 # =============================================================================
 
 
-class DiffusionArgs(BaseModel):
+class VisualGenArgs(StrictBaseModel):
     """User-facing configuration for diffusion model loading and inference.
 
     This is the main config class used in CLI args and YAML config files.
     PipelineLoader converts this to DiffusionModelConfig internally.
 
     Example:
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path="/path/to/model",
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             parallel=ParallelConfig(dit_tp_size=2),
@@ -277,6 +282,9 @@ class DiffusionArgs(BaseModel):
         ),
     )
 
+    # Skip warmup inference after loading (useful for testing or fast startup)
+    skip_warmup: bool = False
+
     # Sub-configs (dict input for quant_config is coerced to QuantConfig in model_validator)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
@@ -293,7 +301,7 @@ class DiffusionArgs(BaseModel):
     @model_validator(mode="before")
     @classmethod
     def _parse_quant_config_dict(cls, data: Any) -> Any:
-        """Parse user-facing DiffusionArgs.quant_config (dict or None) into QuantConfig and dynamic flags.
+        """Parse user-facing VisualGenArgs.quant_config (dict or None) into QuantConfig and dynamic flags.
 
         User input is ModelOpt-format dict (e.g. {"quant_algo": "FP8", "dynamic": True}).
         We coerce it to QuantConfig + dynamic_weight_quant + force_dynamic_quantization so that
@@ -324,21 +332,31 @@ class DiffusionArgs(BaseModel):
         """Convert to dictionary."""
         return self.model_dump()
 
+    @set_api_status("prototype")
     @classmethod
-    def from_dict(cls, config_dict: Dict[str, Any]) -> "DiffusionArgs":
+    def from_dict(cls, config_dict: Dict[str, Any]) -> "VisualGenArgs":
         """Create from dictionary with automatic nested config parsing.
 
-        Pydantic automatically handles nested configs, but we keep this method
-        for backward compatibility and to filter unknown fields.
+        Unknown fields cause a ValidationError (extra="forbid").
         """
-        # Get valid field names for DiffusionArgs
-        valid_fields = set(cls.model_fields.keys())
+        return cls(**config_dict)
 
-        # Filter to only include valid fields (ignore unknown fields)
-        filtered_dict = {k: v for k, v in config_dict.items() if k in valid_fields}
+    @set_api_status("prototype")
+    @classmethod
+    def from_yaml(cls, yaml_path: Union[str, Path], **overrides: Any) -> "VisualGenArgs":
+        """Load configuration from a YAML file.
 
-        # Pydantic automatically converts nested dicts to their respective config classes
-        return cls(**filtered_dict)
+        Args:
+            yaml_path: Path to the YAML configuration file.
+            **overrides: Keyword arguments that override values from the YAML file.
+
+        Returns:
+            A validated VisualGenArgs instance.
+        """
+        with open(yaml_path, "r") as f:
+            config_dict = yaml.safe_load(f) or {}
+        config_dict.update(overrides)
+        return cls(**config_dict)
 
 
 # =============================================================================
@@ -378,11 +396,11 @@ def discover_pipeline_components(checkpoint_path: Path) -> Dict[str, Path]:
 class DiffusionModelConfig(BaseModel):
     """Internal ModelConfig for diffusion models.
 
-    This is created by PipelineLoader from DiffusionArgs + checkpoint.
+    This is created by PipelineLoader from VisualGenArgs + checkpoint.
     Contains merged/parsed config from:
     - pretrained_config: From checkpoint/config.json
     - quant_config: From checkpoint or user quant config
-    - Sub-configs: From DiffusionArgs (pipeline, attention, parallel, teacache)
+    - Sub-configs: From VisualGenArgs (pipeline, attention, parallel, teacache)
     """
 
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -399,7 +417,7 @@ class DiffusionModelConfig(BaseModel):
 
     dynamic_weight_quant: bool = False
 
-    # Sub-configs from DiffusionArgs (merged during from_pretrained)
+    # Sub-configs from VisualGenArgs (merged during from_pretrained)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
@@ -497,13 +515,13 @@ class DiffusionModelConfig(BaseModel):
     def from_pretrained(
         cls,
         checkpoint_dir: str,
-        args: Optional["DiffusionArgs"] = None,
+        args: Optional["VisualGenArgs"] = None,
         **kwargs,
     ) -> "DiffusionModelConfig":
         """
         Load config from pretrained checkpoint.
 
-        Called by PipelineLoader with DiffusionArgs:
+        Called by PipelineLoader with VisualGenArgs:
             config = DiffusionModelConfig.from_pretrained(
                 checkpoint_dir=args.checkpoint_path,
                 args=args,
@@ -511,7 +529,7 @@ class DiffusionModelConfig(BaseModel):
 
         Args:
             checkpoint_dir: Path to checkpoint
-            args: DiffusionArgs containing user config
+            args: VisualGenArgs containing user config
                 - (torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
             **kwargs: Additional config options (e.g., mapping)
         """
@@ -566,7 +584,7 @@ class DiffusionModelConfig(BaseModel):
         if args and args.quant_config.quant_algo is not None:
             quant_config = args.quant_config
             quant_config_dict = (
-                None  # DiffusionArgs has no per-layer dict; only from checkpoint parse
+                None  # VisualGenArgs has no per-layer dict; only from checkpoint parse
             )
             dynamic_weight_quant = args.dynamic_weight_quant
             dynamic_activation_quant = args.force_dynamic_quantization
@@ -587,7 +605,7 @@ class DiffusionModelConfig(BaseModel):
             quant_config_dict=quant_config_dict,
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,
-            # Sub-configs from DiffusionArgs
+            # Sub-configs from VisualGenArgs
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
