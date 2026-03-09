@@ -676,13 +676,11 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
-        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount
-        && numColumns < effectiveSplitWorkThreshold;
+        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold;
 
     if (canUseHeuristic)
     {
-        launchHeuristicTopKDecode(
-            logits, seqLens, preIdx, indices, stride0, next_n, topK, preIdxStride, preIdxCount, numRows, stream);
+        launchHeuristicTopKDecode(logits, numColumns, preIdx, preIdxCount, topK, indices, stream);
     }
     else if (numColumns < kSortingAlgorithmThreshold)
     {

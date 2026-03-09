@@ -15,21 +15,15 @@
  */
 
 // ============================================================================
-// heuristic_topk.cuh — V2e: V2d + OPT5 (safety-guard done!=1) +
-//                           OPT6 (NUM_BINS=2048 + parallel Phase 4b K-th bin search) +
-//                           OPT7 (Phase 3 sub-pass 1 elimination via per-thread count cache)
+// heuristic_topk.cuh — V2d: V2c + skip 4a + skip Pass A + 256-bin + snap3
 // Heuristic-Guided TopK — Sort-Free, Histogram-Based Selection
 // Optimised for NVIDIA B200 (Blackwell, sm_100), single thread-block kernel
 //
 // V2d: ballot-free Phase 3, skip-4a, skip-PassA, 256-bin, snap≤3
 //      OPT3 (__ldg), OPT4 (redux.sync)
-// V2e: +OPT5 (skip Phase 3 blockCountGE re-scan when done==1)
-//      +OPT6 (NUM_BINS=2048 + parallel 2-step K-th bin search in Phase 4b)
-//      +OPT7 (reuse per-thread counts cached by last blockCountGE; eliminates
-//             Phase 3 sub-pass 1 full-N rescan)
 //
 // Define HEURISTIC_TOPK_PROFILE before including to enable per-phase printf.
-// Shared memory: ~59 KB (no CUB dependency)
+// Shared memory: ~50 KB (no CUB dependency)
 // ============================================================================
 
 #pragma once
@@ -56,23 +50,22 @@ constexpr int SAFETY_MARGIN = 2048;
 constexpr int MAX_CANDIDATES = TOP_K + SAFETY_MARGIN * 2; // 6144
 
 constexpr int MAX_REFINE_ITERS = 15;
-constexpr int NUM_BINS = 2048;
+constexpr int NUM_BINS = 256;
 
 static_assert(TOP_K % BLOCK_SIZE == 0);
 static_assert(MAX_CANDIDATES % BLOCK_SIZE == 0);
 
 // ============================================================================
-// Shared Memory Layout (~59 KB)
+// Shared Memory Layout (~26 KB)
 // ============================================================================
 
 struct KernelSmem
 {
-    alignas(16) float keys[MAX_CANDIDATES]; // 24 KB
-    alignas(16) int vals[MAX_CANDIDATES];   // 24 KB
+    alignas(16) float keys[MAX_CANDIDATES]; // 12 KB
+    alignas(16) int vals[MAX_CANDIDATES];   // 12 KB
 
-    int warp_counts[NUM_WARPS];             // 64 B
-    int histogram[NUM_BINS];                // 8 KB
-    int per_thread_counts[BLOCK_SIZE];      // 2 KB — OPT7: cached from last blockCountGE
+    int warp_counts[NUM_WARPS]; // 64 B
+    int histogram[NUM_BINS];    // 1 KB
 
     float threshold;
     int cand_count;
@@ -165,9 +158,6 @@ __device__ __forceinline__ void blockCountGE(
     for (int i = (N & ~3) + tid; i < N; i += BLOCK_SIZE)
         c += (__ldg(&input[i]) >= threshold);
 
-    // OPT7: cache per-thread count for Phase 3 sub-pass 1 reuse
-    smem->per_thread_counts[tid] = c;
-
     c = warpReduceSum(c);
 
     if (lane == 0)
@@ -249,19 +239,27 @@ __device__ __forceinline__ void blockFusedSnapIter(KernelSmem* smem, int count, 
 }
 
 // ============================================================================
-// Device function: algorithm body (independently optimized by ptxas)
-// __noinline__ ensures ptxas allocates registers and schedules instructions
-// for this function independently from the caller, matching standalone SASS.
+// Main Kernel
 // ============================================================================
 
-__device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, int const N,
-    int const* __restrict__ preIdx, int const M, int const topK, float* __restrict__ outputValues,
-    int* __restrict__ outputIndices, KernelSmem* smem, int const preIdxOffset = 0)
+__global__ void __launch_bounds__(BLOCK_SIZE, 1)
+    heuristicTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
+        int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
 {
+    extern __shared__ unsigned char smem_raw[];
+    auto* smem = reinterpret_cast<KernelSmem*>(smem_raw);
+
     int const tid = threadIdx.x;
     int const warp_id = tid / WARP_SIZE;
     int const lane = tid & (WARP_SIZE - 1);
     unsigned const full_mask = 0xffffffffu;
+
+#ifdef HEURISTIC_TOPK_PROFILE
+    long long prof_t0 = 0, prof_t1 = 0, prof_t2 = 0, prof_t3 = 0, prof_t4 = 0;
+    int prof_p2_iters = 0, prof_p2_first_count = 0, prof_p2_done_type = 0;
+    if (tid == 0)
+        prof_t0 = clock64();
+#endif
 
     // ================================================================
     // Phase 1 — Min/Max/Mean of pre-indexed values
@@ -273,7 +271,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
     int local_cnt = 0;
     for (int i = tid; i < M; i += BLOCK_SIZE)
     {
-        int idx = __ldg(&preIdx[i]) + preIdxOffset;
+        int idx = __ldg(&preIdx[i]);
         if (idx >= 0 && idx < N)
         {
             float v = __ldg(&input[idx]);
@@ -299,7 +297,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         smem->histogram[NUM_WARPS * 2 + warp_id] = __float_as_int(wsum);
         smem->histogram[NUM_WARPS * 3 + warp_id] = wcnt;
     }
-    __syncthreads();
+    __syncthreads(); // S1
 
     if (tid == 0)
     {
@@ -322,7 +320,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         smem->cnt_hi = 1;
         smem->done = 0;
     }
-    __syncthreads();
+    __syncthreads(); // S2
 
     if (smem->val_hi <= -FLT_MAX || smem->val_lo >= smem->val_hi)
     {
@@ -336,14 +334,23 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
     }
 
     // ================================================================
-    // Phase 2 — Interpolation threshold search
+    // Phase 2 — Interpolation threshold search (count-only)
     // ================================================================
+
+#ifdef HEURISTIC_TOPK_PROFILE
+    if (tid == 0)
+        prof_t1 = clock64();
+#endif
 
     blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
 
     if (tid == 0)
     {
         int c = smem->cand_count;
+#ifdef HEURISTIC_TOPK_PROFILE
+        prof_p2_first_count = c;
+        prof_p2_iters = 1;
+#endif
         if (c >= TOP_K && c <= MAX_CANDIDATES)
             smem->done = 1;
         else if (c > MAX_CANDIDATES)
@@ -393,7 +400,9 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
                     smem->done = 2;
                 }
                 else
+                {
                     smem->threshold = nv;
+                }
             }
             else
                 smem->threshold = nv;
@@ -405,6 +414,9 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         if (tid == 0)
         {
             int c = smem->cand_count;
+#ifdef HEURISTIC_TOPK_PROFILE
+            prof_p2_iters++;
+#endif
             if (c >= TOP_K && c <= MAX_CANDIDATES)
                 smem->done = 1;
             else if (c > MAX_CANDIDATES)
@@ -423,21 +435,34 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
 
     if (tid == 0 && !smem->done)
     {
+        // Fallback: prefer val_lo (count > MAX_CANDIDATES, overshoot) since
+        // Phase 4 can select from the excess.  With MAX_CANDIDATES=4096,
+        // the overshoot is much less likely to drop true top-K elements.
+        // If val_lo's count would massively exceed MAX_CANDIDATES, use val_hi
+        // (undershoot) and let the fill step pad with (-FLT_MAX, -1).
         if (smem->cnt_lo <= MAX_CANDIDATES * 2)
             smem->threshold = smem->val_lo;
         else
             smem->threshold = smem->val_hi;
         smem->done = 2;
     }
+#ifdef HEURISTIC_TOPK_PROFILE
+    if (tid == 0)
+    {
+        prof_p2_done_type = smem->done;
+        prof_t2 = clock64();
+    }
+#endif
     __syncthreads();
 
     // ================================================================
     // Phase 3 — Ballot-free collect
     // ================================================================
 
-    // OPT5: when done==1, Phase 2 already verified count in [TOP_K, MAX_CANDIDATES];
-    //        skip the redundant full-N blockCountGE re-check entirely.
-    if (smem->done != 1)
+    // Safety net: if count exceeds MAX_CANDIDATES, tighten threshold by
+    // bisecting toward val_hi (which gave count < TOP_K) until it fits.
+    // Each retry is one L2-cached blockCountGE (~6μs worst case).
+    // Normal path (done=1, count already in range): 1 count + break.
     {
         blockCountGE(input, N, smem->threshold, smem, tid, warp_id, lane);
         if (tid == 0 && smem->cand_count > MAX_CANDIDATES)
@@ -468,10 +493,20 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         }
     }
 
-    // OPT7: reuse per-thread counts cached by the last blockCountGE call;
-    //        saves one full N-scan (blockCountGE's __syncthreads guarantees visibility).
-    int my_total_qual = smem->per_thread_counts[tid];
+    // Sub-pass 1: per-thread qualifying count
+    int my_total_qual = 0;
+    {
+        float const thr = smem->threshold;
+        for (int i = tid * 4; i + 3 < N; i += BLOCK_SIZE * 4)
+        {
+            float4 v4 = __ldg(reinterpret_cast<float4 const*>(input + i));
+            my_total_qual += (v4.x >= thr) + (v4.y >= thr) + (v4.z >= thr) + (v4.w >= thr);
+        }
+        for (int i = (N & ~3) + tid; i < N; i += BLOCK_SIZE)
+            my_total_qual += (__ldg(&input[i]) >= thr);
+    }
 
+    // Warp-level inclusive prefix sum of per-thread counts
     int thread_prefix = my_total_qual;
 #pragma unroll
     for (int off = 1; off < WARP_SIZE; off *= 2)
@@ -487,6 +522,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         smem->warp_counts[warp_id] = warp_total_qual;
     __syncthreads();
 
+    // Cross-warp exclusive prefix sum
     if (tid == 0)
     {
         int total = 0;
@@ -502,6 +538,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
 
     int my_write_pos = smem->warp_counts[warp_id] + my_excl_offset;
 
+    // Sub-pass 2: per-thread write (ballot-free)
     {
         float const thr = smem->threshold;
         for (int i = tid * 4; i + 3 < N; i += BLOCK_SIZE * 4)
@@ -532,11 +569,16 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
     }
     __syncthreads();
 
+    int const cand_count = min(smem->cand_count, MAX_CANDIDATES);
+
+#ifdef HEURISTIC_TOPK_PROFILE
+    if (tid == 0)
+        prof_t3 = clock64();
+#endif
+
     // ================================================================
     // Phase 4 — Histogram-based selection + partition
     // ================================================================
-
-    int const cand_count = min(smem->cand_count, MAX_CANDIDATES);
 
     if (cand_count == TOP_K)
     {
@@ -545,11 +587,26 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
             outputValues[i] = smem->keys[i];
             outputIndices[i] = smem->vals[i];
         }
+#ifdef HEURISTIC_TOPK_PROFILE
+        if (tid == 0)
+        {
+            prof_t4 = clock64();
+            printf(
+                "[topK prof] P1=%lld P2=%lld P3=%lld P4=%lld total=%lld | "
+                "P2_iters=%d first_count=%d done_type=%d cands=%d (exact)\n",
+                prof_t1 - prof_t0, prof_t2 - prof_t1, prof_t3 - prof_t2, prof_t4 - prof_t3, prof_t4 - prof_t0,
+                prof_p2_iters, prof_p2_first_count, prof_p2_done_type, cand_count);
+        }
+#endif
         return;
     }
 
     if (cand_count > TOP_K)
     {
+
+        // ---- 4a: Candidate Min/Max (restored for correctness) ----
+        // pmax_saved is from preIdx and may underestimate the true candidate
+        // max when non-preIdx elements exceed pmax.  Use actual scan.
         float cmin = FLT_MAX, cmax = -FLT_MAX;
         for (int i = tid; i < cand_count; i += BLOCK_SIZE)
         {
@@ -564,7 +621,7 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
             smem->warp_counts[warp_id] = __float_as_int(cmin);
             smem->histogram[warp_id] = __float_as_int(cmax);
         }
-        __syncthreads();
+        __syncthreads(); // S-4a
 
         float block_min = FLT_MAX, block_max = -FLT_MAX;
         for (int w = 0; w < NUM_WARPS; w++)
@@ -575,9 +632,10 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         if (block_max <= block_min)
             block_max = block_min + 1e-6f;
 
+        // ---- 4b: 256-bin histogram ----
         for (int i = tid; i < NUM_BINS; i += BLOCK_SIZE)
             smem->histogram[i] = 0;
-        __syncthreads();
+        __syncthreads(); // S-4b1
 
         float range1 = block_max - block_min;
         float inv1 = (range1 > 0.0f) ? ((float) (NUM_BINS - 1) + 0.99f) / range1 : 0.0f;
@@ -588,57 +646,16 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
             bin = min(max(bin, 0), NUM_BINS - 1);
             atomicAdd(&smem->histogram[bin], 1);
         }
-        __syncthreads();
+        __syncthreads(); // S-4b2
 
-        // OPT6: Parallel K-th bin search (2-step).
-        // Each warp sums BINS_PER_WARP consecutive bins (high→low); tid=0 locates the
-        // target warp in NUM_WARPS steps; one thread in that warp scans BINS_PER_WARP bins.
-        // Total serial depth: NUM_WARPS + BINS_PER_WARP = 16 + 128 = 144 steps vs 2048.
-        {
-            constexpr int BINS_PER_WARP = NUM_BINS / NUM_WARPS;
-            static_assert(NUM_BINS % NUM_WARPS == 0, "NUM_BINS must be divisible by NUM_WARPS");
-            // Step 1: each warp accumulates its slice of bins (high→low)
-            int warp_bin_sum = 0;
-            for (int j = 0; j < BINS_PER_WARP; j++)
-                warp_bin_sum += smem->histogram[NUM_BINS - 1 - warp_id * BINS_PER_WARP - j];
-            if (lane == 0)
-                smem->warp_counts[warp_id] = warp_bin_sum;
-        }
-        __syncthreads(); // S-4b3a
-
-        // Step 2: tid=0 finds which warp contains the K-th element
         if (tid == 0)
         {
-            int cum = 0, tw = NUM_WARPS - 1;
-            for (int w = 0; w < NUM_WARPS; w++)
-            {
-                cum += smem->warp_counts[w];
-                if (cum >= TOP_K)
-                {
-                    tw = w;
-                    break;
-                }
-            }
-            // Recompute prefix before target warp for step 3
-            cum = 0;
-            for (int w = 0; w < tw; w++)
-                cum += smem->warp_counts[w];
-            smem->cnt_lo = cum; // prefix count before target warp
-            smem->cnt_hi = tw;  // target warp index
-        }
-        __syncthreads();        // S-4b3b
-
-        // Step 3: one thread in target warp scans its BINS_PER_WARP bins
-        if (warp_id == smem->cnt_hi && lane == 0)
-        {
-            constexpr int BINS_PER_WARP = NUM_BINS / NUM_WARPS;
-            int base_cum = smem->cnt_lo;
+            int cum = 0;
             float thr = block_min;
-            for (int j = 0; j < BINS_PER_WARP; j++)
+            for (int b = NUM_BINS - 1; b >= 0; b--)
             {
-                int b = NUM_BINS - 1 - smem->cnt_hi * BINS_PER_WARP - j;
-                base_cum += smem->histogram[b];
-                if (base_cum >= TOP_K)
+                cum += smem->histogram[b];
+                if (cum >= TOP_K)
                 {
                     thr = block_min + (float) b * range1 / (float) NUM_BINS;
                     break;
@@ -646,13 +663,34 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
             }
             smem->threshold = thr;
         }
-        __syncthreads(); // S-4b3c
+        __syncthreads(); // S-4b3
 
+#ifdef HEURISTIC_TOPK_PROFILE
+        long long prof_4b = 0, prof_4d = 0;
+        int prof_snap_iters = 0;
+        if (tid == 0)
+            prof_4b = clock64();
+#endif
+
+        // ---- 4d: Snap iterations ----
+        // Each snap moves threshold by one distinct value.  The limit must
+        // exceed the number of distinct values in the histogram's target bin.
+        // With cand_count up to MAX_CANDIDATES and 256 bins, worst case is
+        // ~cand_count/NUM_BINS ≈ 24.  But the histogram range [block_min,
+        // block_max] may be much wider than the target bin, concentrating
+        // many candidates in a few bins.  Use cand_count/4 as a safe limit
+        // (each snap is cheap: 2 syncs + 1 smem scan of cand_count elements).
         bool snap_converged = false;
         int snap_limit = (cand_count > 128 ? cand_count / 4 : 32);
+        int snap_iters_done = 0;
         for (int si = 0; si < snap_limit; si++)
         {
             blockFusedSnapIter(smem, cand_count, tid, warp_id, lane);
+            snap_iters_done = si + 1;
+#ifdef HEURISTIC_TOPK_PROFILE
+            if (tid == 0)
+                prof_snap_iters++;
+#endif
             int cge = smem->cnt_lo;
             int cgt = smem->cnt_hi;
             if (cgt < TOP_K && cge >= TOP_K)
@@ -661,13 +699,27 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
                 break;
             }
         }
-        (void) snap_converged;
 
+        if (!snap_converged && tid == 0)
+        {
+            printf(
+                "[topK WARN] snap did NOT converge after %d/%d iters! "
+                "cands=%d count_ge=%d count_gt=%d thr=%.6f\n",
+                snap_iters_done, snap_limit, cand_count, smem->cnt_lo, smem->cnt_hi, smem->threshold);
+        }
+
+#ifdef HEURISTIC_TOPK_PROFILE
+        if (tid == 0)
+            prof_4d = clock64();
+#endif
+
+        // ---- 4e: Partition ----
         float sel_thr = smem->threshold;
         if (tid == 0)
             smem->out_count = 0;
-        __syncthreads();
+        __syncthreads(); // S-4e1
 
+        // ---- Partition: emit > and == sel_thr from candidate set ----
         for (int base = warp_id * WARP_SIZE; base < cand_count; base += BLOCK_SIZE)
         {
             int i = base + lane;
@@ -709,15 +761,35 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         }
         __syncthreads();
 
-        int filled = min(smem->out_count, TOP_K);
-        for (int i = filled + tid; i < TOP_K; i += BLOCK_SIZE)
+        // Fill any remaining output slots if partition underflowed
         {
-            outputValues[i] = -FLT_MAX;
-            outputIndices[i] = -1;
+            int filled = min(smem->out_count, TOP_K);
+            for (int i = filled + tid; i < TOP_K; i += BLOCK_SIZE)
+            {
+                outputValues[i] = -FLT_MAX;
+                outputIndices[i] = -1;
+            }
         }
+#ifdef HEURISTIC_TOPK_PROFILE
+        if (tid == 0)
+        {
+            prof_t4 = clock64();
+            long long p4_hist = prof_4b - prof_t3;
+            long long p4_snap = prof_4d - prof_4b;
+            long long p4_part = prof_t4 - prof_4d;
+            printf(
+                "[topK prof] P1=%lld P2=%lld P3=%lld P4=%lld total=%lld | "
+                "P2_iters=%d first_count=%d done_type=%d cands=%d | "
+                "P4: hist=%lld snap=%lld(x%d) part=%lld\n",
+                prof_t1 - prof_t0, prof_t2 - prof_t1, prof_t3 - prof_t2, prof_t4 - prof_t3, prof_t4 - prof_t0,
+                prof_p2_iters, prof_p2_first_count, prof_p2_done_type, cand_count, p4_hist, p4_snap, prof_snap_iters,
+                p4_part);
+        }
+#endif
         return;
     }
 
+    // Edge case: cand_count < TOP_K
     for (int i = tid; i < cand_count; i += BLOCK_SIZE)
     {
         outputValues[i] = smem->keys[i];
@@ -728,20 +800,17 @@ __device__ __noinline__ void heuristicTopKJob(float const* __restrict__ input, i
         outputValues[i] = -FLT_MAX;
         outputIndices[i] = -1;
     }
-}
-
-// ============================================================================
-// Main Kernel (calls heuristicTopKJob as an independently-optimized device fn)
-// ============================================================================
-
-__global__ void __launch_bounds__(BLOCK_SIZE, 1)
-    heuristicTopKKernel(float const* __restrict__ input, int const N, int const* __restrict__ preIdx, int const M,
-        int const topK, float* __restrict__ outputValues, int* __restrict__ outputIndices, int const thresholdPos)
-{
-    extern __shared__ unsigned char smem_raw[];
-    auto* smem = reinterpret_cast<KernelSmem*>(smem_raw);
-
-    heuristicTopKJob(input, N, preIdx, M, topK, outputValues, outputIndices, smem);
+#ifdef HEURISTIC_TOPK_PROFILE
+    if (tid == 0)
+    {
+        prof_t4 = clock64();
+        printf(
+            "[topK prof] P1=%lld P2=%lld P3=%lld P4=%lld total=%lld | "
+            "P2_iters=%d first_count=%d done_type=%d cands=%d (underflow)\n",
+            prof_t1 - prof_t0, prof_t2 - prof_t1, prof_t3 - prof_t2, prof_t4 - prof_t3, prof_t4 - prof_t0,
+            prof_p2_iters, prof_p2_first_count, prof_p2_done_type, cand_count);
+    }
+#endif
 }
 
 // ============================================================================
