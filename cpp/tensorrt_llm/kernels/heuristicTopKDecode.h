@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -17,8 +17,8 @@
 #pragma once
 
 #include "tensorrt_llm/common/config.h"
-#include <cuda_runtime.h>
 #include <cstdint>
+#include <cuda_runtime.h>
 
 TRTLLM_NAMESPACE_BEGIN
 
@@ -28,8 +28,8 @@ namespace kernels
 inline constexpr int kHeuristicTopK = 2048;
 inline constexpr int kHeuristicSize = 2048;
 
-void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
-    int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows, cudaStream_t stream);
+void launchHeuristicTopKDecode(
+    float const* logits, int N, int const* preIdx, int preIdxCount, int topK, int* outIndices, cudaStream_t stream);
 
 } // namespace kernels
 

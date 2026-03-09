@@ -1,5 +1,5 @@
 /*
- * Copyright (c) 2019-2025, NVIDIA CORPORATION.  All rights reserved.
+ * Copyright (c) 2019-2026, NVIDIA CORPORATION.  All rights reserved.
  * Copyright (c) 2021, NAVER Corp.  Authored by CLOVA.
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -122,12 +122,12 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
             skip_cnt = len;
         }
         WideT const* in_cast = reinterpret_cast<decltype(in_cast)>(in + skip_cnt);
-        const idxT len_cast = (len - skip_cnt) / items_per_scalar;
+        idxT const len_cast = (len - skip_cnt) / items_per_scalar;
 
         for (idxT i = thread_rank; i < len_cast; i += num_threads)
         {
             wide.scalar = in_cast[i];
-            const idxT real_i = skip_cnt + i * items_per_scalar;
+            idxT const real_i = skip_cnt + i * items_per_scalar;
 #pragma unroll
             for (int j = 0; j < items_per_scalar; ++j)
             {
@@ -147,7 +147,7 @@ __device__ void vectorized_process(size_t thread_rank, size_t num_threads, T con
         // and so
         // len - (skip_cnt + len_cast * items_per_scalar) < items_per_scalar <=
         // WARP_SIZE no need to use loop
-        const idxT remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
+        idxT const remain_i = skip_cnt + len_cast * items_per_scalar + thread_rank;
         if (remain_i < len)
         {
             f(in[remain_i], remain_i);
@@ -676,13 +676,11 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
     bool const canUseHeuristic = preIdx != nullptr && stride1 == 1 && topK == kHeuristicTopK
-        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount
-        && numColumns < effectiveSplitWorkThreshold;
+        && preIdxCount == kHeuristicSize && preIdxStride >= preIdxCount && numColumns < effectiveSplitWorkThreshold;
 
     if (canUseHeuristic)
     {
-        launchHeuristicTopKDecode(
-            logits, seqLens, preIdx, indices, stride0, next_n, topK, preIdxStride, preIdxCount, numRows, stream);
+        launchHeuristicTopKDecode(logits, numColumns, preIdx, preIdxCount, topK, indices, stream);
     }
     else if (numColumns < kSortingAlgorithmThreshold)
     {
