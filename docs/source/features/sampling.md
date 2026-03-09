@@ -19,9 +19,10 @@ The PyTorch backend supports a wide variety of features, listed below:
 There are two sampling backends available.
 
 * Torch Sampler
-* TRTLLM Sampler
+* TRTLLM Sampler (deprecated)
 
-Torch Sampler currently supports a superset of features of TRTLLM Sampler, and is intended as the long-term solution. One can specify which sampler to use explicitly with:
+Torch Sampler is used by default and supports a superset of features of TRTLLM Sampler. TRTLLM Sampler will be removed in release 1.4.
+One can specify which sampler to use explicitly with:
 
 ```python
 from tensorrt_llm import LLM
