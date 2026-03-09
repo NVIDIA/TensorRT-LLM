@@ -571,8 +571,7 @@ def test_idempotent_double_application():
 
 
 class InterleavedDownstreamFork(nn.Module):
-    """Model where the largest linear's downstream ops appear BEFORE the
-    remaining linears in graph order.
+    """Model where the largest linear's downstream ops appear BEFORE the remaining linears in graph order.
 
     This mirrors real MHA patterns where:
       q_proj(x) -> reshape_q -> ...   (largest, downstream appears early)
@@ -605,8 +604,9 @@ class InterleavedDownstreamFork(nn.Module):
 
 
 class DeepDownstreamFork(nn.Module):
-    """Model where the largest linear has a deep chain of downstream ops
-    before the remaining linears, testing transitive movement.
+    """Model where the largest linear has a deep chain of downstream ops before the remaining linears.
+
+    Tests transitive movement.
 
     largest -> relu -> linear -> relu -> linear -> ...
     remaining_1, remaining_2 appear after the chain
@@ -632,8 +632,10 @@ class DeepDownstreamFork(nn.Module):
 
 
 def test_interleaved_downstream_topological_order():
-    """Regression: aux node must not violate topological order when the
-    largest linear's downstream ops precede the remaining linears."""
+    """Regression: aux node must not violate topological order.
+
+    This checks when the largest linear's downstream ops precede the remaining linears.
+    """
     cuda_stream_manager.add_device(torch.cuda.current_device())
     model = InterleavedDownstreamFork(128, 256, 128).eval().to("cuda")
     example = torch.randn(4, 128, device="cuda")
@@ -662,8 +664,7 @@ def test_interleaved_downstream_cuda_graph():
 
 
 def test_deep_downstream_topological_order():
-    """Regression: deep chain of ops downstream of the largest linear must
-    all be moved after the aux node."""
+    """Regression: deep chain of ops downstream of the largest linear must all be moved after the aux node."""
     cuda_stream_manager.add_device(torch.cuda.current_device())
     model = DeepDownstreamFork(128, 256, 128).eval().to("cuda")
     example = torch.randn(4, 128, device="cuda")

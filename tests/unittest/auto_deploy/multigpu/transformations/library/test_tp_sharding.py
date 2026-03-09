@@ -386,23 +386,6 @@ class GDN_Block_Unfused(nn.Module):
         return self.out_proj(normed.reshape(b, s, -1))
 
 
-class FineGrainedFP8MLP(nn.Module):
-    """MLP using FineGrainedFP8 quantization for testing."""
-
-    def __init__(self, in_features, out_features, bias=False):
-        super().__init__()
-        self.in_features = in_features
-        self.out_features = out_features
-        # Use larger features divisible by block size (128)
-        hidden_features = max(4 * in_features, 128)
-        self.linear1 = FakeFineGrainedFP8Linear(in_features, hidden_features, bias=bias)
-        self.linear2 = FakeFineGrainedFP8Linear(hidden_features, out_features, bias=bias)
-
-    def forward(self, x):
-        y = F.relu(self.linear1(x))
-        return self.linear2(y)
-
-
 def _run_sharding_execution_job(
     model_cls: nn.Module,
     dist_op_expected: str,

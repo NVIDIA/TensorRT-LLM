@@ -135,9 +135,7 @@ def test_decode_only(gdr_env, num_k_heads, num_v_heads):
     assert torch.isfinite(y).all()
 
     # Reference: preprocess (L2 + GQA expand) and call fused_recurrent directly
-    q_norm, k_norm, g, beta = _preprocess_for_reference(
-        q, k, a, b, A_log, dt_bias, num_v_heads
-    )
+    q_norm, k_norm, g, beta = _preprocess_for_reference(q, k, a, b, A_log, dt_bias, num_v_heads)
     q_flat = q_norm.view(batch, num_v_heads, -1)
     k_flat = k_norm.view(batch, num_v_heads, -1)
     v_flat = v.view(batch, num_v_heads, -1)

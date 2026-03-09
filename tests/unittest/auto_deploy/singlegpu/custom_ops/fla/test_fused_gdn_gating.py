@@ -63,7 +63,7 @@ class TestFusedGdnGating:
         torch.testing.assert_close(out, ref, atol=1e-5, rtol=1e-5)
 
     def test_torch_and_triton_match(self, batch_size, seq_len, num_heads, dtype):
-        """torch and triton ops produce identical results."""
+        """Torch and triton ops produce identical results."""
         A_log = torch.randn(num_heads, device="cuda", dtype=dtype)
         a = torch.randn(batch_size, seq_len, num_heads, device="cuda", dtype=dtype)
         dt_bias = torch.randn(num_heads, device="cuda", dtype=dtype)
