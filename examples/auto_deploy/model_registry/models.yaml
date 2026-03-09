@@ -181,8 +181,6 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: deepseek-ai/DeepSeek-R1
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
-- name: deepseek-ai/DeepSeek-V3
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: Qwen/Qwen3-VL-8B-Instruct
