@@ -6,8 +6,7 @@ description: Lightweight guide for manually tuning basic aggregate (inflight bat
   architecture-class heuristics, and pointers to existing config databases. Use when
   a human is manually tuning a TRT-LLM config for standard throughput-optimized
   serving via trtllm-serve. NOT for multi-node, disaggregated serving, speculative
-  decoding, or TensorRT engine configs. Prefer trtllm-config-generator when
-  automated/scripted config generation with exact per-model values is needed.
+  decoding, or TensorRT engine configs.
 ---
 
 # Basic Aggregate Single-Node Config Guide
