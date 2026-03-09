@@ -22,23 +22,23 @@ from cutlass.utils import LayoutEnum
 import cutlass.utils.hopper_helpers as sm90_utils_basic
 
 
-from cute import ampere_helpers as sm80_utils
-from cute import hopper_helpers as sm90_utils
-from cute import utils
-from cute import copy_utils
-from cute.mask import AttentionMask
-from cute.softmax import Softmax, apply_score_mod_inner
-from cute.seqlen_info import SeqlenInfoQK
-from cute.block_info import BlockInfo
-from cute.block_sparsity import BlockSparseTensors
-from cute.block_sparse_utils import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.ampere_helpers as sm80_utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.hopper_helpers as sm90_utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.copy_utils as copy_utils
+from .mask import AttentionMask
+from .softmax import Softmax, apply_score_mod_inner
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     produce_block_sparse_loads,
     consume_block_sparse_loads,
 )
-from cute import pipeline
-from cute.pack_gqa import PackGQA
-from cute.named_barrier import NamedBarrierFwd
-from cute.tile_scheduler import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.pipeline as pipeline
+from .pack_gqa import PackGQA
+from .named_barrier import NamedBarrierFwd
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTScheduler,

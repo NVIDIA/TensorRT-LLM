@@ -24,8 +24,6 @@ at commit ea8f73506369d7cdd498396474107a978858138c)
 """
 
 import math
-import pathlib
-import sys
 from typing import Optional
 
 import torch
@@ -33,10 +31,6 @@ import torch.nn as nn
 
 from ...attention_backend.interface import PredefinedAttentionMask
 from .interface import AttentionTensorLayout
-
-_fa_path = str(pathlib.Path(__file__).parents[1] / "jit_kernels" / "flash_attention")
-if _fa_path not in sys.path:
-    sys.path.insert(0, _fa_path)
 
 _flash_attn_fwd_import_error = None
 try:

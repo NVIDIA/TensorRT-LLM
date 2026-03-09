@@ -13,19 +13,19 @@ from cutlass.cute import FastDivmodDivisor
 from cutlass import Float32, Int32, Boolean, const_expr
 from cutlass.utils import LayoutEnum
 
-from cute import hopper_helpers as sm90_utils
-from cute import utils
-from cute import copy_utils
-from cute.hopper_helpers import gemm_zero_init, gemm_w_idx
-from cute.mask import AttentionMask
-from cute.seqlen_info import SeqlenInfoQK
-from cute.block_info import BlockInfo
-from cute import pipeline
-from cute.tile_scheduler import TileSchedulerArguments, SingleTileScheduler, ParamsBase
-from cute.named_barrier import NamedBarrierFwd, NamedBarrierBwd
-from cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
-from cute.block_sparsity import BlockSparseTensors
-from cute.block_sparse_utils import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.hopper_helpers as sm90_utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.copy_utils as copy_utils
+from .hopper_helpers import gemm_zero_init, gemm_w_idx
+from .mask import AttentionMask
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.pipeline as pipeline
+from .tile_scheduler import TileSchedulerArguments, SingleTileScheduler, ParamsBase
+from .named_barrier import NamedBarrierFwd, NamedBarrierBwd
+from .softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     get_total_q_block_count_bwd,
     produce_block_sparse_q_loads_bwd_sm90,
     consume_block_sparse_mma_bwd_sm90,

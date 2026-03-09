@@ -6,8 +6,8 @@ import cutlass.cute as cute
 from cutlass.cute.nvgpu import cpasync
 from cutlass import Int32, const_expr
 
-from cute import utils
-from cute.cute_dsl_utils import ParamsBase
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+from .cute_dsl_utils import ParamsBase
 from cutlass.cute import FastDivmodDivisor
 
 

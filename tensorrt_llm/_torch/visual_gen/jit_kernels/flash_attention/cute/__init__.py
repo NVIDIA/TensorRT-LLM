@@ -4,12 +4,12 @@ __version__ = "0.1.0"
 
 import cutlass.cute as cute
 
-from cute.interface import (
+from .interface import (
     flash_attn_func,
     flash_attn_varlen_func,
 )
 
-from cute.cute_dsl_utils import cute_compile_patched
+from .cute_dsl_utils import cute_compile_patched
 
 # Patch cute.compile to optionally dump SASS
 cute.compile = cute_compile_patched

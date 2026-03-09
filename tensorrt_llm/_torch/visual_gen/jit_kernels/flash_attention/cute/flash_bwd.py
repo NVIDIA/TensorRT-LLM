@@ -14,11 +14,11 @@ from cutlass.cute.nvgpu import cpasync, warp
 from cutlass import Float32, Int32
 import cutlass.utils as utils_basic
 
-from cute import ampere_helpers as sm80_utils
-from cute import utils
-from cute.mask import AttentionMask
-from cute.seqlen_info import SeqlenInfoQK
-from cute.tile_scheduler import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.ampere_helpers as sm80_utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+from .mask import AttentionMask
+from .seqlen_info import SeqlenInfoQK
+from .tile_scheduler import (
     ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,

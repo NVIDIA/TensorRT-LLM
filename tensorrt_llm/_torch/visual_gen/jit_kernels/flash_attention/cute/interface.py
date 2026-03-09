@@ -31,18 +31,18 @@ import cuda.bindings.driver as cuda
 import cutlass
 import cutlass.cute as cute
 
-from cute import utils
-from cute.cute_dsl_utils import to_cute_tensor
-from cute.flash_fwd import FlashAttentionForwardSm90
-from cute.flash_fwd_sm100 import FlashAttentionForwardSm100
-from cute.flash_bwd_preprocess import FlashAttentionBackwardPreprocess
-from cute.flash_bwd import FlashAttentionBackwardSm80
-from cute.flash_bwd_sm90 import FlashAttentionBackwardSm90
-from cute.flash_bwd_sm100 import FlashAttentionBackwardSm100
-from cute.flash_bwd_postprocess import FlashAttentionBackwardPostprocess
-from cute.flash_fwd_combine import FlashAttentionForwardCombine
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+from .cute_dsl_utils import to_cute_tensor
+from .flash_fwd import FlashAttentionForwardSm90
+from .flash_fwd_sm100 import FlashAttentionForwardSm100
+from .flash_bwd_preprocess import FlashAttentionBackwardPreprocess
+from .flash_bwd import FlashAttentionBackwardSm80
+from .flash_bwd_sm90 import FlashAttentionBackwardSm90
+from .flash_bwd_sm100 import FlashAttentionBackwardSm100
+from .flash_bwd_postprocess import FlashAttentionBackwardPostprocess
+from .flash_fwd_combine import FlashAttentionForwardCombine
 
-from cute.block_sparsity import (
+from .block_sparsity import (
     BlockSparseTensorsTorch,
     to_cute_block_sparse_tensors,
     normalize_block_sparse_tensors,

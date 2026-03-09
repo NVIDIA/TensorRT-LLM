@@ -9,9 +9,9 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from cute import utils as utils
-from cute.cute_dsl_utils import ParamsBase
-from cute.seqlen_info import SeqlenInfoQK
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+from .cute_dsl_utils import ParamsBase
+from .seqlen_info import SeqlenInfoQK
 
 
 @dataclass

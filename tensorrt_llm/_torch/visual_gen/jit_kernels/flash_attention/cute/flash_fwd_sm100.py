@@ -27,25 +27,24 @@ from cutlass.cute.nvgpu import cpasync
 import cutlass.cute.nvgpu.tcgen05 as tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 
-from cute.paged_kv import PagedKVManager
-from cute import utils as utils
-from cute import copy_utils
-from cute import pipeline as pipeline
-from cute.mask import AttentionMask
-from cute.softmax import SoftmaxSm100, apply_score_mod_inner
-from cute.seqlen_info import SeqlenInfoQK
-from cute.block_info import BlockInfo
-from cute.block_sparsity import BlockSparseTensors
-from cute.block_sparse_utils import (
+from .paged_kv import PagedKVManager
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.copy_utils as copy_utils
+from .mask import AttentionMask
+from .softmax import SoftmaxSm100, apply_score_mod_inner
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     get_total_block_count,
     produce_block_sparse_loads_sm100,
     softmax_block_sparse_sm100,
     handle_block_sparse_empty_tile_correction_sm100,
 )
-from cute.pack_gqa import PackGQA
-from cute import blackwell_helpers as sm100_utils
+from .pack_gqa import PackGQA
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.blackwell_helpers as sm100_utils
 from cutlass.cute import FastDivmodDivisor
-from cute.tile_scheduler import (
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     StaticPersistentTileScheduler,

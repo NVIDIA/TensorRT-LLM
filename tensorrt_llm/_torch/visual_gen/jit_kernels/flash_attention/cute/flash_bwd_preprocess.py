@@ -11,10 +11,10 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32
 
-from cute import utils
-from cute import copy_utils
-from cute.seqlen_info import SeqlenInfoQK
-from cute.tile_scheduler import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.copy_utils as copy_utils
+from .seqlen_info import SeqlenInfoQK
+from .tile_scheduler import (
     ParamsBase,
     SingleTileScheduler,
     SingleTileVarlenScheduler,

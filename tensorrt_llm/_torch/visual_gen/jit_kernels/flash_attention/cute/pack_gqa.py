@@ -4,7 +4,7 @@
 import cutlass
 import cutlass.cute as cute
 
-from cute import utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
 
 
 class PackGQA:

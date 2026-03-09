@@ -13,10 +13,10 @@ import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
 # Import data structures from block_sparsity
-from cute.block_sparsity import BlockSparseTensors
-from cute import utils
-from cute import copy_utils
-from cute.named_barrier import NamedBarrierBwd
+from .block_sparsity import BlockSparseTensors
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.copy_utils as copy_utils
+from .named_barrier import NamedBarrierBwd
 
 
 @cute.jit

@@ -7,7 +7,7 @@ from typing import Callable, NamedTuple, Tuple
 import cutlass.cute as cute
 import torch
 
-from cute.cute_dsl_utils import to_cute_tensor
+from .cute_dsl_utils import to_cute_tensor
 
 
 def ceildiv(a: int, b: int) -> int:

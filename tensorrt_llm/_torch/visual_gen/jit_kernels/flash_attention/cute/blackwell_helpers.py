@@ -7,8 +7,8 @@ from cutlass import Int32, Boolean, const_expr
 from cutlass.cute.nvgpu import tcgen05
 from cutlass._mlir.dialects import llvm
 
-from cute import mma_sm100_desc as sm100_desc
-from cute.utils import parse_swizzle_from_pointer
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.mma_sm100_desc as sm100_desc
+from .utils import parse_swizzle_from_pointer
 
 
 @cute.jit

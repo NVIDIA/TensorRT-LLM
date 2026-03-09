@@ -14,14 +14,14 @@ from cutlass.cute.nvgpu import cpasync, tcgen05
 import cutlass.utils.blackwell_helpers as sm100_utils_basic
 from cutlass.pipeline import PipelineAsync, PipelineConsumer
 
-from cute import utils
-from cute import copy_utils
-from cute import pipeline
-from cute.blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
-from cute.mask import AttentionMask
-from cute.seqlen_info import SeqlenInfoQK
-from cute.block_info import BlockInfo
-from cute.tile_scheduler import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.copy_utils as copy_utils
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.pipeline as pipeline
+from .blackwell_helpers import gemm_w_idx, gemm_ptx_w_idx  # noqa
+from .mask import AttentionMask
+from .seqlen_info import SeqlenInfoQK
+from .block_info import BlockInfo
+from .tile_scheduler import (
     TileSchedulerArguments,
     SingleTileScheduler,
     SingleTileLPTBwdScheduler,  # noqa
@@ -29,11 +29,11 @@ from cute.tile_scheduler import (
     ParamsBase,
 )
 
-from cute import barrier
-from cute.named_barrier import NamedBarrierBwdSm100
-from cute.softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
-from cute.block_sparsity import BlockSparseTensors
-from cute.block_sparse_utils import (
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.barrier as barrier
+from .named_barrier import NamedBarrierBwdSm100
+from .softmax import apply_score_mod_inner, apply_score_mod_bwd_inner
+from .block_sparsity import BlockSparseTensors
+from .block_sparse_utils import (
     get_total_q_block_count_bwd,
     get_block_sparse_iteration_info_bwd,
     get_m_block_from_iter_bwd,

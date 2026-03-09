@@ -7,8 +7,8 @@ import cutlass
 import cutlass.cute as cute
 from cutlass import Float32, Int32, const_expr
 
-from cute import utils as utils
-from cute.seqlen_info import SeqlenInfoQK
+import tensorrt_llm._torch.visual_gen.jit_kernels.flash_attention.cute.utils as utils
+from .seqlen_info import SeqlenInfoQK
 
 
 @cute.jit
