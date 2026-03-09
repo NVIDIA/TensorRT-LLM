@@ -240,11 +240,18 @@ tensorrt_llm::kernels::TrtllmGenBatchedGemmRunnerOptions getOptions(
     }
     else
     {
+        EltwiseActType eltwiseActType = EltwiseActType::None;
+        switch (actType)
+        {
+        default:
+        case ActType::Relu2: eltwiseActType = EltwiseActType::Relu2; break;
+        case ActType::Silu: eltwiseActType = EltwiseActType::Silu; break;
+        }
         options = {
             .dtypeA = dtypeWeights,
             .dtypeB = dtypeAct,
             .dtypeC = dtypeAct,
-            .eltwiseActType = EltwiseActType::Relu2,
+            .eltwiseActType = eltwiseActType,
             .deepSeekFp8 = useDeepSeekFp8,
             .fusedAct = false,
             .routeAct = true,
