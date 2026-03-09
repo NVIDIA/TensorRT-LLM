@@ -52,7 +52,7 @@ struct dtype_traits<half>
 
 namespace
 {
-tle::Tensor numpyToTensor(nb::object const& object)
+tle::Tensor arrayInterfaceToTensor(nb::object const& object)
 {
     std::string dtype_name = nb::cast<std::string>(object.attr("dtype").attr("name"));
     nb::object metadata = object.attr("dtype").attr("metadata");
@@ -108,6 +108,26 @@ tle::Tensor numpyToTensor(nb::object const& object)
     return tle::Tensor::of(dtype, data_ptr, shape);
 }
 
+tle::Tensor pythonObjectToTensor(nb::object const& object)
+{
+    try
+    {
+        // Use the custom caster path for torch.Tensor inputs (CPU or CUDA).
+        return nb::cast<tle::Tensor>(object);
+    }
+    catch (std::exception const&)
+    {
+        // Fallback to array interface path below.
+    }
+
+    if (nb::hasattr(object, "__array_interface__"))
+    {
+        return arrayInterfaceToTensor(object);
+    }
+
+    TLLM_THROW("Unsupported managed weight input. Expected torch.Tensor or an object with __array_interface__.");
+}
+
 } // namespace
 
 namespace tensorrt_llm::nanobind::executor
@@ -138,7 +158,7 @@ Executor::Executor(nb::bytes const& engineBuffer, std::string const& jsonConfigS
         {
             std::string name = nb::cast<std::string>(rawName);
             nb::object array_obj = nb::cast<nb::object>(rawArray);
-            managedWeightsMap->emplace(name, numpyToTensor(array_obj));
+            managedWeightsMap->emplace(name, pythonObjectToTensor(array_obj));
         }
     }
     mExecutor = std::make_unique<tle::Executor>(

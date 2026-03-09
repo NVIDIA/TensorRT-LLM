@@ -28,9 +28,9 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SizeType32> maxNumTokens, std::optional<ParallelConfig> parallelConfig,
     std::optional<PeftCacheConfig> const& peftCacheConfig,
     std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig, std::optional<DecodingConfig> decodingConfig,
-    bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
-    ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
-    SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
+    bool useGpuDirectStorage, float gpuWeightPercent, bool aliasManagedWeightsFromGpu,
+    std::optional<SizeType32> maxQueueSize, ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig,
+    std::optional<DebugConfig> debugConfig, SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
     std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
@@ -51,6 +51,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mDecodingConfig(std::move(decodingConfig))
     , mUseGpuDirectStorage((useGpuDirectStorage))
     , mGpuWeightsPercent(gpuWeightPercent)
+    , mAliasManagedWeightsFromGpu(aliasManagedWeightsFromGpu)
     , mMaxQueueSize(maxQueueSize)
     , mExtendedRuntimePerfKnobConfig(extendedRuntimePerfKnobConfig)
     , mDebugConfig(std::move(debugConfig))
@@ -69,6 +70,29 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     TLLM_CHECK(requestStatsMaxIterations >= 0);
     TLLM_CHECK(mMaxBeamWidth > 0);
     TLLM_CHECK(maxSeqIdleMicroseconds > 0);
+}
+
+ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedulerConfig, KvCacheConfig kvCacheConfig,
+    bool enableChunkedContext, bool normalizeLogProbs, SizeType32 iterStatsMaxIterations,
+    SizeType32 requestStatsMaxIterations, BatchingType batchingType, std::optional<SizeType32> maxBatchSize,
+    std::optional<SizeType32> maxNumTokens, std::optional<ParallelConfig> parallelConfig,
+    std::optional<PeftCacheConfig> const& peftCacheConfig,
+    std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig, std::optional<DecodingConfig> decodingConfig,
+    bool useGpuDirectStorage, float gpuWeightPercent, std::optional<SizeType32> maxQueueSize,
+    ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig, std::optional<DebugConfig> debugConfig,
+    SizeType32 recvPollPeriodMs, uint64_t maxSeqIdleMicroseconds,
+    std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
+    std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
+    std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
+    bool promptTableOffloading, bool enableTrtOverlap, bool failFastOnAttentionWindowTooLarge)
+    : ExecutorConfig(maxBeamWidth, std::move(schedulerConfig), std::move(kvCacheConfig), enableChunkedContext,
+        normalizeLogProbs, iterStatsMaxIterations, requestStatsMaxIterations, batchingType, maxBatchSize, maxNumTokens,
+        std::move(parallelConfig), peftCacheConfig, std::move(logitsPostProcessorConfig), std::move(decodingConfig),
+        useGpuDirectStorage, gpuWeightPercent, false, maxQueueSize, extendedRuntimePerfKnobConfig,
+        std::move(debugConfig), recvPollPeriodMs, maxSeqIdleMicroseconds, specDecConfig,
+        std::move(guidedDecodingConfig), std::move(additionalModelOutputs), std::move(cacheTransceiverConfig),
+        gatherGenerationLogits, promptTableOffloading, enableTrtOverlap, failFastOnAttentionWindowTooLarge)
+{
 }
 
 // getters
@@ -161,6 +185,11 @@ bool ExecutorConfig::getUseGpuDirectStorage() const
 float ExecutorConfig::getGpuWeightsPercent() const
 {
     return mGpuWeightsPercent;
+}
+
+bool ExecutorConfig::getAliasManagedWeightsFromGpu() const
+{
+    return mAliasManagedWeightsFromGpu;
 }
 
 std::optional<SizeType32> ExecutorConfig::getMaxQueueSize() const
@@ -313,6 +342,11 @@ void ExecutorConfig::setUseGpuDirectStorage(bool const& useGpuDirectStorage)
 void ExecutorConfig::setGpuWeightsPercent(float const& gpuWeightsPercent)
 {
     mGpuWeightsPercent = gpuWeightsPercent;
+}
+
+void ExecutorConfig::setAliasManagedWeightsFromGpu(bool const& aliasManagedWeightsFromGpu)
+{
+    mAliasManagedWeightsFromGpu = aliasManagedWeightsFromGpu;
 }
 
 void ExecutorConfig::setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize)
