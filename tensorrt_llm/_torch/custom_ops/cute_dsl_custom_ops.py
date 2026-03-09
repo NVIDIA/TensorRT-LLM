@@ -2895,7 +2895,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
             )
             if load_balance:
                 g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
-                    cutlass.Int32, (1,), stride_order=(0,))
+                    cutlass.Int32, (1, ), stride_order=(0, ))
             else:
                 g_global_counter_fake = None
             compiled_kernel = cute.compile(
@@ -2907,7 +2907,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seqlen_fake,
                 output_indices_fake,
                 output_values_fake,
-
                 stream=fake_stream,
                 enable_persistent_dynamic_scheduling=load_balance,
                 min_blocks_per_mp=4 if large_occupancy else 1,
@@ -2992,8 +2991,9 @@ if IS_CUTLASS_DSL_AVAILABLE:
 
             # Prepare global counter for persistent dynamic scheduling
             if load_balance:
-                g_global_counter_torch = torch.zeros(
-                    1, dtype=torch.int32, device="cuda")
+                g_global_counter_torch = torch.zeros(1,
+                                                     dtype=torch.int32,
+                                                     device="cuda")
             else:
                 g_global_counter_torch = None
 
@@ -3006,7 +3006,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 seq_lens,
                 output_indices_torch,
                 output_values_torch,
-
             )
 
             return output_indices_torch, output_values_torch
@@ -3134,9 +3133,17 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_cache = dict()
 
         @classmethod
-        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
-                     num_copy_bits, load_balance, large_occupancy,
-                     chunk_size_per_cta, num_ctas_per_row,
+        def _compile(cls,
+                     dtype,
+                     bucketed_num_cols,
+                     top_k,
+                     next_n,
+                     return_val,
+                     num_copy_bits,
+                     load_balance,
+                     large_occupancy,
+                     chunk_size_per_cta,
+                     num_ctas_per_row,
                      dynamic=False):
             """Compile and cache multi-CTA top-k kernels for the given config."""
             key = (
@@ -3337,24 +3344,33 @@ if IS_CUTLASS_DSL_AVAILABLE:
                 # Dynamic mode: 2D grid (num_rows, num_ctas_per_row) with
                 # per-CTA early exit for rows needing fewer chunks.
                 # Intermediate buffers: 2D (num_rows, merge_cols)
-                first_output_indices = torch.empty(
-                    num_rows, merge_cols, dtype=torch.int32, device="cuda")
-                first_output_values = torch.empty(
-                    num_rows, merge_cols, dtype=torch_dtype, device="cuda")
+                first_output_indices = torch.empty(num_rows,
+                                                   merge_cols,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
+                first_output_values = torch.empty(num_rows,
+                                                  merge_cols,
+                                                  dtype=torch_dtype,
+                                                  device="cuda")
 
                 # Shared buffer for both kernels (they run sequentially)
                 buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-                buffer_torch = torch.empty(
-                    num_rows * num_ctas_per_row, buffer_numbers,
-                    buffer_dim2,
-                    dtype=torch.int32, device="cuda")
+                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+                                           buffer_numbers,
+                                           buffer_dim2,
+                                           dtype=torch.int32,
+                                           device="cuda")
 
                 # Final output tensors
-                output_indices_torch = torch.empty(
-                    num_rows, top_k, dtype=torch.int32, device="cuda")
+                output_indices_torch = torch.empty(num_rows,
+                                                   top_k,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
                 if return_val:
-                    output_values_torch = torch.empty(
-                        num_rows, top_k, dtype=torch_dtype, device="cuda")
+                    output_values_torch = torch.empty(num_rows,
+                                                      top_k,
+                                                      dtype=torch_dtype,
+                                                      device="cuda")
                 else:
                     output_values_torch = None
 
@@ -3389,19 +3405,25 @@ if IS_CUTLASS_DSL_AVAILABLE:
                     num_rows, merge_cols, dtype=torch_dtype, device="cuda")
 
                 # Prepare final output tensors
-                output_indices_torch = torch.empty(
-                    num_rows, top_k, dtype=torch.int32, device="cuda")
+                output_indices_torch = torch.empty(num_rows,
+                                                   top_k,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
                 if return_val:
-                    output_values_torch = torch.empty(
-                        num_rows, top_k, dtype=torch_dtype, device="cuda")
+                    output_values_torch = torch.empty(num_rows,
+                                                      top_k,
+                                                      dtype=torch_dtype,
+                                                      device="cuda")
                 else:
                     output_values_torch = None
 
                 # Prepare buffer
                 buffer_dim2 = max(chunk_size_per_cta, merge_cols)
-                buffer_torch = torch.empty(
-                    num_rows * num_ctas_per_row, buffer_numbers, buffer_dim2,
-                    dtype=torch.int32, device="cuda")
+                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+                                           buffer_numbers,
+                                           buffer_dim2,
+                                           dtype=torch.int32,
+                                           device="cuda")
 
                 # Execute first kernel: per-chunk top-k
                 compiled_kernel_first(

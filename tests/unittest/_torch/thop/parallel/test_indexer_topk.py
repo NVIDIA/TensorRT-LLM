@@ -1,6 +1,6 @@
 import pytest
 import torch
-from utils.util import getSMVersion, skip_pre_hopper, skip_pre_blackwell
+from utils.util import getSMVersion, skip_pre_blackwell, skip_pre_hopper
 
 # Import tensorrt_llm to load custom CUDA operators (indexer_topk_decode, indexer_topk_prefill)
 import tensorrt_llm  # noqa: F401
@@ -265,6 +265,7 @@ def test_indexer_topk_prefill(batch_size, index_topk, num_tokens):
 # CuTE DSL Top-K Tests
 # ============================================================================
 
+
 def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, run_fn):
     """Common test logic for CuTE DSL top-k kernels.
 
@@ -311,8 +312,7 @@ def _run_cute_dsl_topk_test(batch_size, next_n, index_topk, num_tokens, dtype, r
 @pytest.mark.parametrize("num_tokens", [4096, 8192])
 @pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
 @pytest.mark.parametrize("load_balance", [False, True])
-def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype,
-                              load_balance):
+def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype, load_balance):
     _run_cute_dsl_topk_test(
         batch_size,
         next_n,
@@ -340,8 +340,7 @@ def test_cute_dsl_topk_decode(batch_size, next_n, index_topk, num_tokens, dtype,
 @pytest.mark.parametrize("chunk_size_per_cta", [16384])
 @pytest.mark.parametrize("dynamic", [False, True])
 def test_cute_dsl_topk_decode_multi_cta(
-    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta,
-    dynamic
+    batch_size, next_n, index_topk, num_tokens, dtype, chunk_size_per_cta, dynamic
 ):
     _run_cute_dsl_topk_test(
         batch_size,
