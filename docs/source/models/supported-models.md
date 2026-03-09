@@ -81,3 +81,7 @@ Note:
 - I: Image
 - V: Video
 - A: Audio
+
+# Visual Generation Models
+
+For diffusion-based image and video generation models, see the [Visual Generation](./visual-generation.md) documentation.
