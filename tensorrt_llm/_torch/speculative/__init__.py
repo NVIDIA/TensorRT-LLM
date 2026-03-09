@@ -7,6 +7,7 @@ from .interface import (SpecMetadata, SpecWorkerBase,
 from .mtp import MTPEagleWorker, MTPSampler, MTPSpecMetadata, MTPWorker
 from .ngram import NGramDrafter, NGramPoolManager
 from .pard import PARDSpecMetadata, PARDWorker
+from .sa_enhancer import SADraftEnhancer
 from .sa_worker import SASampler, SASpecMetadata, SAWorker
 from .save_hidden_state import (SaveHiddenStatesResourceManager,
                                 SaveHiddenStatesSpecMetadata)
@@ -31,6 +32,7 @@ __all__ = [
     "NGramPoolManager",
     "PARDSpecMetadata",
     "PARDWorker",
+    "SADraftEnhancer",
     "SASampler",
     "SASpecMetadata",
     "SAWorker",
