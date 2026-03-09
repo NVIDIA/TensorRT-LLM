@@ -20,7 +20,7 @@ from tensorrt_llm.inputs.multimodal import MultimodalParams
 from ...inputs import (BaseMultimodalDummyInputsBuilder,
                        BaseMultimodalInputProcessor, ExtraProcessedInputs,
                        MultimodalPlaceholderMetadata,
-                       MultimodalPlaceholderPlacement, TextPrompt,
+                       MultimodalPlaceholderPlacement, TextPrompt, TokensPrompt,
                        register_input_processor,
                        support_multimodal_disaggregated)
 from ...logger import logger
@@ -259,16 +259,16 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         return fused_input_ids, mm_features
 
     def get_prompt_token_ids(
-        self, prompt_token_ids: List[int],
+        self, inputs: Union[TextPrompt, TokensPrompt],
         mm_handles: List[Dict[str,
                               Any]]) -> Tuple[List[int], List[int], List[int]]:
         """
         Build input token ids with multimodal placeholders expanded to the number of MM tokens.
 
-        Uses an already tokenized prompt. Delegates expansion to _expand_image_placeholders_in_token_ids.
+        Uses an already tokenized prompt or tokenizes the txt prompt first. Delegates expansion to _expand_image_placeholders_in_token_ids.
 
         Args:
-            prompt_token_ids: An already tokenized text prompt.
+            inputs: Inputs containing an already tokenized text prompt or a text prompt string.
             mm_handles: List of multimodal embedding handles.
 
         Returns:
@@ -277,6 +277,16 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 - mm_token_length: per-image MM token lengths
                 - mm_token_offsets: start offsets (positions) for each image's MM tokens within expanded_ids
         """
+        # TODO: Move this function to the base input processor class when extending for more models
+        text_prompt = inputs.get("prompt")
+        prompt_token_ids = inputs.get("prompt_token_ids")
+        if text_prompt:
+            prompt_token_ids = self.tokenizer(
+                text_prompt, return_tensors="pt").input_ids[0].tolist()
+        elif not prompt_token_ids and not text_prompt:
+            raise ValueError(
+                "Text prompt or token IDs are required but not provided")
+
         if not isinstance(mm_handles, list):
             raise ValueError("mm_handles must be a list")
 

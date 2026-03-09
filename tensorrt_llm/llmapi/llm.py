@@ -524,9 +524,7 @@ class BaseLLM:
                 )
             mm_handles = disaggregated_params.multimodal_embedding_handles
             prompt_token_ids, mm_token_length, mm_token_positions = self.input_processor.get_prompt_token_ids(
-                inputs["prompt_token_ids"] if
-                vlm_fast_path_for_token_ids_and_mm_data_available else inputs,
-                mm_handles)
+                inputs, mm_handles)
             prompt = inputs.get("prompt", None)
             query_token_ids = inputs.get("query_token_ids", None)
             if is_gen_only:
