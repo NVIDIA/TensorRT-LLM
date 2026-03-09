@@ -14,17 +14,15 @@
 # limitations under the License.
 """Wrapper tests that invoke verl repo tests via subprocess.
 
-The verl repo is cloned by CI into the path specified by the VERL_ROOT
-environment variable (see verl_config.yml for setup details).
+The verl repo is cloned by CI into verl_repo/ next to this file
+(see verl_config.yml and jenkins/L0_Test.groovy for setup details).
 """
 
 import os
 import subprocess
 import sys
 
-import pytest
-
-VERL_ROOT = os.environ.get("VERL_ROOT", "")
+VERL_ROOT = os.path.join(os.path.dirname(__file__), "verl_repo")
 
 
 def _run_verl_test(test_path, timeout=600):
@@ -39,6 +37,6 @@ def _run_verl_test(test_path, timeout=600):
     assert result.returncode == 0, f"Verl test failed with return code {result.returncode}"
 
 
-@pytest.mark.skipif(not VERL_ROOT, reason="VERL_ROOT not set")
 def test_async_server():
+    assert os.path.isdir(VERL_ROOT), f"verl repo not found at {VERL_ROOT}"
     _run_verl_test("tests/workers/rollout/rollout_trtllm/test_async_server.py")
