@@ -74,6 +74,13 @@ list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
      "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
 
+# xgrammar uses "static const" class members that are ODR-used, which causes
+# linker errors in Debug builds (-O0). Use -O1 for xgrammar sources so the
+# compiler inlines these constants. Remove once upstream fixes this.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set_source_files_properties(${XGRAMMAR_SRCS} PROPERTIES COMPILE_OPTIONS "-O1")
+endif()
+
 if(NOT WIN32)
   # additional warnings
   #
