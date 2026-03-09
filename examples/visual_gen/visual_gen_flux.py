@@ -114,8 +114,8 @@ def parse_args():
     parser.add_argument(
         "--teacache_thresh",
         type=float,
-        default=0.2,
-        help="TeaCache similarity threshold (rel_l1_thresh)",
+        default=None,
+        help="TeaCache similarity threshold (default: 0.6 for FLUX.1, 0.2 for FLUX.2)",
     )
     parser.add_argument(
         "--use_ret_steps",
@@ -215,7 +215,11 @@ def build_diffusion_args(args) -> VisualGenArgs:
         attention={"backend": args.attention_backend},
         teacache={
             "enable_teacache": args.enable_teacache,
-            "teacache_thresh": args.teacache_thresh,
+            **(
+                {"teacache_thresh": args.teacache_thresh}
+                if args.teacache_thresh is not None
+                else {}
+            ),
             "use_ret_steps": args.use_ret_steps,
         },
         parallel={
