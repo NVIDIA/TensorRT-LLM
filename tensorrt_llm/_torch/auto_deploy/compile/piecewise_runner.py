@@ -24,12 +24,12 @@ The runner's behavior is controlled by two class-level contexts set by the orche
 
 Phase semantics:
   1. WARMUP: Run the submodule eagerly (multiple iterations to stabilize allocator state).
-  2. CAPTURE: Capture the submodule as a CUDA graph.  If this runner is linked to a
-     following dynamic op (via set_dynamic_out_info), also allocate the dynamic op's
-     output buffer *inside* the graph capture so it gets a deterministic address from
-     the shared graph pool.
-  3. REPLAY: Replay the captured CUDA graph.  The DynamicOpWrapper retrieves the
-     pre-allocated output buffer via get_dynamic_out_buf().
+  2. CAPTURE: Capture the submodule as a CUDA graph.  If this runner is linked to
+     following dynamic ops (via set_dynamic_out_info), also allocate each dynamic
+     op's output buffer *inside* the graph capture so it gets a deterministic
+     address from the shared graph pool.
+  3. REPLAY: Replay the captured CUDA graph.  Each DynamicOpWrapper retrieves its
+     own pre-allocated output buffer via get_dynamic_out_buf(nt, submod_id).
 
 MetadataWrapper: wraps metadata-prep dynamic ops whose outputs flow into
   subsequent CUDA-graph-captured static segments.  These ops (e.g.
@@ -44,7 +44,7 @@ Memory:
   All model-level inputs (input_ids, position_ids, etc.) come from SequenceInfo's
   InputBuffer, which provides stable addresses across calls.  Dynamic op outputs are
   pre-allocated inside graph captures from a shared pool, giving deterministic addresses.
-  Both static_output and dynamic_out_buf are weak-ref'd via make_weak_ref, allowing the
+  Both static_output and dynamic_out_bufs are weak-ref'd via make_weak_ref, allowing the
   graph pool to recycle memory across layers.  No copy-back mechanism needed.
 """
 
@@ -75,7 +75,8 @@ class SegmentEntry:
 
     cuda_graph: Optional[torch.cuda.CUDAGraph] = None
     static_output: Any = None
-    dynamic_out_buf: Optional[torch.Tensor] = None
+    # Keyed by dynamic submodule index → pre-allocated output buffer
+    dynamic_out_bufs: Dict[int, torch.Tensor] = field(default_factory=dict)
     input_addresses: List[Optional[int]] = field(default_factory=list)
 
 
@@ -197,32 +198,53 @@ class ADPiecewiseRunner(nn.Module):
             self._weight_ptrs.add(b.data_ptr())
 
         self.entries: Dict[int, SegmentEntry] = {}
-        self._next_dynamic_out_info: Optional[OutputInfo] = None
+        # Keyed by dynamic submodule index → OutputInfo discovered during warmup
+        self._next_dynamic_out_infos: Dict[int, OutputInfo] = {}
 
-    def set_dynamic_out_info(self, info: OutputInfo) -> None:
-        """Set the output shape/dtype for the dynamic op that follows this runner.
+    def set_dynamic_out_info(self, dynamic_submod_id: int, info: OutputInfo) -> None:
+        """Set the output shape/dtype for a dynamic op that follows this runner.
 
         Called by the orchestrator after shape discovery.  The runner will allocate
         a buffer of this shape inside torch.cuda.graph() during capture.
-        """
-        self._next_dynamic_out_info = info
 
-    def get_dynamic_out_buf(self, num_tokens: int) -> Optional[torch.Tensor]:
-        """Retrieve the pre-allocated output buffer for the linked dynamic op.
+        Args:
+            dynamic_submod_id: Index of the dynamic submodule in the split graph.
+            info: Output metadata (shape, dtype, device) discovered during warmup.
+        """
+        self._next_dynamic_out_infos[dynamic_submod_id] = info
+
+    def get_dynamic_out_buf(
+        self, num_tokens: int, dynamic_submod_id: int
+    ) -> Optional[torch.Tensor]:
+        """Retrieve the pre-allocated output buffer for a linked dynamic op.
 
         Returns the weak-ref'd buffer allocated during graph capture, or None
         if shape discovery failed or this runner has no linked dynamic op.
+
+        Args:
+            num_tokens: Bucket size identifying the SegmentEntry.
+            dynamic_submod_id: Index of the dynamic submodule whose buffer to retrieve.
         """
         entry = self.entries.get(num_tokens)
-        if entry is None or entry.dynamic_out_buf is None:
+        if entry is None:
             ad_logger.warning(
-                "ADPiecewiseRunner.get_dynamic_out_buf: no buffer for "
-                "num_tokens=%d. Shape discovery may have failed or this "
-                "runner has no linked dynamic op.",
+                "ADPiecewiseRunner.get_dynamic_out_buf: no entry for "
+                "num_tokens=%d, dynamic_submod_id=%d.",
                 num_tokens,
+                dynamic_submod_id,
             )
             return None
-        return entry.dynamic_out_buf
+        buf = entry.dynamic_out_bufs.get(dynamic_submod_id)
+        if buf is None:
+            ad_logger.warning(
+                "ADPiecewiseRunner.get_dynamic_out_buf: no buffer for "
+                "num_tokens=%d, dynamic_submod_id=%d. Shape discovery may "
+                "have failed or this runner has no linked dynamic op.",
+                num_tokens,
+                dynamic_submod_id,
+            )
+            return None
+        return buf
 
     def forward(self, *args, **kwargs) -> Any:
         num_tokens = ADPiecewiseRunner._current_num_tokens
@@ -231,26 +253,27 @@ class ADPiecewiseRunner(nn.Module):
         if num_tokens is None:
             return self.submodule(*args, **kwargs)
 
+        # --- WARMUP ---
+        if phase == "warmup":
+            return self.submodule(*args, **kwargs)
+
         entry = self.entries.get(num_tokens)
         if entry is None:
             entry = SegmentEntry()
             self.entries[num_tokens] = entry
-
-        # --- WARMUP ---
-        if phase == "warmup":
-            return self.submodule(*args, **kwargs)
 
         # --- CAPTURE ---
         if phase == "capture":
             torch.cuda.synchronize()
             graph = torch.cuda.CUDAGraph()
 
-            dynamic_out_buf = None
+            dynamic_out_bufs: Dict[int, torch.Tensor] = {}
             with torch.cuda.graph(graph, pool=self._graph_pool):
                 output = self.submodule(*args, **kwargs)
-                if self._next_dynamic_out_info is not None:
-                    info = self._next_dynamic_out_info
-                    dynamic_out_buf = torch.empty(info.shape, dtype=info.dtype, device=info.device)
+                for submod_id, info in self._next_dynamic_out_infos.items():
+                    dynamic_out_bufs[submod_id] = torch.empty(
+                        info.shape, dtype=info.dtype, device=info.device
+                    )
 
             torch.cuda.synchronize()
 
@@ -259,8 +282,8 @@ class ADPiecewiseRunner(nn.Module):
 
             entry.cuda_graph = graph
             entry.static_output = make_weak_ref(output)
-            if dynamic_out_buf is not None:
-                entry.dynamic_out_buf = make_weak_ref(dynamic_out_buf)
+            for submod_id, buf in dynamic_out_bufs.items():
+                entry.dynamic_out_bufs[submod_id] = make_weak_ref(buf)
 
             # Debug: record input addresses for assertion in replay
             flat_args, _ = tree_flatten((args, kwargs))
@@ -316,10 +339,16 @@ class DynamicOpWrapper(nn.Module):
     ADPiecewiseRunner and passes it as the ``out`` kwarg.
     """
 
-    def __init__(self, submodule: nn.Module, preceding_runner: ADPiecewiseRunner):
+    def __init__(
+        self,
+        submodule: nn.Module,
+        preceding_runner: ADPiecewiseRunner,
+        dynamic_submod_id: int,
+    ):
         super().__init__()
         self.submodule = submodule
         self.preceding_runner = preceding_runner
+        self.dynamic_submod_id = dynamic_submod_id
 
     def forward(self, *args, **kwargs) -> Any:
         phase = ADPiecewiseRunner._current_phase
@@ -328,9 +357,10 @@ class DynamicOpWrapper(nn.Module):
 
         nt = ADPiecewiseRunner._current_num_tokens
         if nt is not None:
-            out_buf = self.preceding_runner.get_dynamic_out_buf(nt)
+            out_buf = self.preceding_runner.get_dynamic_out_buf(nt, self.dynamic_submod_id)
             assert out_buf is not None, (
-                f"DynamicOpWrapper: no pre-allocated out buffer for nt={nt}. "
+                f"DynamicOpWrapper(submod_{self.dynamic_submod_id}): "
+                f"no pre-allocated out buffer for nt={nt}. "
                 f"Shape discovery may have failed — downstream static runners "
                 f"require stable output addresses."
             )

@@ -165,7 +165,7 @@ def fla_cached_gated_delta_rule_fake(
     out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     if out is not None:
-        return out
+        return out.new_empty(0)
     return torch.empty_like(v)
 
 

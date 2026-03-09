@@ -71,7 +71,7 @@ class TestADPiecewiseRunnerInit:
     def test_no_dynamic_out_info_by_default(self):
         submod = nn.Linear(4, 4)
         runner = ADPiecewiseRunner(submod)
-        assert runner._next_dynamic_out_info is None
+        assert runner._next_dynamic_out_infos == {}
 
 
 # ============================================================================
@@ -95,7 +95,7 @@ class TestSegmentEntry:
         entry = SegmentEntry()
         assert entry.cuda_graph is None
         assert entry.static_output is None
-        assert entry.dynamic_out_buf is None
+        assert entry.dynamic_out_bufs == {}
         assert entry.input_addresses == []
 
 
@@ -113,9 +113,10 @@ class TestDynamicOutBuf:
             dtype=torch.float32,
             device=torch.device("cuda"),
         )
-        runner.set_dynamic_out_info(info)
-        assert runner._next_dynamic_out_info is info
-        assert runner.get_dynamic_out_buf(8) is None
+        dynamic_id = 5
+        runner.set_dynamic_out_info(dynamic_id, info)
+        assert runner._next_dynamic_out_infos[dynamic_id] is info
+        assert runner.get_dynamic_out_buf(8, dynamic_id) is None
 
 
 # ============================================================================
@@ -227,6 +228,7 @@ class TestADPiecewiseRunnerFullCycle:
         submod.eval()
 
         num_tokens = 8
+        dynamic_id = 7
         runner = ADPiecewiseRunner(submod).to(device)
 
         info = OutputInfo(
@@ -234,7 +236,7 @@ class TestADPiecewiseRunnerFullCycle:
             dtype=torch.float16,
             device=torch.device(device),
         )
-        runner.set_dynamic_out_info(info)
+        runner.set_dynamic_out_info(dynamic_id, info)
 
         x = torch.randn(num_tokens, 16, device=device)
 
@@ -249,9 +251,10 @@ class TestADPiecewiseRunnerFullCycle:
             runner(x)
 
             entry = runner.entries[num_tokens]
-            assert entry.dynamic_out_buf is not None
-            assert entry.dynamic_out_buf.shape == torch.Size([num_tokens, 32])
-            assert entry.dynamic_out_buf.dtype == torch.float16
+            buf = entry.dynamic_out_bufs.get(dynamic_id)
+            assert buf is not None
+            assert buf.shape == torch.Size([num_tokens, 32])
+            assert buf.dtype == torch.float16
 
     def test_get_dynamic_out_buf_after_capture(self):
         """get_dynamic_out_buf should return the buffer after capture."""
@@ -260,6 +263,7 @@ class TestADPiecewiseRunnerFullCycle:
         submod.eval()
 
         num_tokens = 8
+        dynamic_id = 7
         runner = ADPiecewiseRunner(submod).to(device)
 
         info = OutputInfo(
@@ -267,7 +271,7 @@ class TestADPiecewiseRunnerFullCycle:
             dtype=torch.float16,
             device=torch.device(device),
         )
-        runner.set_dynamic_out_info(info)
+        runner.set_dynamic_out_info(dynamic_id, info)
 
         x = torch.randn(num_tokens, 16, device=device)
 
@@ -281,7 +285,7 @@ class TestADPiecewiseRunnerFullCycle:
             ADPiecewiseRunner.set_current_phase("capture")
             runner(x)
 
-            buf = runner.get_dynamic_out_buf(num_tokens)
+            buf = runner.get_dynamic_out_buf(num_tokens, dynamic_id)
             assert buf is not None
             assert buf.shape == torch.Size([num_tokens, 32])
 

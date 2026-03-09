@@ -174,7 +174,7 @@ def _triton_cached_ssm_fake(
     out: Optional[torch.Tensor] = None,
 ):
     if out is not None:
-        return out
+        return out.new_empty(0)
     # Return a correctly-shaped tensor for tracing with fake tensors
     return torch.empty_like(
         hidden_states,

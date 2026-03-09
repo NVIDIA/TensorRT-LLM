@@ -294,7 +294,7 @@ def _torch_cached_ssm_fake(
     out: Optional[torch.Tensor] = None,
 ):
     if out is not None:
-        return out
+        return out.new_empty(0)
     return torch.empty_like(
         hidden_states,
         memory_format=torch.contiguous_format,

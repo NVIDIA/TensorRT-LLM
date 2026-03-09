@@ -467,7 +467,7 @@ def torch_backend_mla_with_cache_fake(
 ) -> torch.Tensor:
     """Fake implementation for torch_backend_mla_with_cache."""
     if out is not None:
-        return out
+        return out.new_empty(0)
 
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]

@@ -23,7 +23,6 @@ from torch.utils._pytree import PyTree, TreeSpec, tree_flatten
 from tensorrt_llm._torch.autotuner import autotune
 
 from ...utils.cuda_graph import CudaGraphWarmUpPhase
-from ...utils.cuda_mem_tracker import get_mem_info
 from ...utils.logger import ad_logger
 from ..compiler import CompileBackendRegistry, CompilerBackend, GetArgsKwargsForBatchSize
 from ..piecewise_runner import ADPiecewiseRunner, DynamicOpWrapper, MetadataWrapper, OutputInfo
@@ -381,7 +380,11 @@ class PiecewiseCapturedGraph(nn.Module):
                 )
 
                 _inject_out_param(submod)
-                wrapper = DynamicOpWrapper(submod, preceding_runner=current_static_runner)
+                wrapper = DynamicOpWrapper(
+                    submod,
+                    preceding_runner=current_static_runner,
+                    dynamic_submod_id=idx,
+                )
                 setattr(self.split_gm, submod_name, wrapper)
                 self._wrapped_dynamic_indices.add(idx)
                 num_wrapped_dynamic += 1
@@ -401,42 +404,6 @@ class PiecewiseCapturedGraph(nn.Module):
             - num_metadata_wrapped,
             self.piecewise_num_tokens,
         )
-
-    # TODO(nvchenghaoz): Memory logging below (_fmt_mem, _install_mem_hooks), remove for PR
-    @staticmethod
-    def _fmt_mem(label: str) -> str:
-        """Format a one-line memory summary for debug logging."""
-        tot, free, resv, alloc, _ = get_mem_info(empty_cache=False, unit="GB")
-        peak = torch.cuda.max_memory_allocated() / (1 << 30)
-        used = tot - free
-        return (
-            f"[MEM] {label} | "
-            f"alloc={alloc:.3f} GiB, peak={peak:.3f} GiB, "
-            f"resv={resv:.3f} GiB, used={used:.3f}/{tot:.1f} GiB, free={free:.3f} GiB"
-        )
-
-    def _install_mem_hooks(self, phase: str, nt: int) -> List[torch.utils.hooks.RemovableHandle]:
-        """Install pre/post forward hooks on ADPiecewiseRunner submodules for memory logging."""
-        handles: List[torch.utils.hooks.RemovableHandle] = []
-        if self.split_gm is None:
-            return handles
-        for name, mod in self.split_gm.named_children():
-            if not isinstance(mod, ADPiecewiseRunner):
-                continue
-
-            def _make_hooks(submod_name):
-                def pre_hook(module, args):
-                    ad_logger.info(self._fmt_mem(f"segment {phase} before nt={nt} [{submod_name}]"))
-
-                def post_hook(module, args, output):
-                    ad_logger.info(self._fmt_mem(f"segment {phase} after nt={nt} [{submod_name}]"))
-
-                return pre_hook, post_hook
-
-            pre_hook, post_hook = _make_hooks(name)
-            handles.append(mod.register_forward_pre_hook(pre_hook))
-            handles.append(mod.register_forward_hook(post_hook))
-        return handles
 
     def _discover_dynamic_output_shapes(self, args: Tuple, kwargs: Dict) -> Dict[int, OutputInfo]:
         """Run one eager forward with hooks to discover output shapes of wrapped dynamic ops."""
@@ -480,7 +447,7 @@ class PiecewiseCapturedGraph(nn.Module):
         for dynamic_idx, info in discovered.items():
             wrapper = getattr(self.split_gm, f"submod_{dynamic_idx}")
             if isinstance(wrapper, DynamicOpWrapper):
-                wrapper.preceding_runner.set_dynamic_out_info(info)
+                wrapper.preceding_runner.set_dynamic_out_info(dynamic_idx, info)
 
         missing = self._wrapped_dynamic_indices - set(discovered.keys())
         assert not missing, (
@@ -520,30 +487,19 @@ class PiecewiseCapturedGraph(nn.Module):
 
             with CudaGraphWarmUpPhase():
                 ADPiecewiseRunner.set_current_phase("warmup")
-                warmup_hooks = self._install_mem_hooks("warmup", nt)
-                try:
-                    # Run warmup_iters - 1 iterations without shape hooks
-                    for _ in range(warmup_iters - 1):
-                        self.split_gm(*args, **kwargs)
+                for _ in range(warmup_iters - 1):
+                    self.split_gm(*args, **kwargs)
 
-                    # Last warmup iteration: discover dynamic output shapes
-                    if self._wrapped_dynamic_indices:
-                        discovered = self._discover_dynamic_output_shapes(args, kwargs)
-                        self._set_dynamic_out_info_on_runners(discovered)
-                    else:
-                        self.split_gm(*args, **kwargs)
-                finally:
-                    for h in warmup_hooks:
-                        h.remove()
+                # Last warmup iteration: discover dynamic output shapes
+                if self._wrapped_dynamic_indices:
+                    discovered = self._discover_dynamic_output_shapes(args, kwargs)
+                    self._set_dynamic_out_info_on_runners(discovered)
+                else:
+                    self.split_gm(*args, **kwargs)
 
                 # Capture phase
                 ADPiecewiseRunner.set_current_phase("capture")
-                capture_hooks = self._install_mem_hooks("capture", nt)
-                try:
-                    self.split_gm(*args, **kwargs)
-                finally:
-                    for h in capture_hooks:
-                        h.remove()
+                self.split_gm(*args, **kwargs)
 
             ad_logger.info("PiecewiseCapturedGraph: captured graphs for num_tokens=%d", nt)
 

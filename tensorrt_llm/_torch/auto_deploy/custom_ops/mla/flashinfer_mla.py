@@ -527,16 +527,18 @@ def flashinfer_mla_with_cache(
     compressed_kv_flat = compressed_kv.contiguous().view(bs, kv_lora_rank)
     kpe_flat = kpe.contiguous().view(bs, qk_rope_head_dim)
 
-    # Convert cache dtype if needed
+    # Convert to cache dtype if needed (separate vars to keep originals at activation precision)
+    compressed_kv_for_cache = compressed_kv_flat
+    kpe_for_cache = kpe_flat
     if ckv_cache.dtype == torch.float8_e4m3fn:
-        compressed_kv_flat = compressed_kv_flat.to(torch.float8_e4m3fn)
-        kpe_flat = kpe_flat.to(torch.float8_e4m3fn)
+        compressed_kv_for_cache = compressed_kv_flat.to(torch.float8_e4m3fn)
+        kpe_for_cache = kpe_flat.to(torch.float8_e4m3fn)
 
     # Append to paged cache using FlashInfer's append function
     # Note: caches are guaranteed contiguous by CachedSequenceInterface._create_kv_cache_manager
     flashinfer.page.append_paged_mla_kv_cache(
-        compressed_kv_flat[:num_total_tokens],
-        kpe_flat[:num_total_tokens],
+        compressed_kv_for_cache[:num_total_tokens],
+        kpe_for_cache[:num_total_tokens],
         flashinfer_batch_indices[:num_total_tokens],
         flashinfer_positions[:num_total_tokens],
         ckv_cache,
@@ -786,7 +788,7 @@ def flashinfer_mla_with_cache_fake(
 ) -> torch.Tensor:
     """Fake implementation for flashinfer_mla_with_cache."""
     if out is not None:
-        return out
+        return out.new_empty(0)
 
     num_heads = q_nope.shape[2]
     qk_nope_head_dim = q_nope.shape[-1]
