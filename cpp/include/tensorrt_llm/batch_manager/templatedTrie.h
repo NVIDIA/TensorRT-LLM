@@ -199,7 +199,8 @@ public:
                 // Node has no values and no descendants. Delete it
                 if (auto parent = mPrevNode.lock())
                 {
-                    [[maybe_unused]] auto const wasDeleted = parent->clearNode(mKey);
+                    auto const wasDeleted = parent->clearNode(mKey);
+                    TLLM_CHECK_WITH_INFO(wasDeleted, "cascade prune: parent did not find this node as a child");
                 }
             }
             return true;
@@ -207,23 +208,25 @@ public:
         return false;
     }
 
-    //! \brief Set value for vkey.
+    //! \brief Try to set value for vkey.
     //! \param vkey Key.
     //! \param value Value.
-    //! \param overwrite True to allow overwrite.
-    //! \return True if value was overwritten, false otherwise.
-    [[nodiscard]] bool setValue(ValueKey const& vkey, Value const& value, bool overwrite)
+    //! \param overwrite True to allow overwriting an existing value.
+    //! \return True if the node was updated (key inserted or existing value overwritten).
+    //!         False if the key already existed and overwrite=false (no change made).
+    [[nodiscard]] bool trySetValue(ValueKey const& vkey, Value const& value, bool overwrite)
     {
-        if (overwrite)
+        auto itr = mValue.find(vkey);
+        bool priorExists = (itr != mValue.end());
+        if (!priorExists)
         {
-            auto const& [itr, inserted] = mValue.insert_or_assign(vkey, value);
-            return !inserted;
+            mValue.emplace(vkey, value);
         }
-        else
+        else if (overwrite)
         {
-            mValue.try_emplace(vkey, value);
-            return false;
+            itr->second = value;
         }
+        return !priorExists || overwrite;
     }
 
     //! \brief Clear value for vkey.
@@ -242,7 +245,8 @@ public:
                 // Node has no values and no descendants. Delete it
                 if (auto parent = mPrevNode.lock())
                 {
-                    [[maybe_unused]] auto const wasDeleted = parent->clearNode(mKey);
+                    auto const wasDeleted = parent->clearNode(mKey);
+                    TLLM_CHECK_WITH_INFO(wasDeleted, "cascade prune: parent did not find this node as a child");
                 }
             }
             return true;
@@ -280,6 +284,58 @@ public:
         {
             return std::nullopt;
         }
+    }
+
+    //! \brief Get the parent node of this node.
+    //! \return Shared pointer to parent node, or nullptr if this is the root.
+    [[nodiscard]] NodePtr getParentNode() const
+    {
+        return mPrevNode.lock();
+    }
+
+    //! \brief Check if this node has any children.
+    //! \return true if this node has at least one child node.
+    [[nodiscard]] bool hasChildren() const
+    {
+        return !mNextNodes.empty();
+    }
+
+    //! \brief Get all (key, value) pairs for direct child nodes that have a value for vkey.
+    //! \param vkey Value key to look up in each child.
+    //! \return Vector of (NodeKey, Value) pairs for children that have a value for vkey.
+    [[nodiscard]] std::vector<std::pair<NodeKey, Value>> getChildKeyValues(ValueKey const& vkey) const
+    {
+        std::vector<std::pair<NodeKey, Value>> results;
+        for (auto const& [childKey, childNode] : mNextNodes)
+        {
+            auto optVal = childNode->getValue(vkey);
+            if (optVal.has_value())
+            {
+                results.emplace_back(childKey, optVal.value());
+            }
+        }
+        return results;
+    }
+
+    //! \brief Find an existing child node by key, or insert a new one.
+    //! \details If a child with \p key already exists it is returned unchanged.
+    //! Otherwise a new child is created, linked to \p self as its parent, inserted into
+    //! mNextNodes and returned. The caller is responsible for providing \p self as the
+    //! shared_ptr that owns *this (i.e. the caller's NodePtr).
+    //! \param key Key of the child to find or create.
+    //! \param self shared_ptr to *this node (used as the parent pointer for a new child).
+    //! \return NodePtr to the (existing or newly created) child node.
+    [[nodiscard]] NodePtr findOrInsertChild(NodeKey const& key, NodePtr const& self)
+    {
+        auto existing = findMatchingNode(key);
+        if (existing.has_value())
+        {
+            return existing.value().node;
+        }
+        auto newNode = std::make_shared<Node>(key, const_cast<NodePtr&>(self));
+        auto const overwritten = insertNode(key, newNode);
+        TLLM_CHECK_WITH_INFO(!overwritten, "findOrInsertChild: inserted a node that already existed");
+        return newNode;
     }
 
     //! \brief Find all partially matching nodes
@@ -340,6 +396,9 @@ private:
     friend Trie<NodeKey, NodeKeyHashFunctor, ValueKey, ValueKeyHashFunctor, Value, EnablePartialMatching>;
 
     // Private debugging method.
+    // Returns the prefix path to every node that holds a value, including nodes that
+    // are both terminal (have a value) and internal (have children). Used only in
+    // unit tests via getEdges().
     void _getEdges(std::vector<NodeKey> edge, std::vector<std::vector<NodeKey>>& edges) const
     {
         auto const isRoot = mPrevNode.expired();
@@ -351,12 +410,9 @@ private:
         {
             edges.emplace_back(edge);
         }
-        else
+        for (auto const& [key, node] : mNextNodes)
         {
-            for (auto const& [key, node] : mNextNodes)
-            {
-                node->_getEdges(edge, edges);
-            }
+            node->_getEdges(edge, edges);
         }
     }
 
@@ -416,6 +472,13 @@ public:
     {
     }
 
+    //! \brief Get the root node of the trie.
+    //! \return Shared pointer to the root node.
+    [[nodiscard]] NodePtr getRoot() const
+    {
+        return mRoot;
+    }
+
     //! \brief Insert nodes for new prefix, or return existing nodes.
     //! \param key Key for new prefix.
     //! \return  An object containing results + meta-data about how nodes were matched.
@@ -434,7 +497,8 @@ public:
             {
                 lookForMatch = false;
                 auto newNode = std::make_shared<_Node>(key, prevNode);
-                [[maybe_unused]] auto const overwritten = prevNode->insertNode(key, newNode);
+                auto const overwritten = prevNode->insertNode(key, newNode);
+                TLLM_CHECK_WITH_INFO(!overwritten, "insertNodes: inserted a node that already existed");
                 matchedNode = _NodeMatch(key, newNode, true, true);
             }
             prevNode = matchedNode.value().node;

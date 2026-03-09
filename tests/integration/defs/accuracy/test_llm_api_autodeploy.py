@@ -495,7 +495,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.88
+                "free_gpu_memory_fraction": 0.8
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
@@ -518,6 +518,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             config["enable_chunked_prefill"] = True
             config[
                 "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config["transforms"]["compile_model"] = {
+                "piecewise_enabled": True,
+            }
         return config
 
     def get_default_sampling_params(self):
