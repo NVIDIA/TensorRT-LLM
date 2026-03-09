@@ -281,8 +281,12 @@ class ScopedNCCLWindowBuffer
 public:
     ScopedNCCLWindowBuffer(std::shared_ptr<ncclComm_t> comm, size_t size)
         : mComm(std::move(comm))
-        , mBuffer(NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size))
+        , mBuffer{}
     {
+        if (mComm && *mComm)
+        {
+            mBuffer = NCCLWindowAllocator::getInstance().requestBuffer(*mComm, size);
+        }
     }
 
     ~ScopedNCCLWindowBuffer()
@@ -347,6 +351,12 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
     // Request buffer from allocator
     auto& allocator = NCCLWindowAllocator::getInstance();
     NCCLWindowBuffer buffer;
+
+    if (!comm || !*comm)
+    {
+        TLLM_LOG_DEBUG("[createNCCLWindowTensor] null comm; returning invalid buffer");
+        return std::make_pair(torch::Tensor(), NCCLWindowBuffer());
+    }
 
     try
     {
