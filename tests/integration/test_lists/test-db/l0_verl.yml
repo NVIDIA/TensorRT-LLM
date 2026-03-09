@@ -15,6 +15,4 @@ l0_verl:
       backend: verl
       orchestrator: mpi
   tests:
-  # Tests from verl repo - use verl:: prefix to indicate tests from the verl repository
-  # The verl:: prefix will be transformed to the actual verl path during test execution
-  - verl::tests/workers/rollout/rollout_trtllm/test_async_server.py
+  - verl/test_verl_cases.py::test_async_server

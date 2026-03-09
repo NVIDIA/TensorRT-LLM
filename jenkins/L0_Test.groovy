@@ -244,20 +244,6 @@ def processShardTestList(llmSrc, testDBList, splitId, splits, perfMode=false) {
 
     def originalTestLines = readFile(file: testDBList).readLines()
 
-    // Transform verl:: prefixed test paths to actual paths using VERL_ROOT
-    def verlRoot = env.VERL_ROOT
-    if (verlRoot) {
-        echo "Transforming verl:: test paths using VERL_ROOT=${verlRoot}"
-        originalTestLines = originalTestLines.collect { line ->
-            if (line.trim().startsWith('verl::')) {
-                def transformedLine = line.replace('verl::', "${verlRoot}/")
-                echo "Transformed: ${line} -> ${transformedLine}"
-                return transformedLine
-            }
-            return line
-        }
-    }
-
     def cleanedTestLines = []
     def isolationTestLines = []
 
