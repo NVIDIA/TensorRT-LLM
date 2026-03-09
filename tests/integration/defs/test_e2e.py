@@ -3061,7 +3061,7 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
 @pytest.mark.skip_less_device_memory(80000)
 @pytest.mark.skip_less_device(4)
 @pytest.mark.parametrize("eval_task", ["mmlu"])
-@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 8), (8, 2, 8)],
+@pytest.mark.parametrize("tp_size,pp_size,ep_size", [(16, 1, 16), (8, 2, 8)],
                          ids=["tp16", "tp8pp2"])
 @pytest.mark.parametrize("model_path", [
     pytest.param('llama-3.3-models/Llama-3.3-70B-Instruct',
@@ -3079,7 +3079,7 @@ def test_ptp_quickstart_advanced_llama_multi_nodes(llm_root, llm_venv,
                  marks=skip_pre_hopper),
 ])
 def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
-                          mmlu_dataset_root):
+                          mmlu_dataset_root, llm_venv):
     if "Llama-4" in model_path and tp_size == 16:
         pytest.skip("Llama-4 with tp16 is not supported")
 
@@ -3106,10 +3106,7 @@ def test_multi_nodes_eval(model_path, tp_size, pp_size, ep_size, eval_task,
 
     try:
         # run the command with trtllm-llmapi-launch pytest wrapper
-        output = subprocess.check_output(run_cmd,
-                                         text=True,
-                                         stderr=subprocess.STDOUT,
-                                         timeout=7200)
+        output = check_output(" ".join(run_cmd), shell=True, env=llm_venv._new_env)
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired) as e:
         print_warning(f"eval failed: {e.returncode}")
         print_warning(f"eval output:\n{e.output}")
