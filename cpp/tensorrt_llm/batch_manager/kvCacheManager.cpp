@@ -105,6 +105,7 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     , mDurationMs{std::nullopt}
     , mExpirationTime{std::nullopt}
     , mHash{0}
+    , mRepurposed{false}
 {
 }
 
@@ -303,6 +304,16 @@ void KVCacheBlock::setHash()
 size_t KVCacheBlock::getHash() const
 {
     return mHash;
+}
+
+void KVCacheBlock::setRepurposed(bool repurposed)
+{
+    mRepurposed = repurposed;
+}
+
+bool KVCacheBlock::isRepurposed() const
+{
+    return mRepurposed;
 }
 
 VecUniqueTokens const& KVCacheBlock::getUniqueTokens() const
@@ -1004,11 +1015,28 @@ BlockPtr WindowBlockManager::getFreeBlock(GenerationRequest& sequence, executor:
     // independently according to their own priority.  Previously, freeChildren()
     // also detached all descendants, which prevented high-priority interior blocks
     // from surviving eviction pressure on their low-priority leaf children.
-    if (mEventManager && blockInRadixTree(block))
+    //
+    // Serialize with mCachedBlocksRootMutex: storeBlocks, findNewContextBlock,
+    // countReusableBlocks, and loadOrAllocateBlocks all hold this mutex while
+    // accessing the trie, so detachFromLookupNode must do the same.
     {
-        mEventManager->enqueueRemovedEvent(block, mWindowSize);
+        std::lock_guard<std::recursive_mutex> treeLock(mCachedBlocksRootMutex);
+        if (mEventManager && blockInRadixTree(block))
+        {
+            mEventManager->enqueueRemovedEvent(block, mWindowSize);
+        }
+        block->detachFromLookupNode();
     }
-    block->detachFromLookupNode();
+    // Mark the block as repurposed when it has prior content (non-empty token list).
+    // This detects the case where a stolen OOW block is later freed by its new owner
+    // WITHOUT being stored back in the trie, leaving hasRefs()==false and
+    // isInLookupTree()==false even though the GPU content was overwritten.
+    // Fresh, never-used blocks (empty token list) are first-time allocations and must
+    // NOT be marked, since they may later go OOW and legitimately be stored for reuse.
+    if (!block->getUniqueTokens().empty())
+    {
+        block->setRepurposed(true);
+    }
     // Claim the block in primary block queue
     mEvictionPolicy->claimBlock(block, priority, durationMs);
     TLLM_LOG_DEBUG("%s::getFreeBlock - Block %d is now acquired by sequence %d", mLogPrefix.c_str(),
@@ -1134,7 +1162,7 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
     BlockKey ret;
     ret.loraTaskId = llmRequest.getLoraTaskId();
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mCachedBlocksRootMutex);
     auto searchRoot = mCachedBlocksRoot;
     for (auto const& blockKey : blockKeys)
     {
@@ -1160,7 +1188,7 @@ SizeType32 WindowBlockManager::countReusableBlocks(
     auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
 
     SizeType32 reusableBlocks = 0;
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mCachedBlocksRootMutex);
     auto searchRoot = mCachedBlocksRoot;
 
     for (auto const& blockKey : blockKeys)
@@ -1198,7 +1226,7 @@ bool WindowBlockManager::blockInRadixTree(BlockPtr const& block)
 
 std::shared_ptr<KVCacheBlock> WindowBlockManager::findBlocksInReuseTreeByBlockKey(BlockKey const& blockKey)
 {
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mCachedBlocksRootMutex);
     auto blockedUniqueTokens
         = chopVectorIntoBlocks<UniqueToken>(blockKey.uniqueTokens, blockKey.uniqueTokens.size(), mTokensPerBlock, true);
 
@@ -1229,7 +1257,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
     GenerationRequest& sequence, std::vector<executor::RetentionPriorityAndDuration> const& perBlockRetentions,
     executor::KvCacheTransferMode mode, std::string const& directory)
 {
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mCachedBlocksRootMutex);
     SizeType32 numMatchedTokens{0};
     auto searchRoot = mCachedBlocksRoot;
 
@@ -1586,7 +1614,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
     SizeType32 numOowBlocks)
 {
     SizeType32 numBlocksStoredForReuse = 0;
-    std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+    std::lock_guard<std::recursive_mutex> lock(mCachedBlocksRootMutex);
     TLLM_LOG_DEBUG(
         "%s::storeBlocks - %zu blockKeys, %zu blockIds", mLogPrefix.c_str(), blockKeys.size(), blockIds.size());
 
@@ -1647,7 +1675,8 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 // In-window blocks still hold ref=1 from their own sequence at this point
                 // (the ref-decrement loop runs after storeBlocks), so we must NOT apply
                 // the stolen check to them.
-                if (static_cast<SizeType32>(blockCnt) < numOowBlocks && (block->hasRefs() || block->isInLookupTree()))
+                if (static_cast<SizeType32>(blockCnt) < numOowBlocks
+                    && (block->hasRefs() || block->isInLookupTree() || block->isRepurposed()))
                 {
                     TLLM_LOG_DEBUG(
                         "%s::storeBlocks - OOW block %d stolen or relocated (hasRefs=%d, inTree=%d), stopping chain "
@@ -1675,6 +1704,11 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 {
                     break;
                 }
+
+                // Block is now stored in the trie under the new owner's prefix.  Clear
+                // the repurposed flag so a later storeBlocks for the original OOW owner
+                // will correctly observe isInLookupTree()==true and stop at this block.
+                block->setRepurposed(false);
 
                 // Sanity check. The list of stored blocks should be connected.
                 TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
@@ -2455,8 +2489,13 @@ void WindowBlockManager::detachFrontBlock(GenerationRequest& sequence)
             // OOW blocks have scrolled outside the attention window and are no longer
             // reusable for the current sequence.  Override their user-assigned priority
             // to MIN so they are evicted before in-window blocks regardless of what
-            // priority was set at context time.
+            // priority was set at context time.  Also clear any retention timeout so
+            // LRUEvictionPolicy::releaseBlock() does not push the block into the
+            // expiration heap — otherwise refresh() would later restore kDefaultPriority
+            // and defeat the forced MIN eviction order.
             outOfWindowBlock->setPriority(executor::KvCacheRetentionConfig::kMinRetentionPriority);
+            outOfWindowBlock->setDurationMs(std::nullopt);
+            outOfWindowBlock->setExpirationTime(std::nullopt);
             mEvictionPolicy->releaseBlock(outOfWindowBlock);
         }
     }

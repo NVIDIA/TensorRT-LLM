@@ -4074,23 +4074,24 @@ TEST_F(KVCacheManagerTest, GetPriorityByBlockId)
 namespace
 {
 // Shared constants for all TruePriorityEviction tests.
-auto constexpr kPENumLayers = 2;
-auto constexpr kPENumHeads = 2;
-auto constexpr kPESizePerHead = 16;
-auto constexpr kPETokensPerBlock = 4;
-auto constexpr kPEMaxNumSequences = 8;
-auto constexpr kPEBeamWidth = 1;
-SizeType32 constexpr kPEMaxNewTokens = 0;
-bool constexpr kPEIsStreaming = false;
+auto constexpr kPE_NUM_LAYERS = 2;
+auto constexpr kPE_NUM_HEADS = 2;
+auto constexpr kPE_SIZE_PER_HEAD = 16;
+auto constexpr kPE_TOKENS_PER_BLOCK = 4;
+auto constexpr kPE_MAX_NUM_SEQUENCES = 8;
+auto constexpr kPE_BEAM_WIDTH = 1;
+SizeType32 constexpr kPE_MAX_NEW_TOKENS = 0;
+bool constexpr kPE_IS_STREAMING = false;
 
 // Factory: construct and allocate a KVCacheManager for TruePriorityEviction tests.
 std::unique_ptr<KVCacheManager> makePriorityEvictionManager(
     SizeType32 blocksInPrimaryPool, SizeType32 maxAttentionWindow, std::shared_ptr<tr::CudaStream> const& stream)
 {
     auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, 0}}};
-    auto mgr = std::make_unique<KVCacheManager>(kPENumLayers, kPENumHeads, kPESizePerHead, kPETokensPerBlock,
-        blocksPerWindow, kPEMaxNumSequences, kPEBeamWidth, std::vector<BlockManager::SizeType32>{maxAttentionWindow},
-        std::nullopt, nvinfer1::DataType::kHALF, 0, stream, maxAttentionWindow, /*enableBlockReuse=*/true,
+    auto mgr = std::make_unique<KVCacheManager>(kPE_NUM_LAYERS, kPE_NUM_HEADS, kPE_SIZE_PER_HEAD, kPE_TOKENS_PER_BLOCK,
+        blocksPerWindow, kPE_MAX_NUM_SEQUENCES, kPE_BEAM_WIDTH,
+        std::vector<BlockManager::SizeType32>{maxAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0, stream,
+        maxAttentionWindow, /*enableBlockReuse=*/true,
         /*onboardBlocks=*/true);
     mgr->allocatePools(false);
     return mgr;
@@ -4104,9 +4105,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionInteriorBlockEvictedFirst)
 {
     // 5 blocks total: B0 (MIN), B1 (HIGH), B2/B3/B4 (DEFAULT)
     auto constexpr blocksInPrimaryPool = 5;
-    auto const maxAttentionWindow = kPETokensPerBlock * 8;
+    auto const maxAttentionWindow = kPE_TOKENS_PER_BLOCK * 8;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kPEBeamWidth};
+    tr::SamplingConfig const samplingConfig{kPE_BEAM_WIDTH};
     auto kvCacheManager = makePriorityEvictionManager(blocksInPrimaryPool, maxAttentionWindow, stream);
 
     EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), blocksInPrimaryPool);
@@ -4115,12 +4116,13 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionInteriorBlockEvictedFirst)
     // B0 becomes an interior node in the trie (parent of B1).
     auto inputTokensA = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto const inputLengthA = static_cast<SizeType32>(inputTokensA->size());
-    auto llmRequestA = std::make_shared<LlmRequest>(0, kPEMaxNewTokens, inputTokensA, samplingConfig, kPEIsStreaming);
+    auto llmRequestA
+        = std::make_shared<LlmRequest>(0, kPE_MAX_NEW_TOKENS, inputTokensA, samplingConfig, kPE_IS_STREAMING);
     llmRequestA->setKvCacheRetentionConfig(KvCacheRetentionConfig(
         {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, KvCacheRetentionConfig::kMinRetentionPriority),
             KvCacheRetentionConfig::TokenRangeRetentionConfig(4, 8, 90)},
         KvCacheRetentionConfig::kDefaultRetentionPriority));
-    kvCacheManager->addSequence(0, inputLengthA, kPEBeamWidth, llmRequestA);
+    kvCacheManager->addSequence(0, inputLengthA, kPE_BEAM_WIDTH, llmRequestA);
     kvCacheManager->storeContextBlocks(*llmRequestA);
     (void) kvCacheManager->removeSequence(0, llmRequestA);
 
@@ -4137,8 +4139,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionInteriorBlockEvictedFirst)
     auto inputTokensB = std::make_shared<VecTokens>(
         VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111, 112, 113, 114, 115});
     auto const inputLengthB = static_cast<SizeType32>(inputTokensB->size());
-    auto llmRequestB = std::make_shared<LlmRequest>(1, kPEMaxNewTokens, inputTokensB, samplingConfig, kPEIsStreaming);
-    kvCacheManager->addSequence(1, inputLengthB, kPEBeamWidth, llmRequestB);
+    auto llmRequestB
+        = std::make_shared<LlmRequest>(1, kPE_MAX_NEW_TOKENS, inputTokensB, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(1, inputLengthB, kPE_BEAM_WIDTH, llmRequestB);
     kvCacheManager->storeContextBlocks(*llmRequestB);
 
     // 4 blocks claimed by seq B; B1 (prio 90) is the surviving free block.
@@ -4150,6 +4153,21 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionInteriorBlockEvictedFirst)
 
     (void) kvCacheManager->removeSequence(1, llmRequestB);
     EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), blocksInPrimaryPool);
+
+    // Explicit reuse assertion: seq B stored its blocks [100..115] in the trie on
+    // removeSequence.  A new request with the same prefix must reuse them, confirming
+    // that the eviction path left the trie in a consistent state and didn't accidentally
+    // evict the high-priority B1 block (which was the only remaining free block during
+    // seq B's lifetime and is still in the trie under the orphaned [4..7] node).
+    auto inputTokensC = std::make_shared<VecTokens>(inputTokensB->begin(), inputTokensB->end());
+    auto const inputLengthC = static_cast<SizeType32>(inputTokensC->size());
+    auto llmRequestC
+        = std::make_shared<LlmRequest>(2, kPE_MAX_NEW_TOKENS, inputTokensC, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(2, inputLengthC, kPE_BEAM_WIDTH, llmRequestC);
+    // At least the first kPE_TOKENS_PER_BLOCK * 3 tokens are reusable (3 full blocks).
+    EXPECT_GE(llmRequestC->getContextCurrentPosition(), kPE_TOKENS_PER_BLOCK * 3);
+    (void) kvCacheManager->removeSequence(2, llmRequestC);
+    EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), blocksInPrimaryPool);
 }
 
 // Verifies that a HIGH-priority interior block is preserved while a LOW-priority
@@ -4158,9 +4176,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionHighPriorityInteriorBlockPreserve
 {
     // 4 blocks total: B0 (HIGH=interior), B1 (MIN=leaf), B2/B3 (DEFAULT)
     auto constexpr blocksInPrimaryPool = 4;
-    auto const maxAttentionWindow = kPETokensPerBlock * 8;
+    auto const maxAttentionWindow = kPE_TOKENS_PER_BLOCK * 8;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kPEBeamWidth};
+    tr::SamplingConfig const samplingConfig{kPE_BEAM_WIDTH};
     auto kvCacheManager = makePriorityEvictionManager(blocksInPrimaryPool, maxAttentionWindow, stream);
 
     EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), blocksInPrimaryPool);
@@ -4169,12 +4187,13 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionHighPriorityInteriorBlockPreserve
     // B0 is interior (parent of B1); B1 is the leaf and has the LOWEST priority.
     auto inputTokensA = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7});
     auto const inputLengthA = static_cast<SizeType32>(inputTokensA->size());
-    auto llmRequestA = std::make_shared<LlmRequest>(0, kPEMaxNewTokens, inputTokensA, samplingConfig, kPEIsStreaming);
+    auto llmRequestA
+        = std::make_shared<LlmRequest>(0, kPE_MAX_NEW_TOKENS, inputTokensA, samplingConfig, kPE_IS_STREAMING);
     llmRequestA->setKvCacheRetentionConfig(KvCacheRetentionConfig(
         {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, 90),
             KvCacheRetentionConfig::TokenRangeRetentionConfig(4, 8, KvCacheRetentionConfig::kMinRetentionPriority)},
         KvCacheRetentionConfig::kDefaultRetentionPriority));
-    kvCacheManager->addSequence(0, inputLengthA, kPEBeamWidth, llmRequestA);
+    kvCacheManager->addSequence(0, inputLengthA, kPE_BEAM_WIDTH, llmRequestA);
     kvCacheManager->storeContextBlocks(*llmRequestA);
     (void) kvCacheManager->removeSequence(0, llmRequestA);
 
@@ -4187,8 +4206,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionHighPriorityInteriorBlockPreserve
     // Seq B: 4 new tokens (1 block). Should evict B1 (prio 0, lowest) — NOT the interior B0.
     auto inputTokensB = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103});
     auto const inputLengthB = static_cast<SizeType32>(inputTokensB->size());
-    auto llmRequestB = std::make_shared<LlmRequest>(1, kPEMaxNewTokens, inputTokensB, samplingConfig, kPEIsStreaming);
-    kvCacheManager->addSequence(1, inputLengthB, kPEBeamWidth, llmRequestB);
+    auto llmRequestB
+        = std::make_shared<LlmRequest>(1, kPE_MAX_NEW_TOKENS, inputTokensB, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(1, inputLengthB, kPE_BEAM_WIDTH, llmRequestB);
     kvCacheManager->storeContextBlocks(*llmRequestB);
 
     // B1 (leaf, prio 0) claimed by seq B; B0, B2, B3 remain free.
@@ -4200,8 +4220,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionHighPriorityInteriorBlockPreserve
 
     auto inputTokensC = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 200, 201, 202, 203});
     auto const inputLengthC = static_cast<SizeType32>(inputTokensC->size());
-    auto llmRequestC = std::make_shared<LlmRequest>(2, kPEMaxNewTokens, inputTokensC, samplingConfig, kPEIsStreaming);
-    kvCacheManager->addSequence(2, inputLengthC, kPEBeamWidth, llmRequestC);
+    auto llmRequestC
+        = std::make_shared<LlmRequest>(2, kPE_MAX_NEW_TOKENS, inputTokensC, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(2, inputLengthC, kPE_BEAM_WIDTH, llmRequestC);
 
     // B0 cached [0..3]; B1 was evicted (so [4..7] is no longer cached).
     // Seq C shares the first block [0..3] with seq A → B0 reused.
@@ -4221,9 +4242,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionQueueIntegrityAfterChainEviction)
 {
     // 6 blocks: B0 (prio MIN), B1 (prio DEFAULT), B2 (prio HIGH), B3/B4/B5 (DEFAULT)
     auto constexpr blocksInPrimaryPool = 6;
-    auto const maxAttentionWindow = kPETokensPerBlock * 10;
+    auto const maxAttentionWindow = kPE_TOKENS_PER_BLOCK * 10;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kPEBeamWidth};
+    tr::SamplingConfig const samplingConfig{kPE_BEAM_WIDTH};
     auto kvCacheManager = makePriorityEvictionManager(blocksInPrimaryPool, maxAttentionWindow, stream);
 
     auto const& blockManager = kvCacheManager->getBlockManager();
@@ -4236,13 +4257,14 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionQueueIntegrityAfterChainEviction)
     // Trie chain: root → B0 → B1 → B2
     auto inputTokensA = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
     auto const inputLengthA = static_cast<SizeType32>(inputTokensA->size());
-    auto llmRequestA = std::make_shared<LlmRequest>(0, kPEMaxNewTokens, inputTokensA, samplingConfig, kPEIsStreaming);
+    auto llmRequestA
+        = std::make_shared<LlmRequest>(0, kPE_MAX_NEW_TOKENS, inputTokensA, samplingConfig, kPE_IS_STREAMING);
     llmRequestA->setKvCacheRetentionConfig(KvCacheRetentionConfig(
         {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, KvCacheRetentionConfig::kMinRetentionPriority),
             KvCacheRetentionConfig::TokenRangeRetentionConfig(4, 8, KvCacheRetentionConfig::kDefaultRetentionPriority),
             KvCacheRetentionConfig::TokenRangeRetentionConfig(8, 12, 90)},
         KvCacheRetentionConfig::kDefaultRetentionPriority));
-    kvCacheManager->addSequence(0, inputLengthA, kPEBeamWidth, llmRequestA);
+    kvCacheManager->addSequence(0, inputLengthA, kPE_BEAM_WIDTH, llmRequestA);
     kvCacheManager->storeContextBlocks(*llmRequestA);
     (void) kvCacheManager->removeSequence(0, llmRequestA);
 
@@ -4258,8 +4280,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionQueueIntegrityAfterChainEviction)
     // True priority eviction detaches ONLY B0; B1 and B2 remain in trie.
     auto inputTokensX = std::make_shared<VecTokens>(VecTokens{200, 201, 202, 203});
     auto const inputLengthX = static_cast<SizeType32>(inputTokensX->size());
-    auto llmRequestX = std::make_shared<LlmRequest>(1, kPEMaxNewTokens, inputTokensX, samplingConfig, kPEIsStreaming);
-    kvCacheManager->addSequence(1, inputLengthX, kPEBeamWidth, llmRequestX);
+    auto llmRequestX
+        = std::make_shared<LlmRequest>(1, kPE_MAX_NEW_TOKENS, inputTokensX, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(1, inputLengthX, kPE_BEAM_WIDTH, llmRequestX);
 
     // 5 blocks remain after B0 is claimed.
     EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), 5);
@@ -4273,8 +4296,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionQueueIntegrityAfterChainEviction)
     auto inputTokensY
         = std::make_shared<VecTokens>(VecTokens{300, 301, 302, 303, 304, 305, 306, 307, 308, 309, 310, 311});
     auto const inputLengthY = static_cast<SizeType32>(inputTokensY->size());
-    auto llmRequestY = std::make_shared<LlmRequest>(2, kPEMaxNewTokens, inputTokensY, samplingConfig, kPEIsStreaming);
-    kvCacheManager->addSequence(2, inputLengthY, kPEBeamWidth, llmRequestY);
+    auto llmRequestY
+        = std::make_shared<LlmRequest>(2, kPE_MAX_NEW_TOKENS, inputTokensY, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(2, inputLengthY, kPE_BEAM_WIDTH, llmRequestY);
 
     // After seq X is released (returns 1 block) and seq Y claims 3:
     // free = 6 (all released by X) - 3 (claimed by Y) = 3
@@ -4282,6 +4306,19 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionQueueIntegrityAfterChainEviction)
     EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
 
     (void) kvCacheManager->removeSequence(2, llmRequestY);
+    EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), blocksInPrimaryPool);
+    EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
+
+    // Explicit reuse assertion: seq Y stored its 3 blocks ([300..311]) in the trie
+    // on removeSequence.  A new request with the same prefix must be able to reuse at
+    // least one of those blocks, confirming the trie is consistent after interior-block
+    // eviction.
+    auto inputTokensZ = std::make_shared<VecTokens>(*inputTokensY);
+    auto llmRequestZ
+        = std::make_shared<LlmRequest>(3, kPE_MAX_NEW_TOKENS, inputTokensZ, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(3, static_cast<SizeType32>(inputTokensZ->size()), kPE_BEAM_WIDTH, llmRequestZ);
+    EXPECT_GE(llmRequestZ->getContextCurrentPosition(), kPE_TOKENS_PER_BLOCK);
+    (void) kvCacheManager->removeSequence(3, llmRequestZ);
     EXPECT_EQ(kvCacheManager->getNumFreeBlocks(), blocksInPrimaryPool);
     EXPECT_TRUE(blockManager.verifyQueueIntegrity(maxAttentionWindow));
 }
@@ -4292,9 +4329,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionQueueIntegrityAfterChainEviction)
 TEST_F(KVCacheManagerTest, TruePriorityEvictionNoCrashAfterInteriorEviction)
 {
     auto constexpr blocksInPrimaryPool = 8;
-    auto const maxAttentionWindow = kPETokensPerBlock * 10;
+    auto const maxAttentionWindow = kPE_TOKENS_PER_BLOCK * 10;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kPEBeamWidth};
+    tr::SamplingConfig const samplingConfig{kPE_BEAM_WIDTH};
     auto kvCacheManager = makePriorityEvictionManager(blocksInPrimaryPool, maxAttentionWindow, stream);
 
     auto const& blockManager = kvCacheManager->getBlockManager();
@@ -4302,11 +4339,12 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionNoCrashAfterInteriorEviction)
     // Seq 0: 3 blocks — MIN priority for first block (interior), DEFAULT for the rest.
     // Trie: root → B0(MIN) → B1(DEFAULT) → B2(DEFAULT)
     auto inputTokens0 = std::make_shared<VecTokens>(VecTokens{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11});
-    auto llmRequest0 = std::make_shared<LlmRequest>(0, kPEMaxNewTokens, inputTokens0, samplingConfig, kPEIsStreaming);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kPE_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kPE_IS_STREAMING);
     llmRequest0->setKvCacheRetentionConfig(KvCacheRetentionConfig(
         {KvCacheRetentionConfig::TokenRangeRetentionConfig(0, 4, KvCacheRetentionConfig::kMinRetentionPriority)},
         KvCacheRetentionConfig::kDefaultRetentionPriority));
-    kvCacheManager->addSequence(0, static_cast<SizeType32>(inputTokens0->size()), kPEBeamWidth, llmRequest0);
+    kvCacheManager->addSequence(0, static_cast<SizeType32>(inputTokens0->size()), kPE_BEAM_WIDTH, llmRequest0);
     kvCacheManager->storeContextBlocks(*llmRequest0);
     (void) kvCacheManager->removeSequence(0, llmRequest0);
 
@@ -4317,8 +4355,9 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionNoCrashAfterInteriorEviction)
     // True priority eviction detaches only B0; B1, B2 remain in trie.
     auto inputTokens1
         = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111});
-    auto llmRequest1 = std::make_shared<LlmRequest>(1, kPEMaxNewTokens, inputTokens1, samplingConfig, kPEIsStreaming);
-    kvCacheManager->addSequence(1, static_cast<SizeType32>(inputTokens1->size()), kPEBeamWidth, llmRequest1);
+    auto llmRequest1
+        = std::make_shared<LlmRequest>(1, kPE_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kPE_IS_STREAMING);
+    kvCacheManager->addSequence(1, static_cast<SizeType32>(inputTokens1->size()), kPE_BEAM_WIDTH, llmRequest1);
     kvCacheManager->storeContextBlocks(*llmRequest1);
     (void) kvCacheManager->removeSequence(1, llmRequest1);
 
@@ -4326,9 +4365,10 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionNoCrashAfterInteriorEviction)
 
     // Seq 2: 4 new tokens (fresh; no overlap with any prior sequence).
     auto inputTokens2 = std::make_shared<VecTokens>(VecTokens{200, 201, 202, 203});
-    auto llmRequest2 = std::make_shared<LlmRequest>(2, kPEMaxNewTokens, inputTokens2, samplingConfig, kPEIsStreaming);
+    auto llmRequest2
+        = std::make_shared<LlmRequest>(2, kPE_MAX_NEW_TOKENS, inputTokens2, samplingConfig, kPE_IS_STREAMING);
     EXPECT_NO_THROW(
-        kvCacheManager->addSequence(2, static_cast<SizeType32>(inputTokens2->size()), kPEBeamWidth, llmRequest2));
+        kvCacheManager->addSequence(2, static_cast<SizeType32>(inputTokens2->size()), kPE_BEAM_WIDTH, llmRequest2));
     kvCacheManager->storeContextBlocks(*llmRequest2);
     (void) kvCacheManager->removeSequence(2, llmRequest2);
 
@@ -4339,9 +4379,10 @@ TEST_F(KVCacheManagerTest, TruePriorityEvictionNoCrashAfterInteriorEviction)
     // path left the trie in a consistent state for subsequent insertions/lookups.
     auto inputTokens3
         = std::make_shared<VecTokens>(VecTokens{100, 101, 102, 103, 104, 105, 106, 107, 108, 109, 110, 111});
-    auto llmRequest3 = std::make_shared<LlmRequest>(3, kPEMaxNewTokens, inputTokens3, samplingConfig, kPEIsStreaming);
+    auto llmRequest3
+        = std::make_shared<LlmRequest>(3, kPE_MAX_NEW_TOKENS, inputTokens3, samplingConfig, kPE_IS_STREAMING);
     EXPECT_NO_THROW(
-        kvCacheManager->addSequence(3, static_cast<SizeType32>(inputTokens3->size()), kPEBeamWidth, llmRequest3));
+        kvCacheManager->addSequence(3, static_cast<SizeType32>(inputTokens3->size()), kPE_BEAM_WIDTH, llmRequest3));
 
     // Seq 1's blocks are in the trie and should be reused.
     EXPECT_GT(llmRequest3->getContextCurrentPosition(), 0);
@@ -6653,14 +6694,14 @@ TEST_F(KVCacheManagerTest, KVCacheManagerEventStoreForDifferentWindowDoesNotFlus
 namespace
 {
 // Shared constants for all VSWA tests.
-auto constexpr kVSWATokensPerBlock = 4;
-auto constexpr kVSWAAttentionWindow = 8;
-auto constexpr kVSWAMaxSequenceLength = 128;
-SizeType32 constexpr kVSWAMaxNewTokens = 40;
-auto constexpr kVSWABeamWidth = 1;
-auto constexpr kVSWABeamIdx = 0;
-bool constexpr kVSWAIsStreaming = false;
-TokenIdType constexpr kVSWAFirstToken = 1000;
+auto constexpr kVSWA_TOKENS_PER_BLOCK = 4;
+auto constexpr kVSWA_ATTENTION_WINDOW = 8;
+auto constexpr kVSWA_MAX_SEQUENCE_LENGTH = 128;
+SizeType32 constexpr kVSWA_MAX_NEW_TOKENS = 40;
+auto constexpr kVSWA_BEAM_WIDTH = 1;
+auto constexpr kVSWA_BEAM_IDX = 0;
+bool constexpr kVSWA_IS_STREAMING = false;
+TokenIdType constexpr kVSWA_FIRST_TOKEN = 1000;
 
 // Factory: construct and allocate a KVCacheManager for VSWA tests.
 // numLayers=2, numHeads=2, sizePerHead=64, tokensPerBlock=4, attentionWindow=8,
@@ -6668,10 +6709,10 @@ TokenIdType constexpr kVSWAFirstToken = 1000;
 std::unique_ptr<KVCacheManager> makeVSWAManager(
     SizeType32 blocksInPrimaryPool, bool enableBlockReuse, std::shared_ptr<tr::CudaStream> const& stream)
 {
-    auto const blocksPerWindow = BlocksPerWindow{{kVSWAAttentionWindow, {blocksInPrimaryPool, 0}}};
-    auto mgr = std::make_unique<KVCacheManager>(2, 2, 64, kVSWATokensPerBlock, blocksPerWindow, 8, kVSWABeamWidth,
-        std::vector<SizeType32>{kVSWAAttentionWindow}, std::nullopt, nvinfer1::DataType::kHALF, 0, stream,
-        kVSWAMaxSequenceLength, enableBlockReuse, /*onboardBlocks=*/false);
+    auto const blocksPerWindow = BlocksPerWindow{{kVSWA_ATTENTION_WINDOW, {blocksInPrimaryPool, 0}}};
+    auto mgr = std::make_unique<KVCacheManager>(2, 2, 64, kVSWA_TOKENS_PER_BLOCK, blocksPerWindow, 8, kVSWA_BEAM_WIDTH,
+        std::vector<SizeType32>{kVSWA_ATTENTION_WINDOW}, std::nullopt, nvinfer1::DataType::kHALF, 0, stream,
+        kVSWA_MAX_SEQUENCE_LENGTH, enableBlockReuse, /*onboardBlocks=*/false);
     mgr->allocatePools(false);
     return mgr;
 }
@@ -6684,11 +6725,11 @@ TEST_F(KVCacheManagerTest, VSWANonStolenOOWBlockStoredForReuse)
     // SWA with a generous pool so the OOW block is never stolen.
     auto constexpr blocksInPrimaryPool = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kVSWABeamWidth};
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
     auto kvCacheManager = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/true, stream);
 
     auto const& blockManager = kvCacheManager->getBlockManager();
-    TokenIdType constexpr firstToken = kVSWAFirstToken;
+    TokenIdType constexpr firstToken = kVSWA_FIRST_TOKEN;
 
     // Seq 0: 11 input tokens → allocates 3 blocks covering tokens [1000..1010].
     // After addToken (token 1011), numTokens==12 triggers OOW for block 0 (tokens
@@ -6696,10 +6737,10 @@ TEST_F(KVCacheManagerTest, VSWANonStolenOOWBlockStoredForReuse)
     auto inputTokens0 = std::make_shared<VecTokens>(11);
     std::iota(inputTokens0->begin(), inputTokens0->end(), firstToken);
     auto llmRequest0
-        = std::make_shared<LlmRequest>(0, kVSWAMaxNewTokens, inputTokens0, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(0, 11, kVSWABeamWidth, llmRequest0);
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
 
-    llmRequest0->addNewToken(firstToken + 11, kVSWABeamIdx);
+    llmRequest0->addNewToken(firstToken + 11, kVSWA_BEAM_IDX);
     kvCacheManager->addToken(0);
 
     // Release seq 0: the OOW block has hasRefs()==0 (never stolen) so storeBlocks
@@ -6707,16 +6748,16 @@ TEST_F(KVCacheManagerTest, VSWANonStolenOOWBlockStoredForReuse)
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
 
     // Seq 1: exactly the same 4-token prefix as the OOW block → must reuse it.
-    auto inputTokens1 = std::make_shared<VecTokens>(kVSWATokensPerBlock);
+    auto inputTokens1 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
     std::iota(inputTokens1->begin(), inputTokens1->end(), firstToken);
     auto llmRequest1
-        = std::make_shared<LlmRequest>(1, kVSWAMaxNewTokens, inputTokens1, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(1, kVSWATokensPerBlock, kVSWABeamWidth, llmRequest1);
+        = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(1, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest1);
 
     // The OOW block was stored with 4 tokens, but S1's usableSize=4-1=3 so the
     // search key has 3 tokens.  3/4 tokens match → contextCurrentPosition == 3.
     // Any non-zero value confirms the OOW block was stored and is being reused.
-    EXPECT_EQ(llmRequest1->getContextCurrentPosition(), kVSWATokensPerBlock - 1);
+    EXPECT_EQ(llmRequest1->getContextCurrentPosition(), kVSWA_TOKENS_PER_BLOCK - 1);
 
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(1, llmRequest1)));
     // All blocks must be free — no leaks.
@@ -6733,19 +6774,19 @@ TEST_F(KVCacheManagerTest, VSWAStolenOOWBlockNoCorruption)
     // goes to seq1, which steals the OOW block.
     auto constexpr blocksInPrimaryPool = 4;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kVSWABeamWidth};
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
     auto kvCacheManager = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/true, stream);
 
     auto const& blockManager = kvCacheManager->getBlockManager();
 
     // Seq 0: 11 tokens, triggering 1 OOW block after addToken.
     auto inputTokens0 = std::make_shared<VecTokens>(11);
-    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWAFirstToken);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
     auto llmRequest0
-        = std::make_shared<LlmRequest>(0, kVSWAMaxNewTokens, inputTokens0, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(0, 11, kVSWABeamWidth, llmRequest0);
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
 
-    llmRequest0->addNewToken(kVSWAFirstToken + 11, kVSWABeamIdx);
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
     kvCacheManager->addToken(0);
 
     // After addToken: B0 goes OOW (detachFrontBlock); (12-1)%4 != 0 so no new
@@ -6756,10 +6797,10 @@ TEST_F(KVCacheManagerTest, VSWAStolenOOWBlockNoCorruption)
     // Seq 1: 8 tokens → needs 2 blocks.  It acquires B0 (OOW, MIN) and B3 (DEFAULT),
     // stealing the OOW block away from seq 0.
     auto inputTokens1 = std::make_shared<VecTokens>(8);
-    std::iota(inputTokens1->begin(), inputTokens1->end(), kVSWAFirstToken + 100);
+    std::iota(inputTokens1->begin(), inputTokens1->end(), kVSWA_FIRST_TOKEN + 100);
     auto llmRequest1
-        = std::make_shared<LlmRequest>(1, kVSWAMaxNewTokens, inputTokens1, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(1, 8, kVSWABeamWidth, llmRequest1);
+        = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(1, 8, kVSWA_BEAM_WIDTH, llmRequest1);
 
     // Seq 0's removeSequence: storeBlocks hits the stolen block (hasRefs()>0) and
     // stops cleanly — no crash, no trie corruption.
@@ -6767,6 +6808,19 @@ TEST_F(KVCacheManagerTest, VSWAStolenOOWBlockNoCorruption)
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(1, llmRequest1)));
 
     // All blocks must be free after both sequences are released.
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    // Reuse assertion: seq1 stored its 2 blocks ([kVSWA_FIRST_TOKEN+100 .. +107]) in the
+    // trie during removeSequence.  A follow-up request with seq1's prefix must be able to
+    // reuse at least one of those blocks, confirming that seq0's storeBlocks correctly
+    // stopped at the stolen OOW block and did NOT corrupt the trie with seq0's stale prefix.
+    auto inputTokensReuse = std::make_shared<VecTokens>(*inputTokens1);
+    auto llmRequestReuse
+        = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, inputTokensReuse, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(
+        2, static_cast<SizeType32>(inputTokensReuse->size()), kVSWA_BEAM_WIDTH, llmRequestReuse);
+    EXPECT_GT(llmRequestReuse->getContextCurrentPosition(), 0);
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(2, llmRequestReuse)));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
 
@@ -6782,7 +6836,7 @@ TEST_F(KVCacheManagerTest, VSWAStolenAndReleasedOOWBlockIsInLookupTreeProtection
     // Seq1 (1 block) steals B0 (lowest-priority).
     auto constexpr blocksInPrimaryPool = 4;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kVSWABeamWidth};
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
     auto kvCacheManager = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/true, stream);
 
     auto const& blockManager = kvCacheManager->getBlockManager();
@@ -6790,23 +6844,23 @@ TEST_F(KVCacheManagerTest, VSWAStolenAndReleasedOOWBlockIsInLookupTreeProtection
 
     // Seq 0: 11 tokens → allocates B0 (tokens 1000..1003), B1 (1004..1007), B2 (1008..1010).
     auto inputTokens0 = std::make_shared<VecTokens>(11);
-    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWAFirstToken);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
     auto llmRequest0
-        = std::make_shared<LlmRequest>(0, kVSWAMaxNewTokens, inputTokens0, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(0, 11, kVSWABeamWidth, llmRequest0);
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
 
     // addToken: B0 goes OOW at MIN priority; no new block allocated ((12-1)%4 != 0).
     // Free queue: B0 (MIN), B3 (DEFAULT).
-    llmRequest0->addNewToken(kVSWAFirstToken + 11, kVSWABeamIdx);
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
     kvCacheManager->addToken(0);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 2);
 
     // Seq 1: 4 tokens (distinct prefix) → steals B0 (lowest-priority block in pool).
-    auto inputTokens1 = std::make_shared<VecTokens>(kVSWATokensPerBlock);
+    auto inputTokens1 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
     std::iota(inputTokens1->begin(), inputTokens1->end(), seq1FirstToken);
     auto llmRequest1
-        = std::make_shared<LlmRequest>(1, kVSWAMaxNewTokens, inputTokens1, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(1, kVSWATokensPerBlock, kVSWABeamWidth, llmRequest1);
+        = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(1, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest1);
     EXPECT_EQ(blockManager.getNumFreeBlocks(), 1); // only B3 left
 
     // removeSequence(1) FIRST: seq1's storeBlocks stores B0 in trie under seq1's key.
@@ -6824,20 +6878,20 @@ TEST_F(KVCacheManagerTest, VSWAStolenAndReleasedOOWBlockIsInLookupTreeProtection
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 
     // Seq 2: same prefix as seq1 → must reuse B0 stored at seq1's key.
-    auto inputTokens2 = std::make_shared<VecTokens>(kVSWATokensPerBlock);
+    auto inputTokens2 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
     std::iota(inputTokens2->begin(), inputTokens2->end(), seq1FirstToken);
     auto llmRequest2
-        = std::make_shared<LlmRequest>(2, kVSWAMaxNewTokens, inputTokens2, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(2, kVSWATokensPerBlock, kVSWABeamWidth, llmRequest2);
+        = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, inputTokens2, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(2, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest2);
     // 4 tokens stored, usable key has 3 tokens → 3/4 match → contextCurrentPosition==3.
-    EXPECT_EQ(llmRequest2->getContextCurrentPosition(), kVSWATokensPerBlock - 1);
+    EXPECT_EQ(llmRequest2->getContextCurrentPosition(), kVSWA_TOKENS_PER_BLOCK - 1);
 
     // Seq 3: same prefix as seq0's first block → must NOT find it (never stored after Fix 3 break).
-    auto inputTokens3 = std::make_shared<VecTokens>(kVSWATokensPerBlock);
-    std::iota(inputTokens3->begin(), inputTokens3->end(), kVSWAFirstToken);
+    auto inputTokens3 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
+    std::iota(inputTokens3->begin(), inputTokens3->end(), kVSWA_FIRST_TOKEN);
     auto llmRequest3
-        = std::make_shared<LlmRequest>(3, kVSWAMaxNewTokens, inputTokens3, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(3, kVSWATokensPerBlock, kVSWABeamWidth, llmRequest3);
+        = std::make_shared<LlmRequest>(3, kVSWA_MAX_NEW_TOKENS, inputTokens3, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(3, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest3);
     EXPECT_EQ(llmRequest3->getContextCurrentPosition(), 0);
 
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(2, llmRequest2)));
@@ -6855,7 +6909,7 @@ TEST_F(KVCacheManagerTest, VSWAOOWBlockReleasedAtMinPriority)
     // next allocation should claim B0 before B4.
     auto constexpr blocksInPrimaryPool = 5;
     auto const stream = std::make_shared<tr::CudaStream>();
-    tr::SamplingConfig const samplingConfig{kVSWABeamWidth};
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
     // Use reuse=false so seq1's addSequence does a plain allocation (no trie lookup).
     auto kvCacheManager = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/false, stream);
 
@@ -6863,19 +6917,19 @@ TEST_F(KVCacheManagerTest, VSWAOOWBlockReleasedAtMinPriority)
 
     // Seq 0: 11 input tokens → allocates B0, B1, B2.
     auto inputTokens0 = std::make_shared<VecTokens>(11);
-    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWAFirstToken);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
     auto llmRequest0
-        = std::make_shared<LlmRequest>(0, kVSWAMaxNewTokens, inputTokens0, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(0, 11, kVSWABeamWidth, llmRequest0);
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
 
     // Capture B0's ID before it goes OOW.
     auto const onlyWindowSize = theOnlyWindowSize(*kvCacheManager);
     auto const& seq0 = kvCacheManager->getSequence(0);
-    auto const oowBlockId = seq0.getCacheBlockIds(onlyWindowSize)[kVSWABeamIdx][0];
+    auto const oowBlockId = seq0.getCacheBlockIds(onlyWindowSize)[kVSWA_BEAM_IDX][0];
 
     // addToken: B0 → free queue at MIN priority; B3 allocated (block boundary).
     // Free queue now: B0 (MIN), B4 (DEFAULT).
-    llmRequest0->addNewToken(kVSWAFirstToken + 11, kVSWABeamIdx);
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
     kvCacheManager->addToken(0);
 
     // After addToken: B0 OOW (MIN priority). (12-1)%4 != 0 → no new block allocated.
@@ -6884,19 +6938,89 @@ TEST_F(KVCacheManagerTest, VSWAOOWBlockReleasedAtMinPriority)
 
     // Seq 1: 4 tokens → needs 1 block.  getFreeBlock iterates from lowest priority
     // bucket first, so it returns B0 (MIN) before B4 (DEFAULT).
-    auto inputTokens1 = std::make_shared<VecTokens>(kVSWATokensPerBlock);
+    auto inputTokens1 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
     std::iota(inputTokens1->begin(), inputTokens1->end(), 2000);
     auto llmRequest1
-        = std::make_shared<LlmRequest>(1, kVSWAMaxNewTokens, inputTokens1, samplingConfig, kVSWAIsStreaming);
-    kvCacheManager->addSequence(1, kVSWATokensPerBlock, kVSWABeamWidth, llmRequest1);
+        = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(1, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest1);
 
     auto const& seq1 = kvCacheManager->getSequence(1);
-    auto const seq1BlockId = seq1.getCacheBlockIds(onlyWindowSize)[kVSWABeamIdx][0];
+    auto const seq1BlockId = seq1.getCacheBlockIds(onlyWindowSize)[kVSWA_BEAM_IDX][0];
 
     // The OOW block (B0, MIN priority) must have been chosen over the DEFAULT block.
     EXPECT_EQ(seq1BlockId, oowBlockId);
 
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
     EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(1, llmRequest1)));
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+}
+
+// Verify the isRepurposed() guard in storeBlocks: when a stolen OOW block is freed
+// by its new owner WITHOUT being stored in the reuse trie (e.g., the new owner's
+// removeSequence is called with std::nullopt, simulating a failed/cancelled request),
+// storeBlocks for the original sequence must stop at that block via isRepurposed()==true.
+TEST_F(KVCacheManagerTest, VSWAStolenOOWBlockRepurposedWithoutStoring)
+{
+    // Pool=4: seq0 uses B0(OOW),B1,B2 for context + B3 never used.
+    // After addToken, B0 goes OOW → free(MIN), B3 free(DEFAULT).
+    // Seq1 (1 block) steals B0 (lowest-priority = MIN).
+    auto constexpr blocksInPrimaryPool = 4;
+    auto const stream = std::make_shared<tr::CudaStream>();
+    tr::SamplingConfig const samplingConfig{kVSWA_BEAM_WIDTH};
+    auto kvCacheManager = makeVSWAManager(blocksInPrimaryPool, /*enableBlockReuse=*/true, stream);
+
+    auto const& blockManager = kvCacheManager->getBlockManager();
+
+    // Seq 0: 11 tokens → allocates B0 (tokens 1000..1003), B1 (1004..1007), B2 (1008..1010).
+    auto inputTokens0 = std::make_shared<VecTokens>(11);
+    std::iota(inputTokens0->begin(), inputTokens0->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest0
+        = std::make_shared<LlmRequest>(0, kVSWA_MAX_NEW_TOKENS, inputTokens0, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(0, 11, kVSWA_BEAM_WIDTH, llmRequest0);
+
+    // addToken: B0 goes OOW at MIN priority; (12-1)%4 != 0 → no new block.
+    // Free queue: B0 (MIN), B3 (DEFAULT).
+    llmRequest0->addNewToken(kVSWA_FIRST_TOKEN + 11, kVSWA_BEAM_IDX);
+    kvCacheManager->addToken(0);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), 2);
+
+    // Seq 1: 4 tokens (distinct prefix, starting at 2000) → steals B0 (lowest priority).
+    // getFreeBlock marks B0 as repurposed because it has non-empty tokens from seq0.
+    TokenIdType constexpr seq1FirstToken = 2000;
+    auto inputTokens1 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
+    std::iota(inputTokens1->begin(), inputTokens1->end(), seq1FirstToken);
+    auto llmRequest1
+        = std::make_shared<LlmRequest>(1, kVSWA_MAX_NEW_TOKENS, inputTokens1, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(1, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest1);
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), 1); // only B3 left
+
+    // Release seq1 with std::nullopt: simulates a failed/cancelled request.
+    // releaseBlocks skips storeBlocks entirely, so B0 is freed back to the pool
+    // without being stored in the reuse trie.  At this point:
+    //   B0.hasRefs()       == false  (seq1 released it)
+    //   B0.isInLookupTree() == false  (seq1 never stored it)
+    //   B0.isRepurposed()  == true   (set in getFreeBlock, never cleared)
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(1, std::nullopt)));
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), 2); // B0 + B3 free
+
+    // Release seq0: storeBlocks encounters B0 as its first OOW block.
+    // findMatchingBlock(B0's original key) returns null (B0 is not in the trie).
+    // OOW guard fires on isRepurposed()==true → break immediately, no corruption.
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(0, llmRequest0)));
+    EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+
+    // Negative reuse check: seq2 with seq0's OOW block prefix must NOT find it in
+    // the trie — the isRepurposed() guard must have prevented seq0's storeBlocks
+    // from inserting B0 under seq0's prefix.  Without the guard, storeBlocks would
+    // have inserted B0 (with seq1's overwritten KV content) and contextCurrentPosition
+    // would be kVSWA_TOKENS_PER_BLOCK - 1 instead of 0.
+    auto inputTokens2 = std::make_shared<VecTokens>(kVSWA_TOKENS_PER_BLOCK);
+    std::iota(inputTokens2->begin(), inputTokens2->end(), kVSWA_FIRST_TOKEN);
+    auto llmRequest2
+        = std::make_shared<LlmRequest>(2, kVSWA_MAX_NEW_TOKENS, inputTokens2, samplingConfig, kVSWA_IS_STREAMING);
+    kvCacheManager->addSequence(2, kVSWA_TOKENS_PER_BLOCK, kVSWA_BEAM_WIDTH, llmRequest2);
+    EXPECT_EQ(llmRequest2->getContextCurrentPosition(), 0);
+
+    EXPECT_NO_THROW(static_cast<void>(kvCacheManager->removeSequence(2, llmRequest2)));
     EXPECT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
 }
