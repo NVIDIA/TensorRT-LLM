@@ -21,6 +21,9 @@ own chunk.  Single kernel launch, no intermediate buffer, no merge kernel.
 import cutlass
 import cutlass.cute as cute
 from cutlass._mlir.dialects import llvm
+from cutlass.cute.typing import Int32 as CuteInt32
+from cutlass.cute.typing import Pointer as CutePointer
+from cutlass.cutlass_dsl import dsl_user_op
 from cutlass.utils.distributed import atomicAdd
 from cutlass.utils.smem_allocator import SmemAllocator
 
@@ -63,17 +66,72 @@ def fence_acq_rel_gpu(*, loc=None, ip=None):
     )
 
 
+@dsl_user_op
+def _red_relaxed_gpu(ptr: CutePointer, val: CuteInt32, loc=None, ip=None) -> None:
+    """fence.acq_rel.gpu + red.relaxed.gpu.global.add.s32 (no read-back)."""
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+        "fence.acq_rel.gpu;\nred.relaxed.gpu.global.add.s32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
+@dsl_user_op
+def _st_release_gpu(ptr: CutePointer, val: CuteInt32, loc=None, ip=None) -> None:
+    """fence.acq_rel.gpu + st.release.gpu.global.b32 (release store, no RMW)."""
+    llvm.inline_asm(
+        None,
+        [ptr.toint().ir_value(loc=loc, ip=ip), val.ir_value(loc=loc, ip=ip)],
+        "fence.acq_rel.gpu;\nst.release.gpu.global.b32 [$0], $1;",
+        "l,r",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
+
+
 @cute.jit
 def red_release_gpu(ptr, val):
-    """Atomic add with release semantics (GPU scope)."""
-    fence_acq_rel_gpu()
-    atomicAdd(ptr, val)
+    """fence + red.relaxed.gpu (no read-back, lighter than atomicAdd)."""
+    _red_relaxed_gpu(ptr, val)
+
+
+@cute.jit
+def st_release_gpu(ptr, val):
+    """fence + st.release.gpu (release store for counter resets)."""
+    _st_release_gpu(ptr, val)
+
+
+@dsl_user_op
+def _ld_acquire_gpu(ptr: CutePointer, loc=None, ip=None) -> CuteInt32:
+    """GPU-scope acquire load: ld.global.acquire.gpu.b32 (plain load, not atomic).
+
+    Much cheaper than atomicAdd(ptr, 0) in the spin loop — multiple CTAs
+    can read simultaneously without serialization.
+    """
+    from cutlass.cutlass_dsl import T
+    return llvm.inline_asm(
+        T.i32(),
+        [ptr.toint().ir_value(loc=loc, ip=ip)],
+        "ld.global.acquire.gpu.b32 $0, [$1];",
+        "=r,l",
+        has_side_effects=True,
+        asm_dialect=0,
+        loc=loc,
+        ip=ip,
+    )
 
 
 @cute.jit
 def ld_acquire_gpu(ptr):
-    """Acquire-semantic read via atomicAdd(ptr, 0)."""
-    return atomicAdd(ptr, cutlass.Int32(0))
+    """GPU-scope acquire load (plain load, not atomic)."""
+    return _ld_acquire_gpu(ptr)
 
 
 @cute.jit
@@ -207,22 +265,99 @@ class DistributedRadixTopKKernel:
     # Step 1: Load chunk → smem (convert to ordered)
     # ------------------------------------------------------------------
     @cute.jit
-    def load_chunk_to_smem(self, input_row_ptr, shared_ordered, chunk_start,
+    def load_chunk_to_smem(self, input_row, shared_ordered, chunk_start,
                            actual_chunk_size, tidx):
-        """Load one chunk of input into shared memory as ordered integers.
+        """Load valid chunk elements into smem as ordered integers.
 
-        OOB elements are filled with 0 (smallest ordered value, i.e. most
-        negative float, which won't affect descending top-k).
+        Follows the prologue/aligned/tail pattern from filtered_top_k_varlen_util:
+          - Scalar prologue: handle misaligned prefix at chunk_start
+          - Vectorized main: num_copy_bits-wide loads for the aligned region
+          - Scalar tail: remaining elements after the last aligned vector
+        Thread layout: thread t handles every (num_threads)-th vector in the
+        aligned region (coalesced warp access).
         """
-        for i in range(tidx, self.chunk_size, self.num_threads):
-            if i < actual_chunk_size:
-                val = input_row_ptr[chunk_start + i]
-                shared_ordered[i] = self.to_ordered(val)
-            else:
-                if cutlass.const_expr(self.dtype == cutlass.Float32):
-                    shared_ordered[i] = cutlass.Uint32(0)
-                else:
-                    shared_ordered[i] = cutlass.Uint16(0)
+        vec_size = cutlass.const_expr(self.vec_size)
+        num_threads = cutlass.const_expr(self.num_threads)
+        # align_bytes and elem_bytes are compile-time Python ints
+        align_bytes = self.num_copy_bits // 8
+        elem_bytes = self.dtype.width // 8
+
+        # --- Compute prologue / aligned / tail region sizes ---
+        # Pointer to chunk[0]; .toint() gives byte address as Int64.
+        row_ptr = input_row.iterator + chunk_start
+        row_addr_u64 = row_ptr.toint()
+
+        misalign = row_addr_u64 % align_bytes
+        fix_bytes = cutlass.Int64(0)
+        if misalign != 0:
+            fix_bytes = align_bytes - misalign
+
+        prologue_elems = cutlass.Int32(fix_bytes // elem_bytes)
+        remaining = actual_chunk_size - prologue_elems
+        aligned_size = (remaining // vec_size) * vec_size
+        left_size = remaining - aligned_size
+        # Byte address of first element in the aligned region
+        aligned_addr = row_addr_u64 + fix_bytes
+
+        # --- Part 2: Vectorized aligned region ---
+        copy_atom = cute.make_copy_atom(
+            cute.nvgpu.CopyUniversalOp(),
+            self.dtype,
+            num_bits_per_copy=cutlass.const_expr(self.num_copy_bits),
+        )
+        frag = cute.make_fragment((vec_size,), self.dtype)
+        stride = cutlass.const_expr(num_threads * vec_size)
+
+
+        # --- Part 1: Scalar prologue (before alignment boundary) ---
+        for j in range(tidx, prologue_elems, num_threads):
+            shared_ordered[j] = self.to_ordered(input_row[chunk_start + j])
+
+        # Thread t covers [t*vs, t*vs+vs), [t*vs+stride, ...) in the aligned region.
+        # All start offsets i = t*vs + k*stride are multiples of vec_size, so
+        # aligned_addr + i*elem_bytes is always align_bytes-aligned.
+        # Assert this to the MLIR verifier via assumed_align on each make_ptr.
+        i = tidx * vec_size
+        while i < aligned_size:
+            src_ptr = cute.make_ptr(
+                self.dtype,
+                aligned_addr + cutlass.Int64(i) * elem_bytes,
+                assumed_align=align_bytes,
+            )
+            src = cute.make_tensor(src_ptr, cute.make_layout((vec_size,)))
+
+            cute.copy(copy_atom, src, frag)
+            # Apply to_ordered transform into a correctly-typed uint32 fragment so
+            # that autovec_copy sees matching types (uint32 → uint32) and can emit
+            # STS.128 instead of 8 scalar STS instructions.
+            ordered_frag = cute.make_fragment((vec_size,), self.ordered_type)
+            for j in cutlass.range(vec_size, unroll_full=True):
+                # ordered_frag[j] = self.to_ordered(frag[j])
+                shared_ordered[i + prologue_elems + j] = self.to_ordered(frag[j])
+
+            # # Smem layout reordering: aligned region at smem[0..aligned_size-1],
+            # # prologue at smem[aligned_size..+prologue-1], tail at smem[aligned_size+prologue..].
+            # # smem_base is 128B-aligned and i is always a multiple of vec_size*elem_bytes,
+            # # so smem[i] is always align_bytes-aligned → STS.128 is valid.
+            # # Must specify AddressSpace.smem explicitly so make_ptr creates a smem pointer
+            # # (not global), and assumed_align hints the compiler to emit STS.128.
+            # shared_addr_u64 = (shared_ordered.iterator + i).toint()
+            # shared_ptr = cute.make_ptr(
+            #     self.ordered_type,
+            #     shared_addr_u64,
+            #     cute.AddressSpace.smem,
+            #     assumed_align=align_bytes,
+            # )
+            # shared_tensor = cute.make_tensor(shared_ptr, cute.make_layout((vec_size,)))
+            # cute.autovec_copy(ordered_frag, shared_tensor)
+
+            i = i + stride
+
+        # --- Part 3: Scalar tail (after last aligned vector) ---
+        for j in range(tidx, left_size, num_threads):
+            k = prologue_elems + aligned_size + j
+            shared_ordered[k] = self.to_ordered(input_row[chunk_start + k])
+
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
@@ -324,17 +459,95 @@ class DistributedRadixTopKKernel:
         cute.arch.barrier()
 
     # ------------------------------------------------------------------
-    # Step 2c: Single radix round (called explicitly per round)
+    # Step 2c-single: Single-CTA radix round (no global state, no barriers)
     # ------------------------------------------------------------------
     @cute.jit
-    def _radix_round(self, round_idx: cutlass.Constexpr, hist_offset: cutlass.Constexpr,
-                     next_hist_offset: cutlass.Constexpr, shift: cutlass.Constexpr,
+    def _radix_round_single_cta(self, round_idx: cutlass.Constexpr,
+                                 shift: cutlass.Constexpr,
+                                 shared_ordered, actual_chunk_size, prefix,
+                                 remaining_k, local_histogram, suffix_buf,
+                                 s_scalars, s_warp_sums, num_threads, tidx):
+        """Execute one radix select round for single-CTA mode.
+
+        No global memory histogram merging and no inter-CTA barriers needed:
+        the CTA owns all data, so ``local_histogram`` (smem) is already the
+        complete histogram after the local build pass.
+        """
+        # Compute prefix_mask for this round (top round_idx*8 bits)
+        prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            if cutlass.const_expr(prefix_mask_bits == 0):
+                prefix_mask = cutlass.Uint32(0)
+            else:
+                prefix_mask = cutlass.Uint32(
+                    ((1 << prefix_mask_bits) - 1) << (32 - prefix_mask_bits))
+        else:
+            if cutlass.const_expr(prefix_mask_bits == 0):
+                prefix_mask = cutlass.Uint16(0)
+            else:
+                prefix_mask = cutlass.Uint16(
+                    ((1 << prefix_mask_bits) - 1) << (16 - prefix_mask_bits))
+
+        # Clear local histogram
+        for i in range(tidx, self.radix, num_threads):
+            local_histogram[i] = cutlass.Int32(0)
+        cute.arch.barrier()
+
+        # Build histogram directly in smem (no global merge)
+        val_one = cutlass.Int32(1)
+        for i in range(tidx, actual_chunk_size, num_threads):
+            ordered = shared_ordered[i]
+            if (ordered & prefix_mask) == prefix:
+                if cutlass.const_expr(self.dtype == cutlass.Float32):
+                    bucket = cutlass.Int32(
+                        (ordered >> cutlass.Uint32(shift)) &
+                        cutlass.Uint32(0xFF))
+                else:
+                    bucket = cutlass.Int32(
+                        (ordered >> cutlass.Uint16(shift)) &
+                        cutlass.Uint16(0xFF))
+                atomicAdd(local_histogram.iterator + bucket, val_one)
+        cute.arch.barrier()
+
+        # local_histogram is already the complete histogram — compute
+        # suffix sum and find the threshold bucket directly.
+        self.suffix_sum_and_find_threshold(local_histogram, suffix_buf,
+                                           s_scalars, remaining_k,
+                                           s_warp_sums, tidx)
+
+        found_bucket = s_scalars[0]
+        found_remaining_k = s_scalars[1]
+
+        if cutlass.const_expr(self.dtype == cutlass.Float32):
+            prefix = prefix | cutlass.Uint32(
+                cutlass.Uint32(found_bucket) << cutlass.Uint32(shift))
+        else:
+            prefix = prefix | cutlass.Uint16(
+                cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
+        remaining_k = found_remaining_k
+
+        return prefix, remaining_k
+
+    # ------------------------------------------------------------------
+    # Step 2c: Multi-CTA radix round (called explicitly per round)
+    # ------------------------------------------------------------------
+    @cute.jit
+    def _radix_round(self, round_idx: cutlass.Constexpr,
+                     num_rounds: cutlass.Constexpr,
+                     iter,
+                     shift: cutlass.Constexpr,
                      shared_ordered, actual_chunk_size, prefix, remaining_k,
                      local_histogram, suffix_buf, s_scalars, s_warp_sums,
                      state_base_ptr, state_row, cta_in_group, barrier_phase,
                      ctas_per_group, num_threads, tidx):
         """Execute one radix select round with inter-CTA synchronisation."""
-        global_hist_ptr = state_base_ptr + cutlass.Int32(hist_offset)
+        # FlashInfer-style triple-buffer rotation
+        hist_buf_idx = (iter * cutlass.Int32(num_rounds) +
+                        cutlass.Int32(round_idx)) % cutlass.Int32(3)
+        next_hist_buf_idx = (hist_buf_idx + cutlass.Int32(1)) % cutlass.Int32(3)
+        hist_offset = hist_buf_idx * cutlass.Int32(self.radix)
+        next_hist_offset = next_hist_buf_idx * cutlass.Int32(self.radix)
+        global_hist_ptr = state_base_ptr + hist_offset
 
         # Compute prefix_mask for this round (top round_idx*8 bits)
         prefix_mask_bits = cutlass.const_expr(round_idx * self.radix_bits)
@@ -360,7 +573,7 @@ class DistributedRadixTopKKernel:
         # CTA 0 clears the *next* round's histogram buffer
         if cta_in_group == 0:
             for i in range(tidx, self.radix, num_threads):
-                state_row[next_hist_offset + i] = cutlass.Int32(0)
+                state_row[next_hist_offset + cutlass.Int32(i)] = cutlass.Int32(0)
 
         # Inter-CTA barrier (only thread 0 signals arrival)
         if tidx == 0:
@@ -374,7 +587,7 @@ class DistributedRadixTopKKernel:
 
         # Read merged histogram into local_histogram (smem)
         for i in range(tidx, self.radix, num_threads):
-            local_histogram[i] = state_row[hist_offset + i]
+            local_histogram[i] = state_row[hist_offset + cutlass.Int32(i)]
         cute.arch.barrier()
 
         # Suffix sum and find threshold bucket
@@ -394,16 +607,6 @@ class DistributedRadixTopKKernel:
                 cutlass.Uint16(found_bucket) << cutlass.Uint16(shift))
         remaining_k = found_remaining_k
 
-        # Barrier before next round (only thread 0 signals arrival)
-        if tidx == 0:
-            red_release_gpu(
-                state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
-                cutlass.Int32(1))
-        barrier_phase = barrier_phase + 1
-        barrier_inter_cta(
-            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
-            barrier_phase * ctas_per_group, tidx)
-
         return prefix, remaining_k, barrier_phase
 
     # ------------------------------------------------------------------
@@ -415,8 +618,9 @@ class DistributedRadixTopKKernel:
         """Count elements strictly greater than ordered_pivot in this
         CTA's shared_ordered.  Uses local_histogram[0] as shared counter.
 
-        Matches FlashInfer's local_gt_count computation at the end of
-        RadixSelectFromSharedMemory.
+        Uses warp reduction (FlashInfer pattern): each thread counts its
+        elements, then a butterfly warp-sum reduces 32 threads to one
+        atomicAdd per warp, cutting smem contention by 32x.
         """
         if tidx == 0:
             local_histogram[0] = cutlass.Int32(0)
@@ -427,8 +631,13 @@ class DistributedRadixTopKKernel:
             ordered = shared_ordered[i]
             if ordered > ordered_pivot:
                 my_count = my_count + 1
-        if my_count > 0:
-            atomicAdd(local_histogram.iterator, my_count)
+
+        # Warp-level reduction: butterfly sum across 32 threads.
+        warp_sum = cute.arch.warp_reduction_sum(my_count)
+        # Only lane 0 of each warp atomics the warp's total to smem.
+        if cute.arch.lane_idx() == 0:
+            if warp_sum > 0:
+                atomicAdd(local_histogram.iterator, warp_sum)
         cute.arch.barrier()
 
         return local_histogram[0]
@@ -503,6 +712,50 @@ class DistributedRadixTopKKernel:
         return barrier_phase
 
     # ------------------------------------------------------------------
+    # Step 3-single: Single-CTA output collection (no inter-CTA barrier)
+    # ------------------------------------------------------------------
+    @cute.jit
+    def collect_output_single_cta(self, shared_ordered, actual_chunk_size,
+                                   chunk_start, ordered_pivot, top_k,
+                                   local_histogram,
+                                   output_indices_row, output_values_row,
+                                   tidx):
+        """Single-CTA output collection using a smem counter.
+
+        No inter-CTA barrier is needed.  ``local_histogram[2]`` is reused as
+        a smem output counter (safe because the histogram phase is complete).
+        """
+        val_one = cutlass.Int32(1)
+
+        # Reuse local_histogram[2] as smem output counter
+        if tidx == 0:
+            local_histogram[2] = cutlass.Int32(0)
+        cute.arch.barrier()
+
+        # Pass 1: strictly greater than pivot
+        for i in range(tidx, actual_chunk_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered > ordered_pivot:
+                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
+                                val_one)
+                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        cute.arch.barrier()
+
+        # Pass 2: equal to pivot (fill remaining slots up to k)
+        for i in range(tidx, actual_chunk_size, self.num_threads):
+            ordered = shared_ordered[i]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
+                                val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(
+                            ordered_pivot)
+
+    # ------------------------------------------------------------------
     # Main kernel
     # ------------------------------------------------------------------
     @cute.kernel
@@ -575,10 +828,15 @@ class DistributedRadixTopKKernel:
         row_idx = group_id
         barrier_phase = cutlass.Int32(0)
 
-        state_size = cutlass.const_expr(STATE_SIZE)
-        state_base_ptr = row_states.iterator + cutlass.Int32(
-            group_id * state_size)
-        state_row = row_states[group_id, None]
+        # Multi-CTA only: global state pointer (compiled away for single-CTA)
+        if cutlass.const_expr(ctas_per_group > 1):
+            state_size = cutlass.const_expr(STATE_SIZE)
+            state_base_ptr = row_states.iterator + cutlass.Int32(
+                group_id * state_size)
+            state_row = row_states[group_id, None]
+
+            # Per-call iteration counter (row_states zeroed by caller).
+            iter_var = cutlass.Int32(0)
 
         while row_idx < num_rows:
             # Compute effective length from seqlen
@@ -596,7 +854,6 @@ class DistributedRadixTopKKernel:
                     actual_chunk_size = cutlass.Int32(remaining_len)
 
             # Early exit: k >= length → return all indices directly
-            # (FlashInfer: "k >= vocab_size: return all indices")
             input_row = input_data[row_idx, None]
             output_indices_row = output_indices[row_idx, None]
             if cutlass.const_expr(output_values is not None):
@@ -612,51 +869,32 @@ class DistributedRadixTopKKernel:
                         if cutlass.const_expr(output_values is not None):
                             output_values_row[chunk_start + i] = input_row[
                                 chunk_start + i]
-                # Fill remaining slots with -1 (only CTA 0)
+                # Fill remaining slots with -1 (only CTA 0 / single-CTA)
                 if cta_in_group == 0:
                     for i in range(tidx + length, top_k, num_threads):
                         output_indices_row[i] = cutlass.Int32(-1)
-                # Inter-CTA barrier to keep barrier_phase in sync.
-                # Unlike FlashInfer (which uses `continue` + triple buffer),
-                # we need an explicit barrier here.
-                if tidx == 0:
-                    red_release_gpu(
-                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
-                        cutlass.Int32(1))
-                barrier_phase = barrier_phase + 1
-                barrier_inter_cta(
-                    state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
-                    barrier_phase * ctas_per_group, tidx)
+                # Multi-CTA: clear next iter's first histogram buffer.
+                # No inter-CTA barrier needed here (FlashInfer pattern):
+                # early-exit writes no global histogram, so there is nothing
+                # to synchronize.  barrier_phase is intentionally NOT
+                # incremented so the next normal row's barrier targets remain
+                # consistent.
+                if cutlass.const_expr(ctas_per_group > 1):
+                    # CTA 0 clears the first buffer used by the next iteration
+                    # (FlashInfer pattern: histogram[(iter+1)*num_rounds % 3]).
+                    if cta_in_group == 0:
+                        num_rounds_const = cutlass.const_expr(self.num_rounds)
+                        next_first_offset = (
+                            (iter_var + cutlass.Int32(1)) *
+                            cutlass.Int32(num_rounds_const)
+                        ) % cutlass.Int32(3) * cutlass.Int32(self.radix)
+                        for i in range(tidx, self.radix, num_threads):
+                            state_row[next_first_offset +
+                                      cutlass.Int32(i)] = cutlass.Int32(0)
             else:
                 # Step 1: Load chunk to smem as ordered
-                self.load_chunk_to_smem(
-                    input_row, shared_ordered, chunk_start,
-                    actual_chunk_size, tidx)
-
-                # All CTAs cooperatively clear histogram buffers
-                # BEFORE the initial barrier.  arrival_counter is NEVER
-                # zeroed (it accumulates across rows with barrier_phase).
-                hist_total = cutlass.const_expr(3 * self.radix)
-                for i in range(tidx, hist_total, num_threads):
-                    state_row[i] = cutlass.Int32(0)
-                cute.arch.barrier()
-
-                # Initial inter-CTA barrier for this row.
-                if tidx == 0:
-                    red_release_gpu(
-                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
-                        cutlass.Int32(1))
-                barrier_phase = barrier_phase + 1
-                barrier_inter_cta(
-                    state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
-                    barrier_phase * ctas_per_group, tidx)
-
-                # CTA 0 clears output counter AFTER barrier
-                # (FlashInfer: st_release(&state->output_counter, 0))
-                if cta_in_group == 0:
-                    if tidx == 0:
-                        fence_acq_rel_gpu()
-                        state_row[_OUTPUT_COUNTER] = cutlass.Int32(0)
+                self.load_chunk_to_smem(input_row, shared_ordered,
+                                        chunk_start, actual_chunk_size, tidx)
 
                 # Step 2: Multi-round radix select
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
@@ -665,79 +903,140 @@ class DistributedRadixTopKKernel:
                     prefix = cutlass.Uint16(0)
                 remaining_k = cutlass.Int32(top_k)
 
-                # Round 0 (bits [ordered_bits-8 .. ordered_bits-1])
-                prefix, remaining_k, barrier_phase = self._radix_round(
-                    0, _HIST_BUF_0, _HIST_BUF_1,
-                    self.ordered_bits - 1 * self.radix_bits,
-                    shared_ordered, actual_chunk_size, prefix, remaining_k,
-                    local_histogram, suffix_buf, s_scalars, s_warp_sums,
-                    state_base_ptr, state_row, cta_in_group, barrier_phase,
-                    ctas_per_group, num_threads, tidx)
+                if cutlass.const_expr(ctas_per_group == 1):
+                    # ---- Single-CTA path: no global state, no barriers ----
+                    # Round 0
+                    prefix, remaining_k = self._radix_round_single_cta(
+                        0, self.ordered_bits - 1 * self.radix_bits,
+                        shared_ordered, actual_chunk_size, prefix, remaining_k,
+                        local_histogram, suffix_buf, s_scalars, s_warp_sums,
+                        num_threads, tidx)
+                    # Round 1
+                    prefix, remaining_k = self._radix_round_single_cta(
+                        1, self.ordered_bits - 2 * self.radix_bits,
+                        shared_ordered, actual_chunk_size, prefix, remaining_k,
+                        local_histogram, suffix_buf, s_scalars, s_warp_sums,
+                        num_threads, tidx)
+                    if cutlass.const_expr(self.num_rounds > 2):
+                        # Round 2 (fp32 only)
+                        prefix, remaining_k = self._radix_round_single_cta(
+                            2, self.ordered_bits - 3 * self.radix_bits,
+                            shared_ordered, actual_chunk_size, prefix,
+                            remaining_k, local_histogram, suffix_buf,
+                            s_scalars, s_warp_sums, num_threads, tidx)
+                        # Round 3 (fp32 only)
+                        prefix, remaining_k = self._radix_round_single_cta(
+                            3, self.ordered_bits - 4 * self.radix_bits,
+                            shared_ordered, actual_chunk_size, prefix,
+                            remaining_k, local_histogram, suffix_buf,
+                            s_scalars, s_warp_sums, num_threads, tidx)
 
-                # Round 1 (bits [ordered_bits-16 .. ordered_bits-9])
-                prefix, remaining_k, barrier_phase = self._radix_round(
-                    1, _HIST_BUF_1, _HIST_BUF_2,
-                    self.ordered_bits - 2 * self.radix_bits,
-                    shared_ordered, actual_chunk_size, prefix, remaining_k,
-                    local_histogram, suffix_buf, s_scalars, s_warp_sums,
-                    state_base_ptr, state_row, cta_in_group, barrier_phase,
-                    ctas_per_group, num_threads, tidx)
+                    # Step 3: Collect output (smem counter, no inter-CTA sync)
+                    self.collect_output_single_cta(
+                        shared_ordered, actual_chunk_size, chunk_start,
+                        prefix, top_k, local_histogram,
+                        output_indices_row, output_values_row, tidx)
 
-                if cutlass.const_expr(self.num_rounds > 2):
-                    # Round 2 (fp32 only)
+                else:
+                    # ---- Multi-CTA path ----
+                    # Initial inter-CTA barrier for this row.
+                    if tidx == 0:
+                        red_release_gpu(
+                            state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                            cutlass.Int32(1))
+                    barrier_phase = barrier_phase + 1
+                    barrier_inter_cta(
+                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                        barrier_phase * ctas_per_group, tidx)
+
+                    # CTA 0 resets output counter AFTER barrier (release store)
+                    if cta_in_group == 0:
+                        if tidx == 0:
+                            st_release_gpu(
+                                state_base_ptr + cutlass.Int32(_OUTPUT_COUNTER),
+                                cutlass.Int32(0))
+
+                    num_rounds_const = cutlass.const_expr(self.num_rounds)
+                    # Round 0
                     prefix, remaining_k, barrier_phase = self._radix_round(
-                        2, _HIST_BUF_2, _HIST_BUF_0,
-                        self.ordered_bits - 3 * self.radix_bits,
-                        shared_ordered, actual_chunk_size, prefix,
-                        remaining_k, local_histogram, suffix_buf,
-                        s_scalars, s_warp_sums, state_base_ptr,
-                        state_row, cta_in_group, barrier_phase,
+                        0, num_rounds_const, iter_var,
+                        self.ordered_bits - 1 * self.radix_bits,
+                        shared_ordered, actual_chunk_size, prefix, remaining_k,
+                        local_histogram, suffix_buf, s_scalars, s_warp_sums,
+                        state_base_ptr, state_row, cta_in_group, barrier_phase,
+                        ctas_per_group, num_threads, tidx)
+                    # Round 1
+                    prefix, remaining_k, barrier_phase = self._radix_round(
+                        1, num_rounds_const, iter_var,
+                        self.ordered_bits - 2 * self.radix_bits,
+                        shared_ordered, actual_chunk_size, prefix, remaining_k,
+                        local_histogram, suffix_buf, s_scalars, s_warp_sums,
+                        state_base_ptr, state_row, cta_in_group, barrier_phase,
                         ctas_per_group, num_threads, tidx)
 
-                    # Round 3 (fp32 only)
-                    prefix, remaining_k, barrier_phase = self._radix_round(
-                        3, _HIST_BUF_0, _HIST_BUF_1,
-                        self.ordered_bits - 4 * self.radix_bits,
+                    if cutlass.const_expr(self.num_rounds > 2):
+                        # Round 2 (fp32 only)
+                        prefix, remaining_k, barrier_phase = self._radix_round(
+                            2, num_rounds_const, iter_var,
+                            self.ordered_bits - 3 * self.radix_bits,
+                            shared_ordered, actual_chunk_size, prefix,
+                            remaining_k, local_histogram, suffix_buf,
+                            s_scalars, s_warp_sums, state_base_ptr,
+                            state_row, cta_in_group, barrier_phase,
+                            ctas_per_group, num_threads, tidx)
+                        # Round 3 (fp32 only)
+                        prefix, remaining_k, barrier_phase = self._radix_round(
+                            3, num_rounds_const, iter_var,
+                            self.ordered_bits - 4 * self.radix_bits,
+                            shared_ordered, actual_chunk_size, prefix,
+                            remaining_k, local_histogram, suffix_buf,
+                            s_scalars, s_warp_sums, state_base_ptr,
+                            state_row, cta_in_group, barrier_phase,
+                            ctas_per_group, num_threads, tidx)
+
+                    # Count > pivot elements per CTA (for batch atomicAdd)
+                    local_gt_count = self.compute_local_gt_count(
                         shared_ordered, actual_chunk_size, prefix,
-                        remaining_k, local_histogram, suffix_buf,
-                        s_scalars, s_warp_sums, state_base_ptr,
-                        state_row, cta_in_group, barrier_phase,
-                        ctas_per_group, num_threads, tidx)
+                        local_histogram, tidx)
 
-                # prefix is now the ordered pivot
-                ordered_pivot = prefix
+                    # Step 3: Collect output
+                    output_counter_ptr = state_base_ptr + cutlass.Int32(
+                        _OUTPUT_COUNTER)
+                    arrival_counter_ptr = state_base_ptr + cutlass.Int32(
+                        _ARRIVAL_COUNTER)
 
-                # Count > pivot elements per CTA (for batch atomicAdd)
-                local_gt_count = self.compute_local_gt_count(
-                    shared_ordered, actual_chunk_size, ordered_pivot,
-                    local_histogram, tidx)
+                    barrier_phase = self.collect_output(
+                        shared_ordered, actual_chunk_size, chunk_start,
+                        prefix, top_k, local_gt_count,
+                        output_counter_ptr, arrival_counter_ptr, barrier_phase,
+                        ctas_per_group, local_histogram,
+                        output_indices_row, output_values_row, tidx)
 
-                # Step 3: Collect output
-                output_counter_ptr = state_base_ptr + cutlass.Int32(
-                    _OUTPUT_COUNTER)
-                arrival_counter_ptr = state_base_ptr + cutlass.Int32(
-                    _ARRIVAL_COUNTER)
-
-                barrier_phase = self.collect_output(
-                    shared_ordered, actual_chunk_size, chunk_start,
-                    ordered_pivot, top_k, local_gt_count,
-                    output_counter_ptr,
-                    arrival_counter_ptr, barrier_phase, ctas_per_group,
-                    local_histogram,
-                    output_indices_row, output_values_row, tidx)
-
-                # Final inter-CTA barrier: ensure all CTAs finish output
-                # collection before any CTA starts clearing state for
-                # the next row.
-                if tidx == 0:
-                    red_release_gpu(arrival_counter_ptr,
-                                    cutlass.Int32(1))
-                barrier_phase = barrier_phase + 1
-                barrier_inter_cta(arrival_counter_ptr,
-                                  barrier_phase * ctas_per_group, tidx)
+                    # Final inter-CTA barrier: ensure all CTAs finish before
+                    # moving to the next row.
+                    if tidx == 0:
+                        red_release_gpu(arrival_counter_ptr,
+                                        cutlass.Int32(1))
+                    barrier_phase = barrier_phase + 1
+                    barrier_inter_cta(arrival_counter_ptr,
+                                      barrier_phase * ctas_per_group, tidx)
 
             # Advance to next row (round-robin).
             row_idx = row_idx + num_groups
+            if cutlass.const_expr(ctas_per_group > 1):
+                iter_var = iter_var + cutlass.Int32(1)
+
+        # End-of-kernel cleanup (FlashInfer-style): CTA 0 resets state so the
+        # next kernel call can use torch.empty instead of torch.zeros.
+        if cutlass.const_expr(ctas_per_group > 1):
+            if cta_in_group == 0:
+                hist_total = cutlass.const_expr(3 * self.radix)
+                for i in range(tidx, hist_total, num_threads):
+                    state_row[i] = cutlass.Int32(0)
+                if tidx == 0:
+                    st_release_gpu(
+                        state_base_ptr + cutlass.Int32(_ARRIVAL_COUNTER),
+                        cutlass.Int32(0))
 
     # ------------------------------------------------------------------
     # Host-side launcher

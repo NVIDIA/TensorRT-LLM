@@ -3446,6 +3446,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
                          kernels.
         """
         kernel_cache = dict()
+        # buffer_cache is used to cache the row_states.
+        buffer_cache = dict()
 
         @classmethod
         def _compile(cls, dtype, chunk_size, top_k, next_n, num_copy_bits,
@@ -3531,7 +3533,10 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_sms = _get_num_sms()
 
             # Compute chunk_size and ctas_per_group from smem capacity
-            max_smem = 48 * 1024  # 48 KB default
+            # TODO(@limin): need to tune the chunk_size and ctas_per_group to get the best performance for different batch_size and num_tokens.
+            # max_smem = 48 * 1024  # 48 KB default
+            # align with flashinfer's config.
+            max_smem = 227 * 1024  # 227 KB
             overhead = 256 * 4 * 2 + 16 + 8 * 4  # histograms + suffix + scalars + warp_sums
             if dtype == cutlass.Float32:
                 ordered_elem_size = 4
@@ -3555,9 +3560,6 @@ if IS_CUTLASS_DSL_AVAILABLE:
             num_groups = min(num_sms // ctas_per_group, num_rows)
             if num_groups < 1:
                 num_groups = 1
-            
-            logger.info(f"limin: num_rows: {num_rows}, num_cols: {num_cols}, num_groups: {num_groups}, ctas_per_group: {ctas_per_group}, chunk_size: {chunk_size}, max_chunk: {max_chunk}")
-            logger.info(f"seq_lens: {seq_lens}")
 
             # Compile key
             key = (dtype, chunk_size, top_k, next_n, num_copy_bits,
@@ -3567,10 +3569,16 @@ if IS_CUTLASS_DSL_AVAILABLE:
                              ctas_per_group, num_sms, return_val)
             compiled_kernel = cls.kernel_cache[key]
 
-            # Allocate row_states
-            row_states = torch.zeros(
-                num_groups, DISTRIBUTED_TOPK_STATE_SIZE,
-                dtype=torch.int32, device="cuda")
+            # Allocate row_states once with num_sms rows — large enough for
+            # any ctas_per_group config because group_id < num_groups
+            # <= num_sms // ctas_per_group <= num_sms.  The kernel resets
+            # the slots it used at end-of-kernel, so the buffer stays clean
+            # across calls without re-zeroing (FlashInfer pattern).
+            if "row_states" not in cls.buffer_cache:
+                cls.buffer_cache["row_states"] = torch.zeros(
+                    num_sms, DISTRIBUTED_TOPK_STATE_SIZE,
+                    dtype=torch.int32, device="cuda")
+            row_states = cls.buffer_cache["row_states"]
 
             # Allocate outputs
             output_indices = torch.empty(
