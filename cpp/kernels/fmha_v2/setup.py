@@ -3333,10 +3333,13 @@ def use_cubin_header(sm,
                      head_size,
                      dtype,
                      output_dtype=None,
-                     enable_skip_softmax=False):
+                     enable_skip_softmax=False,
+                     attention_mask_type=None):
     if enable_skip_softmax:
         return False
     if 'e4m3' in dtype and output_dtype in ['bf16', 'fp16']:
+        return False
+    if attention_mask_type == AttentionMaskType.BIDIRECTIONAL_SLIDING_WINDOW:
         return False
     return (sm == 90 and head_size == 128) or (sm == 89 and 'e4m3' in dtype)
 
@@ -3349,9 +3352,11 @@ def get_cubin_header(kernel_traits, specs_names):
     cubin_lens_dict = {}
     launchers_dict = {}
     for kspec, fname, lname, kname in specs_names:
+        mask_type = AttentionMaskType.BIDIRECTIONAL_SLIDING_WINDOW \
+            if '_bidirectional_sliding_window' in kname else None
         if generate_cu_trtllm and not use_cubin_header(
                 kspec.sm, kspec.head_size, kspec.dtype, kspec.output_dtype,
-                kspec.enable_skip_softmax):
+                kspec.enable_skip_softmax, mask_type):
             continue
         name = fname.replace('.', '_')
         data = 'extern unsigned char cubin_{name}_cubin[];'.format(name=name)
@@ -3487,7 +3492,8 @@ def get_cubin_header(kernel_traits, specs_names):
         return_softmax_stats_flag = pythonBoolean2cpp[sm != '90' or (
             sm == '90' and '_softmax' in kname)]
 
-        enable_skip_softmax_flag = pythonBoolean2cpp['_skipSoftmax' in kname]
+        enable_skip_softmax = '_skipSoftmax' in kname
+        enable_skip_softmax_flag = pythonBoolean2cpp[enable_skip_softmax]
 
         # meta_unroll_step
         meta_unroll_step = unroll_step if ('_nl' in kname
@@ -3516,7 +3522,8 @@ def get_cubin_header(kernel_traits, specs_names):
                 def get_lname_from_kname(kname: str) -> str:
                     if use_cubin_header(int(sm), int(head_size), prec.lower(),
                                         output_prec.lower(),
-                                        enable_skip_softmax_flag):
+                                        enable_skip_softmax,
+                                        attention_mask_type):
                         return 'nullptr'
                     lname = kname.replace('_kernel', '')
                     mask_types = [
@@ -3537,9 +3544,9 @@ def get_cubin_header(kernel_traits, specs_names):
 {cubin_name}_len, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
 {attention_input_layout_value}, {is_il}, {is_flash_atten}, {is_warp_specialization}, {is_fp32_accu}, \
 {is_alibi_supported}, {is_tiled}, {has_softcapping_scale}, {return_softmax_stats_flag}, {enable_skip_softmax_flag}, {lname}}}\
-'''.format(**locals()) if use_cubin_header(int(sm), int(head_size),
-                                           prec.lower(), output_prec.lower(),
-                                           enable_skip_softmax_flag) else '''\
+'''.format(**locals()) if use_cubin_header(
+                    int(sm), int(head_size), prec.lower(), output_prec.lower(),
+                    enable_skip_softmax, attention_mask_type) else '''\
 {{ DATA_TYPE_{prec}, DATA_TYPE_{output_prec}, {seq_len}, {q_step}, {kv_step}, {head_size}, {head_size_v}, \
 {sage_block_sizes[0]}, {sage_block_sizes[1]}, {sage_block_sizes[2]}, kSM_{sm}, nullptr, \
 0, \"{kname}\", {smem}, {threads}, {meta_unroll_step}, {attention_mask_type_value}, \
