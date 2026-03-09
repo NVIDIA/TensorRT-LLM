@@ -290,7 +290,6 @@ test_e2e.py::test_openai_chat_guided_decoding[openai/gpt-oss-120b] SKIP (https:/
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[True] SKIP (https://nvbugs/5849648)
 accuracy/test_disaggregated_serving.py::TestGPTOSS::test_auto_dtype[False] SKIP (https://nvbugs/5849648)
 disaggregated/test_disaggregated.py::test_disaggregated_deepseek_v3_lite_fp8_overlap_cuda_graph[DeepSeek-V3-Lite-fp8] SKIP (https://nvbugs/5884712)
-unittest/auto_deploy/singlegpu/smoke/test_ad_build_small_single.py::test_build_ad[deepseek-ai/DeepSeek-V3-llm_extra_args10] SKIP (https://nvbugs/5888827)
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_off-cpp_mamba_cache] SKIP (https://nvbugs/5888560)
 accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_fp8_4gpus[attention_dp_on-cpp_mamba_cache] SKIP (https://nvbugs/5888560)
 accuracy/test_llm_api_pytorch.py::TestGPTOSS::test_eagle3_4gpus[v1_kv_cache-cutlass-one_model-no_overlap_scheduler] SKIP (https://nvbugs/5809169)
