@@ -887,10 +887,10 @@ def collectTestResults(pipeline, testFilter)
                 sh """
                     python3 llm/jenkins/scripts/perf/get_pre_merge_html.py \
                     --input-files=${yamlFileList} \
-                    --output-file=perf_sanity_report.html
+                    --output-file=perf_regression.html
                 """
-                trtllm_utils.uploadArtifacts("perf_sanity_report.html", "${UPLOAD_PATH}/test-results/")
-                echo "Perf sanity report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_sanity_report.html"
+                trtllm_utils.uploadArtifacts("perf_regression.html", "${UPLOAD_PATH}/test-results/")
+                echo "Perf regression report: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/test-results/perf_regression.html"
             } else {
                 echo "No perf_data.yaml files found."
             }
