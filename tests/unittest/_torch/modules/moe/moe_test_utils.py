@@ -284,13 +284,6 @@ def should_skip_trtllm(
     # These are known issues that need investigation. Skipping to avoid test failures
     # and CUDA errors that can cascade to subsequent tests.
 
-    # Issue: W4A8_NVFP4_FP8 with top_k=1 causes CUDA illegal memory access
-    if quant_algo == QuantAlgo.W4A8_NVFP4_FP8 and top_k == 1:
-        return (
-            "[Potential Bug] TRTLLMGenFusedMoE W4A8_NVFP4_FP8 with top_k=1 "
-            "causes CUDA illegal memory access."
-        )
-
     # Issue: NVFP4 with large expert count + large hidden_size + seq_len=1
     # has a single FP4BlockScaleMoERunner tactic with accuracy failure.
     # Observed: e256_k8_h7168_i2048, seq=1, bfloat16 — tactic[204] with tile
@@ -324,11 +317,6 @@ def should_skip_trtllm(
 
     # Issue: W4A8_MXFP4_MXFP8 has accuracy issues on certain model configs
     if quant_algo == QuantAlgo.W4A8_MXFP4_MXFP8:
-        if intermediate_size >= 14336:
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with large "
-                f"intermediate_size has accuracy issues (intermediate_size={intermediate_size} >= 14336)."
-            )
         if num_experts >= 60 and intermediate_size >= 1408:
             return (
                 f"[Potential Bug] TRTLLMGenFusedMoE W4A8_MXFP4_MXFP8 with many experts "
