@@ -754,8 +754,7 @@ class PyMicroBatchScheduler(MicroBatchScheduler):
                 draft_discard = req.num_draft_tokens - remaining_space
                 if draft_discard > 0:
                     logger.debug(f"Discarding {draft_discard} draft tokens")
-                    if hasattr(req, "discard_draft_tokens"):
-                        req.discard_draft_tokens(draft_discard)
+                    req.discard_draft_tokens(draft_discard)
 
 
 class SchedulerPolicyBase(ABC):

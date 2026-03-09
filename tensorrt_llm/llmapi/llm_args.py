@@ -1687,6 +1687,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
 
+    use_python_scheduler: bool = Field(
+        default=False,
+        description="Use pure-Python scheduler instead of C++ scheduler.")
+
     def _to_pybind(self):
         return _SchedulerConfig(
             capacity_scheduler_policy=self.capacity_scheduler_policy._to_pybind(

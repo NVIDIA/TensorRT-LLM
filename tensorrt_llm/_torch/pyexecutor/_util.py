@@ -1144,7 +1144,7 @@ def create_py_executor_instance(
     if scheduler_capacity == 1 and mapping.enable_attention_dp and kv_cache_manager:
         scheduler_capacity += 1
 
-    use_python_scheduler = os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1"
+    use_python_scheduler = scheduler_config.use_python_scheduler if scheduler_config is not None else False
     if use_python_scheduler and not isinstance(kv_cache_manager,
                                                KVCacheManagerV2):
         scheduler = SimpleUnifiedScheduler(
