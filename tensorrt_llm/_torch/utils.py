@@ -54,6 +54,7 @@ class ActivationType(IntEnum):
 class ActType_TrtllmGen(IntEnum):
     SwiGlu = 0
     Relu2 = 1
+    Silu = 2
 
 
 # IMPORTANT: when adding a new activation type, please update this function.
