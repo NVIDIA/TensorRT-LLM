@@ -26,8 +26,7 @@ from tensorrt_llm.llmapi.utils import download_hf_model
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
-from .checkpoints import WeightLoader
-from .config import DiffusionModelConfig, PipelineComponent, VisualGenArgs
+from .config import DiffusionModelConfig, VisualGenArgs
 from .models import AutoPipeline
 
 if TYPE_CHECKING:

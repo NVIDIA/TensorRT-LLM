@@ -215,7 +215,6 @@ class LTX2Attention(Attention):
         self,
         x: torch.Tensor,
         context: torch.Tensor | None = None,
-        mask: torch.Tensor | None = None,
         pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         k_pe: tuple[torch.Tensor, torch.Tensor] | None = None,
         pre_projected_kv: tuple[torch.Tensor, torch.Tensor] | None = None,
@@ -225,7 +224,6 @@ class LTX2Attention(Attention):
         Args:
             x: Query input [B, T, D].
             context: Key/value input [B, S, C]. None → self-attention.
-            mask: Attention mask (currently unused by TRT-LLM backends).
             pe: (cos, sin) RoPE embeddings for Q (and K when k_pe is None).
             k_pe: Separate (cos, sin) RoPE embeddings for K (for AV cross-attn).
             pre_projected_kv: Pre-projected (k, v) tuple from project_kv().
@@ -494,8 +492,8 @@ class BasicAVTransformerBlock(nn.Module):
 
         run_vx = video is not None and video.enabled and vx.numel() > 0
         run_ax = audio is not None and audio.enabled and ax.numel() > 0
-        run_a2v = run_vx and (audio is not None and ax.numel() > 0)
-        run_v2a = run_ax and (video is not None and vx.numel() > 0)
+        run_a2v = run_vx and run_ax
+        run_v2a = run_ax and run_vx
 
         has_perturbations = perturbations is not None and isinstance(
             perturbations, BatchedPerturbationConfig
@@ -522,7 +520,6 @@ class BasicAVTransformerBlock(nn.Module):
             vx = vx + self.attn2(
                 rms_norm(vx, eps=self.norm_eps),
                 context=video.context,
-                mask=video.context_mask,
             )
             del vshift_msa, vscale_msa, vgate_msa
 
@@ -547,7 +544,6 @@ class BasicAVTransformerBlock(nn.Module):
             ax = ax + self.audio_attn2(
                 rms_norm(ax, eps=self.norm_eps),
                 context=audio.context,
-                mask=audio.context_mask,
             )
             del ashift_msa, ascale_msa, agate_msa
 
