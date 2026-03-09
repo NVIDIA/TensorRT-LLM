@@ -250,6 +250,32 @@ class MnnvlMemory:
                         )
                     else:
                         error_msg += " This may be due to kernel version (requires Linux 5.6+)."
+                    # Release resources on failure path to avoid leaks; then re-raise.
+                    if isinstance(exported_fabric_handle, int):
+                        try:
+                            os.close(exported_fabric_handle)
+                        except OSError as e:
+                            logger.warning(
+                                "Failed to close exported shareable handle on pidfd_getfd failure: %s",
+                                e,
+                            )
+                    try:
+                        _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
+                    except Exception as e:
+                        logger.warning(
+                            "cuMemRelease failed during error cleanup (original error will be raised): %s",
+                            e,
+                        )
+                    for _pidfd in pidfds:
+                        try:
+                            os.close(_pidfd)
+                        except OSError:
+                            pass
+                    for _rfd in remote_fds:
+                        try:
+                            os.close(_rfd)
+                        except OSError:
+                            pass
                     raise RuntimeError(error_msg)
                 remote_fds.append(remote_fd)
 
