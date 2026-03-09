@@ -250,6 +250,7 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
 
         result["tool_calls"] = []
         for item in tool_calls:
+            # Bypass pydantic check to WAR `tau2-bench-telecom` ill-format tool_call.
             item = dict(item)
             if "function" in item:
                 item["function"] = dict(item["function"])
