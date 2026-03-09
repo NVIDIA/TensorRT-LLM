@@ -512,9 +512,7 @@ def _classify_regression_type(values):
         std_val = math.sqrt(sum((v - mean_val) ** 2 for v in values) / n_pts)
         if std_val > 0:
             outlier_indices = [
-                i
-                for i, v in enumerate(values)
-                if abs(v - mean_val) / std_val > _OUTLIER_ZSCORE
+                i for i, v in enumerate(values) if abs(v - mean_val) / std_val > _OUTLIER_ZSCORE
             ]
         else:
             outlier_indices = []
@@ -1156,10 +1154,7 @@ def _build_data_table_html(data_dict):
         val = data_dict[k]
         if val is None:
             val = ""
-        rows.append(
-            f"<tr><td>{escape_html(str(k))}</td>"
-            f"<td>{escape_html(str(val))}</td></tr>"
-        )
+        rows.append(f"<tr><td>{escape_html(str(k))}</td><td>{escape_html(str(val))}</td></tr>")
     return f'<table class="kv-table">{"".join(rows)}</table>'
 
 
@@ -1253,8 +1248,7 @@ def generate_pre_merge_html(new_data_list, history_grouped, output_file):
         latest_nd = (
             max(
                 new_data_entries,
-                key=lambda d: _parse_timestamp(
-                    d.get("ts_created") or d.get("@timestamp", 0)),
+                key=lambda d: _parse_timestamp(d.get("ts_created") or d.get("@timestamp", 0)),
             )
             if new_data_entries
             else {}
