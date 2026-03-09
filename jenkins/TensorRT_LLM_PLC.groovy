@@ -211,19 +211,21 @@ def pulseScan(llmRepo, branchName) {
         sh 'unzip -p sbom.zip "*.json" > sbom_toupload.json'
         sh "cat sbom_toupload.json"
         withCredentials([string(credentialsId: 'trtllm_plc_slack_webhook', variable: 'PLC_SLACK_WEBHOOK')]) {
-            def ELASTICSEARCH_URL = "http://nvdataflow.nvidia.com/dataflow2/swdl-tensorrt/posting"
-            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-trtllm-plc"
+            def ELASTICSEARCH_POST_URL = "http://nvdataflow.nvidia.com/dataflow/swdl-tensorrt-infra-plc/posting"
+            def ELASTICSEARCH_QUERY_URL = "https://gpuwa.nvidia.com/elasticsearch"
+            def TRTLLM_ES_INDEX_BASE = "df-swdl-tensorrt-infra-plc"
             def jobPath = env.JOB_NAME.replaceAll("/", "%2F")
             def pipelineUrl = "${env.JENKINS_URL}blue/organizations/jenkins/${jobPath}/detail/${jobPath}/${env.BUILD_NUMBER}/pipeline"
             withEnv([
-                "TRTLLM_ES_URL=${ELASTICSEARCH_URL}",
+                "TRTLLM_ES_POST_URL=${ELASTICSEARCH_POST_URL}",
+                "TRTLLM_ES_QUERY_URL=${ELASTICSEARCH_QUERY_URL}",
                 "TRTLLM_ES_INDEX_BASE=${TRTLLM_ES_INDEX_BASE}",
                 "TRTLLM_PLC_WEBHOOK=${PLC_SLACK_WEBHOOK}"
             ]) {
                 sh """
                     python3 -m venv venv
-                    venv/bin/pip install requests
-                    venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl}
+                    venv/bin/pip install requests elasticsearch==7.13.4
+                    venv/bin/python ./jenkins/scripts/submit_vulnerability_report.py --build-url ${pipelineUrl} --build-number ${env.BUILD_NUMBER} --branch ${params.branchName}
                 """
             }
         }
@@ -270,14 +272,14 @@ pipeline {
             parallel {
                 stage("Source Code OSS Scanning"){
                     stages {
-                        //stage("Generate Lock Files"){
-                            //steps
-                            //{
-                                //script {
-                                    //generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
-                                //}
-                            //}
-                        //}
+                        stage("Generate Lock Files"){
+                            steps
+                            {
+                                script {
+                                    generateLockFiles(env.LLM_REPO, env.BRANCH_NAME)
+                                }
+                            }
+                        }
                         stage("Run Pulse Scanning"){
                             steps
                             {
@@ -288,14 +290,14 @@ pipeline {
                         }
                     }
                 }
-                //stage("SonarQube Code Analysis"){
-                    //steps
-                    //{
-                        //script {
-                            //sonarScan()
-                        //}
-                    //}
-                //}
+                stage("SonarQube Code Analysis"){
+                    steps
+                    {
+                        script {
+                            sonarScan()
+                        }
+                    }
+                }
             }
         }
     } // stages
