@@ -25,6 +25,7 @@ from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeAlias
 
 import numpy as np
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
@@ -160,6 +161,11 @@ GenericSampleState = TypeVar("GenericSampleState", bound=SampleState)
 
 
 class Sampler(ABC, Generic[GenericSampleState]):
+    # Set by PyExecutor when TP sync is active to broadcast new_tokens
+    # from rank 0 after sampling, preventing cross-rank divergence.
+    _tp_sync_new_tokens: bool = False
+    _tp_group = None
+
     def setup_sampler_step(self, scheduled_requests: ScheduledRequests):
         pass
 
@@ -454,12 +460,13 @@ def _group_requests_by_strategy_key(
     # 3) Full recompute for the pre-recorded slots.
     #    Every slot with a None strategy must already be in slots_needing_recompute
     #    (populated by setup_sampler_step when a new request arrives).
-    assert None not in strategies or all(
-        seq_slots_list[i] in recompute_batch_slots for i in range(n) if strategies[i] is None
-    ), (
-        "Found slots with uncached strategies not registered in slots_needing_recompute. "
-        "Ensure setup_sampler_step is called before sample_async for new requests."
-    )
+    #    Auto-fix: after sleep/wakeup, some slots may have None strategy
+    #    without being in slots_needing_recompute.
+    if None in strategies:
+        for i in range(n):
+            if strategies[i] is None and seq_slots_list[i] not in recompute_batch_slots:
+                recompute_batch_slots.add(seq_slots_list[i])
+                store.slots_needing_recompute.add(seq_slots_list[i])
 
     for slot in recompute_batch_slots:
         i = slot_to_idx[slot]
@@ -2396,6 +2403,12 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             seq_slots=seq_slots_host,
             seq_lens=seq_lens_host,
         )
+
+        # Broadcast new_tokens from rank 0 so all TP ranks have
+        # identical tokens. This prevents divergent finish_reasons from
+        # independent CUDA random states during non-greedy sampling.
+        if self._tp_sync_new_tokens:
+            dist.broadcast(new_tokens, src=0, group=self._tp_group)
 
         finish_reasons = self.store.finish_reasons
         seq_slots = seq_slots_host.to(device="cuda", non_blocking=True)

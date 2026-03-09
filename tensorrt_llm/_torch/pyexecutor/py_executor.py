@@ -311,6 +311,11 @@ class PyExecutor:
         self.guided_decoder = guided_decoder
         self.dist = dist
         self.disable_overlap_scheduler = disable_overlap_scheduler
+
+        # Track requests that are locally finished on non-rank-0 workers
+        # but haven't been confirmed as finished by rank 0's schedule yet.
+        # This prevents active_requests divergence across TP ranks when PP=1.
+        self._tp_pending_termination: list = []
         self.virtual_memory_pools = virtual_memory_pools
 
         # enqueue and _fetch_new_requests used data
@@ -465,6 +470,18 @@ class PyExecutor:
         # getter is required.
         self.should_exclude_last_generation_logits = (
             not self.disable_overlap_scheduler and self.dist.pp_size == 1)
+
+        # Whether this executor should synchronize active_requests
+        # across TP ranks. True when PP=1, TP>1, and not using attention DP.
+        self._tp_sync_active = (
+            self.dist.pp_size == 1 and self.dist.tp_size > 1
+            and not self.enable_attention_dp)
+
+        # Tell the sampler to broadcast new_tokens from rank 0 after
+        # sampling, so all TP ranks compute identical finish_reasons.
+        if self._tp_sync_active and hasattr(self.dist, 'mapping'):
+            self.sampler._tp_sync_new_tokens = True
+            self.sampler._tp_group = self.dist.mapping.tp_group_pg
 
         # Request processing state (managed by executor)
         self.canceled_req_ids: List[int] = []
@@ -1599,7 +1616,31 @@ class PyExecutor:
 
     def _prepare_and_schedule_batch(self):
         new_requests = self._fetch_and_activate_new_requests()
-        if self.should_stop_processing:
+
+        # When TP schedule sync is active, rank 0 broadcasts the stop
+        # decision so all ranks exit the loop together. Without this, rank 0
+        # may see empty active_requests (and exit) while non-rank-0 workers
+        # still have deferred-termination requests → they call tp_broadcast
+        # but rank 0 is gone → NCCL hang.
+        if self._tp_sync_active:
+            if self.dist.rank == 0:
+                stop = self.should_stop_processing
+            else:
+                stop = None
+            stop = self.dist.tp_broadcast(stop, root=0)
+            if stop:
+                # Non-rank-0: flush any pending terminations before exiting
+                if self.dist.rank != 0 and self._tp_pending_termination:
+                    terminate_ids = {r.py_request_id for r in self._tp_pending_termination}
+                    self.active_requests[:] = [
+                        r for r in self.active_requests
+                        if r.py_request_id not in terminate_ids
+                    ]
+                    for req in self._tp_pending_termination:
+                        self._terminate_request(req)
+                    self._tp_pending_termination = []
+                return None, None
+        elif self.should_stop_processing:
             return None, None
 
         if self.kv_cache_transceiver:
@@ -1657,8 +1698,67 @@ class PyExecutor:
             # that speculation is about to happen.
             self._prepare_draft_requests()
 
-        scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule(
-        )
+        # Broadcast schedule from rank 0 to all TP ranks when PP=1.
+        # Without this, each rank runs its own scheduler independently, which
+        # causes schedule divergence across nodes (different ctx/gen splits)
+        # leading to NCCL deadlock. The PP path already does this in
+        # _pp_schedule_and_propagate via tp_broadcast.
+        if self._tp_sync_active:
+            # Only rank 0 runs the scheduler; non-rank-0 use the broadcast.
+            if self.dist.rank == 0:
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule()
+                serializable_schedule = SerializableSchedulerOutput.from_scheduler_result(
+                    scheduled_batch, fitting_disagg_gen_init_requests,
+                    num_fitting_reqs)
+            else:
+                serializable_schedule = None
+
+            with nvtx_range("tp_broadcast_schedule"):
+                serializable_schedule = self.dist.tp_broadcast(
+                    serializable_schedule, root=0)
+
+            if self.dist.rank != 0:
+                # Flush pending termination: terminate requests that rank 0's
+                # schedule no longer references (rank 0 has also finished them).
+                scheduled_ids = set(
+                    serializable_schedule.context_requests
+                    + serializable_schedule.generation_requests
+                    + serializable_schedule.paused_requests
+                    + serializable_schedule.fitting_disagg_gen_init_requests)
+                still_pending = []
+                to_terminate = []
+                for req in self._tp_pending_termination:
+                    if req.py_request_id not in scheduled_ids:
+                        to_terminate.append(req)
+                    else:
+                        # Rank 0 still needs this request — keep it alive
+                        still_pending.append(req)
+                if to_terminate:
+                    # Batch-remove terminated requests from active_requests
+                    terminate_ids = {r.py_request_id for r in to_terminate}
+                    self.active_requests[:] = [
+                        r for r in self.active_requests
+                        if r.py_request_id not in terminate_ids
+                    ]
+                    for req in to_terminate:
+                        self._terminate_request(req)
+                    logger.debug(
+                        f"TP sync: flushed {len(to_terminate)} pending terminations, "
+                        f"rank={self.dist.rank}, still_pending={len(still_pending)}, "
+                        f"iter={self.iter_counter}")
+                self._tp_pending_termination = still_pending
+
+                # Now reconstruct the schedule from rank 0's broadcast
+                scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = serializable_schedule.to_scheduler_result(
+                    self.active_requests)
+
+            logger.debug(
+                f"TP broadcast schedule: rank={self.dist.rank}, "
+                f"ctx={len(scheduled_batch.context_requests)}, "
+                f"gen={len(scheduled_batch.generation_requests)}, "
+                f"active={len(self.active_requests)}, iter={self.iter_counter}")
+        else:
+            scheduled_batch, fitting_disagg_gen_init_requests, num_fitting_reqs = self._schedule()
 
         if self.drafter is not None and not self.use_spec_decode:
             for request in scheduled_batch.all_requests():
@@ -2324,7 +2424,10 @@ class PyExecutor:
                 all_ranks_num_active_tokens.append(num_active_tokens)
             total_num_active_requests = sum(all_ranks_num_active_requests)
         else:
-            total_num_active_requests = len(activate_requests)
+            # Exclude deferred-termination requests from active count
+            # so non-rank-0 workers compute the same capacity as rank 0.
+            num_pending = len(self._tp_pending_termination) if self._tp_sync_active else 0
+            total_num_active_requests = len(activate_requests) - num_pending
             all_ranks_num_active_requests = None
 
         # 2. Fetch and enqueue to waiting queue
@@ -3195,13 +3298,35 @@ class PyExecutor:
             else:
                 new_active_requests.append(request)
 
-        self.active_requests.clear()
-        self.active_requests.extend(new_active_requests)
-        # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
-        self._enqueue_responses(new_responses)
-        for request in requests_to_terminate:
-            self._terminate_request(request)
-        return requests_to_terminate
+        # On non-rank-0 workers with TP schedule sync, defer request
+        # termination until rank 0's schedule confirms the request is done.
+        # This prevents active_requests divergence across TP ranks.
+        if self._tp_sync_active and self.dist.rank != 0:
+            # Keep finished requests in active_requests (don't remove them).
+            # Store them in pending_termination for later cleanup.
+            pending_ids = {req.py_request_id for req in self._tp_pending_termination}
+            for req in requests_to_terminate:
+                if req.py_request_id not in pending_ids:
+                    self._tp_pending_termination.append(req)
+            # Re-add terminated requests back to active list
+            self.active_requests.clear()
+            self.active_requests.extend(new_active_requests)
+            self.active_requests.extend(requests_to_terminate)
+            self._enqueue_responses(new_responses)
+            if requests_to_terminate:
+                logger.debug(
+                    f"TP sync: deferred {len(requests_to_terminate)} terminations, "
+                    f"rank={self.dist.rank}, total_pending={len(self._tp_pending_termination)}, "
+                    f"iter={self.iter_counter}")
+            return []  # No requests actually terminated yet
+        else:
+            self.active_requests.clear()
+            self.active_requests.extend(new_active_requests)
+            # Request should be terminated after enqueueing response to ensure we can enqueue response successfully.
+            self._enqueue_responses(new_responses)
+            for request in requests_to_terminate:
+                self._terminate_request(request)
+            return requests_to_terminate
 
     def _await_any_response(self,
                             timeout: Optional[float] = None

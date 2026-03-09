@@ -436,7 +436,8 @@ def safe_gather(comm, obj, root=0, chunk_size: int = 4 * 1024 * 1024):
                 out.append(None)  # None
                 continue
             start = int(displs[i])
-            blob = recvbuf[start:start + sz].tobytes()
+            _slice = recvbuf[start:start + sz]
+            blob = _slice.cpu().numpy().tobytes() if hasattr(_slice, 'numpy') else _slice.tobytes()
             try:
                 out.append(pickle.loads(blob))  # nosec B301
             except Exception as e:
