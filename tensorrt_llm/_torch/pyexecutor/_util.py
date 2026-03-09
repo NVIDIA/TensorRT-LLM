@@ -619,11 +619,20 @@ class KvCacheCreator:
             draft_kv_cache_manager_cls = KVCacheManagerV2
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        # Draft KV cache should never use block reuse — it is ephemeral and
+        # does not participate in the radix tree.  Passing enable_block_reuse
+        # to the draft V2 manager causes CUDA errors during event recording
+        # when the internal commit/stop_committing machinery fires on close().
+        draft_kv_cache_config = self._kv_cache_config.model_copy(
+            update={
+                'enable_block_reuse': False,
+                'enable_partial_reuse': False
+            })
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
-            kv_cache_config=self._kv_cache_config,
+            kv_cache_config=draft_kv_cache_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,

@@ -1948,6 +1948,8 @@ class KVCacheManagerV2(BaseResourceManager):
             else:
                 req.context_current_position = kv_cache.num_committed_tokens
 
+            if kv_cache.is_active:
+                return True
             if not kv_cache.resume(self._stream.cuda_stream):
                 return False
 
@@ -1998,6 +2000,13 @@ class KVCacheManagerV2(BaseResourceManager):
 
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
+        if self.is_draft:
+            # Draft V2 manager: mirror the main manager by creating/resizing
+            # KV caches for scheduled requests (the main V2 scheduler does not
+            # know about the draft manager).
+            self._prepare_draft_resources(scheduled_batch)
+            return
+
         # KV allocation is handled by KVCacheV2Scheduler via try_allocate_*.
         # Only run post-allocation work here.
 
@@ -2017,6 +2026,39 @@ class KVCacheManagerV2(BaseResourceManager):
                     req.context_chunk_size = min(
                         chunk_size,
                         req.prompt_len - req.context_current_position)
+
+    def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
+        """Create/resize KV caches in the draft V2 manager for scheduled requests.
+
+        The main V2 scheduler only manages the primary KV cache manager.
+        The draft manager must mirror context/generation allocations so that
+        its IndexMapper contains the correct request IDs for
+        copy_batch_block_offsets().
+        """
+        with request_context(True, scheduled_batch):
+            for req in scheduled_batch.context_requests:
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    # New request — create, resume, and resize.
+                    kv_cache = self._create_kv_cache(req.py_request_id,
+                                                     req.lora_task_id, None)
+                    kv_cache.stop_committing()
+                    success = kv_cache.resume(self._stream.cuda_stream)
+                    if not success:
+                        logger.warning(
+                            f"Draft KV cache resume failed for request "
+                            f"{req.py_request_id}")
+                        continue
+                capacity = (req.context_current_position +
+                            req.context_chunk_size + self.num_extra_kv_tokens)
+                kv_cache.resize(capacity)
+
+            for req in scheduled_batch.generation_requests:
+                kv_cache = self.kv_cache_map.get(req.py_request_id)
+                if kv_cache is None:
+                    continue
+                new_cap = (kv_cache.capacity + 1 + get_draft_token_length(req))
+                kv_cache.resize(new_cap)
 
     def get_kv_cache_stats(self):
 
@@ -2158,8 +2200,11 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        kv_cache = self.kv_cache_map.pop(request.py_request_id)
-        if (self.enable_block_reuse and not request.is_dummy_request
+        kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
+        if kv_cache is None:
+            return
+        if (self.enable_block_reuse and not self.is_draft
+                and not request.is_dummy_request
                 and request.context_current_position
                 > kv_cache.num_committed_tokens):
             # When block reuse is enabled, before freeing the resources, we need to commit the tokens to prepare for reuse if it is not committed yet.
@@ -2384,13 +2429,18 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
-            if self.enable_block_reuse and not req.is_dummy_request:
+            if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
                     kv_cache.commit(
                         req.get_tokens(DEFAULT_BEAM_INDEX)
                         [kv_cache.num_committed_tokens:req.
                          context_current_position])
-                kv_cache.stop_committing()
+                # Only stop committing after the final context chunk;
+                # intermediate chunks still need to commit later.
+                # By this point _update_request_states has already run,
+                # so completed context requests are no longer CONTEXT_INIT.
+                if req.state != LlmRequestState.CONTEXT_INIT:
+                    kv_cache.stop_committing()
             else:
                 success = kv_cache.resize(None, req.context_current_position)
                 if not success:
