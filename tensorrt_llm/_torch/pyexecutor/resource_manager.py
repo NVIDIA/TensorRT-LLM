@@ -2008,24 +2008,9 @@ class KVCacheManagerV2(BaseResourceManager):
             return
 
         # KV allocation is handled by KVCacheV2Scheduler via try_allocate_*.
-        # Only run post-allocation work here.
-
-        # Adjust chunk sizes for block reuse boundaries (must happen after
-        # allocation, before forward pass).
-        if self.enable_block_reuse:
-            for req in scheduled_batch.context_requests:
-                if req.is_first_context_chunk:
-                    chunk_size = req.context_chunk_size
-                    if req.context_current_position + req.context_chunk_size < req.prompt_len:
-                        floored_end_position = (
-                            req.context_current_position +
-                            req.context_chunk_size
-                        ) // self.tokens_per_block * self.tokens_per_block
-                        chunk_size = floored_end_position - req.context_current_position
-
-                    req.context_chunk_size = min(
-                        chunk_size,
-                        req.prompt_len - req.context_current_position)
+        # Block reuse boundary alignment is handled inside the scheduler
+        # (_schedule_context_chunked) before resize, so allocation, token
+        # budget, and forward pass all use the same chunk_size.
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.

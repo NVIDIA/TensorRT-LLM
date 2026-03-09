@@ -1676,3 +1676,130 @@ class TestEdgeCases:
         assert ids(out.fitting_disagg_gen_init_requests) == [1]
         assert ids(out.generation_requests) == [2]
         assert ids(out.context_requests) == [4]
+
+
+# ===========================================================================
+# Block Reuse Boundary Alignment (Chunked + Partial Reuse)
+# ===========================================================================
+
+
+class TestBlockReuseBoundaryAlignment:
+    """Verify that chunked context aligns chunk end to block boundary when
+    context_current_position is not block-aligned (partial reuse scenario)."""
+
+    def test_partial_reuse_aligns_chunk_end(self):
+        """Partial reuse sets context_current_position=50 (not block-aligned).
+        tokens_per_block=64, chunk_unit_size=64, max_num_tokens=128.
+        remaining after reuse = 950 (prompt=1000, reused=50).
+        chunk_size = min(128, 950) = 128 → unit round: 128//64*64 = 128.
+        chunk < remaining (128 < 950) → enters alignment block.
+        end_pos = 50 + 128 = 178, 178 % 64 != 0.
+        floored = 178 // 64 * 64 = 128 → chunk_size = 128 - 50 = 78.
+        """
+
+        def prepare_with_partial_reuse(req):
+            req.context_current_position = 50
+            req.context_remaining_length = 950  # 1000 - 50
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=64,
+                                    prepare_context_fn=prepare_with_partial_reuse)
+        sched = make_scheduler(mgr, max_num_tokens=128,
+                               ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000,
+                               prompt_len=1000)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        # chunk_size should be 78 (aligned to block boundary at pos 128)
+        assert req.context_chunk_size == 78
+
+    def test_block_aligned_position_no_change(self):
+        """When context_current_position is already block-aligned (full block
+        reuse), chunk_size should not be further adjusted."""
+
+        def prepare_with_full_reuse(req):
+            req.context_current_position = 128  # 2 * 64, block-aligned
+            req.context_remaining_length = 872  # 1000 - 128
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=64,
+                                    prepare_context_fn=prepare_with_full_reuse)
+        sched = make_scheduler(mgr, max_num_tokens=300,
+                               ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000,
+                               prompt_len=1000)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        # 300 // 64 * 64 = 256; end = 128 + 256 = 384, already aligned
+        assert req.context_chunk_size == 256
+
+    def test_partial_reuse_last_chunk_no_alignment(self):
+        """Last chunk should NOT be rounded — all remaining tokens must be
+        processed regardless of block boundary."""
+
+        def prepare_with_partial_reuse(req):
+            req.context_current_position = 50
+            req.context_remaining_length = 80  # 130 - 50
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=64,
+                                    prepare_context_fn=prepare_with_partial_reuse)
+        sched = make_scheduler(mgr, max_num_tokens=500,
+                               ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=130, prompt_len=130)
+        out = sched.schedule_request([req], set())
+        assert ids(out.context_requests) == [0]
+        # 80 <= 500 budget, 80 == remaining → last chunk, no rounding
+        assert req.context_chunk_size == 80
+
+    def test_partial_reuse_resize_uses_aligned_size(self):
+        """Verify resize_context is called with the aligned chunk_size, not
+        the pre-alignment value."""
+        resize_calls = []
+
+        def prepare_with_partial_reuse(req):
+            req.context_current_position = 50
+            req.context_remaining_length = 950
+            return True
+
+        def track_resize(req, n):
+            resize_calls.append(n)
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=64,
+                                    prepare_context_fn=prepare_with_partial_reuse,
+                                    resize_context_fn=track_resize)
+        sched = make_scheduler(mgr, max_num_tokens=128,
+                               ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000,
+                               prompt_len=1000)
+        sched.schedule_request([req], set())
+        # resize should receive 78 (aligned), not 128 (pre-alignment)
+        assert resize_calls == [78]
+
+    def test_partial_reuse_budget_accounting_uses_aligned_size(self):
+        """Token budget should account for the aligned chunk_size.
+        After aligned chunk of 78, remaining budget should allow a gen request.
+        pos=50, budget=80, remaining=950 → chunk=64 (unit round of 80).
+        end=50+64=114, 114%64!=0 → floored=64, chunk=64-50=14.
+        14 + 1(gen) = 15 <= 80: gen fits.
+        """
+
+        def prepare_with_partial_reuse(req):
+            if req.request_id == 0:
+                req.context_current_position = 50
+                req.context_remaining_length = 950
+            return True
+
+        mgr = make_kv_cache_manager(tokens_per_block=64,
+                                    prepare_context_fn=prepare_with_partial_reuse)
+        sched = make_scheduler(mgr, max_num_tokens=80,
+                               ctx_chunk_config=(None, 64))
+        ctx = make_ctx_request(0, context_remaining_length=1000,
+                               prompt_len=1000)
+        gen = make_gen_request(1)  # 1 token
+        out = sched.schedule_request([ctx, gen], set())
+        assert ids(out.context_requests) == [0]
+        assert ctx.context_chunk_size == 14
+        # 14 + 1 = 15 <= 80: gen fits
+        assert ids(out.generation_requests) == [1]

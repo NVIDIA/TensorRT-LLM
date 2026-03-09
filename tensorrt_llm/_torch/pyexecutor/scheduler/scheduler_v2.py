@@ -325,6 +325,15 @@ class KVCacheV2Scheduler(RequestScheduler):
         # constructor), this also guarantees block alignment.
         if chunk_size < context_remaining:
             chunk_size = (chunk_size // self.chunk_unit_size) * self.chunk_unit_size
+            # When partial reuse is enabled, context_current_position may not
+            # be block-aligned. Floor the absolute end position to a block
+            # boundary so that committed blocks stay reusable. This must
+            # happen before resize_context() so allocation, token budget, and
+            # forward pass all use the same chunk_size.
+            end_pos = req.context_current_position + chunk_size
+            if end_pos % self.tokens_per_block != 0:
+                end_pos = (end_pos // self.tokens_per_block) * self.tokens_per_block
+                chunk_size = end_pos - req.context_current_position
 
         if chunk_size <= 0:
             # TODO: consider suspending first-chunk KVCache to release
