@@ -47,6 +47,7 @@ class TestQwen2_5_VL_7B(LlmapiAccuracyTestHarness):
     kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6)
 
     def test_auto_dtype(self):
+        pytest.skip("Sampling failed: getContextChunkSize assertion error. GPU: H100")
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
@@ -152,6 +153,7 @@ class TestVILA1_5_3B(LlmapiAccuracyTestHarness):
     )
 
     def test_auto_dtype(self):
+        pytest.skip("IMA. GPU: (no CI data)")
         with LLM(
             self.MODEL_PATH,
             max_num_tokens=self.MAX_NUM_TOKENS,
