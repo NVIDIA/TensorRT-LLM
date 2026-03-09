@@ -201,12 +201,11 @@ def download_precompiled(workspace: str, version: str) -> str:
         return wheel_path
 
 
-def get_latest_main_wheel(workspace: str, from_main_value: str) -> str:
-    """Find and return the tar.gz URL from the latest compatible GenPostMergeBuilds
-    build on Artifactory. Requires NVIDIA network/VPN access.
+def resolve_precompiled_from_main(from_main_value: str) -> str:
+    """Resolve the Artifactory tar.gz URL for a GenPostMergeBuilds build matching
+    a commit on main. Requires NVIDIA network/VPN access.
 
     Args:
-        workspace: Temporary directory for intermediate files.
         from_main_value: Either "1" (auto-detect via merge-base) or a commit SHA
             (short or full) to match directly.
 
@@ -468,8 +467,8 @@ if use_precompiled:
     with TemporaryDirectory() as tempdir:
         if not precompiled_location:
             if precompiled_from_main and precompiled_from_main != "0":
-                precompiled_location = get_latest_main_wheel(
-                    tempdir, precompiled_from_main)
+                precompiled_location = resolve_precompiled_from_main(
+                    precompiled_from_main)
             else:
                 version = precompiled if precompiled != "1" else get_version()
                 precompiled_location = download_precompiled(tempdir, version)
