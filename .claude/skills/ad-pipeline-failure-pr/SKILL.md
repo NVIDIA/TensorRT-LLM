@@ -5,13 +5,13 @@ description: Analyze the latest AutoDeploy pipeline or a user-specified pipeline
 
 # Pipeline Failure PR
 
-**Input:** latest AutoDeploy `model-coverage` GitLab pipeline, or a specific upstream/downstream pipeline ID / pipeline URL. **Auth requirement:** the user must export a GitLab token in `GITLAN_TOKEN` before this skill can query pipelines, jobs, or traces. **Output:** first ask the user which output format is preferred. Default to reporting in chat. Alternative outputs are a Markdown report (`md`) and a per-failure CSV (`csv`). The skill still produces a bucketed failure report plus at most one PR per actionable root-cause bucket, and when a PR is not justified but the bucket is still worth tracking, create one issue for that bucket.
+**Input:** latest AutoDeploy `model-coverage` GitLab pipeline, or a specific upstream/downstream pipeline ID / pipeline URL. **Auth requirement:** the user must export a GitLab token in `GITLAB_TOKEN` before this skill can query pipelines, jobs, or traces. **Output:** first ask the user which output format is preferred. Default to reporting in chat. Alternative outputs are a Markdown report (`md`) and a per-failure CSV (`csv`). The skill still produces a bucketed failure report plus at most one PR per actionable root-cause bucket, and when a PR is not justified but the bucket is still worth tracking, create one issue for that bucket.
 
 ## Core Rule
 
 This skill must be standalone. Resolve pipelines, failed jobs, and raw logs directly from GitLab APIs and job traces. Do **not** depend on `autodeploy-dashboard` code, scripts, CSVs, or its legacy categorization logic. This skill owns the bucketing rules, skip rules, repo ownership decision, and one-PR-per-bucket behavior.
 
-Before any GitLab API call, require `GITLAN_TOKEN` to be set in the environment. If it is missing, stop immediately and tell the user: `Set GITLAN_TOKEN to a GitLab personal access token and rerun this skill.`
+Before any GitLab API call, require `GITLAB_TOKEN` to be set in the environment. If it is missing, stop immediately and tell the user: `Set GITLAB_TOKEN to a GitLab personal access token and rerun this skill.`
 
 Before doing the main analysis, ask the user which output is preferred:
 - `chat` (default)
@@ -30,7 +30,7 @@ If the user does not specify, default to `chat`.
    - a downstream triggered pipeline in `dl/jet/ci`
 5. If the starting pipeline is upstream, follow the failed bridge chain until you reach the first downstream pipeline with terminal `model-coverage` jobs.
 6. Otherwise resolve the latest upstream AutoDeploy pipeline that ran `model-coverage`, then follow the same bridge chain to the terminal pipeline.
-7. If `GITLAN_TOKEN` is missing, stop immediately and tell the user exactly how to fix it: `Set GITLAN_TOKEN to a GitLab personal access token and rerun this skill.`
+7. If `GITLAB_TOKEN` is missing, stop immediately and tell the user exactly how to fix it: `Set GITLAB_TOKEN to a GitLab personal access token and rerun this skill.`
 
 ## Pipeline Resolution Rules
 
@@ -45,7 +45,7 @@ Use this resolution order:
 
 Do not analyze only the bridge failure if a deeper downstream pipeline contains the real job traces.
 
-All GitLab API and trace-fetching steps in this skill must authenticate with the token from `GITLAN_TOKEN`.
+All GitLab API and trace-fetching steps in this skill must authenticate with the token from `GITLAB_TOKEN`.
 
 ## Phase 1 — Gather Failure Evidence
 
