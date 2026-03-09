@@ -128,7 +128,6 @@ class KVCacheV2Scheduler(RequestScheduler):
         # Reset PEFT accounting for this iteration
         self._claimed_peft_pages = 0
         self._seen_peft_task_ids.clear()
-
         # TODO: block reuse skip optimization (_beneficial_to_skip).
         # V1 skips first-chunk ctx requests whose next block overlaps with
         # an executing chunked ctx's current chunk. Waiting one iteration
@@ -228,7 +227,8 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
 
                     assert (
-                        self.max_context_length is None or context_tokens <= self.max_context_length
+                        self.max_context_length is None
+                        or context_tokens <= self.max_context_length
                     ), (
                         f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
                     )
@@ -266,12 +266,9 @@ class KVCacheV2Scheduler(RequestScheduler):
                 success = self.kv_cache_manager.try_allocate_generation(req)
 
                 if not success:
-                    evict_result = self._try_evict_for_gen(
+                    req_it_end, success = self._try_evict_for_gen(
                         req, requests_list, req_it, req_it_end, evicted
                     )
-                    if evict_result is not None:
-                        success = True
-                        req_it_end = evict_result
 
                 if success:
                     self._commit_peft(req, peft_pages)
@@ -279,16 +276,21 @@ class KVCacheV2Scheduler(RequestScheduler):
                     batch_num_tokens += req_tokens
                     num_scheduled += 1
                     scheduled = True
+                else:
+                    # Self-eviction: suspend this gen request to free its
+                    # GPU pages so other requests can resume().
+                    self.kv_cache_manager.suspend_request(req)
+                    evicted.append(req)
 
             if scheduled:
                 req_it += 1
-            elif req_state_value != self._context_init_state_value:
-                # Gen/encoder failure after eviction: resources exhausted.
-                break
-            else:
-                # Context failure: skip and try next request — a smaller
-                # ctx or gen behind this one may still fit.
+            elif req_state_value == self._context_init_state_value:
+                # Context failure: skip and try next request — a
+                # smaller ctx behind this one may still fit.
                 req_it += 1
+            else:
+                # Gen/encoder failure (including self-eviction): stop.
+                break
 
         return scheduled_ctx, scheduled_gen, evicted, disagg_candidates, has_chunking
 
@@ -393,7 +395,7 @@ class KVCacheV2Scheduler(RequestScheduler):
     def _try_evict_for_gen(self, req, requests_list, req_it, req_it_end, evicted):
         """Evict started requests from active_requests tail to make room.
 
-        Matches V1 MaxUtilizationScheduler: search backwards from req_it_end
+        Search backwards from req_it_end
         for "started" requests (gen in progress or non-first ctx chunk),
         suspend them to free pages, then retry allocation.
 
@@ -401,7 +403,9 @@ class KVCacheV2Scheduler(RequestScheduler):
         main loop), so they are never in scheduled_ctx/scheduled_gen and
         no token budget reclaim is needed.
 
-        Returns new req_it_end on success, None on failure.
+        Returns (new_req_it_end, success) tuple. new_req_it_end is always
+        updated to reflect evicted victims (even on failure) so the caller
+        can skip already-evicted requests.
         """
         while req_it_end > req_it:
             victim_idx = None
@@ -411,7 +415,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                     break
 
             if victim_idx is None:
-                return None
+                break
 
             victim = requests_list[victim_idx]
             # Victim is at index >= req_it (not yet processed by main
@@ -419,16 +423,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             # No token budget reclaim is needed.
             self.kv_cache_manager.suspend_request(victim)
             evicted.append(victim)
-            logger.debug(
-                f"KVCacheV2Scheduler: evicting request {victim.request_id} "
-                f"to free pages for request {req.request_id}"
-            )
             req_it_end = victim_idx
 
             if self.kv_cache_manager.try_allocate_generation(req):
-                return req_it_end
+                return req_it_end, True
 
-        return None
+        return req_it_end, False
 
     # ---- Draft tokens ----
 

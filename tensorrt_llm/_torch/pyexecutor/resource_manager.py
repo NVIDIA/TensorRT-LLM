@@ -1955,9 +1955,15 @@ class KVCacheManagerV2(BaseResourceManager):
 
             return True
         else:
-            # Subsequent chunk: verify cache exists and is active
+            # Subsequent chunk: verify cache exists and is active.
+            # If suspended (e.g., after self-eviction + pause() in the
+            # scheduler), try to resume before giving up.
             kv_cache = self.kv_cache_map.get(req.py_request_id)
-            return kv_cache is not None and kv_cache.is_active
+            if kv_cache is None:
+                return False
+            if kv_cache.is_active:
+                return True
+            return kv_cache.resume(self._stream.cuda_stream)
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2437,6 +2443,13 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            # In the overlap scheduler, the scheduler for iteration N+1
+            # may suspend a gen request's KV cache (via self-eviction or
+            # victim eviction) while iteration N's update_resources still
+            # needs to process it. Skip suspended caches — the request
+            # will be re-prefilled after pause().
+            if not kv_cache.is_active:
+                continue
             new_capacity = None if req.state in (
                 LlmRequestState.GENERATION_COMPLETE,
                 LlmRequestState.CONTEXT_INIT

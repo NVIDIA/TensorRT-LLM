@@ -172,27 +172,29 @@ class TestKVCacheV2Llama:
             outputs = _run_generate(llm, MEDIUM_PROMPTS, sampling_params)
             _assert_all_completed(outputs, expected_count=5)
 
-    # IT5: Eviction under tight memory (with CUDA graph warmup)
-    # Uses max_batch_size=4 so warmup only needs ~4 blocks,
-    # but 10 concurrent requests with max_tokens=64 trigger eviction.
+    # IT5: Eviction under tight memory (no CUDA graph to avoid warmup
+    # needing more blocks than max_tokens allows).
+    # max_tokens=512 with 10 concurrent requests × ~84 tokens forces eviction.
     @pytest.mark.timeout(300)
     def test_eviction(self):
         kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
-                                  free_gpu_memory_fraction=0.08)
+                                  max_tokens=512)
         sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_config,
                  scheduler_config=_V2_SCHEDULER_CONFIG,
+                 cuda_graph_config=None,
                  max_batch_size=4,
                  max_num_tokens=256) as llm:
             outputs = _run_generate(llm, SHORT_PROMPTS, sampling_params)
             _assert_all_completed(outputs, expected_count=10)
 
     # IT6: Extreme eviction pressure (no CUDA graph — tests pure eviction)
+    # max_tokens=256 with 20 prompts × ~148 tokens each forces heavy eviction.
     @pytest.mark.timeout(300)
     def test_extreme_eviction(self):
         kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
-                                  free_gpu_memory_fraction=0.03)
+                                  max_tokens=256)
         sampling_params = SamplingParams(max_tokens=128, temperature=0.0)
         prompts = SHORT_PROMPTS + SHORT_PROMPTS  # 20 prompts
         with LLM(self.MODEL_PATH,
@@ -254,15 +256,18 @@ class TestKVCacheV2Llama:
                                     sampling_params)
             _assert_all_completed(outputs, expected_count=5)
 
-    # IT15: Chunked prefill with eviction (with CUDA graph warmup)
+    # IT15: Chunked prefill with eviction (no CUDA graph to avoid warmup
+    # needing more blocks than max_tokens allows).
+    # max_tokens=384 with 5 medium prompts (~100 tokens) + chunked prefill.
     @pytest.mark.timeout(300)
     def test_chunked_prefill_with_eviction(self):
         kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
-                                  free_gpu_memory_fraction=0.08)
+                                  max_tokens=384)
         sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_config,
                  scheduler_config=_V2_SCHEDULER_CONFIG,
+                 cuda_graph_config=None,
                  max_batch_size=4,
                  enable_chunked_prefill=True,
                  max_num_tokens=128) as llm:

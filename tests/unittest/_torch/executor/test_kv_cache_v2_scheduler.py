@@ -441,7 +441,7 @@ class TestKVCacheFailuresGen:
         mgr.suspend_request.assert_called_once_with(victim)
 
     def test_gen_alloc_fails_evict_insufficient(self):
-        """gen fails, evict victim, retry still fails, no more victims."""
+        """gen fails, evict victim, retry still fails → self-evict."""
         call_count = [0]
 
         def alloc_fn(req):
@@ -454,7 +454,8 @@ class TestKVCacheFailuresGen:
         reqs = [make_gen_request(0), make_gen_request(1), victim]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [0]
-        assert ids(out.paused_requests) == [99]
+        # gen99 evicted as victim for gen1; gen1 self-evicts after
+        assert set(ids(out.paused_requests)) == {1, 99}
 
     def test_multiple_evictions_needed(self):
         """gen fails, 2 victims needed to free enough space."""
@@ -653,7 +654,9 @@ class TestEviction:
         reqs = [make_gen_request(0), victim]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        assert len(out.paused_requests) == 0
+        # gen0 self-evicts; break stops loop before ctx99
+        assert ids(out.paused_requests) == [0]
+        assert len(out.context_requests) == 0
 
     def test_evicted_in_paused_requests(self):
         call_count = [0]
@@ -684,7 +687,7 @@ class TestEviction:
         mgr.suspend_request.assert_called_once_with(victim)
 
     def test_unknown_state_not_evictable(self):
-        """UNKNOWN state at tail is not evictable."""
+        """UNKNOWN state at tail is not evictable; gen0 self-evicts."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
@@ -693,7 +696,8 @@ class TestEviction:
         reqs = [make_gen_request(0), tail]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        assert len(out.paused_requests) == 0
+        # gen0 self-evicts; UNKNOWN-state tail is neither evicted nor scheduled
+        assert ids(out.paused_requests) == [0]
 
     def test_multiple_evictions_order(self):
         """victim2 evicted first (tail), retry fail, victim1 evicted, retry success."""
@@ -735,32 +739,34 @@ class TestEviction:
         assert ids(out.generation_requests) == [0]
         assert ids(out.paused_requests) == [5]
 
-    def test_no_self_eviction(self):
-        """Victim search range is (req_it, req_it_end), no self-eviction."""
+    def test_self_eviction_on_alloc_fail(self):
+        """Gen request self-evicts when alloc fails and no victims exist."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
         sched = make_scheduler(mgr, max_num_tokens=100)
-        # Only one gen req — it's both the failing req and the only candidate
+        # Only one gen req — alloc fails, no victims → self-evicts
         reqs = [make_gen_request(0)]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        assert len(out.paused_requests) == 0
+        assert ids(out.paused_requests) == [0]
 
-    def test_no_started_requests_in_range(self):
-        """All unprocessed are first-chunk ctx → none evictable."""
+    def test_self_eviction_no_started_in_range(self):
+        """Gen self-evicts when all behind it are first-chunk ctx (not evictable)."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
-        sched = make_scheduler(mgr, max_num_tokens=100)
+        sched = make_scheduler(mgr, max_num_tokens=200)
         reqs = [
             make_gen_request(0),
-            make_ctx_request(1, 100, is_first_context_chunk=True),
-            make_ctx_request(2, 100, is_first_context_chunk=True),
+            make_ctx_request(1, 50, is_first_context_chunk=True),
+            make_ctx_request(2, 50, is_first_context_chunk=True),
         ]
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
-        assert len(out.paused_requests) == 0
+        # gen0 self-evicts; break stops loop before ctx1, ctx2
+        assert ids(out.paused_requests) == [0]
+        assert len(out.context_requests) == 0
 
 
 # ===========================================================================
@@ -1499,8 +1505,8 @@ class TestMixedOrdering:
         assert len(out.context_requests) == 0
         assert ids(out.generation_requests) == [1]
 
-    def test_gen_fail_ctx_after_not_tried(self):
-        """Gen fails → break, ctx after is NOT tried."""
+    def test_gen_fail_self_evicts_then_breaks(self):
+        """Gen fails → self-evicts → break. Ctx after is NOT tried."""
         mgr = make_kv_cache_manager(
             try_allocate_generation_fn=lambda req: False,
         )
@@ -1509,6 +1515,7 @@ class TestMixedOrdering:
         out = sched.schedule_request(reqs, set())
         assert len(out.generation_requests) == 0
         assert len(out.context_requests) == 0
+        assert ids(out.paused_requests) == [0]
 
     def test_budget_builds_across_types(self):
         mgr = make_kv_cache_manager()
@@ -1553,6 +1560,28 @@ class TestMixedOrdering:
         reqs = [make_ctx_request(0, 50), make_gen_request(1)]
         out = sched.schedule_request(reqs, set())
         assert ids(out.generation_requests) == [1]
+
+    def test_multiple_gen_after_gen_fail(self):
+        """Gen failure: req0 fails, evicts tail victims, then self-evicts.
+
+        When req0 can't allocate, eviction evicts req2 and req1 (both
+        started gen requests found backwards from tail). Still fails,
+        so req0 self-evicts. All 3 paused.
+        """
+        def selective_gen_alloc(req):
+            # req0 always fails, req1 and req2 succeed
+            return req.request_id != 0
+
+        mgr = make_kv_cache_manager(
+            try_allocate_generation_fn=selective_gen_alloc,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=1000)
+        reqs = [make_gen_request(0), make_gen_request(1), make_gen_request(2)]
+        out = sched.schedule_request(reqs, set())
+        # req0 fails alloc → evicts req2 (tail), then req1 → still fails
+        # → req0 self-evicts. All 3 are paused.
+        assert len(out.generation_requests) == 0
+        assert set(ids(out.paused_requests)) == {0, 1, 2}
 
 
 # ===========================================================================
@@ -1803,3 +1832,5 @@ class TestBlockReuseBoundaryAlignment:
         assert ctx.context_chunk_size == 14
         # 14 + 1 = 15 <= 80: gen fits
         assert ids(out.generation_requests) == [1]
+
+
