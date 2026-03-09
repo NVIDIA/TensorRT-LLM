@@ -309,10 +309,6 @@ class DistributedRadixTopKKernel:
         stride = cutlass.const_expr(num_threads * vec_size)
 
 
-        # --- Part 1: Scalar prologue (before alignment boundary) ---
-        for j in range(tidx, prologue_elems, num_threads):
-            shared_ordered[j] = self.to_ordered(input_row[chunk_start + j])
-
         # Thread t covers [t*vs, t*vs+vs), [t*vs+stride, ...) in the aligned region.
         # All start offsets i = t*vs + k*stride are multiples of vec_size, so
         # aligned_addr + i*elem_bytes is always align_bytes-aligned.
@@ -327,31 +323,33 @@ class DistributedRadixTopKKernel:
             src = cute.make_tensor(src_ptr, cute.make_layout((vec_size,)))
 
             cute.copy(copy_atom, src, frag)
-            # Apply to_ordered transform into a correctly-typed uint32 fragment so
-            # that autovec_copy sees matching types (uint32 → uint32) and can emit
+            # Apply to_ordered into a correctly-typed uint32 fragment so
+            # autovec_copy sees matching types (uint32 → uint32) and emits
             # STS.128 instead of 8 scalar STS instructions.
             ordered_frag = cute.make_fragment((vec_size,), self.ordered_type)
             for j in cutlass.range(vec_size, unroll_full=True):
-                # ordered_frag[j] = self.to_ordered(frag[j])
-                shared_ordered[i + prologue_elems + j] = self.to_ordered(frag[j])
+                ordered_frag[j] = self.to_ordered(frag[j])
 
-            # # Smem layout reordering: aligned region at smem[0..aligned_size-1],
-            # # prologue at smem[aligned_size..+prologue-1], tail at smem[aligned_size+prologue..].
-            # # smem_base is 128B-aligned and i is always a multiple of vec_size*elem_bytes,
-            # # so smem[i] is always align_bytes-aligned → STS.128 is valid.
-            # # Must specify AddressSpace.smem explicitly so make_ptr creates a smem pointer
-            # # (not global), and assumed_align hints the compiler to emit STS.128.
-            # shared_addr_u64 = (shared_ordered.iterator + i).toint()
-            # shared_ptr = cute.make_ptr(
-            #     self.ordered_type,
-            #     shared_addr_u64,
-            #     cute.AddressSpace.smem,
-            #     assumed_align=align_bytes,
-            # )
-            # shared_tensor = cute.make_tensor(shared_ptr, cute.make_layout((vec_size,)))
-            # cute.autovec_copy(ordered_frag, shared_tensor)
+            # Smem layout reordering: aligned region at smem[0..aligned_size-1],
+            # prologue at smem[aligned_size..+prologue-1], tail after that.
+            # smem_base is 128B-aligned and i is always a multiple of vec_size*elem_bytes
+            # → smem[i] is always align_bytes-aligned → STS.128 is valid.
+            shared_addr_u64 = (shared_ordered.iterator + i).toint()
+            shared_ptr = cute.make_ptr(
+                self.ordered_type,
+                shared_addr_u64,
+                cute.AddressSpace.smem,
+                assumed_align=align_bytes,
+            )
+            shared_tensor = cute.make_tensor(shared_ptr, cute.make_layout((vec_size,)))
+            cute.autovec_copy(ordered_frag, shared_tensor)
 
             i = i + stride
+
+        # --- Part 1: Scalar prologue (before alignment boundary) ---
+        for j in range(tidx, prologue_elems, num_threads):
+            shared_ordered[aligned_size + j] = self.to_ordered(
+                input_row[chunk_start + j])
 
         # --- Part 3: Scalar tail (after last aligned vector) ---
         for j in range(tidx, left_size, num_threads):
@@ -359,6 +357,7 @@ class DistributedRadixTopKKernel:
             shared_ordered[k] = self.to_ordered(input_row[chunk_start + k])
 
         cute.arch.barrier()
+        return prologue_elems, aligned_size, left_size
 
     # ------------------------------------------------------------------
     # Step 2a: Build local histogram and merge to global
@@ -647,6 +646,7 @@ class DistributedRadixTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def collect_output(self, shared_ordered, actual_chunk_size, chunk_start,
+                       prologue_elems, aligned_size, left_size,
                        ordered_pivot, top_k, local_gt_count,
                        output_counter_ptr,
                        arrival_counter_ptr, barrier_phase, ctas_per_group,
@@ -675,16 +675,35 @@ class DistributedRadixTopKKernel:
                                                local_gt_count)
         cute.arch.barrier()
 
-        # Pass 1: strictly greater than pivot
-        # All > pivot elements are guaranteed to be in top-k, so no
-        # pos < top_k check needed.  Use local atomicAdd for position.
-        for i in range(tidx, actual_chunk_size, self.num_threads):
+        # Pass 1: strictly greater than pivot — 3-region structure mirrors
+        # the reordered smem layout from load_chunk_to_smem:
+        #   aligned:  smem[i]                       → gmem[chunk_start + prologue_elems + i]
+        #   prologue: smem[aligned_size + i]         → gmem[chunk_start + i]
+        #   tail:     smem[aligned_size+prologue+i]  → gmem[chunk_start + prologue_elems + aligned_size + i]
+        for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered > ordered_pivot:
                 local_pos = atomicAdd(local_histogram.iterator, val_one)
                 pos = local_histogram[1] + local_pos
                 output_indices_row[pos] = cutlass.Int32(
-                    chunk_start + i)
+                    chunk_start + i + prologue_elems)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered > ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered > ordered_pivot:
+                local_pos = atomicAdd(local_histogram.iterator, val_one)
+                pos = local_histogram[1] + local_pos
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + prologue_elems + aligned_size + i)
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
 
@@ -695,16 +714,33 @@ class DistributedRadixTopKKernel:
         barrier_inter_cta(arrival_counter_ptr,
                           barrier_phase * ctas_per_group, tidx)
 
-        # Pass 2: equal to pivot (fill remaining slots)
-        # Use per-element global atomicAdd since cross-CTA coordination
-        # is needed to respect the k limit.
-        for i in range(tidx, actual_chunk_size, self.num_threads):
+        # Pass 2: equal to pivot — same 3-region structure
+        for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered == ordered_pivot:
                 pos = atomicAdd(output_counter_ptr, val_one)
                 if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(
-                        chunk_start + i)
+                        chunk_start + i + prologue_elems)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(
+                            ordered_pivot)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(
+                            ordered_pivot)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(output_counter_ptr, val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + prologue_elems + aligned_size + i)
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(
                             ordered_pivot)
@@ -716,7 +752,8 @@ class DistributedRadixTopKKernel:
     # ------------------------------------------------------------------
     @cute.jit
     def collect_output_single_cta(self, shared_ordered, actual_chunk_size,
-                                   chunk_start, ordered_pivot, top_k,
+                                   chunk_start, prologue_elems, aligned_size,
+                                   left_size, ordered_pivot, top_k,
                                    local_histogram,
                                    output_indices_row, output_values_row,
                                    tidx):
@@ -732,25 +769,65 @@ class DistributedRadixTopKKernel:
             local_histogram[2] = cutlass.Int32(0)
         cute.arch.barrier()
 
-        # Pass 1: strictly greater than pivot
-        for i in range(tidx, actual_chunk_size, self.num_threads):
+        # Pass 1: strictly greater than pivot — 3-region structure
+        for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
+            if ordered > ordered_pivot:
+                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
+                                val_one)
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + i + prologue_elems)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
             if ordered > ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
                                 val_one)
                 output_indices_row[pos] = cutlass.Int32(chunk_start + i)
                 if cutlass.const_expr(output_values_row is not None):
                     output_values_row[pos] = self.from_ordered(ordered)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered > ordered_pivot:
+                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
+                                val_one)
+                output_indices_row[pos] = cutlass.Int32(
+                    chunk_start + prologue_elems + aligned_size + i)
+                if cutlass.const_expr(output_values_row is not None):
+                    output_values_row[pos] = self.from_ordered(ordered)
         cute.arch.barrier()
 
         # Pass 2: equal to pivot (fill remaining slots up to k)
-        for i in range(tidx, actual_chunk_size, self.num_threads):
+        for i in range(tidx, aligned_size, self.num_threads):
             ordered = shared_ordered[i]
             if ordered == ordered_pivot:
                 pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
                                 val_one)
                 if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + i + prologue_elems)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(
+                            ordered_pivot)
+        for i in range(tidx, prologue_elems, self.num_threads):
+            ordered = shared_ordered[i + aligned_size]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
+                                val_one)
+                if pos < top_k:
                     output_indices_row[pos] = cutlass.Int32(chunk_start + i)
+                    if cutlass.const_expr(output_values_row is not None):
+                        output_values_row[pos] = self.from_ordered(
+                            ordered_pivot)
+        for i in range(tidx, left_size, self.num_threads):
+            ordered = shared_ordered[i + aligned_size + prologue_elems]
+            if ordered == ordered_pivot:
+                pos = atomicAdd(local_histogram.iterator + cutlass.Int32(2),
+                                val_one)
+                if pos < top_k:
+                    output_indices_row[pos] = cutlass.Int32(
+                        chunk_start + prologue_elems + aligned_size + i)
                     if cutlass.const_expr(output_values_row is not None):
                         output_values_row[pos] = self.from_ordered(
                             ordered_pivot)
@@ -893,8 +970,10 @@ class DistributedRadixTopKKernel:
                                       cutlass.Int32(i)] = cutlass.Int32(0)
             else:
                 # Step 1: Load chunk to smem as ordered
-                self.load_chunk_to_smem(input_row, shared_ordered,
-                                        chunk_start, actual_chunk_size, tidx)
+                prologue_elems, aligned_size, left_size = \
+                    self.load_chunk_to_smem(input_row, shared_ordered,
+                                            chunk_start, actual_chunk_size,
+                                            tidx)
 
                 # Step 2: Multi-round radix select
                 if cutlass.const_expr(self.dtype == cutlass.Float32):
@@ -934,6 +1013,7 @@ class DistributedRadixTopKKernel:
                     # Step 3: Collect output (smem counter, no inter-CTA sync)
                     self.collect_output_single_cta(
                         shared_ordered, actual_chunk_size, chunk_start,
+                        prologue_elems, aligned_size, left_size,
                         prefix, top_k, local_histogram,
                         output_indices_row, output_values_row, tidx)
 
@@ -1007,6 +1087,7 @@ class DistributedRadixTopKKernel:
 
                     barrier_phase = self.collect_output(
                         shared_ordered, actual_chunk_size, chunk_start,
+                        prologue_elems, aligned_size, left_size,
                         prefix, top_k, local_gt_count,
                         output_counter_ptr, arrival_counter_ptr, barrier_phase,
                         ctas_per_group, local_histogram,
