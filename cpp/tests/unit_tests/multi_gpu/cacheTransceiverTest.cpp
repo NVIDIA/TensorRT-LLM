@@ -767,13 +767,17 @@ protected:
 
                 setenv("TRTLLM_NIXL_PORT", std::to_string(port).c_str(), 1);
 
-                mConnectionManager
-                    = std::make_unique<texec::kv_cache::AgentConnectionManager>(bufferManagers, *mCacheState, "nixl");
+                std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
+                    bufferManagers.begin(), bufferManagers.end());
+                mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
+                    baseBufferManagers, *mCacheState, "nixl");
             }
             else if (isMooncake)
             {
+                std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> baseBufferManagers(
+                    bufferManagers.begin(), bufferManagers.end());
                 mConnectionManager = std::make_unique<texec::kv_cache::AgentConnectionManager>(
-                    bufferManagers, *mCacheState, "mooncake");
+                    baseBufferManagers, *mCacheState, "mooncake");
             }
             else
             {

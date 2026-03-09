@@ -63,6 +63,7 @@ from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
@@ -677,7 +678,8 @@ class PyTorchModelEngine(ModelEngine):
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
         if not self.is_draft_model and not self.mapping.has_cp_helix(
-        ) and self.guided_decoder is None:
+        ) and self.guided_decoder is None and not isinstance(
+                kv_cache_manager, MambaHybridCacheManager):
             # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
             self._general_warmup(resource_manager, reverse=True)
 

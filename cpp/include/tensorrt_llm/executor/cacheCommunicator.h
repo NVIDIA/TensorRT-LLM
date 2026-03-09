@@ -18,6 +18,8 @@
 
 #include "tensorrt_llm/executor/serialization.h"
 #include <atomic>
+#include <cstdint>
+#include <optional>
 #include <vector>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -62,6 +64,13 @@ public:
     [[nodiscard]] virtual bool isThreadSafe() const noexcept
     {
         return false;
+    }
+
+    virtual void activateBuffer(uint8_t /*kind*/) const {}
+
+    [[nodiscard]] virtual std::optional<size_t> getPreAssignedBufferId(uint8_t /*kind*/) const
+    {
+        return std::nullopt;
     }
 };
 
