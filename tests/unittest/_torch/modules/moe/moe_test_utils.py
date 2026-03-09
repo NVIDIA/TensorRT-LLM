@@ -378,7 +378,6 @@ def should_skip_trtllm(
         per_shard = intermediate_size // moe_tp_size
         tp_crash_quants = {
             QuantAlgo.FP8_BLOCK_SCALES,
-            QuantAlgo.NVFP4,
             QuantAlgo.W4A8_NVFP4_FP8,
         }
         if quant_algo in tp_crash_quants and per_shard % 128 != 0:

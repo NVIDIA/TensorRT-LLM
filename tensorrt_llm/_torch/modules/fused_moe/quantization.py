@@ -2563,6 +2563,57 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
     # This assumes the same input shape always results in the same permute indices
     _cache_permute_indices: Dict[torch.Size, torch.Tensor] = {}
 
+    # Alignment for the intermediate (M) dimension of w1_w3 scale buffers.
+    # get_shuffle_matrix_sf_a_row_indices requires M % 128 == 0 and K % 4 == 0
+    _scale_m_alignment = 128
+    _scale_k_alignment = 4
+
+    def _round_up(self, x, alignment):
+        return (x + alignment - 1) // alignment * alignment
+
+    def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
+                           block_scales_vec_size: int):
+        # Pad expand_intermediate_size_per_partition to _scale_m_alignment
+        expand_intermediate_size_per_partition_padded = self._round_up(
+            module.expand_intermediate_size_per_partition,
+            self._scale_m_alignment)
+
+        # # For w2 scale, K = intermediate_size_per_partition / scaling_vector_size
+        # # / block_scales_vec_size. get_shuffle_matrix_sf_a_row_indices requires
+        # # K % 4 == 0, so pad intermediate_size_per_partition accordingly.
+        intermediate_size_per_partition_padded = self._round_up(
+            module.intermediate_size_per_partition, module.scaling_vector_size *
+            block_scales_vec_size * self._scale_k_alignment)
+
+        w3_w1_weight_shape = (module.expert_size_per_partition,
+                              expand_intermediate_size_per_partition_padded,
+                              module.hidden_size // weight_vec_size)
+        w2_weight_shape = (module.expert_size_per_partition, module.hidden_size,
+                           intermediate_size_per_partition_padded //
+                           weight_vec_size)
+
+        w3_w1_weight_scale_shape = (
+            module.expert_size_per_partition,
+            expand_intermediate_size_per_partition_padded, module.hidden_size //
+            module.scaling_vector_size // block_scales_vec_size)
+        w2_weight_scale_shape = (module.expert_size_per_partition,
+                                 module.hidden_size,
+                                 intermediate_size_per_partition_padded //
+                                 module.scaling_vector_size //
+                                 block_scales_vec_size)
+
+        if module.bias:
+            w3_w1_bias_shape = (module.expert_size_per_partition,
+                                expand_intermediate_size_per_partition_padded)
+            w2_bias_shape = (module.expert_size_per_partition,
+                             module.hidden_size)
+        else:
+            w3_w1_bias_shape = None
+            w2_bias_shape = None
+
+        return (w3_w1_weight_shape, w2_weight_shape, w3_w1_bias_shape,
+                w2_bias_shape, w3_w1_weight_scale_shape, w2_weight_scale_shape)
+
     def create_weights(self,
                        module: torch.nn.Module,
                        bias_dtype: Optional[torch.dtype] = None):
@@ -2604,6 +2655,9 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
+        # Zero the buffer so padding rows
+        dst_w3_w1_weight_gpu.zero_()
+
         # Handle gated vs non-gated activations
         if module.is_gated_activation:
             # Gated activation: buffer contains both w3 and w1
@@ -2615,13 +2669,13 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
             if dst_w3_w1_weight_gpu.shape[
                     0] != module.intermediate_size_per_partition * 2:
-                # If padded, we can't just use split directly if we want to fill the padded area correctly or ignore it.
-                # But here we just want to fill the first N rows.
+                # Buffer may be padded for alignment.
+                # For w1, using the padded size half instead of module.intermediate_size_per_partition
+                padded_half = dst_w3_w1_weight_gpu.shape[0] // 2
                 dst_w3_weight = dst_w3_w1_weight_gpu.narrow(
                     0, 0, module.intermediate_size_per_partition)
                 dst_w1_weight = dst_w3_w1_weight_gpu.narrow(
-                    0, module.intermediate_size_per_partition,
-                    module.intermediate_size_per_partition)
+                    0, padded_half, module.intermediate_size_per_partition)
             else:
                 # Keep weights in device buffer
                 dst_w3_weight, dst_w1_weight = dst_w3_w1_weight_gpu.split(
@@ -2667,6 +2721,9 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # FIXME: this depends on the kernel internals
         epilogue_tile_m = 128
 
+        # Pad loaded shard to match dst buffer shape (K dimension may be padded for alignment)
+        w2_weight_shard = _pad_tensor_to_shape(w2_weight_shard,
+                                               dst_w2_weight_gpu.shape)
         # Keep weights in device buffer
         dst_w2_weight_gpu.copy_(w2_weight_shard.view(dst_w2_weight_gpu.dtype),
                                 non_blocking=dst_on_gpu)
@@ -2712,9 +2769,15 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
         w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0
 
+        # Zero the buffer so padding rows are clean
+        dst_w3_w1_weight_scale_gpu.zero_()
+
         # Keep weights in device buffer
         if module.is_gated_activation:
-            # Gated activation: buffer contains both w3 and w1 scales
+            # Gated activation: buffer contains both w3 and w1 scales. The buffer
+            # might be padded, so using the padded half-point instead of the
+            # module.intermediate_size_per_partition.
+            padded_half = dst_w3_w1_weight_scale_gpu.shape[0] // 2
             # w3
             dst_w3_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
                 dim=0, start=0, length=module.intermediate_size_per_partition)
@@ -2722,7 +2785,7 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
             # w1
             dst_w1_weight_scale = dst_w3_w1_weight_scale_gpu.narrow(
                 dim=0,
-                start=module.intermediate_size_per_partition,
+                start=padded_half,
                 length=module.intermediate_size_per_partition)
 
             if w3_size == 0:
@@ -2785,6 +2848,9 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
                                             module.tp_rank,
                                             TensorParallelMode.ROW,
                                             device=device)
+        # Pad loaded shard to match dst buffer shape (K dimension may be padded for alignment)
+        w2_weight_scale = _pad_tensor_to_shape(w2_weight_scale,
+                                               dst_w2_weight_scale_gpu.shape)
         # Keep weights in device buffer
         dst_w2_weight_scale_gpu.copy_(
             w2_weight_scale.view(dst_w2_weight_scale_gpu.dtype))
