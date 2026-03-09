@@ -9,27 +9,22 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: Qwen/Qwen3-0.6B
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
-# DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
-# - name: apple/OpenELM-270M-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
-# - name: apple/OpenELM-1_1B-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# DISABLED: TorchDynamo compilation error - fake tensor dispatch failure
-# - name: apple/OpenELM-3B-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: microsoft/Phi-4-mini-instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+- name: apple/OpenELM-270M-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-1_1B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: apple/OpenELM-3B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'openelm.yaml']
+- name: microsoft/Phi-4-mini-instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: microsoft/Phi-4-mini-reasoning
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/gemma-3-1b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3_1b.yaml']
 - name: meta-llama/Llama-3.1-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10363
-# - name: casperhansen/llama-3-8b-instruct-awq
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: casperhansen/llama-3-8b-instruct-awq
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-1B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-3B-Instruct
@@ -40,9 +35,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen2.5-7B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10363
-# - name: Qwen/Qwen2.5-7B-Instruct-AWQ
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: Qwen/Qwen2.5-7B-Instruct-AWQ
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-4B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: Qwen/Qwen3-8B
@@ -97,9 +91,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-2-7b-chat-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-8B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/Llama-3.1-8B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
@@ -116,22 +109,18 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NVFP4 quantization not supported for pre BLW - CW has only Hopper
-# - name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: Not supported
-# - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: nvidia/NVIDIA-Nemotron-Nano-9B-v2-NVFP4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: google/gemma-3-27b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: Not supported
-# - name: ai21labs/AI21-Jamba-1.5-Mini
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10977
-# - name: meta-llama/Llama-3.2-11B-Vision-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: ai21labs/AI21-Jamba-1.5-Mini
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+- name: meta-llama/Llama-3.2-11B-Vision-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
 - name: meta-llama/CodeLlama-34b-Instruct-hf
@@ -170,61 +159,48 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: deepseek-ai/DeepSeek-R1-Distill-Qwen-32B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: stuck in graph capturing
-# - name: mistralai/Mixtral-8x22B-Instruct-v0.1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-70B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: FakeTensorMode error in unified_attn export
-# - name: nvidia/Llama-3.1-405B-Instruct-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: mistralai/Mixtral-8x22B-Instruct-v0.1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-70B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: nvidia/Llama-3.1-405B-Instruct-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: nvidia/Llama-3.1-Nemotron-70B-Instruct-HF
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: Model loading failure - dynamic module registry issue
-# - name: nvidia/Llama-3_1-Nemotron-51B-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: model not supporting installed transformers version - https://github.com/NVIDIA/TensorRT-LLM/issues/10980
-# - name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-51B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_1-Nemotron-Ultra-253B-v1-FP8
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
+- name: nvidia/Llama-3_3-Nemotron-Super-49B-v1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-30B-A3B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
 - name: Qwen/Qwen3-235B-A22B
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'simple_shard_only.yaml']
-# DISABLED: Auto-deploy compilation error - shape mismatch - https://github.com/NVIDIA/TensorRT-LLM/issues/10978
-# - name: deepseek-ai/DeepSeek-R1
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
-# DISABLED: Auto-deploy compilation error - shape mismatch - https://github.com/NVIDIA/TensorRT-LLM/issues/10978
-# - name: deepseek-ai/DeepSeek-V3
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
-# DISABLED: Auto-deploy compilation error - shape mismatch - https://github.com/NVIDIA/TensorRT-LLM/issues/10978
-# - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+- name: deepseek-ai/DeepSeek-R1
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+- name: deepseek-ai/DeepSeek-V3
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+- name: deepseek-ai/DeepSeek-Coder-V2-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: Qwen/Qwen3-VL-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10363
-# - name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+- name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 - name: codellama/CodeLlama-70b-Instruct-hf
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
-# DISABLED: NOT SUPPORTED - https://github.com/NVIDIA/TensorRT-LLM/issues/10977
-# - name: meta-llama/Llama-3.2-90B-Vision-Instruct
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+- name: meta-llama/Llama-3.2-90B-Vision-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
 - name: openai/gpt-oss-120b
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
 - name: meta-llama/Llama-4-Maverick-17B-128E-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
-# DISABLED: Doesn't fit H100
-# - name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
-#   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
+- name: nvidia/NVIDIA-Nemotron-3-Super-120B-BF16-BF16KV-010726
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml','super_v3.yaml']
 - name: zai-org/GLM-4.7-Flash
   yaml_extra: ['glm-4.7-flash.yaml']
 - name: Nanbeige/Nanbeige4.1-3B

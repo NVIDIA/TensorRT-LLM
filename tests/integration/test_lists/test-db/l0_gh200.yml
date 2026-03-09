@@ -23,6 +23,7 @@ l0_gh200:
   - unittest/bindings
   - unittest/llmapi/test_llm_quant.py
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - unittest/test_model_runner_cpp.py
   - accuracy/test_cli_flow.py::TestGptNext::test_auto_dtype
   - accuracy/test_cli_flow.py::TestSantacoder::test_auto_dtype

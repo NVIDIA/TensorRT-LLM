@@ -57,8 +57,8 @@ from tensorrt_llm.llmapi import (
     AutoDecodingConfig, CudaGraphConfig, DeepSeekSparseAttentionConfig,
     Eagle3DecodingConfig, KvCacheConfig, MoeConfig, MTPDecodingConfig,
     NGramDecodingConfig, PARDDecodingConfig, RocketSparseAttentionConfig,
-    SamplingParams, SkipSoftmaxAttentionConfig, SADecodingConfig,
-    TorchCompileConfig)
+    SADecodingConfig, SamplingParams, SchedulerConfig,
+    SkipSoftmaxAttentionConfig, TorchCompileConfig)
 # isort: on
 from tensorrt_llm.quantization import QuantAlgo
 
@@ -1474,6 +1474,34 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
     @pytest.mark.skip_less_device_memory(60000)
+    @parametrize_with_ids("enable_chunked_prefill", [False, True])
+    @parametrize_with_ids("attention_dp,cuda_graph,overlap_scheduler",
+                          [(False, False, False), (True, True, True)])
+    @parametrize_with_ids("mtp_nextn", [0, 2])
+    def test_bfloat16_python_scheduler(self, mtp_nextn, attention_dp,
+                                       cuda_graph, overlap_scheduler,
+                                       enable_chunked_prefill):
+        scheduler_config = SchedulerConfig(use_python_scheduler=True)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig() if cuda_graph else None,
+        )
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_cache_config,
+                 scheduler_config=scheduler_config,
+                 enable_chunked_prefill=enable_chunked_prefill,
+                 max_num_tokens=256 if enable_chunked_prefill else 8192,
+                 **pytorch_config,
+                 enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device_memory(60000)
     def test_bfloat16_2_model_mtp(self):
         kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.3)
         pytorch_config = dict(
@@ -1551,6 +1579,31 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                  kv_cache_config=kv_cache_config,
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
+                 speculative_config=mtp_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+    @pytest.mark.skip_less_device(4)
+    @parametrize_with_ids("mtp_nextn",
+                          [0, pytest.param(2, marks=skip_pre_hopper)])
+    @pytest.mark.parametrize("tp_size,pp_size,ep_size", [(4, 1, 1), (4, 1, 4)],
+                             ids=["tp4", "ep4"])
+    def test_bfloat16_4gpus_python_scheduler(self, tp_size, pp_size, ep_size,
+                                             mtp_nextn):
+        scheduler_config = SchedulerConfig(use_python_scheduler=True)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.75)
+        pytorch_config = dict(cuda_graph_config=CudaGraphConfig(), )
+        mtp_config = None
+        if mtp_nextn > 0:
+            mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+        with LLM(self.MODEL_PATH,
+                 tensor_parallel_size=tp_size,
+                 pipeline_parallel_size=pp_size,
+                 moe_expert_parallel_size=ep_size,
+                 kv_cache_config=kv_cache_config,
+                 scheduler_config=scheduler_config,
+                 **pytorch_config,
+                 enable_attention_dp=True,
                  speculative_config=mtp_config) as llm:
             task = GSM8K(self.MODEL_NAME)
             task.evaluate(llm)

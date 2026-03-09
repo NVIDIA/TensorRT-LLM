@@ -1,23 +1,27 @@
 import asyncio
+import atexit
 import queue
 import socket
 import threading
 import time
 import traceback
+import weakref
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union
+from typing import Any, Dict, List, Literal, Optional, Union
 
 import torch.multiprocessing as mp
 import zmq
 
 from tensorrt_llm._torch.visual_gen import DiffusionRequest, DiffusionResponse
+from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
 from tensorrt_llm._torch.visual_gen.executor import run_diffusion_worker
 from tensorrt_llm._torch.visual_gen.output import MediaOutput
 
 __all__ = ["VisualGen", "VisualGenParams", "MediaOutput"]
 from tensorrt_llm.executor.ipc import ZeroMqQueue
 from tensorrt_llm.inputs.data import VisualGenInputs
+from tensorrt_llm.llmapi.utils import set_api_status
 from tensorrt_llm.logger import logger
 
 # Timeouts (seconds)
@@ -50,13 +54,10 @@ class DiffusionRemoteClient:
 
     def __init__(
         self,
-        model_path: Union[str, Path],
-        n_workers: int = 1,
-        diffusion_config: Optional[dict] = None,
+        diffusion_args: VisualGenArgs,
     ):
-        self.model_path = str(model_path)
-        self.n_workers = n_workers
-        self.diffusion_config = diffusion_config
+        self.diffusion_args = diffusion_args
+        self.n_workers = diffusion_args.parallel.n_workers
 
         # Setup distributed env
         self.master_addr = "127.0.0.1"
@@ -91,7 +92,8 @@ class DiffusionRemoteClient:
         # Wait for the background thread to initialize the event loop
         self.event_loop_ready.wait()
 
-        # Launch workers
+        # Launch workers (VisualGenArgs is pickled via mp.Process spawn context)
+        n_workers = self.n_workers
         logger.info(f"DiffusionClient: Launching {n_workers} workers")
         ctx = mp.get_context("spawn")
         self.worker_processes = []
@@ -103,10 +105,10 @@ class DiffusionRemoteClient:
                     "world_size": n_workers,
                     "master_addr": self.master_addr,
                     "master_port": self.master_port,
-                    "model_path": self.model_path,
                     "request_queue_addr": self.req_addr_connect,
                     "response_queue_addr": self.resp_addr_connect,
-                    "diffusion_config": self.diffusion_config,
+                    "diffusion_args": self.diffusion_args,
+                    "log_level": logger.level,
                 },
             )
             p.start()
@@ -404,6 +406,7 @@ class DiffusionGenerationResult:
 
 
 @dataclass
+@set_api_status("prototype")
 class VisualGenParams:
     """Parameters for visual generation.
 
@@ -442,7 +445,7 @@ class VisualGenParams:
     # Image-specific parameters
     num_images_per_prompt: int = 1
 
-    ## Image edit parameters
+    # Image edit parameters
     image: Optional[List[str]] = None
     mask: Optional[str] = None
 
@@ -459,23 +462,25 @@ class VisualGenParams:
 class VisualGen:
     """High-level API for visual generation."""
 
+    @set_api_status("prototype")
     def __init__(
         self,
         model_path: Union[str, Path],
-        n_workers: int = 1,
-        diffusion_config: Optional[dict] = None,
+        diffusion_args: Optional[VisualGenArgs] = None,
     ):
         self.model_path = str(model_path)
-        self.n_workers = n_workers
-        self.diffusion_config = diffusion_config
+        self.diffusion_args = (diffusion_args or VisualGenArgs()).model_copy(
+            update={"checkpoint_path": self.model_path}
+        )
 
         self.executor = DiffusionRemoteClient(
-            model_path=self.model_path,
-            n_workers=self.n_workers,
-            diffusion_config=self.diffusion_config,
+            diffusion_args=self.diffusion_args,
         )
         self.req_counter = 0
 
+        atexit.register(VisualGen._atexit_shutdown, weakref.ref(self))
+
+    @set_api_status("prototype")
     def generate(
         self,
         inputs: VisualGenInputs,
@@ -503,6 +508,7 @@ class VisualGen:
             raise RuntimeError(f"Generation failed: {response.error_msg}")
         return response.output
 
+    @set_api_status("prototype")
     def generate_async(
         self,
         inputs: VisualGenInputs,
@@ -553,7 +559,28 @@ class VisualGen:
         self.executor.enqueue_requests([request])
         return DiffusionGenerationResult(req_id, self.executor)
 
+    @staticmethod
+    def _atexit_shutdown(self_ref):
+        instance = self_ref()
+        if instance is not None:
+            instance.shutdown()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> Literal[False]:
+        del exc_value, traceback
+        self.shutdown()
+        return False
+
+    def __del__(self):
+        self.shutdown()
+
+    @set_api_status("prototype")
     def shutdown(self):
         """Shutdown executor and cleanup."""
+        if not hasattr(self, "executor") or self.executor is None:
+            return
         logger.info("VisualGen: Shutting down")
         self.executor.shutdown()
+        self.executor = None
