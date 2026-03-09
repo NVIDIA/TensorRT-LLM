@@ -46,24 +46,6 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 
-def rotate_activation(x: torch.Tensor) -> torch.Tensor:
-    assert x.dtype == torch.bfloat16
-
-    if not HAS_FAST_HADAMARD:
-        # Fallback: skip transformation (acceptable for test/dev)
-        logger.warning_once(
-            "fast-hadamard-transform not available. DSA sparse attention will skip "
-            "hadamard transformation. Install with: "
-            "pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git",
-            key="fast_hadamard_import_missing")
-        return x
-
-    hidden_size = x.size(-1)
-    assert (hidden_size & (hidden_size - 1)
-            ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
-    return hadamard_transform(x, scale=hidden_size**-0.5)
-
-
 def _unravel_indices(flat_indices: torch.Tensor,
                      shape: Tuple[int, ...]) -> Tuple[torch.Tensor, ...]:
     """
@@ -80,6 +62,24 @@ def _unravel_indices(flat_indices: torch.Tensor,
     flat_indices = flat_indices // d1
     i0 = flat_indices
     return i0, i1, i2, i3
+
+
+def rotate_activation(x: torch.Tensor) -> torch.Tensor:
+    assert x.dtype == torch.bfloat16
+
+    if not HAS_FAST_HADAMARD:
+        # Fallback: skip transformation (acceptable for test/dev)
+        logger.warning_once(
+            "fast-hadamard-transform not available. DSA sparse attention will skip "
+            "hadamard transformation. Install with: "
+            "pip install git+https://github.com/Dao-AILab/fast-hadamard-transform.git",
+            key="fast_hadamard_import_missing")
+        return x
+
+    hidden_size = x.size(-1)
+    assert (hidden_size & (hidden_size - 1)
+            ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
 def transform_local_topk_and_prepare_pool_view(
