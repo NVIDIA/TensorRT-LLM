@@ -43,64 +43,10 @@
 
 #if ENABLE_MULTI_DEVICE
 
-#ifdef _WIN32
-#include <windows.h>
-#else
-#include <dlfcn.h>
-#endif
-
 TRTLLM_NAMESPACE_BEGIN
 
 namespace common::nccl_util
 {
-
-//==============================================================================
-// NCCL Helper - Dynamic Library Loading
-//==============================================================================
-
-// Helper class for dynamically loading NCCL symbols (ncclMemAlloc, ncclCommWindowRegister)
-// This allows the code to work with NCCL libraries that may or may not have these symbols
-class NCCLHelper
-{
-public:
-    static NCCLHelper& getInstance();
-
-    // Dynamic loading function type definition
-    using ncclCommWindowRegisterFunc = ncclResult_t (*)(ncclComm_t, void*, size_t, ncclWindow_t*, int);
-    using ncclMemAllocFunc = ncclResult_t (*)(void**, size_t);
-
-    // Get function pointer for ncclCommWindowRegister
-    ncclCommWindowRegisterFunc getNCCLCommWindowRegister();
-
-    // Get function pointer for ncclMemAlloc
-    ncclMemAllocFunc getNCCLMemAlloc();
-
-    // Check if NCCL library is successfully loaded
-    bool isLoaded() const;
-
-    NCCLHelper(NCCLHelper const&) = delete;
-    NCCLHelper& operator=(NCCLHelper const&) = delete;
-    NCCLHelper(NCCLHelper&&) = delete;
-    NCCLHelper& operator=(NCCLHelper&&) = delete;
-
-private:
-    NCCLHelper();
-    ~NCCLHelper();
-
-    void loadNCCLLibrary();
-    void* loadLibraryHandle(char const* libName);
-    void* getSymbolAddress(void* handle, char const* symbolName);
-
-#ifdef _WIN32
-    HMODULE mLibraryHandle;
-#else
-    void* mLibraryHandle;
-#endif
-
-    ncclCommWindowRegisterFunc mNCCLCommWindowRegister;
-    ncclMemAllocFunc mNCCLMemAlloc;
-    bool mIsLoaded;
-};
 
 //==============================================================================
 // NCCL Resource Management
@@ -199,8 +145,30 @@ private:
 };
 
 //==============================================================================
+// NCCL Version Check
+//==============================================================================
+
+// Returns true if the compile-time and runtime NCCL versions support window buffers
+// (ncclMemAlloc / ncclCommWindowRegister).
+inline bool isNcclWindowSupported()
+{
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
+    int version = 0;
+    if (ncclGetVersion(&version) != ncclSuccess)
+    {
+        return false;
+    }
+    return version >= NCCL_VERSION(2, 28, 0);
+#else
+    return false;
+#endif
+}
+
+//==============================================================================
 // NCCL Window Buffer Allocation
 //==============================================================================
+
+#if NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 // Represents a buffer with an associated NCCL window
 struct NCCLWindowBuffer
@@ -405,6 +373,8 @@ inline std::pair<torch::Tensor, NCCLWindowBuffer> createNCCLWindowTensor(
 
     return std::make_pair(tensor, buffer);
 }
+
+#endif // NCCL_VERSION_CODE >= NCCL_VERSION(2, 28, 0)
 
 } // namespace common::nccl_util
 

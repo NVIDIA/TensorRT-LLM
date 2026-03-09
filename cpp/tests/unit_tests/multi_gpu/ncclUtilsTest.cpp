@@ -225,11 +225,10 @@ protected:
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
-        // Check if NCCL symmetric is supported
-        auto& ncclHelper = nccl_util::NCCLHelper::getInstance();
-        if (!ncclHelper.isLoaded())
+        // Check if NCCL window buffer support is available
+        if (!nccl_util::isNcclWindowSupported())
         {
-            GTEST_SKIP() << "NCCL library with symmetric memory support is not available";
+            GTEST_SKIP() << "NCCL window buffer support is not available";
         }
 
         std::set<int> group;
@@ -553,11 +552,10 @@ protected:
             TLLM_CUDA_CHECK(cudaSetDevice(deviceId));
         }
 
-        // Check if NCCL symmetric is supported
-        auto& ncclHelper = nccl_util::NCCLHelper::getInstance();
-        if (!ncclHelper.isLoaded())
+        // Check if NCCL window buffer support is available
+        if (!nccl_util::isNcclWindowSupported())
         {
-            GTEST_SKIP() << "NCCL library with symmetric memory support is not available";
+            GTEST_SKIP() << "NCCL window buffer support is not available";
         }
 
         std::set<int> group;
