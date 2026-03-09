@@ -226,7 +226,7 @@ def _extract_points(data_list, metric):
         val = d.get(metric)
         if ts is not None and val is not None:
             try:
-                points.append((_ts_to_date(ts), float(val), d))
+                points.append((_parse_timestamp(ts), float(val), d))
             except (ValueError, TypeError):
                 pass
     points.sort(key=lambda p: p[0])
@@ -832,7 +832,10 @@ def _generate_svg_chart(
         return _MARGIN["left"] + (dt.timestamp() - min_ts) / ts_range * _PLOT_W
 
     def _x_date_str(date_str):
-        dt = datetime.strptime(date_str, "%Y-%m-%d")
+        try:
+            dt = datetime.strptime(date_str, "%Y-%m-%d %H:%M")
+        except ValueError:
+            dt = datetime.strptime(date_str, "%Y-%m-%d")
         ts = dt.timestamp()
         ts = max(min_ts, min(ts, max_ts))
         return _MARGIN["left"] + (ts - min_ts) / ts_range * _PLOT_W
@@ -1247,7 +1250,15 @@ def generate_pre_merge_html(new_data_list, history_grouped, output_file):
         header = escape_html("  ".join(header_parts))
 
         # Latest data table (for "Show Latest Data" button)
-        latest_nd = new_data_entries[-1] if new_data_entries else {}
+        latest_nd = (
+            max(
+                new_data_entries,
+                key=lambda d: _parse_timestamp(
+                    d.get("ts_created") or d.get("@timestamp", 0)),
+            )
+            if new_data_entries
+            else {}
+        )
         latest_table = _build_data_table_html(latest_nd) if latest_nd else ""
         detail_id = f"latest-detail-{section_idx}"
 
@@ -1490,7 +1501,7 @@ def generate_pre_merge_html(new_data_list, history_grouped, output_file):
                 for (var k = 0; k < keys.length; k++) {{
                     var val = info[keys[k]];
                     if (val === null || val === undefined) val = "";
-                    rows += "<tr><td>" + keys[k] + "</td><td>" + String(val) + "</td></tr>";
+                    rows += "<tr><td>" + String(keys[k]).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</td><td>" + String(val).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</td></tr>";
                 }}
                 popupBody.innerHTML = "<table>" + rows + "</table>";
 
