@@ -1495,7 +1495,9 @@ def generate_pre_merge_html(new_data_list, history_grouped, output_file):
                 for (var k = 0; k < keys.length; k++) {{
                     var val = info[keys[k]];
                     if (val === null || val === undefined) val = "";
-                    rows += "<tr><td>" + String(keys[k]).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</td><td>" + String(val).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;") + "</td></tr>";
+                    var ek = String(keys[k]).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+                    var ev = String(val).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
+                    rows += "<tr><td>" + ek + "</td><td>" + ev + "</td></tr>";
                 }}
                 popupBody.innerHTML = "<table>" + rows + "</table>";
 
