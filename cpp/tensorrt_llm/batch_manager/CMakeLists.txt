@@ -69,28 +69,17 @@ set(SRCS
 
 set(xgrammar_source_dir ${CMAKE_BINARY_DIR}/_deps/xgrammar-src)
 
-# Patch xgrammar: change "static const" to "static constexpr" for class-level
-# integral constants in grammar_functor.cc. Without this, Debug builds (-O0)
-# fail to link due to ODR-use of non-inline static const members.
-set(_xgrammar_functor "${xgrammar_source_dir}/cpp/grammar_functor.cc")
-if(EXISTS "${_xgrammar_functor}")
-  file(READ "${_xgrammar_functor}" _xgrammar_functor_content)
-  string(FIND "${_xgrammar_functor_content}" "static constexpr int16_t k"
-              _already_patched)
-  if(_already_patched EQUAL -1)
-    string(REPLACE "static const int16_t k" "static constexpr int16_t k"
-                   _xgrammar_functor_content "${_xgrammar_functor_content}")
-    file(WRITE "${_xgrammar_functor}" "${_xgrammar_functor_content}")
-    message(
-      STATUS
-        "Patched xgrammar grammar_functor.cc: static const -> static constexpr")
-  endif()
-endif()
-
 file(GLOB_RECURSE XGRAMMAR_SRCS "${xgrammar_source_dir}/cpp/*.cc")
 list(FILTER XGRAMMAR_SRCS EXCLUDE REGEX
      "${xgrammar_source_dir}/cpp/nanobind/.*\\.cc")
 list(APPEND SRCS ${XGRAMMAR_SRCS})
+
+# xgrammar uses "static const" class members that are ODR-used, which causes
+# linker errors in Debug builds (-O0). Use -O1 for xgrammar sources so the
+# compiler inlines these constants. Remove once upstream fixes this.
+if(CMAKE_BUILD_TYPE STREQUAL "Debug")
+  set_source_files_properties(${XGRAMMAR_SRCS} PROPERTIES COMPILE_OPTIONS "-O1")
+endif()
 
 if(NOT WIN32)
   # additional warnings
