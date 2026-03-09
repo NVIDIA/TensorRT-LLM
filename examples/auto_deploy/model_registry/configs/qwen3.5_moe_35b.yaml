@@ -27,3 +27,5 @@ transforms:
   multi_stream_gemm:
     stage: compile
     enabled: true
+  gather_logits_before_lm_head:
+    enabled: true
