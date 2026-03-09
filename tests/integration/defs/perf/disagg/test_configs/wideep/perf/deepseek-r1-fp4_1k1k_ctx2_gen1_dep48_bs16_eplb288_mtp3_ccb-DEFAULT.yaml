@@ -21,7 +21,7 @@ slurm:
 benchmark:
   mode: gen_only
   use_nv_sa_benchmark: false
-  multi_round: 8
+  multi_round: 1
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: '12288'
@@ -86,6 +86,7 @@ worker_config:
       max_tokens_in_buffer: 8320
       backend: DEFAULT
     stream_interval: 20
+    num_postprocess_workers: 4
   ctx:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 4

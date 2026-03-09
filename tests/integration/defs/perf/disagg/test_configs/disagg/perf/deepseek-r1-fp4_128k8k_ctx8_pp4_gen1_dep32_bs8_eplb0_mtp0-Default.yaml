@@ -17,7 +17,7 @@ slurm:
 benchmark:
   mode: e2e
   use_nv_sa_benchmark: true
-  multi_round: 1
+  multi_round: 8
   benchmark_ratio: 0.8
   streaming: true
   concurrency_list: '256'
