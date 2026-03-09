@@ -30,6 +30,7 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
   string(JSON DEP_SOURCE_SUBDIR          ERROR_VARIABLE _err GET "${DEP_OBJECT}" "source_subdir")
   string(JSON DEP_GIT_SUBMODULES_RECURSE ERROR_VARIABLE _err GET "${DEP_OBJECT}" "git_submodules_recurse")
   string(JSON DEP_USE_URL                ERROR_VARIABLE _err GET "${DEP_OBJECT}" "use_url")
+  string(JSON DEP_PATCH_FILE            ERROR_VARIABLE _err GET "${DEP_OBJECT}" "patch_file")
   # cmake-format: on
 
   # Build FetchContent_Declare arguments
@@ -51,6 +52,19 @@ foreach(DEP_IDX RANGE ${DEP_COUNT_MINUS_ONE})
 
   if(DEP_SOURCE_SUBDIR AND NOT DEP_SOURCE_SUBDIR STREQUAL "")
     list(APPEND FETCH_ARGS SOURCE_SUBDIR "${DEP_SOURCE_SUBDIR}")
+  endif()
+
+  if(DEP_PATCH_FILE AND NOT DEP_PATCH_FILE STREQUAL "")
+    list(
+      APPEND
+      FETCH_ARGS
+      PATCH_COMMAND
+      patch
+      -p1
+      --forward
+      --batch
+      -i
+      "${CMAKE_CURRENT_SOURCE_DIR}/${DEP_PATCH_FILE}")
   endif()
 
   FetchContent_Declare(${FETCH_ARGS})
