@@ -22,7 +22,7 @@ pytest-threadleak
 rouge_score
 cloudpickle
 typeguard==4.4.4
-typing-extensions==4.12.2
+typing-extensions==4.15.0
 bandit==1.7.7
 jsonlines==4.0.0
 jieba==0.42.1
