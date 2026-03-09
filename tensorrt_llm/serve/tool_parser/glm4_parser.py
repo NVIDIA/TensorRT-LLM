@@ -107,8 +107,8 @@ class Glm4ToolParser(BaseToolParser):
 
     def __init__(self):
         super().__init__()
-        self.bot_token = "<tool_call>"
-        self.eot_token = "</tool_call>"
+        self.bot_token = "<tool_call>"  # nosec B105
+        self.eot_token = "</tool_call>"  # nosec B105
         self.func_call_regex = r"<tool_call>.*?</tool_call>"
         self.func_detail_regex = re.compile(
             r"<tool_call>(.*?)(?:\\n|\n)(.*)</tool_call>", re.DOTALL
