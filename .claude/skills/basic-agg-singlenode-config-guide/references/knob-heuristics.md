@@ -1,6 +1,6 @@
 # Knob Heuristics — Decision Tables
 
-The 4 knobs that materially affect basic aggregate (IFB) single-node throughput. All heuristics distilled from 72K+ IBDB benchmark records (aggregate/inflight batching, PyTorch backend, non-speculative).
+The 4 knobs that materially affect basic aggregate (IFB) single-node throughput. All heuristics distilled from 72K+ benchmark records (aggregate/inflight batching, PyTorch backend, non-speculative).
 
 ## moe_backend: `moe_config.backend` (MoE models only)
 
