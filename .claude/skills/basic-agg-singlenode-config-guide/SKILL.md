@@ -1,10 +1,13 @@
 ---
 name: basic-agg-singlenode-config-guide
-description: Guide for tuning basic aggregate (inflight batching, single node,
-  PyTorch backend, non-speculative) TRT-LLM serving configs. Covers the 4 critical
-  knobs (moe_backend, attention_dp, kv_fraction, max_num_tokens), architecture-class
-  heuristics, and pointers to existing config databases. Use when optimizing TRT-LLM
-  deployment performance for standard throughput-optimized serving via trtllm-serve.
+description: Lightweight guide for manually tuning basic aggregate (inflight batching,
+  single node, PyTorch backend, non-speculative) TRT-LLM serving configs. Covers the
+  4 critical knobs (moe_backend, attention_dp, kv_fraction, max_num_tokens),
+  architecture-class heuristics, and pointers to existing config databases. Use when
+  a human is manually tuning a TRT-LLM config for standard throughput-optimized
+  serving via trtllm-serve. NOT for multi-node, disaggregated serving, speculative
+  decoding, or TensorRT engine configs. Prefer trtllm-config-generator when
+  automated/scripted config generation with exact per-model values is needed.
 ---
 
 # Basic Aggregate Single-Node Config Guide
