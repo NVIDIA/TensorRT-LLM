@@ -346,11 +346,6 @@ public:
     //! \param self      shared_ptr to this (the root) block.
     void setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize, std::shared_ptr<KVCacheBlock> self);
 
-    [[nodiscard]] bool isPlaceholder() const
-    {
-        return mMemoryPoolBlockIndex.isNull();
-    }
-
     [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
     [[nodiscard]] bool isPrimary() const;
@@ -1787,8 +1782,8 @@ public:
         = 0;
 
     //! @return maxBlockCount of all beams
-    virtual SizeType32 copyBlockOffsets(
-        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const
+    virtual SizeType32 copyBlockOffsets(runtime::ITensor& output, SizeType32 outputSlotOffset,
+        LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const
         = 0;
 
     [[nodiscard]] virtual bool isEnableBlockReuse() const = 0;
@@ -2161,8 +2156,8 @@ public:
         SizeType32 beamWidth) const override;
 
     //! @return maxBlockCount of all beams
-    SizeType32 copyBlockOffsets(
-        runtime::ITensor& output, SizeType32 outputSlotOffset, LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override;
+    SizeType32 copyBlockOffsets(runtime::ITensor& output, SizeType32 outputSlotOffset,
+        LlmRequest::RequestIdType requestId, std::optional<SizeType32> windowSize = std::nullopt) const override;
 
     [[nodiscard]] bool isEnableBlockReuse() const override
     {

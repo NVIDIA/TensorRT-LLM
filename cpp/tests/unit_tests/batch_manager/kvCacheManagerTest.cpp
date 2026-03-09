@@ -244,6 +244,7 @@ void testBlockManagerLinearAttention_ContextNoReuse(int beamWidth, int numTokens
     // use 1 + beamWidth blocks
     GenerationRequest seq0{requestId, numTokens, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(seq0, numBlocksPerBeam, linearWindowSizeCode, /*isShareLastContextBlock=*/false);
+    blockManager.holdSequence(seq0.getRequestId());
     int numSharedBlocks = (numBlocksPerBeam > 1 && beamWidth == 1) ? 1 : 0;
     int numUnsharedBlocks = beamWidth == 1 ? 0 : beamWidth;
     auto occupiedBlocksLinear = numSharedBlocks + numUnsharedBlocks;
@@ -356,6 +357,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     GenerationRequest seq0{requestId, numTokens0, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(
         seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, linearWindowSizeCode);
+    blockManager.holdSequence(seq0.getRequestId());
     ASSERT_EQ(llmRequest0->getContextCurrentPosition(), 0);
     int regularSnapshots = numTokens0 / linearAttentionMetadata.statesSnapshotInterval;
     int contextFinalState = (numTokens0 % tokensPerBlock != 0) ? beamWidth : 1;
@@ -412,6 +414,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     GenerationRequest seq1{1, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(
         seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, linearWindowSizeCode);
+    blockManager.holdSequence(seq1.getRequestId());
     int numReusedBlocks = numReusedTokens / tokensPerBlock;
     for (; numReusedBlocks > 0; --numReusedBlocks)
     {
@@ -806,25 +809,34 @@ void testKVCacheManagerLinearAttention_BlockCopying(
 }
 } // namespace
 
-TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest)
+TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_ContextNoReuse)
 {
     testBlockManagerLinearAttention_ContextNoReuse(4, 10);
     testBlockManagerLinearAttention_ContextNoReuse(8, 96);
     testBlockManagerLinearAttention_ContextNoReuse(8, 97);
     testBlockManagerLinearAttention_ContextNoReuse(1, 97);
+}
 
+TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_ContextReuse)
+{
     testBlockManagerLinearAttention_ContextReuse(4, 10, 135, 10);
     testBlockManagerLinearAttention_ContextReuse(4, 96, 135, 64);
     testBlockManagerLinearAttention_ContextReuse(4, 97, 135, 96);
     testBlockManagerLinearAttention_ContextReuse(1, 97, 135, 97);
+}
 
+TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_DecodingBlockGrowth)
+{
     testKVCacheManagerLinearAttention_DecodingBlockGrowth(1, 100, 100, true);
     testKVCacheManagerLinearAttention_DecodingBlockGrowth(1, 100, 100, false);
     testKVCacheManagerLinearAttention_DecodingBlockGrowth(4, 100, 100, true);
     testKVCacheManagerLinearAttention_DecodingBlockGrowth(4, 100, 100, false);
     testKVCacheManagerLinearAttention_DecodingBlockGrowth(4, 96, 100, true);
     testKVCacheManagerLinearAttention_DecodingBlockGrowth(4, 96, 100, false);
+}
 
+TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_BlockCopying)
+{
     testKVCacheManagerLinearAttention_BlockCopying(1, 100, 35, true);
     testKVCacheManagerLinearAttention_BlockCopying(4, 100, 35, true);
     testKVCacheManagerLinearAttention_BlockCopying(4, 96, 35, true);
