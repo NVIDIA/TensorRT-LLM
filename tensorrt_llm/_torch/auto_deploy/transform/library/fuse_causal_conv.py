@@ -127,8 +127,6 @@ class FuseCausalConvActivation(BaseTransform):
                 graph.erase_node(activation_node)
                 graph.erase_node(conv_node)
 
-        with open("/tmp/fuse_causal_conv_activation.txt", "a") as f:
-            f.write(str(graph))
         info = TransformInfo(
             skipped=False,
             num_matches=len(matches),
