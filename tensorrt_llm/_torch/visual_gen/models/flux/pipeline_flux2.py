@@ -44,11 +44,11 @@ from tensorrt_llm.logger import logger
 
 from .transformer_flux2 import Flux2Transformer2DModel
 
-# TeaCache coefficients for FLUX.2
+# TeaCache coefficients for FLUX.2 (different from FLUX.1)
 FLUX2_TEACACHE_COEFFICIENTS = {
     "dev": {
-        "ret_steps": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
-        "standard": [2.57151496e05, -3.54229917e04, 1.40286849e03, -1.35890334e01, 1.32517977e-01],
+        "ret_steps": [1.04582360e02, -6.87605554e00, -8.61659379e-02, 5.37600252e-02],
+        "standard": [1.04582360e02, -6.87605554e00, -8.61659379e-02, 5.37600252e-02],
     },
 }
 
@@ -122,27 +122,39 @@ class Flux2Pipeline(BasePipeline):
         super().__init__(model_config)
 
     @staticmethod
-    def _compute_flux2_timestep_embedding(module, timestep, guidance=None):
-        """Compute timestep embedding for FLUX.2 transformer.
+    def _compute_flux2_timestep_embedding(
+        module,
+        hidden_states=None,
+        timestep=None,
+        guidance=None,
+        **kwargs,
+    ):
+        """Compute modulated input for FLUX.2 TeaCache (matches original paper).
 
-        Always uses time_guidance_embed (handles both guided and unguided variants).
-
-        Args:
-            module: Flux2Transformer2DModel instance
-            timestep: Timestep tensor [B]
-            guidance: Guidance scale tensor [B] (optional, None for klein)
-
-        Returns:
-            Timestep embedding for TeaCache distance calculation
+        Computes norm1(x_embedder(hidden_states)) * (1 + scale) + shift using
+        the first transformer block's modulation, which captures both temporal
+        (timestep) and content (hidden_states) changes.
         """
-        embed = module.time_guidance_embed
-        te_dtype = next(embed.timestep_embedder.linear_1.parameters()).dtype
-        if te_dtype != torch.int8:
-            t = timestep.to(te_dtype)
-            g = guidance.to(te_dtype) if guidance is not None else None
-        else:
-            t, g = timestep, guidance
-        return embed(t, g)
+
+        # Embed hidden states through x_embedder (same as forward() line 698)
+        x = module.x_embedder(hidden_states.contiguous())
+
+        # Scale timestep/guidance (FLUX convention: multiply by 1000)
+        timestep = timestep.to(x.dtype) * 1000
+        if guidance is not None:
+            guidance = guidance.to(x.dtype) * 1000
+
+        # Compute temb (timestep + optional guidance)
+        temb = module.time_guidance_embed(timestep, guidance)
+
+        # Compute modulation from first block: ((shift1, scale1, gate1), ...)
+        img_mod = module.double_stream_modulation_img(temb)
+        shift1, scale1, _gate1 = img_mod[0]
+
+        # Apply modulation: norm1(x) * (1 + scale) + shift (same as block line 293-294)
+        modulated_input = module.transformer_blocks[0].norm1(x) * (1 + scale1) + shift1
+
+        return modulated_input
 
     @property
     def dtype(self):
@@ -301,8 +313,8 @@ class Flux2Pipeline(BasePipeline):
                 )
             )
 
-            # Enable TeaCache with FLUX.2-specific coefficients
-            self._setup_teacache(self.transformer, coefficients=FLUX2_TEACACHE_COEFFICIENTS)
+            # Enable TeaCache with FLUX.2-specific polynomial coefficients
+            self._setup_teacache(self.transformer, FLUX2_TEACACHE_COEFFICIENTS)
 
     def infer(self, req):
         """Run inference from DiffusionRequest."""

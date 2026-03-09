@@ -1,6 +1,8 @@
 # Visual Generation Examples
 
-Quick reference for running visual generation models (WAN).
+Quick reference for running visual generation models.
+Please refer to [the VisualGen doc](https://nvidia.github.io/TensorRT-LLM/models/visual-generation.html)
+about the details of the feature.
 
 ## Prerequisites
 
@@ -8,40 +10,53 @@ Quick reference for running visual generation models (WAN).
 # Install dependencies (from repository root)
 pip install -r requirements-dev.txt
 pip install git+https://github.com/huggingface/diffusers.git
-pip install av
 ```
 
-## Quick Start
+
+## FLUX (Text-to-Image)
+
+### Basic Usage
+
+**FLUX.1:**
 
 ```bash
-# Set MODEL_ROOT to your model directory (required for examples)
-export MODEL_ROOT=/llm-models
-# Optional: PROJECT_ROOT defaults to repo root when run from examples/visual_gen
-
-# Run all examples (auto-detects GPUs)
-cd examples/visual_gen
-./visual_gen_examples.sh
+python visual_gen_flux.py \
+    --model_path black-forest-labs/FLUX.1-dev \
+    --prompt "A cat sitting on a windowsill" \
+    --height 1024 --width 1024 \
+    --guidance_scale 3.5 \
+    --output_path output.png
 ```
 
+**With FP8 quantization:**
 
-## Environment Variables
+```bash
+python visual_gen_flux.py \
+    --model_path black-forest-labs/FLUX.2-dev \
+    --prompt "A cat sitting on a windowsill" \
+    --linear_type trtllm-fp8-per-tensor \
+    --output_path output_fp8.png
+```
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `PROJECT_ROOT` | Auto-detected | Path to repository root (set when running from `examples/visual_gen`) |
-| `MODEL_ROOT` | `/llm-models` | Path to model directory |
-| `TLLM_LOG_LEVEL` | `INFO` | Logging level |
+**Batch mode (multiple prompts from file):**
 
----
+```bash
+python visual_gen_flux.py \
+    --model_path black-forest-labs/FLUX.1-dev \
+    --prompts_file prompts.txt \
+    --output_dir results/ --seed 42
+```
+
 
 ## WAN (Text-to-Video)
 
 ### Basic Usage
 
 **Single GPU:**
+
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --output_path output.mp4
@@ -50,7 +65,7 @@ python visual_gen_wan_t2v.py \
 **With TeaCache:**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --enable_teacache \
@@ -67,7 +82,7 @@ WAN supports two parallelism modes that can be combined:
 **Ulysses Only (2 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
@@ -79,7 +94,7 @@ GPU Layout: GPU 0-1 share sequence (6 heads each)
 **CFG Only (2 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
@@ -91,7 +106,7 @@ GPU Layout: GPU 0 (positive) | GPU 1 (negative)
 **CFG + Ulysses (4 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
@@ -103,38 +118,48 @@ GPU Layout: GPU 0-1 (positive, Ulysses) | GPU 2-3 (negative, Ulysses)
 **Large-Scale (8 GPUs):**
 ```bash
 python visual_gen_wan_t2v.py \
-    --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers \
+    --model_path Wan-AI/Wan2.1-T2V-1.3B-Diffusers \
     --prompt "A cute cat playing piano" \
     --height 480 --width 832 --num_frames 33 \
     --attention_backend TRTLLM \
     --cfg_size 2 --ulysses_size 4 \
     --output_path output.mp4
 ```
-GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 
----
+
+## WAN (Image-to-Video)
+
+```bash
+python visual_gen_wan_i2v.py \
+    --model_path Wan-AI/Wan2.1-I2V-14B-480P-Diffusers \
+    --image_path input_image.jpg \
+    --prompt "She turns around and smiles" \
+    --height 480 --width 832 --num_frames 81 \
+    --output_path output_i2v.mp4
+```
+
 
 ## Common Arguments
 
-| Argument | WAN | Default | Description |
-|----------|-----|---------|-------------|
-| `--height` | ✓ | 720 | Output height |
-| `--width` | ✓ | 1280 | Output width |
-| `--num_frames` | ✓ | 81 | Number of frames |
-| `--steps` | ✓ | 50 | Denoising steps |
-| `--guidance_scale` | ✓ | 5.0 | CFG guidance strength |
-| `--seed` | ✓ | 42 | Random seed |
-| `--enable_teacache` | ✓ | False | Cache optimization |
-| `--teacache_thresh` | ✓ | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | VANILLA | VANILLA or TRTLLM |
-| `--cfg_size` | ✓ | 1 | CFG parallelism |
-| `--ulysses_size` | ✓ | 1 | Sequence parallelism |
-| `--linear_type` | ✓ | default | Quantization type |
+| Argument | FLUX | WAN | Default | Description |
+|----------|------|-----|---------|-------------|
+| `--height` | ✓ | ✓ | 1024 / 720 | Output height |
+| `--width` | ✓ | ✓ | 1024 / 1280 | Output width |
+| `--num_frames` | — | ✓ | 81 | Number of frames |
+| `--steps` | ✓ | ✓ | 50 | Denoising steps |
+| `--guidance_scale` | ✓ | ✓ | 3.5 / 5.0 | Guidance strength |
+| `--seed` | ✓ | ✓ | 42 | Random seed |
+| `--enable_teacache` | ✓ | ✓ | False | Cache optimization |
+| `--teacache_thresh` | ✓ | ✓ | 0.2 | TeaCache similarity threshold |
+| `--attention_backend` | ✓ | ✓ | VANILLA | VANILLA or TRTLLM |
+| `--cfg_size` | — | ✓ | 1 | CFG parallelism |
+| `--ulysses_size` | ✓ | ✓ | 1 | Sequence parallelism |
+| `--linear_type` | ✓ | ✓ | default | Quantization type |
 
 ## Troubleshooting
 
 **Out of Memory:**
-- Use quantization: `--linear_type trtllm-fp8-blockwise`
+- Use quantization: `--linear_type trtllm-fp8-blockwise` (WAN) or `--linear_type trtllm-fp8-per-tensor` (FLUX)
 - Reduce resolution or frames
 - Enable TeaCache: `--enable_teacache`
 - Use Ulysses parallelism with more GPUs
@@ -149,24 +174,15 @@ GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 - Install necessary dependencies, e.g., `pip install -r requirements-dev.txt`
 
 **Ulysses Errors:**
-- `ulysses_size` must divide 12 (WAN heads)
+- `ulysses_size` must divide the model's head count (12 for WAN)
 - Total GPUs = `cfg_size × ulysses_size`
 - Sequence length must be divisible by `ulysses_size`
 
 ## Output Formats
 
-- **WAN**: `.mp4` (video), `.gif` (animated), `.png` (single frame)
+- **FLUX**: `.png` (image)
+- **WAN**: `.mp4` if FFmpeg is installed, otherwise `.avi` (video)
 
-## Baseline Validation
+## Serving
 
-Compare with official HuggingFace Diffusers implementation:
-
-```bash
-# Run HuggingFace baselines
-./hf_examples.sh
-
-# Or run individual models
-python hf_wan.py --model_path ${MODEL_ROOT}/Wan2.1-T2V-1.3B-Diffusers
-```
-
-Compare outputs with same seed for correctness verification.
+See [`serve/README.md`](serve/README.md) for `trtllm-serve` examples including image generation (FLUX), video generation (WAN T2V/I2V), and API endpoint reference.

@@ -2868,13 +2868,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         pin_memory: bool = True,
         preallocate_extra_steps: int = 0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        pin_memory = pin_memory and prefer_pinned()
-        """Extract the logprobs from the request
+        """Extract the logprobs from the request.
 
         Returns:
             logprobs_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
             logprobs_indices_tensor: A tensor of shape (beam_width, num_generated_tokens, num_logprobs)
         """
+        pin_memory = pin_memory and prefer_pinned()
         num_generated_tokens = request.max_beam_num_tokens - request.py_prompt_len
         assert request.py_num_logprobs == 0, (
             "Beam search only supports returning the sampled logprob per token"
@@ -3056,10 +3056,9 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> None:
         """Update the request with the corrected tokens and logprobs for each beam.
 
-        arguments:
+        Args:
             request: The request to update
             beam_history: The beam history used to update the request
-            finish_reasons: The finish reasons to use to check if the beam is finished (Shape: (beam_width,))
         """
 
         beam_width = request.sampling_config.beam_width
@@ -3468,7 +3467,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         # NB: Unfortunately, Torch provides no combination of torch.index_select (similar to
         #     torch.Tensor.gather -- allows one-to-many mapping) and addition, analogous to how
-        #     torch.Tensor.scatter_add_ (and it's variant torch.Tensor.index_add_ -- allows
+        #     torch.Tensor.scatter_add_ (and its variant torch.Tensor.index_add_ -- allows
         #     many-to-one mapping) combine addition with torch.Tensor.scatter_.
         #
         #     Notwithstanding the previous point, there are two options:
@@ -3901,7 +3900,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         generation_requests_total_steps = (
             # NB: requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
             sum_num_generated_tokens
-            - cast(int, req_offsets[len(scheduled_requests.context_requests)].item())
+            - cast(int, req_offsets[scheduled_requests.num_context_requests].item())
             if scheduled_requests.generation_requests
             else 0
         )
@@ -3922,9 +3921,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # NB: Context request logits always precede generation request logits, also
         #     requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
         if any(r.py_return_context_logits for r in scheduled_requests.context_requests):
-            assert (
-                len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
-            )
+            assert len(num_context_logits_prefix_sum) == scheduled_requests.num_context_requests + 1
             req_num_generated_tokens_cuda = req_num_generated_tokens.to(
                 raw_logits_cuda.device, non_blocking=True
             )
@@ -3941,7 +3938,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # Since logits for generation requests are densely packed, cover them all by a single
                 # fictituous entry in 'context_req_offsets_cuda'.
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : (len(scheduled_requests.context_requests) + 1)
+                    : (scheduled_requests.num_context_requests + 1)
                 ].clone()
                 req_num_steps_fictitious_cuda[-1].fill_(generation_requests_total_steps)
                 next_context_req_offsets_cuda[-1].copy_(
@@ -3950,7 +3947,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
             else:
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : len(scheduled_requests.context_requests)
+                    : scheduled_requests.num_context_requests
                 ]
                 # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
                 # only end-offsets of the token storage locations matter.

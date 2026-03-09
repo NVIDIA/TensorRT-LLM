@@ -26,6 +26,7 @@ Design Goals:
 """
 
 import copy
+import functools
 import logging
 import os
 import pickle
@@ -40,6 +41,7 @@ import cloudpickle
 import pytest
 import torch
 from _torch.modules.moe.moe_test_utils import (
+    IS_CI_MODE,
     MoeBackendType,
     MoeModelConfig,
     create_test_param,
@@ -50,7 +52,9 @@ from _torch.modules.moe.moe_test_utils import (
     should_skip_cutlass,
     should_skip_deepgemm,
     should_skip_multi_gpu,
+    should_skip_to_accelerate_ci,
     should_skip_trtllm,
+    skip_if_insufficient_gpu_memory,
     supports_autotuner_capture,
 )
 from _torch.modules.moe.quantize_utils import get_test_quant_params
@@ -59,6 +63,7 @@ from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
 
 import tensorrt_llm.bindings.internal.runtime as _tbr
+from tensorrt_llm._mnnvl_utils import MnnvlMemory
 from tensorrt_llm._torch.autotuner import AutoTuner, autotune
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import (
@@ -70,6 +75,8 @@ from tensorrt_llm._torch.modules.fused_moe import (
     RenormalizeNaiveMoeRoutingMethod,
     create_moe,
 )
+from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import DeepEPLowLatency
+from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.fused_moe.moe_load_balancer import (
     MoeLoadBalancer,
     MoeLoadBalancerIterContext,
@@ -519,6 +526,12 @@ def _test_moe_worker_impl(
         # Get swiglu tensors if swiglu_gptoss_style is enabled
         swiglu_tensors = quantize_util.get_swiglu_tensors()
 
+        # Get weight_loading_mode from quantize_util if available
+        # (e.g., W4A8AWQQuantizeUtil uses W4A8_CUSTOM mode)
+        weight_loading_mode = getattr(
+            quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
+        )
+
         with moe_load_balancer:
             # Create and setup fused MoE module
             fused_moe = create_moe(
@@ -529,6 +542,7 @@ def _test_moe_worker_impl(
                 swiglu_alpha=swiglu_tensors["swiglu_alpha"] if swiglu_tensors else None,
                 swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
                 swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
+                weight_loading_mode=weight_loading_mode,
             )
             fused_moe.load_weights([weights])
             fused_moe.post_load_weights()
@@ -725,11 +739,7 @@ LOCAL_MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS + [
     MoeModelConfig(4, 2, 128, 64),  # intermediate < hidden
 ]
 
-MOE_MODEL_CONFIGS = (
-    CI_MOE_MODEL_CONFIGS
-    if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1"
-    else LOCAL_MOE_MODEL_CONFIGS
-)
+MOE_MODEL_CONFIGS = CI_MOE_MODEL_CONFIGS if IS_CI_MODE else LOCAL_MOE_MODEL_CONFIGS
 
 # Sequence lengths to test
 SEQ_LENS = [1, 8]
@@ -787,23 +797,47 @@ CI_SWIGLU_COMBOS = [
 ]
 
 # Default runs CI subset. Set TRTLLM_TEST_MOE_CI=0 for full local matrix.
-SWIGLU_COMBOS = (
-    CI_SWIGLU_COMBOS if os.environ.get("TRTLLM_TEST_MOE_CI", "1") == "1" else LOCAL_SWIGLU_COMBOS
-)
+SWIGLU_COMBOS = CI_SWIGLU_COMBOS if IS_CI_MODE else LOCAL_SWIGLU_COMBOS
+
+
+@functools.lru_cache(maxsize=1)
+def _is_mnnvl_supported() -> bool:
+    """Cached check for MNNVL platform support (pynvml query is expensive)."""
+    return MnnvlMemory.supports_mnnvl()
 
 
 def _get_comm_method_skip_reason(
     comm_method: str,
     model_config: "MoeModelConfig",
+    dtype: Optional[torch.dtype] = None,
 ) -> Optional[str]:
     """
     Check if a communication method is compatible with the given model config.
 
     Returns a skip reason string if incompatible, None otherwise.
     """
-    from tensorrt_llm._torch.modules.fused_moe.communication.deep_ep_low_latency import (
-        DeepEPLowLatency,
-    )
+    # NVLink-based methods require MNNVL support (all NVLink links active).
+    # See: _mnnvl_utils.py:supports_mnnvl() -> support_nvlink(need_all_up=True)
+    # Without MNNVL, Communication.__init__() raises RuntimeError (base.py:53-58).
+    if comm_method in ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED"):
+        if not _is_mnnvl_supported():
+            return (
+                f"{comm_method} requires MNNVL support (all NVLink links active). "
+                f"Not supported on this platform."
+            )
+
+    # DeepEP normal mode: is_workload_feasible (deep_ep.py:127) rejects
+    # non-bfloat16, causing a runtime fallback to AllGather. The fallback
+    # replaces self.comm, and when the old DeepEP object is GC'd its
+    # Buffer destructor calls intranode::barrier (deep_ep.cpp:90) which
+    # requires all ranks simultaneously -- non-deterministic GC timing
+    # across MPI ranks causes the barrier to timeout and crash.
+    if comm_method == "DEEPEP" and dtype is not None and dtype != torch.bfloat16:
+        return (
+            f"DeepEP is_workload_feasible rejects dtype={dtype} "
+            f"(requires bfloat16), and the runtime fallback triggers an "
+            f"unsafe Buffer destruction that crashes all ranks."
+        )
 
     if comm_method == "DEEPEPLOWLATENCY":
         if model_config.hidden_size not in DeepEPLowLatency.SUPPORTED_HIDDEN_SIZES:
@@ -867,19 +901,42 @@ def generate_multi_gpu_test_params(
         ):
             # Check multi-GPU specific skip conditions (short-circuit on first match)
             if not skip_reason:
+                # TP modes shard intermediate_size; EP modes don't
+                moe_tp_size = 4 if parallel_mode in ("DTP", "TTP") else 1
                 for reason in (
-                    _get_comm_method_skip_reason(comm_method, model_config),
+                    _get_comm_method_skip_reason(comm_method, model_config, dtype=dtype),
                     should_skip_trtllm(
-                        backend_type, quant_algo, model_config, comm_method=comm_method
+                        backend_type,
+                        quant_algo,
+                        model_config,
+                        comm_method=comm_method,
+                        moe_tp_size=moe_tp_size,
                     ),
                     should_skip_cutlass(
-                        backend_type, comm_method, quant_algo=quant_algo, model_config=model_config
+                        backend_type,
+                        comm_method,
+                        quant_algo=quant_algo,
+                        model_config=model_config,
+                        moe_tp_size=moe_tp_size,
+                        dtype=dtype,
                     ),
-                    should_skip_cutedsl(backend_type, quant_algo, model_config, comm_method),
+                    should_skip_cutedsl(
+                        backend_type,
+                        quant_algo,
+                        model_config,
+                        comm_method,
+                        moe_tp_size=moe_tp_size,
+                    ),
                     should_skip_deepgemm(
-                        backend_type, comm_method, quant_algo=quant_algo, model_config=model_config
+                        backend_type,
+                        comm_method,
+                        quant_algo=quant_algo,
+                        model_config=model_config,
+                        moe_tp_size=moe_tp_size,
                     ),
-                    should_skip_multi_gpu(parallel_mode, model_config, world_size=4),
+                    should_skip_multi_gpu(
+                        parallel_mode, model_config, world_size=4, comm_method=comm_method
+                    ),
                 ):
                     if reason:
                         skip_reason = reason
@@ -974,7 +1031,6 @@ BASE_TEST_PARAMS = generate_base_test_params(
 )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.parametrize(
     "dtype,moe_backend,quant_algo,seq_len,model_config,routing_method_cls,"
     "swiglu_alpha,swiglu_beta,swiglu_limit",
@@ -1000,6 +1056,26 @@ def test_configurable_moe_single_gpu(
     3. Autotune captures and replays all tactics properly
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
+    swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    ci_skip = should_skip_to_accelerate_ci(
+        backend_type=MoeBackendType(moe_backend),
+        quant_algo=quant_algo,
+        model_config=model_config,
+        routing_method_cls=routing_method_cls,
+        dtype=dtype,
+        seq_len=seq_len,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+    )
+    if ci_skip:
+        pytest.skip(ci_skip)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype,
+    )
+
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
     # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
@@ -1033,7 +1109,7 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
     comm_methods=COMM_METHODS,
     swiglu_combos=SWIGLU_COMBOS,
     model_configs=MOE_MODEL_CONFIGS,
-    seq_lens=SEQ_LENS,
+    seq_lens=[8] if IS_CI_MODE else SEQ_LENS,
     dtypes=DTYPES,
     backend_types=BACKEND_TYPES,
     quant_algos=QUANT_ALGOS,
@@ -1041,7 +1117,6 @@ MULTI_GPU_TEST_PARAMS = generate_multi_gpu_test_params(
 )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
 @pytest.mark.parametrize(
     "parallel_mode,comm_method_type,dtype,moe_backend,quant_algo,seq_len,model_config,"
@@ -1061,6 +1136,27 @@ def test_configurable_moe_multi_gpu(
     swiglu_beta,
     swiglu_limit,
 ):
+    swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
+    ci_skip = should_skip_to_accelerate_ci(
+        backend_type=MoeBackendType(moe_backend),
+        quant_algo=quant_algo,
+        model_config=model_config,
+        routing_method_cls=routing_method_cls,
+        dtype=dtype,
+        seq_len=seq_len,
+        swiglu_gptoss_style=swiglu_gptoss_style,
+        parallel_mode=parallel_mode,
+    )
+    if ci_skip:
+        pytest.skip(ci_skip)
+
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype,
+    )
+
     # DeepSeekV3 routing requires float32 routing_logits for TRTLLM backend
     # See: cpp/tensorrt_llm/thop/fp4BlockScaleMoe.cpp:70-72
     dtype_routing_logits = None
@@ -1251,6 +1347,10 @@ def generate_eplb_test_params(
             backend_type, quant_algo, dtype, model_config, routing_method_cls
         )
 
+        # Check comm method platform compatibility (e.g. NVLink support)
+        if not skip_reason:
+            skip_reason = _get_comm_method_skip_reason(comm_method, model_config)
+
         # Check EPLB-specific skip conditions
         if not skip_reason:
             skip_reason = _should_skip_EPLB(
@@ -1294,7 +1394,6 @@ EPLB_TEST_PARAMS = generate_eplb_test_params(
 )
 
 
-@pytest.mark.skip(reason="Temporarily skipped due to the long time to run the test")
 @pytest.mark.skipif(torch.cuda.device_count() < 4, reason="needs 4 GPUs to run this test")
 @pytest.mark.skipif(
     not _tbr.is_host_accessible_device_memory_supported(),
@@ -1314,6 +1413,13 @@ def test_configurable_moe_multi_gpu_eplb(
     num_slots,
     routing_method_cls,
 ):
+    skip_if_insufficient_gpu_memory(
+        model_config.num_experts,
+        model_config.hidden_size,
+        model_config.intermediate_size,
+        dtype,
+    )
+
     world_size = 4
     _test_moe_multi_gpu(
         comm_method_type,

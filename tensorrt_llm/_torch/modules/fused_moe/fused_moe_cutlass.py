@@ -80,11 +80,14 @@ class CutlassFusedMoE(MoE):
         # FP8_BLOCK_SCALES: SM in {90, 120}
         QuantAlgo.FP8_BLOCK_SCALES: {
             "sm_constraint": ("in", {90, 120}),
-            "dtypes": {torch.float16, torch.bfloat16, torch.float32},
+            "dtypes": {torch.bfloat16},
         },
-        # NVFP4: SM in {100, 103}
+        # NVFP4: SM in {100, 103, 120, 121}
+        # SM 120 = desktop Blackwell (e.g. RTX 5090 / GB202)
+        # SM 121 = GB10 / DGX Spark
+        # C++ kernel: isValidSM120MOESpecialisation() supports FP4xFP4 and FP8xFP4
         QuantAlgo.NVFP4: {
-            "sm_constraint": ("in", {100, 103}),
+            "sm_constraint": ("in", {100, 103, 120, 121}),
             "dtypes": {torch.float16, torch.bfloat16, torch.float8_e4m3fn},
         },
         # W4A8_AWQ: SM in {89, 90} only
@@ -131,7 +134,7 @@ class CutlassFusedMoE(MoE):
         - Unquantized (FP16/BF16): SM >= 80
         - FP8 per-tensor (QDQ): SM >= 89
         - FP8_BLOCK_SCALES: SM in {90, 120}
-        - NVFP4: SM in {100, 103}
+        - NVFP4: SM in {100, 103, 120, 121}
         - W4A8_AWQ: SM in {89, 90} only
         - W8A16: SM >= 80
         - W4A16_MXFP4: SM == 90 only
