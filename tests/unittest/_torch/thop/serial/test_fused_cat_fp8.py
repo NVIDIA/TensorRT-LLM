@@ -38,16 +38,6 @@ from utils.util import getSMVersion
 # Import tensorrt_llm to load custom CUDA operators
 import tensorrt_llm  # noqa: F401
 
-if not torch.cuda.is_available():
-    pytest.skip("CUDA is required", allow_module_level=True)
-
-# Check that the fused op is available
-try:
-    torch.ops.trtllm.fused_cat_fp8
-    HAS_FUSED_OP = True
-except (AttributeError, RuntimeError):
-    HAS_FUSED_OP = False
-
 
 def _reference_cat_fp8(pe, nope, use_ue8m0=False):
     """Sequential reference: cat → fp8_quantize_1x128_sf_transpose."""
@@ -123,7 +113,6 @@ def _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label=""):
 @pytest.mark.parametrize("M", [1, 32, 64, 1024, 65536])
 @pytest.mark.parametrize("pe_dim,nope_dim", [(64, 64)])
 @pytest.mark.parametrize("use_ue8m0", [True, False])
-@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_fp8 op not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_fp8_correctness(M, pe_dim, nope_dim, use_ue8m0):
     """Test that fused kernel matches sequential reference (cat + fp8 quantize)."""
@@ -145,7 +134,6 @@ def test_fused_cat_fp8_correctness(M, pe_dim, nope_dim, use_ue8m0):
 
 
 @pytest.mark.parametrize("M", [1, 256])
-@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_fp8 op not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_fp8_output_shape(M):
     """Test that output shapes are correct."""
@@ -164,7 +152,6 @@ def test_fused_cat_fp8_output_shape(M):
     assert scale.dtype == torch.float32
 
 
-@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_fp8 op not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_fp8_zero_input():
     """Test with zero inputs — scales should be minimal, FP8 values should be zero."""
@@ -182,7 +169,6 @@ def test_fused_cat_fp8_zero_input():
 
 
 @pytest.mark.parametrize("M", [64, 1024])
-@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_fp8 op not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_fp8_noncontiguous_input(M):
     """Test with non-contiguous inputs (simulates torch.split in DSA indexer).
@@ -214,7 +200,6 @@ def test_fused_cat_fp8_noncontiguous_input(M):
 
 @pytest.mark.parametrize("M", [1, 16, 64])
 @pytest.mark.parametrize("n_heads", [64])
-@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_fp8 op not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_fp8_3d_input(M, n_heads):
     """Test with 3D inputs matching Q path: [M, n_heads, dim] from split.
@@ -255,7 +240,6 @@ def test_fused_cat_fp8_3d_input(M, n_heads):
 
 
 @pytest.mark.parametrize("M", [1, 16])
-@pytest.mark.skipif(not HAS_FUSED_OP, reason="fused_cat_fp8 op not available")
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
 def test_fused_cat_fp8_mixed_contiguity(M):
     """Test where pe is contiguous but nope is non-contiguous.
