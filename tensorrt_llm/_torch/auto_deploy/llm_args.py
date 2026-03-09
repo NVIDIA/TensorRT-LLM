@@ -244,7 +244,7 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
         description=_shortcut_description("Attention backend to use.", "attn_backend"),
     )
     compile_backend: str = Field(
-        default="torch-compile",
+        default="torch-cudagraph",
         description=_shortcut_description(
             "The backend to use for compiling the model.", "compile_backend"
         ),
