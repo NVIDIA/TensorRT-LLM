@@ -14,7 +14,7 @@ from ..autotuner import (AutoTuner, ConstraintSpec, DistributedTuningStrategy,
 from ..cute_dsl_utils import IS_CUTLASS_DSL_AVAILABLE
 from ..utils import (fp4_scale_infer_shape, fp8_scale_infer_shape,
                      get_last_power_of_2_num_tokens_buckets,
-                     last_positive_power_of_2)
+                     last_positive_power_of_2, next_positive_power_of_2)
 
 try:
     from cuda.bindings import driver as cuda
@@ -318,6 +318,8 @@ if IS_CUTLASS_DSL_AVAILABLE:
         Sm100BlockwiseGemmKernel
     from ..cute_dsl_kernels.blackwell.dense_blockscaled_gemm_persistent import \
         Sm100BlockScaledPersistentDenseGemmKernel
+    from ..cute_dsl_kernels.blackwell.top_k.filtered_top_k_decode_varlen import \
+        FilteredTopKKernelVarlenDecode
     from ..cute_dsl_kernels.blackwell.utils import make_ptr
 
     class CuteDSLNVFP4BlackwellRunner(TunableRunner):
@@ -2807,3 +2809,933 @@ if IS_CUTLASS_DSL_AVAILABLE:
         assert output.dtype == torch.bfloat16, "CuTe DSL fp8 bmm output dtype must be bf16"
         assert output.shape == (batch_size, m,
                                 n), "CuTe DSL fp8 bmm output shape is incorrect"
+
+    def _get_num_sms() -> int:
+        """Return the number of SMs on the current device (cached)."""
+        if not hasattr(_get_num_sms, "_value"):
+            _get_num_sms._value = (
+                torch.cuda.get_device_properties().multi_processor_count)
+        return _get_num_sms._value
+
+    # Module-level dtype mapping (avoid recreating per call)
+    _TORCH_TO_CUTLASS_DTYPE = {
+        torch.float16: cutlass.Float16,
+        torch.bfloat16: cutlass.BFloat16,
+        torch.float32: cutlass.Float32,
+    }
+
+    class CuteDSLTopKDecodeSingleCTARunner:
+        """Runner for CuTE DSL Top-K decode kernel (single CTA version).
+
+        This runner manages compilation and execution of the filtered top-k kernel
+        optimized for Blackwell architecture using CuTE DSL. It implements a
+        radix-based filtering algorithm for efficient top-k selection.
+
+        The runner caches compiled kernels based on configuration (dtype, shape, top_k)
+        to avoid redundant recompilation.
+
+        All methods are class-level — no instantiation needed. Call methods directly
+        via ``CuteDSLTopKDecodeSingleCTARunner.forward(...)``.
+
+        Attributes:
+            kernel_cache: Class-level dict mapping configuration tuples to compiled kernels.
+                         Keys are (dtype, num_cols, top_k, next_n, return_val, num_copy_bits,
+                         load_balance, large_occupancy).
+
+        Note:
+            - Requires Blackwell architecture (SM100+)
+            - Maximum tested top_k is 2048 (see kernel documentation for larger values)
+            - Supports fp16, bf16, and fp32 dtypes
+            - Automatically selects occupancy optimization based on batch size
+        """
+        kernel_cache = dict()
+
+        @classmethod
+        def _compile(cls, dtype, bucketed_num_cols, top_k, next_n, return_val,
+                     num_copy_bits, load_balance, large_occupancy):
+            """Compile and cache a single-CTA top-k kernel for the given config."""
+            key = (
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+            )
+            if key in cls.kernel_cache:
+                return
+            n_rows = cute.sym_int()
+            n_cols = cute.sym_int()
+            n_batch = cute.sym_int()
+            input_fake = cute.runtime.make_fake_compact_tensor(dtype,
+                                                               (n_rows, n_cols),
+                                                               stride_order=(1,
+                                                                             0),
+                                                               assumed_align=32)
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, cute.sym_int(), n_cols),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
+            seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch, ),
+                stride_order=(0, ),
+            )
+            output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, top_k),
+                stride_order=(1, 0),
+            )
+            if return_val:
+                output_values_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype,
+                    (n_rows, top_k),
+                    stride_order=(1, 0),
+                )
+            else:
+                output_values_fake = None
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
+            filtered_topk_func = FilteredTopKKernelVarlenDecode(
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                num_copy_bits=num_copy_bits,
+                return_val=return_val,
+                large_occupancy=large_occupancy,
+                num_sms=_get_num_sms(),
+            )
+            if load_balance:
+                g_global_counter_fake = cute.runtime.make_fake_compact_tensor(
+                    cutlass.Int32, (1, ), stride_order=(0, ))
+            else:
+                g_global_counter_fake = None
+            compiled_kernel = cute.compile(
+                filtered_topk_func,
+                input_fake,
+                None,  # indices_fake
+                buffer_fake,
+                g_global_counter_fake,
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
+                min_blocks_per_mp=4 if large_occupancy else 1,
+                options="--enable-tvm-ffi",
+            )
+            cls.kernel_cache[key] = compiled_kernel
+
+        @classmethod
+        def forward(
+            cls,
+            input_values: torch.Tensor,
+            seq_lens: torch.Tensor,
+            top_k: int,
+            next_n: int,
+            return_val: bool = False,
+            num_copy_bits: int = 256,
+            load_balance: bool = False,
+        ):
+            """Execute filtered top-k selection on input logits."""
+            torch_dtype = input_values.dtype
+            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+            num_rows, num_cols = input_values.shape
+            bucketed_num_cols = next_positive_power_of_2(num_cols)
+
+            num_sms = _get_num_sms()
+            large_occupancy = num_rows > num_sms
+
+            # Compilation key
+            key = (
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+            )
+
+            if key not in cls.kernel_cache:
+                cls._compile(
+                    dtype,
+                    bucketed_num_cols,
+                    top_k,
+                    next_n,
+                    return_val,
+                    num_copy_bits,
+                    load_balance,
+                    large_occupancy,
+                )
+            compiled_kernel = cls.kernel_cache[key]
+
+            # Prepare output tensors
+            output_indices_torch = torch.empty(num_rows,
+                                               top_k,
+                                               dtype=torch.int32,
+                                               device="cuda")
+            if return_val:
+                output_values_torch = torch.empty(num_rows,
+                                                  top_k,
+                                                  dtype=torch_dtype,
+                                                  device="cuda")
+            else:
+                output_values_torch = None
+
+            # Prepare buffer
+            if dtype == cutlass.Float32:
+                buffer_numbers = 2
+            else:
+                buffer_numbers = 1
+            buffer_bytes = num_rows * buffer_numbers * num_cols * 4
+            if buffer_bytes > 1 << 30:  # > 1 GB
+                logger.warning(
+                    f"CuTE DSL top-k: intermediate buffer is {buffer_bytes / (1 << 30):.1f} GB "
+                    f"(num_rows={num_rows}, num_cols={num_cols}). "
+                    "Consider reducing batch size or vocab size to avoid OOM.")
+            buffer_torch = torch.empty(num_rows,
+                                       buffer_numbers,
+                                       num_cols,
+                                       dtype=torch.int32,
+                                       device="cuda")
+
+            # Prepare global counter for persistent dynamic scheduling
+            if load_balance:
+                g_global_counter_torch = torch.zeros(1,
+                                                     dtype=torch.int32,
+                                                     device="cuda")
+            else:
+                g_global_counter_torch = None
+
+            # Execute kernel (TVM FFI uses env stream automatically)
+            compiled_kernel(
+                input_values,
+                None,  # indices
+                buffer_torch,
+                g_global_counter_torch,
+                seq_lens,
+                output_indices_torch,
+                output_values_torch,
+            )
+
+            return output_indices_torch, output_values_torch
+
+    @torch.library.custom_op("trtllm::cute_dsl_topk_decode_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_topk_decode_blackwell(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        load_balance: bool = False,
+    ) -> torch.Tensor:
+        """CuteDSL-based Top-K selection optimized for Blackwell decode phase.
+
+        Args:
+            input_values: Input logits tensor [batch_size * next_n, vocab_size]
+            seq_lens: Sequence lengths for each batch [batch_size]
+            top_k: Number of top elements to select (max 2048)
+            next_n: Number of candidates per sequence (for speculative decoding)
+            num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+            load_balance: Enable persistent dynamic scheduling for load balancing
+
+        Returns:
+            indices: Top-k indices [batch_size * next_n, top_k]
+
+        Note:
+            This function requires Blackwell architecture (SM100+) and CuTE DSL support.
+            Maximum supported top_k is 2048.
+        """
+        # Validate SM version
+        sm_version = get_sm_version()
+        if sm_version < 100:
+            raise ValueError(
+                f"CuTE DSL top-k requires Blackwell (SM100+), but got SM {sm_version}. "
+                "Use standard top-k implementation for older architectures.")
+
+        # Validate inputs
+        if top_k <= 0 or top_k > 2048:
+            raise ValueError(
+                f"top_k must be in range [1, 2048], got {top_k}. "
+                "Maximum supported top_k is 2048 for Blackwell architecture.")
+
+        if next_n <= 0:
+            raise ValueError(f"next_n must be positive, got {next_n}")
+
+        if num_copy_bits not in [128, 256]:
+            raise ValueError(
+                f"num_copy_bits must be 128 or 256, got {num_copy_bits}")
+
+        if input_values.dim() != 2:
+            raise ValueError(
+                f"input_values must be 2D [num_rows, vocab_size], got shape {input_values.shape}"
+            )
+
+        if seq_lens.dim() != 1:
+            raise ValueError(
+                f"seq_lens must be 1D [batch_size], got shape {seq_lens.shape}")
+
+        supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+        if input_values.dtype not in supported_dtypes:
+            raise ValueError(f"Unsupported dtype {input_values.dtype}. "
+                             f"Supported dtypes: {supported_dtypes}")
+
+        indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
+            input_values=input_values,
+            seq_lens=seq_lens,
+            top_k=top_k,
+            next_n=next_n,
+            return_val=False,  # Only return indices
+            num_copy_bits=num_copy_bits,
+            load_balance=load_balance,
+        )
+        return indices
+
+    @torch.library.register_fake("trtllm::cute_dsl_topk_decode_blackwell")
+    def _(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        load_balance: bool = False,
+    ):
+        num_rows = input_values.shape[0]
+        input_values.dtype
+
+        # Create output tensors matching the custom op return signature: (values, indices)
+        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+        return indices
+
+    class CuteDSLTopKDecodeMultiCTARunner:
+        """Runner for CuTE DSL Top-K decode kernel (multi CTA version).
+
+        This runner manages compilation and execution of the filtered top-k kernel
+        using multiple CTAs per row, optimized for Blackwell architecture using
+        CuTE DSL. It splits each row into chunks processed by separate CTAs,
+        then merges partial results in a second kernel pass.
+
+        Supports two modes:
+        - **Static** (dynamic=False): Fixed grid (num_rows, num_ctas_per_row).
+          All rows get the same number of CTAs.
+        - **Dynamic** (dynamic=True): 1D grid with binary search task mapping.
+          Each row gets only the CTAs it needs. Merge kernel reads per-row
+          valid length from an offset table.
+
+        The runner caches compiled kernel pairs (first pass + merge pass) based on
+        configuration to avoid redundant recompilation.
+
+        All methods are class-level — no instantiation needed. Call methods directly
+        via ``CuteDSLTopKDecodeMultiCTARunner.forward(...)``.
+
+        Attributes:
+            kernel_cache: Class-level dict mapping configuration tuples to compiled
+                         kernel pairs (first_kernel, second_kernel).
+
+        Note:
+            - Requires Blackwell architecture (SM100+)
+            - Maximum tested top_k is 2048
+            - Supports fp16, bf16, and fp32 dtypes
+            - Automatically selects occupancy optimization based on batch size
+        """
+        kernel_cache = dict()
+
+        @classmethod
+        def _compile(cls,
+                     dtype,
+                     bucketed_num_cols,
+                     top_k,
+                     next_n,
+                     return_val,
+                     num_copy_bits,
+                     load_balance,
+                     large_occupancy,
+                     chunk_size_per_cta,
+                     num_ctas_per_row,
+                     dynamic=False):
+            """Compile and cache multi-CTA top-k kernels for the given config."""
+            key = (
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+                True,
+                chunk_size_per_cta,
+                num_ctas_per_row,
+                dynamic,
+            )
+            if key in cls.kernel_cache:
+                return
+            n_rows = cute.sym_int()
+            n_cols = cute.sym_int()
+            n_batch = cute.sym_int()
+            input_fake = cute.runtime.make_fake_compact_tensor(dtype,
+                                                               (n_rows, n_cols),
+                                                               stride_order=(1,
+                                                                             0),
+                                                               assumed_align=32)
+            buffer_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (cute.sym_int(), cute.sym_int(), cute.sym_int()),
+                stride_order=(2, 1, 0),
+                assumed_align=32,
+            )
+            seqlen_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_batch, ),
+                stride_order=(0, ),
+            )
+            n_first_kernel_output_cols = cute.sym_int()
+            first_kernel_output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, n_first_kernel_output_cols),
+                stride_order=(1, 0),
+            )
+            first_kernel_output_values_fake = cute.runtime.make_fake_compact_tensor(
+                dtype,
+                (n_rows, n_first_kernel_output_cols),
+                stride_order=(1, 0),
+                assumed_align=32,
+            )
+            fake_stream = cute.runtime.make_fake_stream(
+                use_tvm_ffi_env_stream=True)
+
+            # First kernel: process each chunk independently
+            filtered_topk_func_first = FilteredTopKKernelVarlenDecode(
+                dtype,
+                chunk_size_per_cta,  # num_cols
+                top_k,
+                next_n,
+                num_copy_bits=num_copy_bits,
+                return_val=True,  # first kernel must return values
+                large_occupancy=large_occupancy,
+                enable_multi_cta=True,
+                chunk_size_per_cta=chunk_size_per_cta,
+                num_ctas_per_row=num_ctas_per_row,
+                merge_blocks=False,
+                enable_dynamic_multi_cta=dynamic,
+            )
+            compiled_kernel_first = cute.compile(
+                filtered_topk_func_first,
+                input_fake,
+                None,  # indices_fake
+                buffer_fake,
+                None,  # g_global_counter_fake
+                seqlen_fake,
+                first_kernel_output_indices_fake,
+                first_kernel_output_values_fake,
+                stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
+                min_blocks_per_mp=1,
+                options="--enable-tvm-ffi",
+            )
+
+            # Second kernel: merge partial results
+            merge_num_cols = num_ctas_per_row * top_k
+            indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, n_first_kernel_output_cols),
+                stride_order=(1, 0),
+            )
+            output_indices_fake = cute.runtime.make_fake_compact_tensor(
+                cutlass.Int32,
+                (n_rows, top_k),
+                stride_order=(1, 0),
+            )
+            if return_val:
+                output_values_fake = cute.runtime.make_fake_compact_tensor(
+                    dtype,
+                    (n_rows, top_k),
+                    stride_order=(1, 0),
+                )
+            else:
+                output_values_fake = None
+
+            filtered_topk_func_second = FilteredTopKKernelVarlenDecode(
+                dtype,
+                merge_num_cols,  # num_cols
+                top_k,
+                next_n,
+                num_copy_bits=num_copy_bits,
+                return_val=return_val,
+                large_occupancy=large_occupancy,
+                enable_multi_cta=False,
+                merge_blocks=True,
+                varlen_merge_input=dynamic,
+            )
+            compiled_kernel_second = cute.compile(
+                filtered_topk_func_second,
+                input_fake,
+                indices_fake,
+                buffer_fake,
+                None,  # g_global_counter_fake
+                seqlen_fake,
+                output_indices_fake,
+                output_values_fake,
+                stream=fake_stream,
+                enable_persistent_dynamic_scheduling=load_balance,
+                min_blocks_per_mp=1,
+                options="--enable-tvm-ffi",
+            )
+            cls.kernel_cache[key] = (compiled_kernel_first,
+                                     compiled_kernel_second)
+
+        @classmethod
+        def forward(
+            cls,
+            input_values: torch.Tensor,
+            seq_lens: torch.Tensor,
+            top_k: int,
+            next_n: int,
+            return_val: bool = False,
+            num_copy_bits: int = 256,
+            chunk_size_per_cta: int = 16384,
+            dynamic: bool = True,
+        ):
+            """Execute multi-CTA filtered top-k selection on input logits."""
+            torch_dtype = input_values.dtype
+            dtype = _TORCH_TO_CUTLASS_DTYPE[torch_dtype]
+            num_rows, num_cols = input_values.shape
+            bucketed_num_cols = next_positive_power_of_2(num_cols)
+
+            num_sms = _get_num_sms()
+            large_occupancy = num_rows > num_sms
+            load_balance = False
+
+            num_ctas_per_row = math.ceil(num_cols / chunk_size_per_cta)
+            merge_cols = num_ctas_per_row * top_k
+
+            # Compilation key (use bucketed_num_cols to reduce recompilations;
+            # include num_ctas_per_row since it depends on actual num_cols)
+            key = (
+                dtype,
+                bucketed_num_cols,
+                top_k,
+                next_n,
+                return_val,
+                num_copy_bits,
+                load_balance,
+                large_occupancy,
+                True,  # enable_multi_cta
+                chunk_size_per_cta,
+                num_ctas_per_row,
+                dynamic,
+            )
+
+            if key not in cls.kernel_cache:
+                cls._compile(
+                    dtype,
+                    bucketed_num_cols,
+                    top_k,
+                    next_n,
+                    return_val,
+                    num_copy_bits,
+                    load_balance,
+                    large_occupancy,
+                    chunk_size_per_cta,
+                    num_ctas_per_row,
+                    dynamic,
+                )
+            compiled_kernel_first, compiled_kernel_second = \
+                cls.kernel_cache[key]
+
+            if dtype == cutlass.Float32:
+                buffer_numbers = 2
+            else:
+                buffer_numbers = 1
+
+            if dynamic:
+                # Dynamic mode: 2D grid (num_rows, num_ctas_per_row) with
+                # per-CTA early exit for rows needing fewer chunks.
+                # Intermediate buffers: 2D (num_rows, merge_cols)
+                first_output_indices = torch.empty(num_rows,
+                                                   merge_cols,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
+                first_output_values = torch.empty(num_rows,
+                                                  merge_cols,
+                                                  dtype=torch_dtype,
+                                                  device="cuda")
+
+                # Shared buffer for both kernels (they run sequentially)
+                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+                                           buffer_numbers,
+                                           buffer_dim2,
+                                           dtype=torch.int32,
+                                           device="cuda")
+
+                # Final output tensors
+                output_indices_torch = torch.empty(num_rows,
+                                                   top_k,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
+                if return_val:
+                    output_values_torch = torch.empty(num_rows,
+                                                      top_k,
+                                                      dtype=torch_dtype,
+                                                      device="cuda")
+                else:
+                    output_values_torch = None
+
+                # Execute first kernel: per-chunk top-k with early exit
+                compiled_kernel_first(
+                    input_values,
+                    None,  # indices
+                    buffer_torch,
+                    None,  # g_global_counter_torch
+                    seq_lens,
+                    first_output_indices,
+                    first_output_values,
+                )
+
+                # Execute second kernel: varlen merge (reuses buffer_torch)
+                # merge_width computed in-kernel from seqlen.
+                compiled_kernel_second(
+                    first_output_values,
+                    first_output_indices,
+                    buffer_torch,
+                    None,  # g_global_counter_torch
+                    seq_lens,
+                    output_indices_torch,
+                    output_values_torch,
+                )
+            else:
+                # Static mode: fixed grid (num_rows, num_ctas_per_row)
+                # Prepare intermediate output tensors for first kernel
+                first_kernel_output_indices_torch = torch.empty(
+                    num_rows, merge_cols, dtype=torch.int32, device="cuda")
+                first_kernel_output_values_torch = torch.empty(
+                    num_rows, merge_cols, dtype=torch_dtype, device="cuda")
+
+                # Prepare final output tensors
+                output_indices_torch = torch.empty(num_rows,
+                                                   top_k,
+                                                   dtype=torch.int32,
+                                                   device="cuda")
+                if return_val:
+                    output_values_torch = torch.empty(num_rows,
+                                                      top_k,
+                                                      dtype=torch_dtype,
+                                                      device="cuda")
+                else:
+                    output_values_torch = None
+
+                # Prepare buffer
+                buffer_dim2 = max(chunk_size_per_cta, merge_cols)
+                buffer_torch = torch.empty(num_rows * num_ctas_per_row,
+                                           buffer_numbers,
+                                           buffer_dim2,
+                                           dtype=torch.int32,
+                                           device="cuda")
+
+                # Execute first kernel: per-chunk top-k
+                compiled_kernel_first(
+                    input_values,
+                    None,  # indices, used for merge blocks kernel
+                    buffer_torch,
+                    None,  # g_global_counter_torch
+                    seq_lens,
+                    first_kernel_output_indices_torch,
+                    first_kernel_output_values_torch,
+                )
+
+                # Execute second kernel: merge partial results
+                compiled_kernel_second(
+                    first_kernel_output_values_torch,
+                    first_kernel_output_indices_torch,
+                    buffer_torch,
+                    None,  # g_global_counter_torch
+                    seq_lens,
+                    output_indices_torch,
+                    output_values_torch,
+                )
+
+            return output_indices_torch, output_values_torch
+
+    @torch.library.custom_op("trtllm::cute_dsl_topk_decode_multi_cta_blackwell",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_topk_decode_multi_cta_blackwell(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        chunk_size_per_cta: int = 16384,
+        dynamic: bool = True,
+    ) -> torch.Tensor:
+        """CuteDSL-based multi-CTA Top-K selection optimized for Blackwell decode phase.
+
+        Splits each row into chunks processed by separate CTAs, then merges results.
+        Suitable for large vocabulary sizes where single-CTA is insufficient.
+
+        Args:
+            input_values: Input logits tensor [batch_size * next_n, vocab_size]
+            seq_lens: Sequence lengths for each batch [batch_size]
+            top_k: Number of top elements to select (max 2048)
+            next_n: Number of candidates per sequence (for speculative decoding)
+            num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+            chunk_size_per_cta: Number of columns each CTA processes
+            dynamic: Use dynamic multi-CTA scheduling (1D grid + binary search)
+
+        Returns:
+            indices: Top-k indices [batch_size * next_n, top_k]
+
+        Note:
+            This function requires Blackwell architecture (SM100+) and CuTE DSL support.
+        """
+        # Validate SM version
+        sm_version = get_sm_version()
+        if sm_version < 100:
+            raise ValueError(
+                f"CuTE DSL top-k requires Blackwell (SM100+), but got SM {sm_version}. "
+                "Use standard top-k implementation for older architectures.")
+
+        # Validate inputs
+        if top_k <= 0 or top_k > 2048:
+            raise ValueError(
+                f"top_k must be in range [1, 2048], got {top_k}. "
+                "Maximum supported top_k is 2048 for Blackwell architecture.")
+
+        if next_n <= 0:
+            raise ValueError(f"next_n must be positive, got {next_n}")
+
+        if num_copy_bits not in [128, 256]:
+            raise ValueError(
+                f"num_copy_bits must be 128 or 256, got {num_copy_bits}")
+
+        if chunk_size_per_cta <= 0:
+            raise ValueError(
+                f"chunk_size_per_cta must be positive, got {chunk_size_per_cta}"
+            )
+
+        if input_values.dim() != 2:
+            raise ValueError(
+                f"input_values must be 2D [num_rows, vocab_size], got shape {input_values.shape}"
+            )
+
+        if seq_lens.dim() != 1:
+            raise ValueError(
+                f"seq_lens must be 1D [batch_size], got shape {seq_lens.shape}")
+
+        supported_dtypes = {torch.float16, torch.bfloat16, torch.float32}
+        if input_values.dtype not in supported_dtypes:
+            raise ValueError(f"Unsupported dtype {input_values.dtype}. "
+                             f"Supported dtypes: {supported_dtypes}")
+
+        indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
+            input_values=input_values,
+            seq_lens=seq_lens,
+            top_k=top_k,
+            next_n=next_n,
+            return_val=False,  # Only return indices
+            num_copy_bits=num_copy_bits,
+            chunk_size_per_cta=chunk_size_per_cta,
+            dynamic=dynamic,
+        )
+        return indices
+
+    @torch.library.register_fake(
+        "trtllm::cute_dsl_topk_decode_multi_cta_blackwell")
+    def _(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        chunk_size_per_cta: int = 16384,
+        dynamic: bool = True,
+    ):
+        num_rows = input_values.shape[0]
+
+        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+        return indices
+
+    @torch.library.custom_op("trtllm::cute_dsl_indexer_topk_decode",
+                             mutates_args=(),
+                             device_types="cuda")
+    def cute_dsl_indexer_topk_decode(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        dynamic: bool = True,
+    ) -> torch.Tensor:
+        """Unified CuTE DSL Top-K that auto-selects single-CTA or multi-CTA.
+
+        Automatically chooses the faster kernel based on:
+          1. dtype threshold: fp16/bf16 >= 131072, fp32 >= 65536
+          2. SM utilization < 25% (num_rows < num_sms // 4)
+        Multi-CTA is only used when both conditions are met, ensuring it
+        only activates when single-CTA occupancy is genuinely low.
+        Uses chunk_size_per_cta=16384 for multi-CTA.
+
+        Based on benchmark results (Blackwell SM100, top_k=2048).
+        See bench_cute_dsl_single_vs_multi_cta_topk.py.
+
+        Args:
+            input_values: Input logits tensor [batch_size * next_n, vocab_size]
+            seq_lens: Sequence lengths for each batch [batch_size]
+            top_k: Number of top elements to select (max 2048)
+            next_n: Number of candidates per sequence (for speculative decoding)
+            num_copy_bits: Number of bits for vectorized memory copy (128 or 256)
+
+        Returns:
+            indices: Top-k indices [batch_size * next_n, top_k]
+        """
+        num_rows = input_values.shape[0]
+        num_tokens = input_values.shape[1]
+        chunk_size_per_cta = 16384
+
+        # Multi-CTA vocab thresholds by dtype.
+        # fp32: multi-CTA wins at vocab >= 65536 (4+ CTAs per row)
+        # fp16/bf16: multi-CTA wins at vocab >= 131072 (8+ CTAs per row)
+        if input_values.dtype == torch.float32:
+            use_multi_cta = num_tokens >= 65536
+        else:
+            use_multi_cta = num_tokens >= 131072
+
+        # Only use multi-CTA when SM utilization from single-CTA is low
+        # (< 25%). Beyond this, single-CTA already saturates the SMs and
+        # multi-CTA 2-pass overhead hurts.
+        if use_multi_cta:
+            num_sms = _get_num_sms()
+            use_multi_cta = num_rows < num_sms // 4
+
+        if use_multi_cta:
+            indices, _ = CuteDSLTopKDecodeMultiCTARunner.forward(
+                input_values=input_values,
+                seq_lens=seq_lens,
+                top_k=top_k,
+                next_n=next_n,
+                return_val=False,
+                num_copy_bits=num_copy_bits,
+                chunk_size_per_cta=chunk_size_per_cta,
+                dynamic=dynamic,
+            )
+        else:
+            indices, _ = CuteDSLTopKDecodeSingleCTARunner.forward(
+                input_values=input_values,
+                seq_lens=seq_lens,
+                top_k=top_k,
+                next_n=next_n,
+                return_val=False,
+                num_copy_bits=num_copy_bits,
+            )
+        return indices
+
+    @torch.library.register_fake("trtllm::cute_dsl_indexer_topk_decode")
+    def _(
+        input_values: torch.Tensor,
+        seq_lens: torch.Tensor,
+        top_k: int,
+        next_n: int = 1,
+        num_copy_bits: int = 256,
+        dynamic: bool = True,
+    ):
+        num_rows = input_values.shape[0]
+        indices = input_values.new_empty((num_rows, top_k), dtype=torch.int32)
+        return indices
+
+    # TODO: call this warmup in DSL initialization or autotune warmup to compile all the dsl top-k kernels.
+    def warmup_cute_dsl_topk_kernels(
+        dtype=cutlass.BFloat16,
+        top_k: int = 2048,
+        next_n: int = 1,
+        return_val: bool = False,
+        num_copy_bits: int = 256,
+        bucketed_num_cols_list: list | None = None,
+        chunk_size_per_cta: int = 16384,
+    ):
+        """Pre-compile CuTE DSL top-k kernels for common configurations.
+
+        Enumerates all combinations of (bucketed_num_cols, large_occupancy)
+        and compiles both single-CTA and multi-CTA kernels. This avoids
+        compilation latency on the first decode request.
+
+        Args:
+            dtype: Cutlass data type (default BFloat16).
+            top_k: Number of top-k elements (default 2048).
+            next_n: Speculative decoding candidates (default 1).
+            return_val: Whether kernels should return values (default False).
+            num_copy_bits: Vectorization width (default 256).
+            bucketed_num_cols_list: List of bucketed num_cols to warmup.
+                If None, uses powers of 2 from 4096 to 262144.
+            chunk_size_per_cta: Chunk size for multi-CTA (default 16384).
+        """
+        # Default bucketed num_cols values to warmup (powers of 2 from 4096 to 262144).
+        _CUTE_DSL_TOPK_WARMUP_BUCKETED_NUM_COLS = [
+            1 << i for i in range(12, 19)
+        ]
+        if bucketed_num_cols_list is None:
+            bucketed_num_cols_list = _CUTE_DSL_TOPK_WARMUP_BUCKETED_NUM_COLS
+
+        load_balance = False
+        count = 0
+        for bucketed_num_cols in bucketed_num_cols_list:
+            for large_occupancy in [False, True]:
+                # Single-CTA kernel
+                CuteDSLTopKDecodeSingleCTARunner._compile(
+                    dtype,
+                    bucketed_num_cols,
+                    top_k,
+                    next_n,
+                    return_val,
+                    num_copy_bits,
+                    load_balance,
+                    large_occupancy,
+                )
+                count += 1
+
+                # Multi-CTA kernel (only when num_cols > chunk_size_per_cta)
+                num_ctas_per_row = math.ceil(bucketed_num_cols /
+                                             chunk_size_per_cta)
+                if num_ctas_per_row > 1:
+                    CuteDSLTopKDecodeMultiCTARunner._compile(
+                        dtype,
+                        bucketed_num_cols,
+                        top_k,
+                        next_n,
+                        return_val,
+                        num_copy_bits,
+                        load_balance,
+                        large_occupancy,
+                        chunk_size_per_cta,
+                        num_ctas_per_row,
+                    )
+                    count += 1
+
+                    # Dynamic multi-CTA kernel
+                    CuteDSLTopKDecodeMultiCTARunner._compile(
+                        dtype,
+                        bucketed_num_cols,
+                        top_k,
+                        next_n,
+                        return_val,
+                        num_copy_bits,
+                        load_balance,
+                        large_occupancy,
+                        chunk_size_per_cta,
+                        num_ctas_per_row,
+                        dynamic=True,
+                    )
+                    count += 1
+
+        logger.info(f"Warmup: pre-compiled {count} CuTE DSL top-k kernels "
+                    f"(dtype={dtype}, top_k={top_k}, next_n={next_n})")
