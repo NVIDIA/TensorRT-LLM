@@ -20,6 +20,7 @@ Usage::
 """
 
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -174,20 +175,14 @@ def _model_available(path: Path) -> bool:
     return path.is_dir()
 
 
-def _av_available() -> bool:
-    """Check if PyAV is installed (required for video encoding in E2E tests)."""
-    try:
-        import av  # noqa: F401
-
-        return True
-    except ImportError:
-        return False
+def _ffmpeg_available() -> bool:
+    """Check if ffmpeg CLI is available (required for MP4 encoding)."""
+    return shutil.which("ffmpeg") is not None
 
 
 def _make_visual_gen_options(**extra) -> dict:
     """Build the YAML dict passed via ``--extra_visual_gen_options``."""
     config = {
-        "linear": {"type": "default"},
         "parallel": {"dit_cfg_size": 1, "dit_ulysses_size": 1},
     }
     config.update(extra)
@@ -201,9 +196,6 @@ def _make_visual_gen_options(**extra) -> dict:
 
 @pytest.mark.skipif(
     not _model_available(_WAN_T2V_PATH), reason=f"Wan2.1-T2V model not found at {_WAN_T2V_PATH}"
-)
-@pytest.mark.skipif(
-    not _av_available(), reason="PyAV (av) not installed — required for video encoding in E2E tests"
 )
 class TestWanTextToVideo:
     """Test Wan2.1-T2V-1.3B-Diffusers text-to-video generation via serve API."""
@@ -222,7 +214,19 @@ class TestWanTextToVideo:
         resp = requests.get(server.url_for("health"))
         assert resp.status_code == 200
 
-    def test_t2v_sync(self, server):
+    @pytest.mark.parametrize(
+        "output_format,expected_content_type",
+        [
+            pytest.param("avi", "video/x-msvideo", id="avi"),
+            pytest.param(
+                "mp4",
+                "video/mp4",
+                id="mp4",
+                marks=pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed"),
+            ),
+        ],
+    )
+    def test_t2v_sync(self, server, output_format, expected_content_type):
         """Synchronous text-to-video via POST /v1/videos/generations."""
         resp = requests.post(
             server.url_for("v1", "videos", "generations"),
@@ -233,13 +237,26 @@ class TestWanTextToVideo:
                 "fps": 8,
                 "num_inference_steps": 4,
                 "seed": 42,
+                "output_format": output_format,
             },
         )
         assert resp.status_code == 200, resp.text
-        assert resp.headers["content-type"] == "video/mp4"
+        assert resp.headers["content-type"] == expected_content_type
         assert len(resp.content) > 1000, "Video file too small"
 
-    def test_t2v_async_lifecycle(self, server):
+    @pytest.mark.parametrize(
+        "output_format,expected_content_type",
+        [
+            pytest.param("avi", "video/x-msvideo", id="avi"),
+            pytest.param(
+                "mp4",
+                "video/mp4",
+                id="mp4",
+                marks=pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed"),
+            ),
+        ],
+    )
+    def test_t2v_async_lifecycle(self, server, output_format, expected_content_type):
         """Async video generation: create job → poll → download → delete."""
         base = server.url_for("v1", "videos")
 
@@ -253,6 +270,7 @@ class TestWanTextToVideo:
                 "fps": 8,
                 "num_inference_steps": 4,
                 "seed": 42,
+                "output_format": output_format,
             },
         )
         assert create_resp.status_code == 202, create_resp.text
@@ -275,7 +293,7 @@ class TestWanTextToVideo:
         # 3. Download video content
         content_resp = requests.get(f"{base}/{video_id}/content")
         assert content_resp.status_code == 200
-        assert "video/mp4" in content_resp.headers.get("content-type", "")
+        assert expected_content_type in content_resp.headers.get("content-type", "")
         assert len(content_resp.content) > 1000
 
         # 4. Verify it appears in list
@@ -305,9 +323,6 @@ class TestWanTextToVideo:
 @pytest.mark.skipif(
     not _REF_IMAGE_PATH.is_file(), reason=f"Reference image not found at {_REF_IMAGE_PATH}"
 )
-@pytest.mark.skipif(
-    not _av_available(), reason="PyAV (av) not installed — required for video encoding in E2E tests"
-)
 class TestWanImageToVideo:
     """Test Wan2.2-I2V-A14B-Diffusers image-to-video generation via serve API."""
 
@@ -325,7 +340,19 @@ class TestWanImageToVideo:
         resp = requests.get(server.url_for("health"))
         assert resp.status_code == 200
 
-    def test_ti2v_sync(self, server):
+    @pytest.mark.parametrize(
+        "output_format,expected_content_type",
+        [
+            pytest.param("avi", "video/x-msvideo", id="avi"),
+            pytest.param(
+                "mp4",
+                "video/mp4",
+                id="mp4",
+                marks=pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed"),
+            ),
+        ],
+    )
+    def test_ti2v_sync(self, server, output_format, expected_content_type):
         """Synchronous image-to-video via multipart POST /v1/videos/generations."""
         with open(_REF_IMAGE_PATH, "rb") as f:
             resp = requests.post(
@@ -337,16 +364,29 @@ class TestWanImageToVideo:
                     "fps": "8",
                     "num_inference_steps": "4",
                     "seed": "42",
+                    "output_format": output_format,
                 },
                 files={
                     "input_reference": ("cat_piano.png", f, "image/png"),
                 },
             )
         assert resp.status_code == 200, resp.text
-        assert resp.headers["content-type"] == "video/mp4"
+        assert resp.headers["content-type"] == expected_content_type
         assert len(resp.content) > 1000, "Video file too small"
 
-    def test_ti2v_async_lifecycle(self, server):
+    @pytest.mark.parametrize(
+        "output_format,expected_content_type",
+        [
+            pytest.param("avi", "video/x-msvideo", id="avi"),
+            pytest.param(
+                "mp4",
+                "video/mp4",
+                id="mp4",
+                marks=pytest.mark.skipif(not _ffmpeg_available(), reason="ffmpeg not installed"),
+            ),
+        ],
+    )
+    def test_ti2v_async_lifecycle(self, server, output_format, expected_content_type):
         """Async i2v: create job with image → poll → download → delete."""
         base = server.url_for("v1", "videos")
 
@@ -361,6 +401,7 @@ class TestWanImageToVideo:
                     "fps": "8",
                     "num_inference_steps": "4",
                     "seed": "42",
+                    "output_format": output_format,
                 },
                 files={
                     "input_reference": ("cat_piano.png", f, "image/png"),
@@ -385,7 +426,7 @@ class TestWanImageToVideo:
         # 3. Download
         content_resp = requests.get(f"{base}/{video_id}/content")
         assert content_resp.status_code == 200
-        assert "video/mp4" in content_resp.headers.get("content-type", "")
+        assert expected_content_type in content_resp.headers.get("content-type", "")
         assert len(content_resp.content) > 1000
 
         # 4. Delete

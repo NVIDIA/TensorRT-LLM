@@ -42,7 +42,8 @@ enum class ActType
     //
     // GatedSilu is a special case of SwiGlu where the alpha is 1.0 and the beta is 0.0.
     SwiGlu,
-    Relu2
+    Relu2,
+    Silu
 };
 
 // Type of the element-wise activation to apply after the Gemm
@@ -59,6 +60,10 @@ enum class EltwiseActType
     // act = relu(x0) ^ 2
     // where x0 is the output of the Gemm.
     Relu2,
+    // Silu is defined as the following operation:
+    // act = x0 * sigmoid(x0)
+    // where x0 is the output of the Gemm.
+    Silu
 };
 
 struct TrtllmGenBatchedGemmRunnerOptions

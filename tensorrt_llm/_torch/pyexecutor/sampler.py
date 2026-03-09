@@ -3899,7 +3899,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         generation_requests_total_steps = (
             # NB: requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
             sum_num_generated_tokens
-            - cast(int, req_offsets[len(scheduled_requests.context_requests)].item())
+            - cast(int, req_offsets[scheduled_requests.num_context_requests].item())
             if scheduled_requests.generation_requests
             else 0
         )
@@ -3920,9 +3920,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # NB: Context request logits always precede generation request logits, also
         #     requests == scheduled_requests.context_requests + scheduled_requests.generation_requests
         if any(r.py_return_context_logits for r in scheduled_requests.context_requests):
-            assert (
-                len(num_context_logits_prefix_sum) == len(scheduled_requests.context_requests) + 1
-            )
+            assert len(num_context_logits_prefix_sum) == scheduled_requests.num_context_requests + 1
             req_num_generated_tokens_cuda = req_num_generated_tokens.to(
                 raw_logits_cuda.device, non_blocking=True
             )
@@ -3939,7 +3937,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 # Since logits for generation requests are densely packed, cover them all by a single
                 # fictituous entry in 'context_req_offsets_cuda'.
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : (len(scheduled_requests.context_requests) + 1)
+                    : (scheduled_requests.num_context_requests + 1)
                 ].clone()
                 req_num_steps_fictitious_cuda[-1].fill_(generation_requests_total_steps)
                 next_context_req_offsets_cuda[-1].copy_(
@@ -3948,7 +3946,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 )
             else:
                 req_num_steps_fictitious_cuda = req_num_generated_tokens_cuda[
-                    : len(scheduled_requests.context_requests)
+                    : scheduled_requests.num_context_requests
                 ]
                 # Since the goal is to keep the req_num_steps[i] last tokens for each requests[i],
                 # only end-offsets of the token storage locations matter.

@@ -24,40 +24,6 @@ def _make_dummy_video_tensor(
     return torch.randint(0, 256, (num_frames, height, width, 3), dtype=torch.uint8)
 
 
-class TestMediaStoragePNGFallback:
-    """Test PNG fallback path handling when video encoding fails."""
-
-    def test_png_fallback_with_avi_extension(self, tmp_path):
-        """Test that PNG fallback uses correct path after .avi extension change."""
-        video = _make_dummy_video_tensor()
-        output_path = str(tmp_path / "test.avi")
-
-        # Mock encoder to return None (no encoder available)
-        with patch("tensorrt_llm.serve.media_storage.get_video_encoder", return_value=None):
-            result = MediaStorage._save_encoded_video(video, None, output_path, 24.0)
-
-        # Should create PNG file with correct name
-        assert result.endswith(".png")
-        assert os.path.exists(result)
-        expected_path = str(tmp_path / "test.png")
-        assert result == expected_path
-
-    def test_png_fallback_with_mp4_extension(self, tmp_path):
-        """Test that PNG fallback uses correct path after .mp4 extension."""
-        video = _make_dummy_video_tensor()
-        output_path = str(tmp_path / "test.mp4")
-
-        # Mock encoder to return None (no encoder available)
-        with patch("tensorrt_llm.serve.media_storage.get_video_encoder", return_value=None):
-            result = MediaStorage._save_encoded_video(video, None, output_path, 24.0)
-
-        # Should create PNG file with correct name
-        assert result.endswith(".png")
-        assert os.path.exists(result)
-        expected_path = str(tmp_path / "test.png")
-        assert result == expected_path
-
-
 class TestMediaStorageMP4Encoding:
     """Test MP4 encoding with and without ffmpeg."""
 
