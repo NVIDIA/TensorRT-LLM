@@ -1928,6 +1928,15 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
         "Enable stochastic rounding for Mamba SSM state updates. Only applicable with float16 cache dtype."
     )
 
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_philox_rounds: int = Field(
+        default=10,
+        ge=1,
+        description=
+        "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness "
+        "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
+    )
+
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
 

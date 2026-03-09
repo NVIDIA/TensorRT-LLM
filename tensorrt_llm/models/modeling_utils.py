@@ -164,6 +164,12 @@ class QuantConfig(StrictBaseModel):
         description=
         "Enable stochastic rounding for Mamba SSM state updates. Requires fp16 cache."
     )
+    mamba_ssm_philox_rounds: int = Field(
+        default=10,
+        ge=1,
+        description=
+        "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness."
+    )
 
     @cached_property
     def quant_mode(self) -> QuantModeWrapper:

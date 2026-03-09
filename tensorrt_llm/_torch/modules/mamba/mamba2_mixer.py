@@ -146,6 +146,7 @@ class Mamba2Mixer(nn.Module):
             config.quant_config.mamba_ssm_stochastic_rounding
             and self._use_flashinfer
             and self._mamba_ssm_cache_dtype == torch.float16)
+        self._philox_rounds = config.quant_config.mamba_ssm_philox_rounds
 
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
@@ -441,6 +442,7 @@ class Mamba2Mixer(nn.Module):
                                                             2**62, (1, ),
                                                             device=x_d.device,
                                                             dtype=torch.int64)
+                    mtp_kwargs['philox_rounds'] = self._philox_rounds
 
                 self.selective_state_update_func_mtp(
                     ssm_states,
@@ -478,6 +480,7 @@ class Mamba2Mixer(nn.Module):
                                                             2**62, (1, ),
                                                             device=x_d.device,
                                                             dtype=torch.int64)
+                    ssu_kwargs['philox_rounds'] = self._philox_rounds
 
                 self.selective_state_update_func_no_mtp(
                     ssm_states,
