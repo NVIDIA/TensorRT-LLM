@@ -237,9 +237,6 @@ class ModelLoader:
         self.model_weights_restore_mode = model_weights_restore_mode
         self._weight_pool_proxy = None
 
-    def __del__(self):
-        del self._weight_pool_proxy
-
     @staticmethod
     def load_config_and_apply_defaults(
             checkpoint_dir: str, llm_args: TorchLlmArgs,
@@ -304,7 +301,7 @@ class ModelLoader:
                 is_meta_init = True
             except Exception:
                 logger.info(
-                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}\n"
+                    f"Fallback to regular model init: {traceback.format_exc(limit=10)}"
                 )
                 model = AutoModelForCausalLM.from_config(config)
                 is_meta_init = False
@@ -350,7 +347,7 @@ class ModelLoader:
                         self.model_weights_restore_mode) as pool:
                     model._apply(allocate_weights_on_cuda)
                 self._weight_pool_proxy = pool
-            else:
+            elif is_meta_init:
 
                 def init_meta_tensor(t: torch.Tensor):
                     if t.device != torch.device('meta'):
@@ -361,8 +358,10 @@ class ModelLoader:
                     return memo[t]
 
                 model._apply(init_meta_tensor)
-                model.to("cuda")
 
+            # Ensure everything is at least on CUDA
+            # No-op if worked as expected
+            model.to("cuda")
             del memo
 
             rank_model_storage = get_rank_model_storage(model)

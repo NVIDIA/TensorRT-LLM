@@ -388,8 +388,6 @@ def create_py_executor(
             else:
                 restore_mode = sleep_config.restore_modes[current_stage]
                 with virtual_memory_scope(stage, restore_mode) as memory_pool:
-                    if stage in vm_pools:
-                        del vm_pools[stage]
                     vm_pools[stage] = memory_pool
                     yield
 
