@@ -167,7 +167,9 @@ def submod_has_cuda_ops(submod: nn.Module) -> bool:
     return False
 
 
-_SKIP_OUT_DYNAMIC_OPS: Set[str] = set(_INPLACE_DYNAMIC_OPS) | set(_METADATA_PREP_OPS)
+_SKIP_OUT_DYNAMIC_OPS: Set[str] = (
+    set(_INPLACE_DYNAMIC_OPS) | set(_METADATA_PREP_OPS) | set(_LOGITS_GATHER_OPS)
+)
 
 
 def needs_out_buffer(submod: nn.Module) -> bool:
