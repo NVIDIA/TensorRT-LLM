@@ -194,6 +194,12 @@ void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 c
         pe_row_stride >= pe_dim, "fusedCatFp8: pe_row_stride (%d) must be >= pe_dim (%d)", pe_row_stride, pe_dim);
     TLLM_CHECK_WITH_INFO(nope_row_stride >= nope_dim, "fusedCatFp8: nope_row_stride (%d) must be >= nope_dim (%d)",
         nope_row_stride, nope_dim);
+    TLLM_CHECK_WITH_INFO(pe_row_stride % ELEMS_PER_THREAD == 0,
+        "fusedCatFp8: pe_row_stride (%d) must be a multiple of %d for aligned vectorized access", pe_row_stride,
+        ELEMS_PER_THREAD);
+    TLLM_CHECK_WITH_INFO(nope_row_stride % ELEMS_PER_THREAD == 0,
+        "fusedCatFp8: nope_row_stride (%d) must be a multiple of %d for aligned vectorized access", nope_row_stride,
+        ELEMS_PER_THREAD);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     dim3 grid(num_blocks);

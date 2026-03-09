@@ -54,7 +54,7 @@ def _reference_cat_fp8(pe, nope, use_ue8m0=False):
     return fp8_out, scale
 
 
-def _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label=""):
+def _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label="", use_ue8m0=False):
     """Assert that two FP8-quantized tensors represent similar values.
 
     Compares dequantized outputs (fp8 * scale) using tolerances appropriate
@@ -74,13 +74,15 @@ def _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label=""):
         f"{prefix}Scale shape mismatch: fused={fused_scale_flat.shape}, ref={ref_scale_flat.shape}"
     )
 
-    # Scales: allow ~1% relative difference from bf16 vs fp32 amax precision.
-    # For UE8M0, scales are powers of 2 so they either match exactly or differ
-    # by 2x at boundary cases — rtol=1.0 covers the worst case.
+    # Scales: For UE8M0, scales are powers of 2 so they either match exactly
+    # or differ by 2x at boundary cases — rtol=1.0 covers the worst case.
+    # For non-UE8M0, scales are continuous floats — allow ~2% from bf16 vs
+    # fp32 amax precision difference.
+    scale_rtol = 1.0 if use_ue8m0 else 0.02
     torch.testing.assert_close(
         fused_scale_flat,
         ref_scale_flat,
-        rtol=1.0,
+        rtol=scale_rtol,
         atol=1e-6,
         msg=lambda msg: f"{prefix}Scale mismatch: {msg}",
     )
@@ -110,7 +112,7 @@ def _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label=""):
 
 
 # DSV3.2 indexer config: pe_dim=64, nope_dim=64, head_dim=128
-@pytest.mark.parametrize("M", [1, 32, 64, 1024, 65536])
+@pytest.mark.parametrize("M", [1, 3, 7, 9, 32, 64, 1024, 65536])
 @pytest.mark.parametrize("pe_dim,nope_dim", [(64, 64)])
 @pytest.mark.parametrize("use_ue8m0", [True, False])
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
@@ -129,7 +131,12 @@ def test_fused_cat_fp8_correctness(M, pe_dim, nope_dim, use_ue8m0):
     ref_fp8, ref_scale = _reference_cat_fp8(pe, nope, use_ue8m0)
 
     _assert_fp8_close(
-        fused_fp8, fused_scale, ref_fp8, ref_scale, label=f"M={M}, use_ue8m0={use_ue8m0}"
+        fused_fp8,
+        fused_scale,
+        ref_fp8,
+        ref_scale,
+        label=f"M={M}, use_ue8m0={use_ue8m0}",
+        use_ue8m0=use_ue8m0,
     )
 
 
@@ -169,8 +176,9 @@ def test_fused_cat_fp8_zero_input():
 
 
 @pytest.mark.parametrize("M", [64, 1024])
+@pytest.mark.parametrize("use_ue8m0", [True, False])
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
-def test_fused_cat_fp8_noncontiguous_input(M):
+def test_fused_cat_fp8_noncontiguous_input(M, use_ue8m0):
     """Test with non-contiguous inputs (simulates torch.split in DSA indexer).
 
     In the real DSA forward path, pe/nope come from torch.split() on a
@@ -190,18 +198,26 @@ def test_fused_cat_fp8_noncontiguous_input(M):
     assert not nope.is_contiguous(), "nope should be non-contiguous from split"
 
     # Fused kernel should handle non-contiguous inputs
-    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, True)
+    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
 
     # Reference with contiguous copies
-    ref_fp8, ref_scale = _reference_cat_fp8(pe.contiguous(), nope.contiguous(), use_ue8m0=True)
+    ref_fp8, ref_scale = _reference_cat_fp8(pe.contiguous(), nope.contiguous(), use_ue8m0=use_ue8m0)
 
-    _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label=f"Non-contiguous M={M}")
+    _assert_fp8_close(
+        fused_fp8,
+        fused_scale,
+        ref_fp8,
+        ref_scale,
+        label=f"Non-contiguous M={M}",
+        use_ue8m0=use_ue8m0,
+    )
 
 
 @pytest.mark.parametrize("M", [1, 16, 64])
 @pytest.mark.parametrize("n_heads", [64])
+@pytest.mark.parametrize("use_ue8m0", [True, False])
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
-def test_fused_cat_fp8_3d_input(M, n_heads):
+def test_fused_cat_fp8_3d_input(M, n_heads, use_ue8m0):
     """Test with 3D inputs matching Q path: [M, n_heads, dim] from split.
 
     In the DSA indexer, Q tensors are [M, n_heads, head_dim] split into
@@ -222,7 +238,7 @@ def test_fused_cat_fp8_3d_input(M, n_heads):
     assert not nope.is_contiguous()
 
     # Fused kernel with 3D input (no reshape)
-    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, True)
+    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
 
     # Expected M for kernel: M * n_heads
     total_rows = M * n_heads
@@ -231,17 +247,23 @@ def test_fused_cat_fp8_3d_input(M, n_heads):
 
     # Reference with explicit reshape (old behavior)
     ref_fp8, ref_scale = _reference_cat_fp8(
-        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=True
+        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=use_ue8m0
     )
 
     _assert_fp8_close(
-        fused_fp8, fused_scale, ref_fp8, ref_scale, label=f"3D M={M}, n_heads={n_heads}"
+        fused_fp8,
+        fused_scale,
+        ref_fp8,
+        ref_scale,
+        label=f"3D M={M}, n_heads={n_heads}",
+        use_ue8m0=use_ue8m0,
     )
 
 
 @pytest.mark.parametrize("M", [1, 16])
+@pytest.mark.parametrize("use_ue8m0", [True, False])
 @pytest.mark.skipif(getSMVersion() < 90, reason="Requires SM >= 90")
-def test_fused_cat_fp8_mixed_contiguity(M):
+def test_fused_cat_fp8_mixed_contiguity(M, use_ue8m0):
     """Test where pe is contiguous but nope is non-contiguous.
 
     This matches the non-flashinfer Q path where pe comes from rotary_emb
@@ -261,9 +283,16 @@ def test_fused_cat_fp8_mixed_contiguity(M):
     assert pe.is_contiguous()
     assert not nope.is_contiguous()
 
-    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, True)
+    fused_fp8, fused_scale = torch.ops.trtllm.fused_cat_fp8(pe, nope, use_ue8m0)
     ref_fp8, ref_scale = _reference_cat_fp8(
-        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=True
+        pe.reshape(-1, pe_dim), nope.reshape(-1, nope_dim), use_ue8m0=use_ue8m0
     )
 
-    _assert_fp8_close(fused_fp8, fused_scale, ref_fp8, ref_scale, label=f"Mixed contiguity M={M}")
+    _assert_fp8_close(
+        fused_fp8,
+        fused_scale,
+        ref_fp8,
+        ref_scale,
+        label=f"Mixed contiguity M={M}",
+        use_ue8m0=use_ue8m0,
+    )
