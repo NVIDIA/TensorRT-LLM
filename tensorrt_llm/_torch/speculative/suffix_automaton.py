@@ -126,6 +126,11 @@ class SuffixAutomatonManager(BaseResourceManager):
         # Track which requests have been initialized (for prepare_resources)
         self._initialized_requests: Set[int] = set()
 
+        # Reserved slot for CUDA graph dummy requests — shared by all dummies
+        # so they never consume slots from the real pool.
+        self._dummy_slot_index: int = max_num_requests
+        self._dummy_request_ids: Set[int] = set()
+
     def _ensure_workspace(self, max_draft_len: int):
         """Ensure GPU workspace is allocated with sufficient capacity.
 
@@ -146,9 +151,19 @@ class SuffixAutomatonManager(BaseResourceManager):
             self._gpu_batch_indices = torch.zeros(
                 (self.max_num_requests,), dtype=torch.int32, device="cuda"
             )
+            # Mask: 1 for real requests, 0 for dummies. Populated by
+            # prepare() (outside CUDA graph) and used by extend() (inside
+            # CUDA graph) to zero out dummy entries without Python control
+            # flow that would break graph capture.
+            self._gpu_nondummy_mask = torch.ones(
+                (self.max_num_requests,), dtype=torch.int32, device="cuda"
+            )
 
-            # Allocate GPU workspace for SA states with dynamic size
-            self._gpu_slots = _sa_native.allocate_workspace(self.max_num_requests, self.max_seq_len)
+            # Allocate one extra slot beyond max_num_requests for the shared
+            # CUDA graph dummy (slot index = max_num_requests).
+            self._gpu_slots = _sa_native.allocate_workspace(
+                self.max_num_requests + 1, self.max_seq_len
+            )
 
             self._allocated_max_draft_len = max_draft_len
             self._workspace_allocated = True
@@ -200,13 +215,17 @@ class SuffixAutomatonManager(BaseResourceManager):
             return
 
         slot = self._request_to_slot.pop(request_id)
-        self._free_slots.append(slot)
+
+        if request_id in self._dummy_request_ids:
+            # Dummy slot is reserved; never return it to the free pool.
+            self._dummy_request_ids.discard(request_id)
+        else:
+            self._free_slots.append(slot)
 
         self._host_states_native.pop(request_id, None)
         self._pending_copies.discard(request_id)
         self._initialized_requests.discard(request_id)
 
-        # Clear the GPU slot
         if self._gpu_slots is not None:
             _sa_native.clear_slot(self._gpu_slots, slot, self.max_seq_len)
 
@@ -235,24 +254,27 @@ class SuffixAutomatonManager(BaseResourceManager):
                     )
             self._pending_copies.clear()
 
-        # Validate request_ids and prepare batch indices
-        # Do not use a default fallback - unknown request IDs would corrupt slot 0's state
-        unknown_rids = [rid for rid in request_ids if rid not in self._request_to_slot]
-        if unknown_rids:
-            raise KeyError(
-                f"SuffixAutomatonManager.prepare(): Unknown request IDs {unknown_rids}. "
-                f"All request IDs must be added via add_request() before calling prepare(). "
-                f"Known request IDs: {list(self._request_to_slot.keys())}"
-            )
-
+        # Map each request ID to its slot. Unknown IDs (e.g. CUDA graph
+        # warmup dummies that skipped the context phase) are routed to the
+        # reserved dummy slot so the kernel still runs on valid memory.
+        slots = [self._request_to_slot.get(rid, self._dummy_slot_index) for rid in request_ids]
         batch_indices = torch.tensor(
-            [self._request_to_slot[rid] for rid in request_ids],
+            slots,
+            dtype=torch.int32,
+            pin_memory=prefer_pinned(),
+        )
+        # Build a non-dummy mask (1 = real, 0 = dummy) on CPU, then copy to
+        # the pre-allocated GPU buffer.  extend() will use this mask via a
+        # simple element-wise multiply which is CUDA-graph-safe.
+        nondummy_mask = torch.tensor(
+            [0 if s == self._dummy_slot_index else 1 for s in slots],
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
 
         num_requests = len(request_ids)
         self._gpu_batch_indices[:num_requests].copy_(batch_indices, non_blocking=True)
+        self._gpu_nondummy_mask[:num_requests].copy_(nondummy_mask, non_blocking=True)
         torch.cuda.synchronize()
 
     def extend(
@@ -295,10 +317,16 @@ class SuffixAutomatonManager(BaseResourceManager):
         if num_accepted_tokens.dtype != torch.int32:
             num_accepted_tokens = num_accepted_tokens.to(torch.int32)
 
+        # Zero out accepted-token counts for dummy entries so the kernel's
+        # extend() loop is a no-op for them, avoiding the concurrent-write
+        # race when multiple dummies share one slot.  The mask is populated
+        # by prepare() (outside CUDA graph); the multiply is graph-safe.
+        num_accepted_tokens = num_accepted_tokens * self._gpu_nondummy_mask[:batch_size]
+
         _sa_native.invoke_extend(
             batch_size,
             max_draft_len,
-            self.max_num_requests,
+            self.max_num_requests + 1,
             self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
@@ -351,11 +379,14 @@ class SuffixAutomatonManager(BaseResourceManager):
         if num_accepted_tokens.dtype != torch.int32:
             num_accepted_tokens = num_accepted_tokens.to(torch.int32)
 
+        # Zero out dummy entries (see extend() for rationale).
+        num_accepted_tokens = num_accepted_tokens * self._gpu_nondummy_mask[:batch_size]
+
         _sa_native.invoke_extend_ngram(
             batch_size,
             max_draft_len,
             max_ngram_size,
-            self.max_num_requests,
+            self.max_num_requests + 1,
             self.max_seq_len,
             self._gpu_slots,
             self._gpu_batch_indices[:batch_size],
@@ -387,9 +418,22 @@ class SuffixAutomatonManager(BaseResourceManager):
         self.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
-        """Add dummy requests for CUDA graph warmup."""
+        """Add dummy requests for CUDA graph padding.
+
+        Dummy requests are mapped to a single reserved slot
+        (index = max_num_requests) that lives outside the real slot pool.
+        This prevents CUDA graph padding from exhausting slots that real
+        requests need.
+
+        No host automaton is built -- the GPU slot is already zeroed by
+        allocate_workspace (at::zeros), so the kernel safely produces
+        match_len = 0 for dummies.
+        """
         for rid in request_ids:
-            self.add_request(rid, [1])  # Dummy token
+            if rid in self._request_to_slot:
+                continue
+            self._request_to_slot[rid] = self._dummy_slot_index
+            self._dummy_request_ids.add(rid)
 
     def shutdown(self):
         """Clean up all resources."""
@@ -398,6 +442,7 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         self._request_to_slot.clear()
         self._free_slots = list(range(self.max_num_requests))
+        self._dummy_request_ids.clear()
 
         self._host_states_native.clear()
         self._pending_copies.clear()
