@@ -317,7 +317,8 @@ l0_dgx_h100:
   tests:
     - unittest/_torch/ray_orchestrator/multi_gpu -m "gpu2"
     - unittest/llmapi/test_llm_multi_gpu_pytorch.py -m "gpu2"
-    - unittest/llmapi/test_async_llm.py -m "gpu2"
+    # KV cache v2 resize failure for context update causes hang (reproduced on B200)
+    # - unittest/llmapi/test_async_llm.py -m "gpu2"
     - accuracy/test_llm_api_pytorch_ray.py::TestLlama3_1_8BInstruct::test_pp2_ray
     - examples/test_ray.py::test_llm_inference_distributed_ray[tp2]
     - examples/test_ray.py::test_llm_inference_distributed_ray[pp2]

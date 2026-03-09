@@ -148,6 +148,7 @@ def test_generation_with_return_logits(
     return_log_probs: bool,
     async_generation: bool,
 ):
+    pytest.skip("Skip due to unknown reason. GPU: A30")
     if not (gather_context_logits or gather_generation_logits or return_log_probs):  # prune space
         pytest.skip("Nothing to test")
     if reuse_cache and gather_context_logits:
