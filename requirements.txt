@@ -81,7 +81,7 @@ torchao>=0.14.1,<0.16.0
 cuda-core
 llist
 cuda-tile>=1.0.1
-nvidia-cuda-tileiras>=13.1
+nvidia-cuda-tileiras>=13.1,<13.2
 etcd-sdk-python==0.0.7
 python-multipart
 smg-grpc-proto>=0.4.2
