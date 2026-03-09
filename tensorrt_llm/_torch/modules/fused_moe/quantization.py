@@ -2149,7 +2149,8 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
                 self.load_expert_w2_weight_scale_nvfp4(
                     module, w2_weight_scale, dst_w2_weight_scale[expert_idx])
                 module._add_raw_shared_weights_for_unmap([
-                    w for w in [w1_weight_scale, w3_weight_scale, w2_weight_scale]
+                    w for w in
+                    [w1_weight_scale, w3_weight_scale, w2_weight_scale]
                     if w is not None
                 ])
 
@@ -3136,7 +3137,9 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
                                                 device=device)
 
         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
-        w3_size = w3_weight_scale.shape[0] if w3_weight_scale is not None and w3_weight_scale.numel() > 0 else 0
+        w3_size = w3_weight_scale.shape[
+            0] if w3_weight_scale is not None and w3_weight_scale.numel(
+            ) > 0 else 0
         # Keep weights in device buffer
         if module.is_gated_activation:
             # Gated activation: buffer contains both w3 and w1 scales
