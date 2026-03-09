@@ -1,5 +1,5 @@
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,8 @@ from tensorrt_llm.mapping import Mapping
 
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .modules.vae import BaseParallelVAEAdapter
+from .parallelism import setup_parallel_vae
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -30,6 +32,7 @@ class BasePipeline(nn.Module):
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._parallel_vae_enabled: bool = False
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -106,6 +109,11 @@ class BasePipeline(nn.Module):
         """
         return []
 
+    @property
+    def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:
+        """Return the VAE adapter class for the pipeline."""
+        return None
+
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -164,16 +172,63 @@ class BasePipeline(nn.Module):
                         if mode in coeff_data:
                             teacache_cfg.coefficients = coeff_data[mode]
                             logger.info(f"TeaCache: Using {model_size} coefficients ({mode} mode)")
+                        # Apply model-specific default threshold if user didn't explicitly set one
+                        default_thresh = coeff_data.get("default_thresh")
+                        if (
+                            default_thresh is not None
+                            and "teacache_thresh" not in teacache_cfg.model_fields_set
+                        ):
+                            teacache_cfg.teacache_thresh = default_thresh
+                            logger.info(
+                                f"TeaCache: Using {model_size} default threshold {default_thresh}"
+                            )
                     else:
                         # Single coefficient list (no mode distinction)
                         teacache_cfg.coefficients = coeff_data
                         logger.info(f"TeaCache: Using {model_size} coefficients")
                     break
+            else:
+                raise ValueError(
+                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                    f"Available variants: {list(coefficients.keys())}. "
+                    f"TeaCache is not supported for this model variant."
+                )
 
         # Initialize and enable TeaCache backend
         logger.info("TeaCache: Initializing...")
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
+
+    def setup_parallel_vae(self):
+        if not self.model_config.parallel.enable_parallel_vae:
+            return
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        if self.vae is None:
+            return
+
+        adapter_cls = self.vae_adapter_class
+        if adapter_cls is None:
+            logger.warning(
+                f"Parallel VAE not supported for {self.__class__.__name__}. "
+                "Implement vae_adapter_class in your pipeline to enable parallel VAE."
+            )
+            return
+
+        vae_rank, vae_world_size, adj_groups = setup_parallel_vae(self.model_config)
+        adapter_cls(
+            self.vae,
+            self.model_config.parallel.parallel_vae_split_dim,
+            vae_rank,
+            vae_world_size,
+            adj_groups,
+        )
+        self._parallel_vae_enabled = True
+        logger.info(
+            f"Parallel VAE enabled: {adapter_cls.__name__}, "
+            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
+            f"world_size={vae_world_size}"
+        )
 
     def torch_compile(self) -> None:
         """Apply torch.compile to pipeline components based on TorchCompileConfig.
@@ -289,6 +344,7 @@ class BasePipeline(nn.Module):
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
         """Execute VAE decoding. Only rank 0 performs decoding.
+        If parallel VAE is enabled, all processes perform decoding.
 
         Args:
             latents: Primary latents to decode (e.g., video)
@@ -301,6 +357,14 @@ class BasePipeline(nn.Module):
             Single result if no extra_latents, tuple of results if extra_latents provided.
             Non-rank-0 processes return None placeholders.
         """
+
+        if self._parallel_vae_enabled:
+            primary_result = decode_fn(latents)
+            if extra_latents:
+                extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
+                return (primary_result,) + tuple(extra_results)
+            return primary_result
+
         if self.rank == 0:
             primary_result = decode_fn(latents)
 

@@ -582,14 +582,11 @@ class KVCacheManager(BaseResourceManager):
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests
-            generation_batch = scheduled_batch.generation_requests
-
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
             # allocate KV Cache
-            for req in context_batch:
+            for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -602,6 +599,11 @@ class KVCacheManager(BaseResourceManager):
                                        == self.mapping.cp_size - 1 else 0),
                             req_beam_width, req)
                 else:
+                    # Chunked prefill may schedule the same request across multiple
+                    # context chunks. Sequence allocation must happen only once.
+                    if not req.is_first_context_chunk:
+                        continue
+
                     if self.impl.add_sequence(req.py_request_id, req.prompt_len,
                                               req_beam_width, req):
                         for _ in range(self.num_extra_kv_tokens):
@@ -614,7 +616,10 @@ class KVCacheManager(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
-            for req in generation_batch:
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
+
+            for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -
@@ -1626,21 +1631,20 @@ class KVCacheManagerV2(BaseResourceManager):
         self.kv_connector_manager = kv_connector_manager
 
         quota = float('inf')
-        if kv_cache_config.max_tokens is not None:
-            quota = int(
-                math.ceil(
-                    self._get_cache_quota(kv_cache_config.max_tokens) /
-                    kv_cache_config.max_util_for_resume))
-            if kv_cache_config.free_gpu_memory_fraction is not None:
-                logger.warning(
-                    f"Both max_tokens and free_gpu_memory_fraction are set to {kv_cache_config.max_tokens} and {kv_cache_config.free_gpu_memory_fraction}, the smaller value will be used."
-                )
         if kv_cache_config.max_gpu_total_bytes is not None and kv_cache_config.max_gpu_total_bytes > 0:
-            if quota > int(kv_cache_config.max_gpu_total_bytes):
-                logger.warning(
-                    f"max_gpu_total_bytes {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB is smaller than the calculated quota {quota / (1 << 30)}GiB, clamping quota to {kv_cache_config.max_gpu_total_bytes / (1 << 30)}GiB"
-                )
-            quota = min(quota, int(kv_cache_config.max_gpu_total_bytes))
+            quota = int(kv_cache_config.max_gpu_total_bytes)
+            logger.info(
+                f"max_gpu_total_bytes is provided. New quota is {quota / (1 << 30)}GiB"
+            )
+        if kv_cache_config.max_tokens is not None:
+            quota_from_max_tokens = int(
+                math.ceil(
+                    self._get_quota_from_max_tokens(kv_cache_config.max_tokens)
+                    / kv_cache_config.max_util_for_resume))
+            quota = min(quota, quota_from_max_tokens)
+            logger.info(
+                f"max_tokens {kv_cache_config.max_tokens} is provided. Allowed quota from max_tokens is {quota_from_max_tokens / (1 << 30)}GiB. New quota is {quota / (1 << 30)}GiB"
+            )
 
         assert quota != float(
             'inf'
@@ -1732,7 +1736,7 @@ class KVCacheManagerV2(BaseResourceManager):
             pin_memory=prefer_pinned(),
             device='cpu')
 
-    def _get_cache_quota(self, max_tokens: int) -> int:
+    def _get_quota_from_max_tokens(self, max_tokens: int) -> int:
         return int(max_tokens * self.get_cache_bytes_per_token())
 
     def _build_pool_mapping_tensors(self) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1914,10 +1918,8 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests
-            generation_batch = scheduled_batch.generation_requests
             # allocate KV Cache
-            for req in context_batch:
+            for req in scheduled_batch.context_requests:
                 beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -1968,7 +1970,10 @@ class KVCacheManagerV2(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
-            for req in generation_batch:
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
+
+            for req in scheduled_batch.generation_requests:
                 kv_cache = self.kv_cache_map[req.py_request_id]
                 new_capacity = kv_cache.capacity + 1 + get_draft_token_length(
                     req)
