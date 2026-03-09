@@ -13,17 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import Optional
-
 import torch
 
 
-@torch.library.custom_op("auto_deploy::gather_tokens", mutates_args=("out",))
+@torch.library.custom_op("auto_deploy::gather_tokens", mutates_args=())
 def gather_tokens(
     hidden_states: torch.Tensor,
     token_gather_indices: torch.Tensor,  # long tensor
     tokens_gather_info_host: torch.Tensor,  # int tensor
-    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """Gather hidden states using token_gather_indices before LM head.
 
@@ -32,7 +29,6 @@ def gather_tokens(
             [1, total_token_length, *other_dims]
         token_gather_indices: indices for gathering logits.
         tokens_gather_info_host: info for gathering logits.
-        out: Optional pre-allocated output tensor to write into.
     Returns:
         Gathered and flattened hidden states [num_gathered_tokens, hidden]
     """
@@ -45,23 +41,15 @@ def gather_tokens(
     num_tokens_to_gather, gather_required = tokens_gather_info_host.tolist()
 
     if gather_required:
-        result = hidden_states.index_select(0, token_gather_indices[:num_tokens_to_gather])
+        out = hidden_states.index_select(0, token_gather_indices[:num_tokens_to_gather])
         num_tokens_final = num_tokens_to_gather
     else:
+        out = hidden_states.clone(memory_format=torch.contiguous_format)
         num_tokens_final = bsz * sl
-        if out is None:
-            result = hidden_states.clone(memory_format=torch.contiguous_format)
-        else:
-            result = hidden_states
     if bsz == 1:
-        result = result.view(1, num_tokens_final, *other_dims)
+        return out.view(1, num_tokens_final, *other_dims)
     else:
-        result = result.view(num_tokens_final, 1, *other_dims)
-
-    if out is not None:
-        out.copy_(result)
-        return out.new_empty(0)
-    return result
+        return out.view(num_tokens_final, 1, *other_dims)
 
 
 @gather_tokens.register_fake
@@ -69,10 +57,7 @@ def gather_tokens_fake(
     hidden_states: torch.Tensor,
     token_gather_indices: torch.Tensor,
     tokens_gather_info_host: torch.Tensor,
-    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
-    if out is not None:
-        return out.new_empty(0)
     # NOTE: shape is not correct in fake mode
     # see https://github.com/NVIDIA/TensorRT-LLM/issues/9878
     return torch.empty_like(hidden_states)
