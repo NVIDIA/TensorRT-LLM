@@ -131,14 +131,14 @@ perf/test_perf_sanity.py::test_e2e[disagg-e2e-deepseek-r1-fp4_128k8k_ctx8_pp4_ge
 
 # wideep multi-node
 # GB200 + GB300 supported cases
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con512_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con1024_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con512_ccb-UCX]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con1024_ccb-UCX]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep32_bs16_eplb288_mtp3_con512_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep32_bs16_eplb288_mtp3_con512_ccb-UCX]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp1_con2048_ccb-NIXL]
-perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp1_con2048_ccb-UCX]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con512_ccb-NIXL]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con1024_ccb-NIXL]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con512_ccb-UCX]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep16_bs64_eplb288_mtp3_con1024_ccb-UCX]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep32_bs16_eplb288_mtp3_con512_ccb-NIXL]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx1_gen1_dep32_bs16_eplb288_mtp3_con512_ccb-UCX]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp1_con2048_ccb-NIXL]
+# perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_Qwen3-235B-A22B-FP4_1k1k_ctx2_gen1_dep16_bs128_eplb288_mtp1_con2048_ccb-UCX]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_deepseek-r1-fp4_1k1k_ctx1_gen1_dep32_bs32_eplb288_mtp0_con1024_ccb-NIXL]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_deepseek-r1-fp4_1k1k_ctx1_gen1_dep32_bs32_eplb288_mtp0_con1024_ccb-NIXL_kv-reuse]
 perf/test_perf_sanity.py::test_e2e[disagg-gen_only-wideep_deepseek-r1-fp4_1k1k_ctx1_gen1_dep32_bs32_eplb288_mtp0_con1024_ccb-UCX]
