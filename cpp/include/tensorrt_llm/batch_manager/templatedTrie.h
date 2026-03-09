@@ -199,7 +199,8 @@ public:
                 // Node has no values and no descendants. Delete it
                 if (auto parent = mPrevNode.lock())
                 {
-                    [[maybe_unused]] auto const wasDeleted = parent->clearNode(mKey);
+                    auto const wasDeleted = parent->clearNode(mKey);
+                    TLLM_CHECK_WITH_INFO(wasDeleted, "cascade prune: parent did not find this node as a child");
                 }
             }
             return true;
@@ -207,23 +208,25 @@ public:
         return false;
     }
 
-    //! \brief Set value for vkey.
+    //! \brief Try to set value for vkey.
     //! \param vkey Key.
     //! \param value Value.
-    //! \param overwrite True to allow overwrite.
-    //! \return True if value was overwritten, false otherwise.
-    [[nodiscard]] bool setValue(ValueKey const& vkey, Value const& value, bool overwrite)
+    //! \param overwrite True to allow overwriting an existing value.
+    //! \return True if the node was updated (key inserted or existing value overwritten).
+    //!         False if the key already existed and overwrite=false (no change made).
+    [[nodiscard]] bool trySetValue(ValueKey const& vkey, Value const& value, bool overwrite)
     {
-        if (overwrite)
+        auto itr = mValue.find(vkey);
+        bool priorExists = (itr != mValue.end());
+        if (!priorExists)
         {
-            auto const& [itr, inserted] = mValue.insert_or_assign(vkey, value);
-            return !inserted;
+            mValue.emplace(vkey, value);
         }
-        else
+        else if (overwrite)
         {
-            auto const& [itr, inserted] = mValue.try_emplace(vkey, value);
-            return !inserted; // true iff slot was already occupied (value NOT updated)
+            itr->second = value;
         }
+        return !priorExists || overwrite;
     }
 
     //! \brief Clear value for vkey.
@@ -242,7 +245,8 @@ public:
                 // Node has no values and no descendants. Delete it
                 if (auto parent = mPrevNode.lock())
                 {
-                    [[maybe_unused]] auto const wasDeleted = parent->clearNode(mKey);
+                    auto const wasDeleted = parent->clearNode(mKey);
+                    TLLM_CHECK_WITH_INFO(wasDeleted, "cascade prune: parent did not find this node as a child");
                 }
             }
             return true;
@@ -329,7 +333,8 @@ public:
             return existing.value().node;
         }
         auto newNode = std::make_shared<Node>(key, const_cast<NodePtr&>(self));
-        [[maybe_unused]] auto const overwritten = insertNode(key, newNode);
+        auto const overwritten = insertNode(key, newNode);
+        TLLM_CHECK_WITH_INFO(!overwritten, "findOrInsertChild: inserted a node that already existed");
         return newNode;
     }
 
@@ -492,7 +497,8 @@ public:
             {
                 lookForMatch = false;
                 auto newNode = std::make_shared<_Node>(key, prevNode);
-                [[maybe_unused]] auto const overwritten = prevNode->insertNode(key, newNode);
+                auto const overwritten = prevNode->insertNode(key, newNode);
+                TLLM_CHECK_WITH_INFO(!overwritten, "insertNodes: inserted a node that already existed");
                 matchedNode = _NodeMatch(key, newNode, true, true);
             }
             prevNode = matchedNode.value().node;

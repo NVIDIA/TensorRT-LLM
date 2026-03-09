@@ -7,7 +7,6 @@ from collections import OrderedDict, defaultdict, deque
 from typing import (TYPE_CHECKING, Dict, Iterable, List, Optional, Sequence,
                     Set, Tuple, Union)
 
-from tensorrt_llm.bindings.internal.batch_manager import LinearAttentionMetadata, LinearCacheType
 import torch
 from mpi4py import MPI
 
@@ -17,11 +16,13 @@ from tensorrt_llm._torch.distributed.communicator import Distributed, ReduceOp
 from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
-from tensorrt_llm.bindings.internal.batch_manager import KvCacheStats
+from tensorrt_llm.bindings.internal.batch_manager import (
+    KvCacheStats, LinearAttentionMetadata)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
-from tensorrt_llm.llmapi.llm_args import KvCacheConfig, PeftCacheConfig, PybindMirror
+from tensorrt_llm.llmapi.llm_args import (KvCacheConfig, PeftCacheConfig,
+                                          PybindMirror)
 from tensorrt_llm.lora_helper import LoraConfig
 from tensorrt_llm.lora_manager import LoraManager, LoraModelConfig
 from tensorrt_llm.runtime import ModelConfig as ModelConfigPython
@@ -378,7 +379,8 @@ class KVCacheManager(BaseResourceManager):
                              else 0)
 
         # Determine if this is VSWA (Variable Sliding Window Attention)
-        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(w > 0 for w in self.max_attention_window_vec)
+        self.is_vswa = len(set(self.max_attention_window_vec)) > 1 and all(
+            w > 0 for w in self.max_attention_window_vec)
         self.is_linear_attention = linear_attention_metadata is not None
 
         # Calculate kv cache blocks for each window size
@@ -404,6 +406,13 @@ class KVCacheManager(BaseResourceManager):
                 (self.blocks_in_primary_pool, self.blocks_in_secondary_pool)
                 for window_size in set(self.max_attention_window_vec)
             }
+            if self.is_linear_attention:
+                max_tokens = min(
+                    model_config.max_input_len * self.max_batch_size,
+                    kv_cache_config.max_tokens)
+                max_snapshots = max_tokens // linear_attention_metadata.states_snapshot_interval + self.max_batch_size
+                blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
+                    max_snapshots, max_snapshots)
             logger.info(
                 f"[kv cache manager] Primary/secondary blocks for window sizes set to {blocks_per_window} for estimation dry run"
             )
@@ -595,14 +604,11 @@ class KVCacheManager(BaseResourceManager):
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         # print("KVCacheManager::prepare_resources")
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests
-            generation_batch = scheduled_batch.generation_requests
-
             # wait for all pending work to finish before launching offload/onboarding/partial copy
             self.impl.sync_transfer_manager_with_buffer_manager()
 
             # allocate KV Cache
-            for req in context_batch:
+            for req in scheduled_batch.context_requests:
                 req_beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -633,7 +639,10 @@ class KVCacheManager(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
-            for req in generation_batch:
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
+
+            for req in scheduled_batch.generation_requests:
                 if self.mapping.has_cp_helix():
                     # Distribute the decode blocks across CP ranks in a round-robin manner.
                     decode_block_id = (req.py_decoding_iter -
@@ -1358,7 +1367,8 @@ class KVCacheManager(BaseResourceManager):
                 extra_cost_memory=extra_cost_memory,
                 kv_factor=self.kv_factor,
                 max_batch_size=self.max_batch_size,
-                linear_attention_metadata=PybindMirror.maybe_to_pybind(self.linear_attention_metadata),
+                linear_attention_metadata=PybindMirror.maybe_to_pybind(
+                    self.linear_attention_metadata),
             )
             return blocks_per_window
 
@@ -1949,10 +1959,8 @@ class KVCacheManagerV2(BaseResourceManager):
     @nvtx_range("prepare_resources_kv_cache_manager_v2")
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
         with request_context(self.is_draft, scheduled_batch):
-            context_batch = scheduled_batch.context_requests
-            generation_batch = scheduled_batch.generation_requests
             # allocate KV Cache
-            for req in context_batch:
+            for req in scheduled_batch.context_requests:
                 beam_width = req.sampling_config.beam_width
                 if 'cp_type' in self.mapping.cp_config and CpType.STAR == self.mapping.cp_config[
                         'cp_type']:
@@ -2003,7 +2011,10 @@ class KVCacheManagerV2(BaseResourceManager):
                             self.kv_connector_manager.update_state_after_alloc(
                                 req, block_ids)
 
-            for req in generation_batch:
+            # A request may change from `context_requests_chunking` to `context_requests_last_chunk` in `add_sequence` due to KV cache reuse, so we rebuild the context request lists here.
+            scheduled_batch.reset_context_requests()
+
+            for req in scheduled_batch.generation_requests:
                 kv_cache = self.kv_cache_map[req.py_request_id]
                 new_capacity = kv_cache.capacity + 1 + get_draft_token_length(
                     req)

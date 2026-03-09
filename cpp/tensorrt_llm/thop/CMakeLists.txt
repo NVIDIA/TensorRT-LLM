@@ -68,6 +68,7 @@ add_library(
   fusedQKNormRopeOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
+  fusedGatedRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp

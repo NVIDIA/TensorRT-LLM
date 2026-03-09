@@ -96,7 +96,8 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx, SizeType32
     , mRefCount(0)
     , mSchedulingRefCount(0)
     , mLookupNode{nullptr}
-    , mWindowSize{windowSize}
+    , mWindowSize{std::numeric_limits<int>::max()}
+    // sentinel: unattached; valid sizes are >= 1 or kRecurrentStates (-1)
     , mIsPlaceholder{false}
     , mFreeBlockIterator(std::nullopt)
     , mIsFull{false}
@@ -107,11 +108,11 @@ KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx, SizeType32
 {
 }
 
-BlockPtr KVCacheBlock::createPlaceholder(IdType blockId)
+BlockPtr KVCacheBlock::createPlaceholder(IdType blockId, SizeType32 windowSize)
 {
-    // Use a dummy KVCacheIndex{0}; callers must not submit this index to the GPU kernel.
-    // The mIsPlaceholder flag gates getCacheBlockIndices to return nil.
-    auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex{0});
+    // Use an out-of-range pool index as sentinel; the mIsPlaceholder flag gates
+    // getCacheBlockIndices to return nil so this index is never submitted to the GPU.
+    auto block = std::make_shared<KVCacheBlock>(blockId, tk::KVCacheIndex::nullIndex, windowSize);
     block->mIsPlaceholder = true;
     return block;
 }
@@ -145,8 +146,7 @@ NextBlockMap KVCacheBlock::getNextBlocks() const
     return result;
 }
 
-void KVCacheBlock::attachToLookupNode(
-    radix_block_tree::LookupNodePtr node, int windowSize, std::shared_ptr<KVCacheBlock> self)
+void KVCacheBlock::attachToLookupNode(radix_block_tree::LookupNodePtr node, int windowSize)
 {
     // Detach from any previous node first.
     if (mLookupNode)
@@ -156,9 +156,9 @@ void KVCacheBlock::attachToLookupNode(
             "attachToLookupNode: block %d expected prior lookup slot to be occupied (clearValue returned false)",
             static_cast<int>(mBlockId));
     }
-    // Assign fields AFTER setValue so local state is only updated on success.
-    auto const hadExisting = node->setValue(windowSize, std::move(self), /*overwrite=*/false);
-    TLLM_CHECK_WITH_INFO(!hadExisting,
+    // Assign fields AFTER trySetValue so local state is only updated on success.
+    auto const wasInserted = node->trySetValue(windowSize, shared_from_this(), /*overwrite=*/false);
+    TLLM_CHECK_WITH_INFO(wasInserted,
         "attachToLookupNode: block %d found lookup slot already occupied by another block", static_cast<int>(mBlockId));
     mLookupNode = std::move(node);
     mWindowSize = windowSize;
@@ -176,17 +176,18 @@ void KVCacheBlock::detachFromLookupNode()
         "detachFromLookupNode: block %d expected lookup slot to be occupied (clearValue returned false)",
         static_cast<int>(mBlockId));
     mLookupNode = nullptr;
-    mWindowSize = 0;
+    mWindowSize = std::numeric_limits<int>::max();
 }
 
-void KVCacheBlock::setAsRoot(
-    radix_block_tree::LookupNodePtr rootNode, int windowSize, std::shared_ptr<KVCacheBlock> self)
+void KVCacheBlock::setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize)
 {
     mLookupNode = rootNode;
     mWindowSize = windowSize;
     // Store the root block itself in the root node so that direct children can find it
     // via getPrevBlock() (root->getParentNode() returns nullptr, so the chain stops here).
-    [[maybe_unused]] auto const wasSet = rootNode->setValue(windowSize, std::move(self), /*overwrite=*/true);
+    auto const wasUpdated = rootNode->trySetValue(windowSize, shared_from_this(), /*overwrite=*/true);
+    TLLM_LOG_DEBUG("setAsRoot: block %d wired to root slot for windowSize=%d (wasUpdated=%d)",
+        static_cast<int>(mBlockId), windowSize, static_cast<int>(wasUpdated));
 }
 
 // This is a logical index. In memory pool, 1 in mMemoryPoolBlockIndex is strided by num_layers * kv_num. (see
@@ -350,7 +351,7 @@ void KVCacheBlock::addNextBlock(BlockKey const& blockKey, BlockPtr block)
     auto existing = childNode->getValue(mWindowSize);
     if (!existing.has_value())
     {
-        block->attachToLookupNode(childNode, mWindowSize, block);
+        block->attachToLookupNode(childNode, mWindowSize);
     }
 }
 
@@ -411,7 +412,12 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
     {
         // clearNode removes the child entry and fires cascade pruning upward if the child
         // node becomes empty after the removal.
-        [[maybe_unused]] auto const wasCleared = mLookupNode->clearNode(blockKey);
+        auto const wasCleared = mLookupNode->clearNode(blockKey);
+        if (!wasCleared)
+        {
+            TLLM_LOG_DEBUG("removeNextBlock: key not found for block %d; node may have been pruned already",
+                static_cast<int>(mBlockId));
+        }
     }
 }
 
@@ -423,11 +429,11 @@ void KVCacheBlock::removeNextBlock(BlockKey const& blockKey)
 //   2. Detach in *reverse* order (children before parents).  This is
 //      required because detachFromLookupNode() triggers cascade pruning:
 //      when a node becomes empty (no value, no children) it is removed from
-//      its parent.  If we detached a parent first, the parent's node would
-//      be pruned before we had a chance to look up its children.  By
-//      detaching leaves first the cascade only propagates upward after all
-//      descendants are already gone.
-void KVCacheBlock::freeDescendantsRecursively()
+//      its parent.  If we detached in collection order (parents first), a
+//      parent node could be cascade-pruned away before we had a chance to
+//      look up its children in step 1.  By detaching leaves first, cascade
+//      propagation only moves upward after all descendants are already gone.
+void KVCacheBlock::detachDescendantsFromLookupTree()
 {
     if (!mLookupNode)
     {
@@ -450,7 +456,7 @@ void KVCacheBlock::freeDescendantsRecursively()
                 stack.push_back(block);
             }
         }
-        TLLM_LOG_DEBUG("KVCacheBlock::freeDescendantsRecursively - Freeing block %d", current->getBlockId());
+        TLLM_LOG_DEBUG("KVCacheBlock::detachDescendantsFromLookupTree - detaching block %d", current->getBlockId());
         descendants.push_back(std::move(current));
     }
     // Detach leaves first so cascade-prune works correctly.
@@ -462,7 +468,7 @@ void KVCacheBlock::freeDescendantsRecursively()
 
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
-    freeDescendantsRecursively();
+    detachDescendantsFromLookupTree();
     detachFromLookupNode();
 }
 
@@ -675,7 +681,10 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
     , mTokensPerBlock{tokensPerBlock}
     , mIsSWA{isSWA}
     , mLookupTree{&lookupTree}
-    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tk::KVCacheIndex{0})}
+    // Use an out-of-range pool index for the dummy root block; it is never submitted to the GPU.
+    // The illegal value (INT32_MAX) ensures accidental use triggers an obvious OOB failure.
+    , mCachedBlocksRoot{std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId,
+          tk::KVCacheIndex{std::numeric_limits<tk::KVCacheIndex::UnderlyingType>::max()})}
     , mCacheType{cacheType}
     , mEventManager(std::move(eventManager))
     , mLoopbackAgent{loopbackAgent}
@@ -780,7 +789,7 @@ WindowBlockManager::WindowBlockManager(nvinfer1::DataType dtype, SizeType32 wind
 
     // Wire the dummy root block into the shared lookup tree so that direct children
     // can navigate to it via getPrevBlock() and blockInRadixTree() returns true for them.
-    mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize, mCachedBlocksRoot);
+    mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
 }
 
 WindowBlockManager::~WindowBlockManager()
@@ -1098,14 +1107,19 @@ void WindowBlockManager::setOffsets(tk::KVCacheIndex* offsetsPtr, nvinfer1::Dims
             auto const blockIndex = block->isPlaceholder()
                 ? tk::KVCacheIndex::nullIndex
                 : tk::KVCacheIndex{common::flat_index3(
-                      block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
-            if ((!block->isPlaceholder()) && block->getMemoryPoolBlockIndex() >= mNumPrimaryBlocks) {
-                TLLM_LOG_ERROR("memorypool block index of block id=%d is out of range, getMemoryPoolBlockIndex() = %d, mNumPrimaryBlocks = %d", block->getBlockId(), block->getMemoryPoolBlockIndex(), mNumPrimaryBlocks);
+                    block->getMemoryPoolBlockIndex(), layerIdx, fieldIdx, pool.numLayers, mKVFactor)};
+            if ((!block->isPlaceholder()) && block->getMemoryPoolBlockIndex() >= mNumPrimaryBlocks)
+            {
+                TLLM_LOG_ERROR(
+                    "memorypool block index of block id=%d is out of range, getMemoryPoolBlockIndex() = %d, "
+                    "mNumPrimaryBlocks = %d",
+                    block->getBlockId(), block->getMemoryPoolBlockIndex(), mNumPrimaryBlocks);
                 TLLM_LOG_ERROR("block->isPrimary(): %d", block->isPrimary());
                 TLLM_LOG_ERROR("mAllBlocksById.size(): %lu", mAllBlocksById.size());
             }
-            // TLLM_CHECK_WITH_INFO(block->getMemoryPoolBlockIndex() < mNumPrimaryBlocks, "memorypool block index of block id=%d is out of range, getMemoryPoolBlockIndex() = %d, mNumPrimaryBlocks = %d", block->getBlockId(), block->getMemoryPoolBlockIndex(), mNumPrimaryBlocks);
-            // TLLM_LOG_DEBUG(
+            // TLLM_CHECK_WITH_INFO(block->getMemoryPoolBlockIndex() < mNumPrimaryBlocks, "memorypool block index of
+            // block id=%d is out of range, getMemoryPoolBlockIndex() = %d, mNumPrimaryBlocks = %d",
+            // block->getBlockId(), block->getMemoryPoolBlockIndex(), mNumPrimaryBlocks); TLLM_LOG_DEBUG(
             //     "setOffsets: offsetIndex=%d, block->getMemoryPoolBlockIndex()=%d, fieldIdx=%d, blockIndex=%d",
             //     offsetIndex, block->getMemoryPoolBlockIndex(), fieldIdx, blockIndex.get());
             offsetsPtr[offsetIndex] = blockIndex;
@@ -1913,7 +1927,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
             // We set blockId to an invalid value to indicate that a block has been released early for a limited
             // attention layer. Make sure we don't store an invalid block because of this.
-            auto& block = mAllBlocksById.at(bid);
+            auto block = getBlockById(bid);
             // Protect against blockKeys being shorter than blockIds.
             auto const& blockKey = blockKeys.at(blockCnt);
 
@@ -2343,10 +2357,10 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
-          maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
-          std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
-          enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse,
-          nullptr, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
+        std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
+        enableBlockReuse, onboardBlocks, cacheType, std::nullopt, nullptr, enablePartialReuse, copyOnPartialReuse,
+        nullptr, enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
 {
 }
 
@@ -2361,11 +2375,11 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(numKvHeadsPerLayer, sizePerHead, tokensPerBlock, blocksPerWindow, maxNumSequences, maxBeamWidth,
-          maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
-          std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
-          enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse,
-          copyOnPartialReuse, kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize,
-          indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
+        std::make_shared<runtime::CudaStream>(reinterpret_cast<cudaStream_t>(stream)), maxSequenceLength,
+        enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority, eventManager, enablePartialReuse,
+        copyOnPartialReuse, kvCacheConnectorManager, enableIndexerKCache, indexerKCacheQuantBlockSize,
+        indexerKCacheIndexHeadDim, linearAttentionMetadata)
 {
 }
 
@@ -2420,10 +2434,10 @@ KVCacheManager::KVCacheManager(SizeType32 numLayers, SizeType32 numKvHeads, Size
     SizeType32 indexerKCacheQuantBlockSize, SizeType32 indexerKCacheIndexHeadDim,
     std::optional<LinearAttentionMetadata> linearAttentionMetadata)
     : KVCacheManager(std::vector<SizeType32>(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
-          maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
-          std::move(stream), maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority,
-          std::move(eventManager), enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager),
-          enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
+        maxNumSequences, maxBeamWidth, maxAttentionWindowVec, tempAttentionWindowInputs, dtype, sinkTokenLength,
+        std::move(stream), maxSequenceLength, enableBlockReuse, onboardBlocks, cacheType, secondaryOffloadMinPriority,
+        std::move(eventManager), enablePartialReuse, copyOnPartialReuse, std::move(kvCacheConnectorManager),
+        enableIndexerKCache, indexerKCacheQuantBlockSize, indexerKCacheIndexHeadDim, linearAttentionMetadata)
 {
 }
 

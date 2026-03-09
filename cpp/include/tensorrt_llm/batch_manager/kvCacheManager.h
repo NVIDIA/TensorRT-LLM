@@ -22,8 +22,6 @@
 #include "tensorrt_llm/batch_manager/kvCacheType.h"
 #include "tensorrt_llm/batch_manager/llmRequest.h" // TODO forward declare
 #include "tensorrt_llm/batch_manager/radixBlockTree.h"
-#include "tensorrt_llm/common/assert.h"
-#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/optionalRef.h"
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/executor/transferAgent.h"
@@ -307,7 +305,7 @@ struct KvCacheStats
 // Basic building block of a paged KV cache - a single
 // cache block. This class just holds metadata, no pointers
 // since it is reused across all layers.
-class KVCacheBlock
+class KVCacheBlock : public std::enable_shared_from_this<KVCacheBlock>
 {
 public:
     using IdType = std::int32_t;
@@ -328,8 +326,7 @@ public:
     //! block is stored as the value for \p windowSize in \p node.
     //! \param node    The lookup-tree node to attach to.
     //! \param windowSize Value key identifying this block's slot within the node.
-    //! \param self    shared_ptr to this block (passed in by the caller who already holds it).
-    void attachToLookupNode(radix_block_tree::LookupNodePtr node, int windowSize, std::shared_ptr<KVCacheBlock> self);
+    void attachToLookupNode(radix_block_tree::LookupNodePtr node, int windowSize);
 
     //! \brief Detach this block from the lookup tree.
     //! \details Clears the block's value slot in its current node and resets mLookupNode /
@@ -338,13 +335,12 @@ public:
     void detachFromLookupNode();
 
     //! \brief Initialize a dummy root block's lookup-node link.
-    //! \details Stores \p self as the value for \p windowSize in \p rootNode so that
+    //! \details Stores this block as the value for \p windowSize in \p rootNode so that
     //! direct children can retrieve the root block via getPrevBlock(). Must be called once
     //! after constructing the mCachedBlocksRoot block.
     //! \param rootNode  Root node of the per-manager UnifiedBlockTree.
     //! \param windowSize Window size associated with this WindowBlockManager.
-    //! \param self      shared_ptr to this (the root) block.
-    void setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize, std::shared_ptr<KVCacheBlock> self);
+    void setAsRoot(radix_block_tree::LookupNodePtr rootNode, int windowSize);
 
     [[nodiscard]] kernels::KVCacheIndex::UnderlyingType getMemoryPoolBlockIndex() const;
 
@@ -401,9 +397,9 @@ public:
     //! \brief Create a placeholder KVCacheBlock with no GPU memory.
     //! \details The placeholder holds a block ID for sequence bookkeeping but mIsPlaceholder
     //! is set so that getCacheBlockIndices returns a nil index and the eviction pool ignores it.
-    static BlockPtr createPlaceholder(IdType blockId);
+    static BlockPtr createPlaceholder(IdType blockId, SizeType32 windowSize);
 
-    void freeDescendantsRecursively();
+    void detachDescendantsFromLookupTree();
     void freeBlockAndAllDescendants();
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
@@ -465,8 +461,10 @@ private:
     radix_block_tree::LookupNodePtr mLookupNode;
 
     // Window size slot this block occupies in mLookupNode->mValue.
-    // 0 when mLookupNode is nullptr (unattached sentinel; 0 is never a valid window size).
-    WindowSizeType mWindowSize;
+    // std::numeric_limits<int>::max() when mLookupNode is nullptr (unattached sentinel;
+    // valid sizes are >= 1 or kRecurrentStates (-1); the sentinel is intentionally illegal
+    // so accidental use on an unattached block triggers observable failures).
+    int mWindowSize;
 
     // True when this block has no physical GPU memory (Mamba placeholder).
     bool mIsPlaceholder;
@@ -1081,9 +1079,10 @@ public:
         // The shared lookup tree is reset once by BlockManager::resetReuseState() before
         // this method is called.  Here we only need to re-create the per-window root block
         // and wire it into the (already fresh) shared tree.
-        mCachedBlocksRoot
-            = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId, tensorrt_llm::kernels::KVCacheIndex{0});
-        mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize, mCachedBlocksRoot);
+        mCachedBlocksRoot = std::make_shared<KVCacheBlock>(KVCacheBlock::kCachedBlocksRootId,
+            tensorrt_llm::kernels::KVCacheIndex{
+                std::numeric_limits<tensorrt_llm::kernels::KVCacheIndex::UnderlyingType>::max()});
+        mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
     }
 
 private:

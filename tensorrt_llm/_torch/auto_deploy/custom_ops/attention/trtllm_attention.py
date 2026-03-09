@@ -357,17 +357,19 @@ def trtllm_mha_with_cache(
         _GlobalTrtllmPlanner.get_layer_tensors(kv_cache, kv_scale_orig_quant, kv_scale_quant_orig)
     )
 
-    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse
-    # Input is always [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed),
-    # so b * s == num_tokens always holds.
+    # Reshape Q, K, V to [num_tokens, num_heads * head_dim] and fuse.
+    # Input is [bs, 1] (generate-only) or [1, total_seq_len] (prefill/mixed).
+    # With piecewise CUDA graphs the tensor may be padded to a bucket size
+    # (b*s > num_tokens), so flatten first and slice to the real token count.
     q_shape_og = q.shape
-    q_flat = q.reshape(num_tokens, num_heads * head_dim)
-    k_flat = k.reshape(num_tokens, num_kv_heads * head_dim)
-    v_flat = v.reshape(num_tokens, num_kv_heads * head_dim)
+    q_flat = q.reshape(-1, num_heads * head_dim)[:num_tokens]
+    k_flat = k.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
+    v_flat = v.reshape(-1, num_kv_heads * head_dim)[:num_tokens]
     qkv_fused = torch.cat([q_flat, k_flat, v_flat], dim=-1).contiguous()
 
-    # Prepare output
-    output = torch.empty(num_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
+    # Prepare output (pre-allocate at full padded size so padding positions are clean zeros)
+    total_padded_tokens = q_shape_og[0] * q_shape_og[1]
+    output = torch.zeros(total_padded_tokens, num_heads * head_dim, dtype=q.dtype, device=q.device)
 
     # Map SequenceInfo fields to thop.attention args
     sequence_length = seq_len_with_cache[:num_seq]  # device
@@ -398,7 +400,7 @@ def trtllm_mha_with_cache(
         qkv_fused,  # q (actually fused QKV)
         None,  # k (None when using fused QKV)
         None,  # v (None when using fused QKV)
-        output,  # output
+        output[:num_tokens],  # output
         None,  # output_sf (NVFP4)
         _GlobalTrtllmPlanner.workspace,  # workspace (module-level, like flashinfer)
         sequence_length,  # sequence_length

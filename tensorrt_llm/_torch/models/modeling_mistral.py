@@ -683,6 +683,7 @@ class Mistral3VLM(PreTrainedModel):
             inputs_embeds=inputs_embeds,
             return_context_logits=return_context_logits,
             spec_metadata=spec_metadata,
+            resource_manager=kwargs.get('resource_manager'),
         )
 
     @staticmethod

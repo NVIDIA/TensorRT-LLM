@@ -65,6 +65,7 @@ l0_l40s:
   - examples/test_nemotron_nas.py::test_nemotron_nas_summary_1gpu[DeciLM-7B]
   - examples/test_gpt.py::test_llm_gpt_starcoder_lora_1gpu[peft-lora-starcoder2-15b-unity-copilot-starcoder2-lora_fp16-base_fp16]
   - llmapi/test_llm_examples.py::test_llmapi_quickstart
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - llmapi/test_llm_examples.py::test_llmapi_example_inference
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming

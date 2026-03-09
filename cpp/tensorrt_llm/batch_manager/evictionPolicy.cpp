@@ -129,8 +129,7 @@ BlockPtr LRUEvictionPolicy::getPlaceholderBlock(WindowSizeType windowSize)
     {
         TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::getPlaceholderBlock :: Creating new placeholder block with id=%d",
             __FILE__, __LINE__, mNextPlaceholderBlockId);
-        auto block
-            = std::make_shared<KVCacheBlock>(mNextPlaceholderBlockId--, kernels::KVCacheIndex::nullIndex, windowSize);
+        auto block = KVCacheBlock::createPlaceholder(mNextPlaceholderBlockId--, windowSize);
         mAllPlaceholders[block->getBlockId()] = block;
         return block;
     }
@@ -169,9 +168,6 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
         "Attempted to release the cached-blocks root into the eviction queue");
     if (block->isPlaceholder())
     {
-        TLLM_LOG_DEBUG(
-            "%s;%d - LRUEvictionPolicy::releaseBlock :: blockId=%d is a placeholder block, collected for reuse.",
-            __FILE__, __LINE__, block->getBlockId());
         mPlaceholderBlockPool.insert(block);
         return;
     }

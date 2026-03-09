@@ -16,30 +16,6 @@ l0_dgx_b200:
       orchestrator: mpi
   tests:
   - unittest/_torch/misc/test_autotuner.py::test_autotuner_distributed_strategy
-  # ------------- legacy MoE tests ---------------
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall[DeepEPLowLatency]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEPLowLatency]
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[NVLinkTwoSided]
-  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
-  # --- CUTLASS ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and None"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not MXFP8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
-  # --- TRTLLM ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
-  # --- CUTEDSL (NVFP4 only) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
-  # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM"
-  # ------------- MoE: test_multi_gpu_eplb ---------------
-  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
-  # ---- end MoE tests ----
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-False-True-True]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_auto_dtype_4gpus[4-4-True-True-True]
   - accuracy/test_llm_api_pytorch.py::TestNemotronV3Super::test_nvfp4_4gpu_mtp_ar TIMEOUT (60)
@@ -60,6 +36,39 @@ l0_dgx_b200:
   - unittest/_torch/visual_gen/test_wan_i2v.py::TestWanI2VCombinedOptimizations::test_all_optimizations_combined
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxParallelism::test_ulysses_2gpu_correctness
   - unittest/_torch/visual_gen/test_flux_pipeline.py::TestFluxCombinedOptimizations::test_all_optimizations_combined
+- condition:
+    ranges:
+      system_gpu_count:
+        gte: 4
+        lte: 4
+    wildcards:
+      gpu:
+      - '*b200*'
+      linux_distribution_name: ubuntu*
+      cpu: x86_64
+    terms:
+      stage: pre_merge
+      backend: pytorch
+      orchestrator: mpi
+  tests:
+  # ------------- MoE: test_multi_gpu (by backend x quant) ---------------
+  # --- CUTLASS ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and FP8 and not MXFP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and NVFP4"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W4A8_MXFP4_MXFP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTLASS and W8A16"
+  # --- TRTLLM ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and NVFP4 and not W4A8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and FP8_BLOCK_SCALES"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_NVFP4_FP8"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A16_MXFP4"
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "TRTLLM and W4A8_MXFP4_MXFP8"
+  # --- CUTEDSL (NVFP4 only) ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "CUTEDSL"
+  # --- DEEPGEMM (FP8_BLOCK_SCALES only) ---
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu -k "DEEPGEMM"
+  # ------------- MoE: test_multi_gpu_eplb ---------------
+  - unittest/_torch/modules/moe/test_moe_module.py::test_configurable_moe_multi_gpu_eplb
 - condition:
     ranges:
       system_gpu_count:
@@ -103,6 +112,8 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1dp2cp2] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp2cp2] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v2-cudagraph:with_padding-pp1tp1cp4] TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1tp1cp4] TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1tp2cp2] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_mtp] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus[throughput_bs8_mtp] TIMEOUT (60)
@@ -139,6 +150,8 @@ l0_dgx_b200:
   - accuracy/test_disaggregated_serving.py::TestDeepSeekV3Lite::test_auto_dtype_with_helix[fifo_v1-cudagraph:with_padding-pp1tp1cp4] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v1-cudagraph:with_padding-pp2tp1cp2] TIMEOUT (60)
   - accuracy/test_disaggregated_serving.py::TestQwen3_8B::test_auto_dtype_with_helix[fifo_v1-cudagraph:with_padding-pp1dp2cp2] TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp1dp2cp2] TIMEOUT (60)
+  - accuracy/test_disaggregated_serving.py::TestDeepSeekV32Exp::test_auto_dtype_with_helix[fifo-cudagraph:with_padding-pp2tp1cp2] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekR1::test_nvfp4_multi_gpus_corner_case TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[baseline_fp8kv] TIMEOUT (60)
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV32::test_fp8_blockscale[latency] TIMEOUT (60)
@@ -169,7 +182,6 @@ l0_dgx_b200:
       backend: pytorch
       orchestrator: mpi
   tests:
-  - unittest/_torch/modules/test_fused_moe.py::test_fused_moe_alltoall_fp4[DeepEP]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_bfloat16_4gpus[tp4-attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[tp4-fp8kv=False-attn_backend=FLASHINFER-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=False-attn_backend=TRTLLM-torch_compile=False]
@@ -251,9 +263,11 @@ l0_dgx_b200:
   - accuracy/test_llm_api_pytorch.py::TestLlama3_1_8BInstruct::test_fp8_4gpus[pp4-fp8kv=True-attn_backend=TRTLLM-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestDeepSeekV3Lite::test_nvfp4_4gpus[moe_backend=CUTEDSL-mtp_nextn=2-ep4-fp8kv=True-attention_dp=True-cuda_graph=True-overlap_scheduler=True-torch_compile=False]
   - accuracy/test_llm_api_pytorch.py::TestLlama3_3_70BInstruct::test_fp4_tp2pp2[torch_compile=False-enable_gemm_allreduce_fusion=False]
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_fp8
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4
+  - visual_gen/test_visual_gen_benchmark.py
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:
@@ -270,7 +284,9 @@ l0_dgx_b200:
       backend: autodeploy
       orchestrator: mpi
   tests:
-  - unittest/_torch/auto_deploy/unit/multigpu
+  - unittest/auto_deploy/multigpu/custom_ops
+  - unittest/auto_deploy/multigpu/smoke
+  - unittest/auto_deploy/multigpu/transformations
   - accuracy/test_llm_api_autodeploy.py::TestLlama3_1_8B::test_auto_dtype[trtllm-False-4]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[fp8-4-trtllm]
   - accuracy/test_llm_api_autodeploy.py::TestNemotronNanoV3::test_accuracy[nvfp4-4-trtllm]
