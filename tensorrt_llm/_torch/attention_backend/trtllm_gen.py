@@ -904,19 +904,37 @@ class FlashInferTrtllmGenAttention:
         batch_start: int,
         batch_size: int,
     ):
-        """Build FlashInfer block_tables from kv_cache_block_offsets.
+        """Convert C++ KVBlockArray block offsets to FlashInfer page indices.
 
-        The C++ qkv_preprocessing kernel uses kv_cache_block_offsets (global
-        block indices) to write K/V into the pool.  get_buffers() returns a
-        tensor whose page stride equals kv_factor single-KV-block strides.
-        Therefore the correct FlashInfer page index is the C++ K-block offset
-        divided by kv_factor (=2).
+        The C++ qkv_preprocessing kernel writes K/V via KVBlockArray, which
+        addresses the pool as: pool_base + block_offset * bytes_per_single_kv_block.
+        Each K/V block is a separate entry (K at offset N, V at N+1).
+
+        FlashInfer indexes into the tensor returned by get_buffers(layer_idx),
+        where each "page" spans one K block + one V block.  The page stride
+        (get_buffers().stride(0)) varies by KV cache manager:
+
+        - KVCacheManager (V1): strided view over multi-layer pool.
+          stride(0) = num_layers * single_kv_block_elems, so
+          divisor = num_layers (e.g. 72).
+          k_offset = page * num_layers -> page = k_offset // 72.
+        - KVCacheManagerV2: contiguous per-layer tensor.
+          stride(0) = kv_factor * single_kv_block_elems, so
+          divisor = kv_factor (= 2).
+          k_offset = page * num_layers * kv_factor + layer * kv_factor
+          -> page_in_tensor = k_offset // 2.
+
+        The unified formula k_offsets // (stride(0) // single_kv_block_elems)
+        handles both layouts without branching.
         """
         if kv_cache_block_offsets is None:
             return None
         pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
         k_offsets = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size, 0, :]
-        return k_offsets // 2
+        kv_buf = self._kv_cache_manager.get_buffers(layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
+        single_kv_block_elems = kv_buf.shape[2] * kv_buf.shape[3] * kv_buf.shape[4]
+        divisor = kv_buf.stride(0) // single_kv_block_elems
+        return k_offsets // divisor
 
     def run_context(self, params: EnqueueContextParams):
         block_tables = self._build_block_tables(
