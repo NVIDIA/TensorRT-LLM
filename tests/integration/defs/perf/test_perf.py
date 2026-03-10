@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -247,6 +247,8 @@ TRUST_REMOTE_CODE_MODELS = {  # these models require explicit trust_remote_code=
 
 # Autodeploy model configs - maps model name to config file path (relative to TRT-LLM root)
 AUTODEPLOY_MODEL_CONFIGS = {
+    "llama_v3.1_8b_instruct_fp8":
+    "examples/auto_deploy/model_registry/configs/dashboard_default.yaml",
     "nemotron_nano_3_30b_fp8": "examples/auto_deploy/nano_v3.yaml",
 }
 
@@ -1360,6 +1362,18 @@ class MultiMetricPerfTest(AbstractPerfScriptTestClass):
                 if os.path.exists(config_file):
                     with open(config_file, 'r') as f:
                         autodeploy_config = yaml.safe_load(f)
+
+            max_input_len = max(
+                self._config.input_lens) if self._config.input_lens else 0
+            max_output_len = max(
+                self._config.output_lens) if self._config.output_lens else 0
+            required_max_seq_len = max(self._config.max_num_tokens,
+                                       max_input_len + max_output_len)
+            current_max_seq_len = autodeploy_config.get("max_seq_len", 0)
+            if not isinstance(current_max_seq_len, int):
+                current_max_seq_len = 0
+            if current_max_seq_len < required_max_seq_len:
+                autodeploy_config["max_seq_len"] = required_max_seq_len
 
             print_info(f"_autodeploy model config: {autodeploy_config}")
             with open(autodeploy_config_path, 'w') as f:

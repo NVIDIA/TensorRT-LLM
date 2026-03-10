@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -22,9 +22,15 @@ from diff_tools import get_csv_lines, get_diff, load_file
 
 class SanityPerfCheck():
 
-    def __init__(self, target_perf_csv, base_perf_csv=None, threshold=0.1):
+    def __init__(self,
+                 target_perf_csv,
+                 base_perf_csv=None,
+                 threshold=0.1,
+                 base_perf_autodeploy_csv=None):
         self.target_perf_csv = Path(target_perf_csv)
         self.base_perf_csv = Path(base_perf_csv)
+        self.base_perf_autodeploy_csv = (Path(base_perf_autodeploy_csv)
+                                         if base_perf_autodeploy_csv else None)
         self.threshold = threshold
 
     def report_diff(self, full_diff: pd.DataFrame) -> None:
@@ -48,6 +54,12 @@ class SanityPerfCheck():
                     f'a/tests/integration/defs/perf/{base_perf_filename}',
                     f'b/tests/integration/defs/perf/{base_perf_filename}'):
                 f.write(diff_line)
+
+    def _is_autodeploy_entry(self, df: pd.DataFrame) -> pd.Series:
+        if 'network_name' not in df.columns:
+            return pd.Series([False] * len(df), index=df.index)
+        return df['network_name'].str.contains('_autodeploy',
+                                               na=False).fillna(False)
 
     def _check_autodeploy_failures(self, full_diff: pd.DataFrame,
                                    base_perf: pd.DataFrame,
@@ -216,38 +228,114 @@ class SanityPerfCheck():
         base_perf = load_file(self.base_perf_csv.as_posix())
         current_perf = load_file(self.target_perf_csv.as_posix())
 
-        # Filter performance data by device subtype for autodeploy tests
-        base_perf, current_perf = self._filter_by_device_subtype(
-            base_perf, current_perf)
+        # Backward compatibility: single baseline file mode.
+        if self.base_perf_autodeploy_csv is None:
+            # Filter performance data by device subtype for autodeploy tests
+            base_perf, current_perf = self._filter_by_device_subtype(
+                base_perf, current_perf)
 
-        full_diff, new_base = get_diff(base_perf, current_perf)
-        if not full_diff.empty:
-            self.report_diff(full_diff)
-            output_patch = self.target_perf_csv.with_name(
-                'perf_patch.patch').as_posix()
-            self.write_patch(get_csv_lines(base_perf), get_csv_lines(new_base),
-                             output_patch, self.base_perf_csv.name)
-            print(f"patch_file was written to {output_patch}")
+            full_diff, new_base = get_diff(base_perf, current_perf)
+            if not full_diff.empty:
+                self.report_diff(full_diff)
+                output_patch = self.target_perf_csv.with_name(
+                    'perf_patch.patch').as_posix()
+                self.write_patch(get_csv_lines(base_perf),
+                                 get_csv_lines(new_base), output_patch,
+                                 self.base_perf_csv.name)
+                print(f"patch_file was written to {output_patch}")
+                print(
+                    "You can download the file and update base_perf.csv by `git apply <patch file>`"
+                )
+
+                # Check if any of the failed tests are autodeploy tests
+                autodeploy_failures = self._check_autodeploy_failures(
+                    full_diff, base_perf, current_perf)
+
+                if autodeploy_failures:
+                    print(
+                        "Sanity perf check failed for autodeploy tests - failing the build"
+                    )
+                    return 1
+                else:
+                    print(
+                        "Sanity perf check failed, but it has been disabled for non-autodeploy tests"
+                    )
+            return 0
+
+        # Two-file mode: non-autodeploy uses base_perf_csv, autodeploy uses base_perf_autodeploy_csv.
+        if not self.base_perf_autodeploy_csv.exists():
             print(
-                "You can download the file and update base_perf.csv by `git apply <patch file>`"
+                f"{self.base_perf_autodeploy_csv.name} doesn't exist, skip autodeploy perf check."
+            )
+            return 0
+
+        base_perf_autodeploy = load_file(
+            self.base_perf_autodeploy_csv.as_posix())
+
+        base_is_ad = self._is_autodeploy_entry(base_perf)
+        current_is_ad = self._is_autodeploy_entry(current_perf)
+        base_ad_is_ad = self._is_autodeploy_entry(base_perf_autodeploy)
+
+        base_non_autodeploy = base_perf[~base_is_ad].copy()
+        current_non_autodeploy = current_perf[~current_is_ad].copy()
+        base_autodeploy = base_perf_autodeploy[base_ad_is_ad].copy()
+        current_autodeploy = current_perf[current_is_ad].copy()
+
+        # Only autodeploy comparisons are device-subtype constrained.
+        base_autodeploy, current_autodeploy = self._filter_by_device_subtype(
+            base_autodeploy, current_autodeploy)
+
+        autodeploy_failures = False
+
+        # 1) Non-autodeploy check (report-only, never fails build)
+        if not current_non_autodeploy.empty:
+            non_ad_full_diff, non_ad_new_base = get_diff(
+                base_non_autodeploy, current_non_autodeploy)
+            if not non_ad_full_diff.empty:
+                print("=== Non-autodeploy diffs ===")
+                self.report_diff(non_ad_full_diff)
+                output_patch = self.target_perf_csv.with_name(
+                    'perf_patch_base_perf_pytorch.patch').as_posix()
+                self.write_patch(get_csv_lines(base_non_autodeploy),
+                                 get_csv_lines(non_ad_new_base), output_patch,
+                                 self.base_perf_csv.name)
+                print(f"patch_file was written to {output_patch}")
+        else:
+            print(
+                "No non-autodeploy rows in target csv, skip non-autodeploy diff."
             )
 
-            # Check if any of the failed tests are autodeploy tests
-            autodeploy_failures = self._check_autodeploy_failures(
-                full_diff, base_perf, current_perf)
+        # 2) Autodeploy check (regressions fail build)
+        if not current_autodeploy.empty:
+            ad_full_diff, ad_new_base = get_diff(base_autodeploy,
+                                                 current_autodeploy)
+            if not ad_full_diff.empty:
+                print("=== Autodeploy diffs ===")
+                self.report_diff(ad_full_diff)
+                output_patch = self.target_perf_csv.with_name(
+                    'perf_patch_base_perf_autodeploy.patch').as_posix()
+                self.write_patch(get_csv_lines(base_autodeploy),
+                                 get_csv_lines(ad_new_base), output_patch,
+                                 self.base_perf_autodeploy_csv.name)
+                print(f"patch_file was written to {output_patch}")
 
-            if autodeploy_failures:
-                print(
-                    "Sanity perf check failed for autodeploy tests - failing the build"
-                )
-                return 1
-            else:
-                print(
-                    "Sanity perf check failed, but it has been disabled for non-autodeploy tests"
-                )
+                autodeploy_failures = self._check_autodeploy_failures(
+                    ad_full_diff, base_autodeploy, current_autodeploy)
+        else:
+            print("No autodeploy rows in target csv, skip autodeploy diff.")
+
+        if autodeploy_failures:
+            print(
+                "Sanity perf check failed for autodeploy tests - failing the build"
+            )
+            return 1
         return 0
 
 
 if __name__ == '__main__':
-    exit_code = SanityPerfCheck(sys.argv[1], sys.argv[2])()
+    base_perf_autodeploy_csv = sys.argv[3] if len(sys.argv) > 3 else None
+    exit_code = SanityPerfCheck(
+        sys.argv[1],
+        sys.argv[2],
+        base_perf_autodeploy_csv=base_perf_autodeploy_csv)()
     sys.exit(exit_code)

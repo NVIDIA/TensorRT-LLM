@@ -2,10 +2,14 @@
 
 ## Background
 "Sanity perf check" is a mechanism to detect performance regressions in the L0 pipeline.
-The tests defined in `l0_perf.yml` are the ones that are required to pass for every PR before merge.
+The tests defined in `l0_perf.yml` and `l0_perf_autodeploy.yml` are the ones that are required to pass for every PR before merge.
 
-### `base_perf.csv`
-The baseline for performance benchmarking is defined at `base_perf.csv` - this file contains the metrics that we verify regression on between CI runs.
+### Baseline Files
+The baseline for performance benchmarking is defined in csv files under `tests/integration/defs/perf/`:
+
+- `base_perf.csv`: TensorRT backend baseline
+- `base_perf_pytorch.csv`: PyTorch baseline
+- `base_perf_autodeploy.csv`: AutoDeploy baseline
 
 This file contains records in the following format:
 ```
@@ -17,13 +21,13 @@ To allow for some machine dependent variance in performance benchmarking we also
 `threshold` is relative.
 
 ## CI
-As part of our CI, the `test_perf.py` collects performance metrics for configurations defined in `l0_perf.yml`. This step outputs a `perf_script_test_results.csv` containing the metrics collected for all configurations.
+As part of our CI, the `test_perf.py` collects performance metrics for configurations defined in the perf test lists (`l0_perf.yml` and `l0_perf_autodeploy.yml`). This step outputs a `perf_script_test_results.csv` containing the metrics collected for all configurations.
 
-After this step completes, the CI will run `sanity_perf_check.py`. This script will make sure that all differences in metrics from the run on this branch is within a designated threshold of the baseline (`base_perf.csv`).
+After this step completes, the CI will run `sanity_perf_check.py`. This script will make sure that all differences in metrics from the run on this branch are within designated thresholds of the corresponding baseline files.
 
 There're 4 possible results for this:
 1. The current HEAD impact on the performance for our setups is within accepted threshold - the perf check will **pass** w/o exception.
-2. The current HEAD introduces a new setup/metric in `l0_perf.yml` or removes some of them. This will result in new metrics collected by `test_perf.py` which will **fail** `sanity_perf_check.py`. This requires an update for `base_perf.csv`.
+2. The current HEAD introduces a new setup/metric in the perf test lists or removes some of them. This will result in new metrics collected by `test_perf.py` which will **fail** `sanity_perf_check.py`. This requires a baseline update.
 3. The current HEAD improves performance for at least one metric by more than the accepted threshold, which will **fail** `sanity_perf_check.py`. This requires an update for `base_perf.csv`
 4. The current HEAD introduces a regression to one of the metrics that is over the accepted threshold, which will **fail** `sanity_perf_check.py`. This will require to fix the current branch and rerun the pipeline.
 
@@ -42,7 +46,10 @@ Then, you can run it with:
 ```
 sanity_perf_check.py <target_perf_csv_path> <base_perf_csv_path>
 ```
-** In the CI, `<base_perf_csv_path>` is the `base_perf.csv` file path mentioned above.
+** In CI, a second optional baseline file can be passed for `_autodeploy` metrics:
+```
+sanity_perf_check.py <target_perf_csv_path> <base_perf_csv_path> <base_perf_autodeploy_csv_path>
+```
 
 Running this print the diffs between both performance results. It presents only:
 1. Metrics that have a diff bigger than the accepted threshold.

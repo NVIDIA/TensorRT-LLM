@@ -130,16 +130,20 @@ if [ $pytest_exit_code -eq 4 ]; then
 fi
 
 if [ $SLURM_PROCID -eq 0 ] && [ "$perfMode" = "true" ]; then
-    if [[ "$stageName" == *PyTorch* ]]; then
+    if [[ "$stageName" == *AutoDeploy* ]]; then
+        basePerfFilename="base_perf_autodeploy.csv"
+    elif [[ "$stageName" == *PyTorch* ]]; then
         basePerfFilename="base_perf_pytorch.csv"
     else
         basePerfFilename="base_perf.csv"
     fi
     basePerfPath="$llmSrcNode/tests/integration/defs/perf/$basePerfFilename"
+    basePerfAutodeployPath="$llmSrcNode/tests/integration/defs/perf/base_perf_autodeploy.csv"
     echo "Check Perf Result"
     python3 $llmSrcNode/tests/integration/defs/perf/sanity_perf_check.py \
         $stageName/perf_script_test_results.csv \
-        $basePerfPath
+        $basePerfPath \
+        $basePerfAutodeployPath
     perf_check_exit_code=$?
 
     echo "Create Perf Report"

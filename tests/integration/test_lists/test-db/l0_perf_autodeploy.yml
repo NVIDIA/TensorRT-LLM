@@ -1,0 +1,18 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+version: 0.0.1
+l0_perf_autodeploy:
+  - condition:
+      ranges:
+        system_gpu_count:
+          gte: 1
+          lte: 1
+      wildcards:
+        gpu:
+          - '*h100*'
+        linux_distribution_name: ubuntu*
+      terms:
+        stage: pre_merge
+        backend: autodeploy
+    tests:
+      - perf/test_perf.py::test_perf[deepseek_r1_distill_qwen_32b-bench-_autodeploy-float16-input_output_len:1024,1024-reqs:512]
