@@ -544,6 +544,16 @@ def _register_fake():
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     sz, dtype=torch.float)
 
+    @torch.library.register_fake("trtllm::fused_cat_fp8")
+    def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool = False):
+        pe_dim = pe.shape[-1]
+        nope_dim = nope.shape[-1]
+        head_dim = pe_dim + nope_dim
+        M = pe.numel() // pe_dim
+        fp8_out = pe.new_empty((M, head_dim), dtype=torch.float8_e4m3fn)
+        scale_out = pe.new_empty((M, 1), dtype=torch.float32)
+        return fp8_out, scale_out
+
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
         x: torch.Tensor,
