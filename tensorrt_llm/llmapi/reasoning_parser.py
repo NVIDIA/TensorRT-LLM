@@ -177,8 +177,23 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                  *,
                  reasoning_at_start: bool = True,
                  chat_template_kwargs: Optional[dict[str, Any]] = None) -> None:
+        self._force_nonempty_content = False
         if isinstance(chat_template_kwargs, dict):
             reasoning_at_start = chat_template_kwargs.get(
                 "enable_thinking", reasoning_at_start)
+            self._force_nonempty_content = chat_template_kwargs.get(
+                "force_nonempty_content", False) is True
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
+
+    def _maybe_swap_content(
+            self, result: ReasoningParserResult) -> ReasoningParserResult:
+        """When force_nonempty_content is set and content is empty, move
+        reasoning_content into content so the response always has content."""
+        if self._force_nonempty_content and not result.content and result.reasoning_content:
+            return ReasoningParserResult(content=result.reasoning_content,
+                                         reasoning_content="")
+        return result
+
+    def parse(self, text: str) -> ReasoningParserResult:
+        return self._maybe_swap_content(super().parse(text))
