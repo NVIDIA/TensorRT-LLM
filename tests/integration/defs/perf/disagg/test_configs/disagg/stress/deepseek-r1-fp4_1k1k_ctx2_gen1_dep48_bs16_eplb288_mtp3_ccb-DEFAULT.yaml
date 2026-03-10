@@ -25,7 +25,7 @@ slurm:
   numa_bind: true
 benchmark:
   mode: e2e
-  use_nv_sa_benchmark: true
+  use_nv_sa_benchmark: false
   multi_round: 20
   benchmark_ratio: 0.8
   streaming: true
