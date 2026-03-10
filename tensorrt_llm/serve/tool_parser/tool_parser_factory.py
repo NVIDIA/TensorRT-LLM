@@ -4,6 +4,7 @@ from .base_tool_parser import BaseToolParser
 from .deepseekv3_parser import DeepSeekV3Parser
 from .deepseekv31_parser import DeepSeekV31Parser
 from .deepseekv32_parser import DeepSeekV32Parser
+from .glm4_parser import Glm4ToolParser
 from .kimi_k2_tool_parser import KimiK2ToolParser
 from .qwen3_coder_parser import Qwen3CoderToolParser
 from .qwen3_tool_parser import Qwen3ToolParser
@@ -17,6 +18,7 @@ class ToolParserFactory:
         "deepseek_v3": DeepSeekV3Parser,
         "deepseek_v31": DeepSeekV31Parser,
         "deepseek_v32": DeepSeekV32Parser,
+        "glm4": Glm4ToolParser,
     }
 
     @staticmethod
