@@ -2178,8 +2178,7 @@ def test_disaggregated_logprobs(disaggregated_test_root,
                                 except json.JSONDecodeError as e:
                                     raise AssertionError(
                                         f"Invalid streaming chunk JSON: "
-                                        f"{data_str[:200]}"
-                                    ) from e
+                                        f"{data_str[:200]}") from e
                                 choices = chunk.get("choices", [])
                                 if choices:
                                     lp_data = choices[0].get("logprobs")
