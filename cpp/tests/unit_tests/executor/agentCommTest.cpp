@@ -155,7 +155,7 @@ protected:
 
 TEST_P(AgentCommTest, AgentConnectionManagerBasic)
 {
-    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
     auto connectionManager = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     ASSERT_TRUE(connectionManager != nullptr);
     ASSERT_EQ(connectionManager->getCacheTransBufferManagers().size(), bufferManagers.size());
@@ -170,7 +170,7 @@ TEST_P(AgentCommTest, AgentConnectionManagerBasic)
 
 TEST_P(AgentCommTest, AgentConnectionManagerConnect)
 {
-    std::vector<CacheTransBufferManager*> bufferManagers{mTransBufferManager.get()};
+    std::vector<tensorrt_llm::batch_manager::BaseTransBufferManager*> bufferManagers{mTransBufferManager.get()};
     auto connectionManager0 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     auto connectionManager1 = std::make_unique<AgentConnectionManager>(bufferManagers, *mCacheState, backend);
     auto agentName0 = connectionManager0->getAgentName();
