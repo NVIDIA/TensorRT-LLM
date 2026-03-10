@@ -676,7 +676,10 @@ class Sm100BlockScaledContiguousGroupedGemmKernel:
 
         # Compute grid size
         self.tile_sched_params, grid = self._compute_grid(
-            c, self.cta_tile_shape_mnk, self.cluster_shape_mn, max_active_clusters,
+            c,
+            self.cta_tile_shape_mnk,
+            self.cluster_shape_mn,
+            max_active_clusters,
             self.raster_along_m,
         )
 
