@@ -24,23 +24,22 @@ This benchmarks ONLY the communication kernels, specifically:
 Launch (examples):
 
 ```bash
-# Spawn mode (default): single python invocation, workers spawned via MPIPoolExecutor.
+# Minimal: sweep batch sizes 1..1024 (powers of 2) on ep=8.
 python tests/microbenchmarks/bench_moe_comm.py \
-    --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 \
-    -b 1 -e 1024 -f 2
+    --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 -b 1 -e 1024 -f 2
 
-# mpirun mode: avoids spawn overhead; required for multi-node or when spawn is problematic.
-# --ep_size can be omitted; inferred from MPI world size.
-mpirun -n 8 python tests/microbenchmarks/bench_moe_comm.py \
-    --backend NVLINK_ONE_SIDED --profile deepseek_v3 \
-    -b 1 -e 1024 -f 2
-
-# CUDA graph + kernel breakdown: eliminates CPU launch overhead; reports per-kernel GPU times.
-# --perfect_router: fixed uniform routing (removes routing variance from measurements).
+# Add kernel breakdown and per-iteration stats; save results to JSON.
+# --perfect_router removes routing variance so timings are stable across iterations.
 python tests/microbenchmarks/bench_moe_comm.py \
     --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 --perfect_router \
-    --cuda_graph --kernel_breakdown --iter_stats \
-    -b 1 -e 1024 -f 2 --output_file out.json
+    --kernel_breakdown --iter_stats -b 1 -e 1024 -f 2 --output_file out.json
+
+# mpirun mode: workers are pre-launched by MPI instead of spawned internally.
+# Useful for multi-node, or when MPIPoolExecutor spawn causes issues.
+mpirun -n 8 python tests/microbenchmarks/bench_moe_comm.py \
+    --backend NVLINK_ONE_SIDED --profile deepseek_v3 --perfect_router \
+    --kernel_breakdown --iter_stats -b 1 -e 1024 -f 2 --output_file out.json
+
 ```
 """
 
@@ -902,13 +901,9 @@ def parse_args() -> argparse.Namespace:
         help="Use deterministic balanced router assignments to avoid communication load imbalance.",
     )
     parser.add_argument(
-        "--cuda_graph",
+        "--no_cuda_graph",
         action="store_true",
-        help=(
-            "Capture dispatch and combine into CUDA graphs. "
-            "Uses CUDA events for more accurate per-iteration timing (lower CPU overhead than Kineto ranges). "
-            "Compatible with --kernel_breakdown: individual kernels remain visible inside graph replays via CUPTI, but can only be categorized as 'other_kernels'."
-        ),
+        help="Disable CUDA graph mode. By default, dispatch and combine are captured into CUDA graphs for lower CPU overhead and more accurate timing.",
     )
     parser.add_argument(
         "--pdl",
@@ -1001,7 +996,7 @@ def _run_benchmark_worker_under_current_mpi(
     # but silently drops CUDA_EVENT records.  _set_device_from_local_rank() (below) is
     # the first call that creates the CUDA context, so we init CUPTI here.
     _early_cupti_ctx: Optional[Any] = None
-    if args.cuda_graph and args.kernel_breakdown:
+    if not args.no_cuda_graph and args.kernel_breakdown:
         _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
         if _cupti_ok:
             _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
@@ -1062,7 +1057,7 @@ def _run_benchmark_worker_under_current_mpi(
         "max_num_tokens_per_rank": max_num_tokens_per_rank,
         "random_seed": int(args.random_seed),
         "device_count": torch.cuda.device_count(),
-        "cuda_graph": bool(args.cuda_graph),
+        "cuda_graph": not args.no_cuda_graph,
         "pdl": bool(args.pdl),
     }
     if rank == 0:
@@ -1079,7 +1074,7 @@ def _run_benchmark_worker_under_current_mpi(
     # CUPTI was initialized before the CUDA context at the top of this function.
     # Reuse that early context; do not re-initialize here (too late for CUDA_EVENT delivery).
     _cupti_ctx: Optional[Any] = _early_cupti_ctx
-    if args.cuda_graph and args.kernel_breakdown and _cupti_ctx is None:
+    if not args.no_cuda_graph and args.kernel_breakdown and _cupti_ctx is None:
         _maybe_warn_rank0(
             "[bench] CUPTI unavailable, kernel breakdown disabled for cuda_graph mode."
         )
@@ -1160,7 +1155,7 @@ def _run_benchmark_worker_under_current_mpi(
             # Time dispatch and combine
             _time_fn = (
                 _time_dispatch_and_combine_cuda_graph
-                if args.cuda_graph
+                if not args.no_cuda_graph
                 else _time_dispatch_and_combine
             )
             time_fn_kwargs: Dict[str, Any] = dict(
@@ -1174,7 +1169,7 @@ def _run_benchmark_worker_under_current_mpi(
                 iters=int(args.iters),
                 flush_l2=True,
             )
-            if args.cuda_graph:
+            if not args.no_cuda_graph:
                 time_fn_kwargs["cupti_ctx"] = _cupti_ctx
             dispatch_times_us, combine_times_us, detailed_stats = _time_fn(
                 backend, **time_fn_kwargs
