@@ -22,6 +22,7 @@ import sys
 import time
 from datetime import datetime
 
+import yaml
 from defs.trt_test_alternative import print_info, print_warning
 
 _project_root = os.path.abspath(
@@ -224,93 +225,6 @@ def get_common_values(new_data_dict, match_keys):
     return common_values_dict
 
 
-def query_history_data(common_values_dict):
-    """
-    Query post-merge data with common values to narrow down scope.
-    """
-    # Query data from the last 90 days
-    last_days = QUERY_LOOKBACK_DAYS
-
-    # Build must clauses with base filters
-    must_clauses = [
-        {
-            "term": {
-                "b_is_valid": True
-            }
-        },
-        {
-            "term": {
-                "b_is_post_merge": True
-            }
-        },
-        {
-            "term": {
-                "b_is_regression": False
-            }
-        },
-        {
-            "range": {
-                "ts_created": {
-                    "gte":
-                    int(time.time() - 24 * 3600 * last_days) // (24 * 3600) *
-                    24 * 3600 * 1000,
-                }
-            }
-        },
-    ]
-
-    # Add common values as term filters to narrow down the query
-    for key, value in common_values_dict.items():
-        must_clauses.append({"term": {key: value}})
-
-    json_data = {
-        "query": {
-            "bool": {
-                "must": must_clauses
-            },
-        },
-        "size": MAX_QUERY_SIZE,
-    }
-    json_data = json.dumps(json_data)
-
-    data_list = []
-    try:
-        res = OpenSearchDB.queryFromOpenSearchDB(json_data,
-                                                 TEST_INFO_PROJECT_NAME)
-        if res is None:
-            # No response from database, return None
-            print_info(
-                f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned no response"
-            )
-            return None
-        payload = res.json().get("hits", {}).get("hits", [])
-        if len(payload) == 0:
-            # No history data found in database, return empty list
-            print_info(
-                f"No history data found in {TEST_INFO_PROJECT_NAME}, returned empty list"
-            )
-            return []
-        for hit in payload:
-            data_dict = hit.get("_source", {})
-            data_dict["_id"] = hit.get("_id", "")
-            if data_dict["_id"] == "":
-                print_info(
-                    f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned data with no _id"
-                )
-                # Invalid data, return None
-                return None
-            data_list.append(data_dict)
-        print_info(
-            f"Successfully queried from {TEST_INFO_PROJECT_NAME}, queried {len(data_list)} entries"
-        )
-        return data_list
-    except Exception as e:
-        print_info(
-            f"Failed to query from {TEST_INFO_PROJECT_NAME}, returned error: {e}"
-        )
-        return None
-
-
 def match(history_data, new_data, match_keys):
     """
     Check if the server and client config of history data match the new data
@@ -329,16 +243,76 @@ def match(history_data, new_data, match_keys):
     return True
 
 
-def calculate_best_perf_result(history_data_list, new_data):
+def _rolling_smooth(values, window=3):
+    """Trailing rolling mean with same-length output.
+
+    Early elements use fewer samples (i.e. the first element is itself,
+    the second is the mean of the first two, etc.).
     """
-    Get the best performance metrics from history data and new data
+    if not values:
+        return []
+    smoothed = []
+    for i in range(len(values)):
+        start = max(0, i - window + 1)
+        w = values[start:i + 1]
+        smoothed.append(sum(w) / len(w))
+    return smoothed
+
+
+def _percentile(values, p):
+    """Compute the p-th percentile with linear interpolation."""
+    if not values:
+        return 0.0
+    s = sorted(values)
+    k = (p / 100.0) * (len(s) - 1)
+    lo = int(k)
+    hi = min(lo + 1, len(s) - 1)
+    frac = k - lo
+    return s[lo] + frac * (s[hi] - s[lo])
+
+
+def _daily_aggregate_values(data_list, metric):
+    """Aggregate multiple data points on the same day to a single mean value.
+
+    Returns a list of daily-aggregated metric values sorted by date.
     """
-    # Combine history data and new data
+    by_day = {}
+    for data in data_list:
+        if data.get("b_is_baseline"):
+            continue
+        val = data.get(metric)
+        if val is None:
+            continue
+        ts = data.get("ts_created") or data.get("@timestamp")
+        if ts is None:
+            continue
+        if isinstance(ts, (int, float)):
+            if ts > 1e12:
+                ts = ts / 1000
+            day_key = datetime.fromtimestamp(ts).strftime("%Y-%m-%d")
+        elif isinstance(ts, datetime):
+            day_key = ts.strftime("%Y-%m-%d")
+        else:
+            day_key = str(ts)[:10]
+        by_day.setdefault(day_key, []).append(val)
+    result = []
+    for day in sorted(by_day):
+        vals = by_day[day]
+        result.append(sum(vals) / len(vals))
+    return result
+
+
+def calculate_baseline_metrics(history_data_list, new_data):
+    """Calculate baseline metrics using rolling smooth + percentile algorithm.
+
+    For each metric, aggregates data to daily values, applies a trailing
+    rolling mean (window=3), then takes:
+      - P95 for MAXIMIZE_METRICS (larger is better, e.g. throughput)
+      - P5  for MINIMIZE_METRICS (smaller is better, e.g. latency)
+    """
     all_data = []
     if history_data_list:
         all_data.extend(history_data_list)
-
-    # Handle new_data as either a single dict or list
     if isinstance(new_data, list):
         all_data.extend(new_data)
     elif new_data:
@@ -347,35 +321,18 @@ def calculate_best_perf_result(history_data_list, new_data):
     if not all_data:
         return {}
 
-    best_metrics = {}
+    baseline_metrics = {}
+    for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
+        daily_vals = _daily_aggregate_values(all_data, metric)
+        if not daily_vals:
+            continue
+        smoothed = _rolling_smooth(daily_vals, window=3)
+        if metric in MAXIMIZE_METRICS:
+            baseline_metrics[metric] = _percentile(smoothed, 95)
+        else:
+            baseline_metrics[metric] = _percentile(smoothed, 5)
 
-    # Calculate best values for maximize metrics
-    for metric in MAXIMIZE_METRICS:
-        values = []
-        for data in all_data:
-            # Skip baseline data
-            if data.get("b_is_baseline") and data.get("b_is_baseline") == True:
-                continue
-            if metric not in data:
-                continue
-            values.append(data.get(metric))
-        if values:
-            best_metrics[metric] = max(values)
-
-    # Calculate best values for minimize metrics
-    for metric in MINIMIZE_METRICS:
-        values = []
-        for data in all_data:
-            # Skip baseline data
-            if data.get("b_is_baseline") and data.get("b_is_baseline") == True:
-                continue
-            if metric not in data:
-                continue
-            values.append(data.get(metric))
-        if values:
-            best_metrics[metric] = min(values)
-
-    return best_metrics
+    return baseline_metrics
 
 
 def get_history_data(new_data_dict, match_keys, common_values_dict):
@@ -423,7 +380,32 @@ def get_history_data(new_data_dict, match_keys, common_values_dict):
     cmd_idxs = new_data_dict.keys()
     history_data_list = None
     if cmd_idxs:
-        history_data_list = query_history_data(common_values_dict)
+        last_days = QUERY_LOOKBACK_DAYS
+        must_clauses = [
+            {
+                "term": {
+                    "b_is_valid": True
+                }
+            },
+            {
+                "term": {
+                    "b_is_post_merge": True
+                }
+            },
+            {
+                "range": {
+                    "ts_created": {
+                        "gte":
+                        int(time.time() - 24 * 3600 * last_days) //
+                        (24 * 3600) * 24 * 3600 * 1000,
+                    }
+                }
+            },
+        ]
+        for key, value in common_values_dict.items():
+            must_clauses.append({"term": {key: value}})
+        history_data_list = OpenSearchDB.queryPerfDataFromOpenSearchDB(
+            TEST_INFO_PROJECT_NAME, must_clauses, size=MAX_QUERY_SIZE)
 
     # If query_history_data returned None, it means network failure
     if history_data_list is None:
@@ -504,9 +486,12 @@ def prepare_regressive_test_cases(history_baseline_dict, new_data_dict):
             continue
 
         is_post_merge = new_data.get("b_is_post_merge", False)
-        baseline_id = history_baseline.get("_id", "")
-
-        info_parts = [f"baseline_id: {baseline_id}"]
+        info_parts = [
+            f"baseline_id: {history_baseline.get('_id', '')}",
+            f"baseline_branch: {history_baseline.get('s_branch', '')}",
+            f"baseline_commit: {history_baseline.get('s_commit', '')}",
+            f"baseline_date: {history_baseline.get('ts_created', '')}",
+        ]
         regressive_metrics = []
         # Check all metrics and build info string
         for metric in MAXIMIZE_METRICS + MINIMIZE_METRICS:
@@ -563,8 +548,8 @@ def prepare_baseline_data(history_baseline_dict, history_data_dict,
     cmd_idxs = new_data_dict.keys()
     # Find the best history post-merge data for each cmd
     for cmd_idx in cmd_idxs:
-        # Calculate best metrics from history post-merge data and new data
-        best_metrics = calculate_best_perf_result(history_data_dict[cmd_idx],
+        # Calculate baseline metrics using rolling smooth + P95 algorithm
+        best_metrics = calculate_baseline_metrics(history_data_dict[cmd_idx],
                                                   new_data_dict[cmd_idx])
 
         # Create new_baseline_data from new_data_dict and set b_is_baseline
@@ -643,82 +628,115 @@ def _get_metric_keys():
     return metric_keys
 
 
-def _print_regression_data(data, print_func=None):
+def generate_perf_yaml(new_data_dict, output_dir=None):
     """
-    Print regression info and config.
+    Save new perf data entries to perf_data.yaml for post-processing.
+
+    Each entry in the output list is a dict with:
+      - "new_data": the new perf data dict
     """
-    if print_func is None:
-        print_func = print_info
+    all_entries = []
+    for cmd_idx, new_data in new_data_dict.items():
+        entry = {"new_data": new_data}
+        all_entries.append(entry)
 
-    if "s_regression_info" in data:
-        print_func("=== Regression Info ===")
-        for item in data["s_regression_info"].split(","):
-            print_func(item.strip())
-
-    metric_keys = _get_metric_keys()
-
-    print_func("\n=== Config ===")
-    config_keys = sorted([key for key in data.keys() if key not in metric_keys])
-    for key in config_keys:
-        if key == "s_regression_info":
-            continue
-        value = data[key]
-        print_func(f'"{key}": {value}')
+    if output_dir is not None and len(all_entries) > 0:
+        perf_data_file = os.path.join(output_dir, "perf_data.yaml")
+        with open(perf_data_file, 'w') as f:
+            yaml.dump(all_entries, f, default_flow_style=False)
+        print_info(
+            f"Saved {len(all_entries)} perf data entries to {perf_data_file}")
+    elif len(all_entries) == 0:
+        print_info("No perf data to save.")
 
 
-def check_perf_regression(new_data_dict, fail_on_regression=False):
-    """
-    Check performance regression by printing regression data from new_data_dict.
-    If fail_on_regression is True, raises RuntimeError when regressions are found.
-    (This is a temporary feature to fail regression tests. We are observing the stability and will fail them by default soon.)
-    """
-    # Filter regression data from new_data_dict
-    regressive_data_list = [
-        data for data in new_data_dict.values()
-        if data.get("b_is_regression", False)
-    ]
-    # Split regression data into post-merge and pre-merge
-    post_merge_regressions = [
-        data for data in regressive_data_list
-        if data.get("b_is_post_merge", False)
-    ]
-    pre_merge_regressions = [
-        data for data in regressive_data_list
-        if not data.get("b_is_post_merge", False)
-    ]
+# def _print_regression_data(data, print_func=None):
+#     """
+#     Print regression info and config.
+#     """
+#     if print_func is None:
+#         print_func = print_info
+#
+#     if "s_regression_info" in data:
+#         print_func("=== Regression Info ===")
+#         for item in data["s_regression_info"].split(","):
+#             print_func(item.strip())
+#
+#     metric_keys = _get_metric_keys()
+#
+#     print_func("\n=== Config ===")
+#     config_keys = sorted([key for key in data.keys() if key not in metric_keys])
+#     for key in config_keys:
+#         if key == "s_regression_info":
+#             continue
+#         value = data[key]
+#         print_func(f'"{key}": {value}')
 
-    # Print pre-merge regression data with print_warning
-    if len(pre_merge_regressions) > 0:
-        print_warning(
-            f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
-        )
-        for i, data in enumerate(pre_merge_regressions):
-            print_warning(f"\n{'=' * 60}")
-            print_warning(f"Pre-merge Regression Data #{i + 1}")
-            print_warning("=" * 60)
-            _print_regression_data(data, print_func=print_warning)
-
-        if fail_on_regression:
-            raise RuntimeError(
-                f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
-            )
-
-    # Print post-merge regression data with print_warning
-    if len(post_merge_regressions) > 0:
-        print_warning(
-            f"Found {len(post_merge_regressions)} post-merge perf regression data"
-        )
-        for i, data in enumerate(post_merge_regressions):
-            print_warning(f"\n{'=' * 60}")
-            print_warning(f"Post-merge Regression Data #{i + 1}")
-            print_warning("=" * 60)
-            _print_regression_data(data, print_func=print_warning)
-
-        if fail_on_regression:
-            raise RuntimeError(
-                f"Found {len(post_merge_regressions)} post-merge perf regression data"
-            )
-
-    # Print summary if no regressions
-    if len(regressive_data_list) == 0:
-        print_info("No regression data found.")
+# def check_perf_regression(new_data_dict,
+#                           fail_on_regression=False,
+#                           output_dir=None):
+#     """
+#     Check performance regression by printing regression data from new_data_dict.
+#     If fail_on_regression is True, raises RuntimeError when regressions are found.
+#     (This is a temporary feature to fail regression tests. We are observing the stability and will fail them by default soon.)
+#     If output_dir is provided, saves regression data to regression_data.yaml.
+#     """
+#     # Filter regression data from new_data_dict
+#     regressive_data_list = [
+#         data for data in new_data_dict.values()
+#         if data.get("b_is_regression", False)
+#     ]
+#     # Split regression data into post-merge and pre-merge
+#     post_merge_regressions = [
+#         data for data in regressive_data_list
+#         if data.get("b_is_post_merge", False)
+#     ]
+#     pre_merge_regressions = [
+#         data for data in regressive_data_list
+#         if not data.get("b_is_post_merge", False)
+#     ]
+#
+#     # Save regression data to yaml file if output_dir is provided
+#     if output_dir is not None and len(regressive_data_list) > 0:
+#         regression_data_file = os.path.join(output_dir, "regression_data.yaml")
+#         with open(regression_data_file, 'w') as f:
+#             yaml.dump(regressive_data_list, f, default_flow_style=False)
+#         print_info(
+#             f"Saved {len(regressive_data_list)} regression data to {regression_data_file}"
+#         )
+#
+#     # Print pre-merge regression data with print_warning
+#     if len(pre_merge_regressions) > 0:
+#         print_warning(
+#             f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
+#         )
+#         for i, data in enumerate(pre_merge_regressions):
+#             print_warning(f"\n{'=' * 60}")
+#             print_warning(f"Pre-merge Regression Data #{i + 1}")
+#             print_warning("=" * 60)
+#             _print_regression_data(data, print_func=print_warning)
+#
+#         if fail_on_regression:
+#             raise RuntimeError(
+#                 f"Found {len(pre_merge_regressions)} pre-merge perf regression data"
+#             )
+#
+#     # Print post-merge regression data with print_warning
+#     if len(post_merge_regressions) > 0:
+#         print_warning(
+#             f"Found {len(post_merge_regressions)} post-merge perf regression data"
+#         )
+#         for i, data in enumerate(post_merge_regressions):
+#             print_warning(f"\n{'=' * 60}")
+#             print_warning(f"Post-merge Regression Data #{i + 1}")
+#             print_warning("=" * 60)
+#             _print_regression_data(data, print_func=print_warning)
+#
+#         if fail_on_regression:
+#             raise RuntimeError(
+#                 f"Found {len(post_merge_regressions)} post-merge perf regression data"
+#             )
+#
+#     # Print summary if no regressions
+#     if len(regressive_data_list) == 0:
+#         print_info("No regression data found.")

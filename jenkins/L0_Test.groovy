@@ -895,19 +895,22 @@ def getMountListForSlurmTest(SlurmCluster cluster, boolean useSbatch = false)
 
 def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG, perfMode=false, stageName="Undefined", splitId=1, splits=1, gpuCount=1, nodeCount=1, skipInstallWheel=false, cpver="cp312")
 {
-    SlurmPartition partition = SlurmConfig.partitionConfig[platform] as SlurmPartition
+    SlurmPartition partition = SlurmConfig.resolvePlatform(platform)
     SlurmCluster cluster = SlurmConfig.clusterConfig[partition.clusterName]
 
     // Create a unique suffix for the job name
     String customSuffix = "${env.BUILD_TAG}-${UUID.randomUUID().toString().replaceAll("-", "").substring(0, 6)}".toLowerCase()
     def jobUID = "${cluster.host}-multi_node_test-${customSuffix}"
-    def disaggMode = stageName.contains("PerfSanity-Disagg")
+    def disaggMode = stageName.contains("Disagg-PerfSanity")
 
     Utils.exec(pipeline, script: "env | sort && pwd && ls -alh")
+
+    def stageIsInterrupted = false
 
     try {
         // Run ssh command to start node in desired cluster via SLURM
         withCredentials([
+            string(credentialsId: 'TRTLLM_HF_TOKEN', variable: 'HF_TOKEN'),
             usernamePassword(
                 credentialsId: 'svc_tensorrt',
                 usernameVariable: 'USERNAME',
@@ -1164,6 +1167,7 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                     export resourcePathNode=$resourcePathNode
                     export pytestCommand="$pytestCommand"
                     export coverageConfigFile="$coverageConfigFile"
+                    export HF_TOKEN=$HF_TOKEN
                     export NVIDIA_IMEX_CHANNELS=\${NVIDIA_IMEX_CHANNELS:-0}
                     export NVIDIA_VISIBLE_DEVICES=\${NVIDIA_VISIBLE_DEVICES:-\$(seq -s, 0 \$((\$(nvidia-smi --query-gpu=count -i 0 --format=csv,noheader)-1)))}
                     ${envExportStatements}
@@ -1175,10 +1179,6 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                 """.replaceAll("(?m)^\\s*", "")
 
                 if (disaggMode) {
-                    if(nodeCount > 1) {
-                        srunArgs.add("--mpi=pmix")
-                    }
-
                     def scriptLaunchPrefixPathLocal = Utils.createTempLocation(pipeline, "./slurm_launch_prefix.sh")
                     def scriptLaunchSrunArgsPathLocal = Utils.createTempLocation(pipeline, "./slurm_srun_args.txt")
                     def scriptLaunchDraftPathLocal = "${llmSrcLocal}/jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh"
@@ -1198,7 +1198,8 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
                         --run-sh ${scriptRunPathNode} \\
                         --install-sh ${scriptInstallPathNode} \\
                         --script-prefix ${scriptLaunchPrefixPathLocal} \\
-                        --srun-args ${scriptLaunchSrunArgsPathLocal}
+                        --srun-args ${scriptLaunchSrunArgsPathLocal} \\
+                        --split-group ${splitId}
                     """
                 } else {
                     if(nodeCount > 1) {
@@ -1376,8 +1377,11 @@ def runLLMTestlistWithSbatch(pipeline, platform, testList, config=VANILLA_CONFIG
             }
             echo "Finished test stage execution."
         }
+    } catch (InterruptedException e) {
+        stageIsInterrupted = true
+        throw e
     } finally {
-        uploadResults(pipeline, cluster, jobUID, stageName)
+        uploadResults(pipeline, cluster, jobUID, stageName, stageIsInterrupted)
         stage("Clean Up Slurm Resource") {
             // Workaround to handle the interruption during clean up SLURM resources
             retry(3) {
