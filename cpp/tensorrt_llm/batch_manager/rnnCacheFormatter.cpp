@@ -22,6 +22,7 @@
 #include "tensorrt_llm/common/assert.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
+#include "tensorrt_llm/executor/cache_transmission/agent_utils/connection.h"
 #include "tensorrt_llm/executor/cache_transmission/cacheSplitConcat.h"
 #include <algorithm>
 
@@ -155,6 +156,14 @@ void RnnCacheFormatter::format(TransferSession& session)
     auto& onlyUseDynamicBuffer = std::get<2>(allocationResult);
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+
+    auto const* agentConnection
+        = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
+    if (agentConnection != nullptr)
+    {
+        TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent needs all RNN send buffers pre-allocated");
+        TLLM_CHECK(onlyUseDynamicBuffer == false);
+    }
 
     std::vector<runtime::ITensor::SharedPtr> inputConvBlocks;
     std::vector<runtime::ITensor::SharedPtr> inputSsmBlocks;
@@ -302,7 +311,19 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     // Allocate receive buffers
     size_t remainNoCoverSourceNum = 0;
     size_t bufferCoverSourceNum = 0;
-    auto cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+    std::optional<int> cacheBufferId = std::nullopt;
+
+    auto preAssignedRnnId
+        = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kRNN));
+    if (preAssignedRnnId.has_value())
+    {
+        cacheBufferId = static_cast<int>(*preAssignedRnnId);
+    }
+    else
+    {
+        cacheBufferId = mRnnCacheTransBufferManager->assignBufferIndexForRecv();
+    }
+
     auto allocationResult = mRnnCacheTransBufferManager->getOrAllocateRecvBuffers(
         cacheBufferId, static_cast<int>(sourceNum), bufferSizesPerSource, bufferManager);
     auto& recvBuffers = std::get<0>(allocationResult);
@@ -310,6 +331,13 @@ void RnnCacheFormatter::unformat(TransferSession& session)
     auto& onlyUseDynamicBuffer = std::get<2>(allocationResult);
 
     TLLM_CHECK(cacheBufferId.has_value() || onlyUseDynamicBuffer);
+
+    if (preAssignedRnnId.has_value())
+    {
+        TLLM_CHECK_WITH_INFO(bufferCoverSourceNumTmp == sourceNum, "Agent needs all RNN recv buffers pre-allocated");
+        TLLM_CHECK(onlyUseDynamicBuffer == false);
+    }
+
     bufferCoverSourceNum = bufferCoverSourceNumTmp;
     remainNoCoverSourceNum = sourceNum > bufferCoverSourceNum ? sourceNum - bufferCoverSourceNum : 0;
 
