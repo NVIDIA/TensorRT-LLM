@@ -1792,7 +1792,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     if not single_token_stop_words_only
                     else self._are_stop_words_single_token
                 )
-                batched_finish_reasons[:, stop_word_indices] = torch.where(
+                batched_finish_reasons_stop_words = batched_finish_reasons[:, stop_word_indices]
+                _ = batched_finish_reasons_stop_words.masked_fill_(
                     stop_words_func(
                         stop_seq_slots,
                         stop_tokens,
@@ -1801,18 +1802,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         else num_accepted_tokens,
                     ),
                     FinishReason.STOP_WORDS.value,
-                    batched_finish_reasons[:, stop_word_indices],
                 )
+                batched_finish_reasons[:, stop_word_indices] = batched_finish_reasons_stop_words
 
-            batched_finish_reasons = torch.where(
+            _ = batched_finish_reasons.masked_fill_(
                 self._are_max_length(seq_lens, store.max_lengths_cuda[seq_slots]),
                 FinishReason.LENGTH.value,
-                batched_finish_reasons,
             )
-            batched_finish_reasons = torch.where(
+
+            _ = batched_finish_reasons.masked_fill_(
                 self._are_end_id(store.end_ids_cuda[seq_slots], tokens),
                 FinishReason.END_ID.value,
-                batched_finish_reasons,
             )
 
             finish_reasons[:, seq_slots] = batched_finish_reasons
@@ -1916,7 +1916,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Fill in the new tokens at the end of the past tokens buffer
             full_tokens[-self._max_tokens :] = tokens
             # short words are padded with _PAD_STOP_WORD_TOKEN_ID, so we need to mask them
-            mask = stop_words != self._PAD_STOP_WORD_TOKEN_ID
+            mask = stop_words == self._PAD_STOP_WORD_TOKEN_ID
             matches = torch.empty(
                 (
                     self._max_tokens,
@@ -1941,15 +1941,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             stop_words_for_match = stop_words.unsqueeze(0)
             _ = torch.eq(full_tokens_for_match, stop_words_for_match, out=matches)
             # Mask the padding tokens
-            matches_after_mask = torch.where(
-                mask.unsqueeze(0).expand(self._max_tokens, -1, -1, -1, -1), matches, True
+            _ = matches.masked_fill_(
+                mask.unsqueeze(0).expand(self._max_tokens, -1, -1, -1, -1), True
             )
             # Update the past tokens storage for the next iteration
             store.past_tokens_cuda[:, seq_slots] = full_tokens
             # Return the result
             word_len_dim = 2
             num_words_dim = 1
-            return torch.any(matches_after_mask.all(dim=word_len_dim), dim=num_words_dim)
+            return torch.any(matches.all(dim=word_len_dim), dim=num_words_dim)
 
         @nvtx_range("_are_stop_words_single_token")
         def _are_stop_words_single_token(
@@ -3721,8 +3721,10 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     group_logits_indices_for_processed_logprobs_cuda
                 ]
                 current_softmax_cuda = group_softmax_cuda[logit_indices_for_processed_logprobs_cuda]
-                processed_logits_cuda = torch.where(
-                    current_softmax_cuda > 0, current_logits_cuda, float("-inf")
+
+                # processed_logits_cuda is an alias to current_logits_cuda after this operation
+                processed_logits_cuda = current_logits_cuda.masked_fill_(
+                    current_softmax_cuda == 0, float("-inf")
                 )
                 temperature_for_processed_logprobs = group_temperature_cuda
                 if isinstance(temperature_for_processed_logprobs, torch.Tensor):
