@@ -31,7 +31,8 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import parse_gsm8k_output, wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell)
+                           skip_no_hopper, skip_pre_blackwell,
+                           skip_pre_hopper)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -2106,7 +2107,7 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@skip_no_hopper
+@skip_pre_hopper
 @pytest.mark.parametrize("streaming", [False, True],
                          ids=["non_streaming", "streaming"])
 @pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
