@@ -10,8 +10,8 @@ Run a model with AutoDeploy using gpu-shell. If you are not given the model-id, 
 ## Setup
 
 Before the first run, create the logs directory and worklog file in the user's PWD:
-- Logs directory: `$PWD/ad_run_logs/`
-- Worklog file: `$PWD/ad_run_logs/<MODEL_SHORT_NAME>_worklog.md` (e.g. `qwen3.5_moe_400b_worklog.md`)
+- Logs directory: `$PWD/ad-test-workspace/ad_run_logs/`
+- Worklog file: `$PWD/ad-test-workspace/ad_run_logs/<MODEL_SHORT_NAME>_worklog.md` (e.g. `qwen3.5_moe_400b_worklog.md`)
 
 Derive `<MODEL_SHORT_NAME>` from the config yaml filename (strip the `.yaml` extension).
 
@@ -45,13 +45,13 @@ By default, if compilation succeeds, `build_and_run_ad.py` runs example prompts 
 
 After the run completes, move the log file into the logs directory with a descriptive name:
 ```
-$PWD/ad_run_logs/<MODEL_SHORT_NAME>_<YYYYMMDD_HHMMSS>_<STATUS>.log
+$PWD/ad-test-workspace/ad_run_logs/<MODEL_SHORT_NAME>_<YYYYMMDD_HHMMSS>_<STATUS>.log
 ```
 Where `<STATUS>` is one of: `success`, `compile_error`, `runtime_error`, `bad_generation`.
 
 ### 4. Update the worklog
 
-Append a new entry to the worklog markdown file (`$PWD/ad_run_logs/<MODEL_SHORT_NAME>_worklog.md`) with the following format:
+Append a new entry to the worklog markdown file (`$PWD/ad-test-workspace/ad_run_logs/<MODEL_SHORT_NAME>_worklog.md`) with the following format:
 
 ```markdown
 ## Run: <YYYY-MM-DD HH:MM:SS>
