@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=65e89d2a"></script>
-    <script src="_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -385,12 +385,14 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -417,7 +419,6 @@
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -453,6 +454,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -569,6 +571,7 @@
 <h3>Known Issues<a class="headerlink" href="#known-issues" title="Link to this heading">#</a></h3>
 <ul class="simple">
 <li><p><strong>DGX Spark:</strong> DGX Spark support is in beta. Only single-node configurations and the models listed above have been validated in this release.</p></li>
+<li><p><strong>Disaggregated Serving:</strong> A hang may occur in disaggregated serving with context pipeline parallelism and generation tensor parallelism configurations.</p></li>
 </ul>
 </section>
 </section>
@@ -752,7 +755,7 @@
 <li><p>Add KV events support for sliding window attention</p></li>
 <li><p>Add TRTLLM MoE nvfp4 cubins for mid-high concurrency; attention_dp for TRTLLM MoE</p></li>
 <li><p>Add Piecewise CUDA Graph support for MLA</p></li>
-<li><p>Support mutliCtasKvMode for high-throughput MLA kernels</p></li>
+<li><p>Support multiCtasKvMode for high-throughput MLA kernels</p></li>
 <li><p>Enable kvcache to be reused during request generation</p></li>
 <li><p>Add ADP schedule balance optimization</p></li>
 <li><p>Add chunked prefill support for MLA (Blackwell)</p></li>
@@ -851,7 +854,7 @@
 <li><p><strong>BREAKING CHANGE</strong> Rename mixed_sampler to enable_mixed_sampler</p></li>
 <li><p><strong>BREAKING CHANGE</strong> Rename LLM.autotuner_enabled to enable_autotuner</p></li>
 <li><p>Add back allreduce_strategy parameter into TorchLlmArgs</p></li>
-<li><p>Add LLmArgs option to force using dynamic quantization</p></li>
+<li><p>Add LlmArgs option to force using dynamic quantization</p></li>
 <li><p>Change default LoRA cache sizes and change peft_cache_config cache size fields to take effect when not explicitly set in lora_config</p></li>
 <li><p>Remove deprecated LoRA LLM args, that are already specified in lora_config</p></li>
 <li><p>Add request_perf_metrics to LLMAPI</p></li>
@@ -1027,7 +1030,7 @@
 <ul class="simple">
 <li><p><strong>Model Support</strong></p>
 <ul>
-<li><p>Added Qwen3 support.Refer to “Qwen3” section in <code class="docutils literal notranslate"><span class="pre">examples/models/core/qwen/README.md</span></code>.</p></li>
+<li><p>Added Qwen3 support. Refer to “Qwen3” section in <code class="docutils literal notranslate"><span class="pre">examples/models/core/qwen/README.md</span></code>.</p></li>
 <li><p>Added HyperCLOVAX-SEED-Vision support in PyTorch flow. Refer to <code class="docutils literal notranslate"><span class="pre">examples/models/contrib/hyperclovax/README.md</span></code></p></li>
 <li><p>Added Dynasor-CoT in scaffolding examples. Refer to <code class="docutils literal notranslate"><span class="pre">examples/scaffolding/contrib/Dynasor/README.md</span></code></p></li>
 <li><p>Added Mistral Small 3.1 24B VLM support in TRT workflow</p></li>
@@ -1090,14 +1093,14 @@
 <li><p>The dependent NCCL version is maintained at 2.25.1</p></li>
 <li><p>Open-sourced XQA kernels</p></li>
 <li><p>Dependent datasets version was upgraded to 3.1.0</p></li>
-<li><p>Migrate Triton Backend to TensorRT LLM repo to TensorRT LLM submodule</p></li>
+<li><p>Migrate Triton Backend from TensorRT LLM repo to TensorRT LLM submodule</p></li>
 <li><p>Downgrade gcc toolset version from 13 to 11</p></li>
 </ul>
 </section>
 <section id="id19">
 <h3>API Changes<a class="headerlink" href="#id19" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p>[Breaking Change]:Enable scheduling overlap by default</p></li>
+<li><p>[BREAKING CHANGE] Enable scheduling overlap by default</p></li>
 <li><p>Remove deprecated GptSession/V1 from TRT workflow</p></li>
 <li><p>Set _AutoDeployLlmArgs as primary config object</p></li>
 <li><p>Allow overriding CLI arguments with YAML file in trtllm-serve</p></li>
@@ -1109,7 +1112,6 @@
 <ul class="simple">
 <li><p>Fix hang bug when context server doesn’t have enough capacity for KV Cache (#3095)</p></li>
 <li><p>Fix C++ decoder synchronization in PyTorch (#3106)</p></li>
-<li><p>Fix bug of create cuda stream as default parameter which will be initialized during importing (#3764)</p></li>
 <li><p>Fix bug related to creating CUDA stream as default parameter, which will be initialized during importing (#3764)</p></li>
 <li><p>Fix attention DP bug on Qwen3 MoE model (#4141)</p></li>
 <li><p>Fix illegal memory access when running LLaMA 4 with CUDA Graph enabled (#4101)</p></li>
@@ -1234,7 +1236,7 @@
 <section id="id23">
 <h3>API Changes<a class="headerlink" href="#id23" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p>Exposed <code class="docutils literal notranslate"><span class="pre">kc_cache_retention_config</span></code> from C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API to the LLM API.</p></li>
+<li><p>Exposed <code class="docutils literal notranslate"><span class="pre">kv_cache_retention_config</span></code> from C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API to the LLM API.</p></li>
 <li><p>Moved <code class="docutils literal notranslate"><span class="pre">BuildConfig</span></code> arguments to <code class="docutils literal notranslate"><span class="pre">LlmArgs</span></code>.</p></li>
 <li><p>Removed speculative decoding parameters from stateful decoders.</p></li>
 <li><p>Exposed <code class="docutils literal notranslate"><span class="pre">DecoderState</span></code> via bindings and integrated it in decoder.</p></li>
@@ -1252,7 +1254,7 @@
 <li><p>Fixed a bug when loading an engine using LoRA through the LLM API. (#2782)</p></li>
 <li><p>Fixed incorrect batch slot usage in <code class="docutils literal notranslate"><span class="pre">addCumLogProbs</span></code> kernel. Thanks to the contribution from &#64;aotman in #2787.</p></li>
 <li><p>Fixed incorrect output for Llama-3.2-11B-Vision-Instruct. (#2796)</p></li>
-<li><p>Removed the necessary of <code class="docutils literal notranslate"><span class="pre">--extra-index-url</span> <span class="pre">https://pypi.nvidia.com</span></code> when running <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">tensorrt-llm</span></code>.</p></li>
+<li><p>Removed the necessity of <code class="docutils literal notranslate"><span class="pre">--extra-index-url</span> <span class="pre">https://pypi.nvidia.com</span></code> when running <code class="docutils literal notranslate"><span class="pre">pip</span> <span class="pre">install</span> <span class="pre">tensorrt-llm</span></code>.</p></li>
 </ul>
 </section>
 <section id="id25">
@@ -1463,7 +1465,7 @@
 <section id="id42">
 <h3>Known Issues<a class="headerlink" href="#id42" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><p>There is a known AllReduce performance issue on AMD-based CPU platforms on NCCL 2.23.4, which can be workarounded by <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">NCCL_P2P_LEVEL=SYS</span></code>.</p></li>
+<li><p>There is a known AllReduce performance issue on AMD-based CPU platforms on NCCL 2.23.4, which can be worked around by <code class="docutils literal notranslate"><span class="pre">export</span> <span class="pre">NCCL_P2P_LEVEL=SYS</span></code>.</p></li>
 </ul>
 </section>
 </section>
@@ -1523,7 +1525,7 @@
 <li><p>Added support for Llama 3.2 and llama 3.2-Vision model. Refer to <code class="docutils literal notranslate"><span class="pre">examples/mllama/README.md</span></code> for more details on the llama 3.2-Vision model.</p></li>
 <li><p>Added support for Deepseek-v2. Refer to <code class="docutils literal notranslate"><span class="pre">examples/deepseek_v2/README.md</span></code>.</p></li>
 <li><p>Added support for Cohere Command R models. Refer to <code class="docutils literal notranslate"><span class="pre">examples/commandr/README.md</span></code>.</p></li>
-<li><p>Added support for Falcon 2,  refer to <code class="docutils literal notranslate"><span class="pre">examples/falcon/README.md</span></code>, thanks to the contribution from &#64;puneeshkhanna in #1926.</p></li>
+<li><p>Added support for Falcon 2, refer to <code class="docutils literal notranslate"><span class="pre">examples/falcon/README.md</span></code>, thanks to the contribution from &#64;puneeshkhanna in #1926.</p></li>
 <li><p>Added support for InternVL2. Refer to <code class="docutils literal notranslate"><span class="pre">examples/multimodal/README.md</span></code>.</p></li>
 <li><p>Added support for Qwen2-0.5B and Qwen2.5-1.5B model. (#2388)</p></li>
 <li><p>Added support for Minitron. Refer to <code class="docutils literal notranslate"><span class="pre">examples/nemotron</span></code>.</p></li>
@@ -1536,7 +1538,7 @@
 <ul class="simple">
 <li><p>Fixed a slice error in forward function. (#1480)</p></li>
 <li><p>Fixed an issue that appears when building BERT. (#2373)</p></li>
-<li><p>Fixed an issue that model is not loaded when building BERT. (2379)</p></li>
+<li><p>Fixed an issue that model is not loaded when building BERT. (#2379)</p></li>
 <li><p>Fixed the broken executor examples. (#2294)</p></li>
 <li><p>Fixed the issue that the kernel <code class="docutils literal notranslate"><span class="pre">moeTopK()</span></code> cannot find the correct expert when the number of experts is not a power of two. Thanks &#64;dongjiyingdjy for reporting this bug.</p></li>
 <li><p>Fixed an assertion failure on <code class="docutils literal notranslate"><span class="pre">crossKvCacheFraction</span></code>. (#2419)</p></li>
@@ -1605,7 +1607,7 @@
 <ul class="simple">
 <li><p>Fixed a typo in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/models/model_weights_loader.py</span></code>, thanks to the contribution from &#64;wangkuiyi in #2152.</p></li>
 <li><p>Fixed duplicated import module in <code class="docutils literal notranslate"><span class="pre">tensorrt_llm/runtime/generation.py</span></code>, thanks to the contribution from &#64;lkm2835 in #2182.</p></li>
-<li><p>Enabled <code class="docutils literal notranslate"><span class="pre">share_embedding</span></code> for the models that have no <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> in legacy  checkpoint conversion path, thanks to the contribution from &#64;lkm2835 in #2232.</p></li>
+<li><p>Enabled <code class="docutils literal notranslate"><span class="pre">share_embedding</span></code> for the models that have no <code class="docutils literal notranslate"><span class="pre">lm_head</span></code> in legacy checkpoint conversion path, thanks to the contribution from &#64;lkm2835 in #2232.</p></li>
 <li><p>Fixed <code class="docutils literal notranslate"><span class="pre">kv_cache_type</span></code> issue in the Python benchmark, thanks to the contribution from &#64;qingquansong in #2219.</p></li>
 <li><p>Fixed an issue with SmoothQuant calibration with custom datasets. Thanks to the contribution by &#64;Bhuvanesh09 in #2243.</p></li>
 <li><p>Fixed an issue surrounding <code class="docutils literal notranslate"><span class="pre">trtllm-build</span> <span class="pre">--fast-build</span></code> with fake or random weights. Thanks to &#64;ZJLi2013 for flagging it in #2135.</p></li>
@@ -1746,7 +1748,7 @@
 <li><p>[BREAKING CHANGE] The <code class="docutils literal notranslate"><span class="pre">use_custom_all_reduce</span></code> argument is removed from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code>.</p></li>
 <li><p>[BREAKING CHANGE] The <code class="docutils literal notranslate"><span class="pre">multi_block_mode</span></code> argument is moved from build stage (<code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> and builder API) to the runtime.</p></li>
 <li><p>[BREAKING CHANGE] The build time argument <code class="docutils literal notranslate"><span class="pre">context_fmha_fp32_acc</span></code> is moved to runtime for decoder models.</p></li>
-<li><p>[BREAKING CHANGE] The arguments <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, <code class="docutils literal notranslate"><span class="pre">pp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">cp_size</span></code> is removed from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
+<li><p>[BREAKING CHANGE] The arguments <code class="docutils literal notranslate"><span class="pre">tp_size</span></code>, <code class="docutils literal notranslate"><span class="pre">pp_size</span></code> and <code class="docutils literal notranslate"><span class="pre">cp_size</span></code> are removed from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
 <li><p>The C++ batch manager API is deprecated in favor of the C++ <code class="docutils literal notranslate"><span class="pre">executor</span></code> API, and it will be removed in a future release of TensorRT-LLM.</p></li>
 <li><p>Added a version API to the C++ library, a <code class="docutils literal notranslate"><span class="pre">cpp/include/tensorrt_llm/executor/version.h</span></code> file is going to be generated.</p></li>
 </ul>
@@ -1855,7 +1857,7 @@
 <li><p>Removed <code class="docutils literal notranslate"><span class="pre">attention_qk_half_accumulation</span></code> argument from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
 <li><p>Removed <code class="docutils literal notranslate"><span class="pre">use_context_fmha_for_generation</span></code> argument from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
 <li><p>Removed <code class="docutils literal notranslate"><span class="pre">strongly_typed</span></code> argument from <code class="docutils literal notranslate"><span class="pre">trtllm-build</span></code> command.</p></li>
-<li><p>The default value of <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> reads from the HuggingFace mode config now.</p></li>
+<li><p>The default value of <code class="docutils literal notranslate"><span class="pre">max_seq_len</span></code> reads from the HuggingFace model config now.</p></li>
 </ul>
 </li>
 <li><p>C++ runtime</p>
@@ -1925,7 +1927,7 @@
 <li><p>Supported Jais, see <code class="docutils literal notranslate"><span class="pre">examples/jais/README.md</span></code>.</p></li>
 <li><p>Supported DiT, see <code class="docutils literal notranslate"><span class="pre">examples/dit/README.md</span></code>.</p></li>
 <li><p>Supported VILA 1.5.</p></li>
-<li><p>Supported Video NeVA, see <code class="docutils literal notranslate"><span class="pre">Video</span> <span class="pre">NeVA</span></code>section in <code class="docutils literal notranslate"><span class="pre">examples/multimodal/README.md</span></code>.</p></li>
+<li><p>Supported Video NeVA, see <code class="docutils literal notranslate"><span class="pre">Video</span> <span class="pre">NeVA</span></code> section in <code class="docutils literal notranslate"><span class="pre">examples/multimodal/README.md</span></code>.</p></li>
 <li><p>Supported Grok-1, see <code class="docutils literal notranslate"><span class="pre">examples/grok/README.md</span></code>.</p></li>
 <li><p>Supported Qwen1.5-110B with FP8 PTQ.</p></li>
 <li><p>Supported Phi-3 small model with block sparse attention.</p></li>
@@ -2071,10 +2073,7 @@
 <section id="id75">
 <h3>Fixed Issues<a class="headerlink" href="#id75" title="Link to this heading">#</a></h3>
 <ul class="simple">
-<li><ul>
 <li><p>Fixed some unexpected behaviors in beam search and early stopping, so that the outputs are more accurate.</p></li>
-</ul>
-</li>
 <li><p>Fixed segmentation fault with pipeline parallelism and <code class="docutils literal notranslate"><span class="pre">gather_all_token_logits</span></code>. (#1284)</p></li>
 <li><p>Removed the unnecessary check in XQA to fix code Llama 70b Triton crashes. (#1256)</p></li>
 <li><p>Fixed an unsupported ScalarType issue for BF16 LoRA. (https://github.com/triton-inference-server/tensorrtllm_backend/issues/403)</p></li>
@@ -2677,9 +2676,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="../../../_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -385,12 +385,14 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -417,7 +419,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -453,6 +454,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -529,7 +531,7 @@
                   
   <section class="tex2jax_ignore mathjax_ignore" id="tuning-max-batch-size-and-max-num-tokens">
 <span id="id1"></span><h1>Tuning Max Batch Size and Max Num Tokens<a class="headerlink" href="#tuning-max-batch-size-and-max-num-tokens" title="Link to this heading">#</a></h1>
-<p>One of TensorRT-LLM’s key features is it’s inflight batching scheduler and runtime that handles simultaneously scheduling and executing requests in both context and generation phases. Max-Num tokens, in conjunction with Max-Batch size dictates how and when the scheduler schedules new and current requests, and understanding their role and how to tune them can provide significant performance benefits.</p>
+<p>One of TensorRT-LLM’s key features is its inflight batching scheduler and runtime, which simultaneously schedules and executes requests in both context and generation phases. Max num tokens, together with max batch size, dictate how and when the scheduler admits new requests and continues current ones, and understanding how to tune them can provide significant performance benefits.</p>
 <blockquote>
 <div><p>Disclaimer: While performance numbers shown here are real, they are only for demonstration purposes. Differences in environment, SKU, interconnect, and workload can all significantly affect performance and lead to your results differing from what is shown here.</p>
 </div></blockquote>
@@ -606,7 +608,7 @@
 </section>
 <section id="tuning-max-num-tokens">
 <h2>Tuning Max Num Tokens<a class="headerlink" href="#tuning-max-num-tokens" title="Link to this heading">#</a></h2>
-<p>If max num tokens is too small it can bottleneck request scheduling. However if it is too large it can result in prompt tokens taking up too much memory (especially in long context workloads), not leaving enough for kv-cache and resulting in performance hits or even out of memory errors. The default value of max num tokens is is 8192. It’s recommended that you sweep across several values of max num tokens to identify the best number for your workload. Good values to try are powers of 2 &gt;= 1024. Since max num tokens and max batch size both affect scheduling, grid searching across combinations of them if possible is ideal.</p>
+<p>If max num tokens is too small it can bottleneck request scheduling. However, if it is too large it can result in prompt tokens taking up too much memory (especially in long-context workloads), not leaving enough for kv-cache and resulting in performance hits or even out-of-memory errors. The default value of max num tokens is 8192. It’s recommended that you sweep across several values of max num tokens to identify the best number for your workload. Good values to try are powers of 2 &gt;= 1024. Since max num tokens and max batch size both affect scheduling, grid searching across combinations of them if possible is ideal.</p>
 <section id="how-to-change-max-num-tokens">
 <h3>How to change Max Num Tokens<a class="headerlink" href="#how-to-change-max-num-tokens" title="Link to this heading">#</a></h3>
 <p>Like Max Batch size, max num tokens is also specified in the build config.</p>
@@ -869,9 +871,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

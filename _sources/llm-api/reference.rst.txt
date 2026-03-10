@@ -289,6 +289,22 @@ API Reference
     :member-order: groupwise
     :inherited-members:
 
+.. autoclass:: tensorrt_llm.llmapi.PARDDecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
+.. autoclass:: tensorrt_llm.llmapi.SADecodingConfig
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :special-members: __init__
+    :member-order: groupwise
+    :inherited-members:
+
 .. autoclass:: tensorrt_llm.llmapi.UserProvidedDecodingConfig
     :members:
     :undoc-members:
@@ -328,7 +344,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: parse_obj,model_computed_fields,from_orm,validate,json,model_post_init,model_validate,model_json_schema,model_extra,model_dump_json,model_parametrized_name,model_dump,parse_raw,update_forward_refs,copy,parse_file,dict,schema,model_fields_set,model_validate_json,model_construct,model_fields,model_copy,construct,model_config,model_validate_strings,schema_json,model_rebuild
+    :exclude-members: construct,from_orm,model_copy,model_construct,update_forward_refs,parse_file,model_rebuild,model_fields_set,model_computed_fields,schema_json,model_json_schema,validate,json,model_parametrized_name,parse_raw,schema,model_dump,model_validate_json,model_validate_strings,model_validate,model_extra,model_config,model_dump_json,dict,model_fields,copy,parse_obj,model_post_init
 
 .. autoclass:: tensorrt_llm.llmapi.TrtLlmArgs
     :members:
@@ -337,7 +353,7 @@ API Reference
     :special-members: __init__
     :member-order: groupwise
     :inherited-members:
-    :exclude-members: parse_obj,model_computed_fields,from_orm,validate,json,model_post_init,model_validate,model_json_schema,model_extra,model_dump_json,model_parametrized_name,model_dump,parse_raw,update_forward_refs,copy,parse_file,dict,schema,model_fields_set,model_validate_json,model_construct,model_fields,model_copy,construct,model_config,model_validate_strings,schema_json,model_rebuild
+    :exclude-members: construct,from_orm,model_copy,model_construct,update_forward_refs,parse_file,model_rebuild,model_fields_set,model_computed_fields,schema_json,model_json_schema,validate,json,model_parametrized_name,parse_raw,schema,model_dump,model_validate_json,model_validate_strings,model_validate,model_extra,model_config,model_dump_json,dict,model_fields,copy,parse_obj,model_post_init
 
 .. autoclass:: tensorrt_llm.llmapi.AutoDecodingConfig
     :members:

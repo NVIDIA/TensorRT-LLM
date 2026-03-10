@@ -38,7 +38,7 @@ docker run --rm -it \
 -p 8000:8000 \
 -v ~/.cache:/root/.cache:rw \
 --name tensorrt_llm \
-nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc6 \
+nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7 \
 /bin/bash
 ```
 
@@ -255,7 +255,7 @@ Sample result in Blackwell
 
 ## Benchmarking Performance
 
-To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this first creating a wrapper `bench.sh`(http://bench.sh) script.
+To benchmark the performance of your TensorRT LLM server you can leverage the built-in `benchmark_serving.py` script. To do this, first create a wrapper `bench.sh` script.
 
 ```shell
 cat <<EOF >  bench.sh

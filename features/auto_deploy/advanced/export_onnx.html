@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="../../../_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -76,7 +76,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -385,12 +385,14 @@
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -417,7 +419,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -453,6 +454,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -532,11 +534,23 @@
 <p>AutoDeploy provides a mode to export PyTorch/HuggingFace models to ONNX format specifically designed for EdgeLLM deployment. This mode performs graph transformations to fuse RoPE (Rotary Position Embedding) and attention operations into a single <code class="docutils literal notranslate"><span class="pre">AttentionPlugin</span></code> operation, then exports the optimized graph to ONNX.</p>
 <section id="overview">
 <h2>Overview<a class="headerlink" href="#overview" title="Link to this heading">#</a></h2>
-<p>The <code class="docutils literal notranslate"><span class="pre">export_edgellm_onnx</span></code> mode differs from the standard AutoDeploy workflow in two key ways:</p>
+<p>The <code class="docutils literal notranslate"><span class="pre">export_edgellm_onnx</span></code> mode differs from the standard AutoDeploy workflow in several key ways:</p>
 <ol class="arabic simple">
 <li><p><strong>Operation Fusion</strong>: Fuses <code class="docutils literal notranslate"><span class="pre">torch_rope_with_explicit_cos_sin</span></code> and <code class="docutils literal notranslate"><span class="pre">torch_cached_attention_with_cache</span></code> into a single <code class="docutils literal notranslate"><span class="pre">AttentionPlugin</span></code> operation</p></li>
+<li><p><strong>Multimodal Input Support</strong>: Rewrites the model to accept <code class="docutils literal notranslate"><span class="pre">inputs_embeds</span></code> instead of <code class="docutils literal notranslate"><span class="pre">input_ids</span></code>, enabling multimodal model support</p></li>
+<li><p><strong>Embedding Export</strong>: Exports the embedding table as <code class="docutils literal notranslate"><span class="pre">embedding.safetensors</span></code> for runtime embedding lookup</p></li>
 <li><p><strong>ONNX Export</strong>: Outputs an ONNX model file instead of a TensorRT Engine</p></li>
 </ol>
+<section id="multimodal-input-changes">
+<h3>Multimodal Input Changes<a class="headerlink" href="#multimodal-input-changes" title="Link to this heading">#</a></h3>
+<p>To support multimodal models (e.g., vision-language models), the exported ONNX model now accepts <code class="docutils literal notranslate"><span class="pre">inputs_embeds</span></code> (float16 tensor of shape <code class="docutils literal notranslate"><span class="pre">[batch_size,</span> <span class="pre">seq_len,</span> <span class="pre">hidden_size]</span></code>) instead of <code class="docutils literal notranslate"><span class="pre">input_ids</span></code> (int32 tensor of shape <code class="docutils literal notranslate"><span class="pre">[batch_size,</span> <span class="pre">seq_len]</span></code>). This allows EdgeLLM runtime to:</p>
+<ul class="simple">
+<li><p>Perform embedding lookup for text tokens using the exported <code class="docutils literal notranslate"><span class="pre">embedding.safetensors</span></code></p></li>
+<li><p>Fuse multimodal embeddings (from vision/audio encoders) with text embeddings</p></li>
+<li><p>Pass the combined embeddings directly to the TensorRT engine</p></li>
+</ul>
+<p>The embedding table is exported separately so that the runtime can handle both text-only and multimodal inputs efficiently.</p>
+</section>
 </section>
 <section id="quick-start">
 <h2>Quick Start<a class="headerlink" href="#quick-start" title="Link to this heading">#</a></h2>
@@ -609,19 +623,22 @@ python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span>--model<
 <tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">model.onnx</span></code></p></td>
 <td><p>The exported ONNX model with fused attention operations</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">config.json</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">embedding.safetensors</span></code></p></td>
+<td><p>Embedding table weights (for multimodal input support)</p></td>
+</tr>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">config.json</span></code></p></td>
 <td><p>Model configuration (architecture, hidden size, etc.)</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tokenizer.json</span></code></p></td>
 <td><p>Tokenizer vocabulary and configuration</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">tokenizer_config.json</span></code></p></td>
 <td><p>Tokenizer settings</p></td>
 </tr>
-<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">special_tokens_map.json</span></code></p></td>
+<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">special_tokens_map.json</span></code></p></td>
 <td><p>Special token mappings</p></td>
 </tr>
-<tr class="row-odd"><td><p><code class="docutils literal notranslate"><span class="pre">processed_chat_template.json</span></code></p></td>
+<tr class="row-even"><td><p><code class="docutils literal notranslate"><span class="pre">processed_chat_template.json</span></code></p></td>
 <td><p>Processed chat template for inference</p></td>
 </tr>
 </tbody>
@@ -646,6 +663,7 @@ python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span>--model<
 <span class="n">ad_config</span><span class="o">.</span><span class="n">attn_backend</span> <span class="o">=</span> <span class="s2">&quot;torch&quot;</span>
 
 <span class="c1"># Optionally customize output location</span>
+<span class="n">ad_config</span><span class="o">.</span><span class="n">transforms</span><span class="p">[</span><span class="s2">&quot;rewrite_embedding_to_inputs_embeds&quot;</span><span class="p">][</span><span class="s2">&quot;output_dir&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;./my_output&quot;</span>
 <span class="n">ad_config</span><span class="o">.</span><span class="n">transforms</span><span class="p">[</span><span class="s2">&quot;export_to_onnx&quot;</span><span class="p">][</span><span class="s2">&quot;output_dir&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;./my_output&quot;</span>
 
 <span class="c1"># Run the export</span>
@@ -693,7 +711,10 @@ python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span>--model<
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#overview">Overview</a><ul class="nav section-nav flex-column">
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#multimodal-input-changes">Multimodal Input Changes</a></li>
+</ul>
+</li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#quick-start">Quick Start</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#command-line-options">Command Line Options</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#examples">Examples</a><ul class="nav section-nav flex-column">
@@ -795,9 +816,9 @@ python<span class="w"> </span>onnx_export_llm.py<span class="w"> </span>--model<
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

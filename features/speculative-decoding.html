@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="../_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -387,12 +387,14 @@
 <li class="toctree-l2"><a class="reference internal" href="../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -419,7 +421,6 @@
 <li class="toctree-l1"><a class="reference internal" href="long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -455,6 +456,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -574,6 +576,7 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="n">model</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
 </pre></div>
 </div>
+<p>EAGLE 3 can be combined with the <a class="reference internal" href="#suffix-automaton-sa-enhancement">Suffix Automaton enhancement</a> for improved acceptance rates on repetitive content. See the SA section below for details.</p>
 </section>
 <section id="ngram">
 <h3>NGram<a class="headerlink" href="#ngram" title="Link to this heading">#</a></h3>
@@ -613,6 +616,26 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 <span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/deepseek_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
 </pre></div>
 </div>
+<p>MTP can be combined with the <a class="reference internal" href="#suffix-automaton-sa-enhancement">Suffix Automaton enhancement</a> for improved acceptance rates on repetitive content. See the SA section below for details.</p>
+</section>
+<section id="pard">
+<h3>PARD<a class="headerlink" href="#pard" title="Link to this heading">#</a></h3>
+<p>PARD (PARallel Draft) is a target-independent speculative decoding method that predicts all draft tokens in a single forward pass using mask tokens. Unlike MTP or EAGLE 3 which generate drafts one token at a time, PARD produces K draft tokens in parallel.</p>
+<p>Reference: <a class="reference external" href="https://arxiv.org/pdf/2504.18583">PARD: Parallel Drafting for Speculative Decoding</a></p>
+<ul class="simple">
+<li><p><code class="docutils literal notranslate"><span class="pre">max_draft_len</span></code>: Maximum draft candidate length.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">speculative_model</span></code>: Path or HuggingFace model ID for the PARD draft model.</p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">mask_token_id</span></code>: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.</p></li>
+</ul>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">PARDDecodingConfig</span>
+
+<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">PARDDecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span> <span class="n">speculative_model</span><span class="o">=</span><span class="s2">&quot;/path/to/pard_model&quot;</span><span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>PARD can be combined with the <a class="reference internal" href="#suffix-automaton-sa-enhancement">Suffix Automaton enhancement</a> for improved acceptance rates on repetitive content. See the SA section below for details.</p>
 </section>
 <section id="user-provided-drafting">
 <h3>User-provided drafting<a class="headerlink" href="#user-provided-drafting" title="Link to this heading">#</a></h3>
@@ -632,6 +655,36 @@ TRT-LLM supports a modified version of the algorithm presented in the paper: tre
 </div>
 </section>
 </section>
+<section id="suffix-automaton-sa-enhancement">
+<h2>Suffix Automaton (SA) Enhancement<a class="headerlink" href="#suffix-automaton-sa-enhancement" title="Link to this heading">#</a></h2>
+<p>The Suffix Automaton (SA) is a model-free, GPU-based pattern-matching draft enhancer. It finds suffix matches in previously generated tokens and proposes draft tokens when the match is long enough. SA is very accurate when it matches (exact pattern repetition), while neural methods are better for novel content — combining them gives the best of both worlds.</p>
+<p>SA can be combined with the following speculative decoding techniques:</p>
+<ul class="simple">
+<li><p><strong>MTP</strong> (<code class="docutils literal notranslate"><span class="pre">MTPDecodingConfig</span></code>)</p></li>
+<li><p><strong>EAGLE 3</strong> (<code class="docutils literal notranslate"><span class="pre">Eagle3DecodingConfig</span></code>)</p></li>
+<li><p><strong>PARD</strong> (<code class="docutils literal notranslate"><span class="pre">PARDDecodingConfig</span></code>)</p></li>
+</ul>
+<p>To enable SA combination, set <code class="docutils literal notranslate"><span class="pre">use_sa_spec=True</span></code> on the speculative config. The <code class="docutils literal notranslate"><span class="pre">sa_spec_threshold</span></code> parameter controls the minimum suffix match length required to override the neural draft (default: 4).</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">Eagle3DecodingConfig</span>
+
+<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span>
+    <span class="n">max_draft_len</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+    <span class="n">speculative_model</span><span class="o">=</span><span class="s2">&quot;/path/to/eagle3_model&quot;</span><span class="p">,</span>
+    <span class="n">use_sa_spec</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
+    <span class="n">sa_spec_threshold</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>SA can also be used as a standalone speculative decoding technique via <code class="docutils literal notranslate"><span class="pre">SADecodingConfig</span></code>:</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.llmapi</span><span class="w"> </span><span class="kn">import</span> <span class="n">SADecodingConfig</span>
+
+<span class="n">speculative_config</span> <span class="o">=</span> <span class="n">SADecodingConfig</span><span class="p">(</span><span class="n">max_draft_len</span><span class="o">=</span><span class="mi">4</span><span class="p">)</span>
+
+<span class="n">llm</span> <span class="o">=</span> <span class="n">LLM</span><span class="p">(</span><span class="s2">&quot;/path/to/target_model&quot;</span><span class="p">,</span> <span class="n">speculative_config</span><span class="o">=</span><span class="n">speculative_config</span><span class="p">)</span>
+</pre></div>
+</div>
+</section>
 <section id="usage-with-trtllm-bench-and-trtllm-serve">
 <h2>Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code><a class="headerlink" href="#usage-with-trtllm-bench-and-trtllm-serve" title="Link to this heading">#</a></h2>
 <div class="admonition note">
@@ -645,6 +698,8 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li><p><code class="docutils literal notranslate"><span class="pre">Eagle3</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">NGram</span></code></p></li>
 <li><p><code class="docutils literal notranslate"><span class="pre">DraftTarget</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">PARD</span></code></p></li>
+<li><p><code class="docutils literal notranslate"><span class="pre">SA</span></code></p></li>
 </ul>
 <blockquote>
 <div><p>Note: The PyTorch backend supports only <code class="docutils literal notranslate"><span class="pre">Eagle3</span></code>. <code class="docutils literal notranslate"><span class="pre">decoding_type:</span> <span class="pre">Eagle</span></code> is accepted as a backward-compatible alias for <code class="docutils literal notranslate"><span class="pre">Eagle3</span></code>, but EAGLE (v1/v2) draft checkpoints are incompatible.</p>
@@ -662,6 +717,15 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
 <span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
 <span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/draft/model</span>
+</pre></div>
+</div>
+<div class="highlight-yaml notranslate"><div class="highlight"><pre><span></span><span class="c1"># SA combination: enable Suffix Automaton enhancement with any supported technique</span>
+<span class="nt">speculative_config</span><span class="p">:</span>
+<span class="w">  </span><span class="nt">decoding_type</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">Eagle3</span>
+<span class="w">  </span><span class="nt">max_draft_len</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
+<span class="w">  </span><span class="nt">speculative_model</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">/path/to/draft/model</span>
+<span class="w">  </span><span class="nt">use_sa_spec</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">true</span>
+<span class="w">  </span><span class="nt">sa_spec_threshold</span><span class="p">:</span><span class="w"> </span><span class="l l-Scalar l-Scalar-Plain">4</span>
 </pre></div>
 </div>
 <div class="admonition note">
@@ -731,9 +795,11 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#eagle-3">EAGLE 3</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#ngram">NGram</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#mtp">MTP</a></li>
+<li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#pard">PARD</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#user-provided-drafting">User-provided drafting</a></li>
 </ul>
 </li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#suffix-automaton-sa-enhancement">Suffix Automaton (SA) Enhancement</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#usage-with-trtllm-bench-and-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
   </nav></div>
@@ -826,9 +892,9 @@ Existing workflows using <code class="docutils literal notranslate"><span class=
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       
