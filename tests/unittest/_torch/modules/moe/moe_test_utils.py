@@ -675,6 +675,7 @@ def should_skip_routing_method(
 def supports_autotuner_capture(
     backend_type: MoeBackendType,
     _quant_algo: Optional[QuantAlgo],
+    use_flashinfer: bool,
 ) -> bool:
     """
     Determine if a backend+quant_algo combination supports AutoTuner capture/replay.
@@ -689,6 +690,9 @@ def supports_autotuner_capture(
     """
     # DEEPGEMM does not support autotuner capture
     if backend_type == MoeBackendType.DEEPGEMM:
+        return False
+
+    if use_flashinfer:
         return False
 
     return True

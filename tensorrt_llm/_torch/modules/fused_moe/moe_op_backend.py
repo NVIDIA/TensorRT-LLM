@@ -21,11 +21,9 @@ This module provides a registry-based backend abstraction for different MoE impl
 """
 
 import os
-from typing import Any, Dict, List, Optional, Tuple, Type, Union
+from typing import Dict, List, Optional, Tuple, Type
 
 import torch
-
-from tensorrt_llm.logger import logger
 
 # Global registry for MoE backends
 _MOE_OP_BACKEND_REGISTRY: Dict[str, Type["MoEOpBackend"]] = {}
@@ -93,88 +91,6 @@ class MoEOpBackend:
         """Quantize tensor to MXFP8 format."""
         raise NotImplementedError
 
-    # ==================== MNNVL Memory Operations ====================
-
-    def mnnvl_initialize(self) -> None:
-        """Initialize MNNVL memory."""
-        raise NotImplementedError
-
-    def mnnvl_get_workspaces(self, mapping: Any) -> Any:
-        """Get MoE workspaces for NVLink communication."""
-        raise NotImplementedError
-
-    def mnnvl_get_prepare_workspace(self, mapping: Any) -> Any:
-        """Get MoE prepare workspace for NVLink communication."""
-        raise NotImplementedError
-
-    def mnnvl_moe_alltoallv_prepare_without_allgather(
-        self,
-        expert_ids: torch.Tensor,
-        expert_statics: Optional[torch.Tensor],
-        workspace: torch.Tensor,
-        max_token_count_per_rank: int,
-        ep_rank: int,
-        ep_size: int,
-        expert_count: int,
-        slot_count: int,
-        top_k: int,
-        scales: Optional[torch.Tensor] = None,
-    ) -> Tuple[Any, Optional[torch.Tensor]]:
-        """Prepare for MNNVL MoE AlltoAllV."""
-        raise NotImplementedError
-
-    def mnnvl_moe_alltoallv(
-        self,
-        x: Union[torch.Tensor, List[Optional[torch.Tensor]]],
-        alltoall_info,
-        workspace: torch.Tensor,
-        ep_rank: int,
-        ep_size: int,
-    ) -> Union[torch.Tensor, List[Optional[torch.Tensor]]]:
-        """Execute MNNVL MoE AlltoAllV."""
-        raise NotImplementedError
-
-    def mnnvl_moe_alltoallv_combine(
-        self,
-        x: torch.Tensor,
-        alltoall_info,
-        workspace: torch.Tensor,
-        ep_rank: int,
-        ep_size: int,
-        top_k: int,
-        token_count: int,
-        use_low_precision_combine: bool = False,
-        do_reduce: bool = True,
-    ) -> torch.Tensor:
-        """Combine results from MNNVL MoE AlltoAllV."""
-        raise NotImplementedError
-
-    # ==================== MoeAlltoAll Operations ====================
-
-    def get_a2a_workspace_size(
-        self,
-        ep_size: int,
-        top_k: int,
-        max_num_tokens: int,
-        hidden_size: int,
-        dtype: torch.dtype = torch.bfloat16,
-        extra_payload_bytes_per_token: int = 0,
-    ) -> int:
-        """Calculate workspace size per rank for MoE AlltoAll."""
-        raise NotImplementedError
-
-    def create_moe_alltoall(
-        self,
-        mapping: Any,
-        max_num_tokens: int,
-        top_k: int,
-        num_slots: int,
-        workspace_size_per_rank: int,
-        num_experts: Optional[int] = None,
-    ) -> Any:
-        """Create MoE AlltoAll communication handler."""
-        raise NotImplementedError
-
     # ==================== MoE Runner Operations ====================
 
     def run_fp8_block_scale_moe(
@@ -198,6 +114,8 @@ class MoEOpBackend:
         routing_method_type: int,
         topk_weights: Optional[torch.Tensor] = None,
         topk_ids: Optional[torch.Tensor] = None,
+        gated_act_type: int = 0,
+        output: Optional[torch.Tensor] = None,
         use_shuffled_weight: bool = False,
         weight_layout: int = 0,
         enable_pdl: Optional[bool] = None,
@@ -284,94 +202,6 @@ class TRTLLMOpBackend(MoEOpBackend):
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return torch.ops.trtllm.mxfp8_quantize(input, is_sf_swizzled_layout, alignment=alignment)
 
-    # MNNVL Operations
-    def mnnvl_initialize(self):
-        self._MnnvlMemory.initialize()
-
-    def mnnvl_get_workspaces(self, mapping):
-        return self._MnnvlMoe.get_moe_workspaces(mapping)
-
-    def mnnvl_get_prepare_workspace(self, mapping):
-        return self._MnnvlMoe.get_moe_prepare_workspace(mapping)
-
-    def mnnvl_moe_alltoallv_prepare_without_allgather(
-        self,
-        expert_ids,
-        expert_statics,
-        workspace,
-        max_token_count_per_rank,
-        ep_rank,
-        ep_size,
-        expert_count,
-        slot_count,
-        top_k,
-        scales=None,
-    ):
-        return self._MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-            expert_ids,
-            expert_statics,
-            workspace,
-            max_token_count_per_rank,
-            ep_rank,
-            ep_size,
-            expert_count,
-            slot_count,
-            top_k,
-        )
-
-    def mnnvl_moe_alltoallv(self, x, alltoall_info, workspace, ep_rank, ep_size):
-        return self._MnnvlMoe.mnnvl_moe_alltoallv(x, alltoall_info, workspace, ep_rank, ep_size)
-
-    def mnnvl_moe_alltoallv_combine(
-        self,
-        x,
-        alltoall_info,
-        workspace,
-        ep_rank,
-        ep_size,
-        top_k,
-        token_count,
-        use_low_precision_combine=False,
-        do_reduce=True,
-    ):
-        return self._MnnvlMoe.mnnvl_moe_alltoallv_combine(
-            x,
-            alltoall_info,
-            workspace,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            top_k=top_k,
-            token_count=token_count,
-            use_low_precision_combine=use_low_precision_combine,
-            do_reduce=do_reduce,
-        )
-
-    # AlltoAll Operations
-    def get_a2a_workspace_size(
-        self,
-        ep_size,
-        top_k,
-        max_num_tokens,
-        hidden_size,
-        dtype=torch.bfloat16,
-        extra_payload_bytes_per_token: int = 0,
-    ):
-        return self._MoeAlltoAll.calculate_required_workspace_size(
-            ep_size, top_k, max_num_tokens, hidden_size, dtype, extra_payload_bytes_per_token
-        )
-
-    def create_moe_alltoall(
-        self, mapping, max_num_tokens, top_k, num_slots, workspace_size_per_rank, num_experts
-    ):
-        return self._MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=max_num_tokens,
-            top_k=top_k,
-            num_slots=num_slots,
-            workspace_size_per_rank=workspace_size_per_rank,
-            num_experts=num_experts,
-        )
-
     # MoE Runners
     def run_fp8_block_scale_moe(
         self,
@@ -394,6 +224,8 @@ class TRTLLMOpBackend(MoEOpBackend):
         routing_method_type,
         topk_weights=None,
         topk_ids=None,
+        gated_act_type=0,
+        output=None,
         use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=None,
@@ -419,6 +251,8 @@ class TRTLLMOpBackend(MoEOpBackend):
             routing_method_type,
             topk_weights=topk_weights,
             topk_ids=topk_ids,
+            act_type=gated_act_type,
+            output=output,
         )
 
     def run_fp4_block_scale_moe(
@@ -497,15 +331,12 @@ class TRTLLMOpBackend(MoEOpBackend):
                     act_type=gated_act_type,
                     topk_weights=topk_weights,
                     topk_ids=topk_ids,
+                    output=output,
                 )
                 if not do_finalize:
                     return outputs
                 else:
                     final_hidden_states = outputs[0]
-                    if final_hidden_states.shape[1] > valid_hidden_size:
-                        final_hidden_states = final_hidden_states[
-                            :, :valid_hidden_size
-                        ].contiguous()
                     return final_hidden_states
             elif (
                 gemm1_weights_scale is not None
@@ -571,6 +402,7 @@ class TRTLLMOpBackend(MoEOpBackend):
                 act_type=gated_act_type,
                 topk_weights=topk_weights,
                 topk_ids=topk_ids,
+                output=output,
             )
 
 
@@ -581,9 +413,6 @@ class FlashinferOpBackend(MoEOpBackend):
 
     def __init__(self):
         import flashinfer.fused_moe as _flashinfer_fused_moe
-        from flashinfer.comm.mnnvl import MnnvlMemory as _flashinfer_MnnvlMemory
-        from flashinfer.comm.trtllm_alltoall import MnnvlMoe as _flashinfer_MnnvlMoe
-        from flashinfer.comm.trtllm_moe_alltoall import MoeAlltoAll as _flashinfer_MoeAlltoAll
         from flashinfer.fp4_quantization import fp4_quantize as _flashinfer_fp4_quantize
         from flashinfer.fp8_quantization import mxfp8_quantize as _flashinfer_mxfp8_quantize
         from flashinfer.fused_moe.core import ActivationType as _flashinfer_activation_type
@@ -596,9 +425,6 @@ class FlashinferOpBackend(MoEOpBackend):
         self._activation_type = _flashinfer_activation_type
         self._routing_method_type = _flashinfer_routing_method_type
         self._fused_moe = _flashinfer_fused_moe
-        self._MnnvlMemory = _flashinfer_MnnvlMemory
-        self._MnnvlMoe = _flashinfer_MnnvlMoe
-        self._MoeAlltoAll = _flashinfer_MoeAlltoAll
         self._fp4_quantize = _flashinfer_fp4_quantize
         self._mxfp8_quantize = _flashinfer_mxfp8_quantize
 
@@ -611,6 +437,7 @@ class FlashinferOpBackend(MoEOpBackend):
         _mapping = {
             0: _flashinfer.Swiglu.value,
             1: _flashinfer.Relu2.value,
+            2: _flashinfer.Silu.value,
         }
         if activation_type not in _mapping:
             raise ValueError(f"Unsupported activation type: {activation_type}")
@@ -664,122 +491,6 @@ class FlashinferOpBackend(MoEOpBackend):
             input, is_sf_swizzled_layout, alignment=alignment, enable_pdl=enable_pdl
         )
 
-    # MNNVL Operations
-    def mnnvl_initialize(self):
-        self._MnnvlMemory.initialize()
-
-    def mnnvl_get_workspaces(self, mapping):
-        return self._MnnvlMoe.get_moe_workspaces(mapping)
-
-    def mnnvl_get_prepare_workspace(self, mapping):
-        return self._MnnvlMoe.get_moe_prepare_workspace(mapping)
-
-    def mnnvl_moe_alltoallv_prepare_without_allgather(
-        self,
-        expert_ids,
-        expert_statics,
-        workspace,
-        max_token_count_per_rank,
-        ep_rank,
-        ep_size,
-        expert_count,
-        slot_count,
-        top_k,
-        scales=None,
-    ):
-        # flashinfer API has different signature
-        alltoall_info, _, __, gathered_info = (
-            self._MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
-                expert_ids,
-                scales,
-                expert_statics,
-                workspace,
-                max_token_count_per_rank,
-                ep_rank,
-                ep_size,
-                expert_count,
-                slot_count,
-                top_k,
-            )
-        )
-        return alltoall_info, gathered_info
-
-    def mnnvl_moe_alltoallv(self, x, alltoall_info, workspace, ep_rank, ep_size):
-        # flashinfer processes one tensor at a time
-        results = []
-        for tensor in x:
-            if tensor is not None:
-                result = self._MnnvlMoe.mnnvl_moe_alltoallv(
-                    tensor, alltoall_info, workspace, ep_rank, ep_size
-                )
-                results.append(result)
-            else:
-                results.append(None)
-        return results
-
-    def mnnvl_moe_alltoallv_combine(
-        self,
-        x,
-        alltoall_info,
-        workspace,
-        ep_rank,
-        ep_size,
-        top_k,
-        token_count,
-        use_low_precision_combine=False,
-        do_reduce=True,
-    ):
-        # flashinfer doesn't support use_low_precision_combine
-        assert do_reduce, "do_reduce must be True"
-        assert use_low_precision_combine is False, "use_low_precision_combine must be False"
-        return self._MnnvlMoe.mnnvl_moe_alltoallv_combine(
-            x,
-            alltoall_info,
-            workspace,
-            ep_rank=ep_rank,
-            ep_size=ep_size,
-            top_k=top_k,
-            token_count=token_count,
-        )
-
-    # AlltoAll Operations
-    def get_a2a_workspace_size(
-        self,
-        ep_size,
-        top_k,
-        max_num_tokens,
-        hidden_size,
-        dtype=torch.bfloat16,
-        extra_payload_bytes_per_token: int = 0,
-    ):
-        workspace_size = self._MoeAlltoAll.get_moe_workspace_size_per_rank(
-            ep_size, top_k, max_num_tokens, hidden_size, extra_payload_bytes_per_token
-        )
-        # Check for environment variable override
-        workspace_mb_env = os.environ.get("TRTLLM_MOE_A2A_WORKSPACE_MB")
-        if workspace_mb_env:
-            workspace_size_env = int(workspace_mb_env) * 1024 * 1024
-            logger.warning(
-                f"Overriding automatically calculated workspace_size_per_rank ({workspace_size} bytes) with "
-                f"TRTLLM_MOE_A2A_WORKSPACE_MB={workspace_mb_env} ({workspace_size_env} bytes). "
-                f"Automatically calculated workspace_size_per_rank is conservatively large, "
-                f"please only consider overriding it if you have a specific reason."
-            )
-            workspace_size = workspace_size_env
-        return workspace_size
-
-    def create_moe_alltoall(
-        self, mapping, max_num_tokens, top_k, num_slots, workspace_size_per_rank, num_experts
-    ):
-        # flashinfer API has not updated to the new signature yet
-        return self._MoeAlltoAll(
-            mapping=mapping,
-            max_num_tokens=max_num_tokens,
-            top_k=top_k,
-            num_experts=num_slots,
-            workspace_size_per_rank=workspace_size_per_rank,
-        )
-
     # MoE Runners
     def run_fp8_block_scale_moe(
         self,
@@ -802,6 +513,8 @@ class FlashinferOpBackend(MoEOpBackend):
         routing_method_type,
         topk_weights=None,
         topk_ids=None,
+        gated_act_type=0,
+        output=None,
         use_shuffled_weight=False,
         weight_layout=0,
         enable_pdl=None,
@@ -855,6 +568,7 @@ class FlashinferOpBackend(MoEOpBackend):
                 use_shuffled_weight=use_shuffled_weight,
                 weight_layout=weight_layout,
                 enable_pdl=enable_pdl,
+                output=output,
                 tune_max_num_tokens=tune_max_num_tokens,
             )
 
@@ -974,7 +688,4 @@ class FlashinferOpBackend(MoEOpBackend):
             return outputs
         else:
             final_hidden_states = outputs[0]
-            # Slice output if it was padded
-            if final_hidden_states.shape[1] > valid_hidden_size:
-                final_hidden_states = final_hidden_states[:, :valid_hidden_size].contiguous()
             return final_hidden_states

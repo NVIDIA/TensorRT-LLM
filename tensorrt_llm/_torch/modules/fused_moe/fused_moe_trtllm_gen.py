@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Tuple, Union
 import torch
 from torch import nn
 
-from tensorrt_llm._mnnvl_utils import MnnvlMemory
+from tensorrt_llm._mnnvl_utils import MnnvlMemory, MnnvlMoe
 from tensorrt_llm._torch.distributed.moe_alltoall import MoeAlltoAll
 from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.logger import logger
@@ -234,10 +234,10 @@ class TRTLLMGenFusedMoE(MoE):
 
                 if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                     # Initialize appropriate MnnvlMemory implementation
-                    self.op_backend.mnnvl_initialize()
-                    self.alltoall_workspace = self.op_backend.mnnvl_get_workspaces(
+                    MnnvlMemory.initialize()
+                    self.alltoall_workspace = MnnvlMoe.get_moe_workspaces(
                         model_config.mapping)
-                    self.alltoall_prepare_workspace = self.op_backend.mnnvl_get_prepare_workspace(
+                    self.alltoall_prepare_workspace = MnnvlMoe.get_moe_prepare_workspace(
                         model_config.mapping)
 
                 elif self.alltoall_method_type == AlltoallMethodType.NVLinkOneSided:
@@ -597,7 +597,7 @@ class TRTLLMGenFusedMoE(MoE):
             # fp8_block_scale_moe_runner needs 2D shape for x_sf and only support SM100+
             if x_sf is None:
                 x, x_sf = torch.ops.trtllm.fp8_quantize_1x128(x)
-            final_hidden_states = self.op_backend.run_fp8_block_scale_moe(
+            result = self.op_backend.run_fp8_block_scale_moe(
                 router_logits,
                 routing_bias,
                 x,
@@ -619,12 +619,12 @@ class TRTLLMGenFusedMoE(MoE):
                 topk_ids=token_selected_experts,
                 output=moe_output,
             )
-
+            # When output is provided, use it directly as the result
+            final_hidden_states = moe_output if moe_output is not None else result
         elif self.has_nvfp4 or self.has_w4a16_mxfp4 or self.has_w4a8_mxfp4_mxfp8:
-            if not do_finalize:
-                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
-
-            factor = 1 if self.activation_type == ActivationType.Relu2 else 2
+            factor = 1 if self.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+            ] else 2
             intermediate_size_per_partition_padded = self.w3_w1_weight.shape[
                 -2] // factor
             act_type = self._to_trtllm_gen_activation_type(self.activation_type)
@@ -670,7 +670,18 @@ class TRTLLMGenFusedMoE(MoE):
                 output=moe_output,
             )
 
-            final_hidden_states = moe_output if moe_output is not None else outputs
+            if not do_finalize:
+                assert not self.reduce_results, "reduce_results must be False when do_finalize is False"
+                return outputs
+            else:
+                # When output is provided, use it directly as the result
+                final_hidden_states = moe_output if moe_output is not None else outputs
+                # Slice output if it was padded (only needed when moe_output is not provided)
+                if moe_output is None and final_hidden_states.shape[
+                        1] > self.hidden_size:
+                    final_hidden_states = final_hidden_states[:, :self.
+                                                              hidden_size].contiguous(
+                                                              )
         elif self.has_w4a8_nvfp4_fp8:
 
             outputs = torch.ops.trtllm.fp8_fp4_block_scale_moe_runner(
@@ -744,8 +755,12 @@ class TRTLLMGenFusedMoE(MoE):
                 token_selected_experts,
                 output=moe_output,
             )
-            final_hidden_states = final_hidden_states[:, :self.
-                                                      hidden_size].contiguous()
+            # When output is provided, use it directly as the result
+            final_hidden_states = moe_output if moe_output is not None else result
+            if moe_output is None:
+                final_hidden_states = final_hidden_states[:, :self.
+                                                          hidden_size].contiguous(
+                                                          )
         else:
             raise NotImplementedError(
                 "TRTLLMGenFusedMoE only supports fp8_block_scaling, nvfp4, w4a16_mxfp4, w4a8_mxfp4_mxfp8 and w4a8_mxfp4_fp8 dtypes."
@@ -838,7 +853,7 @@ class TRTLLMGenFusedMoE(MoE):
                 else:
                     loadbalancer_local_statistic_info = None
 
-                alltoall_info, gathered_loadbalancer_local_statistic_info = self.op_backend.mnnvl_moe_alltoallv_prepare_without_allgather(
+                alltoall_info, gathered_loadbalancer_local_statistic_info = MnnvlMoe.mnnvl_moe_alltoallv_prepare_without_allgather(
                     token_selected_experts,
                     loadbalancer_local_statistic_info,
                     self.alltoall_prepare_workspace,
@@ -857,8 +872,7 @@ class TRTLLMGenFusedMoE(MoE):
 
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
-
-                x, x_sf, token_selected_experts, token_final_scales = self.op_backend.mnnvl_moe_alltoallv(
+                x, x_sf, token_selected_experts, token_final_scales = MnnvlMoe.mnnvl_moe_alltoallv(
                     [x, x_sf, token_selected_experts, token_final_scales],
                     alltoall_info,
                     self.alltoall_workspace,
@@ -976,7 +990,7 @@ class TRTLLMGenFusedMoE(MoE):
         if self.enable_alltoall:
             if self.alltoall_method_type == AlltoallMethodType.NVLinkTwoSided:
                 if alltoall_info is not None:
-                    final_hidden_states = self.op_backend.mnnvl_moe_alltoallv_combine(
+                    final_hidden_states = MnnvlMoe.mnnvl_moe_alltoallv_combine(
                         final_hidden_states,
                         alltoall_info,
                         self.alltoall_workspace,
