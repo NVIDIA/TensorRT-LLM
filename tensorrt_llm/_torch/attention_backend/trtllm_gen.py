@@ -835,6 +835,7 @@ class EnqueueParams:
     position_shift_enabled: bool = False
     paged_context_fmha: bool = False
     attention_sinks: Optional[torch.Tensor] = None
+    is_mla_enable: bool = False
 
 
 @dataclass
@@ -1061,6 +1062,7 @@ class FlashInferTrtllmGenAttention:
             cyclic_attention_window_size=params.cyclic_attention_window_size,
             beam_width=0,
             sink_token_length=params.sink_token_length,
+            is_mla_enable=params.is_mla_enable,
         )
         torch.ops.trtllm.qkv_preprocessing(**ctx_qkv_args)
 
@@ -1230,6 +1232,7 @@ class FlashInferTrtllmGenAttention:
             beam_width=params.beam_width,
             sink_token_length=params.sink_token_length,
             seq_offset=params.seq_offset,
+            is_mla_enable=params.is_mla_enable,
         )
 
         q_processed = gen_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
@@ -1657,6 +1660,7 @@ def trtllm_gen_attention(
         position_shift_enabled=False,
         paged_context_fmha=use_paged_context_fmha,
         attention_sinks=attention_sinks,
+        is_mla_enable=is_mla_enable,
     )
 
     # Context Phase

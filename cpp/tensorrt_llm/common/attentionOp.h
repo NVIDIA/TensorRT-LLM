@@ -259,15 +259,20 @@ public:
     template <typename T>
     int getKvCacheElemSizeInBits() const
     {
-        if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
+        return getKvCacheElemSizeInBits(mKVCacheQuantMode, sizeof(T) * 8);
+    }
+
+    static int getKvCacheElemSizeInBits(tensorrt_llm::common::QuantMode quantMode, size_t dTypeSize)
+    {
+        if (quantMode.hasInt8KvCache() || quantMode.hasFp8KvCache())
         {
             return 8;
         }
-        else if (mKVCacheQuantMode.hasFp4KvCache())
+        else if (quantMode.hasFp4KvCache())
         {
             return 4;
         }
-        return sizeof(T) * 8;
+        return dTypeSize * 8;
     }
 
     struct KvCacheBlockArrays

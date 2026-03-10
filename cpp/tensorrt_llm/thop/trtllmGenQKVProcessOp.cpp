@@ -204,7 +204,8 @@ void qkv_processing(
     bool generation_phase, int64_t rotary_vision_start, int64_t rotary_vision_length,
     // Extra args (for KV cache computation)
     int64_t layer_idx, int64_t tokens_per_block, int64_t max_attention_window_size, int64_t kv_cache_quant_mode,
-    int64_t cyclic_attention_window_size, int64_t beam_width, int64_t sink_token_length, int64_t seq_offset)
+    int64_t cyclic_attention_window_size, int64_t beam_width, int64_t sink_token_length, int64_t seq_offset,
+    bool is_mla_enable)
 {
     auto stream = at::cuda::getCurrentCUDAStream().stream();
 
@@ -227,17 +228,12 @@ void qkv_processing(
         auto* blockOffsets = static_cast<KVBlockArray::DataType*>(
             kv_cache_block_offsets->index({poolIndex, static_cast<int64_t>(seq_offset)}).data_ptr());
 
-        int cacheElemBits;
-        if (quantMode.hasInt8KvCache() || quantMode.hasFp8KvCache())
-            cacheElemBits = 8;
-        else if (quantMode.hasFp4KvCache())
-            cacheElemBits = 4;
-        else
-            cacheElemBits = static_cast<int>(qkv_input->element_size()) * 8;
+        int cacheElemBits
+            = AttentionOp::getKvCacheElemSizeInBits(quantMode, static_cast<size_t>(qkv_input->element_size()));
 
         auto const blockSize = tokens_per_block * kv_head_num * size_per_head;
-        auto const bytesPerBlock = blockSize * cacheElemBits / 8;
-        int32_t const kvFactor = 2;
+        auto const bytesPerBlock = blockSize * cacheElemBits / CHAR_BIT;
+        int32_t const kvFactor = is_mla_enable ? 1 : 2;
         auto const intraPoolOffset = layerIdxInCachePool * kvFactor * bytesPerBlock;
         auto const sizePerToken = static_cast<int32_t>(kv_head_num * size_per_head * cacheElemBits / 8);
 
@@ -408,7 +404,8 @@ TRTLLM_NAMESPACE_END
     "int cyclic_attention_window_size, "               \
     "int beam_width, "                                 \
     "int sink_token_length, "                          \
-    "int seq_offset=0"
+    "int seq_offset=0, "                               \
+    "bool is_mla_enable=False"
 
 // clang-format on
 
