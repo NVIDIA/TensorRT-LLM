@@ -192,12 +192,17 @@ for concurrency in ${concurrency_list}; do
         $([ "${streaming}" = "false" ] && echo "--non-streaming")
 
     # Print failed request count (consistent with non-nv_sa benchmark format)
-    python - "${output_dir}/result.json" <<-'PYEOF' 2>/dev/null || true
-	import json, sys
-	with open(sys.argv[1]) as f:
-	    d = json.load(f)
-	failed = d['num_prompts'] - d['completed']
-	print(f'Total failed requests: {failed}')
+    python - "${output_dir}/result.json" <<-'PYEOF'
+	import json
+	import sys
+
+	try:
+	    with open(sys.argv[1], encoding="utf-8") as f:
+	        d = json.load(f)
+	    failed = d["num_prompts"] - d["completed"]
+	    print(f"Total failed requests: {failed}")
+	except (OSError, json.JSONDecodeError, KeyError) as exc:
+	    print(f"WARNING: failed to read request counts from {sys.argv[1]}: {exc}", file=sys.stderr)
 	PYEOF
 
     echo "Benchmark with concurrency ${concurrency} done"
