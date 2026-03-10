@@ -244,9 +244,6 @@ def _time_dispatch_and_combine(
     """
     device = hidden_states.device
 
-    # Prepare dispatch once (excluded from timing)
-    _ = backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens, None)
-
     # L2 cache flushing buffer
     l2_buffer = None
     if flush_l2:
@@ -270,6 +267,9 @@ def _time_dispatch_and_combine(
         for _ in range(warmup):
             if l2_buffer is not None:
                 l2_buffer.zero_()
+            backend.prepare_dispatch(
+                token_selected_slots, all_rank_num_tokens
+            )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
             recv_hidden_states, _, _, _ = backend.dispatch(
                 hidden_states,
                 hidden_states_sf,
@@ -294,6 +294,9 @@ def _time_dispatch_and_combine(
 
             # Mark dispatch operation for aggregated timing
             with torch.profiler.record_function("dispatch"):
+                backend.prepare_dispatch(
+                    token_selected_slots, all_rank_num_tokens
+                )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
                 recv_hidden_states, _, _, _ = backend.dispatch(
                     hidden_states,
                     hidden_states_sf,
@@ -636,6 +639,7 @@ def _time_dispatch_and_combine_cuda_graph(
         _cupti = None
 
     # ---- 1. Shape discovery: one eager run ----
+    backend.prepare_dispatch(token_selected_slots, all_rank_num_tokens)
     recv_hidden_states, _, _, _ = backend.dispatch(
         hidden_states,
         hidden_states_sf,
@@ -686,6 +690,9 @@ def _time_dispatch_and_combine_cuda_graph(
         for _ in range(warmup):
             if l2_buffer is not None:
                 l2_buffer.zero_()
+            backend.prepare_dispatch(
+                token_selected_slots, all_rank_num_tokens
+            )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
             backend.dispatch(
                 hidden_states,
                 hidden_states_sf,
@@ -699,6 +706,9 @@ def _time_dispatch_and_combine_cuda_graph(
             if l2_buffer is not None:
                 l2_buffer.zero_()
             _record_external(d_starts[i])
+            backend.prepare_dispatch(
+                token_selected_slots, all_rank_num_tokens
+            )  # For most ranks this is no-op except for NVLINK_TWO_SIDED
             backend.dispatch(
                 hidden_states,
                 hidden_states_sf,
