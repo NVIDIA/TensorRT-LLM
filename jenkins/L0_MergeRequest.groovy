@@ -384,7 +384,7 @@ def mergeWaiveList(pipeline, globalVars)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/alpine:latest"
+    image = "urm.nvidia.com/docker/python:slim-bullseye"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
