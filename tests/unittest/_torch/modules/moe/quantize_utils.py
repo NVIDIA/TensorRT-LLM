@@ -256,7 +256,12 @@ class RefMLPFusedMoE(nn.Module):
                 ]
             )
         else:
-            element_wise_activation = relu2 if activation_type == ActivationType.Relu2 else F.silu
+            if activation_type == ActivationType.Relu2:
+                element_wise_activation = relu2
+            elif activation_type == ActivationType.Silu:
+                element_wise_activation = F.silu
+            else:
+                raise ValueError(f"Unsupported non-gated activation type: {activation_type}")
             self.experts = nn.ModuleList(
                 [
                     MLP(
