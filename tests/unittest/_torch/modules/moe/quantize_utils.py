@@ -568,13 +568,13 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class NVFP4RefGatedMLPFusedMoE(RefMLPFusedMoE):
+class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of NVFP4 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
     expected_quant_algo = QuantAlgo.NVFP4
 
-    def __init__(self, *args, swiglu_gptoss_style: bool = False, **kwargs):
+    def __init__(self, *args, swiglu_gptoss_style: Optional[bool] = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.swiglu_gptoss_style = swiglu_gptoss_style
 
@@ -587,19 +587,6 @@ class NVFP4RefGatedMLPFusedMoE(RefMLPFusedMoE):
             # error accumulation with certain routing methods (e.g. Llama4Renormalize).
             # Max observed mismatch in non-skipped cases is ~2.7% < 3%.
             check_accuracy(output, ref_output, rtol=1e-2, atol=0.15, percent=0.97)
-
-
-class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
-    """Reference implementation of NVFP4 quantization for correctness testing."""
-
-    scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
-    expected_quant_algo = QuantAlgo.NVFP4
-
-    def check_accuracy(self, output, ref_output):
-        # Relaxed percent from 0.98 to 0.97 to account for NVFP4 quantization
-        # error accumulation with certain routing methods (e.g. Llama4Renormalize).
-        # Max observed mismatch in non-skipped cases is ~2.7% < 3%.
-        check_accuracy(output, ref_output, rtol=1e-2, atol=0.15, percent=0.97)
 
 
 class NVFP4QuantizeUtil(BaseQuantizeUtil):
@@ -715,14 +702,10 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 )
         return weights
 
-    def create_ref_module(self, routing_method, ref_cls=None) -> torch.nn.Module:
+    def create_ref_module(self, routing_method, ref_cls=NVFP4RefMLPFusedMoE) -> torch.nn.Module:
         """
         Create a reference module for correctness testing.
-        Uses NVFP4RefGatedMLPFusedMoE for gated activations and
-        NVFP4RefMLPFusedMoE for element-wise activations.
         """
-        if ref_cls is None:
-            ref_cls = NVFP4RefGatedMLPFusedMoE if self._is_gated else NVFP4RefMLPFusedMoE
         kwargs = dict(
             num_experts=self.num_experts,
             routing_method=routing_method,
@@ -736,8 +719,7 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
         )
-        if ref_cls == NVFP4RefGatedMLPFusedMoE:
-            # NVFP4RefGatedMLPFusedMoE accepts swiglu_gptoss_style for tolerance tuning
+        if self._is_gated:
             kwargs["swiglu_gptoss_style"] = self.swiglu_gptoss_style
         return ref_cls(**kwargs)
 
