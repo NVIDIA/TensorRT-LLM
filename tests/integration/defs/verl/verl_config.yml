@@ -39,4 +39,8 @@ verl_config:
     - "NVSHMEM_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem"
     - "LD_LIBRARY_PATH=\"${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH\""
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
-    - "TRTLLM_TEST_MODEL_PATH_ROOT=/scratch.trt_llm_data/llm-models"
+    - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"
+
+  # HuggingFace models needed by verl tests (downloaded to TRTLLM_TEST_MODEL_PATH_ROOT)
+  required_models:
+    - "Qwen/Qwen2.5-0.5B-Instruct"

@@ -71,6 +71,27 @@ def _clone_verl_repo(config):
     )
 
 
+def _download_models(config):
+    """Download required HF models to TRTLLM_TEST_MODEL_PATH_ROOT."""
+    model_root = os.environ.get("TRTLLM_TEST_MODEL_PATH_ROOT", "")
+    if not model_root:
+        return
+    for model_id in config.get("required_models", []):
+        local_dir = os.path.join(model_root, model_id)
+        if os.path.isdir(local_dir):
+            print(f"[verl setup] Model {model_id} already at {local_dir}")
+            continue
+        print(f"[verl setup] Downloading {model_id} to {local_dir}")
+        subprocess.check_call(
+            [
+                sys.executable,
+                "-c",
+                f"from huggingface_hub import snapshot_download; "
+                f"snapshot_download('{model_id}', local_dir='{local_dir}')",
+            ],
+        )
+
+
 @pytest.fixture(scope="session", autouse=True)
 def verl_setup():
     """Session-scoped fixture: install deps, set env vars, clone verl repo."""
@@ -78,6 +99,7 @@ def verl_setup():
     _export_env_vars(config)
     _run_install_commands(config)
     _clone_verl_repo(config)
+    _download_models(config)
     yield VERL_ROOT
 
 
