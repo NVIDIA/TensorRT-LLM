@@ -142,6 +142,8 @@ def _run_ssm_prefill(
     C_prefill = C_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, G, N]
     dt_prefill = dt_flat[:num_prefill_tokens].unsqueeze(0)  # [1, S_p, H]
 
+    seq_idx_prefill = seq_idx_prefill[:, :num_prefill_tokens]
+
     initial_states = None
     if torch.any(use_initial_states[:num_prefill]):
         initial_states = torch.where(

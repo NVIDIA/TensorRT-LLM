@@ -1048,6 +1048,24 @@ def _register_fake():
             (m, n), dtype=input.dtype) if output_hp_norm else None
         return normed_output_fp4, output, sf_out, hp_output
 
+    @torch.library.register_fake("trtllm::fused_gated_rmsnorm_quant")
+    def _(
+        x: torch.Tensor,
+        z: torch.Tensor,
+        weight: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-5,
+        sf_scale: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, n = x.shape
+        # y_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
+        y_fp4 = x.new_empty((m, n // 8), dtype=torch.int32)
+        # sf_out: scale factors in swizzled layout
+        sf_vec_size = 16
+        sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
+        sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
+        return y_fp4, sf_out
+
     @torch.library.register_fake("trtllm::fused_relu2_quantize")
     def _(
         input: torch.Tensor,

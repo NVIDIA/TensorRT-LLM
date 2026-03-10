@@ -18,8 +18,9 @@
 # As the ratio between KV data size and KV block scale size is fixed, we can simply use a pool with
 # smaller block size and the same number of blocks for block scale.
 import os
-from dataclasses import dataclass, field
-from typing import NewType, Protocol
+from dataclasses import dataclass
+from enum import IntEnum
+from typing import ClassVar, NewType, Protocol
 
 from ._common import CacheTier, LayerId
 
@@ -92,8 +93,15 @@ class BufferConfig:
     """
 
 
+class LayerType(IntEnum):
+    ATTENTION = 0
+    SSM = 1
+
+
 @dataclass(slots=True)
 class AttentionLayerConfig:
+    type: ClassVar[LayerType] = LayerType.ATTENTION
+
     layer_id: LayerId
     # Each page can have multiple sub-pages, e.g. separate K and V data, block quantization scales for K and/or V, etc.
     # KV cache manager will automatically group sub-pages of the same size, and redirect pages of different sizes to
@@ -113,6 +121,21 @@ class AttentionLayerConfig:
         assert len(set(buffer.role for buffer in self.buffers)) == len(self.buffers), (
             "duplicate buffer role"
         )
+
+
+@dataclass(slots=True)
+class SsmLayerConfig:
+    type: ClassVar[LayerType] = LayerType.SSM
+
+    layer_id: LayerId
+
+    buffers: list[BufferConfig]
+
+    def __post_init__(self) -> None:
+        assert all(buf.tokens_per_block_override is None for buf in self.buffers)
+
+
+LayerConfig = AttentionLayerConfig | SsmLayerConfig
 
 
 @dataclass(slots=True)
@@ -138,19 +161,19 @@ class KVCacheManagerConfig:
     cache_tiers: list[CacheTierConfig]
 
     # AttentionLayerConfig.layer_id should not duplicate
-    layers: list[AttentionLayerConfig]
+    layers: list[LayerConfig]
 
     # When memory utilization is above this threshold, KV cache resuming will fail. This helps
     # reserving some memory for KVCache growth and avoids frequent suspend/resume for dynamic batch size.
-    max_util_for_resume: float = field(default=0.97)
+    max_util_for_resume: float = 0.97
 
-    enable_partial_reuse: bool = field(default=True)
+    enable_partial_reuse: bool = True
     """
     If True, we will try to reuse tokens from partially matched blocks.
     """
 
     # unsupported yet
-    helix_config: HelixConfig | None = field(default=None)
+    helix_config: HelixConfig | None = None
 
     def __post_init__(self) -> None:
         assert self.cache_tiers and self.cache_tiers[0].tier == CacheTier.GPU_MEM
