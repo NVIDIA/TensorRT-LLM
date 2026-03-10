@@ -17,7 +17,7 @@ from tensorrt_llm._torch.modules.multi_stream_utils import \
     maybe_execute_in_parallel
 from tensorrt_llm._torch.modules.rotary_embedding import RotaryEmbedding
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
-from tensorrt_llm._torch.utils import maybe_compile, maybe_compiled_cat
+from tensorrt_llm._torch.utils import maybe_compile
 from tensorrt_llm._utils import get_size_in_bytes, get_sm_version, prefer_pinned
 from tensorrt_llm.bindings import DataType
 from tensorrt_llm.bindings.executor import KvCacheConfig
@@ -29,7 +29,6 @@ from tensorrt_llm.llmapi.llm_args import SparseAttentionConfig
 from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.models.modeling_utils import QuantConfig
-from tensorrt_llm.quantization.utils import fp8_utils
 
 from .kernel import triton_convert_req_index_to_global_index
 
@@ -1605,13 +1604,10 @@ class Indexer(nn.Module):
         return q_pe, q_nope, k_pe, k_nope
 
     def _prep_q_or_k(self, qk_pe: torch.Tensor, qk_nope: torch.Tensor):
-        """Concatenate, rotate, and FP8 quantize for Q or K"""
-        q_or_k = maybe_compiled_cat([qk_pe, qk_nope], dim=-1)
-        q_or_k = rotate_activation(q_or_k)
-        q_or_k = q_or_k.view(-1, self.head_dim)
-        q_or_k = fp8_utils.fp8_quantize_1x128_sf_transpose(
-            q_or_k, use_ue8m0=self.scale_fmt == "ue8m0")
-        return q_or_k
+        """Concatenate and FP8 quantize for Q or K via fused kernel."""
+        fp8_out, scale = torch.ops.trtllm.fused_cat_fp8(
+            qk_pe, qk_nope, self.scale_fmt == "ue8m0")
+        return fp8_out, scale
 
     @torch.inference_mode()
     def forward(self, qr: torch.Tensor, hidden_states: torch.Tensor,
