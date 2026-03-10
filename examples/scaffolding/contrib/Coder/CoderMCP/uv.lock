@@ -142,6 +142,7 @@ name = "coder-mcp"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "mcp" },
     { name = "starlette" },
     { name = "uvicorn" },
@@ -149,6 +150,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "mcp", specifier = ">=1.0.0" },
     { name = "starlette", specifier = ">=0.37.0" },
     { name = "uvicorn", specifier = ">=0.30.0" },

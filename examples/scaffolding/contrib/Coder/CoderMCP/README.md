@@ -1,69 +1,86 @@
 # Coder MCP Server
 
-MCP (Model Context Protocol) server that exposes Coder agent tools for file system operations, shell commands, and task management.
+`CoderMCP` is an Apiary-backed MCP server for the Coder agent.
 
 ## Tools
 
-The server exposes the following tools:
-
-### File System Tools
-- **read_file** - Read file contents with line numbers
-- **list_dir** - List directory contents with type labels
-- **grep_files** - Search files for regex patterns
-- **apply_patch** - Apply patches to create, update, or delete files
+### File Tools
+- `read_file`
+- `list_dir`
+- `grep_files`
+- `apply_patch`
 
 ### Shell Tools
-- **shell** - Execute shell commands as an array (via execvp)
-- **shell_command** - Execute shell commands as a string in user's shell
+- `shell`
+- `shell_command`
 
-### Planning/Control Tools
-- **update_plan** - Update task plan with progress tracking
-- **think** - Record thoughts/reflections
-- **complete_task** - Signal task completion
+### Planning Tools
+- `update_plan`
+- `think`
+- `complete_task`
 
-## Usage
+## Architecture
 
-### Running the Server
+Each MCP client connects to `/sse` and gets a `client_id`. That `client_id`
+selects a persistent Apiary sandbox session, so filesystem and shell state are
+preserved across tool calls for that client.
+
+```
+ScaffoldingLlm -> MCPWorker -> CoderMCP -> Apiary daemon -> sandbox session
+```
+
+## Running the Server
 
 ```bash
-# Default: runs on 0.0.0.0:8083
+# Default: runs on 0.0.0.0:8083 and uses APIARY_URL/APIARY_WORKING_DIR
 python coder_mcp.py
 
 # Custom host/port
 python coder_mcp.py --host 127.0.0.1 --port 9000
 
-# Set working directory for file operations
-python coder_mcp.py --working-dir /path/to/project
+# Explicit Apiary config
+python coder_mcp.py \
+    --apiary-url http://127.0.0.1:8080 \
+    --working-dir /workspace \
+    --idle-timeout 300
 ```
 
-### Environment Variables
+## Environment Variables
 
-- `CODER_WORKING_DIRECTORY` - Default working directory for file operations (defaults to current directory)
+- `APIARY_URL` - Apiary daemon URL
+- `APIARY_API_TOKEN` - Bearer token for Apiary authentication
+- `APIARY_WORKING_DIR` - Default working directory inside the sandbox
+- `MCP_AUTH_TOKEN` - Optional bearer token required on the MCP SSE endpoint
 
-### Using with TensorRT-LLM Scaffolding
+## Using with TensorRT-LLM Scaffolding
 
 ```python
 from tensorrt_llm.scaffolding.worker import MCPWorker
 from tensorrt_llm.scaffolding.contrib.Coder import create_coder_scaffolding_llm
 
-# Start the Coder MCP server first (in a separate process):
-# python coder_mcp.py --port 8083
-
-# Then create the MCP worker and Coder agent
-mcp_worker = MCPWorker(urls=["http://localhost:8083/sse"])
+mcp_worker = MCPWorker.init_with_urls(
+    ["http://localhost:8083/sse?client_id=my-session"]
+)
+await mcp_worker.init_in_asyncio_event_loop()
 
 coder = create_coder_scaffolding_llm(
     generation_worker=generation_worker,
     mcp_worker=mcp_worker,
 )
 
-# Run a coding task
 result = coder.generate("Add a hello world function to main.py")
 print(result.text)
 ```
 
 ## Protocol
 
-The server uses SSE (Server-Sent Events) transport for MCP communication:
+The server uses SSE transport for MCP communication:
 - SSE endpoint: `/sse`
 - Message endpoint: `/messages/`
+
+Pass `client_id` as an SSE query parameter to bind a caller to a specific
+sandbox session:
+
+```text
+http://localhost:8083/sse?client_id=my-session
+```
