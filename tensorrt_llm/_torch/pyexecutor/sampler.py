@@ -2395,15 +2395,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         else:
             token_log_probs = [[] for _ in range(beam_width)]
             for step_idx in range(count):
-                topk_token = token_list[step_idx]
-                topk_logprob = logprobs_list[step_idx]
-                topk_token = topk_token[:num_topk_logprobs]
-                topk_logprob = topk_logprob[:num_topk_logprobs]
-                min_rank = len(topk_token) + 1
+                topk_tokens = token_list[step_idx][:num_topk_logprobs]
+                topk_logprobs = logprobs_list[step_idx][:num_topk_logprobs]
+                min_rank = len(topk_tokens) + 1
 
                 topk_logprob_dict = {
                     token: Logprob(logprob=logprob, rank=rank + 1)
-                    for rank, (token, logprob) in enumerate(zip(topk_token, topk_logprob))
+                    for rank, (token, logprob) in enumerate(zip(topk_tokens, topk_logprobs))
                 }
 
                 for beam_idx in range(beam_width):
