@@ -29,7 +29,6 @@ from ._common import (
     CacheTier,
     LayerId,
     MemAddress,
-    PageIndex,
     PageStatus,
 )
 from ._config import CacheTierConfig, DataRole, DiskCacheTierConfig
@@ -47,7 +46,6 @@ from ._storage._core import (
     PoolGroupBase,
     PoolGroupIndex,
     PoolIndex,
-    PoolIndex0,
     Slot,
     SlotId,
 )
@@ -61,7 +59,6 @@ from ._utils import (
     filled_list,
     get_uniform_attribute,
     make_typed,
-    map_optional,
     partition,
     remove_if,
     round_up,
@@ -520,14 +517,6 @@ class StorageManager:
             cast(int, storage.slot_address(pg_idx, attr.pool_index, SlotId(0))) + attr.offset
         )
 
-    def get_page_indices_ref(
-        self, lc_id: LifeCycleId, pages: Iterator[Page | None]
-    ) -> Iterator[int | None]:
-        "Reference implementation. Not fast enough for production."
-        scale = self._slot_to_page_indices[lc_id][PoolIndex0]
-        assert all(scale == s for s in self._slot_to_page_indices[lc_id])
-        return (map_optional(page, lambda p: scale * int(p.slot_id)) for page in pages)
-
     def get_buffer_attr(self, layer_id: LayerId, data_role: DataRole) -> BufferAttr:
         return self._buffer_attr[BufferId(layer_id, data_role)]
 
@@ -535,10 +524,6 @@ class StorageManager:
         self, level: CacheLevel, pg_idx: PoolGroupIndex, slot_id: SlotId, pool_idx: PoolIndex
     ) -> Address:
         return self._levels[level].storage.slot_address(pg_idx, pool_idx, slot_id)
-
-    def get_page_indices_for_slot(self, life_cycle: LifeCycleId, slot_id: SlotId) -> PageIndex:
-        scale = self._slot_to_page_indices[life_cycle][PoolIndex0]
-        return PageIndex(scale * int(slot_id))
 
     def get_statistics(
         self, level: CacheLevel = GPU_LEVEL
