@@ -151,13 +151,11 @@ class Mamba2Mixer(nn.Module):
         if self._use_flashinfer:
             logger.info_once("Using flashinfer for selective state update",
                              key="selective_state_update")
-            self.selective_state_update_func_no_mtp = selective_state_update_fi
-            self.selective_state_update_func_mtp = selective_state_update_fi
+            self.selective_state_update_func = selective_state_update_fi
         else:
             logger.info_once("Using native for selective state update",
                              key="selective_state_update")
-            self.selective_state_update_func_no_mtp = selective_state_update_native
-            self.selective_state_update_func_mtp = selective_state_update_native
+            self.selective_state_update_func = selective_state_update_native
 
         # Warn if stochastic rounding was requested but couldn't be enabled
         if config.quant_config.mamba_ssm_stochastic_rounding and not self._use_stochastic_rounding:
@@ -444,7 +442,7 @@ class Mamba2Mixer(nn.Module):
                                                             dtype=torch.int64)
                     mtp_kwargs['philox_rounds'] = self._philox_rounds
 
-                self.selective_state_update_func_mtp(
+                self.selective_state_update_func(
                     ssm_states,
                     x_d.view(
                         num_decodes,
@@ -482,7 +480,7 @@ class Mamba2Mixer(nn.Module):
                                                             dtype=torch.int64)
                     ssu_kwargs['philox_rounds'] = self._philox_rounds
 
-                self.selective_state_update_func_no_mtp(
+                self.selective_state_update_func(
                     ssm_states,
                     x_d,
                     dt_d,
