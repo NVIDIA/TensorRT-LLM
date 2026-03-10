@@ -95,6 +95,14 @@ Do NOT proceed to Phase 8 until the reviewer returns PASS.
 ## Phase 8 — AutoDeploy End-to-End Run
 
 Invoke the `ad-run-agent` subagent to run the model through AutoDeploy on GPU. Pass it:
+
+Step 1: Reduced num layers
+Run with reduced num layer - to test e2e flow for issues and iterate faster. 
+The generation will be bad in step 1 because we are not loading all layers.
+
+Step 2: Full layers
+Run with full num layers. The generation should be coherent in step 2.
+
 - **Model HF ID:** the HuggingFace model-id (or local checkpoint path) used throughout onboarding
 - **Config YAML:** the AD config yaml file for this model (from `examples/auto_deploy/model_registry/configs/`)
 - **Description:** a short description of the current state, e.g.:
@@ -111,7 +119,7 @@ If the run **fails** or produces **bad generation**:
 3. Re-invoke the ad-run-agent with an updated description reflecting the change (e.g., "retry after fixing RoPE scaling in config")
 4. Repeat until the run succeeds with meaningful generation
 
-Do NOT proceed to Phase 9 until the ad-run-agent reports a successful run with coherent generation.
+Do NOT proceed to Phase 9 until the step 2 with full layers reports a successful run with coherent generation.
 
 ## Phase 9 — Summary Report
 Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified, (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took), (7) AD end-to-end run result (success/fail, number of iterations, final generation quality).
