@@ -32,6 +32,8 @@ namespace torch_ext
 
 using CreateTensorFn = std::function<at::Tensor(at::IntArrayRef shape, at::ScalarType dtype, c10::Device device)>;
 
+// This enum is exposed to Python via nanobind (tensorrt_llm.bindings.internal.thop.BufferKind).
+// Integer values must stay in sync with the Python binding.
 enum class BufferKind : int
 {
     Default = 0,

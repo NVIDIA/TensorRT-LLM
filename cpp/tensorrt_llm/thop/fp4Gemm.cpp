@@ -132,8 +132,8 @@ void runGemm(at::Tensor& out, at::Tensor const& mat1, at::Tensor const& mat2, at
 // Only W4A4_NVFP4 and W4A8_MXFP4_FP8 are currently supported
 at::Tensor fp4_bmm_impl(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor const& mat1Scale,
     at::Tensor const& mat2Scale, at::Tensor const& globalScale, FP4GemmType fp4GemmType,
-    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind, tkc::CutlassGemmConfig const* maybe_config,
-    c10::optional<torch::List<int64_t>> group = c10::nullopt)
+    std::optional<c10::ScalarType> out_dtype, int64_t output_buffer_kind,
+    tkc::CutlassGemmConfig const* maybe_config = nullptr, c10::optional<torch::List<int64_t>> group = c10::nullopt)
 {
     if (fp4GemmType == FP4GemmType::W4A8_MXFP4_MXFP8)
     {
@@ -224,7 +224,7 @@ at::Tensor fp4_bmm(at::Tensor const& mat1, at::Tensor const& mat2, at::Tensor co
     // better performance.
     // Note that we can still add a heuristic here.
     return fp4_bmm_impl(mat1, mat2, mat1Scale, mat2Scale, globalScale, static_cast<FP4GemmType>(fp4GemmType), out_dtype,
-        static_cast<int>(torch_ext::BufferKind::Default), nullptr);
+        static_cast<int>(torch_ext::BufferKind::Default));
 }
 
 class FP4GemmRunner : public torch::CustomClassHolder
