@@ -131,7 +131,8 @@ class RayExecutor(RpcExecutorMixin, GenerationExecutor):
         }
 
         runtime_env["env_vars"] = {
-            k: v for k, v in os.environ.items() if k not in _NODE_LOCAL_VARS
+            k: v
+            for k, v in os.environ.items() if k not in _NODE_LOCAL_VARS
         }
         runtime_env["env_vars"].update({
             "TLLM_DISABLE_MPI": "1",
