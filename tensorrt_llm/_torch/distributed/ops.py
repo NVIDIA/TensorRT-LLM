@@ -797,8 +797,12 @@ class AllReduce(nn.Module):
             if (bool(is_valid) and window_tensor is not None
                     and window_tensor.numel() > 0):
                 return window_tensor
-        except Exception:
-            pass
+        except RuntimeError as e:
+            # Expected in edge cases: dispatch errors (device/dtype mismatch) or
+            # NCCL errors. Fall back to None (no window optimization).
+            logger.debug(
+                "get_nccl_window_for_shape: create_nccl_window_tensor failed "
+                "(shape=%s): %s", shape_list, e)
         return None
 
     def forward(

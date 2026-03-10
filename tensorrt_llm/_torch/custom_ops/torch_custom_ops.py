@@ -45,6 +45,7 @@ if IS_CUTLASS_DSL_AVAILABLE:
     from tensorrt_llm._torch.custom_ops.cute_dsl_custom_ops import \
         CuteDSLNVFP4BlackwellRunner
 
+# BufferKind is bound from C++; see cpp/tensorrt_llm/thop/outputTensor.h (torch_ext::BufferKind).
 from tensorrt_llm.bindings.internal.thop import BufferKind
 
 
@@ -391,6 +392,7 @@ class FP8RowwiseGemmRunner(TunableRunner):
         return (
             self.output_buffer_kind,
             self.output_dtype,
+            tuple(self.group) if self.group is not None else None,
         )
 
     def get_valid_tactics(self, inputs: List[torch.Tensor],
@@ -927,10 +929,10 @@ class NVFP4GemmUnifiedRunner(TunableRunner):
                                          group=self.group)(inputs,
                                                            tactic=sub_tactic)
         elif backend == "cutedsl":
-            to_userbuffers = self.output_buffer_kind == int(
-                BufferKind.USERBUFFERS)
-            return CuteDSLNVFP4BlackwellRunner(
-                self.output_dtype, to_userbuffers)(inputs, tactic=sub_tactic)
+            return CuteDSLNVFP4BlackwellRunner(self.output_dtype,
+                                               self.output_buffer_kind,
+                                               self.group)(inputs,
+                                                           tactic=sub_tactic)
         else:
             raise ValueError(f"Invalid tactic: {tactic}")
 

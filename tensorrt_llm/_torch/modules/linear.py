@@ -33,6 +33,7 @@ from ...models.modeling_utils import QuantConfig
 from ..utils import (Fp4QuantizedTensor, get_model_extra_attrs,
                      replace_parameter_and_save_metadata, unswizzle_sf)
 
+
 class WeightMode(str, enum.Enum):
     # weight of a vanilla layer
     VANILLA = 'vanilla'
@@ -154,7 +155,6 @@ def load_weight_shard(
     slice_obj = [slice(d) for d in tensor_shape]
     slice_obj[split_dim] = slice(slice_start, slice_end)
     return maybe_convert_to_torch_tensor(weight, tuple(slice_obj))
-
 
 
 def copy_weight(dst: Parameter, src: torch.Tensor):
@@ -2771,34 +2771,36 @@ class Linear(nn.Module):
     ) -> Optional[torch.Tensor]:
         if not self._should_use_nccl_window_output(
                 input, all_reduce_params, lora_params, prefer_window_output):
-            mpi_off = mpi_disabled()
-            has_all_reduce = self.all_reduce is not None
-            strategy = None if self.all_reduce is None else self.all_reduce.strategy
-            enable_allreduce = None if all_reduce_params is None else all_reduce_params.enable_allreduce
-            has_lora = self.lora is not None and bool(lora_params)
-            valid_input = isinstance(input, torch.Tensor) and input.numel() > 0
-            strategy_ok = strategy in (AllReduceStrategy.AUTO,
-                                       AllReduceStrategy.NCCL_SYMMETRIC)
-            reasons = []
-            if mpi_off:
-                reasons.append("mpi_disabled")
-            if not has_all_reduce:
-                reasons.append("no_all_reduce")
-            if has_all_reduce and not strategy_ok:
-                reasons.append("strategy_not_auto_or_nccl_symmetric")
-            if enable_allreduce is False and not prefer_window_output:
-                reasons.append("enable_allreduce_false")
-            if has_lora:
-                reasons.append("lora_active")
-            if not valid_input:
-                reasons.append("invalid_input")
-            logger.debug(
-                "create_nccl_window_tensor skipped "
-                f"(reasons={reasons}, "
-                f"mpi_disabled={mpi_off}, has_all_reduce={has_all_reduce}, "
-                f"strategy={strategy}, enable_allreduce={enable_allreduce}, "
-                f"prefer_window_output={prefer_window_output}, "
-                f"has_lora={has_lora}, valid_input={valid_input})")
+            if logger.level in ('verbose', 'debug', 'trace'):
+                mpi_off = mpi_disabled()
+                has_all_reduce = self.all_reduce is not None
+                strategy = None if self.all_reduce is None else self.all_reduce.strategy
+                enable_allreduce = None if all_reduce_params is None else all_reduce_params.enable_allreduce
+                has_lora = self.lora is not None and bool(lora_params)
+                valid_input = isinstance(input,
+                                         torch.Tensor) and input.numel() > 0
+                strategy_ok = strategy in (AllReduceStrategy.AUTO,
+                                           AllReduceStrategy.NCCL_SYMMETRIC)
+                reasons = []
+                if mpi_off:
+                    reasons.append("mpi_disabled")
+                if not has_all_reduce:
+                    reasons.append("no_all_reduce")
+                if has_all_reduce and not strategy_ok:
+                    reasons.append("strategy_not_auto_or_nccl_symmetric")
+                if enable_allreduce is False and not prefer_window_output:
+                    reasons.append("enable_allreduce_false")
+                if has_lora:
+                    reasons.append("lora_active")
+                if not valid_input:
+                    reasons.append("invalid_input")
+                logger.debug(
+                    "create_nccl_window_tensor skipped "
+                    f"(reasons={reasons}, "
+                    f"mpi_disabled={mpi_off}, has_all_reduce={has_all_reduce}, "
+                    f"strategy={strategy}, enable_allreduce={enable_allreduce}, "
+                    f"prefer_window_output={prefer_window_output}, "
+                    f"has_lora={has_lora}, valid_input={valid_input})")
             return None
         output_shape = list(input.shape)
         if not output_shape:
