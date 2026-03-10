@@ -91,7 +91,8 @@ def encode_arguments_to_dsml(tool_call: Dict[str, str]) -> str:
     )
     P_dsml_strs = []
 
-    arguments = json.loads(tool_call["arguments"])
+    raw_args = tool_call["arguments"]
+    arguments = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
 
     for k, v in arguments.items():
         p_dsml_str = p_dsml_template.format(

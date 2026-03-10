@@ -81,6 +81,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
@@ -809,6 +810,12 @@ class OpenAIServer:
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if self.tool_parser and request.tools:
+                tool_parser_cls = ToolParserFactory.parsers.get(
+                    self.tool_parser.lower())
+                if tool_parser_cls and getattr(
+                        tool_parser_cls, 'needs_raw_special_tokens', False):
+                    sampling_params.skip_special_tokens = False
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)

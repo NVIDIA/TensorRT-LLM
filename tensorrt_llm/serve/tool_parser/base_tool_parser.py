@@ -16,6 +16,8 @@ from .utils import find_common_prefix, is_complete_json, partial_json_loads
 class BaseToolParser(ABC):
     """Base class providing two sets of interfaces: one-time and streaming incremental."""
 
+    needs_raw_special_tokens: bool = False
+
     def __init__(self):
         # Streaming state management
         # Buffer for accumulating incomplete patterns that arrive across multiple streaming chunks
