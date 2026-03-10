@@ -10,8 +10,8 @@ Python and C++ codebase supporting TensorRT engine-based and PyTorch-based execu
 **CRITICAL (YOU MUST):**
 - Read and follow `CODING_GUIDELINES.md` for ALL code changes (C++ and Python)
 - NVIDIA copyright header on ALL new files (update year on modified files)
-- `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Do not add
-  co-authors to the git commit message unless explicitly instructed to do so by the user.
+- `git commit -s` (DCO sign-off required). Never attribute AI tools in sign-off line. Always rely on `git` to do the sign off instead of directly adding sign off in commit message.
+- Do not add co-authors to the git commit message unless explicitly instructed to do so by the user.
 - `pre-commit` hooks run on commit — if files are modified by hooks, re-stage and commit again
 - PR title format: `[JIRA/NVBUG/None][type] description` (e.g., `[TRTLLM-5516][perf] optimize cuda graph padding`)
 - Set `LLM_MODELS_ROOT` env var when running tests that need model weights
