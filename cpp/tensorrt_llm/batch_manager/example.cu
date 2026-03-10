@@ -22,7 +22,7 @@
 // Requirements: CUDA 10.2+, GPU with compute capability >= 7.0,
 //               driver support for cuMemAddressReserve.
 
-#include "tensorrt_llm/batch_manager/cuda_vmm_arena.h"
+#include "tensorrt_llm/batch_manager/cudaVmmArena.h"
 
 #include <cstdio>
 

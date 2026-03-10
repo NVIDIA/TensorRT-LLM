@@ -25,7 +25,7 @@
 //
 // Or with CMake, see the accompanying CMakeLists.txt.
 
-#include "tensorrt_llm/batch_manager/cuda_vmm_arena.h"
+#include "tensorrt_llm/batch_manager/cudaVmmArena.h"
 
 #include <gtest/gtest.h>
 
