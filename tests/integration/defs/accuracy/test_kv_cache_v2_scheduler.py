@@ -30,7 +30,7 @@ from tensorrt_llm.llmapi import (CudaGraphConfig, Eagle3DecodingConfig,
                                  SamplingParams, SchedulerConfig)
 from tensorrt_llm.lora_helper import LoraConfig
 
-from ..conftest import (llm_models_root, skip_pre_hopper)
+from ..conftest import (llm_models_root, parametrize_with_ids, skip_pre_hopper)
 from .accuracy_core import GSM8K, LlmapiAccuracyTestHarness
 
 # ---------------------------------------------------------------------------
@@ -89,6 +89,10 @@ LONG_PROMPT = (_LONG_BLOCK * 12 +
 _V2_SCHEDULER_CONFIG = SchedulerConfig(
     capacity_scheduler_policy="MAX_UTILIZATION")
 
+# Host tier for eviction tests. V2's suspend/resume needs a secondary cache
+# tier so HELD pages can be evicted from GPU to host, freeing GPU slots.
+_HOST_CACHE_SIZE = 256 * 1024 * 1024  # 256 MiB
+
 
 def _run_generate(llm, prompts, sampling_params=None):
     """Run generation and return list of CompletionOutput."""
@@ -105,6 +109,18 @@ def _assert_all_completed(outputs, expected_count=None):
         assert len(out.outputs) > 0, f"Output {i} has no outputs"
         assert len(
             out.outputs[0].token_ids) > 0, f"Output {i} has empty token_ids"
+
+
+def _assert_outputs_match(outputs_a, outputs_b, label_a="A", label_b="B"):
+    """Assert two output lists produce identical token sequences."""
+    assert len(outputs_a) == len(outputs_b), (
+        f"Output count mismatch: {label_a}={len(outputs_a)}, "
+        f"{label_b}={len(outputs_b)}")
+    for i, (oa, ob) in enumerate(zip(outputs_a, outputs_b)):
+        assert oa.outputs[0].token_ids == ob.outputs[0].token_ids, (
+            f"Prompt {i}: {label_a} vs {label_b} outputs differ.\n"
+            f"{label_a}: {oa.outputs[0].token_ids}\n"
+            f"{label_b}: {ob.outputs[0].token_ids}")
 
 
 # ===========================================================================
@@ -131,11 +147,7 @@ class TestKVCacheV2Llama:
             outputs_v2 = llm.generate(prompts,
                                       sampling_params=sampling_params)
 
-        for i, (o1, o2) in enumerate(zip(outputs_v1, outputs_v2)):
-            assert o1.outputs[0].token_ids == o2.outputs[0].token_ids, (
-                f"Prompt {i}: V1 and V2 outputs differ.\n"
-                f"V1: {o1.outputs[0].token_ids}\n"
-                f"V2: {o2.outputs[0].token_ids}")
+        _assert_outputs_match(outputs_v1, outputs_v2, "V1", "V2")
 
     # IT2: Token budget limited
     def test_token_budget_limited(self):
@@ -172,38 +184,55 @@ class TestKVCacheV2Llama:
             outputs = _run_generate(llm, MEDIUM_PROMPTS, sampling_params)
             _assert_all_completed(outputs, expected_count=5)
 
-    # IT5: Eviction under tight memory (no CUDA graph to avoid warmup
-    # needing more blocks than max_tokens allows).
-    # max_tokens=512 with 10 concurrent requests × ~84 tokens forces eviction.
+    # IT5: Eviction under tight memory.
+    # Parametrized over CUDA graph on/off:
+    #  - cuda_graph=True (production): max_tokens=2048 (~32 blocks), long
+    #    prompts (~500 tokens each → 4 concurrent need ~36 blocks → eviction)
+    #  - cuda_graph=False (isolation): max_tokens=288 (~10 blocks), short
+    #    prompts for maximum eviction pressure
+    # host_cache_size enables V2's suspend/resume to free GPU slots.
+    # Verifies output matches a no-eviction baseline to catch corruption.
     @pytest.mark.timeout(300)
-    def test_eviction(self):
-        kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
-                                  max_tokens=512)
+    @pytest.mark.parametrize("use_cuda_graph", [True, False],
+                             ids=["cuda_graph", "no_cuda_graph"])
+    def test_eviction(self, use_cuda_graph):
         sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
-        with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_config,
-                 scheduler_config=_V2_SCHEDULER_CONFIG,
-                 cuda_graph_config=None,
-                 max_batch_size=4,
-                 max_num_tokens=256) as llm:
-            outputs = _run_generate(llm, SHORT_PROMPTS, sampling_params)
-            _assert_all_completed(outputs, expected_count=10)
+        if use_cuda_graph:
+            max_tokens, max_num_tokens = 2048, 1024
+            prompts = [LONG_PROMPT] * 8
+        else:
+            max_tokens, max_num_tokens = 288, 256
+            prompts = SHORT_PROMPTS
+        cuda_graph_kwargs = {} if use_cuda_graph else {
+            "cuda_graph_config": None
+        }
 
-    # IT6: Extreme eviction pressure (no CUDA graph — tests pure eviction)
-    # max_tokens=256 with 20 prompts × ~148 tokens each forces heavy eviction.
-    @pytest.mark.timeout(300)
-    def test_extreme_eviction(self):
-        kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
-                                  max_tokens=256)
-        sampling_params = SamplingParams(max_tokens=128, temperature=0.0)
-        prompts = SHORT_PROMPTS + SHORT_PROMPTS  # 20 prompts
+        # Baseline: plenty of memory, no eviction
+        kv_baseline = KvCacheConfig(use_kv_cache_manager_v2=True,
+                                    enable_block_reuse=False)
         with LLM(self.MODEL_PATH,
-                 kv_cache_config=kv_config,
+                 kv_cache_config=kv_baseline,
                  scheduler_config=_V2_SCHEDULER_CONFIG,
-                 cuda_graph_config=None,
-                 max_num_tokens=128) as llm:
-            outputs = _run_generate(llm, prompts, sampling_params)
-            _assert_all_completed(outputs, expected_count=20)
+                 max_num_tokens=max_num_tokens,
+                 **cuda_graph_kwargs) as llm:
+            outputs_baseline = _run_generate(llm, prompts, sampling_params)
+
+        # Tight memory: forces eviction
+        kv_evict = KvCacheConfig(use_kv_cache_manager_v2=True,
+                                 max_tokens=max_tokens,
+                                 enable_block_reuse=False,
+                                 host_cache_size=_HOST_CACHE_SIZE)
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_evict,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 max_batch_size=4,
+                 max_num_tokens=max_num_tokens,
+                 **cuda_graph_kwargs) as llm:
+            outputs_evict = _run_generate(llm, prompts, sampling_params)
+
+        _assert_all_completed(outputs_evict, expected_count=len(prompts))
+        _assert_outputs_match(outputs_baseline, outputs_evict,
+                              "no-eviction", "eviction")
 
     # IT7: Batch size limited
     def test_batch_size_limited(self):
@@ -238,12 +267,73 @@ class TestKVCacheV2Llama:
             outputs_overlap = llm.generate(prompts,
                                            sampling_params=sampling_params)
 
-        for i, (o1, o2) in enumerate(
-                zip(outputs_no_overlap, outputs_overlap)):
+        _assert_outputs_match(outputs_no_overlap, outputs_overlap,
+                              "non-overlap", "overlap")
+
+    # DEBUG: Full V1 vs V2 cross-comparison (temporary, delete after BUG-012)
+    def test_debug_v1_v2_cross_comparison(self):
+        sampling_params = SamplingParams(max_tokens=32, temperature=0.0)
+        prompts = SHORT_PROMPTS[:5]
+
+        # V1 non-overlap
+        kv_v1 = KvCacheConfig()
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_v1,
+                 disable_overlap_scheduler=True) as llm:
+            v1_no = llm.generate(prompts, sampling_params=sampling_params)
+
+        # V1 overlap
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_v1,
+                 disable_overlap_scheduler=False) as llm:
+            v1_ov = llm.generate(prompts, sampling_params=sampling_params)
+
+        # V2 non-overlap
+        kv_v2 = KvCacheConfig(use_kv_cache_manager_v2=True)
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_v2,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 disable_overlap_scheduler=True) as llm:
+            v2_no = llm.generate(prompts, sampling_params=sampling_params)
+
+        # V2 overlap
+        with LLM(self.MODEL_PATH, kv_cache_config=kv_v2,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 disable_overlap_scheduler=False) as llm:
+            v2_ov = llm.generate(prompts, sampling_params=sampling_params)
+
+        # Print cross comparison
+        pairs = [
+            ('V1-no', v1_no), ('V1-ov', v1_ov),
+            ('V2-no', v2_no), ('V2-ov', v2_ov),
+        ]
+        print('\n=== CROSS COMPARISON ===')
+        for ia, (na, oa) in enumerate(pairs):
+            for ib, (nb, ob) in enumerate(pairs):
+                if ib <= ia:
+                    continue
+                match = sum(
+                    1 for a, b in zip(oa, ob)
+                    if a.outputs[0].token_ids == b.outputs[0].token_ids)
+                diff = [
+                    i for i, (a, b) in enumerate(zip(oa, ob))
+                    if a.outputs[0].token_ids != b.outputs[0].token_ids
+                ]
+                status = f'{match}/5' + (f' (diff: {diff})' if diff else '')
+                print(f'  {na} vs {nb}: {status}')
+
+        print('\n=== ALL OUTPUTS ===')
+        for name, outputs in pairs:
+            print(f'\n--- {name} ---')
+            for i, o in enumerate(outputs):
+                print(f'  P{i}: {o.outputs[0].token_ids[:15]}...')
+
+        # Assert V2-no matches V1-no (the key check)
+        for i, (o1, o2) in enumerate(zip(v1_no, v2_no)):
             assert o1.outputs[0].token_ids == o2.outputs[0].token_ids, (
-                f"Prompt {i}: overlap vs non-overlap outputs differ.\n"
-                f"No-overlap: {o1.outputs[0].token_ids}\n"
-                f"Overlap: {o2.outputs[0].token_ids}")
+                f"Prompt {i}: V1-no vs V2-no differ")
+
+        # Assert V2-ov matches V2-no
+        for i, (o1, o2) in enumerate(zip(v2_no, v2_ov)):
+            assert o1.outputs[0].token_ids == o2.outputs[0].token_ids, (
+                f"Prompt {i}: V2-no vs V2-ov differ")
 
     # IT14: Block reuse with shared-prefix prompts
     def test_block_reuse(self):
@@ -256,23 +346,100 @@ class TestKVCacheV2Llama:
                                     sampling_params)
             _assert_all_completed(outputs, expected_count=5)
 
-    # IT15: Chunked prefill with eviction (no CUDA graph to avoid warmup
-    # needing more blocks than max_tokens allows).
-    # max_tokens=384 with 5 medium prompts (~100 tokens) + chunked prefill.
+    # IT15: Chunked prefill with eviction.
+    # max_tokens=2048 with long prompts for CUDA graph compatibility.
     @pytest.mark.timeout(300)
     def test_chunked_prefill_with_eviction(self):
         kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
-                                  max_tokens=384)
+                                  max_tokens=2048,
+                                  enable_block_reuse=False,
+                                  host_cache_size=_HOST_CACHE_SIZE)
         sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
+        long_prompts = [LONG_PROMPT] * 8
         with LLM(self.MODEL_PATH,
                  kv_cache_config=kv_config,
                  scheduler_config=_V2_SCHEDULER_CONFIG,
-                 cuda_graph_config=None,
                  max_batch_size=4,
                  enable_chunked_prefill=True,
-                 max_num_tokens=128) as llm:
-            outputs = _run_generate(llm, MEDIUM_PROMPTS, sampling_params)
-            _assert_all_completed(outputs, expected_count=5)
+                 max_num_tokens=256) as llm:
+            outputs = _run_generate(llm, long_prompts, sampling_params)
+            _assert_all_completed(outputs, expected_count=8)
+
+    # IT18: Eviction with block reuse enabled.
+    # max_tokens=2048 with long prompts for CUDA graph compatibility.
+    @pytest.mark.timeout(300)
+    def test_eviction_with_block_reuse(self):
+        kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
+                                  max_tokens=2048,
+                                  enable_block_reuse=True,
+                                  host_cache_size=_HOST_CACHE_SIZE)
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
+        long_prompts = [LONG_PROMPT] * 8
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_config,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 max_batch_size=4,
+                 max_num_tokens=1024) as llm:
+            outputs = _run_generate(llm, long_prompts, sampling_params)
+            _assert_all_completed(outputs, expected_count=8)
+
+    # IT19: Chunked prefill + eviction + block reuse.
+    # max_tokens=2048 with long prompts for CUDA graph compatibility.
+    @pytest.mark.timeout(300)
+    def test_chunked_prefill_eviction_block_reuse(self):
+        kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
+                                  max_tokens=2048,
+                                  enable_block_reuse=True,
+                                  host_cache_size=_HOST_CACHE_SIZE)
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
+        long_prompts = [LONG_PROMPT] * 8
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_config,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 max_batch_size=4,
+                 enable_chunked_prefill=True,
+                 max_num_tokens=256) as llm:
+            outputs = _run_generate(llm, long_prompts, sampling_params)
+            _assert_all_completed(outputs, expected_count=8)
+
+    # IT20: Eviction + overlap scheduler.
+    # max_tokens=2048 with long prompts for CUDA graph compatibility.
+    # Overlap + eviction is the most timing-sensitive combination:
+    # iteration N+1's scheduler may suspend N's requests while N's
+    # update_resources hasn't run yet (BUG-009 scenario).
+    @pytest.mark.timeout(300)
+    def test_eviction_overlap(self):
+        sampling_params = SamplingParams(max_tokens=64, temperature=0.0)
+        long_prompts = [LONG_PROMPT] * 8
+
+        kv_config = KvCacheConfig(use_kv_cache_manager_v2=True,
+                                  max_tokens=2048,
+                                  enable_block_reuse=False,
+                                  host_cache_size=_HOST_CACHE_SIZE)
+
+        # Non-overlap eviction baseline
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_config,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 max_batch_size=4,
+                 disable_overlap_scheduler=True,
+                 max_num_tokens=1024) as llm:
+            outputs_no_overlap = _run_generate(llm, long_prompts,
+                                               sampling_params)
+
+        # Overlap eviction
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_config,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 max_batch_size=4,
+                 disable_overlap_scheduler=False,
+                 max_num_tokens=1024) as llm:
+            outputs_overlap = _run_generate(llm, long_prompts,
+                                            sampling_params)
+
+        _assert_all_completed(outputs_overlap, expected_count=8)
+        _assert_outputs_match(outputs_no_overlap, outputs_overlap,
+                              "non-overlap-eviction", "overlap-eviction")
 
 
 # ===========================================================================
@@ -398,6 +565,36 @@ class TestKVCacheV2DSv3Lite:
                  max_num_tokens=256) as llm:
             outputs = _run_generate(llm, [LONG_PROMPT], sampling_params)
             _assert_all_completed(outputs, expected_count=1)
+
+
+# ===========================================================================
+# IT21: V2 non-overlap accuracy on DeepSeek-V3-Lite
+# ===========================================================================
+@skip_pre_hopper
+@pytest.mark.skip_less_device_memory(60000)
+class TestKVCacheV2DSv3LiteAccuracy(LlmapiAccuracyTestHarness):
+    """V2 non-overlap accuracy test on DeepSeek-V3-Lite (1 GPU, >=60GB)."""
+
+    MODEL_NAME = "deepseek-ai/DeepSeek-V3-Lite"
+    MODEL_PATH = f"{llm_models_root()}/DeepSeek-V3-Lite/bf16"
+
+    # IT21/IT22: GSM8K accuracy with V2 non-overlap / overlap scheduler
+    @parametrize_with_ids("disable_overlap", [True, False])
+    def test_accuracy_v2(self, disable_overlap):
+        kv_config = KvCacheConfig(free_gpu_memory_fraction=0.75,
+                                  use_kv_cache_manager_v2=True)
+        pytorch_config = dict(
+            disable_overlap_scheduler=disable_overlap,
+            cuda_graph_config=CudaGraphConfig(),
+            moe_config=MoeConfig(
+                backend="CUTLASS"),
+        )
+        with LLM(self.MODEL_PATH,
+                 kv_cache_config=kv_config,
+                 scheduler_config=_V2_SCHEDULER_CONFIG,
+                 **pytorch_config) as llm:
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
 
 
 # ===========================================================================

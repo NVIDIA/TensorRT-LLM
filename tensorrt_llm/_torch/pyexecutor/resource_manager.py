@@ -1920,9 +1920,28 @@ class KVCacheManagerV2(BaseResourceManager):
         if not kv_cache.is_active:
             if not kv_cache.resume(self._stream.cuda_stream):
                 return False
+            self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
         new_capacity = kv_cache.capacity + 1 + get_draft_token_length(req)
         return kv_cache.resize(new_capacity)
+
+    def _restore_page_index_bufs(self, request_id: int, kv_cache) -> None:
+        """Re-connect host page-index buffers after resume().
+
+        suspend() clears the base_page_index_buf pointers (sets them to
+        None) so the KV cache stops writing page indices to the host
+        buffer.  After resume(), the KV cache has re-locked pages but
+        copy_batch_block_offsets still reads from the host buffer, so we
+        must re-connect the buffers to avoid stale/zero page indices that
+        would cause illegal memory accesses during the forward pass.
+        """
+        index = self.index_mapper.get_index(request_id)
+        for i in range(self.max_beam_width):
+            for pool_idx in range(self.num_pools):
+                buffer: torch.Tensor = self.host_kv_cache_block_offsets[
+                    pool_idx, index * self.max_beam_width + i, 0]
+                kv_cache.set_base_page_index_buf(i, pool_idx,
+                                                 memoryview(buffer.numpy()))
 
     def prepare_context(self, req: LlmRequest) -> bool:
         """Create _KVCache, handle block reuse, and resume. Does NOT resize.
@@ -1952,6 +1971,7 @@ class KVCacheManagerV2(BaseResourceManager):
                 return True
             if not kv_cache.resume(self._stream.cuda_stream):
                 return False
+            self._restore_page_index_bufs(req.py_request_id, kv_cache)
 
             return True
         else:
@@ -1963,7 +1983,10 @@ class KVCacheManagerV2(BaseResourceManager):
                 return False
             if kv_cache.is_active:
                 return True
-            return kv_cache.resume(self._stream.cuda_stream)
+            if not kv_cache.resume(self._stream.cuda_stream):
+                return False
+            self._restore_page_index_bufs(req.py_request_id, kv_cache)
+            return True
 
     def resize_context(self, req: LlmRequest, num_tokens: int) -> bool:
         """Resize KV cache to cover context_current_position + num_tokens.
@@ -2420,6 +2443,13 @@ class KVCacheManagerV2(BaseResourceManager):
             if req.py_request_id not in self.kv_cache_map:
                 continue
             kv_cache = self.kv_cache_map[req.py_request_id]
+            # In the overlap scheduler, iteration N+1's eviction may
+            # suspend a ctx request's KV cache while iteration N's
+            # update_resources still needs to process it.  Skip the
+            # resize — the request will be resumed by the scheduler
+            # on the next iteration.
+            if not kv_cache.is_active:
+                continue
             if self.enable_block_reuse and not self.is_draft and not req.is_dummy_request:
                 if req.context_current_position > kv_cache.num_committed_tokens:
                     kv_cache.commit(
@@ -2447,7 +2477,7 @@ class KVCacheManagerV2(BaseResourceManager):
             # may suspend a gen request's KV cache (via self-eviction or
             # victim eviction) while iteration N's update_resources still
             # needs to process it. Skip suspended caches — the request
-            # will be re-prefilled after pause().
+            # will be resumed by the scheduler on the next iteration.
             if not kv_cache.is_active:
                 continue
             new_capacity = None if req.state in (

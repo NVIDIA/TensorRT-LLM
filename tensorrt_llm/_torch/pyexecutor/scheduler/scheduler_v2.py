@@ -62,6 +62,10 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.chunk_unit_size = 0
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
+        logger.info(
+            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, "
+            "max_batch_size=%s",
+            self.tokens_per_block, max_num_tokens, max_batch_size)
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
             self.chunk_unit_size = ctx_chunk_config[1]
@@ -392,11 +396,22 @@ class KVCacheV2Scheduler(RequestScheduler):
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
 
+    def _is_evictable(self, req: LlmRequest) -> bool:
+        """A started request whose KV cache is still active on GPU.
+
+        Already-suspended requests are not useful eviction victims
+        because suspending them again is a no-op that frees no pages.
+        """
+        if not self._is_started_request(req):
+            return False
+        kv_cache = self.kv_cache_manager.kv_cache_map.get(req.py_request_id)
+        return kv_cache is not None and kv_cache.is_active
+
     def _try_evict_for_gen(self, req, requests_list, req_it, req_it_end, evicted):
         """Evict started requests from active_requests tail to make room.
 
         Search backwards from req_it_end
-        for "started" requests (gen in progress or non-first ctx chunk),
+        for evictable requests (started AND KV cache active on GPU),
         suspend them to free pages, then retry allocation.
 
         Victims are always at indices >= req_it (not yet processed by the
@@ -410,7 +425,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         while req_it_end > req_it:
             victim_idx = None
             for i in range(req_it_end - 1, req_it, -1):
-                if self._is_started_request(requests_list[i]):
+                if self._is_evictable(requests_list[i]):
                     victim_idx = i
                     break
 
@@ -418,9 +433,6 @@ class KVCacheV2Scheduler(RequestScheduler):
                 break
 
             victim = requests_list[victim_idx]
-            # Victim is at index >= req_it (not yet processed by main
-            # loop), so it was never added to scheduled_ctx/scheduled_gen.
-            # No token budget reclaim is needed.
             self.kv_cache_manager.suspend_request(victim)
             evicted.append(victim)
             req_it_end = victim_idx
