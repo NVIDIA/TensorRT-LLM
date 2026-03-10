@@ -242,6 +242,15 @@ if __name__ == '__main__':
         help="Return per-request perf metrics",
     )
 
+    parser.add_argument(
+        '--exclude-input-in-output',
+        default=False,
+        required=False,
+        action='store_true',
+        help=
+        'Exclude input tokens from output. Applied to both control and speculative calls.'
+    )
+
     FLAGS = parser.parse_args()
     if not FLAGS.url_target:
         FLAGS.url_target = "localhost:8001"
@@ -295,7 +304,8 @@ if __name__ == '__main__':
                 FLAGS.frequency_penalty, FLAGS.temperature, FLAGS.stop_words,
                 FLAGS.bad_words, [], [], "ensemble", False, 1, False, None,
                 None, None, None, FLAGS.end_id, FLAGS.pad_id, False,
-                FLAGS.verbose)
+                FLAGS.verbose,
+                exclude_input_in_output=FLAGS.exclude_input_in_output)
             assert (len(output_control) == 1)
             output_control = output_control[0]
             if FLAGS.verbose:
@@ -324,7 +334,8 @@ if __name__ == '__main__':
                     "tensorrt_llm_bls", False, 1, False, None, None,
                     return_generation_logits_data, return_perf_metrics_data,
                     FLAGS.end_id, FLAGS.pad_id, False, FLAGS.verbose,
-                    FLAGS.num_draft_tokens, FLAGS.use_draft_logits)
+                    FLAGS.num_draft_tokens, FLAGS.use_draft_logits,
+                    exclude_input_in_output=FLAGS.exclude_input_in_output)
                 assert (len(output_speculative) == 1)
                 output_speculative = output_speculative[0]
                 if FLAGS.verbose:
