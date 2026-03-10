@@ -1,8 +1,8 @@
 # GLM-5
 
-This guide walks you through running the GLM-5 model with TensorRT-LLM using the PyTorch backend.
+This guide walks you through running the GLM-5 model with TensorRT LLM using the PyTorch backend.
 
-GLM-5 uses Multi-Latent Attention (MLA) with DeepSeek Sparse Attention (DSA). It shares the same architecture as DeepSeek V3.2 and reuses the `DeepseekV32ForCausalLM` code path in TensorRT-LLM.
+GLM-5 uses Multi-Latent Attention (MLA) with DeepSeek Sparse Attention (DSA). It shares the same architecture as DeepSeek V3.2 and reuses the `DeepseekV32ForCausalLM` code path in TensorRT LLM.
 
 
 ## Table of Contents
@@ -37,15 +37,15 @@ git clone https://huggingface.co/zai-org/GLM-5-FP8 /models/GLM-5-FP8
 | Item | Details |
 |------|---------|
 | Hardware | 8x B200 GPUs (SM100) |
-| Container | `nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3` with this PR installed |
+| Minimum version | 1.3.0rc7 |
 
-Refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for instructions on building TensorRT-LLM from source and starting a TRT-LLM Docker container.
+Refer to [this guide](https://nvidia.github.io/TensorRT-LLM/installation/build-from-source-linux.html) for instructions on building TensorRT LLM from source and starting a TensorRT LLM Docker container.
 
 ```bash
 docker run --gpus all --ipc=host \
     --ulimit memlock=-1 --ulimit stack=67108864 \
     -v /path/to/your/models:/models \
-    -it nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc3 bash
+    -it nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7 bash
 ```
 
 > **All commands below should be run inside the Docker container.**
@@ -85,7 +85,6 @@ trtllm-serve \
   /models/GLM-5-FP8 \
   --host localhost \
   --port 8000 \
-  --backend pytorch \
   --max_batch_size 128 \
   --max_num_tokens 8192 \
   --tp_size 8 \

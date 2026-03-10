@@ -87,11 +87,11 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
             'slot_mapping_scale':
             m.slot_mapping_scale.clone(),
         }
-        block_ids = draft_kv_cache_manager.get_batch_cache_indices(
+        block_ids_per_seq = draft_kv_cache_manager.get_block_ids_per_seq(
             m.request_ids)
-        for i in range(len(block_ids)):
-            m.host_indexer_k_cache_block_offsets[i, :len(block_ids[i])].copy_(
-                torch.tensor(block_ids[i], dtype=torch.int32, device='cpu'))
+        num_blocks = block_ids_per_seq.shape[1]
+        m.host_indexer_k_cache_block_offsets[:len(
+            block_ids_per_seq), :num_blocks].copy_(block_ids_per_seq)
         m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
             m.host_indexer_k_cache_block_offsets[:m.num_seqs],
             non_blocking=True)
@@ -112,9 +112,9 @@ def restore_attn_metadata_after_draft_replay(attn_metadata, saved_state):
     if saved_dsa is not None:
         m = attn_metadata
         m.host_indexer_k_cache_block_offsets.copy_(
-            saved_dsa['host_indexer_k_cache_block_offsets'])
+            saved_dsa['host_indexer_k_cache_block_offsets'], non_blocking=True)
         m.indexer_k_cache_block_offsets.copy_(
-            saved_dsa['indexer_k_cache_block_offsets'])
+            saved_dsa['indexer_k_cache_block_offsets'], non_blocking=True)
         m.host_slot_mapping_fp8.copy_(saved_dsa['host_slot_mapping_fp8'])
         m.host_slot_mapping_scale.copy_(saved_dsa['host_slot_mapping_scale'])
         m.slot_mapping_fp8.copy_(saved_dsa['slot_mapping_fp8'])

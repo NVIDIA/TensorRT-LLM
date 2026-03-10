@@ -1861,8 +1861,9 @@ class DeepseekV3ForCausalLM(SpecDecOneEngineForCausalLM[DeepseekV3Model,
             model_config._frozen = True
 
         if model_config.pretrained_config.model_type == 'glm_moe_dsa':
-            model_config = copy.deepcopy(model_config)
+            model_config._frozen = False
             model_config.pretrained_config.model_type = 'deepseek_v32'
+            model_config._frozen = True
 
         super().__init__(model=DeepseekV3Model(
             model_config, mapping_with_cp=self.mapping_with_cp),

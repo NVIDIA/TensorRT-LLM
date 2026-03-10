@@ -143,7 +143,6 @@ class TrtllmAttentionWrapper:
 
         self.rotary_inv_freq, self.rotary_cos_sin = self.rope_params.create_rope_const_params(
         )
-        self._normalize_mla_rotary_cache_layout()
 
         self.num_heads = num_heads
         self.num_kv_heads = num_kv_heads or num_heads
@@ -168,42 +167,6 @@ class TrtllmAttentionWrapper:
         self.print_skip_softmax_stat = os.environ.get(
             "TRTLLM_PRINT_SKIP_SOFTMAX_STAT", "0") == "1"
 
-    def _normalize_mla_rotary_cache_layout(self) -> None:
-        if (not self.is_mla_enable or self.rotary_cos_sin is None
-                or self.qk_rope_head_dim is None or self.qk_rope_head_dim <= 0):
-            return
-
-        max_positions = self.rope_params.max_positions
-        if max_positions <= 0:
-            return
-
-        total = self.rotary_cos_sin.numel()
-        if total % max_positions != 0:
-            logger.warning_once(
-                f"Unexpected rotary_cos_sin shape for MLA: total={total}, max_positions={max_positions}",
-                key="mla_rope_layout_invalid",
-            )
-            return
-
-        floats_per_position = total // max_positions
-        expected_floats_per_position = self.qk_rope_head_dim * 2
-        if floats_per_position == expected_floats_per_position:
-            return
-
-        if floats_per_position * 2 != expected_floats_per_position:
-            logger.warning_once(
-                "Unexpected MLA rotary cache layout: "
-                f"floats_per_position={floats_per_position} "
-                f"expected={expected_floats_per_position}",
-                key="mla_rope_layout_unexpected",
-            )
-            return
-
-        # For non-YaRN configs we may only have qk_rope_head_dim/2 float2; duplicate coefficients.
-        cos_sin = self.rotary_cos_sin.view(max_positions, -1, 2)
-        self.rotary_cos_sin = torch.cat([cos_sin, cos_sin],
-                                        dim=1).reshape(1, -1).contiguous()
-
     def update_quant_config(self, quant_config: Optional[QuantConfig] = None):
         quant_config = quant_config or QuantConfig()
         self.quant_mode = int(quant_config.layer_quant_mode)
@@ -220,8 +183,6 @@ class TrtllmAttentionWrapper:
             self.rope_params.max_positions = required_max_positions
             self.rotary_inv_freq, self.rotary_cos_sin = (
                 self.rope_params.create_rope_const_params())
-
-            self._normalize_mla_rotary_cache_layout()
 
     def plan(
         self,

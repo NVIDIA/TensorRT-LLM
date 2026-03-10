@@ -14,7 +14,8 @@ from transformers import PreTrainedTokenizerFast
 from ..tokenizer import TransformersTokenizer
 
 # Keys from tokenizer_config.json that are safe to pass to PreTrainedTokenizerFast.
-# We do not pass extra_special_tokens when it is a list (old transformers expects a dict).
+# extra_special_tokens is not copied directly to the new config. It is renamed to additional_special_tokens
+# for compatibility with older transformers.
 _SAFE_CONFIG_KEYS = (
     "pad_token",
     "pad_token_id",
