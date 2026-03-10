@@ -22,7 +22,7 @@
 #include "tensorrt_llm/kernels/kvCacheUtils.h"
 #include "tensorrt_llm/kernels/unfusedAttentionKernels.h"
 #include "tensorrt_llm/runtime/torchUtils.h"
-#include "tensorrt_llm/thop/thUtils.h"
+#include "tensorrt_llm/thop/attentionOp.h"
 #include <ATen/cuda/CUDAContext.h>
 #include <torch/extension.h>
 #include <type_traits>
