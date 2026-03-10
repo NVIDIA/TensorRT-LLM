@@ -8,6 +8,7 @@ This file tests:
 4. prepare/restore attention metadata for draft replay
 """
 
+import builtins
 import random
 from unittest.mock import Mock, patch
 
@@ -2439,19 +2440,17 @@ class TestPrepareRestoreAttnMetadataForDraftReplay:
             TrtllmAttentionMetadata
 
         meta = self._make_mock_metadata()
-        meta.__class__ = type("FakeTrtllm", (TrtllmAttentionMetadata, ), {})
         mgr = self._make_mock_draft_manager()
         original_kv_mgr = meta.kv_cache_manager
         original_offsets = meta.kv_cache_block_offsets.clone()
         original_host_offsets = meta.host_kv_cache_block_offsets.clone()
 
-        with patch.object(TrtllmAttentionMetadata, '__instancecheck__',
-                          lambda cls, inst: inst is meta):
-            with patch(
-                    'tensorrt_llm._torch.speculative.interface.DSAtrtllmAttentionMetadata'
-            ) as MockDsa:
-                MockDsa.__instancecheck__ = lambda self, x: False
-                saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
+        with patch('tensorrt_llm._torch.speculative.interface.isinstance',
+                   side_effect=lambda obj, cls:
+                   (obj is meta if cls is TrtllmAttentionMetadata else False
+                    if cls.__name__ == 'DSAtrtllmAttentionMetadata' else
+                    builtins.isinstance(obj, cls))):
+            saved = prepare_attn_metadata_for_draft_replay(meta, mgr)
 
         assert saved is not None
         assert saved['target_kv_cache_manager'] is original_kv_mgr
