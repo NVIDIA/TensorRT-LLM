@@ -523,85 +523,6 @@ TransferState NixlTransferStatus::wait(int64_t timeout_ms) const
     return mRawAgent->getXferStatus(mHandle) == NIXL_SUCCESS;
 }
 
-[[nodiscard]] MemoryDescs NixlHelper::splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize)
-{
-    detectedChunkSize = 0;
-    auto const& descVec = descs.getDescs();
-    if (descVec.empty() || descs.getType() != MemoryType::kVRAM)
-        return descs;
-
-    std::vector<MemoryDesc> result;
-    result.reserve(descVec.size());
-
-    for (auto const& desc : descVec)
-    {
-        uintptr_t addr = desc.getAddr();
-        size_t len = desc.getLen();
-        uint32_t deviceId = desc.getDeviceId();
-
-        if (len == 0)
-            continue;
-
-        // Query start and end of the descriptor
-        CUdeviceptr startBase = 0;
-        size_t startSize = 0;
-        CUresult startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
-
-        CUdeviceptr endBase = 0;
-        size_t endSize = 0;
-        CUresult endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
-
-        // If either query fails, or both are in the same allocation -> no split needed
-        if (startErr != CUDA_SUCCESS || endErr != CUDA_SUCCESS || startBase == endBase)
-        {
-            result.emplace_back(addr, len, deviceId);
-            continue;
-        }
-
-        // Multi-chunk VMM detected: use first chunk's size as uniform chunk size
-        size_t chunkSize = startSize;
-
-        TLLM_CHECK_WITH_INFO(endSize == chunkSize,
-            "VMM chunk size mismatch: first chunk %zu bytes, last chunk %zu bytes. "
-            "All VMM chunks must be the same size.",
-            chunkSize, endSize);
-
-        TLLM_CHECK_WITH_INFO(addr % chunkSize == 0,
-            "VMM descriptor start address 0x%lx is not aligned to chunk size %zu. "
-            "Pool base address must be chunk-aligned.",
-            static_cast<unsigned long>(addr), chunkSize);
-
-        if (detectedChunkSize > 0)
-        {
-            TLLM_CHECK_WITH_INFO(chunkSize == detectedChunkSize,
-                "Inconsistent VMM chunk sizes across descriptors: %zu vs %zu. "
-                "All VMM pools must use the same chunk size.",
-                chunkSize, detectedChunkSize);
-        }
-        detectedChunkSize = chunkSize;
-
-        uintptr_t current = addr;
-        size_t remaining = len;
-
-        while (remaining > 0)
-        {
-            size_t offsetInChunk = static_cast<size_t>(current % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
-            result.emplace_back(current, pieceSize, deviceId);
-            current += pieceSize;
-            remaining -= pieceSize;
-        }
-    }
-
-    if (result.size() != descVec.size())
-    {
-        TLLM_LOG_DEBUG("NixlHelper::splitVmmDescs: split %zu -> %zu VRAM entries (chunkSize=%zu)", descVec.size(),
-            result.size(), detectedChunkSize);
-    }
-
-    return MemoryDescs{descs.getType(), std::move(result)};
-}
-
 NixlTransferAgent::NixlTransferAgent(BaseAgentConfig const& config)
     : mName{config.mName}
 {
@@ -678,33 +599,11 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
     // Split VRAM descriptors at VMM chunk boundaries so each sub-descriptor
     // falls within a single cuMemCreate allocation (required by gdr_copy / cuda_ipc).
     size_t detectedChunkSize = 0;
-    auto splitDescs = NixlHelper::splitVmmDescs(descs, detectedChunkSize);
+    auto splitDescs = VmmDescSplitter::splitVmmDescs(descs, detectedChunkSize);
 
     // Record per-desc VMM chunk info for use in deregisterMemory / submitTransferRequests
-    if (descs.getType() == MemoryType::kVRAM)
-    {
-        for (auto const& desc : descs.getDescs())
-        {
-            // Detect VMM chunk size for this specific descriptor
-            uintptr_t addr = desc.getAddr();
-            size_t len = desc.getLen();
-            size_t chunkSize = 0;
-
-            if (len > 1)
-            {
-                CUdeviceptr startBase = 0, endBase = 0;
-                size_t startSize = 0, endSize = 0;
-                CUresult startErr = cuMemGetAddressRange(&startBase, &startSize, static_cast<CUdeviceptr>(addr));
-                CUresult endErr = cuMemGetAddressRange(&endBase, &endSize, static_cast<CUdeviceptr>(addr + len - 1));
-                if (startErr == CUDA_SUCCESS && endErr == CUDA_SUCCESS && startBase != endBase)
-                {
-                    chunkSize = startSize;
-                }
-            }
-
-            mVramRegionInfo[addr] = {len, chunkSize};
-        }
-    }
+    auto detectedRegionMap = VmmDescSplitter::detectVramRegionMap(descs);
+    mLocalVramRegionInfo.merge(detectedRegionMap);
 
     // Coalesce contiguous memory regions to reduce registration overhead (disabled by default)
     // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
@@ -722,7 +621,7 @@ void NixlTransferAgent::registerMemory(RegisterDescs const& descs)
 void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
 {
     // Split using per-region registry info to match what was registered
-    auto splitDescs = splitDescsFromRegistry(descs);
+    auto splitDescs = VmmDescSplitter::splitDescsWithRegionMap(descs, mLocalVramRegionInfo);
 
     // Coalesce contiguous memory regions to match what was registered (disabled by default)
     // Set TRTLLM_NIXL_ENABLE_COALESCE=1 to enable this optimization
@@ -737,7 +636,7 @@ void NixlTransferAgent::deregisterMemory(RegisterDescs const& descs)
     {
         for (auto const& desc : descs.getDescs())
         {
-            mVramRegionInfo.erase(desc.getAddr());
+            mLocalVramRegionInfo.erase(desc.getAddr());
         }
     }
 }
@@ -750,18 +649,44 @@ void NixlTransferAgent::loadRemoteAgent(std::string const& name, AgentDesc const
     TLLM_CHECK(status == NIXL_SUCCESS);
     TLLM_CHECK_WITH_INFO(
         name == remoteName, "loadRemoteAgent gets error agent name: %s != %s", name.c_str(), remoteName.c_str());
+
+    // Store remote VMM region info for chunk boundary calculations in
+    // VmmDescSplitter::splitTransferDescsWithRegionMaps. Per-agent map because different remote agents may have
+    // overlapping virtual addresses.
+    auto const& regions = agentDesc.getVramRegions();
+    if (!regions.empty())
+    {
+        auto& remoteMap = mRemoteVramRegionInfo[name];
+        for (auto const& r : regions)
+        {
+            remoteMap[r.baseAddr] = {r.totalLen, r.chunkSize};
+        }
+    }
 }
 
 AgentDesc NixlTransferAgent::getLocalAgentDesc()
 {
-    nixl_blob_t desc;
-    nixl_status_t status = mRawAgent->getLocalMD(desc);
+    nixl_blob_t nixlBlob;
+    nixl_status_t status = mRawAgent->getLocalMD(nixlBlob);
     TLLM_CHECK(status == NIXL_SUCCESS);
-    return AgentDesc{desc};
+
+    // Pack local VMM region info so remote agents can compute chunk boundaries.
+    std::vector<VramRegionMeta> regions;
+    for (auto const& [base, info] : mLocalVramRegionInfo)
+    {
+        if (info.chunkSize > 0)
+        {
+            regions.push_back({base, info.totalLen, info.chunkSize});
+        }
+    }
+
+    return AgentDesc{nixlBlob, std::move(regions)};
 }
 
 void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
 {
+    // Clean up remote VMM region info before invalidating the remote agent.
+    mRemoteVramRegionInfo.erase(name);
     mRawAgent->invalidateRemoteMD(name);
 }
 
@@ -783,7 +708,13 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     // Split transfer descriptors at VMM chunk boundaries to match registered memory.
     // Both src and dst are split at chunk boundaries to ensure each descriptor
     // falls within a single registered memory region on both local and remote sides.
-    auto [splitSrc, splitDst] = splitTransferDescsFromRegistry(request.getSrcDescs(), request.getDstDescs());
+    // Find remote agent's VMM region map (empty map if not found).
+    static VramRegionMap const kEmptyMap;
+    auto remoteIt = mRemoteVramRegionInfo.find(request.getRemoteName());
+    auto const& remoteRegionMap = (remoteIt != mRemoteVramRegionInfo.end()) ? remoteIt->second : kEmptyMap;
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        request.getSrcDescs(), request.getDstDescs(), mLocalVramRegionInfo, remoteRegionMap);
 
     // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
     // This matches the coalescing done during registerMemory()
@@ -798,7 +729,6 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
     }
     else
     {
-        NVTX3_SCOPED_RANGE(createXferReq);
         status = mRawAgent->createXferReq(NixlHelper::convert(request.getOp()), NixlHelper::convertXferDist(splitSrc),
             NixlHelper::convertXferDist(splitDst), request.getRemoteName(), handle, &mExtraParams);
     }
@@ -880,107 +810,6 @@ bool NixlTransferAgent::checkRemoteDescs(std::string const& name, MemoryDescs co
     TLLM_CHECK_WITH_INFO(status == NIXL_SUCCESS || status == NIXL_ERR_NOT_FOUND, "checkRemoteMD failed with status: %s",
         nixlEnumStrings::statusStr(status).c_str());
     return status == NIXL_SUCCESS;
-}
-
-size_t NixlTransferAgent::lookupChunkSize(uintptr_t addr) const
-{
-    auto it = mVramRegionInfo.upper_bound(addr);
-    if (it != mVramRegionInfo.begin())
-    {
-        --it;
-        if (addr >= it->first && addr < it->first + it->second.totalLen)
-        {
-            return it->second.chunkSize;
-        }
-    }
-    return 0;
-}
-
-MemoryDescs NixlTransferAgent::splitDescsFromRegistry(MemoryDescs const& descs) const
-{
-    if (descs.getType() != MemoryType::kVRAM)
-        return descs;
-
-    auto const& descVec = descs.getDescs();
-    if (descVec.empty())
-        return descs;
-
-    std::vector<MemoryDesc> result;
-    result.reserve(descVec.size());
-
-    for (auto const& desc : descVec)
-    {
-        size_t chunkSize = lookupChunkSize(desc.getAddr());
-        if (chunkSize == 0)
-        {
-            result.push_back(desc);
-            continue;
-        }
-
-        uintptr_t addr = desc.getAddr();
-        size_t remaining = desc.getLen();
-        uint32_t deviceId = desc.getDeviceId();
-
-        while (remaining > 0)
-        {
-            size_t offsetInChunk = static_cast<size_t>(addr % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
-            result.emplace_back(addr, pieceSize, deviceId);
-            addr += pieceSize;
-            remaining -= pieceSize;
-        }
-    }
-
-    return MemoryDescs{descs.getType(), std::move(result)};
-}
-
-std::pair<MemoryDescs, MemoryDescs> NixlTransferAgent::splitTransferDescsFromRegistry(
-    MemoryDescs const& srcDescs, MemoryDescs const& dstDescs) const
-{
-    NVTX3_SCOPED_RANGE(splitTransferDescsFromRegistry);
-    if (srcDescs.getType() != MemoryType::kVRAM)
-        return {srcDescs, dstDescs};
-
-    auto const& srcVec = srcDescs.getDescs();
-    auto const& dstVec = dstDescs.getDescs();
-    TLLM_CHECK(srcVec.size() == dstVec.size());
-
-    std::vector<MemoryDesc> splitSrc, splitDst;
-    splitSrc.reserve(srcVec.size());
-    splitDst.reserve(dstVec.size());
-
-    for (size_t i = 0; i < srcVec.size(); ++i)
-    {
-        size_t chunkSize = lookupChunkSize(srcVec[i].getAddr());
-        if (chunkSize == 0)
-        {
-            splitSrc.push_back(srcVec[i]);
-            splitDst.push_back(dstVec[i]);
-            continue;
-        }
-
-        // Split at chunk boundaries for BOTH src and dst.
-        // Both sides may have VMM chunk boundaries that NIXL requires descriptors to respect.
-        uintptr_t srcAddr = srcVec[i].getAddr();
-        uintptr_t dstAddr = dstVec[i].getAddr();
-        size_t remaining = srcVec[i].getLen();
-
-        while (remaining > 0)
-        {
-            size_t srcOffsetInChunk = static_cast<size_t>(srcAddr % chunkSize);
-            size_t srcPieceSize = chunkSize - srcOffsetInChunk;
-            size_t dstOffsetInChunk = static_cast<size_t>(dstAddr % chunkSize);
-            size_t dstPieceSize = chunkSize - dstOffsetInChunk;
-            size_t pieceSize = std::min({remaining, srcPieceSize, dstPieceSize});
-            splitSrc.emplace_back(srcAddr, pieceSize, srcVec[i].getDeviceId());
-            splitDst.emplace_back(dstAddr, pieceSize, dstVec[i].getDeviceId());
-            srcAddr += pieceSize;
-            dstAddr += pieceSize;
-            remaining -= pieceSize;
-        }
-    }
-
-    return {MemoryDescs{srcDescs.getType(), std::move(splitSrc)}, MemoryDescs{dstDescs.getType(), std::move(splitDst)}};
 }
 
 NixlTransferAgent::~NixlTransferAgent()
