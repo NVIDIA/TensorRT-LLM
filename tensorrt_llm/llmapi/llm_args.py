@@ -758,7 +758,7 @@ class DecodingBaseConfig(StrictBaseModel):
         """
         return True
 
-    @functools.cached_property
+    @property
     def spec_dec_mode(self):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
         # Use an alias for the import here to avoid name collisions with the one for the
@@ -776,6 +776,9 @@ class DecodingBaseConfig(StrictBaseModel):
     def tokens_per_gen_step(self) -> int:
         """Total tokens per gen request in one spec dec iteration (including golden token)."""
         return 1 + self.max_total_draft_tokens
+
+    def num_capture_layers(self) -> int:
+        return 0
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
@@ -1022,6 +1025,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
+
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["SaveState"] = "SaveState"
@@ -1186,6 +1200,7 @@ class SADecodingConfig(DecodingBaseConfig):
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
+    _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -1199,6 +1214,14 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch" or backend == "_autodeploy"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if self._draft_target_one_model:
+            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -1239,7 +1262,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
@@ -1322,6 +1345,17 @@ class PARDDecodingConfig(DecodingBaseConfig):
     )
 
     decoding_type: Literal["PARD"] = "PARD"
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -1668,6 +1702,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
+
+    use_python_scheduler: bool = Field(
+        default=False,
+        description="Use pure-Python scheduler instead of C++ scheduler.")
 
     def _to_pybind(self):
         return _SchedulerConfig(
@@ -3278,6 +3316,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.disable_overlap_scheduler = True
                 self.cuda_graph_config = None
                 self.speculative_config.max_draft_len = 1
+            elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
+                if self.backend == "_autodeploy":
+                    self.speculative_config._draft_target_one_model = False
 
         else:
             self.decoding_config = None

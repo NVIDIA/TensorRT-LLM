@@ -193,7 +193,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
     if (matrixType != MatrixType::MatrixC)
     {
         // When using 2CTA MMA, we only need to load half of the tile in each CTA for B.
-        if (matrixType == MatrixType::MatrixB && tileShape[1] > 1 && options.mClusterDimX == 2)
+        if (matrixType == MatrixType::MatrixB && tileShape[1] > 1 && options.mClusterDimX >= 2)
         {
             tileShape[1] /= 2;
         }
@@ -226,7 +226,7 @@ static auto makeTmaShapeStrideAbc(GemmOptions const& options, int sizeM, int siz
 
 // Create the TMA shape/stride for A/B block scaling factors.
 static auto makeTmaShapeStrideSfAb(int mM, int mN, int mK, MatrixType matrixType, int tileM, int tileN, int tileK,
-    tg::SfLayout layout, int sfReshapeFactor, const int32_t numEltsPerSf)
+    tg::SfLayout layout, int sfReshapeFactor, int32_t const numEltsPerSf)
 {
 
     // The outer dimension.
@@ -524,7 +524,7 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             // Build TMA descriptor for gmem A block scaling factors.
             auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(options.mM * options.mNumBatches,
                 options.mN, options.mK, MatrixType::MatrixA, options.mTileM, options.mTileN, options.mTileK,
-                tg::SfLayout::R128c4, options.mSfReshapeFactor, numEltsPerSfA);
+                options.mSfLayoutA, options.mSfReshapeFactor, numEltsPerSfA);
             params.tmaSfA[0]
                 = gemm::buildSfTmaDescriptor(dTypeSfA, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
         }
@@ -646,7 +646,30 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
             tg::Dtype const dTypeSf = (options.mDtypeA == tg::Dtype::E2m1) ? tg::Dtype::E4m3 : tg::Dtype::UE8m0;
             int32_t const numEltsPerSfA = options.mSfBlockSizeA;
 
-            if (options.mRouteSfsImpl.value() == batchedGemm::RouteImpl::NoRoute)
+            if (batchedGemm::doesRouteImplUseTma(options.mRouteSfsImpl.value()))
+            {
+
+                // The input is NOT padded:
+                // [act0, act1, act2, ...]
+
+                // Build TMA descriptor for gmem A block scaling factors.
+                // Pad number of scaling factors to the nearest multiple of 16 because of the TMA 16B
+                // alignment requirement.
+                auto numSfsInK = options.mK / numEltsPerSfA;
+                numSfsInK = ceilDiv(numSfsInK, 16) * 16;
+
+                auto numSfsInValidK = options.mValidK / numEltsPerSfA;
+                numSfsInValidK = ceilDiv(numSfsInValidK, 16) * 16;
+
+                auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideAbc(options, options.mNumTokens,
+                    options.mN, numSfsInK, 1 /* tileM */, options.mTileN, options.mTileK / numEltsPerSfA,
+                    MatrixType::MatrixA, options.mNumTokens, options.mValidN, numSfsInValidK);
+                params.tmaSfA[0]
+                    = gemm::buildNdTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA),
+                        /*doPad=*/false,
+                        /*doSwizzle=*/true);
+            }
+            else if (options.mRouteSfsImpl.value() == batchedGemm::RouteImpl::NoRoute)
             {
 
                 // The input is padded:
@@ -655,8 +678,8 @@ static KernelParams setKernelParams(GemmOptions_ const& options, bool const batc
 
                 // Build TMA descriptor for gmem A block scaling factors.
                 auto [shapeSfA, strideSfA, tileShapesSfA] = makeTmaShapeStrideSfAb(inputNumTokensSfA, options.mN,
-                    options.mK, MatrixType::MatrixA, options.mTileM, options.mTileN, options.mTileK,
-                    tg::SfLayout::R128c4, options.mSfReshapeFactor, numEltsPerSfA);
+                    options.mK, MatrixType::MatrixA, options.mTileM, options.mTileN, options.mTileK, options.mSfLayoutA,
+                    options.mSfReshapeFactor, numEltsPerSfA);
                 params.tmaSfA[0]
                     = gemm::buildSfTmaDescriptor(dTypeSf, shapeSfA, strideSfA, tileShapesSfA, const_cast<void*>(dSfA));
             }
