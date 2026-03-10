@@ -313,6 +313,8 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
+    sh "apk add python3"
+    sh "apk add git"
     sh "env | sort"
     if (!GEN_POST_MERGE_BUILDS_ONLY) {
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
@@ -384,7 +386,7 @@ def mergeWaiveList(pipeline, globalVars)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/python:slim-bullseye"
+    image = "urm.nvidia.com/docker/alpine:3.18"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
