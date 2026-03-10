@@ -41,7 +41,7 @@ class LogParser(object):
         """
         self.benchmark_type = benchmark_type
         self.config = config
-        self.metrics_config = metrics_config  
+        self.metrics_config = metrics_config
         self.result_dir = result_dir
 
     def _extract_log(self, pattern: str, metric_names: List[str], log_content: str):
@@ -62,7 +62,9 @@ class LogParser(object):
                 item = dict(zip(metric_names, values))
                 item["concurrency"] = concurrency
                 results.append(item)
-                logger.debug(f"Extracted: concurrency={concurrency}, {dict(zip(metric_names, values))}")
+                logger.debug(
+                    f"Extracted: concurrency={concurrency}, {dict(zip(metric_names, values))}"
+                )
             except (ValueError, IndexError) as e:
                 logger.warning(f"Error processing match: {e}")
                 continue
