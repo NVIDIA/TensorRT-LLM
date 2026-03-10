@@ -2107,10 +2107,10 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 @pytest.mark.skip_less_device(4)
 @skip_no_hopper
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
-                         indirect=True)
 @pytest.mark.parametrize("streaming", [False, True],
                          ids=["non_streaming", "streaming"])
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
 def test_disaggregated_logprobs(disaggregated_test_root,
                                 disaggregated_example_root, llm_venv,
                                 deepseek_v3_model_root, streaming):
