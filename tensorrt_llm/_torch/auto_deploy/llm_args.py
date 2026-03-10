@@ -260,8 +260,8 @@ class LlmArgs(DynamicYamlMixInForSettings, TorchLlmArgs, BaseSettings):
     )
 
     ### SEQUENCE INTERFACE CONFIG ##################################################################
-    max_seq_len: int = Field(default=512, ge=1, description="The maximum sequence length.")
-    max_batch_size: int = Field(default=8, ge=1, description="The maximum batch size.")
+    max_seq_len: int = Field(default=2048, ge=1, description="The maximum sequence length.")
+    max_batch_size: int = Field(default=64, ge=1, description="The maximum batch size.")
 
     def model_dump(self, *args, **kwargs):
         """Convert the arguments to a dictionary that can be used as kwargs for the LLM API."""
