@@ -43,12 +43,14 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        SsmLayerConfig,
         TokenId,
         TokenIdExt,
         _KVCache,
     )
     from kv_cache_manager_v2._block_radix_tree import traverse_post_order
     from kv_cache_manager_v2._common import (
+        BAD_PAGE_INDEX,
         GPU_LEVEL,
         CacheTier,
         MemAddress,
@@ -57,6 +59,7 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
+    from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         TemporaryCudaStream,
@@ -85,12 +88,14 @@ else:
         KVCacheManagerConfig,
         LayerGroupId,
         LayerId,
+        SsmLayerConfig,
         TokenId,
         TokenIdExt,
         _KVCache,
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._block_radix_tree import traverse_post_order
     from tensorrt_llm.runtime.kv_cache_manager_v2._common import (
+        BAD_PAGE_INDEX,
         GPU_LEVEL,
         CacheTier,
         MemAddress,
@@ -99,6 +104,7 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
+    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         TemporaryCudaStream,
@@ -1184,6 +1190,137 @@ class TestHeteroTokensPerBlock(TestKVCacheManagerV2):
         # empty input just for ref-check.
         input = []
         self.engine.execute([Step(kv_cache, input, history)], stream)
+        kv_cache.close()
+
+
+class TestSSMSupport(unittest.TestCase):
+    """Tests for basic SSM (State Space Model / Mamba) support in KVCacheManager v2."""
+
+    _token_id_gen: Iterator[int]
+
+    def setUp(self) -> None:
+        init_cuda_once()
+        self._token_id_gen = itertools.count()
+        gc.collect()
+        gc.disable()
+
+    def tearDown(self) -> None:
+        gc.enable()
+        if hasattr(self, "manager"):
+            self.manager.shutdown()
+            del self.manager
+
+    def next_token(self) -> TokenIdExt:
+        return TokenId(next(self._token_id_gen))
+
+    def _make_ssm_config(
+        self,
+        tokens_per_block: int = 32,
+        gpu_quota: int = 32 << 20,
+        num_attn_layers: int = 2,
+        num_ssm_layers: int = 2,
+        window_size: SlidingWindowSize = None,
+    ) -> KVCacheManagerConfig:
+        layers = []
+        lid = 0
+        for _ in range(num_attn_layers):
+            layers.append(
+                AttentionLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[
+                        BufferConfig(role=DataRole("key"), size=8192),
+                        BufferConfig(role=DataRole("value"), size=8192),
+                    ],
+                    sliding_window_size=window_size,
+                )
+            )
+            lid += 1
+        for _ in range(num_ssm_layers):
+            layers.append(
+                SsmLayerConfig(
+                    layer_id=LayerId(lid),
+                    buffers=[
+                        BufferConfig(role=DataRole("ssm_state"), size=8192),
+                    ],
+                )
+            )
+            lid += 1
+        return KVCacheManagerConfig(
+            tokens_per_block=tokens_per_block,
+            vocab_size=1024,
+            cache_tiers=[GpuCacheTierConfig(quota=gpu_quota)],
+            layers=layers,
+        )
+
+    def test_suspend_and_resume_with_ssm(self) -> None:
+        """Suspend and resume work correctly (SSM page locks/unlocks)."""
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        kv_cache = self.manager.create_kv_cache()
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        ssm_lg = None
+        for lc_id, lc in self.manager._life_cycles.items():
+            if isinstance(lc, SsmLifeCycle):
+                ssm_lg = LayerGroupId(lc_id)
+                break
+        assert ssm_lg is not None
+        # Grow some capacity
+        kv_cache.capacity = 100
+        initial_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
+        self.assertNotEqual(initial_slot, BAD_PAGE_INDEX)
+        # Suspend
+        kv_cache.stop_committing()
+        kv_cache.suspend()
+        self.assertEqual(kv_cache.status, _KVCache.Status.SUSPENDED)
+        # Resume
+        success = kv_cache.resume(stream)
+        self.assertTrue(success)
+        self.assertEqual(kv_cache.status, _KVCache.Status.ACTIVE)
+        # SSM slot should be the same
+        resumed_slot = kv_cache.get_ssm_block_base_index(ssm_lg)
+        self.assertEqual(initial_slot, resumed_slot, "SSM slot unchanged after suspend/resume")
+        kv_cache.close()
+
+    def test_no_reuse_with_ssm(self) -> None:
+        """input_tokens are accepted but no prefix reuse happens with SSM layers."""
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        tokens = [self.next_token() for _ in range(64)]
+        kv_cache = self.manager.create_kv_cache(input_tokens=tokens)
+        self.assertEqual(kv_cache.num_committed_tokens, 0, "No reuse when SSM layers present")
+        # Resume before close so cuda_stream is set
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        kv_cache.close()
+
+    def test_ssm(self) -> None:
+        """Inference with SSM layer: prefill 63 tokens, decode 52 tokens."""
+        cfg = self._make_ssm_config()
+        self.manager = KVCacheManager(cfg)
+        engine = FakeEngine(cfg)
+        kv_cache = self.manager.create_kv_cache()
+        stream_holder = CachedCudaStream()
+        stream = cast(CudaStream, stream_holder.handle)
+        kv_cache.resume(stream)
+        kv_cache.stop_committing()
+        # prefill
+        prompt = [self.next_token() for _ in range(63)]
+        kv_cache.capacity = len(prompt)
+        kv_cache.history_length = len(prompt)
+        engine.execute([Step(kv_cache, prompt, [])], stream)
+        history = list(prompt)
+        # decode
+        for _ in range(52):
+            kv_cache.capacity = len(history) + 1
+            token = self.next_token()
+            engine.execute([Step(kv_cache, [token], history)], stream)
+            history.append(token)
+            kv_cache.history_length = len(history)
+        # final check
+        engine.execute([Step(kv_cache, [], history)], stream)
         kv_cache.close()
 
 
