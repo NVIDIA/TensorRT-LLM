@@ -39,3 +39,4 @@ verl_config:
     - "NVSHMEM_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem"
     - "LD_LIBRARY_PATH=\"${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH\""
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
+    - "TRTLLM_TEST_MODEL_PATH_ROOT=/scratch.trt_llm_data/llm-models"
