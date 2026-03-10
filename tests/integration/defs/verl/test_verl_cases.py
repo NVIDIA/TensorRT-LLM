@@ -65,6 +65,10 @@ def _clone_verl_repo(config):
         shell=True,
     )
     assert os.path.isdir(VERL_ROOT), f"Failed to clone verl repo to {VERL_ROOT}"
+    print(f"[verl setup] Installing verl package from {VERL_ROOT}")
+    subprocess.check_call(
+        [sys.executable, "-m", "pip", "install", "-e", VERL_ROOT],
+    )
 
 
 @pytest.fixture(scope="session", autouse=True)
