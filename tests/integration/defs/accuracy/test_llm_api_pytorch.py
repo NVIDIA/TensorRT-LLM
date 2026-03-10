@@ -3031,16 +3031,18 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
     @pytest.mark.skip_less_mpi_world_size(8)
     @skip_pre_blackwell
     @pytest.mark.parametrize(
-        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend",
+        "tp_size,pp_size,ep_size,mtp_nextn,fp8kv,attention_dp,cuda_graph,overlap_scheduler,max_batch_size,moe_backend,q_split_threshold",
         [
-            (8, 1, 8, 0, True, True, True, True, 32, "CUTLASS"),
-            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM"),
+            (8, 1, 8, 0, True, True, True, True, 32, "CUTLASS", None),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", None),
+            (8, 1, 8, 3, False, False, True, True, 1, "TRTLLM", 0),
         ],
-        ids=["baseline_fp8kv", "latency"])
+        ids=["baseline_fp8kv", "latency", "latency_qsplit"])
     def test_nvfp4_multi_gpus_chunked_prefill(self, tp_size, pp_size, ep_size,
                                               mtp_nextn, fp8kv, attention_dp,
                                               cuda_graph, overlap_scheduler,
-                                              max_batch_size, moe_backend):
+                                              max_batch_size, moe_backend,
+                                              q_split_threshold):
         sm_version = get_sm_version()
         if moe_backend == "TRTLLM" and sm_version in (120, 121):
             pytest.skip(f"{moe_backend} backend does not support SM 120 or 121")
@@ -3061,6 +3063,12 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
         mtp_config = None
         if mtp_nextn > 0:
             mtp_config = MTPDecodingConfig(num_nextn_predict_layers=mtp_nextn)
+
+        dsa_config = None
+        if q_split_threshold is not None:
+            dsa_config = DeepSeekSparseAttentionConfig(
+                q_split_threshold=q_split_threshold)
+
         with LLM(f"{llm_models_root()}/DeepSeek-V3.2-Exp-FP4-v2",
                  max_batch_size=max_batch_size,
                  tensor_parallel_size=tp_size,
@@ -3070,6 +3078,7 @@ class TestDeepSeekV32(LlmapiAccuracyTestHarness):
                  **pytorch_config,
                  enable_attention_dp=attention_dp,
                  speculative_config=mtp_config,
+                 sparse_attention_config=dsa_config,
                  enable_chunked_prefill=True,
                  max_num_tokens=512) as llm:
 

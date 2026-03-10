@@ -11,6 +11,7 @@ from tensorrt_llm._torch.attention_backend.interface import (
     MLAParams, PositionalEmbeddingParams)
 from tensorrt_llm._torch.attention_backend.trtllm import (
     TrtllmAttention, TrtllmAttentionMetadata)
+from tensorrt_llm._torch.distributed.ops import allgather
 from tensorrt_llm._torch.modules.layer_norm import LayerNorm
 from tensorrt_llm._torch.modules.linear import Linear
 from tensorrt_llm._torch.modules.multi_stream_utils import \
@@ -1393,40 +1394,77 @@ class Indexer(nn.Module):
         if has_prefill and not metadata.skip_indexer_for_ctx_reqs:
             # Use chunked prefill to reduce memory footprint
             if metadata.indexer_prefill_chunks is not None:
+
+                # Default to 8192 if sparse_attention_config is not available (e.g., in unit tests)
+                q_split_threshold = metadata.sparse_attention_config.q_split_threshold if metadata.sparse_attention_config is not None else 8192
+                q_split_eligible = q_split_threshold >= 0 and metadata.mapping is not None and not metadata.mapping.enable_attention_dp and metadata.mapping.tp_size > 1
+
+                if q_split_eligible:
+                    tp_rank = metadata.mapping.tp_rank
+                    tp_size = metadata.mapping.tp_size
+
                 for chunk in metadata.indexer_prefill_chunks:
                     # Gather K from cache for this chunk (dual to _update_k_cache)
                     chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
                         metadata, chunk)
+
+                    chunk_num_token = chunk.token_end - chunk.token_start
+                    apply_q_split = q_split_eligible and chunk_num_token >= q_split_threshold
+                    if apply_q_split:
+                        chunk_q_start = chunk_num_token * tp_rank // tp_size
+                        chunk_q_end = chunk_num_token * (tp_rank + 1) // tp_size
+                    else:
+                        chunk_q_start = 0
+                        chunk_q_end = chunk_num_token
+
+                    global_q_start = chunk.token_start + chunk_q_start
+                    global_q_end = chunk.token_start + chunk_q_end
+
                     logits = fp8_mqa_logits(
-                        q_fp8[chunk.token_start:chunk.token_end, ...],
+                        q_fp8[global_q_start:global_q_end, ...],
                         (chunk_k_fp8, chunk_k_scale),
-                        weights[chunk.token_start:chunk.token_end, ...],
-                        chunk.cu_seqlen_ks,
-                        chunk.cu_seqlen_ke,
+                        weights[global_q_start:global_q_end, ...],
+                        chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
+                        chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
                     )
                     if use_custom_topk:
                         torch.ops.trtllm.indexer_topk_prefill(
-                            logits, chunk.cu_seqlen_ks, chunk.cu_seqlen_ke,
-                            topk_indices_buffer[
-                                chunk.token_start:chunk.token_end, :])
+                            logits,
+                            chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end],
+                            chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end],
+                            topk_indices_buffer[global_q_start:global_q_end, :])
                     else:
                         topk_indices = logits.topk(min(self.index_topk,
                                                        logits.shape[-1]),
                                                    dim=-1)[1]
-                        topk_indices -= chunk.cu_seqlen_ks[:, None]
+                        topk_indices -= chunk.cu_seqlen_ks[
+                            chunk_q_start:chunk_q_end][:, None]
 
                         mask_lo = topk_indices >= 0
-                        mask_hi = topk_indices - (chunk.cu_seqlen_ke -
-                                                  chunk.cu_seqlen_ks)[:,
-                                                                      None] < 0
+                        mask_hi = topk_indices - (
+                            chunk.cu_seqlen_ke[chunk_q_start:chunk_q_end] -
+                            chunk.cu_seqlen_ks[chunk_q_start:chunk_q_end]
+                        )[:, None] < 0
                         mask = mask_lo & mask_hi
 
                         # local indices per sequence
                         topk_indices = topk_indices.masked_fill(~mask, -1)
 
                         topk_indices_buffer[
-                            chunk.token_start:chunk.token_end, :topk_indices.
+                            global_q_start:global_q_end, :topk_indices.
                             shape[-1]] = topk_indices.to(dtype=torch.int32)
+
+                    if apply_q_split:
+                        q_sizes = [(r + 1) * chunk_num_token // tp_size -
+                                   r * chunk_num_token // tp_size
+                                   for r in range(tp_size)]
+                        topk_indices_buffer[
+                            chunk.token_start:chunk.token_end, :] = allgather(
+                                topk_indices_buffer[
+                                    global_q_start:global_q_end, :],
+                                metadata.mapping,
+                                dim=0,
+                                sizes=q_sizes)
             else:
                 # Fallback: single-pass indexer prefill (TODO: remove this once chunked prefill is fully tested)
                 cu_seqlen_ks = metadata.cu_seqlen_ks[:num_ctx_tokens]

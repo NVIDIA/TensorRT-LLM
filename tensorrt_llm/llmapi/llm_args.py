@@ -275,12 +275,12 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
-    enable_heuristic_topk: bool = Field(
-        default=False,
+    q_split_threshold: int = Field(
+        default=8192,
         description=
-        "Whether to reuse previous step's TopK indices as heuristic hints "
-        "for the decode indexer TopK kernel, reducing threshold search iterations."
-    )
+        "If number of packed tokens in prefill chunk exceeds this threshold, \
+            q tokens will be evenly distributed across ranks for indexer computation. \
+            If negative, q split will always be disabled.")
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch"
