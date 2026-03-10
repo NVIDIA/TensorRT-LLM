@@ -17,21 +17,29 @@
 #ifndef TRTLLM_CUDAVMMARENA_H
 #define TRTLLM_CUDAVMMARENA_H
 
-#include <cuda.h>
 #include <cstddef>
-#include <vector>
+#include <cuda.h>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
-namespace tensorrt_llm::batch_manager::vmm {
+namespace tensorrt_llm::batch_manager::vmm
+{
 
 /// Exception thrown for CUDA driver API errors.
-class CudaVmmError : public std::runtime_error {
+class CudaVmmError : public std::runtime_error
+{
 public:
-    explicit CudaVmmError(const std::string& msg, CUresult result = CUDA_SUCCESS)
-        : std::runtime_error(msg), result_(result) {}
+    explicit CudaVmmError(std::string const& msg, CUresult result = CUDA_SUCCESS)
+        : std::runtime_error(msg)
+        , result_(result)
+    {
+    }
 
-    CUresult result() const noexcept { return result_; }
+    CUresult result() const noexcept
+    {
+        return result_;
+    }
 
 private:
     CUresult result_;
@@ -53,7 +61,8 @@ private:
 ///   arena.shrink(32 << 20);             // Release upper 32 MiB back to OS
 ///
 /// Thread safety: not thread-safe; external synchronization is required.
-class CudaVmmArena {
+class CudaVmmArena
+{
 public:
     /// Reserve `max_size` bytes of virtual address space on `device`.
     /// `max_size` is rounded up to the device's allocation granularity.
@@ -63,10 +72,10 @@ public:
     ~CudaVmmArena();
 
     // Non-copyable, non-movable: owns CUDA virtual/physical resources.
-    CudaVmmArena(const CudaVmmArena&)            = delete;
-    CudaVmmArena& operator=(const CudaVmmArena&) = delete;
-    CudaVmmArena(CudaVmmArena&&)                 = delete;
-    CudaVmmArena& operator=(CudaVmmArena&&)      = delete;
+    CudaVmmArena(CudaVmmArena const&) = delete;
+    CudaVmmArena& operator=(CudaVmmArena const&) = delete;
+    CudaVmmArena(CudaVmmArena&&) = delete;
+    CudaVmmArena& operator=(CudaVmmArena&&) = delete;
 
     // -----------------------------------------------------------------------
     // Resize operations
@@ -92,19 +101,34 @@ public:
 
     /// Base device pointer of the reserved VA range.
     /// Only bytes in [ptr(), ptr() + committed_size()) are valid to access.
-    CUdeviceptr ptr() const noexcept { return base_ptr_; }
+    CUdeviceptr ptr() const noexcept
+    {
+        return base_ptr_;
+    }
 
     /// Number of bytes currently mapped to physical memory.
-    size_t committed_size() const noexcept { return committed_size_; }
+    size_t committed_size() const noexcept
+    {
+        return committed_size_;
+    }
 
     /// Total reserved virtual address range (>= max_size passed to constructor).
-    size_t max_size() const noexcept { return max_size_; }
+    size_t max_size() const noexcept
+    {
+        return max_size_;
+    }
 
     /// Physical allocation granularity in bytes for this device.
-    size_t granularity() const noexcept { return granularity_; }
+    size_t granularity() const noexcept
+    {
+        return granularity_;
+    }
 
     /// CUDA device index this arena was created for.
-    int device() const noexcept { return device_; }
+    int device() const noexcept
+    {
+        return device_;
+    }
 
 private:
     // Allocate one granularity-sized physical handle, map it at `offset` into
@@ -115,29 +139,31 @@ private:
     void unmap_chunk(size_t chunk_idx);
 
     // Throw CudaVmmError if `res` is not CUDA_SUCCESS.
-    static void check(CUresult res, const char* where);
+    static void check(CUresult res, char const* where);
 
     // Round `n` up to the next multiple of `align` (which must be a power of 2).
-    static size_t align_up(size_t n, size_t align) noexcept {
+    static size_t align_up(size_t n, size_t align) noexcept
+    {
         return (n + align - 1) & ~(align - 1);
     }
 
     // Round `n` down to the previous multiple of `align`.
-    static size_t align_down(size_t n, size_t align) noexcept {
+    static size_t align_down(size_t n, size_t align) noexcept
+    {
         return n & ~(align - 1);
     }
 
-    int         device_;
-    size_t      granularity_;   ///< Minimum physical page granularity, bytes.
-    size_t      max_size_;      ///< Reserved VA range size (aligned up).
-    size_t      committed_size_;///< Currently mapped byte count.
-    CUdeviceptr base_ptr_;      ///< Start of the reserved VA range.
+    int device_;
+    size_t granularity_;    ///< Minimum physical page granularity, bytes.
+    size_t max_size_;       ///< Reserved VA range size (aligned up).
+    size_t committed_size_; ///< Currently mapped byte count.
+    CUdeviceptr base_ptr_;  ///< Start of the reserved VA range.
 
     /// One handle per committed granularity chunk, in order.
     std::vector<CUmemGenericAllocationHandle> handles_;
 
     CUmemAllocationProp alloc_prop_; ///< Shared allocation properties.
-    CUmemAccessDesc     access_desc_;///< Shared access descriptor.
+    CUmemAccessDesc access_desc_;    ///< Shared access descriptor.
 };
 
 } // namespace tensorrt_llm::batch_manager::vmm

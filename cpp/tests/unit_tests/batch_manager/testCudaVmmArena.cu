@@ -30,8 +30,8 @@
 #include <gtest/gtest.h>
 
 using namespace tensorrt_llm::batch_manager::vmm;
-#include <cuda_runtime.h>   // cudaMemcpy, cudaDeviceSynchronize
 #include <cstdint>
+#include <cuda_runtime.h> // cudaMemcpy, cudaDeviceSynchronize
 #include <numeric>
 #include <vector>
 
@@ -41,24 +41,32 @@ using namespace tensorrt_llm::batch_manager::vmm;
 // ---------------------------------------------------------------------------
 
 /// Per-process CUDA driver + context setup.
-class CudaEnv : public ::testing::Environment {
+class CudaEnv : public ::testing::Environment
+{
 public:
-    void SetUp() override {
+    void SetUp() override
+    {
         ASSERT_EQ(cuInit(0), CUDA_SUCCESS) << "cuInit failed";
         ASSERT_EQ(cuDeviceGet(&dev_, 0), CUDA_SUCCESS);
         ASSERT_EQ(cuCtxCreate(&ctx_, nullptr, 0, dev_), CUDA_SUCCESS);
     }
-    void TearDown() override {
-        if (ctx_) cuCtxDestroy(ctx_);
+
+    void TearDown() override
+    {
+        if (ctx_)
+            cuCtxDestroy(ctx_);
     }
+
     static CUdevice dev_;
     static CUcontext ctx_;
 };
-CUdevice  CudaEnv::dev_{};
+
+CUdevice CudaEnv::dev_{};
 CUcontext CudaEnv::ctx_{};
 
 /// Base fixture used by all test cases.
-class ArenaTest : public ::testing::Test {
+class ArenaTest : public ::testing::Test
+{
 protected:
     // Default arena parameters.  Each test that needs different values
     // creates its own arena inline.
@@ -66,14 +74,14 @@ protected:
 
     // Skip the test early if the device doesn't support VMM.
     // GTEST_SKIP() requires a void context — SetUp() qualifies.
-    void SetUp() override {
+    void SetUp() override
+    {
         CUmemAllocationProp prop{};
-        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id   = 0;
+        prop.location.id = 0;
         size_t g = 0;
-        CUresult res = cuMemGetAllocationGranularity(
-            &g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
+        CUresult res = cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
         if (res == CUDA_ERROR_NOT_SUPPORTED || res == CUDA_ERROR_NO_DEVICE)
             GTEST_SKIP() << "VMM not supported on this system (CUresult=" << res << ")";
         if (res != CUDA_SUCCESS || g == 0)
@@ -81,18 +89,18 @@ protected:
     }
 
     // Helper: build a fresh arena. Throws CudaVmmError on hard failure.
-    static CudaVmmArena* make_arena(size_t max_size = kMaxSize,
-                                     int device      = 0)
+    static CudaVmmArena* make_arena(size_t max_size = kMaxSize, int device = 0)
     {
         return new CudaVmmArena(max_size, device);
     }
 
     // Granularity helper (we need it before the arena exists in some tests).
-    static size_t query_granularity(int device = 0) {
+    static size_t query_granularity(int device = 0)
+    {
         CUmemAllocationProp prop{};
-        prop.type          = CU_MEM_ALLOCATION_TYPE_PINNED;
+        prop.type = CU_MEM_ALLOCATION_TYPE_PINNED;
         prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
-        prop.location.id   = device;
+        prop.location.id = device;
         size_t g = 0;
         cuMemGetAllocationGranularity(&g, &prop, CU_MEM_ALLOC_GRANULARITY_MINIMUM);
         return g;
@@ -103,19 +111,22 @@ protected:
 // Construction
 // ===========================================================================
 
-TEST_F(ArenaTest, ConstructionSetsInitialState) {
+TEST_F(ArenaTest, ConstructionSetsInitialState)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena(kMaxSize));
 
     EXPECT_GT(a->granularity(), 0u);
-    EXPECT_GE(a->max_size(), kMaxSize);          // rounded up >= requested
-    EXPECT_EQ(a->committed_size(), 0u);          // nothing committed yet
-    EXPECT_NE(a->ptr(), 0u);                     // VA range was reserved
+    EXPECT_GE(a->max_size(), kMaxSize); // rounded up >= requested
+    EXPECT_EQ(a->committed_size(), 0u); // nothing committed yet
+    EXPECT_NE(a->ptr(), 0u);            // VA range was reserved
     EXPECT_EQ(a->device(), 0);
 }
 
-TEST_F(ArenaTest, MaxSizeAlignedUpToGranularity) {
+TEST_F(ArenaTest, MaxSizeAlignedUpToGranularity)
+{
     const size_t g = query_granularity();
-    if (g == 0) GTEST_SKIP() << "Cannot query granularity";
+    if (g == 0)
+        GTEST_SKIP() << "Cannot query granularity";
 
     // Request a size that is deliberately not aligned.
     const size_t unaligned = g + 1;
@@ -125,10 +136,12 @@ TEST_F(ArenaTest, MaxSizeAlignedUpToGranularity) {
     EXPECT_GE(a->max_size(), unaligned);
 }
 
-TEST_F(ArenaTest, SmallestPossibleReservation) {
+TEST_F(ArenaTest, SmallestPossibleReservation)
+{
     // A reservation of exactly one granule should succeed.
     const size_t g = query_granularity();
-    if (g == 0) GTEST_SKIP();
+    if (g == 0)
+        GTEST_SKIP();
 
     std::unique_ptr<CudaVmmArena> a(make_arena(g));
     EXPECT_EQ(a->max_size(), g);
@@ -139,7 +152,8 @@ TEST_F(ArenaTest, SmallestPossibleReservation) {
 // grow()
 // ===========================================================================
 
-TEST_F(ArenaTest, GrowCommitsSingleChunk) {
+TEST_F(ArenaTest, GrowCommitsSingleChunk)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -148,7 +162,8 @@ TEST_F(ArenaTest, GrowCommitsSingleChunk) {
     EXPECT_EQ(a->committed_size(), g);
 }
 
-TEST_F(ArenaTest, GrowCommitsMultipleChunks) {
+TEST_F(ArenaTest, GrowCommitsMultipleChunks)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -157,7 +172,8 @@ TEST_F(ArenaTest, GrowCommitsMultipleChunks) {
     EXPECT_EQ(a->committed_size(), 4 * g);
 }
 
-TEST_F(ArenaTest, GrowRoundsUpToGranularity) {
+TEST_F(ArenaTest, GrowRoundsUpToGranularity)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -168,7 +184,8 @@ TEST_F(ArenaTest, GrowRoundsUpToGranularity) {
     EXPECT_EQ(a->committed_size() % g, 0u);
 }
 
-TEST_F(ArenaTest, GrowIncrementallyAccumulatesCommitted) {
+TEST_F(ArenaTest, GrowIncrementallyAccumulatesCommitted)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -182,7 +199,8 @@ TEST_F(ArenaTest, GrowIncrementallyAccumulatesCommitted) {
     EXPECT_EQ(a->committed_size(), 4 * g);
 }
 
-TEST_F(ArenaTest, GrowThrowsWhenNotLargerThanCommitted) {
+TEST_F(ArenaTest, GrowThrowsWhenNotLargerThanCommitted)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(2 * g);
@@ -193,9 +211,11 @@ TEST_F(ArenaTest, GrowThrowsWhenNotLargerThanCommitted) {
     EXPECT_THROW(a->grow(g), CudaVmmError);
 }
 
-TEST_F(ArenaTest, GrowThrowsWhenExceedsMaxSize) {
+TEST_F(ArenaTest, GrowThrowsWhenExceedsMaxSize)
+{
     const size_t g = query_granularity();
-    if (g == 0) GTEST_SKIP();
+    if (g == 0)
+        GTEST_SKIP();
 
     // Reserve exactly one granule.
     std::unique_ptr<CudaVmmArena> a(make_arena(g));
@@ -208,7 +228,8 @@ TEST_F(ArenaTest, GrowThrowsWhenExceedsMaxSize) {
 // shrink()
 // ===========================================================================
 
-TEST_F(ArenaTest, ShrinkReleasesChunks) {
+TEST_F(ArenaTest, ShrinkReleasesChunks)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(4 * g);
@@ -218,7 +239,8 @@ TEST_F(ArenaTest, ShrinkReleasesChunks) {
     EXPECT_EQ(a->committed_size(), 2 * g);
 }
 
-TEST_F(ArenaTest, ShrinkToZeroReleasesAll) {
+TEST_F(ArenaTest, ShrinkToZeroReleasesAll)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(4 * g);
@@ -228,7 +250,8 @@ TEST_F(ArenaTest, ShrinkToZeroReleasesAll) {
     EXPECT_EQ(a->committed_size(), 0u);
 }
 
-TEST_F(ArenaTest, ShrinkRoundsDownToGranularity) {
+TEST_F(ArenaTest, ShrinkRoundsDownToGranularity)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(4 * g);
@@ -239,7 +262,8 @@ TEST_F(ArenaTest, ShrinkRoundsDownToGranularity) {
     EXPECT_EQ(a->committed_size(), 2 * g);
 }
 
-TEST_F(ArenaTest, ShrinkThrowsWhenNotSmallerThanCommitted) {
+TEST_F(ArenaTest, ShrinkThrowsWhenNotSmallerThanCommitted)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(2 * g);
@@ -250,7 +274,8 @@ TEST_F(ArenaTest, ShrinkThrowsWhenNotSmallerThanCommitted) {
     EXPECT_THROW(a->shrink(4 * g), CudaVmmError);
 }
 
-TEST_F(ArenaTest, ShrinkThrowsOnUninitializedArena) {
+TEST_F(ArenaTest, ShrinkThrowsOnUninitializedArena)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     // committed_size == 0; any shrink target is >= committed_size.
     EXPECT_THROW(a->shrink(0), CudaVmmError);
@@ -260,7 +285,8 @@ TEST_F(ArenaTest, ShrinkThrowsOnUninitializedArena) {
 // resize()
 // ===========================================================================
 
-TEST_F(ArenaTest, ResizeGrowsWhenLarger) {
+TEST_F(ArenaTest, ResizeGrowsWhenLarger)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -269,7 +295,8 @@ TEST_F(ArenaTest, ResizeGrowsWhenLarger) {
     EXPECT_EQ(a->committed_size(), 3 * g);
 }
 
-TEST_F(ArenaTest, ResizeShrinksWhenSmaller) {
+TEST_F(ArenaTest, ResizeShrinksWhenSmaller)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(4 * g);
@@ -279,7 +306,8 @@ TEST_F(ArenaTest, ResizeShrinksWhenSmaller) {
     EXPECT_EQ(a->committed_size(), 2 * g);
 }
 
-TEST_F(ArenaTest, ResizeIsNoOpWhenAlreadyAtTarget) {
+TEST_F(ArenaTest, ResizeIsNoOpWhenAlreadyAtTarget)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(2 * g);
@@ -293,7 +321,8 @@ TEST_F(ArenaTest, ResizeIsNoOpWhenAlreadyAtTarget) {
 // grow → shrink → grow cycle
 // ===========================================================================
 
-TEST_F(ArenaTest, GrowShrinkGrowCycle) {
+TEST_F(ArenaTest, GrowShrinkGrowCycle)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -314,7 +343,8 @@ TEST_F(ArenaTest, GrowShrinkGrowCycle) {
 // ptr() stability
 // ===========================================================================
 
-TEST_F(ArenaTest, BasePointerDoesNotChangeAfterGrow) {
+TEST_F(ArenaTest, BasePointerDoesNotChangeAfterGrow)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const CUdeviceptr base = a->ptr();
 
@@ -325,7 +355,8 @@ TEST_F(ArenaTest, BasePointerDoesNotChangeAfterGrow) {
     EXPECT_EQ(a->ptr(), base);
 }
 
-TEST_F(ArenaTest, BasePointerDoesNotChangeAfterShrink) {
+TEST_F(ArenaTest, BasePointerDoesNotChangeAfterShrink)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(4 * g);
@@ -340,28 +371,32 @@ TEST_F(ArenaTest, BasePointerDoesNotChangeAfterShrink) {
 // ===========================================================================
 
 /// Device kernel: write sequential uint32_t values starting at `offset_elems`.
-__global__ void write_seq_kernel(uint32_t* data, uint32_t n, uint32_t offset_elems) {
+__global__ void write_seq_kernel(uint32_t* data, uint32_t n, uint32_t offset_elems)
+{
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) data[i] = offset_elems + i;
+    if (i < n)
+        data[i] = offset_elems + i;
 }
 
 /// Device kernel: verify sequential uint32_t values, store 1 on mismatch.
-__global__ void verify_seq_kernel(const uint32_t* data, uint32_t n,
-                                   uint32_t offset_elems, int* mismatch_flag) {
+__global__ void verify_seq_kernel(uint32_t const* data, uint32_t n, uint32_t offset_elems, int* mismatch_flag)
+{
     uint32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n && data[i] != offset_elems + i)
         atomicExch(mismatch_flag, 1);
 }
 
-static void launch_write(CUdeviceptr base, size_t bytes, uint32_t offset_elems = 0) {
+static void launch_write(CUdeviceptr base, size_t bytes, uint32_t offset_elems = 0)
+{
     auto* p = reinterpret_cast<uint32_t*>(base);
     uint32_t n = static_cast<uint32_t>(bytes / sizeof(uint32_t));
     write_seq_kernel<<<(n + 255) / 256, 256>>>(p, n, offset_elems);
     ASSERT_EQ(cudaDeviceSynchronize(), cudaSuccess);
 }
 
-static bool device_verify(CUdeviceptr base, size_t bytes, uint32_t offset_elems = 0) {
-    auto* p = reinterpret_cast<const uint32_t*>(base);
+static bool device_verify(CUdeviceptr base, size_t bytes, uint32_t offset_elems = 0)
+{
+    auto* p = reinterpret_cast<uint32_t const*>(base);
     uint32_t n = static_cast<uint32_t>(bytes / sizeof(uint32_t));
 
     int* d_flag{};
@@ -377,7 +412,8 @@ static bool device_verify(CUdeviceptr base, size_t bytes, uint32_t offset_elems 
     return flag == 0;
 }
 
-TEST_F(ArenaTest, CommittedMemoryIsWriteable) {
+TEST_F(ArenaTest, CommittedMemoryIsWriteable)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(g);
@@ -386,7 +422,8 @@ TEST_F(ArenaTest, CommittedMemoryIsWriteable) {
     EXPECT_TRUE(device_verify(a->ptr(), g));
 }
 
-TEST_F(ArenaTest, DataInRetainedChunksSurvivesShrink) {
+TEST_F(ArenaTest, DataInRetainedChunksSurvivesShrink)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
     a->grow(4 * g);
@@ -397,11 +434,11 @@ TEST_F(ArenaTest, DataInRetainedChunksSurvivesShrink) {
     // Shrink to 2 chunks — the lower half must be intact.
     a->shrink(2 * g);
 
-    EXPECT_TRUE(device_verify(a->ptr(), 2 * g))
-        << "Data in retained chunks should survive shrink()";
+    EXPECT_TRUE(device_verify(a->ptr(), 2 * g)) << "Data in retained chunks should survive shrink()";
 }
 
-TEST_F(ArenaTest, NewChunksAfterRegrowAreWriteable) {
+TEST_F(ArenaTest, NewChunksAfterRegrowAreWriteable)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -418,7 +455,8 @@ TEST_F(ArenaTest, NewChunksAfterRegrowAreWriteable) {
     EXPECT_TRUE(device_verify(a->ptr() + new_chunk_offset, g, off_elems));
 }
 
-TEST_F(ArenaTest, MultipleSequentialGrowsAllAccessible) {
+TEST_F(ArenaTest, MultipleSequentialGrowsAllAccessible)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena());
     const size_t g = a->granularity();
 
@@ -436,7 +474,8 @@ TEST_F(ArenaTest, MultipleSequentialGrowsAllAccessible) {
 // Destructor safety
 // ===========================================================================
 
-TEST_F(ArenaTest, DestructorWithCommittedMemoryDoesNotLeak) {
+TEST_F(ArenaTest, DestructorWithCommittedMemoryDoesNotLeak)
+{
     // Simply constructing and immediately destroying a grown arena should not
     // crash, assert, or leak CUDA resources.
     {
@@ -448,7 +487,8 @@ TEST_F(ArenaTest, DestructorWithCommittedMemoryDoesNotLeak) {
     SUCCEED(); // If we reach here, no crash occurred.
 }
 
-TEST_F(ArenaTest, DestructorWithZeroCommittedMemoryDoesNotCrash) {
+TEST_F(ArenaTest, DestructorWithZeroCommittedMemoryDoesNotCrash)
+{
     {
         std::unique_ptr<CudaVmmArena> a(make_arena());
         // Never committed anything.
@@ -460,7 +500,8 @@ TEST_F(ArenaTest, DestructorWithZeroCommittedMemoryDoesNotCrash) {
 // Multiple independent arenas
 // ===========================================================================
 
-TEST_F(ArenaTest, TwoArenasAreIndependent) {
+TEST_F(ArenaTest, TwoArenasAreIndependent)
+{
     std::unique_ptr<CudaVmmArena> a(make_arena(64ULL << 20));
     std::unique_ptr<CudaVmmArena> b(make_arena(64ULL << 20));
 
@@ -473,10 +514,8 @@ TEST_F(ArenaTest, TwoArenasAreIndependent) {
 
     // Writes to one must not alias the other.
     uint32_t n = static_cast<uint32_t>(g / sizeof(uint32_t));
-    write_seq_kernel<<<(n + 255) / 256, 256>>>(
-        reinterpret_cast<uint32_t*>(a->ptr()), n, /*offset=*/0);
-    write_seq_kernel<<<(n + 255) / 256, 256>>>(
-        reinterpret_cast<uint32_t*>(b->ptr()), n, /*offset=*/n);
+    write_seq_kernel<<<(n + 255) / 256, 256>>>(reinterpret_cast<uint32_t*>(a->ptr()), n, /*offset=*/0);
+    write_seq_kernel<<<(n + 255) / 256, 256>>>(reinterpret_cast<uint32_t*>(b->ptr()), n, /*offset=*/n);
     cudaDeviceSynchronize();
 
     EXPECT_TRUE(device_verify(a->ptr(), g, /*offset_elems=*/0));
@@ -487,7 +526,8 @@ TEST_F(ArenaTest, TwoArenasAreIndependent) {
 // main
 // ===========================================================================
 
-int main(int argc, char** argv) {
+int main(int argc, char** argv)
+{
     ::testing::InitGoogleTest(&argc, argv);
     ::testing::AddGlobalTestEnvironment(new CudaEnv());
     return RUN_ALL_TESTS();
