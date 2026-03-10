@@ -808,3 +808,108 @@ def trtllm_quant_finegrained_fp8_moe_fused_fake(
 ) -> torch.Tensor:
     _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
     return torch.empty_like(x)
+
+
+@torch.library.custom_op("auto_deploy::trtllm_nvfp4_trtllm_gen_moe_fused", mutates_args=())
+def trtllm_nvfp4_trtllm_gen_moe_fused(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc1_scale_c: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",  # https://github.com/NVIDIA/TensorRT-LLM/issues/12008 Add mapping config support
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    _validate_mlp_style_and_act_fn(is_gated_mlp, act_fn)
+
+    x_shape = x.shape
+    x2d = x.view(-1, x_shape[-1])
+    # The fusion transform can pad K for kernel alignment. Match _torch TRTLLM-Gen path:
+    # pad activations to gemm1 K, quantize, then slice output back to original hidden size.
+    expected_hidden = int(fc1_expert_weights_fp4.shape[-1] * 2)
+    pad_size = expected_hidden - int(x2d.shape[-1])
+    if pad_size > 0:
+        x2d = torch.nn.functional.pad(x2d, (0, pad_size))
+    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+        x2d, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
+    )
+
+    if act_fn in (ActivationType.Silu, ActivationType.Swiglu):
+        act_type = 0
+    elif act_fn == ActivationType.Relu2:
+        act_type = 1
+    else:
+        raise ValueError(f"Unsupported activation '{ActivationType(act_fn).name}' for TRTLLM-Gen.")
+
+    top_k = int(routing_weights.shape[-1])
+    num_experts = int(fc1_expert_weights_fp4.shape[0])
+    factor = 1 if act_type == 1 else 2
+    intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
+    routing_method_type = int(RoutingMethodType.DeepSeekV3)
+
+    outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+        None,
+        None,
+        x_q_fp4,
+        x_sf.view(torch.float8_e4m3fn),
+        fc1_expert_weights_fp4,
+        fc1_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        fc2_expert_weights_fp4,
+        fc2_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        fc1_scale_c,
+        fc1_alpha,
+        fc2_alpha,
+        num_experts,
+        top_k,
+        1,
+        1,
+        intermediate_size,
+        0,
+        num_experts,
+        1.0,
+        routing_method_type,
+        do_finalize=True,
+        act_type=act_type,
+        topk_weights=routing_weights.to(torch.bfloat16),
+        topk_ids=selected_experts.to(torch.int32),
+    )
+    final_hidden_states = outputs[0]
+    if final_hidden_states.shape[1] > x_shape[-1]:
+        final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
+    return final_hidden_states.view(x_shape)
+
+
+@trtllm_nvfp4_trtllm_gen_moe_fused.register_fake
+def trtllm_nvfp4_trtllm_gen_moe_fused_fake(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc1_scale_c: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    is_gated_mlp: bool = True,
+    act_fn: int = int(ActivationType.Silu),
+    mapping_config: str = "",
+    max_num_tokens: int = 0,
+    apply_routing_on_input: bool = False,
+) -> torch.Tensor:
+    return torch.empty_like(x)

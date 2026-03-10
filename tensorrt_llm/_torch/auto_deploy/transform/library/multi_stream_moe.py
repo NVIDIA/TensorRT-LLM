@@ -211,6 +211,7 @@ class MultiStreamMOE(BaseTransform):
             torch.ops.auto_deploy.triton_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_fp8_moe_fused,
             torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused,
+            torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused,
         ]
 
         # Ensure that aux stream and events for the current device are added to the CudaStreamManager.

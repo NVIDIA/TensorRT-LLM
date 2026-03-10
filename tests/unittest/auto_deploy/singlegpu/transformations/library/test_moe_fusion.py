@@ -1,3 +1,6 @@
+import json
+from pathlib import Path
+
 import pytest
 import torch
 import torch.fx as fx
@@ -6,7 +9,7 @@ import torch.nn.functional as F
 from _graph_test_helpers import run_test_transformed_gm
 from _model_test_utils import MoEOpModel
 from _torch_test_utils import fp4_compatible, fp8_compatible, trtllm_ops_available
-from utils.util import skip_pre_hopper
+from utils.util import skip_pre_blackwell, skip_pre_hopper
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
@@ -466,29 +469,40 @@ class MoEOpModelNVFP4(nn.Module):
         for i in range(num_experts):
             w1_fp32 = torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.01
             w2_fp32 = torch.randn(hidden_size, intermediate_size, device="cuda", dtype=dtype) * 0.01
+            w3_fp32 = (
+                torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.01
+                if is_gated_mlp
+                else None
+            )
 
-            # Compute global scales
+            # Compute global scales.
+            # For gated MLP, w1 (gate) and w3 (up) share a single per-tensor weight
+            # scale, matching real checkpoint behaviour.  The _torch module path
+            # asserts w1_weight_scale_2 == w3_weight_scale_2 because the TRTLLM-Gen
+            # kernel derives the FC2 intermediate requantization scale from the ratio
+            # scaleC / scaleGate, which is correct only when both branches use the
+            # same per-tensor scale.
             w1_amax = torch.abs(w1_fp32).max().to(torch.float32)
             w2_amax = torch.abs(w2_fp32).max().to(torch.float32)
-
-            scale_1 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
+            if is_gated_mlp:
+                w3_amax = torch.abs(w3_fp32).max().to(torch.float32)
+                combined_amax = torch.max(w1_amax, w3_amax)
+                scale_1 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / combined_amax
+            else:
+                scale_1 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w1_amax
             scale_2 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w2_amax
 
-            # Quantize weights (non-swizzled layout)
             w1_fp4, w1_bs = torch.ops.trtllm.fp4_quantize(w1_fp32, scale_1, NVFP4_BLOCK_SIZE, False)
             w2_fp4, w2_bs = torch.ops.trtllm.fp4_quantize(w2_fp32, scale_2, NVFP4_BLOCK_SIZE, False)
 
-            # fp4_quantize pads block scales but not weights - infer padded dims from block scale size
             _, w1_k_packed = w1_fp4.shape
             _, w2_k_packed = w2_fp4.shape
-            w1_k_padded = w1_k_packed * NVFP4_PACK_FACTOR  # Convert from uint8 to FP4 element count
+            w1_k_padded = w1_k_packed * NVFP4_PACK_FACTOR
             w2_k_padded = w2_k_packed * NVFP4_PACK_FACTOR
 
-            # Calculate padded N dimension from block scale tensor size
             w1_n_padded = w1_bs.numel() // (w1_k_padded // NVFP4_BLOCK_SIZE)
             w2_n_padded = w2_bs.numel() // (w2_k_padded // NVFP4_BLOCK_SIZE)
 
-            # Reshape block scales to 3D format [N_padded, K/block]
             w1_bs_3d = w1_bs.view(w1_n_padded, w1_k_padded // NVFP4_BLOCK_SIZE)
             w2_bs_3d = w2_bs.view(w2_n_padded, w2_k_padded // NVFP4_BLOCK_SIZE)
 
@@ -503,16 +517,10 @@ class MoEOpModelNVFP4(nn.Module):
             self.register_buffer(f"w2_alpha_{i}", 1.0 / (inp_scale * scale_2))
 
             if is_gated_mlp:
-                w3_fp32 = (
-                    torch.randn(intermediate_size, hidden_size, device="cuda", dtype=dtype) * 0.01
-                )
-                w3_amax = torch.abs(w3_fp32).max().to(torch.float32)
-                scale_3 = FLOAT8_E4M3_MAX * FLOAT4_E2M1_MAX / w3_amax
                 w3_fp4, w3_bs = torch.ops.trtllm.fp4_quantize(
-                    w3_fp32, scale_3, NVFP4_BLOCK_SIZE, False
+                    w3_fp32, scale_1, NVFP4_BLOCK_SIZE, False
                 )
 
-                # Infer padded dimensions for w3
                 _, w3_k_packed = w3_fp4.shape
                 w3_k_padded = w3_k_packed * NVFP4_PACK_FACTOR
                 w3_n_padded = w3_bs.numel() // (w3_k_padded // NVFP4_BLOCK_SIZE)
@@ -521,7 +529,7 @@ class MoEOpModelNVFP4(nn.Module):
                 self.w3_weight.append(nn.Parameter(w3_fp4, requires_grad=False))
                 self.register_buffer(f"w3_input_scale_{i}", inp_scale)
                 self.register_buffer(f"w3_weight_scale_{i}", w3_bs_3d.contiguous())
-                self.register_buffer(f"w3_alpha_{i}", 1.0 / (inp_scale * scale_3))
+                self.register_buffer(f"w3_alpha_{i}", 1.0 / (inp_scale * scale_1))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         router_logits = self.gate(x)
@@ -909,7 +917,7 @@ class NVFP4MoEModuleForInputScaleTest(nn.Module):
 def test_nvfp4_moe_different_input_scales(
     allow_different_input_scales, scales_identical, is_gated_mlp
 ):
-    """Test NVFP4 MoE behavior with different/identical input scales via _stack_nvfp4_moe_weights.
+    """Test NVFP4 MoE behavior with different/identical input scales via _stack_nvfp4_cutlass_moe_weights.
 
     Tests the allow_different_input_scales config option for both gated and non-gated MLP:
     - When scales_identical=True: should always work
@@ -921,7 +929,9 @@ def test_nvfp4_moe_different_input_scales(
 
     This test uses mock tensors to test the transform logic without running the actual NVFP4 kernel.
     """
-    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_nvfp4_moe_weights
+    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import (
+        _stack_nvfp4_cutlass_moe_weights,
+    )
 
     torch.manual_seed(0)
 
@@ -1035,10 +1045,12 @@ def test_nvfp4_moe_different_input_scales(
     if not scales_identical and not allow_different_input_scales:
         # Should fail with assertion error
         with pytest.raises(AssertionError, match="FC1 input scales differ"):
-            _stack_nvfp4_moe_weights(gm, allow_different_input_scales=allow_different_input_scales)
+            _stack_nvfp4_cutlass_moe_weights(
+                gm, allow_different_input_scales=allow_different_input_scales
+            )
     else:
         # Should succeed
-        num_transformed = _stack_nvfp4_moe_weights(
+        num_transformed = _stack_nvfp4_cutlass_moe_weights(
             gm, allow_different_input_scales=allow_different_input_scales
         )
         gm.recompile()
@@ -1477,3 +1489,312 @@ def test_trtllm_quant_finegrained_fp8_moe_fused_correctness():
             rtol=0.05,
             msg="Fused FineGrained FP8 MoE output differs from unfused reference",
         )
+
+
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires FP4 + TRTLLM support",
+)
+@skip_pre_blackwell
+def test_nvfp4_trtllm_gen_non_gated_empty_w3_lists():
+    """Regression test: non-gated TRTLLM-Gen fusion handles empty w3 scale lists.
+
+    Non-gated NVFP4 MoE passes empty w3 tensors/lists through torch_quant_nvfp4_moe.
+    The TRTLLM-Gen fusion path must not crash while normalizing block-scale layout.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    model = MoEOpModelNVFP4(
+        hidden_size=256,
+        intermediate_size=256,
+        num_experts=4,  # Keep routing/kernel-friendly expert count
+        top_k=2,
+        dtype=dtype,
+        is_gated_mlp=False,
+    ).to(device=device)
+
+    x = torch.randn(2, 256, device=device, dtype=dtype) * 0.1
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Regression check: this previously crashed with
+    # "stack expects a non-empty TensorList" in _reverse_interleave_scale_stack.
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm)
+
+    has_trtllm_gen = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused) for n in gm.graph.nodes
+    )
+    if not has_trtllm_gen:
+        pytest.skip("TRTLLM-Gen fusion did not apply.")
+
+    with torch.inference_mode():
+        output = gm(x)
+
+    assert torch.isfinite(output).all(), "TRTLLM-Gen non-gated output contains non-finite values."
+
+
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires FP4 + TRTLLM support",
+)
+@skip_pre_blackwell
+@pytest.mark.parametrize(
+    "hidden_size, intermediate_size", [(256, 256), (512, 256)], ids=["256x256", "512x256"]
+)
+def test_nvfp4_moe_ad_trtllm_gen_vs_cutlass_vs_reference(hidden_size, intermediate_size):
+    """Compare NVFP4 MoE: baseline (torch_quant_nvfp4_moe), Cutlass fused, and AD TRTLLM-Gen fused vs reference.
+
+    Runs the same MoE with:
+    - Baseline: torch_quant_nvfp4_moe (per-expert / fused_moe path)
+    - Cutlass: trtllm_quant_nvfp4_moe_fused (fuse_nvfp4_moe)
+    - AD TRTLLM-Gen: trtllm_nvfp4_trtllm_gen_moe_fused (fuse_nvfp4_moe with backend="trtllm_gen", SM100+ only)
+
+    All outputs are compared to the baseline as reference. On SM100+, TRTLLM-Gen path is also
+    checked to stay within tolerance of the baseline (and thus of the Cutlass path).
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    model = MoEOpModelNVFP4(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=4,  # TRTLLM-Gen routing kernel requires num_experts % 4 == 0
+        top_k=2,
+        dtype=dtype,
+        is_gated_mlp=True,
+    ).to(device=device)
+    # Use larger input scale (0.1) so outputs are in a meaningful range; model.get_input uses 0.01
+    # and yields outputs ~1e-7, making fixed atol too loose.
+    x = torch.randn(2, hidden_size, device=device, dtype=dtype) * 0.1
+
+    gm = torch_export_to_gm(model, args=(x,), clone=True)
+
+    # Reference: run baseline graph (torch_quant_nvfp4_moe)
+    with torch.inference_mode():
+        output_baseline = gm(x)
+
+    # Cutlass path: fuse_nvfp4_moe -> trtllm_quant_nvfp4_moe_fused
+    gm_cutlass = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_cutlass = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion"}},
+    )(None, gm_cutlass)
+    with torch.inference_mode():
+        output_cutlass = gm_cutlass(x)
+
+    # AD TRTLLM-Gen path: fuse_nvfp4_moe(backend="trtllm_gen")
+    # -> trtllm_nvfp4_trtllm_gen_moe_fused (SM100+)
+    # The fusion transform now handles the unified AD load-hook format directly:
+    # incoming NVFP4 block scales are already interleaved and fusion reverses once
+    # before applying TRTLLM-Gen shuffle+interleave.
+    gm_trtllm_gen = torch_export_to_gm(model, args=(x,), clone=True)
+    gm_trtllm_gen = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm_trtllm_gen)
+    has_trtllm_gen = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused)
+        for n in gm_trtllm_gen.graph.nodes
+    )
+    if has_trtllm_gen:
+        with torch.inference_mode():
+            output_trtllm_gen = gm_trtllm_gen(x)
+
+    # All paths should match baseline within NVFP4 tolerance (same weights, same math).
+    # Use scale-dependent atol so the test is meaningful when outputs are small.
+    # Cutlass fused kernel can differ from baseline by ~1e-7 due to reduction/quantization;
+    # use a small floor so we still catch large TRTLLM-Gen vs baseline gaps.
+    rtol = 0.001
+    baseline_scale = output_baseline.detach().float().abs().max().item()
+    atol = max(1e-6, rtol * baseline_scale)
+    # TRTLLM-Gen fused kernel can differ slightly more than Cutlass (scale/gate path); keep same order as baseline.
+    atol_trtllm_gen = max(atol, 5e-6)
+
+    torch.testing.assert_close(
+        output_cutlass,
+        output_baseline,
+        rtol=rtol,
+        atol=atol,
+        msg="Cutlass fused MoE should match baseline within NVFP4 tolerance.",
+    )
+    if has_trtllm_gen:
+        try:
+            torch.testing.assert_close(
+                output_trtllm_gen,
+                output_baseline,
+                rtol=rtol,
+                atol=atol_trtllm_gen,
+                msg="AD TRTLLM-Gen MoE should match baseline (torch_quant_nvfp4_moe) within NVFP4 tolerance.",
+            )
+        except AssertionError as e:
+            diff = (output_trtllm_gen.detach().float() - output_baseline.detach().float()).abs()
+            max_abs_diff = diff.max().item()
+            mean_abs_diff = diff.mean().item()
+            raise AssertionError(
+                f"{e}\n"
+                f"TRTLLM-Gen vs baseline: max_abs_diff={max_abs_diff:.6e}, mean_abs_diff={mean_abs_diff:.6e}, "
+                f"baseline_scale={baseline_scale:.6e}, atol_trtllm_gen={atol_trtllm_gen:.6e}. "
+                "Debug: compare scale mapping (fc1_scale_c, fc1_alpha), weight/scale shuffle, and input quant."
+            ) from e
+
+
+@pytest.mark.skipif(
+    not fp4_compatible() or not trtllm_ops_available(),
+    reason="Requires FP4 + TRTLLM support",
+)
+@skip_pre_blackwell
+def test_nvfp4_moe_trtllm_gen_routing_consistency():
+    """Verify (token, k) -> expert mapping in TRTLLM-Gen matches baseline.
+
+    Uses fixed routing so each token is routed to a single expert with weight 1:
+    token 0 -> expert 0 only, token 1 -> expert 2 only. If the kernel applied
+    the wrong expert output to a token (routing bug), baseline and TRTLLM-Gen
+    would differ.
+    """
+    device = "cuda"
+    dtype = torch.bfloat16
+    hidden_size, intermediate_size = 256, 256
+    num_experts, top_k = 4, 2
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    # Build MoE with same weights as MoEOpModelNVFP4 so we get valid quantized weights
+    model = MoEOpModelNVFP4(
+        hidden_size=hidden_size,
+        intermediate_size=intermediate_size,
+        num_experts=num_experts,
+        top_k=top_k,
+        dtype=dtype,
+        is_gated_mlp=True,
+    ).to(device=device)
+
+    # Clone so the new module owns tensors (FX trace expects get_attr to refer to module members)
+    w1_list = [p.detach().clone() for p in model.w1_weight]
+    w2_list = [p.detach().clone() for p in model.w2_weight]
+    w3_list = [p.detach().clone() for p in model.w3_weight]
+    w1_input_scale = [
+        getattr(model, f"w1_input_scale_{i}").detach().clone() for i in range(num_experts)
+    ]
+    w2_input_scale = [
+        getattr(model, f"w2_input_scale_{i}").detach().clone() for i in range(num_experts)
+    ]
+    w3_input_scale = [
+        getattr(model, f"w3_input_scale_{i}").detach().clone() for i in range(num_experts)
+    ]
+    w1_weight_scale = [
+        getattr(model, f"w1_weight_scale_{i}").detach().clone() for i in range(num_experts)
+    ]
+    w2_weight_scale = [
+        getattr(model, f"w2_weight_scale_{i}").detach().clone() for i in range(num_experts)
+    ]
+    w3_weight_scale = [
+        getattr(model, f"w3_weight_scale_{i}").detach().clone() for i in range(num_experts)
+    ]
+    w1_alpha = [getattr(model, f"w1_alpha_{i}").detach().clone() for i in range(num_experts)]
+    w2_alpha = [getattr(model, f"w2_alpha_{i}").detach().clone() for i in range(num_experts)]
+    w3_alpha = [getattr(model, f"w3_alpha_{i}").detach().clone() for i in range(num_experts)]
+
+    module = NVFP4MoEModuleForInputScaleTest(
+        num_experts,
+        w1_list,
+        w2_list,
+        w3_list,
+        w1_input_scale,
+        w2_input_scale,
+        w3_input_scale,
+        w1_weight_scale,
+        w2_weight_scale,
+        w3_weight_scale,
+        w1_alpha,
+        w2_alpha,
+        w3_alpha,
+        is_gated_mlp=True,
+        act_fn=ActivationType.Silu,
+    ).to(device=device)
+
+    x = torch.randn(2, hidden_size, device=device, dtype=dtype) * 0.1
+
+    # Fixed routing: token 0 -> expert 0 only (weight 1), token 1 -> expert 2 only (weight 1)
+    selected_experts = torch.tensor([[0, 1], [2, 3]], dtype=torch.int64, device=device)
+    routing_weights = torch.tensor([[1.0, 0.0], [1.0, 0.0]], dtype=torch.float32, device=device)
+
+    gm_baseline = fx.symbolic_trace(module)
+    with torch.inference_mode():
+        output_baseline = gm_baseline(x, selected_experts, routing_weights)
+
+    gm_trtllm_gen = fx.symbolic_trace(module)
+    # Set placeholder meta so fusion infers top_k=2 from routing_weights.shape[-1] (default is 8)
+    for node in gm_trtllm_gen.graph.nodes:
+        if node.op == "placeholder" and node.target == "routing_weights":
+            node.meta["val"] = torch.zeros(2, top_k, device=device, dtype=torch.float32)
+            break
+    gm_trtllm_gen = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion", "backend": "trtllm_gen"}},
+    )(None, gm_trtllm_gen)
+    has_trtllm_gen = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused)
+        for n in gm_trtllm_gen.graph.nodes
+    )
+    if not has_trtllm_gen:
+        pytest.skip("TRTLLM-Gen fusion did not apply (scale layout or arch)")
+
+    with torch.inference_mode():
+        output_trtllm_gen = gm_trtllm_gen(x, selected_experts, routing_weights)
+
+    rtol = 0.001
+    baseline_scale = output_baseline.detach().float().abs().max().item()
+    atol = max(1e-6, rtol * baseline_scale)
+    atol_trtllm_gen = max(atol, 5e-6)
+
+    torch.testing.assert_close(
+        output_trtllm_gen,
+        output_baseline,
+        rtol=rtol,
+        atol=atol_trtllm_gen,
+        msg="TRTLLM-Gen with fixed routing (token->single expert) must match baseline; "
+        "if not, (token,k)->expert mapping may be wrong.",
+    )
+
+
+def _load_nemotron_moe_config(model_path: str):
+    """Load MoE dimensions from a Nemotron-style model config.json.
+
+    Returns (hidden_size, intermediate_size, num_experts, top_k) or None if path/config missing.
+    Uses moe_latent_size for hidden if present (latent MoE), else hidden_size.
+    """
+    path = Path(model_path)
+    config_file = path / "config.json"
+    if not config_file.is_file():
+        return None
+    try:
+        with open(config_file) as f:
+            config = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+    hidden = config.get("hidden_size")
+    if hidden is None:
+        return None
+    # Latent MoE uses moe_latent_size as the MoE layer dimension
+    moe_hidden = config.get("moe_latent_size", hidden)
+    if isinstance(moe_hidden, list):
+        moe_hidden = moe_hidden[0] if moe_hidden else hidden
+    inter = config.get("moe_intermediate_size", config.get("intermediate_size"))
+    if inter is None:
+        return None
+    if isinstance(inter, list):
+        inter = inter[0] if inter else None
+    if inter is None:
+        return None
+    num_experts = config.get("n_routed_experts", config.get("num_experts"))
+    top_k = config.get("num_experts_per_tok", config.get("top_k", 2))
+    if num_experts is None:
+        return None
+    return (int(moe_hidden), int(inter), int(num_experts), int(top_k))
