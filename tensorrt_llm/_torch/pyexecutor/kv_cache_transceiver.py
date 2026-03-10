@@ -44,10 +44,7 @@ def create_kv_cache_transceiver(
     if cache_transceiver_config.backend == "DEFAULT":
         # When cache_transceiver_config.backend is not set, fallback to env_vars settings
         # NIXL is the default backend for non hybrid models
-        if mamba_cache_manager is None:
-            cache_transceiver_config.backend = "NIXL"
-        else:
-            cache_transceiver_config.backend = "UCX"
+        cache_transceiver_config.backend = "NIXL"
         # Ordered by priority
         env_vars = [
             ("TRTLLM_USE_NIXL_KVCACHE", "NIXL"),
@@ -71,14 +68,6 @@ def create_kv_cache_transceiver(
             f"Using UCX kv-cache transceiver. If your devices are not in the same domain, please consider setting "
             f"UCX_CUDA_IPC_ENABLE_MNNVL=n, UCX_RNDV_SCHEME=put_zcopy and/or unset UCX_NET_DEVICES upon server "
             f"hangs or lower-than-expected performance.")
-
-    if mamba_cache_manager is not None and cache_transceiver_config.backend in [
-            "NIXL", "MOONCAKE"
-    ]:
-        raise ValueError(
-            "NIXL or MOONCAKE backend does not support hybrid models with RNN (Mamba) states. "
-            "Please use UCX or MPI backend for cache transfer with hybrid models."
-        )
 
     # Select transceiver implementation based on transceiver_runtime
     # transceiver_runtime == None or "CPP" -> use C++ transceiver (default)
