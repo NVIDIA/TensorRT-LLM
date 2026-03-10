@@ -98,9 +98,9 @@ class AutoPipeline:
                 return "FluxPipeline"
 
         #########################################################
-        # 2. Single-safetensors with embedded metadata (LTX-2)
+        # 2. Single-safetensors with embedded metadata (LTX-2 specific)
         #########################################################
-        detected = AutoPipeline._detect_from_safetensors(checkpoint_dir)
+        detected = AutoPipeline._detect_from_single_safetensors(checkpoint_dir)
         if detected is not None:
             return detected
 
@@ -111,7 +111,7 @@ class AutoPipeline:
         )
 
     @staticmethod
-    def _detect_from_safetensors(checkpoint_dir: str) -> "str | None":
+    def _detect_from_single_safetensors(checkpoint_dir: str) -> "str | None":
         """Detect pipeline type from safetensors metadata config."""
         from pathlib import Path
 

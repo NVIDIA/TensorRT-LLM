@@ -4,10 +4,8 @@
 import argparse
 import time
 
-from output_handler import OutputHandler
-
-from tensorrt_llm import logger
-from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
+from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
+from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -193,54 +191,51 @@ def parse_args():
     return parser.parse_args()
 
 
-def main():
-    args = parse_args()
+def _linear_type_to_quant_config(linear_type: str):
+    """Map --linear_type CLI shortcut to quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)
 
-    # world_size = cfg_size * ulysses_size
-    n_workers = args.cfg_size * args.ulysses_size
 
-    # Convert linear_type to quant_config
-    quant_config = None
-    if args.linear_type == "trtllm-fp8-per-tensor":
-        quant_config = {"quant_algo": "FP8", "dynamic": True}
-    elif args.linear_type == "trtllm-fp8-blockwise":
-        quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "trtllm-nvfp4":
-        quant_config = {"quant_algo": "NVFP4", "dynamic": True}
-
-    # Setup Configuration
-    diffusion_config = {
-        "model_type": "ltx2",
-        "text_encoder_path": args.text_encoder_path,
-        "attention": {
-            "backend": args.attention_backend,
-        },
-        "parallel": {
+def _build_diffusion_args(args) -> VisualGenArgs:
+    """Build VisualGenArgs from parsed CLI args."""
+    kwargs = dict(
+        text_encoder_path=args.text_encoder_path,
+        attention={"backend": args.attention_backend},
+        parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
         },
-        "torch_compile": {
+        torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
-        "pipeline": {
+        pipeline={
             "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
         },
-    }
-
+    )
+    quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
-        diffusion_config["quant_config"] = quant_config
+        kwargs["quant_config"] = quant_config
+    return VisualGenArgs(**kwargs)
 
-    # Initialize VisualGen
+
+def main():
+    args = parse_args()
+
+    diffusion_args = _build_diffusion_args(args)
+
     logger.info(
-        f"Initializing VisualGen (LTX2): world_size={n_workers} "
-        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
+        f"Initializing VisualGen (LTX2): cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size}"
     )
     visual_gen = VisualGen(
         model_path=args.model_path,
-        n_workers=n_workers,
-        diffusion_config=diffusion_config,
+        diffusion_args=diffusion_args,
     )
 
     try:
@@ -286,7 +281,12 @@ def main():
         logger.info(f"Generation completed in {end_time - start_time:.2f}s")
 
         # Save Output
-        OutputHandler.save(output, args.output_path, frame_rate=args.frame_rate)
+        MediaStorage.save_video(
+            output.video,
+            args.output_path,
+            audio=output.audio,
+            frame_rate=args.frame_rate,
+        )
 
     finally:
         # Shutdown

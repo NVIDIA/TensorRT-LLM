@@ -426,7 +426,7 @@ class LTX2Pipeline(BasePipeline):
         if needs_text and not text_encoder_path:
             raise ValueError(
                 "text_encoder_path is required for loading the tokenizer "
-                "and text encoder. Set DiffusionArgs.text_encoder_path to "
+                "and text encoder. Set VisualGenArgs.text_encoder_path to "
                 "the Gemma3 model directory."
             )
 
