@@ -37,6 +37,7 @@ from tensorrt_llm._torch.pyexecutor.seq_slot_manager import SeqSlotManager
 from tensorrt_llm._torch.speculative import get_spec_drafter
 from tensorrt_llm._torch.speculative.eagle3 import Eagle3OneModelSampler, Eagle3ResourceManager
 from tensorrt_llm._utils import nvtx_range
+from tensorrt_llm.inputs.multimodal import MultimodalRuntimeData
 from tensorrt_llm.llmapi.llm_args import (
     ContextChunkingPolicy,
     EagleDecodingConfig,
@@ -73,41 +74,6 @@ from ..transform.optimizer import InferenceOptimizer
 from ..utils._graph import get_input_embeddings, get_lm_head_weights
 from ..utils.logger import ad_logger
 from .interface import CachedSequenceInterface, GetInferenceModel
-
-
-def _unwrap_model(model: torch.nn.Module) -> torch.nn.Module:
-    """Walk the wrapper chain (e.g. CapturedGraph → GraphModule → ...) to the innermost model."""
-    while hasattr(model, "model") and model.model is not model:
-        model = model.model
-    return model
-
-
-def _collect_persistent_multimodal_keys(
-    persist_keys: set,
-    ordered_requests: list,
-    extra_args: Dict[str, List[torch.Tensor]],
-) -> None:
-    """Collect persistent multimodal metadata from all requests.
-
-    Models declare which ``py_multimodal_data`` keys should persist across
-    context and generation phases via a ``persistent_multimodal_keys`` class
-    attribute.  For each declared key this function gathers the value from
-    every request (context **and** generation), zero-filling for requests
-    that lack the key.
-    """
-    for key in persist_keys:
-        per_request: List[Optional[torch.Tensor]] = []
-        ref: Optional[torch.Tensor] = None
-        for request in ordered_requests:
-            mm = request.py_multimodal_data
-            if mm is not None and key in mm:
-                per_request.append(mm[key])
-                if ref is None:
-                    ref = mm[key]
-            else:
-                per_request.append(None)
-        if ref is not None:
-            extra_args[key] = [v if v is not None else torch.zeros_like(ref) for v in per_request]
 
 
 @dataclass
@@ -548,11 +514,13 @@ class ADEngine(ModelEngine):
             self.spec_config = ad_config.speculative_config
             self._disable_overlap_scheduler = ad_config.disable_overlap_scheduler
             self.llm_args.max_stats_len = ad_config.max_stats_len
+            self._enable_chunked_prefill = getattr(ad_config, "enable_chunked_prefill", False)
         else:
             self.max_beam_width = 1
             self.spec_config = None
             self._disable_overlap_scheduler = False
             self.llm_args.max_stats_len = 1000
+            self._enable_chunked_prefill = False
 
         # check for max total draft tokens
         if self.spec_config is not None:
@@ -568,8 +536,6 @@ class ADEngine(ModelEngine):
 
         # build model
         self.model = get_inference_model(self.cache_seq_interface)
-        inner = _unwrap_model(self.model)
-        self._persistent_multimodal_keys = getattr(inner, "persistent_multimodal_keys", set())
         # start fresh with fixed seed
         torch.manual_seed(42)
 
@@ -659,8 +625,9 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
-                    if k not in self._persistent_multimodal_keys:
-                        extra_args[k].append(v)
+                    if k == "special_token_offsets":
+                        continue
+                    extra_args[k].append(v)
 
         # store num_prefill and num_prefill_tokens
         num_prefill = len(context_requests)
@@ -736,9 +703,80 @@ class ADEngine(ModelEngine):
         batch_info.extend([num_extend, num_extend_tokens])
         batch_info.extend([num_decode, num_decode_tokens])
 
-        _collect_persistent_multimodal_keys(
-            self._persistent_multimodal_keys, ordered_requests, extra_args
-        )
+        # Chunked prefill + multimodal: stage per-request multimodal layout metadata plus the
+        # per-prefill slice (flat_start, count) into full image embeddings so the VLM wrapper can
+        # reconstruct chunk-local mRoPE and scatter only the chunk's mm tokens.
+        if self._enable_chunked_prefill and num_prefill_seqs > 0:
+            flat_start_list: List[int] = []
+            count_list: List[int] = []
+            mm_item_cu_seqlen: List[int] = [0]
+            mm_token_positions_flat: List[int] = []
+            mm_token_lengths_flat: List[int] = []
+            mm_special_offsets_cu_seqlen: List[int] = [0]
+            mm_special_offsets_flat: List[int] = []
+            cumsum_total_mm = 0
+            for i in range(num_prefill_seqs):
+                req = ordered_requests[i]
+                begin_compute = input_pos[i]
+                end_compute = begin_compute + (cu_seqlen[i + 1] - cu_seqlen[i])
+                mm_pos = getattr(req, "multimodal_positions", None)
+                mm_len = getattr(req, "multimodal_lengths", None)
+                special_offsets = (
+                    req.py_multimodal_data.get("special_token_offsets", [])
+                    if req.py_multimodal_data
+                    else []
+                )
+                mm_pos_list = list(mm_pos) if mm_pos is not None else []
+                mm_len_list = list(mm_len) if mm_len is not None else []
+                mm_item_cu_seqlen.append(mm_item_cu_seqlen[-1] + len(mm_pos_list))
+                mm_token_positions_flat.extend(mm_pos_list)
+                mm_token_lengths_flat.extend(mm_len_list)
+                mm_special_offsets_cu_seqlen.append(
+                    mm_special_offsets_cu_seqlen[-1] + len(special_offsets)
+                )
+                mm_special_offsets_flat.extend(list(special_offsets))
+                if not mm_pos or not mm_len:
+                    flat_start_list.append(0)
+                    count_list.append(0)
+                    continue
+                runtime = MultimodalRuntimeData(
+                    past_seen_token_num=begin_compute,
+                    mm_token_positions=list(mm_pos),
+                    mm_token_lengths=list(mm_len),
+                    chunk_end_pos=end_compute,
+                    special_token_offsets=list(special_offsets),
+                )
+                num_unseen = runtime.num_unseen_mm_tokens
+                num_in_chunk = runtime.num_mm_tokens_in_chunk
+                num_unseen_special = runtime.num_unseen_special_tokens
+                num_special_in_chunk = runtime.num_special_tokens_in_chunk
+                total_mm_i = runtime.total_mm_tokens_in_request
+                total_special_i = runtime.total_special_tokens_in_request
+                flat_start_i = cumsum_total_mm + num_unseen - num_unseen_special
+                flat_start_list.append(flat_start_i)
+                count_list.append(num_in_chunk - num_special_in_chunk)
+                cumsum_total_mm += total_mm_i - total_special_i
+            extra_args["mm_chunk_flat_start"] = [
+                torch.tensor(flat_start_list, dtype=torch.int64, device="cpu")
+            ]
+            extra_args["mm_chunk_count"] = [
+                torch.tensor(count_list, dtype=torch.int64, device="cpu")
+            ]
+            extra_args["mm_item_cu_seqlen"] = [
+                torch.tensor(mm_item_cu_seqlen, dtype=torch.int32, device="cpu")
+            ]
+            extra_args["mm_token_positions"] = [
+                torch.tensor(mm_token_positions_flat, dtype=torch.int32, device="cpu")
+            ]
+            extra_args["mm_token_lengths"] = [
+                torch.tensor(mm_token_lengths_flat, dtype=torch.int32, device="cpu")
+            ]
+            extra_args["mm_special_offsets_cu_seqlen"] = [
+                torch.tensor(mm_special_offsets_cu_seqlen, dtype=torch.int32, device="cpu")
+            ]
+            extra_args["mm_special_offsets"] = [
+                torch.tensor(mm_special_offsets_flat, dtype=torch.int32, device="cpu")
+            ]
 
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(

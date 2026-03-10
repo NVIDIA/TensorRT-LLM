@@ -181,6 +181,8 @@ class _DummyRequest:
         self.py_seq_slot = seq_slot
         self.py_batch_idx = None
         self.py_multimodal_data = None
+        self.multimodal_positions = None
+        self.multimodal_lengths = None
 
     def get_tokens(self, _beam: int) -> List[int]:
         return self._tokens
@@ -241,6 +243,63 @@ def test_ad_engine_chunked_prefill_equivalence(tokens_per_block: int):
     logits_chunked_last = engine.forward(scheduled_requests_part2, resource_manager)["logits"][-1]
 
     torch.testing.assert_close(logits_full_last, logits_chunked_last)  # , atol=1e-5)
+
+    cache_seq_interface.shutdown()
+
+
+def test_ad_engine_chunked_prefill_stages_multimodal_runtime_metadata():
+    """Chunked prefill should stage per-request multimodal layout metadata for the VLM wrapper."""
+    device = torch.device("cuda")
+    max_seq_len = 64
+    max_batch_size = 8
+
+    kv_cache_config = KvCacheConfig(tokens_per_block=8)
+    cache_seq_interface = CachedSequenceInterface(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        device=device,
+        kv_cache_config=kv_cache_config,
+    )
+    cache_seq_interface.to(device)
+
+    engine = ADEngine(get_inference_model, cache_seq_interface)
+    engine._enable_chunked_prefill = True
+
+    kv_manager = _DummyKVCacheManager(tokens_per_block=8)
+    resource_manager = _DummyResourceManager(kv_manager)
+
+    tokens = [1, 2, 99, 99, 99, 99, 3, 4]
+    req = _DummyRequest(tokens=tokens, begin=4, size=4, seq_slot=0)
+    req.multimodal_positions = [2]
+    req.multimodal_lengths = [4]
+    req.py_multimodal_data = None
+
+    scheduled_requests = ScheduledRequests()
+    scheduled_requests.context_requests.append(req)
+
+    engine._prepare_inputs(scheduled_requests, resource_manager, new_tokens=None)
+
+    named_args = cache_seq_interface.named_args
+    assert "mm_item_cu_seqlen" in named_args
+    assert "mm_token_positions" in named_args
+    assert "mm_token_lengths" in named_args
+    assert "mm_special_offsets_cu_seqlen" in named_args
+    assert "mm_special_offsets" in named_args
+
+    torch.testing.assert_close(
+        named_args["mm_item_cu_seqlen"].cpu(), torch.tensor([0, 1], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_token_positions"].cpu(), torch.tensor([2], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_token_lengths"].cpu(), torch.tensor([4], dtype=torch.int32)
+    )
+    torch.testing.assert_close(
+        named_args["mm_special_offsets_cu_seqlen"].cpu(),
+        torch.tensor([0, 0], dtype=torch.int32),
+    )
+    assert named_args["mm_special_offsets"].numel() == 0
 
     cache_seq_interface.shutdown()
 

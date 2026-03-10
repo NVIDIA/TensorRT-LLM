@@ -2,6 +2,7 @@ import types
 from typing import Any, Dict, List, Optional, Tuple
 
 import torch
+from PIL import Image
 
 from ...executor.result import CompletionOutput
 from ...inputs.registry import DefaultInputProcessor, ExtraProcessedInputs
@@ -25,6 +26,83 @@ class ADInputProcessor(DefaultInputProcessor):
         super().__init__(model_path=None, config=None, tokenizer=tokenizer)
         # NOTE: HF's tokenizer/processor that has the apply_chat_template method
         self.processor = processor or getattr(tokenizer, "tokenizer", None)
+
+    @property
+    def get_num_multimodal_tokens(self):
+        """Delegate multimodal token counting to the wrapped HF processor."""
+        if hasattr(self.processor, "_get_num_multimodal_tokens"):
+            return self.processor._get_num_multimodal_tokens
+        raise NotImplementedError(
+            f"get_num_multimodal_tokens not implemented for {self.__class__.__name__}. "
+            "Please ensure the processor exposes _get_num_multimodal_tokens."
+        )
+
+    def get_num_tokens_per_image(self, *, image: Image.Image, **kwargs) -> int:
+        image_size = (image.height, image.width)
+        return self.get_num_multimodal_tokens([image_size], **kwargs)["num_image_tokens"][0]
+
+    def get_num_tokens_per_video(self, *, video: List[Image.Image], **kwargs) -> int:
+        video_size = (len(video), video[0].height, video[0].width)
+        num_video_tokens = self.get_num_multimodal_tokens(video_sizes=[video_size], **kwargs).get(
+            "num_video_tokens"
+        )
+        if num_video_tokens is None:
+            raise NotImplementedError("Underlying processor does not expose num_video_tokens.")
+        return num_video_tokens[0]
+
+    def get_vocab_size(self) -> Optional[int]:
+        """Return the tokenizer vocabulary size for multimodal hashing."""
+        if self.tokenizer is not None and hasattr(self.tokenizer, "vocab_size"):
+            return int(self.tokenizer.vocab_size)
+        wrapped_tokenizer = getattr(self.tokenizer, "tokenizer", None)
+        if wrapped_tokenizer is not None and hasattr(wrapped_tokenizer, "vocab_size"):
+            return int(wrapped_tokenizer.vocab_size)
+        processor_tokenizer = getattr(self.processor, "tokenizer", None)
+        if processor_tokenizer is not None and hasattr(processor_tokenizer, "vocab_size"):
+            return int(processor_tokenizer.vocab_size)
+        return None
+
+    def get_mm_token_ids(self) -> Optional[torch.Tensor]:
+        if hasattr(self.processor, "mm_token_ids"):
+            return self.processor.mm_token_ids
+        sources = [
+            self.processor,
+            getattr(self.processor, "tokenizer", None),
+            self.tokenizer,
+            getattr(self.tokenizer, "tokenizer", None),
+        ]
+        token_ids = []
+        for source in sources:
+            if source is None:
+                continue
+            for attr in ("image_token_id", "video_token_id"):
+                value = getattr(source, attr, None)
+                if value is not None:
+                    token_ids.append(int(value))
+        if token_ids:
+            return torch.tensor(sorted(set(token_ids)), dtype=torch.int32)
+        return None
+
+    def get_mm_special_token_ids(self) -> Optional[torch.Tensor]:
+        if hasattr(self.processor, "mm_special_token_ids"):
+            return self.processor.mm_special_token_ids
+        sources = [
+            self.processor,
+            getattr(self.processor, "tokenizer", None),
+            self.tokenizer,
+            getattr(self.tokenizer, "tokenizer", None),
+        ]
+        token_ids = []
+        for source in sources:
+            if source is None:
+                continue
+            for attr in ("vision_start_token_id", "vision_end_token_id"):
+                value = getattr(source, attr, None)
+                if value is not None:
+                    token_ids.append(int(value))
+        if token_ids:
+            return torch.tensor(sorted(set(token_ids)), dtype=torch.int32)
+        return None
 
     def __call__(
         self, inputs: Dict[str, Any], sampling_params: SamplingParams
