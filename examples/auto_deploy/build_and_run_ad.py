@@ -1,5 +1,7 @@
 """Main entrypoint to build, test, and prompt AutoDeploy inference models."""
 
+import sys
+from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Union
 
 import torch
@@ -24,6 +26,11 @@ from tensorrt_llm._torch.auto_deploy.utils.benchmark import benchmark, store_ben
 from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
 from tensorrt_llm.llmapi.llm import RequestOutput
 from tensorrt_llm.sampling_params import SamplingParams
+
+# Registry paths
+_REGISTRY_DIR = Path(__file__).resolve().parent / "model_registry"
+_REGISTRY_YAML = _REGISTRY_DIR / "models.yaml"
+_REGISTRY_CONFIGS_DIR = _REGISTRY_DIR / "configs"
 
 # Global torch config, set the torch compile cache to fix up to llama 405B
 torch._dynamo.config.cache_size_limit = 20
@@ -238,6 +245,31 @@ class ExperimentConfig(DynamicYamlMixInForSettings, BaseSettings):
         return benchmark
 
 
+def get_registry_yaml_extra(model_name: str) -> List[str]:
+    """Look up a model in the registry and return its resolved yaml_extra config paths.
+
+    Args:
+        model_name: HuggingFace model id as listed in the registry (e.g. ``meta-llama/Llama-3.1-8B-Instruct``).
+
+    Returns:
+        List of absolute paths to the yaml config files for the model.
+
+    Raises:
+        KeyError: If the model is not found in the registry.
+    """
+    with open(_REGISTRY_YAML) as f:
+        registry = yaml.safe_load(f)
+
+    for entry in registry.get("models", []):
+        if entry["name"] == model_name:
+            return [str(_REGISTRY_CONFIGS_DIR / cfg) for cfg in entry.get("yaml_extra", [])]
+
+    raise KeyError(
+        f"Model '{model_name}' not found in the AutoDeploy model registry ({_REGISTRY_YAML}). "
+        "Either add it to the registry or provide --yaml-extra directly."
+    )
+
+
 def build_llm_from_config(config: ExperimentConfig) -> LLM:
     """Builds a LLM object from our config."""
     # construct llm high-level interface object
@@ -260,8 +292,44 @@ def print_outputs(outs: Union[RequestOutput, List[RequestOutput]]) -> List[List[
     return prompts_and_outputs
 
 
+def _inject_registry_yaml_extra() -> None:
+    """If ``--use-registry`` is in sys.argv, replace it with the resolved ``--yaml-extra`` entries.
+
+    This allows callers to simply run::
+
+        python build_and_run_ad.py --model <hf_model_id> --use-registry
+
+    instead of manually specifying every ``--yaml-extra`` path.  The flag is consumed here and the
+    resolved paths are injected back into ``sys.argv`` before pydantic-settings parses them.
+    """
+    if "--use-registry" not in sys.argv:
+        return
+
+    # Extract model name from argv (support both --model=X and --model X forms)
+    model_name: Optional[str] = None
+    for i, arg in enumerate(sys.argv):
+        if arg.startswith("--model="):
+            model_name = arg.split("=", 1)[1]
+            break
+        if arg == "--model" and i + 1 < len(sys.argv):
+            model_name = sys.argv[i + 1]
+            break
+
+    if model_name is None:
+        raise ValueError("--use-registry requires --model to be specified.")
+
+    yaml_extra_paths = get_registry_yaml_extra(model_name)
+
+    # Remove --use-registry and inject --yaml-extra <path0> <path1> ...
+    argv = [a for a in sys.argv if a != "--use-registry"]
+    if yaml_extra_paths:
+        argv += ["--args.yaml-extra"] + yaml_extra_paths
+    sys.argv = argv
+
+
 def main(config: Optional[ExperimentConfig] = None):
     if config is None:
+        _inject_registry_yaml_extra()
         config: ExperimentConfig = CliApp.run(ExperimentConfig)
     ad_logger.info(f"AutoDeploy Experiment Config:\n{yaml.dump(config.model_dump())}")
 
