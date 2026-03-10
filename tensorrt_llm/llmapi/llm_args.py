@@ -1025,6 +1025,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
+
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["SaveState"] = "SaveState"
@@ -1251,7 +1262,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
@@ -1334,6 +1345,17 @@ class PARDDecodingConfig(DecodingBaseConfig):
     )
 
     decoding_type: Literal["PARD"] = "PARD"
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -1680,6 +1702,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
+
+    use_python_scheduler: bool = Field(
+        default=False,
+        description="Use pure-Python scheduler instead of C++ scheduler.")
 
     def _to_pybind(self):
         return _SchedulerConfig(

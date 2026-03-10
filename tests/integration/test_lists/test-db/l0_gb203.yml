@@ -30,6 +30,7 @@ l0_gb203:
   # - examples/test_qwen.py::test_llm_qwen1_5_7b_single_gpu_lora[qwen1.5_7b_chat-Qwen1.5-7B-Chat-750Mb-lora] # https://nvbugs/5234573
   # - examples/test_qwen.py::test_llm_qwen_single_gpu_summary[qwen2.5_1.5b_instruct-enable_paged_kv_cache-enable_remove_input_padding-enable_weight_only-enable_fmha_fp32_acc] # https://nvbugs/5234573
   - llmapi/test_llm_examples.py::test_llmapi_quickstart
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - llmapi/test_llm_examples.py::test_llmapi_example_inference
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
   - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming
