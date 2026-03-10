@@ -587,24 +587,12 @@ TEST_F(TruncateBlocksTest, ComplexMultiTurnConversationTruncation)
     EXPECT_EQ(trace2TotalBlocks, 8); // 31 tokens / 4 = 8 blocks
     EXPECT_NO_THROW((void) kvCacheManager.removeSequence(requestId8, llmRequest8));
 
-    // Record free blocks before truncation
-    auto freeBlocksBefore = kvCacheManager.getNumFreeBlocks();
-
     // --- Truncate trace_1, retaining only system_prompt + user_input_1 ---
-    // This should mark all trace_1 specific blocks (after shared prefix) as low priority
+    // This removes trace_1's blocks beyond the shared prefix from the radix trie
+    // and deprioritizes them for eviction.
     kvCacheManager.truncateBlocks(trace1Turn2Decode, sharedPrefixLength);
 
-    // Record free blocks after truncation
-    auto freeBlocksAfter = kvCacheManager.getNumFreeBlocks();
-
-    // Calculate expected released blocks from trace_1
-    // trace_1 turn 2 decode: 31 tokens = 8 blocks
-    // Keeping first 14 tokens = 4 blocks (ceil(14/4))
-    // Released: blocks after shared prefix that are unique to trace_1
-    auto trace1TotalBlocks = tc::ceilDiv(trace1Turn2DecodeLength, tokensPerBlock);
     auto sharedPrefixBlockCount = tc::ceilDiv(sharedPrefixLength, tokensPerBlock);
-    // Note: Some blocks may be shared, so released blocks <= trace1TotalBlocks - sharedPrefixBlockCount
-    EXPECT_EQ(freeBlocksAfter, freeBlocksBefore + trace1TotalBlocks - sharedPrefixBlockCount);
 
     // --- Verify trace_2 remains completely intact and reusable ---
     LlmRequest::RequestIdType requestId9{8};
@@ -624,4 +612,14 @@ TEST_F(TruncateBlocksTest, ComplexMultiTurnConversationTruncation)
     EXPECT_NO_THROW(kvCacheManager.addSequence(requestId10, sharedPrefixLength, beamWidth, llmRequest10));
     EXPECT_EQ(llmRequest10->getReusedBlocksPerRequest(), sharedPrefixBlockCount);
     EXPECT_NO_THROW((void) kvCacheManager.removeSequence(requestId10, llmRequest10));
+
+    // --- Verify trace_1's full sequence is no longer fully reusable ---
+    // After truncation, only the shared prefix blocks (including the boundary block)
+    // should be reusable. Blocks beyond the prefix were removed from the radix trie.
+    LlmRequest::RequestIdType requestIdTrace1Verify{10};
+    auto llmRequestTrace1Verify = createLlmRequest(requestIdTrace1Verify, trace1Turn2DecodePtr);
+    EXPECT_NO_THROW(
+        kvCacheManager.addSequence(requestIdTrace1Verify, trace1Turn2DecodeLength, beamWidth, llmRequestTrace1Verify));
+    EXPECT_EQ(llmRequestTrace1Verify->getReusedBlocksPerRequest(), sharedPrefixBlockCount);
+    EXPECT_NO_THROW((void) kvCacheManager.removeSequence(requestIdTrace1Verify, llmRequestTrace1Verify));
 }
