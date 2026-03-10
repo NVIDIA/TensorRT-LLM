@@ -1,6 +1,7 @@
 import gc
 import importlib
 import os
+import tempfile
 from functools import wraps
 from pathlib import Path
 from queue import Queue
@@ -60,8 +61,9 @@ class RayWorkerWrapper:
         self.local_gpu = self.physical_to_local_id(self.gpu)
 
         # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
-        os.environ[
-            "DG_JIT_CACHE_DIR"] = f"/tmp/deep_gemm_rank{rank}_gpu{self.gpu}"
+        os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
+            tempfile.gettempdir(),
+            f"deep_gemm_rank{rank}_gpu{self.gpu}")
 
         torch.cuda.set_device(self.local_gpu)
 
