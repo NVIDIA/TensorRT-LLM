@@ -420,6 +420,11 @@ class _SharedPageLock:
         self._uniq_lock = None
         return page
 
+    def replicate(self, ordinal: BlockOrdinal) -> "_SharedPageLock":
+        user = self._user
+        kv_cache, beam_index, _, life_cycle = user
+        return self.holder.lock(unwrap_rawref(kv_cache), beam_index, ordinal, life_cycle, True)
+
     def _get_page_index(self) -> PageIndex:
         storage = unwrap_rawref(self._user.kv_cache).manager._storage
         user = self._user
