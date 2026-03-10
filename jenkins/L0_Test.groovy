@@ -2657,28 +2657,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         if (stageName.contains("-Ray-")) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 install ray[default]")
         }
-        // Verl environment setup
-        if (stageName.contains("-Verl-")) {
-            def verlConfigPath = "${llmSrc}/tests/integration/defs/verl/verl_config.yml"
-            def verlConfig = readYaml(file: verlConfigPath)
-            def verlPath = "${llmSrc}/tests/integration/defs/verl/verl_repo"
-
-            // Build environment variable export prefix from config for shell commands
-            def envPrefix = ""
-            if (verlConfig.verl_config.env_vars) {
-                envPrefix = verlConfig.verl_config.env_vars.collect { "export ${it}" }.join(" && ") + " && "
-            }
-
-            // Run install commands with env vars exported
-            verlConfig.verl_config.install_commands.each { cmd ->
-                trtllm_utils.llmExecStepWithRetry(pipeline, script: "${envPrefix}${cmd}")
-            }
-
-            // Clone verl repo next to the wrapper test so it can be discovered by relative path
-            trtllm_utils.llmExecStepWithRetry(pipeline, script: """
-                git clone ${verlConfig.verl_config.repo_url} ${verlPath} && cd ${verlPath} && git checkout ${verlConfig.verl_config.repo_tag}
-            """)
-        }
         if (!skipInstallWheel) {
             trtllm_utils.llmExecStepWithRetry(pipeline, script: "cd ${llmPath} && pip3 install --force-reinstall --no-deps TensorRT-LLM/tensorrt_llm-*.whl")
         }

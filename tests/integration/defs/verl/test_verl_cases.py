@@ -12,17 +12,69 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Wrapper tests that invoke verl repo tests via subprocess.
+"""Self-contained wrapper tests for the verl repo.
 
-The verl repo is cloned by CI into verl_repo/ next to this file
-(see verl_config.yml and jenkins/L0_Test.groovy for setup details).
+All setup (dependency installation, repo cloning, env vars) is handled by
+a session-scoped pytest fixture. Configuration is read from verl_config.yml.
 """
 
 import os
 import subprocess
 import sys
 
-VERL_ROOT = os.path.join(os.path.dirname(__file__), "verl_repo")
+import pytest
+import yaml
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_CONFIG_PATH = os.path.join(_HERE, "verl_config.yml")
+VERL_ROOT = os.path.join(_HERE, "verl_repo")
+
+
+def _load_config():
+    with open(_CONFIG_PATH) as f:
+        return yaml.safe_load(f)["verl_config"]
+
+
+def _export_env_vars(config):
+    """Export env vars from config into the current process environment."""
+    for entry in config.get("env_vars", []):
+        key, val = entry.split("=", 1)
+        # Resolve shell-style variable references against current env
+        val = val.strip('"')
+        val = os.path.expandvars(val)
+        os.environ[key] = val
+
+
+def _run_install_commands(config):
+    """Run install commands from config with env vars already set."""
+    for cmd in config.get("install_commands", []):
+        print(f"[verl setup] Running: {cmd}")
+        subprocess.check_call(cmd, shell=True)
+
+
+def _clone_verl_repo(config):
+    """Clone the verl repo and checkout the specified tag."""
+    if os.path.isdir(VERL_ROOT):
+        print(f"[verl setup] Repo already exists at {VERL_ROOT}, skipping clone")
+        return
+    repo_url = config["repo_url"]
+    repo_tag = config["repo_tag"]
+    print(f"[verl setup] Cloning {repo_url} (tag={repo_tag}) into {VERL_ROOT}")
+    subprocess.check_call(
+        f"git clone {repo_url} {VERL_ROOT} && cd {VERL_ROOT} && git checkout {repo_tag}",
+        shell=True,
+    )
+    assert os.path.isdir(VERL_ROOT), f"Failed to clone verl repo to {VERL_ROOT}"
+
+
+@pytest.fixture(scope="session", autouse=True)
+def verl_setup():
+    """Session-scoped fixture: install deps, set env vars, clone verl repo."""
+    config = _load_config()
+    _export_env_vars(config)
+    _run_install_commands(config)
+    _clone_verl_repo(config)
+    yield VERL_ROOT
 
 
 def _run_verl_test(test_path, timeout=600):
@@ -38,5 +90,4 @@ def _run_verl_test(test_path, timeout=600):
 
 
 def test_async_server():
-    assert os.path.isdir(VERL_ROOT), f"verl repo not found at {VERL_ROOT}"
     _run_verl_test("tests/workers/rollout/rollout_trtllm/test_async_server.py")
