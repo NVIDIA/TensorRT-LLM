@@ -71,16 +71,18 @@ class LogParser(object):
     def _extract_request_counts_from_log(self, log_content: str) -> Tuple[int, int]:
         """Extract failed/total from log via regex (TRT-LLM benchmark_serving.py format).
 
-        Uses findall + last match to handle multi-concurrency logs.
+        Sums all matches to handle multi-concurrency logs correctly.
         """
         failed_requests = 0
         total_requests = 0
-        failed_matches = re.findall(r"Total failed requests:\s*(\d+)", log_content)
-        total_matches = re.findall(r"Total requests:\s*(\d+)", log_content)
+        # Match "Failed requests:" (capital F) from summary block, not
+        # "Total failed requests:" (lowercase f) which can report 0 incorrectly
+        failed_matches = re.findall(r"Failed requests:\s+(\d+)", log_content)
+        total_matches = re.findall(r"Total requests:\s+(\d+)", log_content)
         if failed_matches:
-            failed_requests = int(failed_matches[-1])
+            failed_requests = sum(int(x) for x in failed_matches)
         if total_matches:
-            total_requests = int(total_matches[-1])
+            total_requests = sum(int(x) for x in total_matches)
         return failed_requests, total_requests
 
     def _extract_request_counts_from_json(self, concurrencies: List[int]) -> Tuple[int, int]:
