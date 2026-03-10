@@ -34,6 +34,15 @@ WAN_T2V_HEIGHT = 480
 WAN_T2V_WIDTH = 832
 WAN_T2V_NUM_FRAMES = 165
 
+# LTX-2 configuration
+LTX2_MODEL_SUBPATH = "ltx-video-2-0.9.7"
+LTX2_TEXT_ENCODER_SUBPATH = "gemma-3-12b-it"
+LTX2_T2V_PROMPT = "A woman with long brown hair and light skin smiles at the camera while standing in a sunlit park, her hair gently blowing in the breeze as she tilts her head slightly to the side."
+LTX2_T2V_HEIGHT = 512
+LTX2_T2V_WIDTH = 768
+LTX2_T2V_NUM_FRAMES = 121
+LTX2_T2V_STEPS = 40
+
 # Dimensions to evaluate
 VBENCH_DIMENSIONS = [
     "subject_consistency",
@@ -71,6 +80,24 @@ VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES = {
     "dynamic_degree": 1.0000,
     "aesthetic_quality": 0.5465,
     "imaging_quality": 0.7142,
+}
+
+VBENCH_LTX2_BF16_GOLDEN_SCORES = {
+    "subject_consistency": 0.9683,
+    "background_consistency": 0.9469,
+    "motion_smoothness": 0.9941,
+    "dynamic_degree": 1.0000,
+    "aesthetic_quality": 0.5097,
+    "imaging_quality": 0.7309,
+}
+
+VBENCH_LTX2_FP8_GOLDEN_SCORES = {
+    "subject_consistency": 0.9817,
+    "background_consistency": 0.9704,
+    "motion_smoothness": 0.9918,
+    "dynamic_degree": 0.0000,
+    "aesthetic_quality": 0.6062,
+    "imaging_quality": 0.6546,
 }
 
 VBENCH_REPO = "https://github.com/Vchitect/VBench.git"
@@ -209,6 +236,66 @@ def wan22_a14b_fp8_video_path(_visual_gen_deps, llm_venv, llm_root):
 def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv, llm_root):
     """Generate video with Wan 2.2 A14B NVFP4 checkpoint."""
     return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
+
+
+def _generate_ltx2_video(llm_venv, llm_root, output_subdir, linear_type="default"):
+    """Generate a video with visual_gen_ltx2.py.
+
+    Returns the path to the generated .mp4, or calls pytest.skip if the model
+    or text encoder is not found under LLM_MODELS_ROOT.
+    """
+    scratch_space = conftest.llm_models_root()
+    model_path = os.path.join(scratch_space, LTX2_MODEL_SUBPATH)
+    text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
+    if not os.path.isdir(model_path):
+        pytest.skip(
+            f"LTX-2 model not found: {model_path} "
+            f"(set LLM_MODELS_ROOT or place {LTX2_MODEL_SUBPATH} under scratch)"
+        )
+    if not os.path.isdir(text_encoder_path):
+        pytest.skip(
+            f"LTX-2 text encoder not found: {text_encoder_path} "
+            f"(set LLM_MODELS_ROOT or place {LTX2_TEXT_ENCODER_SUBPATH} under scratch)"
+        )
+    out_dir = os.path.join(llm_venv.get_working_directory(), "visual_gen_output", output_subdir)
+    os.makedirs(out_dir, exist_ok=True)
+    output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
+    if os.path.isfile(output_path):
+        return output_path
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_ltx2.py")
+    assert os.path.isfile(script_path), f"LTX-2 script not found: {script_path}"
+    cmd = [
+        script_path,
+        "--model_path", model_path,
+        "--text_encoder_path", text_encoder_path,
+        "--prompt", LTX2_T2V_PROMPT,
+        "--height", str(LTX2_T2V_HEIGHT),
+        "--width", str(LTX2_T2V_WIDTH),
+        "--num_frames", str(LTX2_T2V_NUM_FRAMES),
+        "--steps", str(LTX2_T2V_STEPS),
+        "--output_path", output_path,
+    ]
+    if linear_type != "default":
+        cmd.extend(["--linear_type", linear_type])
+    if torch.cuda.device_count() >= 2:
+        cmd.extend(["--cfg_size", "2"])
+    venv_check_call(llm_venv, cmd)
+    assert os.path.isfile(output_path), f"LTX-2 visual gen did not produce {output_path}"
+    return output_path
+
+
+@pytest.fixture(scope="session")
+def ltx2_bf16_video_path(_visual_gen_deps, llm_venv, llm_root):
+    """Generate LTX-2 BF16 T2V video and return path."""
+    return _generate_ltx2_video(llm_venv, llm_root, "ltx2_bf16")
+
+
+@pytest.fixture(scope="session")
+def ltx2_fp8_video_path(_visual_gen_deps, llm_venv, llm_root):
+    """Generate LTX-2 FP8 T2V video and return path."""
+    return _generate_ltx2_video(llm_venv, llm_root, "ltx2_fp8",
+                                linear_type="trtllm-fp8-per-tensor")
+
 
 
 def _normalize_score(val):
@@ -373,6 +460,41 @@ def test_vbench_dimension_score_wan22_a14b_nvfp4(
         golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
+
+
+def test_vbench_dimension_score_ltx2_bf16(
+    vbench_repo_root, ltx2_bf16_video_path, llm_venv
+):
+    """VBench accuracy for LTX-2 BF16 T2V — baseline run (golden scores TBD)."""
+    videos_dir = os.path.dirname(ltx2_bf16_video_path)
+    assert os.path.isfile(ltx2_bf16_video_path), "LTX-2 BF16 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="LTX-2 BF16",
+        golden_scores=VBENCH_LTX2_BF16_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
+
+def test_vbench_dimension_score_ltx2_fp8(
+    vbench_repo_root, ltx2_fp8_video_path, llm_venv
+):
+    """VBench accuracy for LTX-2 FP8 T2V — baseline run (golden scores TBD)."""
+    videos_dir = os.path.dirname(ltx2_fp8_video_path)
+    assert os.path.isfile(ltx2_fp8_video_path), "LTX-2 FP8 video must exist"
+    _run_vbench_and_report(
+        vbench_repo_root,
+        videos_dir,
+        VISUAL_GEN_OUTPUT_VIDEO,
+        llm_venv,
+        title="LTX-2 FP8",
+        golden_scores=VBENCH_LTX2_FP8_GOLDEN_SCORES,
+        max_score_diff=0.05,
+    )
+
 
 
 def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
