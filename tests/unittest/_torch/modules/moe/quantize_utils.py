@@ -220,6 +220,7 @@ class RefMLPFusedMoE(nn.Module):
         if model_config is None:
             model_config = ModelConfig()
         self.quant_config = model_config.quant_config
+        self.activation_type = activation_type
         self._is_gated = is_gated_activation(activation_type)
 
         skip_if_insufficient_gpu_memory(
@@ -459,6 +460,8 @@ class BaseQuantizeUtil(ABC):
                 weights[f"{expert_id}.w3.weight"] = torch.randn(
                     (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
                 )
+            else:
+                weights[f"{expert_id}.w3.weight"] = torch.empty(0, dtype=self.dtype, device="cuda")
         return weights
 
     def create_ref_module(self, routing_method, ref_cls=RefMLPFusedMoE) -> torch.nn.Module:
@@ -626,7 +629,7 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 )
                 w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
             else:
-                w3_weight = None
+                w3_weight = torch.empty(0, dtype=self.dtype, device="cuda")
                 w3_sf_global = None
 
             assert "x_sf_global" in quant_kwargs, "x_sf_global is required for NVFP4 quant"
@@ -638,8 +641,7 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
 
             w3_w1_global = w1_sf_global
-            if self._is_gated:
-                # w3 global and w1 global must be the same
+            if w3_sf_global is not None:
                 w3_w1_global = min(w1_sf_global, w3_sf_global)
 
             # start to quantize
@@ -653,39 +655,37 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             )
             w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(self.hidden_size, -1)
 
-            w3_weight_nvfp4, w3_sf_block_unswizzled = (
-                torch.ops.trtllm.fp4_quantize(
+            if self._is_gated:
+                w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
                     w3_weight, w3_w1_global, scaling_vector_size, False, False
                 )
-                if self._is_gated
-                else (None, None)
-            )
-            w3_sf_block_unswizzled = (
-                w3_sf_block_unswizzled.view(self.intermediate_size, -1) if self._is_gated else None
-            )
+                w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(self.intermediate_size, -1)
+            else:
+                w3_weight_nvfp4 = torch.empty(0, dtype=torch.uint8, device="cuda")
+                w3_sf_block_unswizzled = torch.empty(0, dtype=torch.float8_e4m3fn, device="cuda")
+
+            w1_input_scale = x_sf_global.cuda()
+            w2_input_scale = x_sf_global.cuda()
+            w3_input_scale = x_sf_global.cuda()
 
             weights[f"{expert_id}.w1.weight"] = w1_weight_nvfp4
             weights[f"{expert_id}.w2.weight"] = w2_weight_nvfp4
-            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4 if self._is_gated else None
+            weights[f"{expert_id}.w3.weight"] = w3_weight_nvfp4
             weights[f"{expert_id}.w1.weight_scale"] = w1_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
             ).cuda()
             weights[f"{expert_id}.w2.weight_scale"] = w2_sf_block_unswizzled.view(
                 torch.float8_e4m3fn
             ).cuda()
-            weights[f"{expert_id}.w3.weight_scale"] = (
-                w3_sf_block_unswizzled.view(torch.float8_e4m3fn).cuda() if self._is_gated else None
-            )
-            weights[f"{expert_id}.w1.input_scale"] = 1.0 / x_sf_global.cuda()
-            weights[f"{expert_id}.w2.input_scale"] = 1.0 / x_sf_global.cuda()
-            weights[f"{expert_id}.w3.input_scale"] = (
-                1.0 / x_sf_global.cuda() if self._is_gated else None
-            )
+            weights[f"{expert_id}.w3.weight_scale"] = w3_sf_block_unswizzled.view(
+                torch.float8_e4m3fn
+            ).cuda()
+            weights[f"{expert_id}.w1.input_scale"] = 1.0 / w1_input_scale
+            weights[f"{expert_id}.w2.input_scale"] = 1.0 / w2_input_scale
+            weights[f"{expert_id}.w3.input_scale"] = 1.0 / w3_input_scale
             weights[f"{expert_id}.w1.weight_scale_2"] = 1.0 / w3_w1_global
             weights[f"{expert_id}.w2.weight_scale_2"] = 1.0 / w2_sf_global
-            weights[f"{expert_id}.w3.weight_scale_2"] = (
-                1.0 / w3_w1_global if self._is_gated else None
-            )
+            weights[f"{expert_id}.w3.weight_scale_2"] = 1.0 / w3_w1_global
 
             # Note: NVFP4 bias uses torch.float dtype
             if self.bias:
@@ -695,11 +695,14 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 weights[f"{expert_id}.w2.bias"] = torch.randn(
                     self.hidden_size, device="cuda", dtype=torch.float
                 )
-                weights[f"{expert_id}.w3.bias"] = (
-                    torch.randn(self.intermediate_size, device="cuda", dtype=torch.float)
-                    if self._is_gated
-                    else None
-                )
+                if self._is_gated:
+                    weights[f"{expert_id}.w3.bias"] = torch.randn(
+                        self.intermediate_size, device="cuda", dtype=torch.float
+                    )
+                else:
+                    weights[f"{expert_id}.w3.bias"] = torch.empty(
+                        0, device="cuda", dtype=torch.float
+                    )
         return weights
 
     def create_ref_module(self, routing_method, ref_cls=NVFP4RefMLPFusedMoE) -> torch.nn.Module:
@@ -714,13 +717,12 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             dtype=self.dtype,
             model_config=ModelConfig(quant_config=self.quant_config),
             bias=self.bias,
-            activation_type=self.activation_type,
+            swiglu_gptoss_style=self.swiglu_gptoss_style,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            activation_type=self.activation_type,
         )
-        if self._is_gated:
-            kwargs["swiglu_gptoss_style"] = self.swiglu_gptoss_style
         return ref_cls(**kwargs)
 
 

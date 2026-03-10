@@ -332,18 +332,9 @@ def generate_test_params() -> List:
 TEST_PARAMS = generate_test_params()
 
 
-# (activation_type, backend_type, quant_algo) — valid combinations only.
-_ELEMENT_WISE_BACKEND_COMBOS = [
-    (ActivationType.Relu2, MoeBackendType.CUTLASS, None),
-    (ActivationType.Relu2, MoeBackendType.TRTLLM, QuantAlgo.NVFP4),
-    (ActivationType.Silu, MoeBackendType.TRTLLM, QuantAlgo.NVFP4),
-    (ActivationType.Silu, MoeBackendType.TRTLLM, QuantAlgo.W4A16_MXFP4),
-]
-
-
 def generate_element_wise_test_params() -> List:
     params: List = []
-    for activation_type, backend_type, quant_algo in _ELEMENT_WISE_BACKEND_COMBOS:
+    for activation_type in [ActivationType.Silu, ActivationType.Relu2]:
         for (
             _,  # swiglu_alpha  (ignored)
             _,  # swiglu_beta   (ignored)
@@ -351,8 +342,8 @@ def generate_element_wise_test_params() -> List:
             model_config,
             seq_len,
             dtype,
-            _bt,  # overwritten by backend_type in loop
-            _qa,  # overwritten by quant_algo in loop
+            backend_type,
+            quant_algo,
             routing_method_cls,
             skip_reason,
             base_test_id,
@@ -361,10 +352,14 @@ def generate_element_wise_test_params() -> List:
             MOE_MODEL_CONFIGS,
             SEQ_LENS_TO_TEST,
             DTYPES_TO_TEST,
-            [backend_type],
-            [quant_algo],
+            [MoeBackendType.CUTLASS, MoeBackendType.TRTLLM],
+            [None, QuantAlgo.NVFP4],
         ):
             if skip_reason:
+                continue
+            if backend_type == MoeBackendType.CUTLASS and activation_type == ActivationType.Silu:
+                continue
+            if backend_type == MoeBackendType.TRTLLM and quant_algo is None:
                 continue
             test_id = f"act={activation_type.name}-{base_test_id}"
             param_values = (
@@ -415,9 +410,8 @@ TEST_PARAMS += generate_element_wise_test_params()
 #      - W4A16_MXFP4, W4A8_MXFP4_MXFP8
 #      - W8A16, W4A8_AWQ
 #    - When using element-wise activations
-#      - CUTLASS + Unquantized (Relu2 only)
-#      - TRTLLM + NVFP4
-#      - TRTLLM + W4A16_MXFP4
+#      - Unquantized (CUTLASS)
+#      - NVFP4 (TRTLLM, CUTLASS)
 #
 # 3. ACTIVATION DTYPES: float16, bfloat16
 #
@@ -537,6 +531,7 @@ def test_moe_backend(
             swiglu_alpha=swiglu_alpha if swiglu_gptoss_style else None,
             swiglu_beta=swiglu_beta if swiglu_gptoss_style else None,
             swiglu_limit=swiglu_limit if swiglu_gptoss_style else None,
+            activation_type=activation_type,
         )
 
         # Get swiglu tensors if swiglu_gptoss_style is enabled
@@ -562,6 +557,7 @@ def test_moe_backend(
             swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
             swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
             weight_loading_mode=weight_loading_mode,
+            activation_type=activation_type,
         )
 
         # W4A8_MXFP4_MXFP8 requires different weights for backend and reference
