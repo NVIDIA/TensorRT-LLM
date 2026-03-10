@@ -42,6 +42,7 @@ async def main():
         max_tokens=16384,
         enable_statistics=args.enable_statistics,
         enable_query_collector=args.enable_query_collector,
+        enable_tracing=True,
     )
 
     prompt = """

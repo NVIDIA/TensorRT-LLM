@@ -25,6 +25,7 @@ from tensorrt_llm.scaffolding.task_collection import (
     TaskMetricsCollector,
     drop_kv_cache_scope,
     sub_request_node,
+    with_execution_tracing,
     with_task_collection,
 )
 from tensorrt_llm.scaffolding.worker import Worker
@@ -130,6 +131,7 @@ def create_coder_scaffolding_llm(
     max_iterations: int = 50,
     max_parallel_requests: int = 16,
     enable_statistics: bool = False,
+    enable_tracing: bool = False,
 ) -> ScaffoldingLlm:
     """Create a ScaffoldingLlm configured for the Coder agent.
 
@@ -202,6 +204,9 @@ def create_coder_scaffolding_llm(
         )
         coder_type = wrap_with_detailed_profiler(Coder, "Coder")
 
+    if enable_tracing:
+        coder_type = with_execution_tracing("Coder")(coder_type)
+
     # Create the ChatWithMCPController
     chat_with_tools_controller = chat_with_mcp_controller_type(
         generation_controller, max_iterations=max_iterations
@@ -222,5 +227,8 @@ def create_coder_scaffolding_llm(
         },
         max_parallel_requests=max_parallel_requests,
     )
+
+    if enable_tracing:
+        scaffolding_llm.enable_output_task_collection()
 
     return scaffolding_llm

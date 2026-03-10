@@ -4,18 +4,22 @@ from .controller import (BestOfNController, ChatWithMCPController, Controller,
                          MajorityVoteController, NativeChatController,
                          NativeGenerationController, NativeRewardController,
                          ParallelProcess, PRMController)
+from .execution_trace import ExecutionTrace, TaskRecord, TraceEvent
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
+from .replay import (ReplayDriver, ReplayMCPWorker, TraceReplayDriver,
+                     create_replay_scaffolding_llm)
 from .scaffolding_llm import ScaffoldingLlm
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
                    MCPCallTask, OpenAIToolDescription, RewardTask,
                    StreamGenerationTask, SystemMessage, Task, TaskStatus,
                    UserMessage)
 from .task_collection import (ChatTokenCounter, DropKVCacheWorkerTag,
-                              GenerationTokenCounter, QueryCollector,
-                              TaskCollection, TaskMetricsCollector, TaskTimer,
+                              ExecutionTracer, GenerationTokenCounter,
+                              QueryCollector, TaskCollection,
+                              TaskMetricsCollector, TaskTimer,
                               drop_kv_cache_scope, sub_request_node,
-                              with_task_collection)
+                              with_execution_tracing, with_task_collection)
 from .worker import (MCPWorker, OpenaiWorker, TRTLLMWorker, TRTOpenaiWorker,
                      Worker)
 
@@ -64,4 +68,13 @@ __all__ = [
     "ScaffoldingBenchRequest",
     "DropKVCacheWorkerTag",
     "drop_kv_cache_scope",
+    "ExecutionTrace",
+    "TraceEvent",
+    "TaskRecord",
+    "ExecutionTracer",
+    "with_execution_tracing",
+    "ReplayDriver",
+    "TraceReplayDriver",
+    "ReplayMCPWorker",
+    "create_replay_scaffolding_llm",
 ]

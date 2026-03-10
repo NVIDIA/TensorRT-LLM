@@ -24,6 +24,7 @@ from tensorrt_llm.scaffolding.task_collection import (
     TaskMetricsCollector,
     drop_kv_cache_scope,
     sub_request_node,
+    with_execution_tracing,
     with_task_collection,
 )
 from tensorrt_llm.scaffolding.worker import Worker
@@ -222,6 +223,7 @@ def create_open_deep_research_scaffolding_llm(
     max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
+    enable_tracing: bool = False,
 ) -> ScaffoldingLlm:
     sampling_params = {
         "temperature": 0.9,
@@ -264,6 +266,9 @@ def create_open_deep_research_scaffolding_llm(
             QueryCollector,
         )(chat_with_mcp_type)
 
+    if enable_tracing:
+        supervisor_type = with_execution_tracing("Supervisor")(supervisor_type)
+
     research_chat_with_tools_controller = chat_with_mcp_type(
         gerneration_controller, max_iterations=1
     )
@@ -298,5 +303,8 @@ def create_open_deep_research_scaffolding_llm(
         },
         max_parallel_requests=max_parallel_requests,
     )
+
+    if enable_tracing:
+        scaffolding_llm.enable_output_task_collection()
 
     return scaffolding_llm

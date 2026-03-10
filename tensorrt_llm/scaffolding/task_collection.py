@@ -4,7 +4,8 @@ import time
 from enum import Enum
 from typing import Any, Dict, List, Tuple, Type
 
-from .controller import Controller, ParallelProcess
+from .controller import ParallelProcess, Controller
+from .execution_trace import ExecutionTrace, TaskRecord, TraceEvent
 from .task import ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task
 
 
@@ -18,6 +19,12 @@ class TaskCollection:
         pass
 
     def after_yield(self, tasks: List[Task]):
+        pass
+
+    def on_parallel_start(self, num_branches: int):
+        pass
+
+    def on_parallel_end(self, num_branches: int):
         pass
 
     @staticmethod
@@ -49,14 +56,16 @@ def with_task_collection(name: str, task_collection_cls: Type[TaskCollection],
                 def __call__(self):
                     for obj in self.gen:
                         if isinstance(obj, ParallelProcess):
+                            num_branches = len(obj.sub_gens)
                             new_sub_gens = []
                             for sub_gen in obj.sub_gens:
                                 new_sub_gen = TaskCollectionWrapper(
                                     self.task_collection, sub_gen)
                                 new_sub_gens.append(new_sub_gen)
                             obj.sub_gens = new_sub_gens
-
+                            self.task_collection.on_parallel_start(num_branches)
                             yield obj
+                            self.task_collection.on_parallel_end(num_branches)
                         else:  # obj is a list of tasks
                             self.task_collection.before_yield(obj)
                             yield obj
@@ -508,6 +517,183 @@ class TaskMetricsCollector(TaskCollection):
     @staticmethod
     def get_global_info() -> Any:
         return TaskMetricsCollector.statistics
+
+
+class ExecutionTracer(TaskCollection):
+    """Captures the full execution flow of a controller as a serializable trace.
+
+    Records task yields (with input/output data, token counts, timing) and
+    parallel process events. Attach via ``with_execution_tracing`` decorator
+    or ``with_task_collection("execution_tracer", ExecutionTracer, ...)``.
+
+    After execution, call ``export_trace(prompt)`` to obtain an
+    ``ExecutionTrace`` that can be saved to JSON and later replayed.
+    """
+
+    def __init__(self, controller_name: str = "root"):
+        super().__init__()
+        self.controller_name = controller_name
+        self.events: List[TraceEvent] = []
+        self._start_times: Dict[int, float] = {}
+        self._pre_message_counts: Dict[int, int] = {}
+
+    def _is_task_already_traced(self, task: Task) -> bool:
+        return getattr(task, '_tracing_in_progress', False)
+
+    def _mark_task_tracing_start(self, task: Task):
+        task._tracing_in_progress = True
+
+    def _mark_task_tracing_end(self, task: Task):
+        task._tracing_in_progress = False
+
+    def before_yield(self, tasks: List[Task]):
+        for task in tasks:
+            if self._is_task_already_traced(task):
+                continue
+            self._mark_task_tracing_start(task)
+            task_id = id(task)
+            self._start_times[task_id] = time.time()
+
+            if isinstance(task, ChatTask):
+                task.enable_token_counting = True
+                self._pre_message_counts[task_id] = len(task.messages)
+
+    def after_yield(self, tasks: List[Task]):
+        task_records: List[TaskRecord] = []
+        max_duration_ms = 0.0
+        event_timestamp = time.time()
+
+        for task in tasks:
+            task_id = id(task)
+            if task_id not in self._start_times:
+                continue
+
+            end_time = time.time()
+            duration_ms = (end_time - self._start_times[task_id]) * 1000
+            max_duration_ms = max(max_duration_ms, duration_ms)
+            del self._start_times[task_id]
+            self._mark_task_tracing_end(task)
+
+            record = self._build_task_record(task, task_id)
+            task_records.append(record)
+
+        if task_records:
+            self.events.append(
+                TraceEvent(
+                    event_type="task_yield",
+                    timestamp=event_timestamp,
+                    duration_ms=max_duration_ms,
+                    tasks=task_records,
+                ))
+
+    def on_parallel_start(self, num_branches: int):
+        self.events.append(
+            TraceEvent(
+                event_type="parallel_start",
+                timestamp=time.time(),
+                num_branches=num_branches,
+            ))
+
+    def on_parallel_end(self, num_branches: int):
+        self.events.append(
+            TraceEvent(
+                event_type="parallel_end",
+                timestamp=time.time(),
+                num_branches=num_branches,
+            ))
+
+    def _build_task_record(self, task: Task, task_id: int) -> TaskRecord:
+        worker_tag = str(task.worker_tag.value if hasattr(
+            task.worker_tag, 'value') else task.worker_tag)
+
+        record = TaskRecord(
+            task_type=type(task).__name__,
+            worker_tag=worker_tag,
+        )
+
+        if isinstance(task, ChatTask):
+            pre_count = self._pre_message_counts.pop(task_id, 0)
+            record.input_messages = [
+                self._serialize_message(msg)
+                for msg in task.messages[:pre_count]
+            ]
+            record.output_messages = [
+                self._serialize_message(msg)
+                for msg in task.messages[pre_count:]
+            ]
+            record.prompt_tokens = getattr(task, 'prompt_tokens_num', 0)
+            record.completion_tokens = getattr(task, 'completion_tokens_num', 0)
+            record.reasoning_tokens = getattr(task, 'reasoning_tokens_num', 0)
+            record.finish_reason = getattr(task, 'finish_reason', None)
+            if task.tools is not None:
+                try:
+                    record.tools = [
+                        t.to_dict() if hasattr(t, 'to_dict') else t
+                        for t in task.tools
+                    ]
+                except (TypeError, AttributeError):
+                    record.tools = None
+        elif isinstance(task, MCPCallTask):
+            record.tool_call_id = task.tool_call_id
+            record.tool_name = task.tool_name
+            if isinstance(task.args, str):
+                try:
+                    record.tool_args = json.loads(task.args)
+                except (json.JSONDecodeError, TypeError):
+                    record.tool_args = task.args
+            else:
+                record.tool_args = task.args
+            record.result_str = task.result_str
+        elif isinstance(task, GenerationTask):
+            record.input_str = task.input_str
+            record.output_str = task.output_str
+            record.output_token_count = (len(task.output_tokens)
+                                         if task.output_tokens else 0)
+
+        return record
+
+    @staticmethod
+    def _serialize_message(message) -> Dict[str, Any]:
+        """Serialize a RoleMessage to a dictionary."""
+        result: Dict[str, Any] = {
+            "role": getattr(message, "role", None),
+            "content": getattr(message, "content", None),
+        }
+        if hasattr(message, "reasoning") and message.reasoning is not None:
+            result["reasoning"] = message.reasoning
+        if hasattr(
+                message,
+                "reasoning_content") and message.reasoning_content is not None:
+            result["reasoning_content"] = message.reasoning_content
+        if hasattr(message, "tool_calls") and message.tool_calls is not None:
+            result["tool_calls"] = [{
+                "id": tc.id,
+                "type": "function",
+                "function": {
+                    "name": tc.function.name,
+                    "arguments": tc.function.arguments,
+                },
+            } for tc in message.tool_calls]
+        if hasattr(message, "tool_call_id"):
+            result["tool_call_id"] = message.tool_call_id
+        return result
+
+    def export_trace(self,
+                     prompt: str,
+                     metadata: Dict[str, Any] = None) -> ExecutionTrace:
+        """Build and return the complete ExecutionTrace for this request."""
+        return ExecutionTrace(
+            prompt=prompt,
+            events=list(self.events),
+            metadata=metadata or {},
+        )
+
+
+def with_execution_tracing(controller_name: str):
+    """Convenience decorator that attaches an ExecutionTracer to a controller."""
+    return with_task_collection("execution_tracer",
+                                ExecutionTracer,
+                                controller_name=controller_name)
 
 
 class SubRequestMarker(TaskCollection):
