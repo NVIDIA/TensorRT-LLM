@@ -55,6 +55,9 @@ MODEL_PATH_DICT = {
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
     "gpt_oss_120b_fp4": "gpt_oss/gpt-oss-120b",
+    "k2_thinking_fp4": "Kimi-K2-Thinking-NVFP4",
+    "qwen3_235b_a22b_fp4": "Qwen3/saved_models_Qwen3-235B-A22B_nvfp4_hf",  # Qwen3-235B-A22B-FP4
+    "qwen3_235b_a22b_fp8": "Qwen3/saved_models_Qwen3-235B-A22B_fp8_hf",  # Qwen3-235B-A22B-FP8
 }
 
 SUPPORTED_GPU_TYPE = [
