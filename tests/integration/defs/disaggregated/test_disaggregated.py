@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import json
 import os
 import re
 import shutil
@@ -24,6 +25,7 @@ from collections import namedtuple
 from dataclasses import dataclass
 from typing import Any
 
+import aiohttp
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
@@ -2101,6 +2103,122 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
                                   requests_per_burst=32,
                                   model_path=deepseek_v3_model_root,
                                   cwd=llm_venv.get_working_directory())
+
+
+@pytest.mark.skip_less_device(4)
+@skip_no_hopper
+@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+                         indirect=True)
+@pytest.mark.parametrize("streaming", [False, True],
+                         ids=["non_streaming", "streaming"])
+def test_disaggregated_logprobs(disaggregated_test_root,
+                                disaggregated_example_root, llm_venv,
+                                deepseek_v3_model_root, streaming):
+    """Test that logprobs work correctly in disaggregated serving mode.
+
+    Uses DeepSeek-V3-Lite-fp8 with TP2 (ctx) + TP2 (gen) on 4 GPUs to cover
+    the customer-reported bug where 'LogProbStorage' object has no attribute
+    'cum_log_probs' when logprobs are requested via the OpenAI API in
+    disaggregated serving mode with multi-GPU tensor parallelism.
+
+    Sends completion requests with logprobs enabled (both streaming and
+    non-streaming) and verifies that:
+    1. The request completes without server errors
+    2. The response contains logprobs for each token
+    """
+    setup_model_symlink(llm_venv, deepseek_v3_model_root,
+                        "DeepSeek-V3-Lite/fp8")
+
+    config_file = get_test_config("deepseek_v3_lite_fp8_nixl",
+                                  disaggregated_example_root,
+                                  os.path.dirname(__file__))
+    _, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+        setup_disagg_cluster(config_file, env=llm_venv._new_env,
+                             model_name=deepseek_v3_model_root,
+                             cwd=llm_venv.get_working_directory())
+
+    try:
+        server_url = f"http://localhost:{server_port}"
+        max_tokens = 20
+        prompts = [
+            "What is the capital of France?",
+            "Explain quantum computing in simple terms.",
+            "Write a short poem about the ocean.",
+        ]
+
+        async def check_logprobs():
+            async with aiohttp.ClientSession() as session:
+                for prompt in prompts:
+                    payload = {
+                        "model": "DeepSeek-V3-Lite/fp8",
+                        "prompt": prompt,
+                        "max_tokens": max_tokens,
+                        "logprobs": 1,
+                        "stream": streaming,
+                    }
+                    async with session.post(
+                            f"{server_url}/v1/completions",
+                            json=payload,
+                            timeout=aiohttp.ClientTimeout(
+                                total=120)) as resp:
+                        assert resp.status == 200, \
+                            f"Server returned {resp.status}: {await resp.text()}"
+
+                        if streaming:
+                            all_token_logprobs = []
+                            async for line in resp.content:
+                                decoded = line.decode("utf-8").strip()
+                                if not decoded.startswith("data: "):
+                                    continue
+                                data_str = decoded[len("data: "):]
+                                if data_str == "[DONE]":
+                                    break
+                                try:
+                                    chunk = json.loads(data_str)
+                                except json.JSONDecodeError as e:
+                                    raise AssertionError(
+                                        f"Invalid streaming chunk JSON: "
+                                        f"{data_str[:200]}"
+                                    ) from e
+                                choices = chunk.get("choices", [])
+                                if choices:
+                                    lp_data = choices[0].get("logprobs")
+                                    if lp_data:
+                                        lps = lp_data.get(
+                                            "token_logprobs", [])
+                                        all_token_logprobs.extend(lps)
+                            assert len(all_token_logprobs) > 0, \
+                                "Streaming response should contain logprobs"
+                            for lp in all_token_logprobs:
+                                if lp is not None:
+                                    assert lp <= 0.0, \
+                                        f"Log probability {lp} should be <= 0"
+                        else:
+                            result = await resp.json()
+                            choices = result.get("choices", [])
+                            assert len(choices) > 0, \
+                                "Response should have choices"
+                            logprobs_data = choices[0].get("logprobs")
+                            assert logprobs_data is not None, \
+                                "Response should contain logprobs"
+                            token_logprobs = logprobs_data.get(
+                                "token_logprobs", [])
+                            tokens = logprobs_data.get("tokens", [])
+                            assert len(token_logprobs) == len(tokens), (
+                                f"logprobs count mismatch: "
+                                f"{len(token_logprobs)} logprobs for "
+                                f"{len(tokens)} tokens")
+                            assert len(token_logprobs) > 0, \
+                                "Response should have token logprobs"
+                            for lp in token_logprobs:
+                                if lp is not None:
+                                    assert lp <= 0.0, \
+                                        f"Log probability {lp} should be <= 0"
+
+        asyncio.run(check_logprobs())
+    finally:
+        terminate(*ctx_workers, *gen_workers, disagg_server)
+        shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.skip_less_device(8)
