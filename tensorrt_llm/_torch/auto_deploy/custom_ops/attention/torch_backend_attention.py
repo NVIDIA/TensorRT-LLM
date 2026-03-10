@@ -35,7 +35,31 @@ from ..attention_interface import (
     ResourceHandlerDict,
     UnpagedResourceHandler,
 )
-from .torch_attention import repeat_kv, update_kv_cache
+from .torch_attention import repeat_kv
+
+
+def _update_kv_cache(
+    key_states: torch.Tensor,
+    value_states: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    seq_len: torch.Tensor,  # metadata
+    input_pos: torch.Tensor,  # metadata
+    slot_idx: torch.Tensor,
+    seq_start: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Reference implementation for update kv cache function. Assumes KV cache layout to be [B,S,N,D].
+    This function can be used to build reference attention implementations that use KV cache.
+    """
+
+    for idx in range(seq_len.shape[0]):
+        k_cache[slot_idx[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = key_states[
+            seq_start[idx] : seq_start[idx] + seq_len[idx], ...
+        ]
+        v_cache[slot_idx[idx], input_pos[idx] : input_pos[idx] + seq_len[idx], :, :] = value_states[
+            seq_start[idx] : seq_start[idx] + seq_len[idx], ...
+        ]
 
 
 def _apply_logit_softcapping(attn_scores: torch.Tensor, logit_cap: Optional[float]) -> torch.Tensor:
@@ -149,7 +173,7 @@ def _torch_context_mha(
 ) -> None:
     """Context attention (multiple tokens, potentially multiple sequences) using existing torch functions."""
     # Update KV cache first using existing function
-    update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
+    _update_kv_cache(k, v, k_cache, v_cache, seq_len, input_pos, slot_idx, seq_start)
 
     # Compute attention for each sequence
     attn_outputs = []
@@ -317,8 +341,8 @@ def torch_backend_mha_with_cache(
 
     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
 
-    # Create output tensor
-    y = q.new_empty(*bs_view, num_heads, v_head_dim).contiguous()
+    # Preallocate output tensor (zeros so padding positions are clean)
+    y = q.new_zeros(*bs_view, num_heads, v_head_dim).contiguous()
 
     # Compute attention
     if s == 1:

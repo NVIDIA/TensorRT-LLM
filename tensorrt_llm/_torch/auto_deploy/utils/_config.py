@@ -41,7 +41,8 @@ class DynamicYamlWithDeepMergeSettingsSource(YamlConfigSettingsSource):
                 "specify the `yaml_default` field in your pydantic model instead."
             )
 
-    def _read_files(self, files: PathType | None) -> dict[str, Any]:
+    def _read_files(self, files: PathType | None, **kwargs: Any) -> dict[str, Any]:
+        """Read and deep-merge YAML files. Accepts deep_merge kwarg for parent API compatibility."""
         if files is None:
             return {}
         if isinstance(files, (str, os.PathLike)):
@@ -124,7 +125,7 @@ class DynamicYamlMixInForSettings:
           settings.
     - Explicitly initialized fields for inner settings take precedence over outer yaml configs for
       inner settings since they are provided as init arguments.
-    - Check out ``tests/unittest/_torch/auto_deploy/unit/singlegpu/utils/test_config.py`` for more
+    - Check out ``tests/unittest/auto_deploy/singlegpu/utils/test_config.py`` for more
       examples.
 
 

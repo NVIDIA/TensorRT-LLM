@@ -1,0 +1,19 @@
+--- a/cpp/grammar_functor.cc
++++ b/cpp/grammar_functor.cc
+@@ -1750,11 +1750,11 @@
+   void Apply(Grammar* grammar);
+   static std::optional<uint64_t> HashSequence(const Grammar& grammar, int32_t sequence_id);
+
+-  static const int16_t kNotEndStateFlag = -0x100;
+-  static const int16_t kEndStateFlag = -0x200;
+-  static const int16_t kSelfRecursionFlag = -0x300;
+-  static const int16_t kSimpleCycleFlag = -0x400;
+-  static const int16_t kUnKnownFlag = -0x500;
++  static constexpr int16_t kNotEndStateFlag = -0x100;
++  static constexpr int16_t kEndStateFlag = -0x200;
++  static constexpr int16_t kSelfRecursionFlag = -0x300;
++  static constexpr int16_t kSimpleCycleFlag = -0x400;
++  static constexpr int16_t kUnKnownFlag = -0x500;
+
+  private:
+   Grammar* grammar_;

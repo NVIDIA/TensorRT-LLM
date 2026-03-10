@@ -113,7 +113,7 @@ python3 ../summarize.py --engine_dir ./trt_engines/gptj_fp16_tp1.refit \
 1. Download the llama-7b-hf checkpoint and saved in /llm-models/llama-models/llama-7b-hf/.
 
 2. Calibrate the checkpoint and convert into TensorRT LLM format.
-Run below command lines in [`examples/models/core/llama`](../llama) directory.
+Run below command lines in [`examples/models/core/llama`](../models/core/llama) directory.
 ```bash
 # Calibrate INT4 using AMMO.
 python ../quantization/quantize.py --model_dir  /llm-models/llama-models/llama-7b-hf/ \
@@ -154,7 +154,7 @@ python3 ../summarize.py --engine_dir trt_int4_AWQ_full_from_wtless \
 1. Download the llama-7b-hf checkpoint and saved in /llm-models/llama-models/llama-7b-hf/.
 
 2. Convert the checkpoint into TensorRT LLM format.
-Run below command lines in [`examples/models/core/llama`](../llama) directory.
+Run below command lines in [`examples/models/core/llama`](../models/core/llama) directory.
 ```bash
 python3 convert_checkpoint.py --model_dir /llm-models/llama-models/llama-7b-hf/ \
                 --output_dir ./llama-7b-hf-fp16-woq \
@@ -194,7 +194,7 @@ python3 ../summarize.py --engine_dir ./engines/llama-7b-hf-fp16-woq-1gpu-wtless-
 1. Download the llama-v2-70b-hf checkpoint and saved in /llm-models/llama-models-v2/llama-v2-70b-hf/.
 
 2. Calibrate the checkpoint and convert into TensorRT LLM format.
-Run below command lines in [`examples/models/core/llama`](../llama) directory.
+Run below command lines in [`examples/models/core/llama`](../models/core/llama) directory.
 ```bash
 # Calibrate FP8 using AMMO.
 python ../quantization/quantize.py --model_dir /llm-models/llama-models-v2/llama-v2-70b-hf/ \

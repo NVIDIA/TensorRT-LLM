@@ -1283,12 +1283,12 @@ class TritonFusedMoE(MoE):
         cls,
         quant_algo: Optional["QuantAlgo"],
         dtype_activation: torch.dtype = torch.bfloat16,
-        gptoss_style: bool = False,
+        swiglu_gptoss_style: bool = False,
     ) -> Tuple[bool, Optional[str]]:
         """
         Check if TritonFusedMoE can implement the given quantization algorithm.
 
-        TritonFusedMoE supports (SM90 only, gptoss_style=True only):
+        TritonFusedMoE supports (SM90 only, swiglu_gptoss_style=True only):
         - Unquantized (BF16 only)
         - FP8 per-tensor (QDQ)
         - W4A8_MXFP4_FP8
@@ -1298,8 +1298,8 @@ class TritonFusedMoE(MoE):
             quant_algo: The quantization algorithm to check (None for unquantized)
             dtype_activation: The activation data type. In unquantized mode, activation,
                 weight, and output dtypes must all match (only bfloat16 supported).
-            gptoss_style: Whether gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
-                TritonFusedMoE ONLY supports gptoss_style=True.
+            swiglu_gptoss_style: Whether swiglu_gptoss_style (bias/swiglu with custom alpha/beta/limit) is enabled.
+                TritonFusedMoE ONLY supports swiglu_gptoss_style=True.
 
         Returns:
             Tuple[bool, Optional[str]]: (can_implement, skip_reason)
@@ -1316,10 +1316,10 @@ class TritonFusedMoE(MoE):
             return _warn_and_return(
                 f"TritonFusedMoE only supports SM90, got SM{sm_version}")
 
-        # TritonFusedMoE ONLY supports gptoss_style=True
-        if not gptoss_style:
+        # TritonFusedMoE ONLY supports swiglu_gptoss_style=True
+        if not swiglu_gptoss_style:
             return _warn_and_return(
-                "TritonFusedMoE only supports gptoss_style=True")
+                "TritonFusedMoE only supports swiglu_gptoss_style=True")
 
         # Unquantized mode - only bfloat16 is supported
         if quant_algo is None:

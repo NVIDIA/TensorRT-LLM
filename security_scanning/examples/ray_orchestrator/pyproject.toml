@@ -7,7 +7,7 @@ authors = [
 ]
 requires-python = ">=3.10,<3.13"
 dependencies = [
-    "ray[default] (>=2.53.0,<3.0.0)"
+    "ray[default] (>=2.54.0,<3.0.0)"
 ]
 
 

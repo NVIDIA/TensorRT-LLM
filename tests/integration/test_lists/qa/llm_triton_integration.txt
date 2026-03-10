@@ -395,6 +395,7 @@ triton_server/test_triton_llm.py::test_benchmark_core_model[llama_v2_7b-False-1-
 triton_server/test_triton_llm.py::test_benchmark_core_model[gptj_6b-False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False]
 triton_server/test_triton_llm.py::test_llmapi_backend[1-0-disableDecoupleMode-tensorrt_llm]
 triton_server/test_triton_llm.py::test_llmapi_backend[1-0-enableDecoupleMode-tensorrt_llm]
+triton_server/test_triton_llm.py::test_llmapi_backend_multi_instance
 triton_server/test_triton_memleak.py::test_llama_v3_8b_rss_increasement[test_basic-True-1---False-True-True-0-128-enableDecoupleMode-inflight_fused_batching-disableTrtOverlap--max_utilization-4096--1-1-1-False-ensemble]
 triton_server/test_triton_multi_node.py::test_gpt175b_dummyWeights_multi_node_engine_config
 triton_server/test_triton_rcca.py::test_rcca_bug_4323566[False-1---False-True-False-0-128-disableDecoupleMode-inflight_fused_batching-disableTrtOverlap--guaranteed_no_evict---1-1-1-False-ensemble]

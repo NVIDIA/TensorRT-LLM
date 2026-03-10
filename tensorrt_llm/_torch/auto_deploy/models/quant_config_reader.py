@@ -11,6 +11,8 @@ import os
 from abc import ABC, abstractmethod
 from typing import Any, Callable, Dict, Optional, Tuple, Type
 
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+
 
 class QuantConfigReader(ABC):
     """Base class for reading and parsing quantization config."""
@@ -83,7 +85,9 @@ class QuantConfigReaderRegistry:
 
 @QuantConfigReaderRegistry.register("modelopt")
 class ModelOPTQuantConfigReader(QuantConfigReader):
-    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*")
+    _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens", "*.mixer.gate*", "*.mlp.gate")
+    DEFAULT_TORCH_DTYPE = "float16"
+    DEFAULT_KV_CACHE_DTYPE = "fp8"
 
     def read_config(self, config: Dict) -> Dict:
         producer = config.get("producer", {}).get("name")
@@ -97,10 +101,12 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
         quant_config["exclude_modules"] = excludes + [
             n for n in self._ALWAYS_EXCLUDE if n not in excludes
         ]
-        # Update dtype
-        if quant_config.get("quant_algo") == "NVFP4":
-            quant_config["torch_dtype"] = "float16"
 
+        if "torch_dtype" not in quant_config:
+            ad_logger.warning(
+                f"torch_dtype not found in quant_config, using default {self.DEFAULT_TORCH_DTYPE}"
+            )
+            quant_config["torch_dtype"] = self.DEFAULT_TORCH_DTYPE
         # Handle kv cache
         kv_algo = quant_config.get("kv_cache_quant_algo")
         if kv_algo:
@@ -110,11 +116,7 @@ class ModelOPTQuantConfigReader(QuantConfigReader):
 
         self._quant_config = quant_config
 
-        extra_model_kwargs: Dict[str, Any] = {}
-        if quant_config.get("quant_algo", None) == "NVFP4":
-            extra_model_kwargs["torch_dtype"] = "float16"
-
-        return extra_model_kwargs
+        return {}
 
     @classmethod
     def from_file(
@@ -147,6 +149,7 @@ class HFQuantConfigReader(QuantConfigReader):
     """
 
     _ALWAYS_EXCLUDE = ("lm_head", "model.embed_tokens")
+    _SUPPORTED_QUANT_METHODS = ("mxfp4", "gptq", "fp8")
 
     def __init__(self):
         super().__init__()
@@ -186,7 +189,7 @@ class HFQuantConfigReader(QuantConfigReader):
         # TODO(Fridah-nv):this class is only verified with GPT-OSS MXFP4 and INT4-GPTQ, other hf quantizers
         # should have similar workflow and will be added to the pipeline
         quant_method = str(qconf.get("quant_method", "")).lower()
-        if quant_method not in ["mxfp4", "gptq"]:
+        if quant_method not in cls._SUPPORTED_QUANT_METHODS:
             return None
 
         # Validate GPTQ config: currently only INT4 with group_size=128 is supported

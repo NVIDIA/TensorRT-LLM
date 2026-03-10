@@ -23,7 +23,11 @@ from ._utils import ItemHolderWithSharedPool, PooledFactoryBase, _unwrap, div_up
 
 def _is_prop_supported(prop: drv.CUmemAllocationProp) -> bool:
     err, handle = drv.cuMemCreate(2 << 20, prop, 0)
-    if err == drv.CUresult.CUDA_ERROR_NOT_PERMITTED or err == drv.CUresult.CUDA_ERROR_NOT_SUPPORTED:
+    if (
+        err == drv.CUresult.CUDA_ERROR_NOT_PERMITTED
+        or err == drv.CUresult.CUDA_ERROR_NOT_SUPPORTED
+        or err == drv.CUresult.CUDA_ERROR_INVALID_DEVICE
+    ):
         return False
     elif err == drv.CUresult.CUDA_SUCCESS:
         _unwrap(drv.cuMemRelease(handle))
@@ -52,6 +56,10 @@ class NativePhysMemAllocator:
         prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_FABRIC
         if not _is_prop_supported(prop):
             prop.requestedHandleTypes = drv.CUmemAllocationHandleType.CU_MEM_HANDLE_TYPE_NONE
+            if not _is_prop_supported(prop):
+                prop.allocFlags.gpuDirectRDMACapable = 0
+                if not _is_prop_supported(prop):
+                    raise ValueError("Failed to create physical memory allocation property")
         self._prop = prop
         self._outstanding_handles = set()
 
@@ -73,7 +81,7 @@ class NativePhysMemAllocator:
             _unwrap(drv.cuMemRelease(handle))
         except:
             print(
-                f"Failed to release handle {handle}. num_oustanding = {len(self._outstanding_handles)}"
+                f"Failed to release handle {handle}. num_outstanding = {len(self._outstanding_handles)}"
             )
             raise
 
@@ -97,6 +105,7 @@ class PooledPhysMemAllocator(PooledFactoryBase[drv.CUmemGenericAllocationHandle,
     phys_mem_size: int
 
     def __init__(self, phys_mem_size: int) -> None:
+        """phys_mem_size is the size of each physical memory chunk."""
         raw_alloc = NativePhysMemAllocator(phys_mem_size)
         self.device_id = raw_alloc.device_id
         self.phys_mem_size = phys_mem_size
@@ -134,6 +143,7 @@ class VirtMem:
     def destroy(self) -> None:
         if self._vm_size == 0:
             return
+        _unwrap(drv.cuCtxSynchronize())
         while self._pm_stack:
             self._pop().close()
         _unwrap(drv.cuMemAddressFree(self._address, self._vm_size))
@@ -156,6 +166,7 @@ class VirtMem:
             raise
 
     def shrink(self, num_phys_mem: int) -> None:
+        _unwrap(drv.cuCtxSynchronize())
         for _ in range(num_phys_mem):
             self._pop().close()
 

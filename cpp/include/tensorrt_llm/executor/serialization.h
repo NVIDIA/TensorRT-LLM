@@ -349,6 +349,11 @@ public:
     static void serialize(KVCacheUpdatedData const& data, std::ostream& os);
     [[nodiscard]] static KVCacheUpdatedData deserializeKVCacheUpdatedData(std::istream& is);
 
+    // MmKey
+    [[nodiscard]] static size_t serializedSize(MmKey const& key);
+    static void serialize(MmKey const& key, std::ostream& os);
+    [[nodiscard]] static MmKey deserializeMmKey(std::istream& is);
+
     // UniqueToken
     [[nodiscard]] static size_t serializedSize(tensorrt_llm::runtime::UniqueToken const& token);
     static void serialize(tensorrt_llm::runtime::UniqueToken const& token, std::ostream& os);

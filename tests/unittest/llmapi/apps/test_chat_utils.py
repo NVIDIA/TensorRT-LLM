@@ -1,8 +1,14 @@
 from unittest.mock import MagicMock
 
 import pytest
+from transformers import AutoConfig
 
-from tensorrt_llm.serve.chat_utils import load_chat_template, parse_chat_message_content
+from tensorrt_llm.inputs.registry import MULTIMODAL_PLACEHOLDER_REGISTRY
+from tensorrt_llm.serve.chat_utils import (
+    load_chat_template,
+    parse_chat_message_content,
+    parse_chat_messages_coroutines,
+)
 
 
 @pytest.fixture
@@ -222,3 +228,123 @@ class TestLoadChatTemplate:
         template = "{{ messages }}"
         template_content = load_chat_template(template)
         assert template_content == template
+
+
+_MM_MODEL_TYPE = "qwen3_vl"
+_IMG_PLACEHOLDER = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
+    model_type=_MM_MODEL_TYPE, modality="image"
+)
+_VIDEO_PLACEHOLDER = MULTIMODAL_PLACEHOLDER_REGISTRY.get_placeholder(
+    model_type=_MM_MODEL_TYPE, modality="video"
+)
+
+
+class TestMultimodalPlaceholderCounts:
+    """Verify per-message multimodal placeholder counts.
+
+    Regression test: previously, image/video counts leaked between messages,
+    causing later text-only messages to report stale placeholder counts.
+    """
+
+    @pytest.mark.parametrize(
+        "messages, expected_mm_placeholder_counts",
+        [
+            # Case #1: 2 messages with 1 image each, 3rd message is text-only.
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What's in this image?"},
+                            {"type": "image_url", "image_url": {"url": "foo"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "And this one?"},
+                            {"type": "image_url", "image_url": {"url": "bar"}},
+                        ],
+                    },
+                    {"role": "user", "content": "No image here, just text"},
+                ],
+                [{_IMG_PLACEHOLDER: 1}, {_IMG_PLACEHOLDER: 1}, {}],
+            ),
+            # Case #2: first and last message have one image each, 2nd is text-only.
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What's in this image?"},
+                            {"type": "image_url", "image_url": {"url": "foo"}},
+                        ],
+                    },
+                    {"role": "user", "content": "No image here, just text"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "And this one?"},
+                            {"type": "image_url", "image_url": {"url": "bar"}},
+                        ],
+                    },
+                ],
+                [{_IMG_PLACEHOLDER: 1}, {}, {_IMG_PLACEHOLDER: 1}],
+            ),
+            # Case #3: 1st message with several images, 2nd without any, 3rd with a video.
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What do these images have in common?"},
+                            {"type": "image_url", "image_url": {"url": "foo1"}},
+                            {"type": "image_url", "image_url": {"url": "foo2"}},
+                            {"type": "image_url", "image_url": {"url": "foo3"}},
+                        ],
+                    },
+                    {"role": "user", "content": "No image here, just text"},
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the image and the video."},
+                            {"type": "image_url", "image_url": {"url": "bar"}},
+                            {"type": "video_url", "video_url": {"url": "baz"}},
+                        ],
+                    },
+                ],
+                [{_IMG_PLACEHOLDER: 3}, {}, {_IMG_PLACEHOLDER: 1, _VIDEO_PLACEHOLDER: 1}],
+            ),
+            # Case #4: 1st message with image and video, 2nd with several videos, last is text-only.
+            (
+                [
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "Describe the image and the video."},
+                            {"type": "image_url", "image_url": {"url": "bar"}},
+                            {"type": "video_url", "video_url": {"url": "baz"}},
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": "What do these videos have in common?"},
+                            {"type": "video_url", "video_url": {"url": "foo1"}},
+                            {"type": "video_url", "video_url": {"url": "foo2"}},
+                            {"type": "video_url", "video_url": {"url": "foo3"}},
+                        ],
+                    },
+                    {"role": "user", "content": "No image here, just text"},
+                ],
+                [{_IMG_PLACEHOLDER: 1, _VIDEO_PLACEHOLDER: 1}, {_VIDEO_PLACEHOLDER: 3}, {}],
+            ),
+        ],
+    )
+    def test_per_message_counts(self, messages, expected_mm_placeholder_counts):
+        mock_config = MagicMock(spec=AutoConfig)
+        mock_config.model_type = _MM_MODEL_TYPE
+
+        _, _, mm_placeholder_counts = parse_chat_messages_coroutines(messages, mock_config, None)
+
+        assert mm_placeholder_counts == expected_mm_placeholder_counts

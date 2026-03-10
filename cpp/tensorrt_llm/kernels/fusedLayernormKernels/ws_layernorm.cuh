@@ -690,7 +690,7 @@ struct WarpSpecializedLayerNorm
                     typename PackType<typename Traits::OutputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                         normed_output;
                     typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type output;
-                    typename PackType<typename Traits::AccumulatorType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
+                    typename PackType<typename Traits::InputType, Traits::PACKED_ELEMS_PER_COMPUTE>::type
                         high_precision_normed_output;
 
 #pragma unroll Traits::PACKED_ELEMS_PER_COMPUTE
@@ -719,6 +719,11 @@ struct WarpSpecializedLayerNorm
                             normed_out += beta[j];
                         }
 
+                        if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
+                        {
+                            high_precision_normed_output.array[j] = (typename Traits::InputType) normed_out;
+                        }
+
                         if constexpr (Traits::OUTPUT_SCALE != SCALE_TYPE::NONE)
                         {
                             static_assert(Traits::OUTPUT_SCALE == SCALE_TYPE::SCALAR);
@@ -728,11 +733,6 @@ struct WarpSpecializedLayerNorm
                         if constexpr (Traits::UNNORMED_OUTPUT)
                         {
                             output.array[j] = (typename Traits::InputType) data[m_offset][i][j];
-                        }
-
-                        if constexpr (Traits::HIGH_PRECISION_NORMED_OUTPUT)
-                        {
-                            high_precision_normed_output.array[j] = normed_out;
                         }
 
                         normed_output.array[j] = (typename Traits::OutputType) normed_out;

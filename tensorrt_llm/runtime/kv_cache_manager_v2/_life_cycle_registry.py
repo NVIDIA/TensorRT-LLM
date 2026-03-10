@@ -16,30 +16,54 @@
 from typing import Iterator, NamedTuple, NewType, TypeAlias, cast
 
 from ._common import SlidingWindowSize
-from ._config import KVCacheManagerConfig
+from ._config import AttentionLayerConfig, KVCacheManagerConfig, LayerConfig, SsmLayerConfig
 from ._utils import TypedIndexList, div_up, typed_enumerate
 
 
-class LifeCycle(NamedTuple):
+class AttnLifeCycle(NamedTuple):
     window_size: SlidingWindowSize
     num_sink_blocks: int  # div_up(num_sink_tokens, tokens_per_block)
 
     @staticmethod
     def make(
         window_size: SlidingWindowSize, num_sink_tokens: int | None, tokens_per_block: int
-    ) -> "LifeCycle":
+    ) -> "AttnLifeCycle":
         assert tokens_per_block > 0
         assert window_size is None or window_size > 0
         assert num_sink_tokens is None or num_sink_tokens >= 0
         assert num_sink_tokens in (None, 0) or window_size is not None
         num_sink_blocks = div_up(num_sink_tokens or 0, tokens_per_block)
-        return LifeCycle(window_size, num_sink_blocks)
+        return AttnLifeCycle(window_size, num_sink_blocks)
 
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> tuple[int, int]:
+        num_blocks = div_up(history_length, tokens_per_block)
+        start = min(num_blocks, self.num_sink_blocks)
+        if self.window_size is None:
+            return start, start
+        return start, max(start, (history_length + 1 - self.window_size) // tokens_per_block)
+
+
+class SsmLifeCycle(NamedTuple):
+    def get_stale_range(self, history_length: int, tokens_per_block: int) -> tuple[int, int]:
+        return (0, history_length // tokens_per_block)
+
+
+ssm_life_cycle = SsmLifeCycle()
 
 LifeCycleId = NewType("LifeCycleId", int)
 
+LifeCycle = AttnLifeCycle | SsmLifeCycle
+
 # For public exposure
 LayerGroupId: TypeAlias = LifeCycleId
+
+
+def make_life_cycle(layer: LayerConfig, tokens_per_block: int) -> LifeCycle:
+    if isinstance(layer, SsmLayerConfig):
+        return ssm_life_cycle
+    else:
+        assert isinstance(layer, AttentionLayerConfig)
+        return AttnLifeCycle.make(layer.window_size, layer.num_sink_tokens, tokens_per_block)
 
 
 class LifeCycleRegistry:
@@ -51,9 +75,7 @@ class LifeCycleRegistry:
         self._life_cycle_list = cast(TypedIndexList[LifeCycleId, LifeCycle], [])
         self._life_cycle_id_dict = dict[LifeCycle, LifeCycleId]()
         for layer in config.layers:
-            details = LifeCycle.make(
-                layer.window_size, layer.num_sink_tokens, config.tokens_per_block
-            )
+            details = make_life_cycle(layer, config.tokens_per_block)
             if details not in self._life_cycle_id_dict:
                 assert len(self._life_cycle_id_dict) == len(self._life_cycle_list), (
                     "corrupted life cycle registry"
@@ -88,3 +110,16 @@ class LifeCycleRegistry:
 
     def __contains__(self, lc: LifeCycle) -> bool:
         return lc in self._life_cycle_id_dict
+
+    @property
+    def ssm_life_cycle_id(self) -> LifeCycleId | None:
+        return self._life_cycle_id_dict.get(ssm_life_cycle)
+
+    @property
+    def has_ssm(self) -> bool:
+        return ssm_life_cycle in self._life_cycle_id_dict
+
+    def attention_life_cycles(self) -> Iterator[tuple[LifeCycleId, AttnLifeCycle]]:
+        for lc_id, lc in self.items():
+            if isinstance(lc, AttnLifeCycle):
+                yield lc_id, lc

@@ -114,6 +114,12 @@ struct DMA
         SLIDING_OR_CHUNKED_ATTENTION = Kernel_traits::SLIDING_OR_CHUNKED_ATTENTION
     };
 
+    // Whether use the bidirectional sliding window attention or not.
+    enum
+    {
+        BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION = Kernel_traits::BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION
+    };
+
     // Is heads interleaved ?
     enum
     {
@@ -201,11 +207,27 @@ struct DMA
             // Skip initial kv tiles due to sliding_window_size
             if (SLIDING_OR_CHUNKED_ATTENTION)
             {
-                // The kv_offset_start.
-                int kv_offset_start = is_chunked_attention
-                    ? ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size)
-                    : max(0, q_step_offset + 1 - params.sliding_window_size);
-                kv_idx_start = kv_offset_start / STEP_KV;
+                if constexpr (BIDIRECTIONAL_SLIDING_WINDOW_ATTENTION)
+                {
+                    int kv_offset_start = max(0, q_step_offset - params.sliding_window_size / 2);
+                    int kv_offset_end = min(kv_steps * STEP_KV - 1, q_step_end + params.sliding_window_size / 2);
+
+                    // We do floor division plus 1 to get the correct kv_idx_end, this is because kv_idx_end is
+                    // exclusive
+                    kv_idx_start = kv_offset_start / STEP_KV;
+                    kv_idx_end = kv_offset_end / STEP_KV + 1;
+                }
+                else if (is_chunked_attention)
+                {
+                    int kv_offset_start
+                        = ((q_step_offset >> params.log2_chunked_attention_size) << params.log2_chunked_attention_size);
+                    kv_idx_start = kv_offset_start / STEP_KV;
+                }
+                else
+                {
+                    int kv_offset_start = max(0, q_step_offset + 1 - params.sliding_window_size);
+                    kv_idx_start = kv_offset_start / STEP_KV;
+                }
             }
 
             // Early stop when causal mask is enabled.

@@ -244,8 +244,17 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
+        # Materialize Pydantic v2 ValidatorIterator (single-use) to a list.
+        if not isinstance(tool_calls, list):
+            tool_calls = list(tool_calls)
+
         result["tool_calls"] = []
         for item in tool_calls:
+            # Bypass pydantic check to WAR `tau2-bench-telecom` ill-format tool_call.
+            item = dict(item)
+            if "function" in item:
+                item["function"] = dict(item["function"])
+
             if content := item["function"].get("arguments"):
                 if isinstance(content, str):
                     item["function"]["arguments"] = json.loads(content)
@@ -277,21 +286,28 @@ def parse_chat_messages_coroutines(
     mm_placeholder_counts = []
     mm_data_tracker = MultimodalDataTracker(model_config.model_type,
                                             multimodal_server_config)
-
     for msg in messages:
         parsed_msg = parse_chat_message_content(msg, mm_data_tracker)
         conversation.append(parsed_msg)
+
+        # Track placeholders added for this message only.
+        msg_placeholder_counts = {}
         if parsed_msg["media"]:
             for mdata in parsed_msg["media"]:
-                mm_data_tracker.add_data(mdata["modality"],
-                                         mdata["data"],
-                                         is_embedding=mdata["is_embedding"])
-        mm_placeholder_count = mm_data_tracker.placeholder_counts()
-        if mm_placeholder_count:
+                placeholder = mm_data_tracker.add_data(
+                    mdata["modality"],
+                    mdata["data"],
+                    is_embedding=mdata["is_embedding"])
+                if placeholder:
+                    msg_placeholder_counts[
+                        placeholder] = msg_placeholder_counts.get(
+                            placeholder, 0) + 1
+
+        if msg_placeholder_counts:
             parsed_msg["content"] = add_multimodal_placeholders(
                 model_config.model_type, parsed_msg["content"],
-                mm_placeholder_count)
-        mm_placeholder_counts.append(mm_placeholder_count)
+                msg_placeholder_counts)
+        mm_placeholder_counts.append(msg_placeholder_counts)
 
     return conversation, mm_data_tracker.retrieve_all_async(
     ), mm_placeholder_counts

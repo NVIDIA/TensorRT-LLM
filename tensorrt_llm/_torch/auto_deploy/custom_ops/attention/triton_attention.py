@@ -250,8 +250,8 @@ def flattened_mha_with_cache(
     # Compute scale if not provided
     scale = 1.0 / math.sqrt(qk_head_dim) if scale is None else scale
 
-    # Preallocate output tensor
-    y = q_flat.new_empty(bs, num_heads, v_head_dim)
+    # Preallocate output tensor (zeros so padding positions are clean)
+    y = q_flat.new_zeros(bs, num_heads, v_head_dim)
 
     # PREFILL: process context tokens with variable sequence lengths
     if num_prefill > 0:

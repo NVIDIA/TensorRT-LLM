@@ -4,6 +4,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Set
 import torch
 from torch import nn
 
+from tensorrt_llm._utils import prefer_pinned
 from tensorrt_llm.mapping import Mapping
 
 from ..attention_backend import AttentionMetadata
@@ -13,6 +14,7 @@ from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
 from .mtp import MTPSampler
+from .sa_enhancer import SADraftEnhancer
 from .spec_tree_manager import SpecTreeManager
 
 if TYPE_CHECKING:
@@ -26,14 +28,21 @@ class Eagle3ResourceManager(BaseResourceManager):
     and one for the draft model. Use this class to manage the hidden states.
     """
 
-    def __init__(self, config: "EagleDecodingConfig", dtype: torch.dtype,
-                 hidden_size: int, max_num_requests: int, max_seq_len: int,
-                 max_num_tokens: int):
+    def __init__(self,
+                 config: "EagleDecodingConfig",
+                 dtype: torch.dtype,
+                 hidden_size: int,
+                 max_num_requests: int,
+                 max_seq_len: int,
+                 max_num_tokens: int,
+                 sa_manager=None):
         self.dtype = dtype
         self.max_draft_len = config.max_draft_len
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.max_seq_len = max_seq_len
+        # Optional SA manager for EAGLE3+SA mode
+        self.sa_manager = sa_manager
         # There could be dummy request for padding batch when using CUDA graph.
         # Reserve one more slot for the dummy request.
         slot_size = self.max_seq_len + 1
@@ -42,7 +51,7 @@ class Eagle3ResourceManager(BaseResourceManager):
         from ...llmapi.llm_args import EagleDecodingConfig
 
         if isinstance(config, EagleDecodingConfig):
-            self.max_total_draft_tokens = config.max_total_draft_tokens
+            self.max_total_draft_tokens = config.tokens_per_gen_step - 1
         else:
             self.max_total_draft_tokens = self.max_draft_len
 
@@ -93,19 +102,28 @@ class Eagle3ResourceManager(BaseResourceManager):
         self.seq_lens[slot_id] = 0
         self.start_indices[slot_id] = 0
         self.slot_manager.remove_slot(request.request_id)
+        if self.sa_manager is not None:
+            self.sa_manager.remove_request(request.request_id)
 
     def add_dummy_requests(self, request_ids: List[int]):
         for rid in request_ids:
             self.slot_manager.add_slot(rid)
+        if self.sa_manager is not None:
+            self.sa_manager.add_dummy_requests(request_ids)
 
     def shutdown(self):
-        pass
+        if self.sa_manager is not None:
+            self.sa_manager.shutdown()
 
     def get_max_resource_count(self) -> int:
         return self.max_num_requests
 
     def get_needed_resource_to_completion(self, request: LlmRequest):
         return 0
+
+
+def _get_eagle3_default_capture_layers(num_layers: int):
+    return (1, num_layers // 2 - 1, num_layers - 4)
 
 
 @dataclass
@@ -138,8 +156,8 @@ class Eagle3SpecMetadata(SpecMetadata):
                 if self.num_layers <= 5:
                     raise ValueError(
                         "Not enough hidden layers for default EAGLE3 capture")
-                self.layers_to_capture = (1, self.num_layers // 2 - 1,
-                                          self.num_layers - 4)
+                self.layers_to_capture = _get_eagle3_default_capture_layers(
+                    self.num_layers)
         else:
             self.layers_to_capture = sorted(list(self.layers_to_capture))
             if self.layers_to_capture[0] == -1:
@@ -235,9 +253,13 @@ class Eagle3SpecMetadata(SpecMetadata):
             self.eagle3_resource_manager.seq_lens[slot_id] = seq_len
         # Prepare hidden states gather ids
         self.hidden_states_read_indices_host = torch.tensor(
-            hidden_states_read_indices, dtype=torch.long, pin_memory=True)
+            hidden_states_read_indices,
+            dtype=torch.long,
+            pin_memory=prefer_pinned())
         self.hidden_states_write_indices_host = torch.tensor(
-            hidden_states_write_indices, dtype=torch.long, pin_memory=True)
+            hidden_states_write_indices,
+            dtype=torch.long,
+            pin_memory=prefer_pinned())
         self.is_first_draft = is_first_draft and self.is_draft_model
         if self.is_draft_model:
             self.eagle3_resource_manager.is_first_draft = False
@@ -263,7 +285,8 @@ class Eagle3SpecMetadata(SpecMetadata):
                 to_save = to_save.to(dtype=eagle3_hidden_states.dtype)
                 eagle3_hidden_states[:, i * self.hidden_size:(i + 1) *
                                      self.hidden_size].index_copy_(
-                                         0, token_idx, to_save)
+                                         0, token_idx,
+                                         to_save[:self.num_tokens])
                 break
 
     def get_hidden_states(self):
@@ -286,8 +309,10 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
     max_num_tokens: int = 0
     # The dtype of the hidden states
     dtype: torch.dtype = torch.bfloat16
-    # The index of the batche inputs
+    # The index of the batch inputs
     batch_indices_cuda: Optional[torch.Tensor] = None
+    # Optional resource manager (used to access SA manager for EAGLE3+SA)
+    spec_resource_manager: Optional[Eagle3ResourceManager] = None
 
     def __post_init__(self):
         if self.layers_to_capture is None:
@@ -325,15 +350,21 @@ class Eagle3OneModelSpecMetadata(SpecMetadata):
 
     def prepare(self):
         assert self.request_ids is not None
-        # update batch indeices
+        # update batch indices
         num_seqs = len(self.request_ids)
         batch_indices = torch.arange(num_seqs,
                                      dtype=torch.int,
                                      device='cpu',
-                                     pin_memory=True)
+                                     pin_memory=prefer_pinned())
         self.batch_indices_cuda[:num_seqs].copy_(batch_indices,
                                                  non_blocking=True)
         self.num_tokens -= (self.num_generations) * self.max_draft_len
+
+        sa_manager = getattr(self.spec_resource_manager, 'sa_manager', None)
+        if sa_manager is not None:
+            gen_request_ids = self.request_ids[num_seqs - self.num_generations:]
+            if gen_request_ids:
+                sa_manager.prepare(gen_request_ids, self.max_draft_len)
 
     def maybe_capture_hidden_states(
             self,
@@ -358,19 +389,53 @@ class Eagle3OneModelSampler(MTPSampler):
 
 class Eagle3OneModelWorker(SpecWorkerBase):
 
-    def __init__(self, spec_config: "EagleDecodingConfig", mapping: Mapping):
-        super().__init__()
+    def __init__(self,
+                 spec_config: "EagleDecodingConfig",
+                 mapping: Mapping,
+                 use_separate_draft_kv_cache: bool = False):
+        super().__init__(use_separate_draft_kv_cache)
         self.spec_config = spec_config
         self.mapping = mapping
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if getattr(spec_config, 'use_sa_spec', False):
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
 
     @property
     def max_draft_len(self) -> int:
         return self.spec_config.max_draft_len
 
+    def _prepare_attn_metadata_for_spec_dec(self, attn_metadata):
+        attn_metadata.prepare_for_spec_dec("_seq_lens", "_seq_lens_cuda")
+        # Save kv_lens_cuda values separately instead of routing through
+        # prepare_for_spec_dec, which would clone the tensor and break the
+        # kv_lens_cuda_runtime view that TRTLLM attention reads from.
+        batch_size = attn_metadata.num_seqs
+        if hasattr(attn_metadata, 'kv_lens_cuda'):
+            self._saved_kv_lens_cuda = attn_metadata.kv_lens_cuda[:
+                                                                  batch_size].clone(
+                                                                  )
+        else:
+            self._saved_kv_lens_cuda = None
+
+    def _restore_attn_metadata_from_spec_dec(self, attn_metadata):
+        super()._restore_attn_metadata_from_spec_dec(attn_metadata)
+        if self._saved_kv_lens_cuda is not None:
+            batch_size = self._saved_kv_lens_cuda.shape[0]
+            attn_metadata.kv_lens_cuda[:batch_size].copy_(
+                self._saved_kv_lens_cuda)
+            self._saved_kv_lens_cuda = None
+
     # Skip torch.compile for now since current Torch is not compatible with Triton 3.4
     # @torch.compile(options={"max-autotune": True})
-    def forward(self, input_ids, position_ids, hidden_states, logits,
-                attn_metadata, spec_metadata, draft_model):
+    def forward(self,
+                input_ids,
+                position_ids,
+                hidden_states,
+                logits,
+                attn_metadata,
+                spec_metadata,
+                draft_model,
+                resource_manager=None):
         batch_size = attn_metadata.num_seqs
         num_contexts = attn_metadata.num_contexts
         num_gens = batch_size - num_contexts
@@ -382,6 +447,19 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Sample and accept tokens
         accepted_tokens, num_accepted_tokens = self.sample_and_accept_draft_tokens(
             logits, attn_metadata, spec_metadata)
+
+        sa_manager = getattr(spec_metadata.spec_resource_manager, 'sa_manager',
+                             None)
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                request_ids=spec_metadata.request_ids,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                num_gens=num_gens,
+                num_contexts=num_contexts,
+                max_draft_len=self.max_draft_len,
+            )
 
         # Save the old attn_metadata and spec_metadata
         self._prepare_attn_metadata_for_spec_dec(attn_metadata)
@@ -400,82 +478,100 @@ class Eagle3OneModelWorker(SpecWorkerBase):
         # Predict draft tokens
         next_draft_tokens = []
         original_all_rank_num_tokens = attn_metadata.all_rank_num_tokens
-        for i in range(self.max_draft_len):
-            if i == 0:
-                start_ids_gen = (spec_metadata.batch_indices_cuda[:num_gens] *
-                                 (self.max_draft_len + 1)).long()
-                gather_ids_gen = (start_ids_gen +
-                                  num_accepted_tokens[num_contexts:] - 1 +
-                                  attn_metadata.num_ctx_tokens)
-                gather_ids = torch.concat(
-                    [spec_metadata.gather_ids[:num_contexts], gather_ids_gen],
-                    dim=0)
-            else:
-                # All of the seq_len are 1, use batch_indices_cuda as gather_ids
-                gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
-            if self.guided_decoder is not None:
-                new_tokens = inputs["input_ids"][gather_ids]
-                self.guided_decoder.add_draft_batch(new_tokens,
-                                                    num_accepted_tokens,
-                                                    draft_step=i)
+        # Get the draft KV cache manager if using separate layouts
+        draft_kv_cache_manager = self.get_draft_kv_cache_manager(
+            resource_manager)
 
-            # Update attn_metadata.all_rank_num_tokens for attention DP
-            if original_all_rank_num_tokens is not None:
+        with self.draft_kv_cache_context(attn_metadata, draft_kv_cache_manager):
+            for i in range(self.max_draft_len):
                 if i == 0:
-                    attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
-                elif spec_metadata.all_rank_num_seqs is not None:
-                    attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+                    start_ids_gen = (
+                        spec_metadata.batch_indices_cuda[:num_gens] *
+                        (self.max_draft_len + 1)).long()
+                    gather_ids_gen = (start_ids_gen +
+                                      num_accepted_tokens[num_contexts:] - 1 +
+                                      attn_metadata.num_ctx_tokens)
+                    gather_ids = torch.concat([
+                        spec_metadata.gather_ids[:num_contexts], gather_ids_gen
+                    ],
+                                              dim=0)
+                else:
+                    # All of the seq_len are 1, use batch_indices_cuda as gather_ids
+                    gather_ids = spec_metadata.batch_indices_cuda[:batch_size]
 
-            hidden_states, hidden_states_to_save = draft_model.model(**inputs)
-
-            # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
-            # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
-            # then the following step can use regular decoding mode to generate 1 tokens per step.
-            # Currently the spec-dec mask for chained tree is not implemented yet.
-            # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
-            attn_metadata.use_spec_decoding = False
-
-            logits = draft_model.logits_processor(hidden_states[gather_ids],
-                                                  draft_model.lm_head,
-                                                  attn_metadata, True)
-            if self.guided_decoder is not None:
-                d2t = getattr(draft_model.model, "d2t", None)
-                self.guided_decoder.execute_draft_batch(logits,
-                                                        d2t,
+                if self.guided_decoder is not None:
+                    new_tokens = inputs["input_ids"][gather_ids]
+                    self.guided_decoder.add_draft_batch(new_tokens,
+                                                        num_accepted_tokens,
                                                         draft_step=i)
 
-            new_draft_token = self.draft_decoder(logits, draft_model)
-            next_draft_tokens.append(new_draft_token)
-            # update inputs
-            hidden_states = hidden_states_to_save[gather_ids]
-            position_ids = inputs["position_ids"][gather_ids] + 1
-            # update attn_metadata
-            if i == 0:
-                attn_metadata._seq_lens[:batch_size].fill_(1)
-                attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
-                attn_metadata.on_update()
-                # cannot run generation if their is no kv cache
-                if inputs["attn_metadata"].kv_cache_manager is not None:
-                    attn_metadata.host_request_types[:attn_metadata.
-                                                     num_contexts].fill_(1)
-                    attn_metadata.num_contexts = 0
-                # update kv_lens_cuda
-                if hasattr(attn_metadata, 'kv_lens_cuda'):
-                    attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
-                        self.max_draft_len - num_accepted_tokens[num_contexts:])
-                    attn_metadata.kv_lens_cuda[:num_contexts] += 1
-            elif hasattr(attn_metadata, 'kv_lens_cuda'):
-                attn_metadata.kv_lens_cuda[:batch_size] += 1
-            # support attention dp
-            inputs = {
-                "input_ids": new_draft_token,
-                "position_ids": position_ids,
-                "hidden_states": hidden_states,
-                "attn_metadata": attn_metadata,
-                "spec_metadata": spec_metadata,
-            }
+                # Update attn_metadata.all_rank_num_tokens for attention DP
+                if original_all_rank_num_tokens is not None:
+                    if i == 0:
+                        attn_metadata.all_rank_num_tokens = original_all_rank_num_tokens
+                    elif spec_metadata.all_rank_num_seqs is not None:
+                        attn_metadata.all_rank_num_tokens = spec_metadata.all_rank_num_seqs
+
+                hidden_states, hidden_states_to_save = draft_model.model(
+                    **inputs)
+
+                # FIXME (jhaotingc): Currently we disable use_spec_decoding mode for Eagle engine nth steps except 1st step.
+                # Eagle engine takes in draft_len tokens from the previous step, run spec-dec mode with those tokens,
+                # then the following step can use regular decoding mode to generate 1 tokens per step.
+                # Currently the spec-dec mask for chained tree is not implemented yet.
+                # When token tree is supported, this can be removed and all steps may use spec-dec mode as well.
+                attn_metadata.use_spec_decoding = False
+
+                logits = draft_model.logits_processor(hidden_states[gather_ids],
+                                                      draft_model.lm_head,
+                                                      attn_metadata, True)
+                if self.guided_decoder is not None:
+                    d2t = getattr(draft_model.model, "d2t", None)
+                    self.guided_decoder.execute_draft_batch(logits,
+                                                            d2t,
+                                                            draft_step=i)
+
+                new_draft_token = self.draft_decoder(logits, draft_model)
+                next_draft_tokens.append(new_draft_token)
+                # update inputs
+                hidden_states = hidden_states_to_save[gather_ids]
+                position_ids = inputs["position_ids"][gather_ids] + 1
+                # update attn_metadata
+                if i == 0:
+                    attn_metadata._seq_lens[:batch_size].fill_(1)
+                    attn_metadata._seq_lens_cuda[:batch_size].fill_(1)
+                    attn_metadata.on_update()
+                    # cannot run generation if there is no kv cache
+                    if inputs["attn_metadata"].kv_cache_manager is not None:
+                        attn_metadata.host_request_types[:attn_metadata.
+                                                         num_contexts].fill_(1)
+                        attn_metadata.num_contexts = 0
+                    # update kv_lens_cuda
+                    if hasattr(attn_metadata, 'kv_lens_cuda'):
+                        attn_metadata.kv_lens_cuda[num_contexts:batch_size] -= (
+                            self.max_draft_len -
+                            num_accepted_tokens[num_contexts:])
+                        attn_metadata.kv_lens_cuda[:num_contexts] += 1
+                elif hasattr(attn_metadata, 'kv_lens_cuda'):
+                    attn_metadata.kv_lens_cuda[:batch_size] += 1
+                # support attention dp
+                inputs = {
+                    "input_ids": new_draft_token,
+                    "position_ids": position_ids,
+                    "hidden_states": hidden_states,
+                    "attn_metadata": attn_metadata,
+                    "spec_metadata": spec_metadata,
+                }
         next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Override with SA draft tokens after all draft layers have run,
+        # so that draft layers never see SA tokens in their inputs.
+        if self.sa_enhancer is not None:
+            gen_draft_tokens = next_draft_tokens[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            next_draft_tokens[num_contexts:] = gen_draft_tokens
 
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
@@ -537,11 +633,10 @@ class Eagle3OneModelWorker(SpecWorkerBase):
                 Draft token ids. Flattened.
         '''
 
-        # Note: using greedy for draft tokens is a bit easier to implement and
-        # faster. It doesn't affect the final output and seems to have a negligible
-        # impact on AR.
         d2t = getattr(draft_model.model, "d2t", None)
-        return self._draft_sampler_greedy(logits, d2t)
+        draft_tokens = self._draft_sampler_greedy(logits, d2t)
+
+        return draft_tokens
 
     def prepare_1st_drafter_inputs(
         self,

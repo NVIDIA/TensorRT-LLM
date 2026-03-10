@@ -626,8 +626,10 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
     // Check for buffers still in use - this shouldn't happen if cleanup is called properly,
     // but we log a warning if it does
     size_t inUseCount = 0;
+    size_t totalBytes = 0;
     for (auto const& entry : commIt->second)
     {
+        totalBytes += entry.buffer.size;
         if (entry.inUse)
         {
             ++inUseCount;
@@ -640,6 +642,8 @@ void NCCLWindowAllocator::cleanupBuffersForComm(ncclComm_t comm) noexcept
             "This may indicate buffers weren't properly released before cleanup.",
             inUseCount, static_cast<void*>(comm));
     }
+    TLLM_LOG_DEBUG("[NCCLUtil] NCCL window allocator teardown for comm %p: %zu buffers, %zu bytes total",
+        static_cast<void*>(comm), commIt->second.size(), totalBytes);
 
     for (auto& entry : commIt->second)
     {

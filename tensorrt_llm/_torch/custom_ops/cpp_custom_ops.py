@@ -207,6 +207,12 @@ def _register_fake():
         n = b.shape[0]
         return a.new_empty((m, n), dtype=torch.bfloat16)
 
+    @torch.library.register_fake("tensorrt_llm::quantize_e4m3_per_tensor")
+    def _(input: torch.Tensor):
+        scale_shape = [1] * input.dim()
+        return (input.new_empty(input.shape, dtype=torch.float8_e4m3fn),
+                input.new_empty(scale_shape, dtype=input.dtype))
+
     @torch.library.register_fake(
         "tensorrt_llm::static_quantize_e4m3_per_tensor")
     def _(input: torch.Tensor, scale: torch.Tensor):
@@ -537,6 +543,16 @@ def _register_fake():
         return torch.empty_like(input,
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     sz, dtype=torch.float)
+
+    @torch.library.register_fake("trtllm::fused_cat_fp8")
+    def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool = False):
+        pe_dim = pe.shape[-1]
+        nope_dim = nope.shape[-1]
+        head_dim = pe_dim + nope_dim
+        M = pe.numel() // pe_dim
+        fp8_out = pe.new_empty((M, head_dim), dtype=torch.float8_e4m3fn)
+        scale_out = pe.new_empty((M, 1), dtype=torch.float32)
+        return fp8_out, scale_out
 
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
@@ -973,7 +989,7 @@ def _register_fake():
         kv_scale_quant_orig: Optional[torch.Tensor],
         out_scale: Optional[torch.Tensor],
         block_ids_per_seq: Optional[torch.Tensor],
-        mla_tensor_params: List[Optional[torch.Tensor]],
+        helix_tensor_params: List[Optional[torch.Tensor]],
         predicted_tokens_per_seq: int,
         layer_idx: int,
         num_heads: int,
@@ -1003,7 +1019,9 @@ def _register_fake():
         sf_scale: Optional[torch.Tensor],
         use_rms_norm: bool = True,
         eps: float = 1e-5,
-    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        output_hp_norm: bool = False,
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor,
+               Optional[torch.Tensor]]:
         m, n = input.shape
         # normed_output_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
         normed_output_fp4 = input.new_empty((m, n // 8), dtype=torch.int32)
@@ -1013,4 +1031,40 @@ def _register_fake():
         sf_vec_size = 16
         sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
         sf_out = input.new_empty((sf_size, ), dtype=torch.uint8)
-        return normed_output_fp4, output, sf_out
+        # high_precision_normed_output: [M, N] optional, only when output_hp_norm=True
+        hp_output = input.new_empty(
+            (m, n), dtype=input.dtype) if output_hp_norm else None
+        return normed_output_fp4, output, sf_out, hp_output
+
+    @torch.library.register_fake("trtllm::fused_gated_rmsnorm_quant")
+    def _(
+        x: torch.Tensor,
+        z: torch.Tensor,
+        weight: torch.Tensor,
+        group_size: int,
+        eps: float = 1e-5,
+        sf_scale: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        m, n = x.shape
+        # y_fp4: [M, N/8] as int32 (8 FP4 values packed per int32)
+        y_fp4 = x.new_empty((m, n // 8), dtype=torch.int32)
+        # sf_out: scale factors in swizzled layout
+        sf_vec_size = 16
+        sf_size = ((m + 127) // 128) * 128 * ((n // sf_vec_size + 3) // 4) * 4
+        sf_out = x.new_empty((sf_size, ), dtype=torch.uint8)
+        return y_fp4, sf_out
+
+    @torch.library.register_fake("trtllm::fused_relu2_quantize")
+    def _(
+        input: torch.Tensor,
+        sf_scale: torch.Tensor,
+        sf_vec_size: int = 16,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        # input: 2D tensor [M, N] (bf16 or fp16)
+        # output_fp4: [M, N/2] (packed FP4 values, 2 values per byte)
+        # output_sf: swizzled scale factors
+        output_shape, scale_shape = fp4_utils.get_fp4_shape(
+            input.shape, sf_vec_size, is_swizzled_layout=True)
+        output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
+        output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
+        return output_fp4, output_sf

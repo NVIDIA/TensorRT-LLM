@@ -1030,6 +1030,7 @@ common-files: &common_files |
         tests/unittest/_torch/speculative/test_kv_cache_reuse.py |
         tests/unittest/_torch/speculative/test_mtp.py |
         tests/unittest/_torch/speculative/test_ngram.py |
+        tests/unittest/_torch/speculative/test_sa.py |
         tests/unittest/_torch/speculative/test_save_state.py |
         tests/unittest/_torch/speculative/test_spec_gate.py |
         tests/unittest/_torch/speculative/test_torch_rejection_sampling.py |
@@ -1401,7 +1402,7 @@ repos:
         args: [--allow-multiple-documents, --unsafe]
         exclude: ".*/gitlab/.*.yml"
     -   id: trailing-whitespace
-        exclude: '\.(patch|md)$'
+        exclude: '(\.(patch|md)|scripts/attribution/data/cas/.*)$'
     -   id: check-toml
     -   id: mixed-line-ending
         args: [--fix=lf]
@@ -1441,7 +1442,8 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
     hooks:
@@ -1457,6 +1459,14 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: model-registry-check
+        name: Validate AutoDeploy model registry
+        entry: python scripts/check_model_registry.py
+        language: python
+        additional_dependencies:
+        - PyYAML
+        files: ^examples/auto_deploy/model_registry/models\.yaml$
+        pass_filenames: false
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py
@@ -1472,3 +1482,8 @@ repos:
         entry: ./scripts/dco_check.py
         language: script
         stages: [commit-msg]
+    -   id: pinned memory policy
+        name: Disallow raw pinned-memory APIs in runtime code
+        entry: ./scripts/check_pinned_memory_usage.py
+        language: script
+        files: ^(tensorrt_llm|triton_backend)/.*\.py$
