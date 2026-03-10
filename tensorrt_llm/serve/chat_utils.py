@@ -244,8 +244,17 @@ def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
+        # Materialize Pydantic v2 ValidatorIterator (single-use) to a list.
+        if not isinstance(tool_calls, list):
+            tool_calls = list(tool_calls)
+
         result["tool_calls"] = []
         for item in tool_calls:
+            # Bypass pydantic check to WAR `tau2-bench-telecom` ill-format tool_call.
+            item = dict(item)
+            if "function" in item:
+                item["function"] = dict(item["function"])
+
             if content := item["function"].get("arguments"):
                 if isinstance(content, str):
                     item["function"]["arguments"] = json.loads(content)

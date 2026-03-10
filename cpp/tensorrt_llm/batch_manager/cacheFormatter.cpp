@@ -539,9 +539,9 @@ void CacheFormatter::format(tensorrt_llm::batch_manager::TransferSession& sessio
             "bufferCoverTargetNum:%d pickUpConnections.size():%ld",
             bufferTargetNum, targetNum, peerDuplicateHeadFactor, targetInfo.mDupHeadFactor, bufferCoverTargetNum,
             pickUpConnections.size());
-        auto* agentConnnecion
+        auto const* agentConnection
             = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
-        if (agentConnnecion != nullptr)
+        if (agentConnection != nullptr)
         {
             TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == bufferTargetNum, "Agent need all buffer pre-allocated");
             TLLM_CHECK(onlyUseDynamicBuffer == false);
@@ -792,12 +792,11 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
 
                 TLLM_CHECK(blockNum > 0);
 
-                auto* agentConnnecion
-                    = dynamic_cast<executor::kv_cache::AgentConnection const*>(connections[pickUpConnections[0]]);
-                if (agentConnnecion != nullptr)
+                auto preAssignedKvId
+                    = connections[pickUpConnections[0]]->getPreAssignedBufferId(static_cast<uint8_t>(BufferKind::kKV));
+                if (preAssignedKvId.has_value())
                 {
-                    cacheBufferId = agentConnnecion->getCacheBufferId();
-                    TLLM_CHECK(cacheBufferId.has_value());
+                    cacheBufferId = static_cast<int>(*preAssignedKvId);
                 }
                 else
                 {
@@ -811,7 +810,7 @@ void CacheFormatter::unformat(tensorrt_llm::batch_manager::TransferSession& sess
                 bufferCoverTargetNum = bufferCoverTargetNumtmp;
                 remainNoCoverTargetNum = targetNum > bufferCoverTargetNum ? targetNum - bufferCoverTargetNum : 0;
 
-                if (agentConnnecion != nullptr)
+                if (preAssignedKvId.has_value())
                 {
                     TLLM_CHECK_WITH_INFO(bufferCoverTargetNum == targetNum, "Agent need buffer pre-allocated");
                     TLLM_CHECK(onlyUseDynamicBuffer == false);
