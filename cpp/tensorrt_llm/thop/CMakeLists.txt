@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION &
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &
 # AFFILIATES. All rights reserved. SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License"); you may not
@@ -68,6 +68,7 @@ add_library(
   fusedQKNormRopeOp.cpp
   fusedAddRMSNormQuant.cpp
   fusedActivationQuant.cpp
+  fusedGatedRMSNormQuant.cpp
   fusedTopkSoftmax.cpp
   gatherTreeOp.cpp
   groupRmsNormOp.cpp
@@ -87,6 +88,7 @@ add_library(
   fp8PerTensorScaleMoe.cpp
   fp4BlockScaleMoe.cpp
   noAuxTcOp.cpp
+  fusedCatFp8Op.cpp
   IndexerKCacheScatterOp.cpp
   IndexerTopKOp.cpp
   ncclCommunicatorOp.cpp

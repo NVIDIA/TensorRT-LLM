@@ -20,6 +20,7 @@ l0_a10:
   - unittest/_torch/test_model_config.py
   - unittest/_torch/modeling/test_modeling_mistral.py
   - unittest/_torch/modeling/test_modeling_pixtral.py
+  - unittest/_torch/modeling/test_modeling_cohere2.py
   - unittest/_torch/sampler/test_trtllm_sampler.py
   - unittest/_torch/executor/test_async_transfer_manager.py
   - unittest/_torch/executor/test_scheduler_serializable_output.py
@@ -42,8 +43,8 @@ l0_a10:
   - unittest/disaggregated/test_extractor_v2.py
   - unittest/disaggregated/test_peer.py
   - unittest/disaggregated/region/test_block.py
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun[TinyLlama-1.1B-Chat-v1.0]
-  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_with_mpirun_trt_backend[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu[TinyLlama-1.1B-Chat-v1.0]
+  - disaggregated/test_disaggregated.py::test_disaggregated_single_gpu_trt_backend[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_cuda_graph[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_mixed[TinyLlama-1.1B-Chat-v1.0]
   - disaggregated/test_disaggregated.py::test_disaggregated_overlap[TinyLlama-1.1B-Chat-v1.0]
@@ -79,6 +80,8 @@ l0_a10:
   - test_e2e.py::test_openai_chat_example[pytorch] TIMEOUT (90)
   - test_e2e.py::test_trtllm_bench_request_rate_and_concurrency[enable_concurrency-]
   - test_e2e.py::test_trtllm_bench_invalid_token_pytorch[TinyLlama-1.1B-Chat-v1.0-TinyLlama-1.1B-Chat-v1.0]
+  # visual_gen
+  - unittest/_torch/visual_gen/test_media_storage.py
   # llmapi
   - unittest/llmapi/test_llm_utils.py
   - unittest/llmapi/test_gc_utils.py
@@ -171,6 +174,7 @@ l0_a10:
   - unittest/trt/quantization
   - unittest/trt/functional # 37 mins
   - llmapi/test_llm_examples.py::test_llmapi_quickstart_atexit
+  - examples/test_visual_gen.py::test_visual_gen_quickstart
   - unittest/api_stability
   - unittest/bindings
   - unittest/test_model_runner_cpp.py

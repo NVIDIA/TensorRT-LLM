@@ -21,6 +21,7 @@ from fastapi import Body, FastAPI, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (FileResponse, JSONResponse, Response,
                                StreamingResponse)
+from pydantic import ValidationError
 from starlette.routing import Mount
 from transformers import AutoProcessor
 
@@ -80,6 +81,7 @@ from tensorrt_llm.serve.responses_utils import \
 from tensorrt_llm.serve.responses_utils import get_steady_clock_now_in_seconds
 from tensorrt_llm.serve.responses_utils import \
     request_preprocess as responses_api_request_preprocess
+from tensorrt_llm.serve.tool_parser.tool_parser_factory import ToolParserFactory
 from tensorrt_llm.serve.visual_gen_utils import (VIDEO_STORE,
                                                  parse_visual_gen_params)
 from tensorrt_llm.version import __version__ as VERSION
@@ -808,13 +810,27 @@ class OpenAIServer:
                 gather_generation_logits,
                 reasoning_parser=self.generator.args.reasoning_parser,
                 backend=self.generator.args.backend)
+            if self.tool_parser and request.tools:
+                tool_parser_cls = ToolParserFactory.parsers.get(
+                    self.tool_parser.lower())
+                if tool_parser_cls and getattr(
+                        tool_parser_cls, 'needs_raw_special_tokens', False):
+                    sampling_params.skip_special_tokens = False
             postproc_args = ChatPostprocArgs.from_request(request)
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                request.messages, self.model_config,
-                self.multimodal_server_config)
+            try:
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    request.messages, self.model_config,
+                    self.multimodal_server_config)
+            except ValidationError:
+                # ValidatorIterator rejects extra fields; fall back to raw JSON.
+                raw_body = await raw_request.json()
+                raw_messages = raw_body.get("messages", [])
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    raw_messages, self.model_config,
+                    self.multimodal_server_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -946,8 +962,15 @@ class OpenAIServer:
                 tool.model_dump() for tool in request.tools
             ]
 
-            conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
-                request.messages, self.model_config)
+            try:
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    request.messages, self.model_config)
+            except ValidationError:
+                # ValidatorIterator rejects extra fields; fall back to raw JSON.
+                raw_body = await raw_request.json()
+                raw_messages = raw_body.get("messages", [])
+                conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
+                    raw_messages, self.model_config)
 
             if request.prompt_token_ids is not None:
                 prompt = request.prompt_token_ids
@@ -1656,7 +1679,8 @@ class OpenAIServer:
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
+                output_path=self.media_storage_path /
+                f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,
@@ -1836,7 +1860,8 @@ class OpenAIServer:
 
             actual_output_path = MediaStorage.save_video(
                 video=output.video,
-                output_path=self.media_storage_path / f"{video_id}{resolved_ext}",
+                output_path=self.media_storage_path /
+                f"{video_id}{resolved_ext}",
                 audio=output.audio,
                 frame_rate=request.fps or params.frame_rate,
                 format=resolved_fmt,

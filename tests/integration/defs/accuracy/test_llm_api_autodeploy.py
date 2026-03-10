@@ -429,8 +429,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
     def test_accuracy(self, model_id, world_size, enable_attention_dp,
                       attn_backend):
-        if model_id == "nvfp4":
-            pytest.skip("NVFP4 not yet supported for Super V3")
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
         # bf16 120B model requires at least 4 GPUs
@@ -495,7 +493,7 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64, 128],
             "kv_cache_config": {
                 "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.88
+                "free_gpu_memory_fraction": 0.8
             },
             "model_kwargs": {
                 "torch_dtype": "bfloat16"
@@ -518,6 +516,9 @@ class TestGLM4Flash(LlmapiAccuracyTestHarness):
             config["enable_chunked_prefill"] = True
             config[
                 "max_num_tokens"] = 512  # NOTE: must be > max(tokens_per_block, max_batch_size)
+            config["transforms"]["compile_model"] = {
+                "piecewise_enabled": True,
+            }
         return config
 
     def get_default_sampling_params(self):
@@ -680,6 +681,57 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
+class TestMiniMaxM2(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for MiniMax M2.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    """
+
+    MODEL_NAME = "MiniMaxAI/MiniMax-M2"
+    # Set minimum possible seq len + small buffer, for test speed & memory usage
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init":
+            False,
+            "trust_remote_code":
+            True,
+            "skip_loading_weights":
+            False,
+            "compile_backend":
+            "torch-cudagraph",
+            "free_mem_ratio":
+            0.88,
+            "max_batch_size":
+            64,
+            "max_seq_len":
+            self.MAX_SEQ_LEN,
+            "max_num_tokens":
+            self.MAX_SEQ_LEN,
+            "enable_chunked_prefill":
+            True,
+            "cuda_graph_batch_sizes":
+            [1, 2, 4, 8, 16, 24, 32, 64, 128, 256, 320, 384],
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+        }
+
+    @pytest.mark.skip_less_device(8)
+    def test_finegrained_fp8(self):
+        kwargs = self.get_default_kwargs()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           world_size=8,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)
+
+
 class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     """Accuracy tests for models from the AutoDeploy model registry.
 
@@ -769,3 +821,69 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         task.evaluate(llm, sampling_params=sampling_params)
                     except (AssertionError, RuntimeError, ValueError) as e:
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
+
+
+class TestKimiK2_5(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Kimi-K2.5 via AutoDeploy.
+
+    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
+    Configuration derived from examples/auto_deploy/model_registry/configs/kimi_k2.yaml.
+    """
+
+    MODEL_NAME = "nvidia/Kimi-K2.5-NVFP4"
+    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
+                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+            "enable_chunked_prefill": True,
+            "compile_backend": "torch-cudagraph",
+            "max_batch_size": 64,
+            "max_seq_len": self.MAX_SEQ_LEN,
+            "max_num_tokens": self.MAX_SEQ_LEN,
+            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
+            "kv_cache_config": {
+                "dtype": "bfloat16",
+                "enable_block_reuse": False,
+                "free_gpu_memory_fraction": 0.7,
+                "tokens_per_block": 64,
+            },
+            "model_kwargs": {
+                "torch_dtype": "bfloat16",
+            },
+            "transforms": {
+                "export_to_gm": {
+                    "num_moe_experts_for_export": 2,
+                },
+                "fuse_nvfp4_moe": {
+                    "allow_different_input_scales": True,
+                },
+            },
+        }
+
+    def get_default_sampling_params(self):
+        eos_id = -1
+        beam_width = 1
+        return SamplingParams(end_id=eos_id,
+                              pad_id=eos_id,
+                              n=beam_width,
+                              use_beam_search=beam_width > 1)
+
+    @pytest.mark.skip_less_device_memory(180000)
+    @pytest.mark.parametrize("world_size", [8])
+    def test_nvfp4(self, world_size):
+        if get_device_count() < world_size:
+            pytest.skip("Not enough devices for world size, skipping test")
+        kwargs = self.get_default_kwargs()
+        sampling_params = self.get_default_sampling_params()
+        with AutoDeployLLM(model=self.MODEL_NAME,
+                           tokenizer=self.MODEL_NAME,
+                           dtype="bfloat16",
+                           world_size=world_size,
+                           **kwargs) as llm:
+            task = MMLU(self.MODEL_NAME)
+            task.evaluate(llm, sampling_params=sampling_params)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm)

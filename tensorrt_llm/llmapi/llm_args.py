@@ -758,7 +758,7 @@ class DecodingBaseConfig(StrictBaseModel):
         """
         return True
 
-    @functools.cached_property
+    @property
     def spec_dec_mode(self):
         # spec_dec_mode has more functionality than the raw decoding_mode string.
         # Use an alias for the import here to avoid name collisions with the one for the
@@ -776,6 +776,9 @@ class DecodingBaseConfig(StrictBaseModel):
     def tokens_per_gen_step(self) -> int:
         """Total tokens per gen request in one spec dec iteration (including golden token)."""
         return 1 + self.max_total_draft_tokens
+
+    def num_capture_layers(self) -> int:
+        return 0
 
 
 class KvCacheConnectorConfig(StrictBaseModel):
@@ -899,7 +902,7 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_choices(cls, v):
         if v is not None:
             logger.warning(
-                "NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!"
+                "The eagle_choices/static tree feature is deprecated and will be removed in release 1.4."
             )
             if not isinstance(v, list):
                 if isinstance(v, str):
@@ -914,6 +917,11 @@ class EagleDecodingConfig(DecodingBaseConfig):
     def validate_eagle_config(self) -> 'EagleDecodingConfig':
         if self.max_draft_len is None or self.max_draft_len == 0:
             raise ValueError("max_draft_len must be > 0 for Eagle")
+        if not self.eagle3_one_model:
+            logger.warning(
+                "Eagle3 2-model is deprecated and will be removed in release 1.4."
+            )
+
         self.num_eagle_layers = self.max_draft_len
         self.max_total_draft_tokens = self.max_draft_len  # If using linear-tree, the max_total_draft_tokens is the same as max_draft_len
 
@@ -1016,6 +1024,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
 
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -1181,6 +1200,7 @@ class SADecodingConfig(DecodingBaseConfig):
 
 class DraftTargetDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["Draft_Target"] = "Draft_Target"
+    _draft_target_one_model: bool = PrivateAttr(True)
 
     @model_validator(mode="after")
     def validate_draft_target_config(self):
@@ -1194,6 +1214,14 @@ class DraftTargetDecodingConfig(DecodingBaseConfig):
 
     def supports_backend(self, backend: str) -> bool:
         return backend == "pytorch" or backend == "_autodeploy"
+
+    @functools.cached_property
+    def spec_dec_mode(self):
+        from tensorrt_llm._torch.speculative.interface import \
+            SpeculativeDecodingMode as TorchSpeculativeDecodingMode
+        if self._draft_target_one_model:
+            return TorchSpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+        return TorchSpeculativeDecodingMode.DRAFT_TARGET
 
 
 class MTPDecodingConfig(DecodingBaseConfig):
@@ -1234,7 +1262,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
@@ -1271,8 +1299,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
     def log_two_model_deprecation_warning(self):
         if not self.mtp_eagle_one_model:
             logger.warning(
-                "2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing "
-                "in release 1.3. After that, the flag will be removed entirely."
+                "2-model style MTP is deprecated and will be removed in release 1.4."
             )
         return self
 
@@ -1318,6 +1345,17 @@ class PARDDecodingConfig(DecodingBaseConfig):
     )
 
     decoding_type: Literal["PARD"] = "PARD"
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -1664,6 +1702,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
+
+    use_python_scheduler: bool = Field(
+        default=False,
+        description="Use pure-Python scheduler instead of C++ scheduler.")
 
     def _to_pybind(self):
         return _SchedulerConfig(
@@ -3272,6 +3314,11 @@ class TorchLlmArgs(BaseLlmArgs):
                 self.disable_overlap_scheduler = True
                 self.cuda_graph_config = None
                 self.speculative_config.max_draft_len = 1
+            elif isinstance(self.speculative_config, DraftTargetDecodingConfig):
+                assert self.speculative_config.max_draft_len > 0
+                assert self.speculative_config.speculative_model is not None, "Draft model must be specified."
+                if self.backend == "_autodeploy":
+                    self.speculative_config._draft_target_one_model = False
 
         else:
             self.decoding_config = None
