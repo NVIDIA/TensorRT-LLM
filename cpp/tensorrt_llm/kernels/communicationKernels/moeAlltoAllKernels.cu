@@ -712,7 +712,11 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
         // Using vec_t enables cast_store() for the output, emitting a vectorized int4 write.
         vec_t<float, elems_per_vec> acc[TOP_K];
 
-// Unrolled K accumulation using compact top-k lists
+        // Pass 1: issue all TOP_K loads back-to-back without any type conversion.
+        // Raw InT bytes are loaded directly into acc[k]'s register storage, reinterpreted as
+        // vec_t<InT, elems_per_vec> (VEC_SIZE bytes, fitting in the low end of acc[k]'s
+        // sizeof(float)*elems_per_vec allocation).  Separating load from cast lets the compiler
+        // schedule all VEC_SIZE-byte global loads consecutively, hiding memory latency across k.
 #pragma unroll
         for (int k = 0; k < TOP_K; ++k)
         {
@@ -720,7 +724,7 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
             int dst_idx = ptrs.topk_send_indices[local_token_idx * TOP_K + k];
             if (dst_idx < 0)
             {
-                acc[k].fill(0);
+                acc[k].fill(0.0f);
                 continue;
             }
 
@@ -732,13 +736,22 @@ __device__ void vectorized_combine_impl(T* dst_typed_base, int size_per_token, i
             // (BF16-stride workspace but FP8-sized payload).
             size_t base_token = base_source_rank * static_cast<size_t>(stride_per_token);
 
-            // Load VEC_SIZE bytes, reinterpret as InT[elems_per_vec], convert to float.
-            vec_t<uint8_t, VEC_SIZE> raw;
-            raw.load(recv_buffer + base_token + offset);
-            InT const* elems = reinterpret_cast<InT const*>(&raw);
+            reinterpret_cast<vec_t<InT, elems_per_vec>&>(acc[k]).load(
+                reinterpret_cast<InT const*>(recv_buffer + base_token + offset));
+        }
+
+        // Pass 2: in-place cast InT → float, iterating j in descending order.
+        // float[j] occupies bytes [j*4, j*4+3]; InT[j] occupies [j*sizeof(InT), ...).
+        // For sizeof(InT) < sizeof(float), high-j float writes land above all remaining
+        // InT bytes, so descending order is always write-after-read safe.
 #pragma unroll
-            for (int j = 0; j < elems_per_vec; ++j)
-                acc[k][j] = static_cast<float>(elems[j]);
+        for (int k = 0; k < TOP_K; ++k)
+        {
+            if (ptrs.topk_send_indices[local_token_idx * TOP_K + k] < 0)
+                continue; // acc[k] already holds 0.0f from fill() above
+#pragma unroll
+            for (int j = elems_per_vec - 1; j >= 0; --j)
+                acc[k][j] = static_cast<float>(reinterpret_cast<InT const*>(&acc[k])[j]);
         }
         // Reduce acc[TOP_K] into acc[0] via unrolled tree-reduction.
         // acc[k][j] uses vec_t::operator[] which returns float& — no indirection overhead.
@@ -968,8 +981,10 @@ __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int st
 }
 
 // Vectorized per-element type-conversion helpers (must precede the kernel that calls them).
-// SrcT → float → DstT, using vec_t for wide loads and stores.
+// SrcT → DstT, using vec_t for wide loads and stores.
 // VEC_SIZE is in elements (not bytes), so both SrcT and DstT vectors hold VEC_SIZE values.
+// On SM89+, bf16/fp16 → fp8_e4m3 uses paired PTX cvt instructions (2 elements per instruction),
+// bypassing the float intermediate.  All other type combinations go through float.
 template <int VEC_SIZE, typename ThreadingPolicy, typename SrcT, typename DstT>
 __device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elements)
 {
@@ -983,11 +998,50 @@ __device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elemen
         vec_t<SrcT, VEC_SIZE> in_vec;
         in_vec.load(src + e);
 
-        // Convert each element SrcT → float → DstT.
+        // Sync to ensure all threads have loaded their input vectors before any thread starts writing output.
+        // This avoids write-after-read hazards in the FP8 in-place case where the output of this kernel is
+        // read by the next iteration as input. Without this sync, some threads might start writing their
+        // output (DstT) before other threads have loaded their input (SrcT), causing the load to read partially
+        // updated data.
+        ThreadingPolicy::sync();
+
+        // Convert SrcT → DstT.
         vec_t<DstT, VEC_SIZE> out_vec;
+
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+        // SM89+: for bf16/fp16 → fp8_e4m3 with even VEC_SIZE, use paired PTX conversion.
+        // cvt.rn.satfinite.e4m3x2.{bf16x2|f16x2} converts 2 values in one instruction:
+        //   src u32: bf16/fp16[0] in bits 0:15, bf16/fp16[1] in bits 16:31
+        //   dst u32: fp8_e4m3[0] in bits 0:7,  fp8_e4m3[1]  in bits 8:15
+        // in_vec storage is reinterpreted as uint32_t pairs (2×16-bit → 1×32-bit),
+        // out_vec storage as uint16_t pairs (2×fp8 → 1×uint16, low 16 bits of dst u32).
+        if constexpr ((std::is_same_v<SrcT, __nv_bfloat16>
+                          || std::is_same_v<SrcT, half>) &&std::is_same_v<DstT, __nv_fp8_e4m3>
+            && VEC_SIZE % 2 == 0)
+        {
+            uint32_t const* src_u32 = reinterpret_cast<uint32_t const*>(&in_vec);
+            uint16_t* dst_u16 = reinterpret_cast<uint16_t*>(&out_vec);
 #pragma unroll
-        for (int j = 0; j < VEC_SIZE; ++j)
-            out_vec[j] = DstT(static_cast<float>(in_vec[j]));
+            for (int p = 0; p < VEC_SIZE / 2; ++p)
+            {
+                // Output is .b16 (2×fp8_e4m3 packed): use "=h" (16-bit register constraint).
+                // Input  is .b32 (2×bf16/fp16 packed): use  "r" (32-bit register constraint).
+                uint16_t d;
+                if constexpr (std::is_same_v<SrcT, __nv_bfloat16>)
+                    asm volatile("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
+                else
+                    asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
+                dst_u16[p] = d;
+            }
+        }
+        else
+#endif
+        {
+            // Generic path: SrcT → float → DstT.
+#pragma unroll
+            for (int j = 0; j < VEC_SIZE; ++j)
+                out_vec[j] = DstT(static_cast<float>(in_vec[j]));
+        }
 
         // Vectorized store of VEC_SIZE DstT elements.
         out_vec.store(dst + e);
@@ -1010,13 +1064,15 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
 }
 
 // Unified prepare-combine kernel.
-// FP8_COMBINE=false: vectorized byte-copy (SrcT = payload dtype).
-// FP8_COMBINE=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
-// element_size = sizeof(SrcT) is a compile-time constant derived from the template parameter,
-// so all token-base arithmetic folds to constant-offset addressing with no runtime multiply.
-template <typename ThreadingPolicy, bool FP8_COMBINE, typename SrcT>
+// LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
+// LOW_PRECISION=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
+// stride_per_token: byte distance between tokens in recv_buffer_bytes (host-computed, avoids
+//   per-thread recomputation):
+//   - FP8 external payload: elements_per_token × 1  (compact FP8 layout)
+//   - FP8 in-place / byte-copy: elements_per_token × sizeof(SrcT)  (payload-dtype stride)
+template <typename ThreadingPolicy, bool LOW_PRECISION, typename SrcT>
 __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void const* payload, int elements_per_token,
-    int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters)
+    int ep_size, int max_tokens_per_rank, uint32_t* flag_val_ptr, int const* recv_counters, int stride_per_token)
 {
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
@@ -1029,11 +1085,8 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
         *flag_val_ptr = *flag_val_ptr + 1;
     }
 
-    // Compile-time element size — no runtime multiply needed for token-base arithmetic.
-    constexpr int element_size = static_cast<int>(sizeof(SrcT));
-
     // Copy path: null payload means data is already in workspace — nothing to do.
-    if (!FP8_COMBINE && payload == nullptr)
+    if (!LOW_PRECISION && payload == nullptr)
         return;
 
     int global_token_idx = ThreadingPolicy::token_idx();
@@ -1050,34 +1103,26 @@ __global__ void moeA2APrepareCombineKernel(uint8_t* recv_buffer_bytes, void cons
     if (local_token_idx >= recv_counters[rank_idx])
         return;
 
-    if constexpr (FP8_COMBINE)
-    {
-        // Byte offset for this token in BF16-stride layout.
-        size_t token_byte_offset
-            = static_cast<size_t>(global_token_idx) * elements_per_token * static_cast<size_t>(element_size);
+    size_t const token_offset = static_cast<size_t>(global_token_idx) * stride_per_token;
 
+    if constexpr (LOW_PRECISION)
+    {
         // Source pointer: external payload or in-place from workspace.
         SrcT const* src_ptr = (payload != nullptr)
             ? static_cast<SrcT const*>(payload) + static_cast<size_t>(global_token_idx) * elements_per_token
-            : reinterpret_cast<SrcT const*>(recv_buffer_bytes + token_byte_offset);
+            : reinterpret_cast<SrcT const*>(recv_buffer_bytes + token_offset);
 
-        // Destination pointer for FP8 output:
-        // - External payload: write compact FP8 (1 byte/element) at start of workspace.
-        // - In-place: write at BF16-stride position to avoid overlap between CTAs.
-        __nv_fp8_e4m3* dst_ptr = (payload != nullptr)
-            ? reinterpret_cast<__nv_fp8_e4m3*>(
-                recv_buffer_bytes + static_cast<size_t>(global_token_idx) * elements_per_token)
-            : reinterpret_cast<__nv_fp8_e4m3*>(recv_buffer_bytes + token_byte_offset);
+        // Destination: stride_per_token encodes the correct layout for both paths
+        // (compact FP8 for external, payload-dtype stride for in-place).
+        __nv_fp8_e4m3* dst_ptr = reinterpret_cast<__nv_fp8_e4m3*>(recv_buffer_bytes + token_offset);
 
         vectorized_quant<ThreadingPolicy, SrcT, __nv_fp8_e4m3>(dst_ptr, src_ptr, elements_per_token);
     }
     else
     {
         // Generic byte copy (payload guaranteed non-null by early return above).
-        int bytes_per_token = elements_per_token * element_size;
-        size_t offset = static_cast<size_t>(global_token_idx) * bytes_per_token;
         vectorized_copy<ThreadingPolicy>(
-            recv_buffer_bytes + offset, static_cast<uint8_t const*>(payload) + offset, bytes_per_token);
+            recv_buffer_bytes + token_offset, static_cast<uint8_t const*>(payload) + token_offset, stride_per_token);
     }
 }
 
@@ -1112,7 +1157,6 @@ __global__ void moeA2ACombineKernel(
 
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     cudaGridDependencySynchronize();
-    cudaTriggerProgrammaticLaunchCompletion();
 #endif
 
 #if !DISABLE_SYNC_FOR_PROFILING
@@ -1211,8 +1255,9 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     // FP8 in-place (payload_in_workspace=true, prepare_payload==nullptr): each CTA writes
     // FP8 at the BF16-stride position, so CTAs never race — all tokens must be processed.
     // Copy path with null payload is a no-op; 1 block suffices for the flag increment only.
-    int global_token_num
-        = (params.fp8_combine || params.prepare_payload != nullptr) ? params.ep_size * params.max_tokens_per_rank : 1;
+    int global_token_num = (params.use_low_precision || params.prepare_payload != nullptr)
+        ? params.ep_size * params.max_tokens_per_rank
+        : 1;
     int grid_size_warp = ceilDiv(global_token_num, kWarpsPerBlock);
     int grid_size_block = global_token_num; // one block per token
     int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
@@ -1220,15 +1265,21 @@ void moe_a2a_prepare_combine_launch(MoeA2ACombineParams const& params)
     uint8_t* recv_buffer_bytes = static_cast<uint8_t*>(const_cast<void*>(params.recv_buffers[params.ep_rank]));
     void const* payload = params.prepare_payload;
 
-    // SrcT is selected from the payload dtype for the FP8 quant path; it is a no-op
-    // (dead code via if constexpr) when FP8_COMBINE=false, so passing it always is harmless.
-    SWITCH_BOOL(params.fp8_combine, FP8_COMBINE, {
+    // stride_per_token is computed once on the host and passed to the kernel to avoid
+    // per-thread recomputation:
+    //   FP8 external: EPT × 1        (compact FP8, dst packed tightly)
+    //   FP8 in-place / byte-copy: EPT × sizeof(SrcT)  (payload-dtype stride)
+    SWITCH_BOOL(params.use_low_precision, LOW_PRECISION, {
         SWITCH_DTYPE(params.dtype, SrcT, {
-            auto kernel_fn = params.one_block_per_token ? moeA2APrepareCombineKernel<BlockPolicy, FP8_COMBINE, SrcT>
-                                                        : moeA2APrepareCombineKernel<WarpPolicy, FP8_COMBINE, SrcT>;
+            bool const low_precision_staged = LOW_PRECISION && (params.prepare_payload != nullptr);
+            int const stride_per_token = low_precision_staged
+                ? params.elements_per_token
+                : params.elements_per_token * static_cast<int>(sizeof(SrcT));
+            auto kernel_fn = params.one_block_per_token ? moeA2APrepareCombineKernel<BlockPolicy, LOW_PRECISION, SrcT>
+                                                        : moeA2APrepareCombineKernel<WarpPolicy, LOW_PRECISION, SrcT>;
             launchWithPdlWhenEnabled("moeA2APrepareCombineKernel", kernel_fn, grid, kBlockSize, 0, params.stream,
                 recv_buffer_bytes, payload, params.elements_per_token, params.ep_size, params.max_tokens_per_rank,
-                params.flag_val, params.recv_counters);
+                params.flag_val, params.recv_counters, stride_per_token);
         });
     });
 }
@@ -1285,29 +1336,22 @@ void moe_a2a_combine_launch(MoeA2ACombineParams const& params)
 
     int grid = params.one_block_per_token ? grid_size_block : grid_size_warp;
 
-    // When fp8_combine is set the recv buffers contain FP8 data regardless of params.dtype,
+    // stride_per_token: byte distance between tokens in the recv buffer.
+    //   FP8 external payload: EPT × 1            (compact FP8 layout)
+    //   FP8 in-place / non-FP8: EPT × sizeof(PayloadT)  (payload-dtype stride)
+    bool const low_precision_staged = params.use_low_precision && (params.prepare_payload != nullptr);
+    int stride_per_token;
+    SWITCH_DTYPE(params.dtype, PayloadT, {
+        stride_per_token = low_precision_staged ? params.elements_per_token
+                                                : params.elements_per_token * static_cast<int>(sizeof(PayloadT));
+    });
+
+    // When use_low_precision is set the recv buffers contain FP8 data regardless of params.dtype,
     // so dispatch the FP8 accumulation kernel in that case.
-    auto const effective_dtype = params.fp8_combine ? nvinfer1::DataType::kFP8 : params.dtype;
+    auto const effective_dtype = params.use_low_precision ? nvinfer1::DataType::kFP8 : params.dtype;
 
     // Launch appropriate kernel with compact macros
     SWITCH_DTYPE(effective_dtype, TKernelType, {
-        // stride_per_token: byte distance between tokens in the recv buffer.
-        // For FP8 in-place (payload_in_workspace=true), FP8 bytes are stored at the payload-dtype
-        // stride position so each token occupies elements_per_token * payload_element_size bytes
-        // of address space even though only elements_per_token bytes of FP8 data are read.
-        // For all other cases stride equals size_per_token.
-        int payload_element_size;
-        switch (params.dtype)
-        {
-        case nvinfer1::DataType::kHALF: payload_element_size = sizeof(half); break;
-        case nvinfer1::DataType::kBF16: payload_element_size = sizeof(__nv_bfloat16); break;
-        case nvinfer1::DataType::kFLOAT: payload_element_size = sizeof(float); break;
-        default: payload_element_size = static_cast<int>(sizeof(TKernelType)); break;
-        }
-        bool const fp8_in_place = params.fp8_combine && (params.prepare_payload == nullptr);
-        int const stride_per_token = fp8_in_place ? params.elements_per_token * payload_element_size
-                                                  : params.elements_per_token * static_cast<int>(sizeof(TKernelType));
-
         SWITCH_POLICY(params.one_block_per_token, Policy, {
             SWITCH_TOP_K(params.top_k, TOP_K, {
                 auto kernel_fn = moeA2ACombineKernel<TKernelType, Policy, TOP_K>;

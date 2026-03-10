@@ -159,7 +159,8 @@ struct MoeA2ACombineParams
     // Payload information
     int elements_per_token;   // Number of elements per token
     nvinfer1::DataType dtype; // Data type of the payload (used for combine kernel dispatch)
-    bool fp8_combine;         // If true, prepare kernel quantizes BF16→FP8; combine kernel accumulates FP8→BF16
+    bool
+        use_low_precision; // If true, prepare kernel quantizes payload→FP8; combine kernel accumulates FP8→output dtype
 
     // Local aux data
     uint32_t* flag_val;     // The value of the flag for this round (stored on the local rank)
