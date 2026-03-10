@@ -3,9 +3,6 @@ max_num_tokens: 16384
 tensor_parallel_size: 8
 moe_expert_parallel_size: 1
 trust_remote_code: true
-enable_attention_dp: false
-kv_cache_config:
-  free_gpu_memory_fraction: 0.9
 cuda_graph_config:
   enable_padding: true
   max_batch_size: 64

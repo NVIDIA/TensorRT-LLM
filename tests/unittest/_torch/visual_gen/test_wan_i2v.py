@@ -108,9 +108,8 @@ def wan21_i2v_pipeline_bf16():
         device="cuda",
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -130,9 +129,8 @@ def wan21_i2v_pipeline_fp8():
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
         quant_config={"quant_algo": "FP8", "dynamic": True},
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -152,9 +150,8 @@ def wan21_i2v_pipeline_fp8_blockwise():
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -173,9 +170,8 @@ def wan21_i2v_pipeline_with_image_encoder():
         device="cuda",
         dtype="bfloat16",
         skip_components=SKIP_WITH_IMAGE,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -194,9 +190,8 @@ def wan22_i2v_pipeline_bf16():
         device="cuda",
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -216,9 +211,8 @@ def wan22_i2v_pipeline_fp8():
         dtype="bfloat16",
         skip_components=SKIP_MINIMAL,
         quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
-        pipeline={"warmup_steps": 0},
     )
-    pipeline = PipelineLoader(args).load()
+    pipeline = PipelineLoader(args).load(skip_warmup=True)
     yield pipeline
     del pipeline
     torch.cuda.empty_cache()
@@ -285,9 +279,8 @@ def _run_cfg_worker_i2v(rank, world_size, checkpoint_path, inputs_list, return_d
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             parallel=ParallelConfig(dit_cfg_size=world_size),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify CFG parallel configuration
         assert pipeline.model_config.parallel.dit_cfg_size == world_size, (
@@ -396,9 +389,8 @@ def _run_all_optimizations_worker_i2v(rank, world_size, checkpoint_path, inputs_
             ),
             attention=AttentionConfig(backend="TRTLLM"),
             parallel=ParallelConfig(dit_cfg_size=world_size),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args_full).load()
+        pipeline = PipelineLoader(args_full).load(skip_warmup=True)
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
@@ -655,9 +647,8 @@ class TestWanI2VIntegration:
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             attention=AttentionConfig(backend=backend),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Check transformer attention backend
@@ -712,9 +703,8 @@ class TestWanI2VIntegration:
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Verify TeaCache on transformer
@@ -760,9 +750,8 @@ class TestWanI2VIntegration:
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             optimizations = []
@@ -976,7 +965,7 @@ class TestWanI2VTwoStage:
         print("✓ forward() accepts boundary_ratio parameter for runtime override")
 
     def test_two_stage_with_all_optimizations(self, wan22_i2v_pipeline_fp8):
-        """Test Wan 2.2 with FP8, TeaCache, and TRTLLM attention."""
+        """Test Wan 2.2 with FP8 and TRTLLM attention (TeaCache not supported for Wan 2.2)."""
         # Skip if not two-stage
         if (
             wan22_i2v_pipeline_fp8.boundary_ratio is None
@@ -984,7 +973,7 @@ class TestWanI2VTwoStage:
         ):
             pytest.skip("Not a two-stage checkpoint")
 
-        # Load pipeline with all optimizations
+        # Load pipeline with all supported optimizations (no TeaCache for Wan 2.2)
         args = DiffusionArgs(
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
@@ -992,14 +981,8 @@ class TestWanI2VTwoStage:
             skip_components=SKIP_MINIMAL,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="TRTLLM"),
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             print("\n[Two-Stage + All Optimizations]")
@@ -1011,18 +994,6 @@ class TestWanI2VTwoStage:
             )
             print(f"✓ FP8: transformer={fp8_t1}, transformer_2={fp8_t2}")
             assert fp8_t1 and fp8_t2
-
-            # Check TeaCache on both transformers
-            has_cache_t1 = (
-                hasattr(pipeline, "transformer_cache_backend")
-                and pipeline.transformer_cache_backend
-            )
-            has_cache_t2 = (
-                hasattr(pipeline, "transformer_2_cache_backend")
-                and pipeline.transformer_2_cache_backend
-            )
-            print(f"✓ TeaCache: transformer={has_cache_t1}, transformer_2={has_cache_t2}")
-            assert has_cache_t1 and has_cache_t2
 
             # Check TRTLLM attention
             attn1_backend = pipeline.transformer.blocks[0].attn1.attn_backend
@@ -1056,9 +1027,8 @@ class TestWanI2VRobustness:
                 dtype="bfloat16",
                 skip_components=SKIP_MINIMAL,
                 quant_config={"quant_algo": "INVALID_ALGO", "dynamic": True},
-                pipeline={"warmup_steps": 0},
             )
-            pipeline = PipelineLoader(args).load()
+            pipeline = PipelineLoader(args).load(skip_warmup=True)
             del pipeline
 
     def test_mismatched_image_size(self, test_image):
@@ -1071,9 +1041,8 @@ class TestWanI2VRobustness:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_WITH_IMAGE,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Check if model uses image encoder
@@ -1152,9 +1121,8 @@ class TestWanI2VParallelism(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG (no parallel)
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         config = pipeline_baseline.transformer.model_config.pretrained_config
 
         # Reset torch compile state
@@ -1364,9 +1332,8 @@ class TestWanI2VCombinedOptimizations(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_MINIMAL,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         config = pipeline_baseline.transformer.model_config.pretrained_config
 
         # Reset torch compile state

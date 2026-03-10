@@ -52,11 +52,6 @@ using BlocksPerWindow = std::map<SizeType32, std::tuple<SizeType32, SizeType32>>
 namespace
 {
 
-inline uint8_t getNthByte(SizeType32 hashPart, uint8_t byteIdx) noexcept
-{
-    return static_cast<uint8_t>((hashPart >> (24 - byteIdx * 8)) & 0xFF);
-}
-
 //! \brief Get all blocks in a sequence by traversing backwards from the last block.
 //! \param lastBlock is a BlockPtr to the last block in the sequence to start traversal from
 //! \return Vector of BlockPtr-s in sequence order
@@ -94,173 +89,6 @@ std::vector<BlockPtr> getAllSequenceBlocks(BlockPtr lastBlock)
 
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
-std::vector<MmKey> generateBlockHashExtraKeys(
-    tensorrt_llm::batch_manager::LlmRequest const& llmRequest, SizeType32 startTokenIdx, SizeType32 endTokenIdx)
-{
-    auto const multimodalHashes = llmRequest.getMultimodalHashes();
-    auto const multimodalPositions = llmRequest.getMultimodalPositions();
-    auto const multimodalLengths = llmRequest.getMultimodalLengths();
-    auto const multimodalUuids = llmRequest.getMultimodalUuids();
-
-    if (!multimodalHashes || !multimodalPositions || !multimodalLengths || !(*multimodalHashes)
-        || (*multimodalHashes)->empty() || !(*multimodalPositions) || (*multimodalPositions)->empty()
-        || !(*multimodalLengths) || (*multimodalLengths)->empty())
-    {
-        return {};
-    }
-
-    if ((*multimodalHashes)->size() != (*multimodalPositions)->size()
-        || (*multimodalPositions)->size() != (*multimodalLengths)->size())
-    {
-        TLLM_LOG_WARNING("Multimodal data arrays have mismatched sizes");
-        return {};
-    }
-
-    std::vector<MmKey> extraKeys;
-    extraKeys.reserve((*multimodalPositions)->size());
-    std::array<uint8_t, 32> mmHashArray;
-
-    for (size_t i = 0; i < (*multimodalPositions)->size(); ++i)
-    {
-        auto const& startPos = (*(*multimodalPositions))[i];
-        auto const& length = (*(*multimodalLengths))[i];
-        auto const& mmHashVector = (*(*multimodalHashes))[i];
-
-        TLLM_CHECK_WITH_INFO(mmHashVector.size() == 8, "Multimodal hash vector has unexpected size: %zu (expected 8)",
-            mmHashVector.size());
-
-        // mmHashVector[j] comes from Python's int(hex_chunk, 16)
-        // where hex_chunk like "00010203" means 0x00 is MSB and 0x03 is LSB (big endian)
-        // Convert 8x 32-bit integers into a 32-byte array preserving Blake3 hash byte order
-        // Example: hashPart = 0x00010203 → mmHashArray[0:3] = [0x00, 0x01, 0x02, 0x03]
-        for (size_t j = 0; j < 8; ++j)
-        {
-            auto const& hashPart = mmHashVector[j];
-            for (uint8_t byteIdx = 0; byteIdx < 4; ++byteIdx)
-            {
-                mmHashArray[j * 4 + byteIdx] = getNthByte(hashPart, byteIdx);
-            }
-        }
-
-        // Check if this multimodal content overlaps with the current block
-        if (endTokenIdx > startPos && startTokenIdx < startPos + length)
-        {
-            uint64_t mmStartInBlock = (startPos >= startTokenIdx) ? 0 : static_cast<uint64_t>(startTokenIdx - startPos);
-
-            // Get UUID if available
-            std::optional<std::string> uuid = std::nullopt;
-            if (multimodalUuids && *multimodalUuids && i < (*multimodalUuids)->size())
-            {
-                uuid = (*(*multimodalUuids))[i];
-            }
-
-            extraKeys.emplace_back(mmHashArray, mmStartInBlock, std::move(uuid));
-        }
-    }
-
-    return extraKeys;
-}
-
-std::vector<BlockKey> buildBlockKeys(
-    std::list<VecUniqueTokens>& blockedUniqueTokens, tensorrt_llm::batch_manager::LlmRequest const& llmRequest)
-{
-    std::vector<BlockKey> blockKeys;
-
-    SizeType32 currentTokenIdx = 0;
-    for (auto& uniqueTokens : blockedUniqueTokens)
-    {
-        auto extraKeys = generateBlockHashExtraKeys(llmRequest, currentTokenIdx, currentTokenIdx + uniqueTokens.size());
-        currentTokenIdx += uniqueTokens.size();
-
-        blockKeys.emplace_back(llmRequest.getInputTokensExtraIds().has_value(), llmRequest.getLoraTaskId(),
-            std::move(uniqueTokens), std::move(extraKeys), llmRequest.getCacheSaltID());
-    }
-    return blockKeys;
-}
-
-bool BlockKey::operator==(BlockKey const& other) const noexcept
-{
-    return (usesExtraIds == other.usesExtraIds && loraTaskId == other.loraTaskId && uniqueTokens == other.uniqueTokens
-        && extraKeys == other.extraKeys && cacheSaltID == other.cacheSaltID);
-}
-
-size_t BlockKeyHasher::hash(BlockKey const& blockKey, std::size_t parentHash) noexcept
-{
-    // Hashing algorithm adapted from StackOverflow:
-    // https://stackoverflow.com/questions/664014/what-integer-hash-function-are-good-that-accepts-an-integer-hash-key
-    // Constants provide very good distribution - each input bit affects each output bit with ~50% probability.
-    size_t seed = blockKey.uniqueTokens.size() ^ parentHash * UINT64_C(0xbf58476d1ce4e5b9);
-
-    if (parentHash == 0 && blockKey.cacheSaltID)
-    {
-        // Only hashing the cache salt ID for the first block in the sequence
-        uint64_t c = blockKey.cacheSaltID.value();
-        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
-        c = c ^ (c >> 31);
-        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-    }
-
-    for (auto const& uniqueToken : blockKey.uniqueTokens)
-    {
-        uint32_t a = static_cast<uint32_t>(uniqueToken.tokenId);
-        a = ((a >> 16) ^ a) * 0x45d9f3b;
-        a = ((a >> 16) ^ a) * 0x45d9f3b;
-        a = (a >> 16) ^ a;
-        seed ^= a + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        if (blockKey.usesExtraIds)
-        {
-            uint64_t b = uniqueToken.tokenExtraId;
-            b = (b ^ (b >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-            b = (b ^ (b >> 27)) * UINT64_C(0x94d049bb133111eb);
-            b = b ^ (b >> 31);
-            seed ^= b + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-    }
-
-    if (blockKey.loraTaskId)
-    {
-        uint64_t c = blockKey.loraTaskId.value();
-        c = (c ^ (c >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-        c = (c ^ (c >> 27)) * UINT64_C(0x94d049bb133111eb);
-        c = c ^ (c >> 31);
-        seed ^= c + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-    }
-
-    // Add extra keys for multimodal data mixing in external multimodal item hash and token offset within this sequence
-    // block
-    if (!blockKey.extraKeys.empty())
-    {
-        for (auto const& mmKey : blockKey.extraKeys)
-        {
-            auto const& mmHash = mmKey.hash;
-            auto const& startOffset = mmKey.startOffset;
-            // Hash the multimodal hash array in 32-bit chunks (more efficient)
-            for (size_t i = 0; i < 32; i += 4)
-            {
-                // Combine 4 bytes into a 32-bit word (construct as little endian order)
-                uint32_t word = static_cast<uint32_t>(mmHash[i]) | (static_cast<uint32_t>(mmHash[i + 1]) << 8)
-                    | (static_cast<uint32_t>(mmHash[i + 2]) << 16) | (static_cast<uint32_t>(mmHash[i + 3]) << 24);
-
-                // Mix the word into the seed
-                word = ((word >> 16) ^ word) * 0x45d9f3b;
-                word = ((word >> 16) ^ word) * 0x45d9f3b;
-                word = (word >> 16) ^ word;
-                seed ^= word + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-            }
-
-            // Hash the start offset
-            uint64_t e = static_cast<uint64_t>(startOffset);
-            e = (e ^ (e >> 30)) * UINT64_C(0xbf58476d1ce4e5b9);
-            e = (e ^ (e >> 27)) * UINT64_C(0x94d049bb133111eb);
-            e = e ^ (e >> 31);
-            seed ^= e + 0x9e3779b9 + (seed << 6) + (seed >> 2);
-        }
-    }
-
-    return seed;
-}
-
 KVCacheBlock::KVCacheBlock(IdType blockId, tk::KVCacheIndex blockIdx)
     : mBlockId(blockId)
     , mMemoryPoolBlockIndex{blockIdx}
@@ -455,7 +283,7 @@ std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
             {
                 if (copyOnPartialReuse || (!block->hasRefs() && block->isLeaf()))
                 {
-                    SizeType32 numMatched = key.partialMatch(blockKey);
+                    SizeType32 numMatched = key.numMatchingTokens(blockKey);
                     if (numMatched > bestNumMatched)
                     {
                         bestNumMatched = numMatched;
@@ -1184,11 +1012,12 @@ void WindowBlockManager::offloadBlock(
     return onlyManager.findNewContextBlock(uniqueTokens, llmRequest);
 }
 
-SizeType32 BlockManager::countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+SizeType32 BlockManager::countReusableBlocks(
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
     TLLM_CHECK_WITH_INFO(!isVariableWindow(), "countReusableBlocks does not work for variable window attention");
     auto const& onlyManager = mWindowBlockManagers.cbegin()->second;
-    return onlyManager.countReusableBlocks(uniqueTokens, llmRequest);
+    return onlyManager.countReusableBlocks(uniqueTokens, llmRequest, onlyAllocated);
 }
 
 std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
@@ -1217,7 +1046,7 @@ std::optional<BlockKey> WindowBlockManager::findNewContextBlock(
 }
 
 SizeType32 WindowBlockManager::countReusableBlocks(
-    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
     // Chop tokens into full blocks only (allowPartial=false)
     auto blockedUniqueTokens
@@ -1240,12 +1069,19 @@ SizeType32 WindowBlockManager::countReusableBlocks(
             break;
         }
 
-        // Found a matching block that can be reused
-        ++reusableBlocks;
+        // When onlyAllocated is true, only count blocks that are already allocated
+        // to an active sequence (have refs). Sharing these blocks doesn't consume
+        // from the free pool. Free cached blocks (no refs) are already counted in
+        // the eviction policy's free count and must not be double-counted.
+        if (!onlyAllocated || matchingBlock->hasRefs())
+        {
+            ++reusableBlocks;
+        }
         searchRoot = std::move(matchingBlock);
     }
 
-    TLLM_LOG_DEBUG("%s::countReusableBlocks - Found %d reusable blocks", mLogPrefix.c_str(), reusableBlocks);
+    TLLM_LOG_DEBUG("%s::countReusableBlocks - Found %d reusable blocks (onlyAllocated=%d)", mLogPrefix.c_str(),
+        reusableBlocks, onlyAllocated);
     return reusableBlocks;
 }
 
@@ -2141,10 +1977,13 @@ KVCacheManager::KVCacheManager(std::vector<SizeType32> const& numKvHeadsPerLayer
     // disable block reuse for sink bubble since chopVectorIntoBlocks does not match KV cache blocks in this case
     , mEnableBlockReuse{mSinkBubbleLength > 0 ? false : enableBlockReuse}
 {
+    // When num_layers < len(maxAttentionWindowVec), not all window sizes in the
+    // repeating pattern are used. Update mMaxAttentionWindow to the actual
+    // maximum window size that has been allocated in the block manager.
+    mMaxAttentionWindow = mBlockManager.getLastWindowSize();
+
     TLLM_CHECK_WITH_INFO(mSinkBlockTokenLength == 0 && mSinkBubbleLength == 0,
         "[kv cache manager] streamLLM is not supported at the moment");
-    TLLM_CHECK_DEBUG(std::find(maxAttentionWindowVec.begin(), maxAttentionWindowVec.end(), mMaxAttentionWindow)
-        != maxAttentionWindowVec.end());
     // The sink tokens are stored in blocks separate from other tokens.
     // If the last block of sink tokens is only partially filled,
     // we fill that block with a "bubble" to reach the number of tokens per block.
@@ -2277,11 +2116,16 @@ SizeType32 KVCacheManager::getNeededBlocksOneStep(
             = tc::ceilDiv(numUnSharedTokens, getTokensPerBlock()) * req.mSamplingConfig.beamWidth;
         auto numRequiredBlocks = numSharedBlocks + numUnSharedBlocks;
 
-        // Subtract reusable blocks if block reuse is enabled and we're not using variable window attention
+        // Subtract only reusable blocks that are already allocated (have active refs from another
+        // sequence). Sharing an allocated block doesn't consume from the free pool. We must NOT
+        // subtract free reusable blocks (blocks cached in the radix tree but without active refs),
+        // because those are already counted in the eviction policy's free block count — subtracting
+        // them would double-count (once as reducing demand, once as inflating supply), causing the
+        // scheduler to over-admit requests and leading to "No free block found" errors.
         if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && !isCrossKv())
         {
             auto const uniqueTokens = req.getUniqueTokens(0);
-            auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
+            auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
             // Only subtract from shared blocks (reusable blocks are always shared)
             auto const reusableSharedBlocks = std::min(numReusableBlocks, numSharedBlocks);
             numRequiredBlocks -= reusableSharedBlocks;
@@ -2341,7 +2185,6 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
 
     SizeType32 const numGenBlocksPerBeam = numTotalBlocksPerBeam - numContextBlocks;
 
-    // Get allocated blocks count first - needed to decide if reuse accounting applies
     SizeType32 numAllocBlocksPerBeam = 0;
     {
         std::scoped_lock lck(mSequencesMtx);
@@ -2353,18 +2196,15 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
         }
     }
 
-    // Calculate reusable blocks to subtract from context blocks (for new context requests)
-    // Only apply reuse accounting if:
-    // 1. Block reuse is enabled
-    // 2. Not using variable window attention
-    // 3. Request is in context init state and first context chunk
-    // 4. No blocks have been allocated yet for this sequence (otherwise reuse already applied during allocation)
+    // Only subtract reusable blocks that are already allocated (have active refs). See the
+    // comment in getNeededBlocksOneStep for the full rationale — free reusable blocks must
+    // not be subtracted because they are already counted in the eviction policy's free count.
     SizeType32 numReusableContextBlocks = 0;
     if (mEnableBlockReuse && !mBlockManager.isVariableWindow() && req.isContextInitState() && req.isFirstContextChunk()
         && numAllocBlocksPerBeam == 0)
     {
         auto const uniqueTokens = req.getUniqueTokens(0);
-        auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req);
+        auto const numReusableBlocks = countReusableBlocks(uniqueTokens, req, /*onlyAllocated=*/true);
         numReusableContextBlocks = std::min(numReusableBlocks, numContextBlocks);
         TLLM_LOG_DEBUG(
             "getRemainingBlocksToCompletion: request ID %lu, numContextBlocks=%d, numReusableBlocks=%d, "
@@ -2385,7 +2225,7 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
     SizeType32 numExtraBlocksPerBeam
         = isSlidingWindow && willCrossBlockBoundary && willCrossWindowBlockBoundary ? 1 : 0;
 
-    // Adjust for reusable context blocks
+    // Adjust for reusable context blocks (only allocated ones)
     SizeType32 const effectiveContextBlocks = numContextBlocks - numReusableContextBlocks;
 
     if (numAllocBlocksPerBeam < effectiveContextBlocks) // Still haven't allocated all context blocks
@@ -2394,7 +2234,6 @@ SizeType32 KVCacheManager::getRemainingBlocksToCompletion(LlmRequest const& req,
             + (numGenBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
     }
 
-    // For generation phase, we don't benefit from reuse anymore
     SizeType32 const effectiveTotalBlocks = numTotalBlocksPerBeam - numReusableContextBlocks;
     return (effectiveTotalBlocks - numAllocBlocksPerBeam + numExtraBlocksPerBeam) * req.mSamplingConfig.beamWidth;
 }
@@ -2505,9 +2344,10 @@ std::optional<BlockKey> KVCacheManager::findNewContextBlock(
     return newContextBlockOpt;
 }
 
-SizeType32 KVCacheManager::countReusableBlocks(VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest) const
+SizeType32 KVCacheManager::countReusableBlocks(
+    VecUniqueTokens const& uniqueTokens, LlmRequest const& llmRequest, bool onlyAllocated) const
 {
-    return mBlockManager.countReusableBlocks(uniqueTokens, llmRequest);
+    return mBlockManager.countReusableBlocks(uniqueTokens, llmRequest, onlyAllocated);
 }
 
 bool KVCacheManager::addSequence(

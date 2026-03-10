@@ -57,6 +57,13 @@ Copyright contributors to the SGLang project
 Licensed under the Apache License 2.0
 
 --------------------------------------------------------------------------------
+Suffix Automaton Speculative Decoding
+--------------------------------------------------------------------------------
+Original Source: https://github.com/basetenlabs/sa_spec
+Copyright 2025 Baseten
+Licensed under the Apache License 2.0
+
+--------------------------------------------------------------------------------
 Text Generation Inference
 --------------------------------------------------------------------------------
 Original Source: https://github.com/huggingface/text-generation-inference

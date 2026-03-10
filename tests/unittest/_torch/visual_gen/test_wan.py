@@ -159,9 +159,8 @@ def _run_cfg_worker(rank, world_size, checkpoint_path, inputs_list, return_dict)
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_cfg_size=world_size),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify CFG parallel configuration
         assert pipeline.model_config.parallel.dit_cfg_size == world_size, (
@@ -267,9 +266,8 @@ def _run_all_optimizations_worker(rank, world_size, checkpoint_path, inputs_list
             ),
             attention=AttentionConfig(backend="TRTLLM"),
             parallel=ParallelConfig(dit_cfg_size=world_size),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args_full).load()
+        pipeline = PipelineLoader(args_full).load(skip_warmup=True)
         transformer = pipeline.transformer.eval()
 
         # Verify all optimizations are enabled
@@ -775,9 +773,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify pipeline loaded correctly
         assert pipeline.transformer is not None
@@ -830,9 +827,8 @@ class TestWanPipeline:
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify FP8 weights in transformer blocks
         found_fp8 = False
@@ -869,9 +865,8 @@ class TestWanPipeline:
                 "quant_algo": "NVFP4",
                 "dynamic": True,
             },
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         # Verify NVFP4 weights in transformer blocks
         found_nvfp4 = False
@@ -919,9 +914,8 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         # =====================================================================
         # Load FP8 Pipeline
@@ -933,9 +927,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load()
+        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
 
         # =====================================================================
         # Get Linear Layers from Both Pipelines
@@ -1039,9 +1032,8 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         bf16_model_mem = get_module_memory_gb(pipeline_bf16.transformer)
         bf16_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1060,9 +1052,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load()
+        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
 
         fp8_model_mem = get_module_memory_gb(pipeline_fp8.transformer)
         fp8_peak_mem = torch.cuda.max_memory_allocated() / 1024**3
@@ -1111,9 +1102,8 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
         transformer_bf16 = pipeline_bf16.transformer
 
         # =====================================================================
@@ -1126,9 +1116,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             quant_config={"quant_algo": quant_algo, "dynamic": True},
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_fp8 = PipelineLoader(args_fp8).load()
+        pipeline_fp8 = PipelineLoader(args_fp8).load(skip_warmup=True)
         transformer_fp8 = pipeline_fp8.transformer
 
         # =====================================================================
@@ -1283,10 +1272,9 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
-            pipeline={"warmup_steps": 0},
         )
         # Default attention backend is VANILLA
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         transformer_baseline = pipeline_baseline.transformer
 
         # =====================================================================
@@ -1298,10 +1286,9 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
-            pipeline={"warmup_steps": 0},
         )
         args_vanilla.attention = AttentionConfig(backend="VANILLA")
-        pipeline_vanilla = PipelineLoader(args_vanilla).load()
+        pipeline_vanilla = PipelineLoader(args_vanilla).load(skip_warmup=True)
         transformer_vanilla = pipeline_vanilla.transformer
 
         # =====================================================================
@@ -1412,10 +1399,9 @@ class TestWanPipeline:
             checkpoint_path=CHECKPOINT_PATH,
             device="cuda",
             dtype="bfloat16",
-            pipeline={"warmup_steps": 0},
         )
         args_trtllm.attention = AttentionConfig(backend="TRTLLM")
-        pipeline_trtllm = PipelineLoader(args_trtllm).load()
+        pipeline_trtllm = PipelineLoader(args_trtllm).load(skip_warmup=True)
         transformer_trtllm = pipeline_trtllm.transformer
 
         # Verify automatic backend override for cross-attention
@@ -1524,9 +1510,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         print(f"[Mixed Quant Accuracy] Loading mixed {quant_algo} model...")
         args_fp8_mixed = DiffusionArgs(
@@ -1539,9 +1524,8 @@ class TestWanPipeline:
                 "dynamic": True,
                 "ignore": mixed_ignore_patterns,
             },
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_fp8_mixed = PipelineLoader(args_fp8_mixed).load()
+        pipeline_fp8_mixed = PipelineLoader(args_fp8_mixed).load(skip_warmup=True)
 
         # =====================================================================
         # Create Test Inputs
@@ -1651,9 +1635,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         # Load FP8 static quantized model (from pre-quantized checkpoint)
         print(f"\n[FP8 Static] Loading from {CHECKPOINT_PATH_WAN22_FP8}")
@@ -1662,9 +1645,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_fp8_static = PipelineLoader(args_fp8_static).load()
+        pipeline_fp8_static = PipelineLoader(args_fp8_static).load(skip_warmup=True)
 
         # Load FP8 dynamic quantized model (from BF16 checkpoint with on-the-fly quant)
         print(f"\n[FP8 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_BF16} with dynamic quant")
@@ -1677,9 +1659,8 @@ class TestWanPipeline:
                 "quant_algo": "FP8",
                 "dynamic": True,
             },
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_fp8_dynamic = PipelineLoader(args_fp8_dynamic).load()
+        pipeline_fp8_dynamic = PipelineLoader(args_fp8_dynamic).load(skip_warmup=True)
 
         # Verify FP8 static model has calibrated scales
         static_quant_modules = 0
@@ -1863,9 +1844,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         # Load NVFP4 static quantized model (from pre-quantized checkpoint)
         print(f"\n[NVFP4 Static] Loading from {CHECKPOINT_PATH_WAN22_NVFP4}")
@@ -1874,9 +1854,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load()
+        pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load(skip_warmup=True)
 
         # Load NVFP4 dynamic quantized model (from BF16 checkpoint with on-the-fly quant)
         print(f"\n[NVFP4 Dynamic] Loading from {CHECKPOINT_PATH_WAN22_BF16} with dynamic quant")
@@ -1889,9 +1868,8 @@ class TestWanPipeline:
                 "quant_algo": "NVFP4",
                 "dynamic": True,
             },
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load()
+        pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load(skip_warmup=True)
 
         # Verify NVFP4 static model has quantized weights
         static_quant_modules = 0
@@ -2103,9 +2081,8 @@ class TestWanPipeline:
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_bf16 = PipelineLoader(args_bf16).load()
+        pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         # Load NVFP4 static model (if checkpoint available)
         pipeline_nvfp4_static = None
@@ -2118,9 +2095,8 @@ class TestWanPipeline:
                 device="cuda",
                 dtype="bfloat16",
                 skip_components=SKIP_COMPONENTS,
-                pipeline={"warmup_steps": 0},
             )
-            pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load()
+            pipeline_nvfp4_static = PipelineLoader(args_nvfp4_static).load(skip_warmup=True)
 
             # Verify static model has quantized weights (but NOT in ignored layers)
             for name, module in pipeline_nvfp4_static.transformer.named_modules():
@@ -2158,9 +2134,8 @@ class TestWanPipeline:
                 "dynamic": True,
                 "ignore": mixed_ignore_patterns,
             },
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load()
+        pipeline_nvfp4_dynamic = PipelineLoader(args_nvfp4_dynamic).load(skip_warmup=True)
 
         # Verify dynamic model has quantized weights
         dynamic_quant_modules = 0
@@ -2465,9 +2440,8 @@ class TestWanOptimizations(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_trtllm = PipelineLoader(args_trtllm).load()
+        pipeline_trtllm = PipelineLoader(args_trtllm).load(skip_warmup=True)
         config = pipeline_trtllm.transformer.model_config.pretrained_config
 
         hf_model = (
@@ -2515,9 +2489,8 @@ class TestWanOptimizations(unittest.TestCase):
                 teacache_thresh=0.2,
                 use_ret_steps=True,
             ),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_teacache = PipelineLoader(args_teacache).load()
+        pipeline_teacache = PipelineLoader(args_teacache).load(skip_warmup=True)
         transformer_teacache = pipeline_teacache.transformer.eval()
 
         # Verify TeaCache is enabled
@@ -2658,9 +2631,8 @@ class TestWanParallelism(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG (no parallel)
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         config = pipeline_baseline.transformer.model_config.pretrained_config
 
         # Reset torch compile state to avoid BFloat16 dtype issues
@@ -2853,9 +2825,8 @@ class TestWanCombinedOptimizations(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             parallel=ParallelConfig(dit_cfg_size=1),  # Standard CFG
-            pipeline={"warmup_steps": 0},
         )
-        pipeline_baseline = PipelineLoader(args_baseline).load()
+        pipeline_baseline = PipelineLoader(args_baseline).load(skip_warmup=True)
         config = pipeline_baseline.transformer.model_config.pretrained_config
 
         # Reset torch compile state to avoid BFloat16 dtype issues
@@ -3022,9 +2993,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Check if this is a two-stage model
@@ -3071,9 +3041,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Skip if not two-stage
@@ -3168,9 +3137,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Skip if not two-stage
@@ -3220,9 +3188,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             device="cuda",
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Skip if not two-stage
@@ -3233,65 +3200,6 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             print("[Guidance Scale 2] High-noise stage: uses guidance_scale (e.g., 4.0)")
             print("[Guidance Scale 2] Low-noise stage: uses guidance_scale_2 (e.g., 2.0, 3.0, 4.0)")
             print("\n[PASS] ✓ Different guidance scales supported for two stages")
-            print("=" * 80)
-
-        finally:
-            del pipeline
-            import gc
-
-            gc.collect()
-            torch.cuda.empty_cache()
-
-    def test_two_stage_with_teacache_both_transformers(self):
-        """Test that TeaCache is enabled for both transformers in two-stage mode."""
-        if not is_wan22_checkpoint():
-            pytest.skip(
-                "This test requires Wan 2.2 T2V checkpoint. Set DIFFUSION_MODEL_PATH_WAN22_T2V."
-            )
-        print("\n" + "=" * 80)
-        print("WAN 2.2 TWO-STAGE + TEACACHE TEST")
-        print("=" * 80)
-
-        args = DiffusionArgs(
-            checkpoint_path=CHECKPOINT_PATH_WAN22_T2V,
-            device="cuda",
-            dtype="bfloat16",
-            skip_components=SKIP_COMPONENTS,
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
-            pipeline={"warmup_steps": 0},
-        )
-        pipeline = PipelineLoader(args).load()
-
-        try:
-            # Skip if not two-stage
-            if pipeline.boundary_ratio is None or pipeline.transformer_2 is None:
-                pytest.skip("Checkpoint is not Wan 2.2 (two-stage)")
-
-            # Verify TeaCache on transformer (high-noise)
-            assert hasattr(pipeline, "transformer_cache_backend"), (
-                "Pipeline missing transformer_cache_backend"
-            )
-            assert pipeline.transformer_cache_backend is not None
-            print("\n[TeaCache] ✓ Transformer (high-noise): TeaCache enabled")
-
-            # Verify TeaCache on transformer_2 (low-noise)
-            assert hasattr(pipeline, "transformer_2_cache_backend"), (
-                "Pipeline missing transformer_2_cache_backend"
-            )
-            assert pipeline.transformer_2_cache_backend is not None
-            print("[TeaCache] ✓ Transformer_2 (low-noise): TeaCache enabled")
-
-            # Verify both have get_stats method
-            assert hasattr(pipeline.transformer_cache_backend, "get_stats")
-            assert hasattr(pipeline.transformer_2_cache_backend, "get_stats")
-            print("[TeaCache] ✓ Both transformers support statistics logging")
-
-            print("\n[PASS] ✓ TeaCache enabled for BOTH transformers")
-            print("       ✓ Low-noise stage benefits MORE from TeaCache")
             print("=" * 80)
 
         finally:
@@ -3317,9 +3225,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8", "dynamic": True},
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Skip if not two-stage
@@ -3370,9 +3277,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             dtype="bfloat16",
             skip_components=SKIP_COMPONENTS,
             attention=AttentionConfig(backend="TRTLLM"),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Skip if not two-stage
@@ -3422,14 +3328,14 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             torch.cuda.empty_cache()
 
     def test_two_stage_all_optimizations(self):
-        """Test two-stage with ALL optimizations: FP8 + TeaCache + TRTLLM."""
+        """Test two-stage with all supported optimizations: FP8 + TRTLLM."""
         if not is_wan22_checkpoint():
             pytest.skip(
                 "This test requires Wan 2.2 T2V checkpoint. Set DIFFUSION_MODEL_PATH_WAN22_T2V."
             )
         print("\n" + "=" * 80)
         print("WAN 2.2 TWO-STAGE + ALL OPTIMIZATIONS TEST")
-        print("FP8 + TeaCache + TRTLLM Attention")
+        print("FP8 + TRTLLM Attention (TeaCache not supported for Wan 2.2)")
         print("=" * 80)
 
         args = DiffusionArgs(
@@ -3439,14 +3345,8 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             skip_components=SKIP_COMPONENTS,
             quant_config={"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
             attention=AttentionConfig(backend="TRTLLM"),
-            teacache=TeaCacheConfig(
-                enable_teacache=True,
-                teacache_thresh=0.2,
-                use_ret_steps=True,
-            ),
-            pipeline={"warmup_steps": 0},
         )
-        pipeline = PipelineLoader(args).load()
+        pipeline = PipelineLoader(args).load(skip_warmup=True)
 
         try:
             # Skip if not two-stage
@@ -3465,19 +3365,12 @@ class TestWanTwoStageTransformer(unittest.TestCase):
             if pipeline.transformer.blocks[0].attn1.attn_backend == "TRTLLM":
                 optimizations.append("TRTLLM")
 
-            # Check TeaCache
-            if (
-                hasattr(pipeline, "transformer_cache_backend")
-                and pipeline.transformer_cache_backend is not None
-            ):
-                optimizations.append("TeaCache")
-
             # Check two-stage
             optimizations.append("Two-Stage")
 
             print(f"\n[All Optimizations] Enabled: {', '.join(optimizations)}")
-            assert len(optimizations) == 4, (
-                f"Expected 4 optimizations, got {len(optimizations)}: {optimizations}"
+            assert len(optimizations) == 3, (
+                f"Expected 3 optimizations, got {len(optimizations)}: {optimizations}"
             )
 
             # Verify all optimizations on transformer_2 as well
@@ -3488,12 +3381,6 @@ class TestWanTwoStageTransformer(unittest.TestCase):
 
             if pipeline.transformer_2.blocks[0].attn1.attn_backend == "TRTLLM":
                 print("[All Optimizations] ✓ Transformer_2: TRTLLM enabled")
-
-            if (
-                hasattr(pipeline, "transformer_2_cache_backend")
-                and pipeline.transformer_2_cache_backend is not None
-            ):
-                print("[All Optimizations] ✓ Transformer_2: TeaCache enabled")
 
             print("\n[PASS] ✓ All optimizations working on BOTH transformers")
             print("=" * 80)
@@ -3541,9 +3428,8 @@ class TestWanRobustness(unittest.TestCase):
                 dtype="bfloat16",
                 skip_components=SKIP_COMPONENTS,
                 quant_config={"quant_algo": "INVALID_ALGO"},
-                pipeline={"warmup_steps": 0},
             )
-            pipeline = PipelineLoader(args).load()  # noqa: F841
+            pipeline = PipelineLoader(args).load(skip_warmup=True)  # noqa: F841
 
         print("\n[Error Handling] ✓ Invalid quant_algo raises error as expected")
 

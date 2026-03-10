@@ -837,6 +837,11 @@ class GpuCacheLevelStorage(CacheLevelStorage):
     def pool_size_granularity(self) -> int:
         return self.shared_phys_mem_pool.phys_mem_size
 
+    @override
+    def destroy(self) -> None:
+        super().destroy()
+        self.shared_phys_mem_pool.clear()
+
 
 class HostCacheLevelStorage(CacheLevelStorage):
     TIER: ClassVar[CacheTier] = CacheTier.HOST_MEM

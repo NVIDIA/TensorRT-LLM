@@ -1,5 +1,5 @@
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Type
 
 import torch
 import torch.distributed as dist
@@ -11,6 +11,8 @@ from tensorrt_llm.mapping import Mapping
 
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
+from .modules.vae import BaseParallelVAEAdapter
+from .parallelism import setup_parallel_vae
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -22,12 +24,15 @@ class BasePipeline(nn.Module):
     Base class for diffusion pipelines.
     """
 
+    warmup_steps: int = 2
+
     def __init__(self, model_config: "DiffusionModelConfig"):
         super().__init__()
         self.model_config = model_config
         self.config = model_config.pretrained_config
         self.mapping: Mapping = getattr(model_config, "mapping", None) or Mapping()
         self._cuda_graph_runners: Dict[str, CUDAGraphRunner] = {}
+        self._parallel_vae_enabled: bool = False
 
         # Components
         self.transformer: Optional[nn.Module] = None
@@ -46,11 +51,10 @@ class BasePipeline(nn.Module):
 
     def _setup_cuda_graphs(self):
         """Wrap all transformer components with CUDA graph capture/replay."""
-        cfg = self.model_config.pipeline
-        if not cfg.enable_cuda_graph:
+        if not self.model_config.cuda_graph.enable_cuda_graph:
             return
 
-        if cfg.enable_torch_compile:
+        if self.model_config.torch_compile.enable_torch_compile:
             logger.warning(
                 "CUDA graphs with torch.compile not yet supported. Using torch.compile only."
             )
@@ -104,6 +108,11 @@ class BasePipeline(nn.Module):
         Override this property and use in self._run_warmup() for model-specific warmup.
         """
         return []
+
+    @property
+    def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:
+        """Return the VAE adapter class for the pipeline."""
+        return None
 
     def infer(self, req: Any):
         raise NotImplementedError
@@ -168,14 +177,51 @@ class BasePipeline(nn.Module):
                         teacache_cfg.coefficients = coeff_data
                         logger.info(f"TeaCache: Using {model_size} coefficients")
                     break
+            else:
+                raise ValueError(
+                    f"TeaCache: No coefficients found for checkpoint '{checkpoint_path}'. "
+                    f"Available variants: {list(coefficients.keys())}. "
+                    f"TeaCache is not supported for this model variant."
+                )
 
         # Initialize and enable TeaCache backend
         logger.info("TeaCache: Initializing...")
         self.cache_backend = TeaCacheBackend(teacache_cfg)
         self.cache_backend.enable(model)
 
+    def setup_parallel_vae(self):
+        if not self.model_config.parallel.enable_parallel_vae:
+            return
+        if not dist.is_initialized() or dist.get_world_size() <= 1:
+            return
+        if self.vae is None:
+            return
+
+        adapter_cls = self.vae_adapter_class
+        if adapter_cls is None:
+            logger.warning(
+                f"Parallel VAE not supported for {self.__class__.__name__}. "
+                "Implement vae_adapter_class in your pipeline to enable parallel VAE."
+            )
+            return
+
+        vae_rank, vae_world_size, adj_groups = setup_parallel_vae(self.model_config)
+        adapter_cls(
+            self.vae,
+            self.model_config.parallel.parallel_vae_split_dim,
+            vae_rank,
+            vae_world_size,
+            adj_groups,
+        )
+        self._parallel_vae_enabled = True
+        logger.info(
+            f"Parallel VAE enabled: {adapter_cls.__name__}, "
+            f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
+            f"world_size={vae_world_size}"
+        )
+
     def torch_compile(self) -> None:
-        """Apply torch.compile to pipeline components based on PipelineConfig.
+        """Apply torch.compile to pipeline components based on TorchCompileConfig.
 
         For transformer models, compiles each block in the ModuleList individually.
         This enables future block-wise offloading and keeps compilation efficient
@@ -183,12 +229,14 @@ class BasePipeline(nn.Module):
 
         For non-transformer components, compiles the entire module.
         """
-        pipeline_config = self.model_config.pipeline
-        compile_mode = pipeline_config.torch_compile_mode
+        tc_config = self.model_config.torch_compile
 
-        targets = pipeline_config.torch_compile_models
-        if not targets:
-            targets = self.transformer_components
+        # Using default as max-autotune mode takes more initialization time and
+        # does not improve performance a lot.
+        compile_mode = "default"
+
+        # Compiling transformer blocks provides max performance value.
+        targets = self.transformer_components
 
         for name in targets:
             model = getattr(self, name, None)
@@ -196,7 +244,6 @@ class BasePipeline(nn.Module):
                 logger.warning(f"torch.compile: component '{name}' not found, skipping")
                 continue
 
-            # For transformer models with ModuleList blocks, compile per-block
             blocks_attr = self._find_transformer_blocks(model)
             if blocks_attr:
                 for block_name in blocks_attr:
@@ -206,14 +253,13 @@ class BasePipeline(nn.Module):
                         f"({len(blocks)} blocks, mode={compile_mode})"
                     )
                     compiled_blocks = []
-                    # dynamic=None works better with multiple warmup shapes
                     for block in blocks:
                         compiled_blocks.append(
                             torch.compile(
                                 block,
                                 mode=compile_mode,
                                 dynamic=None,
-                                fullgraph=pipeline_config.enable_fullgraph,
+                                fullgraph=tc_config.enable_fullgraph,
                             )
                         )
                     setattr(model, block_name, nn.ModuleList(compiled_blocks))
@@ -223,7 +269,7 @@ class BasePipeline(nn.Module):
                     model,
                     mode=compile_mode,
                     dynamic=None,
-                    fullgraph=pipeline_config.enable_fullgraph,
+                    fullgraph=tc_config.enable_fullgraph,
                 )
                 setattr(self, name, compiled)
 
@@ -249,7 +295,7 @@ class BasePipeline(nn.Module):
 
         Called automatically by PipelineLoader after model loading and torch.compile.
         """
-        warmup_steps = self.model_config.pipeline.warmup_steps
+        warmup_steps = self.warmup_steps
         if warmup_steps <= 0:
             logger.info("Warmup disabled (warmup_steps=0)")
             return
@@ -288,6 +334,7 @@ class BasePipeline(nn.Module):
         extra_latents: Optional[Dict[str, Tuple[torch.Tensor, Callable]]] = None,
     ):
         """Execute VAE decoding. Only rank 0 performs decoding.
+        If parallel VAE is enabled, all processes perform decoding.
 
         Args:
             latents: Primary latents to decode (e.g., video)
@@ -300,6 +347,14 @@ class BasePipeline(nn.Module):
             Single result if no extra_latents, tuple of results if extra_latents provided.
             Non-rank-0 processes return None placeholders.
         """
+
+        if self._parallel_vae_enabled:
+            primary_result = decode_fn(latents)
+            if extra_latents:
+                extra_results = [efn(elat) for _, (elat, efn) in extra_latents.items()]
+                return (primary_result,) + tuple(extra_results)
+            return primary_result
+
         if self.rank == 0:
             primary_result = decode_fn(latents)
 
