@@ -20,7 +20,6 @@
 #include "nixl.h"
 #include "tensorrt_llm/executor/transferAgent.h"
 #include <atomic>
-#include <map>
 #include <thread>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -52,11 +51,6 @@ struct NixlHelper
     /// @return Pair of coalesced (src, dst) MemoryDescs
     [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> coalesceTransferDescs(
         TransferDescs const& srcDescs, TransferDescs const& dstDescs);
-
-    /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
-    /// For cudaMalloc memory (single allocation), descs pass through unchanged.
-    /// @param[out] detectedChunkSize Set to the VMM chunk size if detected, 0 otherwise.
-    [[nodiscard]] static MemoryDescs splitVmmDescs(MemoryDescs const& descs, size_t& detectedChunkSize);
 };
 
 class NixlTransferStatus final : public TransferStatus
@@ -121,24 +115,12 @@ private:
     std::vector<char> mDRamSrcBuffer;
     std::vector<char> mDRamDstBuffer;
 
-    /// Per-region VMM chunk info recorded at registerMemory time.
-    struct VramRegionInfo
-    {
-        size_t totalLen;
-        size_t chunkSize; ///< 0 = cudaMalloc (no split), >0 = VMM chunk size
-    };
+    /// Local VMM region info (from registerMemory). Keyed by local virtual address.
+    VramRegionMap mLocalVramRegionInfo;
 
-    std::map<uintptr_t, VramRegionInfo> mVramRegionInfo;
-
-    /// Look up VMM chunk size for a given address from stored registration info.
-    [[nodiscard]] size_t lookupChunkSize(uintptr_t addr) const;
-
-    /// Split VRAM descs using per-region registry info (for deregisterMemory).
-    [[nodiscard]] MemoryDescs splitDescsFromRegistry(MemoryDescs const& descs) const;
-
-    /// Split paired transfer descs: split src based on registry, dst follows with matching piece sizes.
-    [[nodiscard]] std::pair<MemoryDescs, MemoryDescs> splitTransferDescsFromRegistry(
-        MemoryDescs const& srcDescs, MemoryDescs const& dstDescs) const;
+    /// Remote VMM region info (from loadRemoteAgent). Keyed by {agentName → {addr → info}}.
+    /// Per-agent maps because different remote agents may have overlapping virtual addresses.
+    std::unordered_map<std::string, VramRegionMap> mRemoteVramRegionInfo;
 };
 
 class NixlLoopbackAgent final : public BaseLoopbackAgent
