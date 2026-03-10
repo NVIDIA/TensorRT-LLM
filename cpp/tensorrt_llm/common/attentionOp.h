@@ -259,17 +259,11 @@ public:
     template <typename T>
     int getKvCacheElemSizeInBits() const
     {
-        return getKvCacheElemSizeInBits<T>(mKVCacheQuantMode);
-    }
-
-    template <typename T>
-    static int getKvCacheElemSizeInBits(tensorrt_llm::common::QuantMode quantMode)
-    {
-        if (quantMode.hasInt8KvCache() || quantMode.hasFp8KvCache())
+        if (mKVCacheQuantMode.hasInt8KvCache() || mKVCacheQuantMode.hasFp8KvCache())
         {
             return 8;
         }
-        else if (quantMode.hasFp4KvCache())
+        else if (mKVCacheQuantMode.hasFp4KvCache())
         {
             return 4;
         }

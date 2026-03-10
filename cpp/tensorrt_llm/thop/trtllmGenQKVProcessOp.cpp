@@ -345,45 +345,113 @@ void qkv_processing(
 TRTLLM_NAMESPACE_END
 
 // Schema string shared by qkv_preprocessing and kv_cache_postprocessing.
-#define QKV_PROCESSING_SCHEMA                                                                                          \
-    "Tensor? qkv_input, Tensor? cross_kv_input, Tensor? quantized_qkv_output, Tensor? q_output, "                      \
-    "Tensor? kv_cache_block_offsets, Tensor? host_kv_cache_pool_pointers, Tensor? host_kv_cache_pool_mapping, "        \
-    "Tensor? qkv_bias, Tensor? qkv_scale_quant_orig, Tensor? qkv_scale_orig_quant, "                                   \
-    "Tensor? o_scale_orig_quant, Tensor? fmha_bmm1_scale, Tensor? fmha_bmm2_scale, "                                   \
-    "Tensor? fmha_tile_counter, Tensor? logn_scaling, "                                                                \
-    "Tensor? tokens_info, Tensor? seq_lens, Tensor? cache_seq_lens, Tensor? encoder_seq_lens, "                        \
-    "Tensor? cu_seq_lens, Tensor? cu_kv_seq_lens, Tensor? sparse_kv_offsets, Tensor? sparse_kv_indices, "              \
-    "Tensor? rotary_embedding_inv_freq, Tensor? rotary_coef_cache_buffer, "                                            \
-    "Tensor? spec_decoding_position_offsets, Tensor? mrope_rotary_cos_sin, Tensor? mrope_position_deltas, "            \
-    "int batch_size, int max_input_seq_len, int max_kv_seq_len, int cyclic_kv_cache_len, "                             \
-    "int sink_token_len, int token_num, bool remove_padding, bool is_last_chunk, bool cross_attention, "               \
-    "int head_num, int kv_head_num, int qheads_per_kv_head, int size_per_head, "                                       \
-    "float fmha_host_bmm1_scale, int rotary_embedding_dim, float rotary_embedding_base, "                              \
-    "int rotary_scaling_type, float rotary_embedding_scale, int rotary_embedding_max_positions, "                      \
-    "int position_embedding_type, bool position_shift_enabled, "                                                       \
-    "bool separate_q_kv_output, bool quantized_fp8_output, bool generation_phase, "                                    \
-    "int rotary_vision_start, int rotary_vision_length, "                                                              \
-    "int layer_idx, int tokens_per_block, int max_attention_window_size, int kv_cache_quant_mode, "                    \
-    "int cyclic_attention_window_size, int beam_width, int sink_token_length, int seq_offset=0"
+// clang-format off
+#define QKV_PROCESSING_SCHEMA                          \
+    "Tensor? qkv_input, "                              \
+    "Tensor? cross_kv_input, "                         \
+    "Tensor? quantized_qkv_output, "                   \
+    "Tensor? q_output, "                               \
+    "Tensor? kv_cache_block_offsets, "                 \
+    "Tensor? host_kv_cache_pool_pointers, "            \
+    "Tensor? host_kv_cache_pool_mapping, "             \
+    "Tensor? qkv_bias, "                               \
+    "Tensor? qkv_scale_quant_orig, "                   \
+    "Tensor? qkv_scale_orig_quant, "                   \
+    "Tensor? o_scale_orig_quant, "                     \
+    "Tensor? fmha_bmm1_scale, "                        \
+    "Tensor? fmha_bmm2_scale, "                        \
+    "Tensor? fmha_tile_counter, "                      \
+    "Tensor? logn_scaling, "                           \
+    "Tensor? tokens_info, "                            \
+    "Tensor? seq_lens, "                               \
+    "Tensor? cache_seq_lens, "                         \
+    "Tensor? encoder_seq_lens, "                       \
+    "Tensor? cu_seq_lens, "                            \
+    "Tensor? cu_kv_seq_lens, "                         \
+    "Tensor? sparse_kv_offsets, "                      \
+    "Tensor? sparse_kv_indices, "                      \
+    "Tensor? rotary_embedding_inv_freq, "              \
+    "Tensor? rotary_coef_cache_buffer, "               \
+    "Tensor? spec_decoding_position_offsets, "         \
+    "Tensor? mrope_rotary_cos_sin, "                   \
+    "Tensor? mrope_position_deltas, "                  \
+    "int batch_size, "                                 \
+    "int max_input_seq_len, "                          \
+    "int max_kv_seq_len, "                             \
+    "int cyclic_kv_cache_len, "                        \
+    "int sink_token_len, "                             \
+    "int token_num, "                                  \
+    "bool remove_padding, "                            \
+    "bool is_last_chunk, "                             \
+    "bool cross_attention, "                           \
+    "int head_num, "                                   \
+    "int kv_head_num, "                                \
+    "int qheads_per_kv_head, "                         \
+    "int size_per_head, "                              \
+    "float fmha_host_bmm1_scale, "                     \
+    "int rotary_embedding_dim, "                       \
+    "float rotary_embedding_base, "                    \
+    "int rotary_scaling_type, "                        \
+    "float rotary_embedding_scale, "                   \
+    "int rotary_embedding_max_positions, "             \
+    "int position_embedding_type, "                    \
+    "bool position_shift_enabled, "                    \
+    "bool separate_q_kv_output, "                      \
+    "bool quantized_fp8_output, "                      \
+    "bool generation_phase, "                          \
+    "int rotary_vision_start, "                        \
+    "int rotary_vision_length, "                       \
+    "int layer_idx, "                                  \
+    "int tokens_per_block, "                           \
+    "int max_attention_window_size, "                  \
+    "int kv_cache_quant_mode, "                        \
+    "int cyclic_attention_window_size, "               \
+    "int beam_width, "                                 \
+    "int sink_token_length, "                          \
+    "int seq_offset=0"
+
+// clang-format on
 
 TORCH_LIBRARY_FRAGMENT(trtllm, m)
 {
+    // clang-format off
     m.def(
         "build_decoder_info("
-        "Tensor? seq_q_offsets, Tensor? seq_kv_offsets, Tensor? padding_offsets, "
-        "Tensor? tokens_info, Tensor? encoder_padding_offsets, Tensor? packed_mask_row_offsets, "
-        "Tensor? seq_cp_partial_offsets, Tensor? attention_mask, "
-        "Tensor? seq_q_lengths, Tensor? seq_kv_lengths, "
-        "Tensor? fmha_tile_counter, Tensor? dequant_scale_qkv, Tensor? quant_scale_o, "
-        "Tensor? fmha_bmm1_scale, Tensor? fmha_bmm2_scale, "
-        "Tensor? rotary_embedding_inv_freq, Tensor? rotary_embedding_inv_freq_cache, "
-        "int cp_size, bool separate_qkv_scales, float fmha_host_bmm1_scale, "
-        "int batch_size, int max_q_seq_length, int max_encoder_q_seq_length, "
-        "int attention_window_size, int sink_token_length, int num_tokens, "
-        "bool remove_padding, int attention_mask_type, "
-        "float rotary_embedding_scale, float rotary_embedding_base, "
-        "int rotary_embedding_dim, int rotary_scaling_type, int rotary_embedding_max_positions"
+        "Tensor? seq_q_offsets, "
+        "Tensor? seq_kv_offsets, "
+        "Tensor? padding_offsets, "
+        "Tensor? tokens_info, "
+        "Tensor? encoder_padding_offsets, "
+        "Tensor? packed_mask_row_offsets, "
+        "Tensor? seq_cp_partial_offsets, "
+        "Tensor? attention_mask, "
+        "Tensor? seq_q_lengths, "
+        "Tensor? seq_kv_lengths, "
+        "Tensor? fmha_tile_counter, "
+        "Tensor? dequant_scale_qkv, "
+        "Tensor? quant_scale_o, "
+        "Tensor? fmha_bmm1_scale, "
+        "Tensor? fmha_bmm2_scale, "
+        "Tensor? rotary_embedding_inv_freq, "
+        "Tensor? rotary_embedding_inv_freq_cache, "
+        "int cp_size, "
+        "bool separate_qkv_scales, "
+        "float fmha_host_bmm1_scale, "
+        "int batch_size, "
+        "int max_q_seq_length, "
+        "int max_encoder_q_seq_length, "
+        "int attention_window_size, "
+        "int sink_token_length, "
+        "int num_tokens, "
+        "bool remove_padding, "
+        "int attention_mask_type, "
+        "float rotary_embedding_scale, "
+        "float rotary_embedding_base, "
+        "int rotary_embedding_dim, "
+        "int rotary_scaling_type, "
+        "int rotary_embedding_max_positions"
         ") -> bool");
+    // clang-format on
 
     m.def("qkv_preprocessing(" QKV_PROCESSING_SCHEMA ") -> ()");
     m.def("kv_cache_postprocessing(" QKV_PROCESSING_SCHEMA ") -> ()");
