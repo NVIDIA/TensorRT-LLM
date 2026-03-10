@@ -18,8 +18,8 @@ from ..pyexecutor.resource_manager import BaseResourceManager, SlotManager
 from ..pyexecutor.sampler import TorchSampler
 from ..pyexecutor.scheduler import ScheduledRequests
 from .interface import SpecMetadata, SpecWorkerBase
+from .sa_enhancer import SADraftEnhancer
 from .spec_sampler_base import SampleStateSpec, SpecSamplerBase
-from .suffix_automaton import SuffixAutomatonManager
 
 if TYPE_CHECKING:
     from tensorrt_llm.llmapi.llm_args import MTPDecodingConfig
@@ -128,8 +128,6 @@ class MTPSpecMetadata(SpecMetadata):
     # CUDA graph, we use this tensor to store the number of input tokens for the
     # subsequent draft forward.
     subseq_all_rank_num_tokens: Optional[List[int]] = None
-    # Optional suffix automaton manager for MTP+SA speculative decoding
-    sa_manager: Optional[SuffixAutomatonManager] = None
 
     def __post_init__(self) -> None:
         if self.mtp_hidden_states_manager is not None:
@@ -221,12 +219,12 @@ class MTPSpecMetadata(SpecMetadata):
                                         pin_memory=prefer_pinned())
             self.slot_ids[:num_seqs].copy_(mtp_slot_ids, non_blocking=True)
 
-        # Prepare SA manager for MTP+SA path (copies pending states to GPU)
-        if self.sa_manager is not None:
+        sa_manager = getattr(self.mtp_hidden_states_manager, 'sa_manager', None)
+        if sa_manager is not None:
             num_contexts = num_seqs - self.num_generations
             gen_request_ids = self.request_ids[num_contexts:]
             if gen_request_ids:
-                self.sa_manager.prepare(gen_request_ids, self.max_draft_len)
+                sa_manager.prepare(gen_request_ids, self.max_draft_len)
 
 
 class MTPSampler(SpecSamplerBase):
@@ -272,10 +270,9 @@ class MTPWorker(SpecWorkerBase):
         self.spec_config = spec_config
         self.model_config = model_config
         self.is_thop = False
-        # Initialize SA spec attributes
-        self.sa_match_len = None
-        self.sa_draft_tokens = None
-        self.sa_spec_index = 0
+        self.sa_enhancer: Optional[SADraftEnhancer] = None
+        if spec_config.use_sa_spec:
+            self.sa_enhancer = SADraftEnhancer(spec_config.sa_spec_threshold)
 
     @property
     def max_draft_len(self) -> int:
@@ -467,6 +464,15 @@ class MTPWorker(SpecWorkerBase):
                     "attn_metadata": draft_inputs["attn_metadata"],
                 }
             next_draft_tokens = torch.stack(next_draft_tokens, dim=1)
+
+        # Override with SA draft tokens after all MTP layers have run,
+        # so that MTP layers never see SA tokens in their inputs.
+        if self.sa_enhancer is not None:
+            num_contexts = attn_metadata.num_contexts
+            gen_draft_tokens = next_draft_tokens[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            next_draft_tokens[num_contexts:] = gen_draft_tokens
 
         # restore attn metadata
         if attn_metadata is not None:
@@ -834,30 +840,18 @@ class MTPWorker(SpecWorkerBase):
                     logits, draft_tokens, num_contexts, batch_size,
                     spec_metadata)
 
-        if self.spec_config.use_sa_spec and spec_metadata.sa_manager is not None:
-
-            # Initialize the output buffers
-            self.sa_match_len = torch.zeros((num_gens, ),
-                                            dtype=torch.int32,
-                                            device="cuda")
-            self.sa_draft_tokens = torch.zeros((num_gens, mtp_num_modules),
-                                               dtype=torch.int32,
-                                               device="cuda")
-
-            self.sa_spec_index = 0
-
-            # Invoke a batch update of the suffix automaton states
-            # and get the next suffix draft tokens
-            if num_gens > 0:
-                gen_request_ids = spec_metadata.request_ids[num_contexts:]
-                match_len, draft_tokens_sa = spec_metadata.sa_manager.extend(
-                    gen_request_ids,
-                    accepted_tokens[num_contexts:],
-                    num_accepted_tokens[num_contexts:],
-                    mtp_num_modules,
-                )
-                self.sa_match_len.copy_(match_len)
-                self.sa_draft_tokens.copy_(draft_tokens_sa)
+        sa_manager = getattr(spec_metadata.mtp_hidden_states_manager,
+                             'sa_manager', None)
+        if self.sa_enhancer is not None and sa_manager is not None:
+            self.sa_enhancer.extend_and_prepare(
+                sa_manager=sa_manager,
+                request_ids=spec_metadata.request_ids,
+                accepted_tokens=accepted_tokens,
+                num_accepted_tokens=num_accepted_tokens,
+                num_gens=num_gens,
+                num_contexts=num_contexts,
+                max_draft_len=mtp_num_modules,
+            )
 
         return accepted_tokens, num_accepted_tokens
 
@@ -1109,19 +1103,6 @@ class MTPWorker(SpecWorkerBase):
             # Simple argmax if no TP or no model config
             draft_tokens = self._draft_sampler_greedy(logits)
 
-        # select between MTP draft tokens and SA draft tokens
-        # Check sa_match_len is not None to handle case where use_sa_spec is True
-        if self.spec_config.use_sa_spec and self.sa_match_len is not None and (
-                num_gens := self.sa_match_len.shape[0]) > 0:
-            num_contexts = draft_tokens.shape[0] - num_gens
-
-            draft_tokens[num_contexts:] = torch.where(
-                self.sa_match_len >= self.spec_config.sa_spec_threshold,
-                self.sa_draft_tokens[:, self.sa_spec_index],
-                draft_tokens[num_contexts:])
-
-            self.sa_spec_index += 1
-
         return draft_tokens
 
 
@@ -1332,6 +1313,17 @@ class MTPEagleWorker(MTPWorker):
         # restore attn_metadata to support cuda graph
         self._restore_attn_metadata_from_spec_dec(attn_metadata)
         attn_metadata.use_spec_decoding = True
+
+        # Override with SA draft tokens after all MTP layers have run,
+        # so that MTP layers never see SA tokens in their inputs.
+        # Must happen before stacking since next_draft_tokens is still a list.
+        if self.sa_enhancer is not None:
+            stacked = torch.stack(next_draft_tokens, dim=1)
+            gen_draft_tokens = stacked[num_contexts:]
+            gen_draft_tokens = self.sa_enhancer.maybe_override_all_draft_tokens(
+                gen_draft_tokens)
+            stacked[num_contexts:] = gen_draft_tokens
+            next_draft_tokens = [stacked[:, i] for i in range(stacked.shape[1])]
 
         next_draft_tokens, next_new_tokens = self._prepare_next_tokens(
             next_draft_tokens, accepted_tokens, spec_metadata, batch_size,
