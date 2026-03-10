@@ -1,0 +1,256 @@
+/*
+ * SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-License-Identifier: Apache-2.0
+ *
+ * Licensed under the Apache License, Version 2.0 (the "License");
+ * you may not use this file except in compliance with the License.
+ * You may obtain a copy of the License at
+ *
+ * http://www.apache.org/licenses/LICENSE-2.0
+ *
+ * Unless required by applicable law or agreed to in writing, software
+ * distributed under the License is distributed on an "AS IS" BASIS,
+ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+ * See the License for the specific language governing permissions and
+ * limitations under the License.
+ */
+
+#pragma once
+
+#include <cassert>
+#include <cstddef>
+#include <cstdint>
+#include <stdexcept>
+#include <vector>
+
+namespace tensorrt_llm::batch_manager::kv_cache_manager_v2
+{
+
+// ---------------------------------------------------------------------------
+// Integer math helpers (mirrors _utils.py)
+// ---------------------------------------------------------------------------
+
+template <typename T>
+[[nodiscard]] inline T divUp(T x, T y) noexcept
+{
+    return (x + y - 1) / y;
+}
+
+template <typename T>
+[[nodiscard]] inline T roundUp(T x, T y) noexcept
+{
+    return divUp(x, y) * y;
+}
+
+template <typename T>
+[[nodiscard]] inline T roundDown(T x, T y) noexcept
+{
+    return (x / y) * y;
+}
+
+template <typename T>
+[[nodiscard]] inline T exactDiv(T x, T y)
+{
+    assert(x % y == 0);
+    return x / y;
+}
+
+template <typename T>
+[[nodiscard]] inline bool inRange(T x, T lower, T upper) noexcept
+{
+    return lower <= x && x < upper;
+}
+
+// Returns the intersection of [a.first, a.second) and [b.first, b.second),
+// or {0,0} if disjoint (caller must check first < second).
+template <typename T>
+[[nodiscard]] inline std::pair<T, T> overlap(std::pair<T, T> a, std::pair<T, T> b) noexcept
+{
+    T lo = a.first > b.first ? a.first : b.first;
+    T hi = a.second < b.second ? a.second : b.second;
+    return {lo, hi};
+}
+
+// ---------------------------------------------------------------------------
+// HalfOpenRange — a half-open range [beg, end). Empty when beg >= end.
+// Mirrors _utils.py::HalfOpenRange.
+// ---------------------------------------------------------------------------
+struct HalfOpenRange
+{
+    int beg = 0;
+    int end = 0;
+
+    [[nodiscard]] int length() const noexcept
+    {
+        return beg < end ? end - beg : 0;
+    }
+
+    [[nodiscard]] bool empty() const noexcept
+    {
+        return beg >= end;
+    }
+
+    explicit operator bool() const noexcept
+    {
+        return beg < end;
+    }
+};
+
+// Returns the intersection of two half-open ranges.
+// The result may be empty (beg >= end), which is safe to chain.
+[[nodiscard]] inline HalfOpenRange intersect(HalfOpenRange a, HalfOpenRange b) noexcept
+{
+    return {std::max(a.beg, b.beg), std::min(a.end, b.end)};
+}
+
+// ---------------------------------------------------------------------------
+// DynamicBitset — resizable bitset using 64-bit words.
+// Mirrors _utils.py::DynamicBitset.
+// ---------------------------------------------------------------------------
+class DynamicBitset
+{
+public:
+    explicit DynamicBitset(int capacity)
+        : mWords(static_cast<size_t>(divUp(capacity, 64)), uint64_t{0})
+        , mNumSetBits(0)
+    {
+    }
+
+    void set(int index)
+    {
+        if (!get(index))
+        {
+            mWords[static_cast<size_t>(index / 64)] |= (uint64_t{1} << (index % 64));
+            ++mNumSetBits;
+        }
+    }
+
+    [[nodiscard]] bool get(int index) const noexcept
+    {
+        return (mWords[static_cast<size_t>(index / 64)] & (uint64_t{1} << (index % 64))) != 0;
+    }
+
+    void clear(int index)
+    {
+        if (get(index))
+        {
+            mWords[static_cast<size_t>(index / 64)] &= ~(uint64_t{1} << (index % 64));
+            --mNumSetBits;
+        }
+    }
+
+    [[nodiscard]] int numSetBits() const noexcept
+    {
+        return mNumSetBits;
+    }
+
+    void resize(int newCapacity)
+    {
+        int oldWords = static_cast<int>(mWords.size());
+        int newWords = divUp(newCapacity, 64);
+        if (newWords > oldWords)
+        {
+            mWords.resize(static_cast<size_t>(newWords), uint64_t{0});
+        }
+        else if (newWords < oldWords)
+        {
+            mWords.resize(static_cast<size_t>(newWords));
+            // mask the last partial word if needed
+            if (newCapacity % 64 != 0)
+            {
+                mWords.back() &= (uint64_t{1} << (newCapacity % 64)) - 1;
+            }
+        }
+    }
+
+    // Returns true if any bit in [start, end) is set.
+    [[nodiscard]] bool anySet(int start, int end) const noexcept
+    {
+        if (start >= end)
+        {
+            return false;
+        }
+        int startWord = start / 64;
+        int endWord = (end - 1) / 64;
+        uint64_t startMask = ~uint64_t{0} << (start % 64);
+        if (startWord == endWord)
+        {
+            int bitsInWord = end % 64;
+            uint64_t endMask = bitsInWord ? ((uint64_t{1} << bitsInWord) - 1) : ~uint64_t{0};
+            return (mWords[static_cast<size_t>(startWord)] & startMask & endMask) != 0;
+        }
+        if (mWords[static_cast<size_t>(startWord)] & startMask)
+        {
+            return true;
+        }
+        for (int w = startWord + 1; w < endWord; ++w)
+        {
+            if (mWords[static_cast<size_t>(w)])
+            {
+                return true;
+            }
+        }
+        int bitsInLastWord = end % 64;
+        if (bitsInLastWord == 0)
+        {
+            return mWords[static_cast<size_t>(endWord)] != 0;
+        }
+        return (mWords[static_cast<size_t>(endWord)] & ((uint64_t{1} << bitsInLastWord) - 1)) != 0;
+    }
+
+private:
+    std::vector<uint64_t> mWords;
+    int mNumSetBits;
+};
+
+// ---------------------------------------------------------------------------
+// Array2D — row-major 2D array with typed row/column indices.
+// Mirrors _utils.py::Array2D.
+// ---------------------------------------------------------------------------
+template <typename T>
+class Array2D
+{
+public:
+    Array2D(int rows, int cols, T initVal = T{})
+        : mData(static_cast<size_t>(rows * cols), initVal)
+        , mCols(cols)
+    {
+    }
+
+    T& operator()(int row, int col) noexcept
+    {
+        return mData[static_cast<size_t>(row * mCols + col)];
+    }
+
+    T const& operator()(int row, int col) const noexcept
+    {
+        return mData[static_cast<size_t>(row * mCols + col)];
+    }
+
+    [[nodiscard]] int rows() const noexcept
+    {
+        return static_cast<int>(mData.size()) / mCols;
+    }
+
+    [[nodiscard]] int cols() const noexcept
+    {
+        return mCols;
+    }
+
+    // Pointer to start of row (for slicing / iteration).
+    T* rowData(int row) noexcept
+    {
+        return mData.data() + row * mCols;
+    }
+
+    T const* rowData(int row) const noexcept
+    {
+        return mData.data() + row * mCols;
+    }
+
+private:
+    std::vector<T> mData;
+    int mCols;
+};
+
+} // namespace tensorrt_llm::batch_manager::kv_cache_manager_v2

@@ -62,7 +62,6 @@ if not TYPE_CHECKING and find_spec("kv_cache_manager_v2") is not None:
     )
     from kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from kv_cache_manager_v2._exceptions import OutOfPagesError
-    from kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -112,7 +111,6 @@ else:
     )
     from tensorrt_llm.runtime.kv_cache_manager_v2._copy_engine import CopyTask, batched_copy
     from tensorrt_llm.runtime.kv_cache_manager_v2._exceptions import OutOfPagesError
-    from tensorrt_llm.runtime.kv_cache_manager_v2._life_cycle_registry import SsmLifeCycle
     from tensorrt_llm.runtime.kv_cache_manager_v2._utils import (
         CachedCudaStream,
         HalfOpenRange,
@@ -1314,6 +1312,122 @@ class TestHeteroTokensPerBlock(TestKVCacheManagerV2):
         kv_cache.close()
 
 
+class TestKVCacheReusePerformance(TestKVCacheManagerV2):
+    """Test class for measuring KV cache reuse performance."""
+
+    def test_cache_reuse_performance(self, profile: bool = False) -> None:
+        """Performance test for KV cache reuse (prefill only).
+
+        - First pass: 20 requests with 1000 tokens per prompt (cold cache).
+        - Second pass: Re-run the same 20 requests to achieve 100% cache hit rate.
+        """
+        self.prepare(
+            gpu_quota=512 << 20,
+            host_quota=512 << 20,
+            disk_quota=1 << 30,
+            num_layers=36,
+            window_size=None,
+            sink_tokens=0,
+            tokens_per_block=32,
+            kv_buf_size=8192,
+        )
+
+        num_requests = 20
+        prompt_len = 1000
+
+        prompts = []
+        for _ in range(num_requests):
+            prompt = [self.next_token() for _ in range(prompt_len)]
+            prompts.append(prompt)
+
+        def run_requests(prompts: list[list[TokenIdExt]]) -> dict:
+            """Run all requests (prefill only) and return performance metrics."""
+            results = {
+                "total_time": 0.0,
+                "num_reused_tokens": 0,
+                "num_computed_tokens": 0,
+            }
+
+            tic_total = time.perf_counter()
+
+            with TemporaryCudaStream([]) as s:
+                stream = cast(CudaStream, s.handle)
+
+                requests = []
+
+                for req_id, prompt in enumerate(prompts):
+                    kv_cache = self.manager.create_kv_cache(None, prompt)
+                    num_reused = kv_cache.num_committed_tokens
+
+                    success = kv_cache.resume(stream)
+                    assert success, f"Failed to resume cache for request {req_id}"
+
+                    results["num_reused_tokens"] += num_reused
+                    results["num_computed_tokens"] += prompt_len - num_reused
+
+                    if not kv_cache.resize(prompt_len + 1):
+                        raise OutOfPagesError(f"Not enough pages for request {req_id}")
+
+                    input_tokens = prompt[num_reused:]
+
+                    requests.append(Step(kv_cache, input_tokens, prompt[:num_reused]))
+
+                for r in requests:
+                    r.kv_cache.commit(r.input)
+                    r.kv_cache.close()
+
+            s.take_finish_event().synchronize()
+
+            toc_total = time.perf_counter()
+            results["total_time"] = toc_total - tic_total
+
+            return results
+
+        profiler1 = None
+        profiler2 = None
+        if profile:
+            import cProfile
+
+            profiler1 = cProfile.Profile()
+            profiler2 = cProfile.Profile()
+
+        # First pass: No cache reuse expected
+        if profiler1 is not None:
+            profiler1.enable()
+        run_requests(prompts)
+        if profiler1 is not None:
+            profiler1.disable()
+
+        # Second pass: 100% cache reuse expected
+        if profiler2 is not None:
+            profiler2.enable()
+        results_pass2 = run_requests(prompts)
+        if profiler2 is not None:
+            profiler2.disable()
+
+        if PRINT_TIME:
+            print(f"total_time = {results_pass2['total_time']}")
+
+        # Verify 100% hit rate on second pass
+        total_tokens_pass2 = (
+            results_pass2["num_reused_tokens"] + results_pass2["num_computed_tokens"]
+        )
+        actual_hit_rate = (
+            (results_pass2["num_reused_tokens"] / total_tokens_pass2 * 100)
+            if total_tokens_pass2 > 0
+            else 0
+        )
+        assert abs(actual_hit_rate - 100.0) < 0.01, (
+            f"Expected 100% hit rate on second pass, got {actual_hit_rate:.2f}%"
+        )
+
+        if profile:
+            profiler1.print_stats(sort="cumtime")
+            profiler2.print_stats(sort="cumtime")
+            profiler1.dump_stats("kv_cache_reuse_pass1.prof")
+            profiler2.dump_stats("kv_cache_reuse_pass2.prof")
+
+
 class TestSSMSupport(unittest.TestCase):
     """Tests for basic SSM (State Space Model / Mamba) support in KVCacheManager v2."""
 
@@ -1384,10 +1498,11 @@ class TestSSMSupport(unittest.TestCase):
         stream_holder = CachedCudaStream()
         stream = cast(CudaStream, stream_holder.handle)
         kv_cache.resume(stream)
+        # Find the SSM layer group ID from the config.
         ssm_lg = None
-        for lc_id, lc in self.manager._life_cycles.items():
-            if isinstance(lc, SsmLifeCycle):
-                ssm_lg = LayerGroupId(lc_id)
+        for layer in cfg.layers:
+            if isinstance(layer, SsmLayerConfig):
+                ssm_lg = self.manager.get_layer_group_id(layer.layer_id)
                 break
         assert ssm_lg is not None
         # Grow some capacity
