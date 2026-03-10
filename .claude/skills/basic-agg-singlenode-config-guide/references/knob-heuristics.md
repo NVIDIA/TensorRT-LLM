@@ -18,6 +18,8 @@ Preserve the user's explicit performance objective before borrowing knob values 
 | `num_postprocess_workers` | Present in some current streaming / higher-concurrency configs; keep or remove it based on nearby checked-in configs. |
 | `attention_dp_config.*` | Preserve it when present in nearby source-backed configs. |
 | `cuda_graph_config.max_batch_size` / `batch_sizes` | Keep it aligned with the batching strategy shown in current docs/configs. |
+| `speculative_config.num_nextn_predict_layers` | Only use this when the exact checked-in config you selected is an in-scope DeepSeek-R1 `MTP` serve config. Copy it verbatim instead of interpolating it. |
+| `speculative_config.use_relaxed_acceptance_for_thinking`, `relaxed_topk`, `relaxed_delta` | Preserve these exactly when present in the checked-in `MTP` config you are following. Do not synthesize them from nearby configs. |
 
 ## Narrow Bench-Derived Hints
 
@@ -33,11 +35,13 @@ These come from `tensorrt_llm/bench/` and are benchmark / engine-build heuristic
 ## Safe Adjustment Order
 
 1. Lock the user's performance objective (`Min Latency`, `Balanced`, `Max Throughput`, or unspecified)
-2. Exact in-scope database config
-3. Same-model in-scope database config for a nearby scenario with matching objective when current sources label it
-4. Same-model curated config that stays in scope and matches the stated objective when the repo labels it explicitly
-5. Model-specific deployment guide / README
-6. Small local adjustments, explicitly marked as unverified
+2. Lock decode mode: non-spec by default, or exact-source-backed `MTP` only when the selected checked-in DeepSeek-R1 serve config explicitly uses it
+3. Exact in-scope database config
+4. Same-model in-scope database config for a nearby scenario with matching objective when current sources label it
+5. Same-model curated config that stays in scope and matches the stated objective when the repo labels it explicitly
+6. If the selected config is `MTP`-backed, copy the full `speculative_config` block from that checked-in YAML
+7. Model-specific deployment guide / README
+8. Small local adjustments, explicitly marked as unverified
 
 ## Things to Avoid
 
@@ -45,6 +49,8 @@ These come from `tensorrt_llm/bench/` and are benchmark / engine-build heuristic
 - "Only N knobs matter" framing
 - Crossing from a latency-oriented config to a throughput-oriented config without calling out the mismatch
 - Copying knob values across unrelated model families
+- Interpolating `speculative_config` fields across scenarios, GPUs, or model families
+- Treating one `MTP`-backed DeepSeek config as evidence that all nearby DeepSeek configs are also in-scope `MTP`
 - Treating an unlabeled default config as a verified latency / balanced / throughput profile
 - Dropping model-specific fields because they look auxiliary
 - Assuming a field is constant just because it was constant for one other model
@@ -53,4 +59,5 @@ These come from `tensorrt_llm/bench/` and are benchmark / engine-build heuristic
 
 - If you hit OOM, follow the exact model guide/config first. Common levers in current checked-in docs/configs include lowering `max_batch_size`, `max_num_tokens`, `max_seq_len`, or `kv_cache_config.free_gpu_memory_fraction`.
 - If a nearby checked-in config contains fields your draft omits, preserve them unless the current docs say they are out of scope.
+- If the selected checked-in config is `MTP`-backed, preserve the entire `speculative_config` block unless the exact checked-in source for that scenario differs.
 - If the deployment guide provides a backend support matrix, use it instead of guessing `moe_config.backend`.
