@@ -87,6 +87,7 @@ def _run_verl_test(test_path, timeout=600):
     assert os.path.exists(full_path), f"Verl test not found: {full_path}"
     result = subprocess.run(
         [sys.executable, "-m", "pytest", full_path, "-v", "--tb=short"],
+        cwd=VERL_ROOT,
         env=os.environ.copy(),
         timeout=timeout,
     )
