@@ -24,18 +24,23 @@ This benchmarks ONLY the communication kernels, specifically:
 Launch (examples):
 
 ```bash
-# Basic usage
-python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend DEEPEP --profile deepseek_v3
+# Spawn mode (default): single python invocation, workers spawned via MPIPoolExecutor.
+python tests/microbenchmarks/bench_moe_comm.py \
+    --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 \
+    -b 1 -e 1024 -f 2
 
-# Show per-kernel breakdown and stats across iterations
-python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 640 --kernel_breakdown --iter_stats
+# mpirun mode: avoids spawn overhead; required for multi-node or when spawn is problematic.
+# --ep_size can be omitted; inferred from MPI world size.
+mpirun -n 8 python tests/microbenchmarks/bench_moe_comm.py \
+    --backend NVLINK_ONE_SIDED --profile deepseek_v3 \
+    -b 1 -e 1024 -f 2
 
-# With batch size sweeping
-python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --backend NVLINK_ONE_SIDED -b 640 -e 2048 -f 2
-
-# Run all supported strategies for the given profile
-python tests/microbenchmarks/bench_moe_comm.py --ep_size 8 --profile deepseek_v3
-
+# CUDA graph + kernel breakdown: eliminates CPU launch overhead; reports per-kernel GPU times.
+# --perfect_router: fixed uniform routing (removes routing variance from measurements).
+python tests/microbenchmarks/bench_moe_comm.py \
+    --ep_size 8 --backend NVLINK_ONE_SIDED --profile deepseek_v3 --perfect_router \
+    --cuda_graph --kernel_breakdown --iter_stats \
+    -b 1 -e 1024 -f 2 --output_file out.json
 ```
 """
 
