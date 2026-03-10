@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=65e89d2a"></script>
-    <script src="_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -65,7 +65,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -79,7 +79,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -388,12 +388,14 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -420,7 +422,6 @@
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -456,6 +457,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -521,6 +523,7 @@
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#launch-docker-container">Launch Docker Container</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#deploy-online-serving-with-trtllm-serve">Deploy Online Serving with trtllm-serve</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-llm-api">Run Offline Inference with LLM API</a></li>
+<li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#run-offline-inference-with-visualgen-api">Run Offline Inference with VisualGen API</a></li>
 <li class="toctree-l2"><a class="reference internal" href="quick-start-guide.html#next-steps">Next Steps</a></li>
 </ul>
 </li>
@@ -561,8 +564,8 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/index.html#preconfigured-recipes">Preconfigured Recipes</a></li>
 </ul>
 </li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html#numa-aware-affinity-in-tensorrt-llm">NUMA-aware affinity in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html#numa-aware-affinity-in-tensorrt-llm">NUMA-aware affinity in TensorRT LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html#other-environmental-considerations">Other environmental considerations</a></li>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html#cpu-affinity-configuration-examples">CPU affinity configuration examples</a></li>
 </ul>
@@ -573,10 +576,19 @@
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="models/supported-models.html#model-feature-support-matrix-key-models">Model-Feature Support Matrix(Key Models)</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/supported-models.html#model-feature-support-matrix-key-models">Model-Feature Support Matrix (Key Models)</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html#multimodal-feature-support-matrix-pytorch-backend">Multimodal Feature Support Matrix (PyTorch Backend)</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models/supported-models.html#visual-generation-models">Visual Generation Models</a></li>
+<li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Prototype)</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#background">Background</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#supported-models">Supported Models</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#optimizations">Optimizations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="models/visual-generation.html#developer-guide">Developer Guide</a></li>
+</ul>
+</li>
 <li class="toctree-l1"><a class="reference internal" href="models/adding-new-model.html">Adding a New Model</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="models/adding-new-model.html#table-of-contents">Table of Contents</a></li>
 <li class="toctree-l2"><a class="reference internal" href="models/adding-new-model.html#introduction">Introduction</a></li>
@@ -652,6 +664,8 @@
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.DynamicBatchConfig"><code class="docutils literal notranslate"><span class="pre">DynamicBatchConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.CacheTransceiverConfig"><code class="docutils literal notranslate"><span class="pre">CacheTransceiverConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig"><code class="docutils literal notranslate"><span class="pre">NGramDecodingConfig</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig"><code class="docutils literal notranslate"><span class="pre">PARDDecodingConfig</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig"><code class="docutils literal notranslate"><span class="pre">SADecodingConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig"><code class="docutils literal notranslate"><span class="pre">UserProvidedDecodingConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.TorchCompileConfig"><code class="docutils literal notranslate"><span class="pre">TorchCompileConfig</span></code></a></li>
 <li class="toctree-l2"><a class="reference internal" href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig"><code class="docutils literal notranslate"><span class="pre">DraftTargetDecodingConfig</span></code></a></li>
@@ -707,7 +721,7 @@
 <li class="toctree-l2"><a class="reference internal" href="features/lora.html#basic-usage">Basic Usage</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/lora.html#advanced-usage">Advanced Usage</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/lora.html#trtllm-serve-with-lora">TRTLLM serve with LoRA</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/lora.html#trtllm-bench-with-lora">TRTLLM bench with LORA</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/lora.html#trtllm-bench-with-lora">TRTLLM bench with LoRA</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a><ul>
@@ -715,14 +729,6 @@
 <li class="toctree-l2"><a class="reference internal" href="features/multi-modality.html#optimizations">Optimizations</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/multi-modality.html#model-support-matrix">Model Support Matrix</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/multi-modality.html#examples">Examples</a></li>
-</ul>
-</li>
-<li class="toctree-l1"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a><ul>
-<li class="toctree-l2"><a class="reference internal" href="features/visual-generation.html#background-and-motivation">Background and Motivation</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/visual-generation.html#quick-start">Quick Start</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/visual-generation.html#quantization">Quantization</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/visual-generation.html#developer-guide">Developer Guide</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/visual-generation.html#summary-and-future-work">Summary and Future Work</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a><ul>
@@ -749,7 +755,7 @@
 <li class="toctree-l1"><a class="reference internal" href="features/quantization.html">Quantization</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/quantization.html#quantization-in-tensorrt-llm">Quantization in TensorRT LLM</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/quantization.html#usage">Usage</a></li>
-<li class="toctree-l2"><a class="reference internal" href="features/quantization.html#model-supported-matrix">Model Supported Matrix</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/quantization.html#model-support-matrix">Model Support Matrix</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/quantization.html#hardware-support-matrix">Hardware Support Matrix</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/quantization.html#quick-links">Quick Links</a></li>
 </ul>
@@ -771,6 +777,7 @@
 </li>
 <li class="toctree-l1"><a class="reference internal" href="features/speculative-decoding.html">Speculative Decoding</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#quick-start">Quick Start</a></li>
+<li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#suffix-automaton-sa-enhancement">Suffix Automaton (SA) Enhancement</a></li>
 <li class="toctree-l2"><a class="reference internal" href="features/speculative-decoding.html#usage-with-trtllm-bench-and-trtllm-serve">Usage with <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> and <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code></a></li>
 </ul>
 </li>
@@ -836,6 +843,7 @@
 <ul>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/overview.html">Architecture Overview</a><ul>
 <li class="toctree-l2"><a class="reference internal" href="developer-guide/overview.html#runtime-optimizations">Runtime Optimizations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="developer-guide/overview.html#visual-generation">Visual Generation</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="developer-guide/perf-analysis.html">Performance Analysis</a><ul>
@@ -962,6 +970,15 @@
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html#performance-benchmark">Performance Benchmark</a></li>
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html#reproduction">Reproduction</a></li>
 <li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html#conclusion">Conclusion</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html#introduction-and-motivation">Introduction and Motivation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html#overview-of-sparse-attention-in-tensorrt-llm">Overview of Sparse Attention in TensorRT LLM</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html#sparse-attention-framework-design">Sparse Attention Framework Design</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html#algorithm-implementations">Algorithm Implementations</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html#evaluation">Evaluation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html#summary-and-future-work">Summary and Future Work</a></li>
 </ul>
 </li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a><ul>
@@ -1233,9 +1250,9 @@
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

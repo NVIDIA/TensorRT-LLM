@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,7 +51,7 @@
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=65e89d2a"></script>
-    <script src="_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -492,12 +492,13 @@ mermaid.initialize(
     }
 );
 
-window.addEventListener("load", load);</script>
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = 'genindex';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +511,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -815,12 +816,14 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -847,7 +850,6 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -883,6 +885,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -1348,6 +1351,13 @@ window.addEventListener("load", load);</script>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-latency-iteration_log">trtllm-bench-latency command line option</a>
 </li>
         <li><a href="commands/trtllm-bench.html#cmdoption-trtllm-bench-throughput-iteration_log">trtllm-bench-throughput command line option</a>
+</li>
+      </ul></li>
+      <li>
+    --kv_cache_dtype
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_dtype">trtllm-serve-serve command line option</a>
 </li>
       </ul></li>
       <li>
@@ -1870,6 +1880,13 @@ window.addEventListener("load", load);</script>
 </li>
       </ul></li>
       <li>
+    --served_model_name
+
+      <ul>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-served_model_name">trtllm-serve-serve command line option</a>
+</li>
+      </ul></li>
+      <li>
     --server_role
 
       <ul>
@@ -2168,6 +2185,8 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.__init__">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.__init__">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.__init__">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.__init__">(tensorrt_llm.llmapi.QuantConfig method)</a>
@@ -2181,6 +2200,8 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input.__init__">(tensorrt_llm.llmapi.RequestOutput.PostprocWorker.Input method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.__init__">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.__init__">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.__init__">(tensorrt_llm.llmapi.SamplingParams method)</a>
 </li>
@@ -2240,6 +2261,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.acceptance_length_threshold">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
@@ -2261,6 +2286,10 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.acceptance_window">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.acceptance_window">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.acceptance_window">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.acceptance_window">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.acceptance_window">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -2309,10 +2338,10 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.alibi_with_scale">alibi_with_scale (tensorrt_llm.functional.PositionEmbeddingType attribute)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allgather">allgather() (in module tensorrt_llm.functional)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.allgather">allgather() (in module tensorrt_llm.functional)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.allow_advanced_sampling">allow_advanced_sampling (tensorrt_llm.llmapi.AutoDecodingConfig attribute)</a>
 
       <ul>
@@ -2329,6 +2358,10 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.allow_advanced_sampling">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -2776,9 +2809,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.construct">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.construct">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.construct">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.construct">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.construct">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.construct">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -2888,9 +2925,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.copy">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.copy">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.copy">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.copy">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.copy">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.copy">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -3052,6 +3093,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.decoding_type">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.decoding_type">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.decoding_type">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.decoding_type">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.decoding_type">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
@@ -3126,9 +3171,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.dict">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.dict">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.dict">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.dict">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.dict">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.dict">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -3209,6 +3258,10 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.draft_len_schedule">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -3417,10 +3470,10 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantAlgo.encode">(tensorrt_llm.llmapi.QuantAlgo method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.EncDecModelRunner.encoder_run">encoder_run() (tensorrt_llm.runtime.EncDecModelRunner method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel">EncoderModel (class in tensorrt_llm.models)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.end_id">end_id (tensorrt_llm.llmapi.SamplingParams attribute)</a>
@@ -3530,9 +3583,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.Config.extra">(tensorrt_llm.llmapi.NGramDecodingConfig.Config attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.Config.extra">(tensorrt_llm.llmapi.PARDDecodingConfig.Config attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.Config.extra">(tensorrt_llm.llmapi.QuantConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.Config.extra">(tensorrt_llm.llmapi.RocketSparseAttentionConfig.Config attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.Config.extra">(tensorrt_llm.llmapi.SADecodingConfig.Config attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.Config.extra">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.Config attribute)</a>
 </li>
@@ -3618,6 +3675,10 @@ window.addEventListener("load", load);</script>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.ContextChunkingPolicy.FIRST_COME_FIRST_SERVED">FIRST_COME_FIRST_SERVED (tensorrt_llm.llmapi.ContextChunkingPolicy attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.first_gen_log_probs">first_gen_log_probs (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.first_gen_logits">first_gen_logits (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggregatedParams.first_gen_tokens">first_gen_tokens (tensorrt_llm.llmapi.DisaggregatedParams attribute)</a>
 </li>
@@ -3962,9 +4023,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.from_orm">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.from_orm">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.from_orm">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.from_orm">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.from_orm">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.from_orm">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -4494,6 +4559,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.PARDDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.SADecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.is_linear_tree">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
@@ -4507,10 +4576,10 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.is_public_pool">is_public_pool (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
-      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.is_redrafter_mode">is_redrafter_mode (tensorrt_llm.runtime.GenerationSession property)</a>
-</li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.is_redrafter_mode">is_redrafter_mode (tensorrt_llm.runtime.GenerationSession property)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.PositionEmbeddingType.is_rope">is_rope() (tensorrt_llm.functional.PositionEmbeddingType method)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.Tensor.is_trt_wrapper">is_trt_wrapper() (tensorrt_llm.functional.Tensor method)</a>
@@ -4712,9 +4781,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.json">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.json">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.json">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.json">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.json">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.json">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -4908,6 +4981,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.load_format">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.load_format">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.load_format">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.load_format">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.load_format">(tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -5077,6 +5154,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.VisualGenParams.mask">mask (tensorrt_llm.llmapi.VisualGenParams attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.mask_token_id">mask_token_id (tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.masked_scatter">masked_scatter() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.masked_select">masked_select() (in module tensorrt_llm.functional)</a>
@@ -5134,6 +5213,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.max_concurrency">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.max_concurrency">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
@@ -5158,6 +5241,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.max_draft_len">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.max_draft_len">(tensorrt_llm.llmapi.UserProvidedDecodingConfig attribute)</a>
@@ -5178,7 +5265,11 @@ window.addEventListener("load", load);</script>
 </li>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.max_matching_ngram_size">max_matching_ngram_size (tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.max_matching_ngram_size">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
+      </ul></li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.max_medusa_tokens">max_medusa_tokens (tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.SamplingConfig.max_new_tokens">max_new_tokens (tensorrt_llm.runtime.SamplingConfig attribute)</a>
@@ -5261,6 +5352,10 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.max_total_draft_tokens">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -5441,9 +5536,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_computed_fields">(tensorrt_llm.llmapi.QuantConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_computed_fields">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_computed_fields">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -5495,9 +5594,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_config">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_config">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_config">(tensorrt_llm.llmapi.QuantConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_config">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_config">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_config">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -5549,9 +5652,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_construct">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_construct">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_construct">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_construct">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_construct">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_construct">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -5603,9 +5710,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_copy">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_copy">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_copy">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_copy">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_copy">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_copy">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -5657,9 +5768,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_dump">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_dump">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_dump">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_dump">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_dump">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_dump">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -5711,9 +5826,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_dump_json">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_dump_json">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_dump_json">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_dump_json">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -5765,9 +5884,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_extra">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_extra">(tensorrt_llm.llmapi.PARDDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_extra">(tensorrt_llm.llmapi.QuantConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_extra">(tensorrt_llm.llmapi.RocketSparseAttentionConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_extra">(tensorrt_llm.llmapi.SADecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_extra">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
@@ -5821,9 +5944,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_fields">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_fields">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_fields">(tensorrt_llm.llmapi.QuantConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_fields">(tensorrt_llm.llmapi.RocketSparseAttentionConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_fields">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_fields">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -5875,9 +6002,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.PARDDecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_fields_set">(tensorrt_llm.llmapi.QuantConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_fields_set">(tensorrt_llm.llmapi.RocketSparseAttentionConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_fields_set">(tensorrt_llm.llmapi.SADecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_fields_set">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
@@ -5935,9 +6066,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_json_schema">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_json_schema">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_json_schema">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_json_schema">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -5997,9 +6132,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_parametrized_name">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_parametrized_name">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_parametrized_name">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6051,9 +6190,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_post_init">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_post_init">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_post_init">(tensorrt_llm.llmapi.QuantConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_post_init">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_post_init">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_post_init">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -6107,9 +6250,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_rebuild">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_rebuild">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_rebuild">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_rebuild">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6161,9 +6308,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_validate">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_validate">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_validate">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_validate">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_validate">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_validate">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6215,9 +6366,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_validate_json">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_validate_json">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_validate_json">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_validate_json">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6269,9 +6424,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.model_validate_strings">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.model_validate_strings">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.model_validate_strings">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6505,6 +6664,24 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.num_capture_layers">num_capture_layers() (tensorrt_llm.llmapi.AutoDecodingConfig method)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.LookaheadDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.MedusaDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.num_capture_layers">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
+</li>
+      </ul></li>
   </ul></td>
   <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.GenerationSession.num_draft_tokens">num_draft_tokens (tensorrt_llm.runtime.GenerationSession attribute)</a>
@@ -6679,6 +6856,10 @@ window.addEventListener("load", load);</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.params_imply_greedy_decoding">params_imply_greedy_decoding() (tensorrt_llm.llmapi.SamplingParams static method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig">PARDDecodingConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.Config">PARDDecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AttentionDpConfig.parse_file">parse_file() (tensorrt_llm.llmapi.AttentionDpConfig class method)</a>
 
       <ul>
@@ -6718,9 +6899,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.parse_file">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.parse_file">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.parse_file">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.parse_file">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.parse_file">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.parse_file">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6772,9 +6957,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.parse_obj">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.parse_obj">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.parse_obj">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.parse_obj">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.parse_obj">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.parse_obj">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -6826,9 +7015,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.parse_raw">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.parse_raw">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.parse_raw">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.parse_raw">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.parse_raw">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.parse_raw">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -7153,6 +7346,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.ray_worker_extension_cls">ray_worker_extension_cls (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.ray_worker_nsight_options">ray_worker_nsight_options (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DisaggScheduleStyle.real">real (tensorrt_llm.llmapi.DisaggScheduleStyle attribute)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.rearrange">rearrange() (in module tensorrt_llm.functional)</a>
@@ -7469,6 +7664,18 @@ window.addEventListener("load", load);</script>
 <h2 id="S">S</h2>
 <table style="width: 100%" class="indextable genindextable"><tr>
   <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.sa_spec_threshold">sa_spec_threshold (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.sa_spec_threshold">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.sa_spec_threshold">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+      </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig">SADecodingConfig (class in tensorrt_llm.llmapi)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.Config">SADecodingConfig.Config (class in tensorrt_llm.llmapi)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sampler_force_async_worker">sampler_force_async_worker (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.sampler_type">sampler_type (tensorrt_llm.llmapi.TorchLlmArgs attribute)</a>
@@ -7546,9 +7753,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.schema">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.schema">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.schema">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.schema">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.schema">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.schema">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -7600,9 +7811,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.schema_json">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.schema_json">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.schema_json">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.schema_json">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.schema_json">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.schema_json">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -7678,6 +7893,8 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.MTPDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.set_max_total_draft_tokens">(tensorrt_llm.llmapi.UserProvidedDecodingConfig method)</a>
 </li>
       </ul></li>
@@ -7731,12 +7948,12 @@ window.addEventListener("load", load);</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MpiCommSession.shutdown_abort">shutdown_abort() (tensorrt_llm.llmapi.MpiCommSession method)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.SideStreamIDType">SideStreamIDType (class in tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.sigmoid">sigmoid() (in module tensorrt_llm.functional)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.silu">silu() (in module tensorrt_llm.functional)</a>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.functional.html#tensorrt_llm.functional.sin">sin() (in module tensorrt_llm.functional)</a>
@@ -7810,6 +8027,10 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.PARDDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.SADecodingConfig property)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.spec_dec_mode">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
@@ -7841,6 +8062,10 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.speculative_model">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.speculative_model">(tensorrt_llm.llmapi.NGramDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.speculative_model">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.speculative_model">(tensorrt_llm.llmapi.SADecodingConfig attribute)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.speculative_model">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig attribute)</a>
 </li>
@@ -7990,7 +8215,11 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.supports_backend">(tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.supports_backend">(tensorrt_llm.llmapi.PARDDecodingConfig method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.supports_backend">(tensorrt_llm.llmapi.RocketSparseAttentionConfig method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.supports_backend">(tensorrt_llm.llmapi.SADecodingConfig method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.supports_backend">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig method)</a>
 </li>
@@ -9357,6 +9586,10 @@ window.addEventListener("load", load);</script>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache9CommState8toStringEv">tensorrt_llm::executor::kv_cache::CommState::toString (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4N12tensorrt_llm8executor8kv_cache10ConnectionE">tensorrt_llm::executor::kv_cache::Connection (C++ class)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10Connection14activateBufferE7uint8_t">tensorrt_llm::executor::kv_cache::Connection::activateBuffer (C++ function)</a>
+</li>
+      <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10Connection22getPreAssignedBufferIdE7uint8_t">tensorrt_llm::executor::kv_cache::Connection::getPreAssignedBufferId (C++ function)</a>
 </li>
       <li><a href="_cpp_gen/executor.html#_CPPv4NK12tensorrt_llm8executor8kv_cache10Connection12isThreadSafeEv">tensorrt_llm::executor::kv_cache::Connection::isThreadSafe (C++ function)</a>
 </li>
@@ -11290,8 +11523,6 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kFLOATEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kFLOAT&gt;::type (C++ type)</a>
 </li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4IEN12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEEE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt; (C++ struct)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType5kHALFEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kHALF&gt;::name (C++ member)</a>
@@ -11304,6 +11535,8 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEE4nameE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt;::name (C++ member)</a>
 </li>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEE4sizeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt;::size (C++ member)</a>
 </li>
       <li><a href="_cpp_gen/runtime.html#_CPPv4N12tensorrt_llm7runtime14DataTypeTraitsIN8nvinfer18DataType6kINT32EXL1EEE4typeE">tensorrt_llm::runtime::DataTypeTraits&lt;nvinfer1::DataType::kINT32, true&gt;::type (C++ type)</a>
@@ -13872,6 +14105,32 @@ window.addEventListener("load", load);</script>
         <li><a href="legacy/python-api/tensorrt_llm.runtime.html#tensorrt_llm.runtime.ModelConfig.tokens_per_block">(tensorrt_llm.runtime.ModelConfig attribute)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.AutoDecodingConfig.tokens_per_gen_step">tokens_per_gen_step (tensorrt_llm.llmapi.AutoDecodingConfig property)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.DraftTargetDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.Eagle3DecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.EagleDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.EagleDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.LookaheadDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.LookaheadDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MedusaDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.MedusaDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.MTPDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.NGramDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.PARDDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.SADecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig property)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.tokens_per_gen_step">(tensorrt_llm.llmapi.UserProvidedDecodingConfig property)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SamplingParams.top_k">top_k (tensorrt_llm.llmapi.SamplingParams attribute)</a>
 
       <ul>
@@ -14538,6 +14797,8 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-host">--host</a>
 </li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-kv_cache_dtype">--kv_cache_dtype</a>
+</li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-free_gpu_memory_fraction">--kv_cache_free_gpu_memory_fraction</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-log_level">--log_level</a>
@@ -14571,6 +14832,8 @@ window.addEventListener("load", load);</script>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-reasoning_parser">--reasoning_parser</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-revision">--revision</a>
+</li>
+        <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-served_model_name">--served_model_name</a>
 </li>
         <li><a href="commands/trtllm-serve/trtllm-serve.html#cmdoption-trtllm-serve-serve-server_role">--server_role</a>
 </li>
@@ -14670,9 +14933,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.update_forward_refs">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.update_forward_refs">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.update_forward_refs">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -14769,10 +15036,20 @@ window.addEventListener("load", load);</script>
 </li>
       <li><a href="legacy/python-api/tensorrt_llm.models.html#tensorrt_llm.models.EncoderModel.use_prompt_tuning">use_prompt_tuning() (tensorrt_llm.models.EncoderModel method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SchedulerConfig.use_python_scheduler">use_python_scheduler (tensorrt_llm.llmapi.SchedulerConfig attribute)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.use_refit">use_refit (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.use_relaxed_acceptance_for_thinking">use_relaxed_acceptance_for_thinking (tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig.use_sa_spec">use_sa_spec (tensorrt_llm.llmapi.Eagle3DecodingConfig attribute)</a>
+
+      <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.MTPDecodingConfig.use_sa_spec">(tensorrt_llm.llmapi.MTPDecodingConfig attribute)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.use_sa_spec">(tensorrt_llm.llmapi.PARDDecodingConfig attribute)</a>
+</li>
+      </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.BuildConfig.use_strip_plan">use_strip_plan (tensorrt_llm.llmapi.BuildConfig attribute)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.use_uvm">use_uvm (tensorrt_llm.llmapi.KvCacheConfig attribute)</a>
@@ -14830,9 +15107,13 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.validate">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.validate">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.QuantConfig.validate">(tensorrt_llm.llmapi.QuantConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.RocketSparseAttentionConfig.validate">(tensorrt_llm.llmapi.RocketSparseAttentionConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.validate">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.validate">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
@@ -14880,18 +15161,24 @@ window.addEventListener("load", load);</script>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.NGramDecodingConfig class method)</a>
 </li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.PARDDecodingConfig class method)</a>
+</li>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.SADecodingConfig class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.SaveHiddenStatesDecodingConfig class method)</a>
 </li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.UserProvidedDecodingConfig.validate_draft_len_schedule_and_sort">(tensorrt_llm.llmapi.UserProvidedDecodingConfig class method)</a>
 </li>
       </ul></li>
-  </ul></td>
-  <td style="width: 33%; vertical-align: top;"><ul>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_draft_target_config">validate_draft_target_config() (tensorrt_llm.llmapi.DraftTargetDecodingConfig method)</a>
 </li>
-      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_dtype">validate_dtype() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
+  </ul></td>
+  <td style="width: 33%; vertical-align: top;"><ul>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_dtype">validate_dtype() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
 
       <ul>
+        <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_dtype">(tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
+</li>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_dtype">(tensorrt_llm.llmapi.TrtLlmArgs class method)</a>
 </li>
       </ul></li>
@@ -14911,6 +15198,8 @@ window.addEventListener("load", load);</script>
       </ul></li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_enable_build_cache">validate_enable_build_cache() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_free_gpu_memory_fraction">validate_free_gpu_memory_fraction() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_gpus_per_node">validate_gpus_per_node() (tensorrt_llm.llmapi.TorchLlmArgs class method)</a>
 
       <ul>
@@ -14929,6 +15218,12 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_lora_config_consistency">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_attention_window">validate_max_attention_window() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_gpu_total_bytes">validate_max_gpu_total_bytes() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
+</li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_util_for_resume">validate_max_util_for_resume() (tensorrt_llm.llmapi.KvCacheConfig class method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_model_format_misc">validate_model_format_misc() (tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.NGramDecodingConfig.validate_ngram_config">validate_ngram_config() (tensorrt_llm.llmapi.NGramDecodingConfig method)</a>
@@ -14955,6 +15250,8 @@ window.addEventListener("load", load);</script>
         <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TrtLlmArgs.validate_runtime_args">(tensorrt_llm.llmapi.TrtLlmArgs method)</a>
 </li>
       </ul></li>
+      <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.validate_sa_config">validate_sa_config() (tensorrt_llm.llmapi.SADecodingConfig method)</a>
+</li>
       <li><a href="llm-api/reference.html#tensorrt_llm.llmapi.TorchLlmArgs.validate_speculative_config">validate_speculative_config() (tensorrt_llm.llmapi.TorchLlmArgs method)</a>
 
       <ul>
@@ -15224,9 +15521,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../../_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="../../_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -387,12 +387,14 @@
 <li class="toctree-l2"><a class="reference internal" href="../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -419,7 +421,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -455,6 +456,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -535,7 +537,7 @@
 <section id="table-of-contents">
 <h2>Table of Contents<a class="headerlink" href="#table-of-contents" title="Link to this heading">#</a></h2>
 <ul class="simple">
-<li><p><a class="reference internal" href="#inference-time-compute-implementation-in-tensorrt-llm">Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation）</a></p>
+<li><p><a class="reference internal" href="#inference-time-compute-implementation-in-tensorrt-llm">Inference-Time Compute Implementation in TensorRT LLM (Part 1: Design and Implementation)</a></p>
 <ul>
 <li><p><a class="reference internal" href="#table-of-content"><span class="xref myst">Table of Content</span></a></p></li>
 <li><p><a class="reference internal" href="#background-and-motivation">Background and Motivation</a></p></li>
@@ -581,11 +583,11 @@
 <p>Decouple inference-time compute method and execution backend. Provides <code class="docutils literal notranslate"><span class="pre">Controller</span></code> concept for users to define the method, <code class="docutils literal notranslate"><span class="pre">Worker</span></code> concept to develop execution backend and <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> to provide API for users to integrate <code class="docutils literal notranslate"><span class="pre">Controller</span></code> and <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and run the request.</p>
 <p>Make the inference-time compute method modular and reusable. An inference time compute method can be
 composed of multiple modules. In scaffolding, <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can be constructed by a series of <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code>, then users can flexibly assemble and replace the <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code>.</p>
-<p>Provides sufficient concurrency to achieve good performance while ease of use. Concurrency is the key for performance. <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> provides three levels of concurrency. The first level is that the different requests to a <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> instance can be concurrent. The second level is that the multiple <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code> can be concurrent.The third level is that the multiply Tasks which yielded from <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can be concurrent.</p>
+<p>Provides sufficient concurrency to achieve good performance while ease of use. Concurrency is the key for performance. <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> provides three levels of concurrency. The first level is that the different requests to a <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> instance can be concurrent. The second level is that the multiple <code class="docutils literal notranslate"><span class="pre">Sub-Controllers</span></code> can be concurrent. The third level is that the multiple Tasks which yielded from <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can be concurrent.</p>
 </section>
 <section id="architecture">
 <h3>Architecture<a class="headerlink" href="#architecture" title="Link to this heading">#</a></h3>
-<p><code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> consists of three core components. Let’s first briefly introduce these components. The <code class="docutils literal notranslate"><span class="pre">Worker</span></code> class is the backend that execute a single task, such as sending an inference request to an LLM inference framework or service, or completing a call to an external tool. The <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class focuses on defining the workflow of a inference-time compute method. The <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> class is responsible for integrating the two and completing the entire task.</p>
+<p><code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> consists of three core components. Let’s first briefly introduce these components. The <code class="docutils literal notranslate"><span class="pre">Worker</span></code> class is the backend that executes a single task, such as sending an inference request to an LLM inference framework or service, or completing a call to an external tool. The <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class focuses on defining the workflow of an inference-time compute method. The <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> class is responsible for integrating the two and completing the entire task.</p>
 <p>This is the call sequence diagram of <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code>:</p>
 <div align="center">
     <img src="https://github.com/NVIDIA/TensorRT-LLM/raw/main/docs/source/blogs/media/tech_blog13_scaffolding_sequence.png" alt="Scaffolding Sequence" width="900px">
@@ -629,7 +631,7 @@ composed of multiple modules. In scaffolding, <code class="docutils literal notr
         <span class="k">raise</span> <span class="ne">NotImplementedError</span>
 </pre></div>
 </div>
-<p>Its two core interfaces are <code class="docutils literal notranslate"><span class="pre">generate()</span></code> and <code class="docutils literal notranslate"><span class="pre">process()</span></code>. <code class="docutils literal notranslate"><span class="pre">generate()</span></code> is the entry point for <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> to invoke. In the default implementation of <code class="docutils literal notranslate"><span class="pre">generate()</span></code>, it produces a <code class="docutils literal notranslate"><span class="pre">Task</span></code> and then invokes <code class="docutils literal notranslate"><span class="pre">process()</span></code>. The <code class="docutils literal notranslate"><span class="pre">process()</span></code> is the most important part of every <code class="docutils literal notranslate"><span class="pre">Contronller</span></code> class, as it defines the implementation the workflow of this inference-time compute method.</p>
+<p>Its two core interfaces are <code class="docutils literal notranslate"><span class="pre">generate()</span></code> and <code class="docutils literal notranslate"><span class="pre">process()</span></code>. <code class="docutils literal notranslate"><span class="pre">generate()</span></code> is the entry point for <code class="docutils literal notranslate"><span class="pre">ScaffoldingLlm</span></code> to invoke. In the default implementation of <code class="docutils literal notranslate"><span class="pre">generate()</span></code>, it produces a <code class="docutils literal notranslate"><span class="pre">Task</span></code> and then invokes <code class="docutils literal notranslate"><span class="pre">process()</span></code>. The <code class="docutils literal notranslate"><span class="pre">process()</span></code> is the most important part of every <code class="docutils literal notranslate"><span class="pre">Controller</span></code> class, as it defines the implementation of the workflow of this inference-time compute method.</p>
 <p>Let’s go into a specific subclass of <code class="docutils literal notranslate"><span class="pre">Controller</span></code> to see how <code class="docutils literal notranslate"><span class="pre">process()</span></code> is implemented.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">class</span><span class="w"> </span><span class="nc">NativeGenerationController</span><span class="p">(</span><span class="n">Controller</span><span class="p">):</span>
 
@@ -648,7 +650,7 @@ composed of multiple modules. In scaffolding, <code class="docutils literal notr
 </pre></div>
 </div>
 <p>Essentially, <code class="docutils literal notranslate"><span class="pre">process()</span></code> is an iterator in python that can return a list of tasks using yield statement. When the iterator is re-entered, that is, when the yield statement ends, the <code class="docutils literal notranslate"><span class="pre">Tasks</span></code> have been completed. That means the result of the <code class="docutils literal notranslate"><span class="pre">Task</span></code> has been written into its result field. Then the <code class="docutils literal notranslate"><span class="pre">process()</span></code> can proceed to the next steps.</p>
-<p>From here we can see that the implement of the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can focus on the design of the workflow. It does not directly call the <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and does not need to care about how these tasks are completed. And that is how <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> decouple inference-time compute method and execution backend.</p>
+<p>From here we can see that the implementation of the <code class="docutils literal notranslate"><span class="pre">Controller</span></code> can focus on the design of the workflow. It does not directly call the <code class="docutils literal notranslate"><span class="pre">Worker</span></code> and does not need to care about how these tasks are completed. And that is how <code class="docutils literal notranslate"><span class="pre">Scaffolding</span></code> decouples inference-time compute method and execution backend.</p>
 <p>Also, <code class="docutils literal notranslate"><span class="pre">Controller</span></code> makes the inference-time compute method modular and reusable. It only requires the <code class="docutils literal notranslate"><span class="pre">sub-Controller</span></code> to be a member of class, and then the <code class="docutils literal notranslate"><span class="pre">process()</span></code> function of the <code class="docutils literal notranslate"><span class="pre">sub-Controller</span></code> is called using the “yield from” statement.</p>
 <div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="k">yield from</span> <span class="bp">self</span><span class="o">.</span><span class="n">reward_controller</span><span class="o">.</span><span class="n">process</span><span class="p">(</span><span class="n">generation_tasks</span><span class="p">,</span>
                                                 <span class="o">**</span><span class="n">reward_kwargs</span><span class="p">)</span>
@@ -1096,9 +1098,9 @@ is a certainty-based, training-free approach to accelerate Chain-of-Thought (CoT
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

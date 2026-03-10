@@ -35,7 +35,7 @@
     <link rel="stylesheet" type="text/css" href="../../../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../../../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../../../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../../../_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="../../../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -51,7 +51,7 @@
     <script src="../../../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../../../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../../../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../../../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="../../../_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -492,12 +492,13 @@ mermaid.initialize(
     }
 );
 
-window.addEventListener("load", load);</script>
+window.addEventListener("load", load);
+window.runMermaid = runMermaid;</script>
     <script>DOCUMENTATION_OPTIONS.pagename = '_modules/tensorrt_llm/llmapi/llm_args';</script>
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -510,7 +511,7 @@ window.addEventListener("load", load);</script>
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -815,12 +816,14 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l2"><a class="reference internal" href="../../../deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../../../models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="../../../models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -847,7 +850,6 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../../../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -883,6 +885,7 @@ window.addEventListener("load", load);</script>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../../../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -991,7 +994,7 @@ window.addEventListener("load", load);</script>
 <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.lora_helper</span><span class="w"> </span><span class="kn">import</span> <span class="p">(</span><span class="n">LoraConfig</span><span class="p">,</span>
                                       <span class="n">get_default_trtllm_modules_to_hf_modules</span><span class="p">)</span>
 
-<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">mpi_rank</span>
+<span class="kn">from</span><span class="w"> </span><span class="nn">.._utils</span><span class="w"> </span><span class="kn">import</span> <span class="n">_str_to_torch_dtype_dict</span><span class="p">,</span> <span class="n">mpi_rank</span>
 
 <span class="c1"># yapf: disable</span>
 <span class="c1"># isort: off</span>
@@ -1182,7 +1185,7 @@ window.addEventListener("load", load);</script>
 
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
 <span class="w">        </span><span class="sd">&quot;&quot;&quot;</span>
-<span class="sd">        Override if the speculation algorithm does not support</span>
+<span class="sd">        Override if the sparse attention algorithm does not support</span>
 <span class="sd">        a subset of the possible backends.</span>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="kc">True</span>
@@ -1208,9 +1211,9 @@ window.addEventListener("load", load);</script>
 <span class="sd">    &quot;&quot;&quot;</span>
     <span class="n">algorithm</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;rocket&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;rocket&quot;</span>
     <span class="n">window_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The window size for snap KV.&quot;</span><span class="p">)</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">32</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The window size for RocketKV.&quot;</span><span class="p">)</span>
     <span class="n">kernel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="mi">63</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The kernel size for snap KV.&quot;</span><span class="p">)</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">63</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The kernel size for RocketKV.&quot;</span><span class="p">)</span>
     <span class="n">topr</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">Union</span><span class="p">[</span><span class="nb">int</span><span class="p">,</span> <span class="nb">float</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">128</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Top-r&quot;</span><span class="p">)</span>
     <span class="n">topk</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">64</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Top-k&quot;</span><span class="p">)</span>
     <span class="n">prompt_budget</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="mi">2048</span><span class="p">,</span>
@@ -1641,7 +1644,7 @@ window.addEventListener("load", load);</script>
 
 <span class="k">class</span><span class="w"> </span><span class="nc">DecodingBaseConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
     <span class="n">max_draft_len</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">NonNegativeInt</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
-        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The number of drafter layers.&quot;</span><span class="p">)</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span> <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The maximum number of draft tokens.&quot;</span><span class="p">)</span>
 
     <span class="n">max_total_draft_tokens</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
@@ -1656,7 +1659,7 @@ window.addEventListener("load", load);</script>
         <span class="n">validation_alias</span><span class="o">=</span><span class="n">AliasChoices</span><span class="p">(</span><span class="s2">&quot;speculative_model&quot;</span><span class="p">,</span>
                                       <span class="s2">&quot;speculative_model_dir&quot;</span><span class="p">),</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. &#39;yuhuili/EAGLE3-LLaMA3.1-Instruct-8B&#39;),&quot;</span>
+        <span class="s2">&quot;The speculative (draft) model. Accepts either (1) a HuggingFace Hub model ID (e.g. &#39;yuhuili/EAGLE3-LLaMA3.1-Instruct-8B&#39;), &quot;</span>
         <span class="s2">&quot;which will be automatically downloaded, or (2) a local filesystem path to a downloaded model directory.&quot;</span>
     <span class="p">)</span>
 
@@ -1763,7 +1766,7 @@ window.addEventListener("load", load);</script>
 <span class="sd">        &quot;&quot;&quot;</span>
         <span class="k">return</span> <span class="kc">True</span>
 
-    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="nd">@property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">spec_dec_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="c1"># spec_dec_mode has more functionality than the raw decoding_mode string.</span>
         <span class="c1"># Use an alias for the import here to avoid name collisions with the one for the</span>
@@ -1776,6 +1779,14 @@ window.addEventListener("load", load);</script>
     <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
     <span class="k">def</span><span class="w"> </span><span class="nf">is_linear_tree</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">==</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span>
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens_per_gen_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Total tokens per gen request in one spec dec iteration (including golden token).&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="mi">1</span> <span class="o">+</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span>
+
+    <span class="k">def</span><span class="w"> </span><span class="nf">num_capture_layers</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+        <span class="k">return</span> <span class="mi">0</span>
 
 
 <span class="k">class</span><span class="w"> </span><span class="nc">KvCacheConnectorConfig</span><span class="p">(</span><span class="n">StrictBaseModel</span><span class="p">):</span>
@@ -1912,7 +1923,7 @@ window.addEventListener("load", load);</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_eagle_choices</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">):</span>
         <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="s2">&quot;NOTE: The Draft token tree is still under development, PLEASE DO NOT USE IT !!!&quot;</span>
+                <span class="s2">&quot;The eagle_choices/static tree feature is deprecated and will be removed in release 1.4.&quot;</span>
             <span class="p">)</span>
             <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">list</span><span class="p">):</span>
                 <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">str</span><span class="p">):</span>
@@ -1930,6 +1941,11 @@ window.addEventListener("load", load);</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">validate_eagle_config</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="s1">&#39;EagleDecodingConfig&#39;</span><span class="p">:</span>
         <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
             <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_draft_len must be &gt; 0 for Eagle&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">eagle3_one_model</span><span class="p">:</span>
+            <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
+                <span class="s2">&quot;Eagle3 2-model is deprecated and will be removed in release 1.4.&quot;</span>
+            <span class="p">)</span>
+
         <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
         <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>  <span class="c1"># If using linear-tree, the max_total_draft_tokens is the same as max_draft_len</span>
 
@@ -1950,7 +1966,7 @@ window.addEventListener("load", load);</script>
             <span class="n">num_eagle_layers_from_choices</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">check_eagle_choices</span><span class="p">()</span>
             <span class="k">if</span> <span class="n">num_eagle_layers_from_choices</span> <span class="o">!=</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="p">:</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                    <span class="sa">f</span><span class="s2">&quot;Base on the input choices, reset the num_eagle_layers(max_draft_len) from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">num_eagle_layers_from_choices</span><span class="si">}</span><span class="s2">&quot;</span>
+                    <span class="sa">f</span><span class="s2">&quot;Based on the input choices, reset the num_eagle_layers(max_draft_len) from </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span><span class="si">}</span><span class="s2"> to </span><span class="si">{</span><span class="n">num_eagle_layers_from_choices</span><span class="si">}</span><span class="s2">&quot;</span>
                 <span class="p">)</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">num_eagle_layers</span> <span class="o">=</span> <span class="n">num_eagle_layers_from_choices</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="n">num_eagle_layers_from_choices</span>
@@ -2041,7 +2057,18 @@ window.addEventListener("load", load);</script>
 <div class="viewcode-block" id="Eagle3DecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.Eagle3DecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">Eagle3DecodingConfig</span><span class="p">(</span><span class="n">EagleDecodingConfig</span><span class="p">):</span>
-    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Eagle3&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Eagle3&quot;</span></div>
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Eagle3&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Eagle3&quot;</span>
+
+    <span class="c1"># Suffix Automaton speculative decoding settings</span>
+    <span class="n">use_sa_spec</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Combine with Suffix Automaton Decoding&quot;</span><span class="p">)</span>
+    <span class="n">sa_spec_threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold for the Suffix Automaton Decoding. If the&quot;</span>
+        <span class="s2">&quot; length of the suffix match exceeds the threshold, use&quot;</span>
+        <span class="s2">&quot; the suffix automaton output for the next draft tokens.&quot;</span><span class="p">)</span></div>
 
 
 
@@ -2199,10 +2226,48 @@ window.addEventListener("load", load);</script>
 
 
 
+<div class="viewcode-block" id="SADecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">SADecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;</span>
+<span class="sd">    Configuration for Suffix Automaton (SA) speculative decoding (one-model design).</span>
+
+<span class="sd">    Uses a GPU-native suffix automaton for pattern matching. Drafting runs inside</span>
+<span class="sd">    the target model forward; supports CUDA graph and overlap scheduler.</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;SA&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;SA&quot;</span>
+    <span class="n">max_matching_ngram_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=-</span><span class="mi">1</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Positive value (e.g., 3): fixed-size ngram matching. &quot;</span>
+        <span class="s2">&quot;-1: longest possible match via suffix automaton. 0 is invalid.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="SADecodingConfig.validate_sa_config">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.validate_sa_config">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s1">&#39;after&#39;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_sa_config</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_matching_ngram_size</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;max_matching_ngram_size must be &gt; 0 (fixed ngram) or -1 (longest match). &quot;</span>
+                <span class="s2">&quot;Got 0.&quot;</span><span class="p">)</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="ow">is</span> <span class="kc">None</span> <span class="ow">or</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span><span class="s2">&quot;max_draft_len must be &gt; 0 for SA&quot;</span><span class="p">)</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+<div class="viewcode-block" id="SADecodingConfig.supports_backend">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.SADecodingConfig.supports_backend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+</div>
+
+
+
 <div class="viewcode-block" id="DraftTargetDecodingConfig">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig">[docs]</a>
 <span class="k">class</span><span class="w"> </span><span class="nc">DraftTargetDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
     <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;Draft_Target&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;Draft_Target&quot;</span>
+    <span class="n">_draft_target_one_model</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">PrivateAttr</span><span class="p">(</span><span class="kc">True</span><span class="p">)</span>
 
 <div class="viewcode-block" id="DraftTargetDecodingConfig.validate_draft_target_config">
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.validate_draft_target_config">[docs]</a>
@@ -2221,7 +2286,15 @@ window.addEventListener("load", load);</script>
 <a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.DraftTargetDecodingConfig.supports_backend">[docs]</a>
     <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
         <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span> <span class="ow">or</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span></div>
-</div>
+
+
+    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">spec_dec_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
+        <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">_draft_target_one_model</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">DRAFT_TARGET_ONE_MODEL</span>
+        <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">DRAFT_TARGET</span></div>
 
 
 
@@ -2260,6 +2333,17 @@ window.addEventListener("load", load);</script>
         <span class="s2">&quot;When using EAGLE-style MTP, use faster one-model implementation (drafter as submodule) vs two-model.&quot;</span>
     <span class="p">)</span>
 
+    <span class="c1"># Suffix Automaton speculative decoding settings</span>
+    <span class="n">use_sa_spec</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Combine with Suffix Automaton Decoding&quot;</span><span class="p">)</span>
+    <span class="n">sa_spec_threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold for the Suffix Automaton Decoding. If the&quot;</span>
+        <span class="s2">&quot; length of the suffix match exceeds the threshold, use&quot;</span>
+        <span class="s2">&quot; the suffix automaton output for the next draft tokens.&quot;</span><span class="p">)</span>
+
     <span class="c1"># TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`</span>
     <span class="c1"># Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.</span>
     <span class="n">num_nextn_predict_layers_from_model_config</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -2296,8 +2380,7 @@ window.addEventListener("load", load);</script>
     <span class="k">def</span><span class="w"> </span><span class="nf">log_two_model_deprecation_warning</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">if</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
-                <span class="s2">&quot;2-model style MTP is deprecated. The mtp_eagle_one_model flag will do nothing &quot;</span>
-                <span class="s2">&quot;in release 1.3. After that, the flag will be removed entirely.&quot;</span>
+                <span class="s2">&quot;2-model style MTP is deprecated and will be removed in release 1.4.&quot;</span>
             <span class="p">)</span>
         <span class="k">return</span> <span class="bp">self</span></div>
 
@@ -2323,6 +2406,69 @@ window.addEventListener("load", load);</script>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">num_nextn_predict_layers_from_model_config</span> <span class="o">==</span> <span class="mi">1</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">use_mtp_vanilla</span> <span class="ow">and</span> <span class="ow">not</span> <span class="bp">self</span><span class="o">.</span><span class="n">mtp_eagle_one_model</span><span class="p">:</span>
             <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP_EAGLE</span>
         <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">MTP</span></div>
+
+
+
+<div class="viewcode-block" id="PARDDecodingConfig">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig">[docs]</a>
+<span class="k">class</span><span class="w"> </span><span class="nc">PARDDecodingConfig</span><span class="p">(</span><span class="n">DecodingBaseConfig</span><span class="p">):</span>
+<span class="w">    </span><span class="sd">&quot;&quot;&quot;Configuration for PARD (Parallel Draft) speculative decoding.</span>
+
+<span class="sd">    PARD is a target-independent speculative decoding method that uses</span>
+<span class="sd">    mask tokens to predict multiple draft tokens in parallel within a</span>
+<span class="sd">    single forward pass.</span>
+
+<span class="sd">    Key features:</span>
+<span class="sd">    - Target-independent: doesn&#39;t use target model hidden states</span>
+<span class="sd">    - Parallel prediction: all K draft tokens in one forward pass</span>
+<span class="sd">    - Shared mask token: uses the same mask_token_id across all positions</span>
+
+<span class="sd">    Reference: https://arxiv.org/pdf/2504.18583</span>
+<span class="sd">    &quot;&quot;&quot;</span>
+    <span class="n">mask_token_id</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The token ID used as a mask token for parallel draft prediction. &quot;</span>
+        <span class="s2">&quot;If None, it will be read from the draft model config (typically vocab_size).&quot;</span>
+    <span class="p">)</span>
+
+    <span class="n">decoding_type</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span><span class="s2">&quot;PARD&quot;</span><span class="p">]</span> <span class="o">=</span> <span class="s2">&quot;PARD&quot;</span>
+
+    <span class="c1"># Suffix Automaton speculative decoding settings</span>
+    <span class="n">use_sa_spec</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">bool</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Combine with Suffix Automaton Decoding&quot;</span><span class="p">)</span>
+    <span class="n">sa_spec_threshold</span><span class="p">:</span> <span class="n">PositiveInt</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="mi">4</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The threshold for the Suffix Automaton Decoding. If the&quot;</span>
+        <span class="s2">&quot; length of the suffix match exceeds the threshold, use&quot;</span>
+        <span class="s2">&quot; the suffix automaton output for the next draft tokens.&quot;</span><span class="p">)</span>
+
+<div class="viewcode-block" id="PARDDecodingConfig.set_max_total_draft_tokens">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.set_max_total_draft_tokens">[docs]</a>
+    <span class="nd">@model_validator</span><span class="p">(</span><span class="n">mode</span><span class="o">=</span><span class="s2">&quot;after&quot;</span><span class="p">)</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">set_max_total_draft_tokens</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="bp">self</span><span class="o">.</span><span class="n">max_total_draft_tokens</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+        <span class="k">return</span> <span class="bp">self</span></div>
+
+
+    <span class="nd">@property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">tokens_per_gen_step</span><span class="p">(</span><span class="bp">self</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">int</span><span class="p">:</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;PARD needs 2K tokens per gen request: K+1 accepted + K-1 masks.&quot;&quot;&quot;</span>
+        <span class="k">return</span> <span class="mi">2</span> <span class="o">*</span> <span class="bp">self</span><span class="o">.</span><span class="n">max_draft_len</span>
+
+<div class="viewcode-block" id="PARDDecodingConfig.supports_backend">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.PARDDecodingConfig.supports_backend">[docs]</a>
+    <span class="k">def</span><span class="w"> </span><span class="nf">supports_backend</span><span class="p">(</span><span class="bp">self</span><span class="p">,</span> <span class="n">backend</span><span class="p">:</span> <span class="nb">str</span><span class="p">)</span> <span class="o">-&gt;</span> <span class="nb">bool</span><span class="p">:</span>
+        <span class="k">return</span> <span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;pytorch&quot;</span></div>
+
+
+    <span class="nd">@functools</span><span class="o">.</span><span class="n">cached_property</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">spec_dec_mode</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
+        <span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm._torch.speculative.interface</span><span class="w"> </span><span class="kn">import</span> \
+            <span class="n">SpeculativeDecodingMode</span> <span class="k">as</span> <span class="n">TorchSpeculativeDecodingMode</span>
+        <span class="k">return</span> <span class="n">TorchSpeculativeDecodingMode</span><span class="o">.</span><span class="n">PARD</span></div>
 
 
 
@@ -2423,7 +2569,7 @@ window.addEventListener("load", load);</script>
 
 <span class="k">class</span><span class="w"> </span><span class="nc">PybindMirror</span><span class="p">(</span><span class="n">ABC</span><span class="p">):</span>
 <span class="w">    </span><span class="sd">&#39;&#39;&#39; A class containing the utilities for mirroring Python classes to</span>
-<span class="sd">    pybinding classes.</span>
+<span class="sd">    pybind classes.</span>
 <span class="sd">    &#39;&#39;&#39;</span>
 
     <span class="nd">@abstractmethod</span>
@@ -2675,6 +2821,10 @@ window.addEventListener("load", load);</script>
         <span class="n">default</span><span class="o">=</span><span class="n">WaitingQueuePolicy</span><span class="o">.</span><span class="n">FCFS</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The waiting queue scheduling policy&quot;</span><span class="p">)</span>
 
+    <span class="n">use_python_scheduler</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Use pure-Python scheduler instead of C++ scheduler.&quot;</span><span class="p">)</span>
+
     <span class="k">def</span><span class="w"> </span><span class="nf">_to_pybind</span><span class="p">(</span><span class="bp">self</span><span class="p">):</span>
         <span class="k">return</span> <span class="n">_SchedulerConfig</span><span class="p">(</span>
             <span class="n">capacity_scheduler_policy</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">capacity_scheduler_policy</span><span class="o">.</span><span class="n">_to_pybind</span><span class="p">(</span>
@@ -2815,8 +2965,10 @@ window.addEventListener("load", load);</script>
         <span class="n">MedusaDecodingConfig</span><span class="p">,</span>
         <span class="n">MTPDecodingConfig</span><span class="p">,</span>
         <span class="n">NGramDecodingConfig</span><span class="p">,</span>
+        <span class="n">SADecodingConfig</span><span class="p">,</span>
         <span class="n">UserProvidedDecodingConfig</span><span class="p">,</span>
         <span class="n">SaveHiddenStatesDecodingConfig</span><span class="p">,</span>
+        <span class="n">PARDDecodingConfig</span><span class="p">,</span>
         <span class="n">AutoDecodingConfig</span><span class="p">,</span>
     <span class="p">],</span>
     <span class="n">Field</span><span class="p">(</span><span class="n">discriminator</span><span class="o">=</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">),</span>
@@ -2880,7 +3032,7 @@ window.addEventListener("load", load);</script>
     <span class="n">secondary_offload_min_priority</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Only blocks with priority &gt; mSecondaryOfflineMinPriority can be offloaded to secondary memory.&quot;</span>
+        <span class="s2">&quot;Only blocks with priority &gt; secondary_offload_min_priority can be offloaded to secondary memory.&quot;</span>
     <span class="p">)</span>
     <span class="n">event_buffer_max_size</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
@@ -2910,8 +3062,11 @@ window.addEventListener("load", load);</script>
     <span class="p">)</span>
 
     <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
-    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span><span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
-                       <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The data type to use for the KV cache.&quot;</span><span class="p">)</span>
+    <span class="n">dtype</span><span class="p">:</span> <span class="nb">str</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span>
+        <span class="s2">&quot;The data type to use for the KV cache. Use &#39;auto&#39; to follow checkpoint metadata, otherwise force the specified dtype.&quot;</span>
+    <span class="p">)</span>
 
     <span class="c1"># This is a pure python field, not a pybind field. It is only for the Pytorch backend.</span>
     <span class="n">mamba_ssm_cache_dtype</span><span class="p">:</span> <span class="n">Literal</span><span class="p">[</span>
@@ -2955,7 +3110,81 @@ window.addEventListener("load", load);</script>
             <span class="n">use_uvm</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">use_uvm</span><span class="p">,</span>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span>
             <span class="n">attention_dp_events_gather_period_ms</span><span class="p">,</span>
-            <span class="n">max_gpu_total_bytes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_gpu_total_bytes</span><span class="p">)</span></div>
+            <span class="n">max_gpu_total_bytes</span><span class="o">=</span><span class="bp">self</span><span class="o">.</span><span class="n">max_gpu_total_bytes</span><span class="p">)</span>
+
+<div class="viewcode-block" id="KvCacheConfig.validate_free_gpu_memory_fraction">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_free_gpu_memory_fraction">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;free_gpu_memory_fraction&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_free_gpu_memory_fraction</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="nb">float</span><span class="p">):</span>
+<span class="w">        </span><span class="sd">&quot;&quot;&quot;Validates that the fraction is between 0.0 and 1.0.&quot;&quot;&quot;</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">v</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;kv_cache_config.free_gpu_memory_fraction must be a float between 0 and 1&quot;</span>
+            <span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_dtype">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_dtype">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;dtype&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_dtype</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="nb">str</span><span class="p">):</span>
+        <span class="n">v</span> <span class="o">=</span> <span class="n">v</span><span class="o">.</span><span class="n">lower</span><span class="p">()</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">in</span> <span class="p">(</span><span class="s2">&quot;auto&quot;</span><span class="p">,</span> <span class="s2">&quot;fp8&quot;</span><span class="p">,</span>
+                 <span class="s2">&quot;nvfp4&quot;</span><span class="p">)</span> <span class="ow">or</span> <span class="n">v</span> <span class="ow">in</span> <span class="n">_str_to_torch_dtype_dict</span><span class="o">.</span><span class="n">keys</span><span class="p">():</span>
+            <span class="k">return</span> <span class="n">v</span>
+
+        <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+            <span class="s1">&#39;kv_cache_config.dtype must be one of &quot;auto&quot;, &quot;fp8&quot;, &quot;nvfp4&quot;, or valid torch.dtype string&#39;</span>
+        <span class="p">)</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_max_gpu_total_bytes">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_gpu_total_bytes">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;max_gpu_total_bytes&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_max_gpu_total_bytes</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="nb">int</span><span class="p">):</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="o">&lt;</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;kv_cache_config.max_gpu_total_bytes must be non-negative&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_max_attention_window">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_attention_window">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;max_attention_window&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_max_attention_window</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">List</span><span class="p">[</span><span class="nb">int</span><span class="p">]]):</span>
+        <span class="k">if</span> <span class="n">v</span> <span class="ow">is</span> <span class="kc">None</span><span class="p">:</span>
+            <span class="k">return</span> <span class="n">v</span>
+
+        <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">v</span><span class="p">,</span> <span class="nb">list</span><span class="p">)</span> <span class="ow">or</span> <span class="nb">len</span><span class="p">(</span><span class="n">v</span><span class="p">)</span> <span class="o">==</span> <span class="mi">0</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;kv_cache_config.max_attention_window must be a non-empty list of positive integers&quot;</span>
+            <span class="p">)</span>
+        <span class="k">for</span> <span class="n">i</span> <span class="ow">in</span> <span class="n">v</span><span class="p">:</span>
+            <span class="k">if</span> <span class="ow">not</span> <span class="nb">isinstance</span><span class="p">(</span><span class="n">i</span><span class="p">,</span> <span class="nb">int</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;kv_cache_config.max_attention_window must contain only integers&quot;</span>
+                <span class="p">)</span>
+            <span class="k">if</span> <span class="n">i</span> <span class="o">&lt;=</span> <span class="mi">0</span><span class="p">:</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;kv_cache_config.max_attention_window values must be positive&quot;</span>
+                <span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+
+
+<div class="viewcode-block" id="KvCacheConfig.validate_max_util_for_resume">
+<a class="viewcode-back" href="../../../llm-api/reference.html#tensorrt_llm.llmapi.KvCacheConfig.validate_max_util_for_resume">[docs]</a>
+    <span class="nd">@field_validator</span><span class="p">(</span><span class="s1">&#39;max_util_for_resume&#39;</span><span class="p">)</span>
+    <span class="nd">@classmethod</span>
+    <span class="k">def</span><span class="w"> </span><span class="nf">validate_max_util_for_resume</span><span class="p">(</span><span class="bp">cls</span><span class="p">,</span> <span class="n">v</span><span class="p">:</span> <span class="nb">float</span><span class="p">):</span>
+        <span class="k">if</span> <span class="ow">not</span> <span class="mi">0</span> <span class="o">&lt;=</span> <span class="n">v</span> <span class="o">&lt;=</span> <span class="mi">1</span><span class="p">:</span>
+            <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                <span class="s2">&quot;kv_cache_config.max_util_for_resume must be between 0 and 1&quot;</span><span class="p">)</span>
+        <span class="k">return</span> <span class="n">v</span></div>
+</div>
 
 
 
@@ -3152,16 +3381,16 @@ window.addEventListener("load", load);</script>
 
     <span class="n">moe_cluster_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The cluster parallel size for MoE models&#39;s expert weights.&quot;</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The cluster parallel size for MoE model&#39;s expert weights.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
     <span class="n">moe_tensor_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The tensor parallel size for MoE models&#39;s expert weights.&quot;</span><span class="p">)</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The tensor parallel size for MoE model&#39;s expert weights.&quot;</span><span class="p">)</span>
 
     <span class="n">moe_expert_parallel_size</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">int</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The expert parallel size for MoE models&#39;s expert weights.&quot;</span><span class="p">)</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The expert parallel size for MoE model&#39;s expert weights.&quot;</span><span class="p">)</span>
 
     <span class="n">enable_attention_dp</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
@@ -3686,7 +3915,7 @@ window.addEventListener("load", load);</script>
 
             <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">EagleDecodingConfig</span><span class="p">):</span>
                 <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
-                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;EAGLE3 draft model must be specified.&quot;</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;EAGLE draft model must be specified.&quot;</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">build_config</span><span class="o">.</span><span class="n">speculative_decoding_mode</span> <span class="o">=</span> <span class="n">SpeculativeDecodingMode</span><span class="o">.</span><span class="n">EAGLE</span>
                 <span class="n">eagle_config</span> <span class="o">=</span> <span class="n">_EagleConfig</span><span class="p">(</span>
@@ -3698,6 +3927,10 @@ window.addEventListener("load", load);</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="n">DecodingConfig</span><span class="p">(</span>
                     <span class="n">decoding_mode</span><span class="o">=</span><span class="n">DecodingMode</span><span class="o">.</span><span class="n">Eagle</span><span class="p">(),</span>
                     <span class="n">eagle_config</span><span class="o">=</span><span class="n">eagle_config</span><span class="p">)</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">PARDDecodingConfig</span><span class="p">):</span>
+                <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
+                    <span class="s2">&quot;speculative_config.decoding_type &#39;PARD&#39; is only supported on the PyTorch backend.&quot;</span>
+                <span class="p">)</span>
             <span class="k">else</span><span class="p">:</span>
                 <span class="k">raise</span> <span class="ne">ValueError</span><span class="p">(</span>
                     <span class="sa">f</span><span class="s2">&quot;Unrecognized speculative config type </span><span class="si">{</span><span class="nb">type</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">)</span><span class="si">}</span><span class="s2">&quot;</span>
@@ -3960,7 +4193,7 @@ window.addEventListener("load", load);</script>
     <span class="n">garbage_collection_gen0_threshold</span><span class="p">:</span> <span class="nb">int</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="mi">20000</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Threshold for Python garbage collection of generation 0 objects.&quot;</span>
+        <span class="s2">&quot;Threshold for Python garbage collection of generation 0 objects. &quot;</span>
         <span class="s2">&quot;Lower values trigger more frequent garbage collection.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;beta&quot;</span><span class="p">)</span>
 
@@ -4044,7 +4277,7 @@ window.addEventListener("load", load);</script>
         <span class="n">ge</span><span class="o">=</span><span class="mi">0</span><span class="p">,</span>
         <span class="n">le</span><span class="o">=</span><span class="mi">1</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes.If 0 disables token-based batching delays.&quot;</span><span class="p">,</span>
+        <span class="s2">&quot;Token accumulation threshold ratio for batch scheduling optimization. If greater than 0, the scheduler will accumulate requests locally until the total token count reaches batch_wait_max_tokens_ratio * max_num_tokens. This mechanism enhances GPU utilization efficiency by ensuring adequate batch sizes. If 0, disables token-based batching delays.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
     <span class="n">torch_compile_config</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="n">TorchCompileConfig</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
@@ -4137,7 +4370,7 @@ window.addEventListener("load", load);</script>
 
     <span class="n">ray_worker_extension_cls</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">str</span><span class="p">]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
-        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The full worker extension class name including module path.&quot;</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;The full worker extension class name including module path. &quot;</span>
         <span class="s2">&quot;Allows users to extend the functions of the RayGPUWorker class.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
@@ -4148,10 +4381,16 @@ window.addEventListener("load", load);</script>
         <span class="n">exclude</span><span class="o">=</span><span class="kc">True</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
+    <span class="n">ray_worker_nsight_options</span><span class="p">:</span> <span class="n">Optional</span><span class="p">[</span><span class="nb">dict</span><span class="p">[</span><span class="nb">str</span><span class="p">,</span> <span class="nb">str</span><span class="p">]]</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
+        <span class="n">default</span><span class="o">=</span><span class="kc">None</span><span class="p">,</span>
+        <span class="n">description</span><span class="o">=</span><span class="s2">&quot;Nsight options.&quot;</span><span class="p">,</span>
+        <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">,</span>
+    <span class="p">)</span>
+
     <span class="n">enable_sleep</span><span class="p">:</span> <span class="nb">bool</span> <span class="o">=</span> <span class="n">Field</span><span class="p">(</span>
         <span class="n">default</span><span class="o">=</span><span class="kc">False</span><span class="p">,</span>
         <span class="n">description</span><span class="o">=</span>
-        <span class="s2">&quot;Enable LLM sleep feature. Sleep feature requires extra setup that may slowdown model loading.&quot;</span>
+        <span class="s2">&quot;Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. &quot;</span>
         <span class="s2">&quot;Only enable it if you intend to use this feature.&quot;</span><span class="p">,</span>
         <span class="n">status</span><span class="o">=</span><span class="s2">&quot;prototype&quot;</span><span class="p">)</span>
 
@@ -4264,6 +4503,9 @@ window.addEventListener("load", load);</script>
                     <span class="n">exclude</span><span class="o">=</span><span class="p">{</span><span class="s2">&quot;decoding_type&quot;</span><span class="p">})</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span> <span class="o">=</span> <span class="n">Eagle3DecodingConfig</span><span class="p">(</span><span class="o">**</span><span class="n">eagle_data</span><span class="p">)</span>
 
+            <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">PARDDecodingConfig</span><span class="p">):</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span><span class="p">,</span> <span class="s2">&quot;PARD max_draft_len must be &gt; 0&quot;</span>
+
             <span class="k">if</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span>
                           <span class="n">SaveHiddenStatesDecodingConfig</span><span class="p">):</span>
                 <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
@@ -4273,6 +4515,11 @@ window.addEventListener("load", load);</script>
                 <span class="bp">self</span><span class="o">.</span><span class="n">disable_overlap_scheduler</span> <span class="o">=</span> <span class="kc">True</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">cuda_graph_config</span> <span class="o">=</span> <span class="kc">None</span>
                 <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">=</span> <span class="mi">1</span>
+            <span class="k">elif</span> <span class="nb">isinstance</span><span class="p">(</span><span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="p">,</span> <span class="n">DraftTargetDecodingConfig</span><span class="p">):</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">max_draft_len</span> <span class="o">&gt;</span> <span class="mi">0</span>
+                <span class="k">assert</span> <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">speculative_model</span> <span class="ow">is</span> <span class="ow">not</span> <span class="kc">None</span><span class="p">,</span> <span class="s2">&quot;Draft model must be specified.&quot;</span>
+                <span class="k">if</span> <span class="bp">self</span><span class="o">.</span><span class="n">backend</span> <span class="o">==</span> <span class="s2">&quot;_autodeploy&quot;</span><span class="p">:</span>
+                    <span class="bp">self</span><span class="o">.</span><span class="n">speculative_config</span><span class="o">.</span><span class="n">_draft_target_one_model</span> <span class="o">=</span> <span class="kc">False</span>
 
         <span class="k">else</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">decoding_config</span> <span class="o">=</span> <span class="kc">None</span>
@@ -4340,6 +4587,8 @@ window.addEventListener("load", load);</script>
             <span class="k">return</span> <span class="bp">self</span>
         <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;fp8&#39;</span><span class="p">:</span>
             <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">FP8</span>
+        <span class="k">elif</span> <span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span> <span class="o">==</span> <span class="s1">&#39;nvfp4&#39;</span><span class="p">:</span>
+            <span class="bp">self</span><span class="o">.</span><span class="n">quant_config</span><span class="o">.</span><span class="n">kv_cache_quant_algo</span> <span class="o">=</span> <span class="n">QuantAlgo</span><span class="o">.</span><span class="n">NVFP4</span>
         <span class="k">else</span><span class="p">:</span>
             <span class="n">logger</span><span class="o">.</span><span class="n">warning</span><span class="p">(</span>
                 <span class="sa">f</span><span class="s2">&quot;Cannot sync quant_config.kv_cache_quant_algo with kv_cache_config.dtype of </span><span class="si">{</span><span class="bp">self</span><span class="o">.</span><span class="n">kv_cache_config</span><span class="o">.</span><span class="n">dtype</span><span class="si">}</span><span class="s2">, &quot;</span>
@@ -4638,9 +4887,9 @@ window.addEventListener("load", load);</script>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

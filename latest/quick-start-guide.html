@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="_static/copybutton.js?v=65e89d2a"></script>
-    <script src="_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -387,12 +387,14 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1"><a class="reference internal" href="deployment-guide/configuring-cpu-affinity.html">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -419,7 +421,6 @@
 <li class="toctree-l1"><a class="reference internal" href="features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -455,6 +456,7 @@
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -535,7 +537,7 @@
 <section id="launch-docker-container">
 <h2>Launch Docker Container<a class="headerlink" href="#launch-docker-container" title="Link to this heading">#</a></h2>
 <p>The <a class="reference external" href="https://catalog.ngc.nvidia.com/orgs/nvidia/teams/tensorrt-llm/containers/release/tags">TensorRT LLM container</a> maintained by NVIDIA contains all of the required dependencies pre-installed. You can start the container on a machine with NVIDIA GPUs via:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc6
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span>docker<span class="w"> </span>run<span class="w"> </span>--rm<span class="w"> </span>-it<span class="w"> </span>--ipc<span class="w"> </span>host<span class="w"> </span>--gpus<span class="w"> </span>all<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">memlock</span><span class="o">=</span>-1<span class="w"> </span>--ulimit<span class="w"> </span><span class="nv">stack</span><span class="o">=</span><span class="m">67108864</span><span class="w"> </span>-p<span class="w"> </span><span class="m">8000</span>:8000<span class="w"> </span>nvcr.io/nvidia/tensorrt-llm/release:1.3.0rc7
 </pre></div>
 </div>
 </section>
@@ -652,6 +654,40 @@ Inference can then be performed using examples similar to the one provided below
 <p>You can also directly load pre-quantized models <a class="reference external" href="https://huggingface.co/collections/nvidia/model-optimizer-66aa84f7966b3150262481a4">quantized checkpoints on Hugging Face</a> in the LLM constructor.
 To learn more about the LLM API, check out the <a class="reference internal" href="llm-api/index.html"><span class="doc std std-doc">LLM API Introduction</span></a> and <a class="reference internal" href="examples/llm_api_examples.html"><span class="doc std std-doc">LLM Examples</span></a>.</p>
 </section>
+<section id="run-offline-inference-with-visualgen-api">
+<h2>Run Offline Inference with VisualGen API<a class="headerlink" href="#run-offline-inference-with-visualgen-api" title="Link to this heading">#</a></h2>
+<p>The VisualGen API provides a similar interface for diffusion-based image and video generation. Here is a simple example to generate a video with Wan 2.1.</p>
+<div class="highlight-python notranslate"><div class="highlight"><pre><span></span><span class="linenos"> 1</span><span class="ch">#! /usr/bin/env python</span>
+<span class="linenos"> 2</span><span class="c1"># SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION &amp; AFFILIATES. All rights reserved.</span>
+<span class="linenos"> 3</span><span class="c1"># SPDX-License-Identifier: Apache-2.0</span>
+<span class="linenos"> 4</span>
+<span class="linenos"> 5</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm</span><span class="w"> </span><span class="kn">import</span> <span class="n">VisualGen</span><span class="p">,</span> <span class="n">VisualGenParams</span>
+<span class="linenos"> 6</span><span class="kn">from</span><span class="w"> </span><span class="nn">tensorrt_llm.serve.media_storage</span><span class="w"> </span><span class="kn">import</span> <span class="n">MediaStorage</span>
+<span class="linenos"> 7</span>
+<span class="linenos"> 8</span>
+<span class="linenos"> 9</span><span class="k">def</span><span class="w"> </span><span class="nf">main</span><span class="p">():</span>
+<span class="linenos">10</span>    <span class="n">visual_gen</span> <span class="o">=</span> <span class="n">VisualGen</span><span class="p">(</span><span class="n">model_path</span><span class="o">=</span><span class="s2">&quot;Wan-AI/Wan2.1-T2V-1.3B-Diffusers&quot;</span><span class="p">)</span>
+<span class="linenos">11</span>    <span class="n">params</span> <span class="o">=</span> <span class="n">VisualGenParams</span><span class="p">(</span>
+<span class="linenos">12</span>        <span class="n">height</span><span class="o">=</span><span class="mi">480</span><span class="p">,</span>
+<span class="linenos">13</span>        <span class="n">width</span><span class="o">=</span><span class="mi">832</span><span class="p">,</span>
+<span class="linenos">14</span>        <span class="n">num_frames</span><span class="o">=</span><span class="mi">81</span><span class="p">,</span>
+<span class="linenos">15</span>        <span class="n">guidance_scale</span><span class="o">=</span><span class="mf">5.0</span><span class="p">,</span>
+<span class="linenos">16</span>        <span class="n">num_inference_steps</span><span class="o">=</span><span class="mi">50</span><span class="p">,</span>
+<span class="linenos">17</span>        <span class="n">seed</span><span class="o">=</span><span class="mi">42</span><span class="p">,</span>
+<span class="linenos">18</span>    <span class="p">)</span>
+<span class="linenos">19</span>    <span class="n">output</span> <span class="o">=</span> <span class="n">visual_gen</span><span class="o">.</span><span class="n">generate</span><span class="p">(</span>
+<span class="linenos">20</span>        <span class="n">inputs</span><span class="o">=</span><span class="s2">&quot;A cat sitting on a windowsill&quot;</span><span class="p">,</span>
+<span class="linenos">21</span>        <span class="n">params</span><span class="o">=</span><span class="n">params</span><span class="p">,</span>
+<span class="linenos">22</span>    <span class="p">)</span>
+<span class="linenos">23</span>    <span class="n">MediaStorage</span><span class="o">.</span><span class="n">save_video</span><span class="p">(</span><span class="n">output</span><span class="o">.</span><span class="n">video</span><span class="p">,</span> <span class="s2">&quot;output.avi&quot;</span><span class="p">,</span> <span class="n">frame_rate</span><span class="o">=</span><span class="n">params</span><span class="o">.</span><span class="n">frame_rate</span><span class="p">)</span>
+<span class="linenos">24</span>
+<span class="linenos">25</span>
+<span class="linenos">26</span><span class="k">if</span> <span class="vm">__name__</span> <span class="o">==</span> <span class="s2">&quot;__main__&quot;</span><span class="p">:</span>
+<span class="linenos">27</span>    <span class="n">main</span><span class="p">()</span>
+</pre></div>
+</div>
+<p>To learn more about VisualGen, check out the <a class="reference internal" href="models/visual-generation.html"><span class="std std-doc">Visual Generation</span></a> documentation and <a class="reference external" href="https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/visual_gen"><code class="docutils literal notranslate"><span class="pre">examples/visual_gen/</span></code></a>.</p>
+</section>
 <section id="next-steps">
 <h2>Next Steps<a class="headerlink" href="#next-steps" title="Link to this heading">#</a></h2>
 <p>In this Quick Start Guide, you have:</p>
@@ -728,6 +764,7 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#launch-docker-container">Launch Docker Container</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#deploy-online-serving-with-trtllm-serve">Deploy Online Serving with trtllm-serve</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-offline-inference-with-llm-api">Run Offline Inference with LLM API</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#run-offline-inference-with-visualgen-api">Run Offline Inference with VisualGen API</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#next-steps">Next Steps</a></li>
 </ul>
   </nav></div>
@@ -820,9 +857,9 @@ To learn more about the LLM API, check out the <a class="reference internal" hre
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       

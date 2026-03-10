@@ -75,8 +75,8 @@ The file `examples/llm-api/llm_kv_cache_connector.py` provides a reference imple
 ### Overview
 
 This example implements a file-system based KV cache.
-1.**Save**: When a request finishes or needs to be swapped out, its KV blocks are saved to disk as `.pt` files.
-2.**Load**: When a new request arrives with the same prompt prefix, the connector identifies the cached files and loads them back into GPU memory, skipping re-computation.
+1. **Save**: When a request finishes or needs to be swapped out, its KV blocks are saved to disk as `.pt` files.
+2. **Load**: When a new request arrives with the same prompt prefix, the connector identifies the cached files and loads them back into GPU memory, skipping re-computation.
 
 ### Implementation Details
 

@@ -9,7 +9,7 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" /><meta name="viewport" content="width=device-width, initial-scale=1" />
 
-    <title>CPU Affinity configuration in TensorRT-LLM &#8212; TensorRT LLM</title>
+    <title>CPU Affinity configuration in TensorRT LLM &#8212; TensorRT LLM</title>
   
   
   
@@ -36,7 +36,7 @@
     <link rel="stylesheet" type="text/css" href="../_static/copybutton.css?v=76b2166b" />
     <link rel="stylesheet" type="text/css" href="../_static/autodoc_pydantic.css" />
     <link rel="stylesheet" type="text/css" href="../_static/togglebutton.css?v=9c3e77be" />
-    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=e17d8078" />
+    <link rel="stylesheet" type="text/css" href="../_static/config_selector.css?v=6097372f" />
     <link rel="stylesheet" type="text/css" href="../_static/custom.css?v=19d20f17" />
   
   <!-- So that users can add custom icons -->
@@ -52,7 +52,7 @@
     <script src="../_static/sphinx_highlight.js?v=dc90522c"></script>
     <script src="../_static/clipboard.min.js?v=a7894cd8"></script>
     <script src="../_static/copybutton.js?v=65e89d2a"></script>
-    <script src="../_static/config_selector.js?v=aaf6cd4a"></script>
+    <script src="../_static/config_selector.js?v=04c94837"></script>
     <script>let toggleHintShow = 'Click to show';</script>
     <script>let toggleHintHide = 'Click to hide';</script>
     <script>let toggleOpenOnPrint = 'true';</script>
@@ -63,7 +63,7 @@
     <script>
         DOCUMENTATION_OPTIONS.theme_version = '0.16.1';
         DOCUMENTATION_OPTIONS.theme_switcher_json_url = './_static/switcher.json';
-        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc6';
+        DOCUMENTATION_OPTIONS.theme_switcher_version_match = '1.3.0rc7';
         DOCUMENTATION_OPTIONS.show_version_warning_banner =
             false;
         </script>
@@ -78,7 +78,7 @@
 
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
   <meta name="docsearch:language" content="en"/>
-  <meta name="docsearch:version" content="1.3.0rc6" />
+  <meta name="docsearch:version" content="1.3.0rc7" />
 
 
   </head>
@@ -387,12 +387,14 @@
 <li class="toctree-l2"><a class="reference internal" href="deployment-guide-for-kimi-k2-thinking-on-trtllm.html">Deployment Guide for Kimi K2 Thinking on TensorRT LLM - Blackwell</a></li>
 </ul>
 </details></li>
-<li class="toctree-l1 current active"><a class="current reference internal" href="#">CPU Affinity configuration in TensorRT-LLM</a></li>
+<li class="toctree-l1 current active"><a class="current reference internal" href="#">CPU Affinity configuration in TensorRT LLM</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">Models</span></p>
 <ul class="nav bd-sidenav">
 <li class="toctree-l1"><a class="reference internal" href="../models/supported-models.html">Supported Models</a></li>
 
+
+<li class="toctree-l1"><a class="reference internal" href="../models/visual-generation.html">Visual Generation (Prototype)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../models/adding-new-model.html">Adding a New Model</a></li>
 </ul>
 <p aria-level="2" class="caption" role="heading"><span class="caption-text">CLI Reference</span></p>
@@ -419,7 +421,6 @@
 <li class="toctree-l1"><a class="reference internal" href="../features/long-sequence.html">Long Sequences</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/lora.html">LoRA (Low-Rank Adaptation)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/multi-modality.html">Multimodal Support in TensorRT LLM</a></li>
-<li class="toctree-l1"><a class="reference internal" href="../features/visual-generation.html">Visual Generation (Diffusion Models) [Beta]</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/overlap-scheduler.html">Overlap Scheduler</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/paged-attention-ifb-scheduler.html">Paged Attention, IFB, and Request Scheduling</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../features/parallel-strategy.html">Parallelism in TensorRT LLM</a></li>
@@ -455,6 +456,7 @@
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog14_Scaling_Expert_Parallelism_in_TensorRT-LLM_part3.html">Scaling Expert Parallelism in TensorRT LLM (Part 3: Pushing the Performance Boundary)</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog15_Optimizing_DeepSeek_V32_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek-V3.2 on NVIDIA Blackwell GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog16_Accelerating_Long_Context_Inference_with_Skip_Softmax_Attention.html">Accelerating Long-Context Inference with Skip Softmax Attention</a></li>
+<li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog17_Sparse_Attention_in_TensorRT-LLM.html">Sparse Attention in TensorRT LLM</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog1_Pushing_Latency_Boundaries_Optimizing_DeepSeek-R1_Performance_on_NVIDIA_B200_GPUs.html">Pushing Latency Boundaries: Optimizing DeepSeek-R1 Performance on NVIDIA B200 GPUs</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog2_DeepSeek_R1_MTP_Implementation_and_Optimization.html">DeepSeek R1 MTP Implementation and Optimization</a></li>
 <li class="toctree-l1"><a class="reference internal" href="../blogs/tech_blog/blog3_Optimizing_DeepSeek_R1_Throughput_on_NVIDIA_Blackwell_GPUs.html">Optimizing DeepSeek R1 Throughput on NVIDIA Blackwell GPUs: A Deep Dive for Developers</a></li>
@@ -512,7 +514,7 @@
         <i class="fa-solid fa-home"></i>
       </a>
     </li>
-    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">CPU Affinity configuration in TensorRT-LLM</span></li>
+    <li class="breadcrumb-item active" aria-current="page"><span class="ellipsis">CPU Affinity configuration in TensorRT LLM</span></li>
   </ul>
 </nav>
 </div>
@@ -530,18 +532,18 @@
                 <article class="bd-article">
                   
   <section class="tex2jax_ignore mathjax_ignore" id="cpu-affinity-configuration-in-tensorrt-llm">
-<h1>CPU Affinity configuration in TensorRT-LLM<a class="headerlink" href="#cpu-affinity-configuration-in-tensorrt-llm" title="Link to this heading">#</a></h1>
+<h1>CPU Affinity configuration in TensorRT LLM<a class="headerlink" href="#cpu-affinity-configuration-in-tensorrt-llm" title="Link to this heading">#</a></h1>
 <section id="numa-aware-affinity-in-tensorrt-llm">
-<h2>NUMA-aware affinity in TensorRT-LLM<a class="headerlink" href="#numa-aware-affinity-in-tensorrt-llm" title="Link to this heading">#</a></h2>
-<p>TensorRT-LLM is frequently deployed on
+<h2>NUMA-aware affinity in TensorRT LLM<a class="headerlink" href="#numa-aware-affinity-in-tensorrt-llm" title="Link to this heading">#</a></h2>
+<p>TensorRT LLM is frequently deployed on
 <a class="reference external" href="https://en.wikipedia.org/wiki/Non-uniform_memory_access">NUMA</a> systems. In
 order to ensure consistent and optimal performance on these systems, it is
 critical to set the CPU affinity of the workers/tasks launched as part of a
-particular TRT-LLM instance so as to minimize latency and maximize bandwidth of
+particular TensorRT LLM instance so as to minimize latency and maximize bandwidth of
 CPU↔GPU and CPU↔DRAM communication.</p>
-<p>Because TensorRT-LLM does the work of allocating GPU/CUDA devices to ranks, it
+<p>Because TensorRT LLM does the work of allocating GPU/CUDA devices to ranks, it
 is logically the ideal place for the CPU affinity to be determined and set. For
-this reason, TensorRT-LLM provides a mechanism to automatically set CPU
+this reason, TensorRT LLM provides a mechanism to automatically set CPU
 affinity according to NUMA topology. In some situations/deployments, the user
 may wish to configure CPU affinity manually (i.e. using
 <a class="reference external" href="https://github.com/numactl/numactl">numactl</a>, <a class="reference external" href="https://github.com/NVIDIA/mlperf-common/blob/main/client/bindpcie">wrappers around the
@@ -573,7 +575,7 @@ environment variable as follows:</p>
 <section id="other-environmental-considerations">
 <h2>Other environmental considerations<a class="headerlink" href="#other-environmental-considerations" title="Link to this heading">#</a></h2>
 <p>Whether or not the user chooses to manually configure CPU affinity or have
-TensorRT-LLM configure it automatically, the environment can also constrain the
+TensorRT LLM configure it automatically, the environment can also constrain the
 CPU affinity in a way that subverts the user’s intent. Both OpenMPI and Slurm
 may configure CPU affinity, so the following additional configuration is
 recommended to avoid this.</p>
@@ -581,7 +583,7 @@ recommended to avoid this.</p>
 <h3>OpenMPI<a class="headerlink" href="#openmpi" title="Link to this heading">#</a></h3>
 <p>By default, OpenMPI chooses a rank-wise CPU affinity that is not sensitized to
 the NUMA-topology of the system. Because it does not know which GPU a
-particular rank will be communicating with (this is determined by TRT-LLM at
+particular rank will be communicating with (this is determined by TensorRT LLM at
 runtime), it cannot set the CPU affinity accordingly. For this reason, it is
 recommended that OpenMPI’s default binding policy be disabled as follows:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">OMPI_MCA_hwloc_base_binding_policy</span><span class="o">=</span>none
@@ -591,12 +593,12 @@ recommended that OpenMPI’s default binding policy be disabled as follows:</p>
 <p>The first environment variable ensures that OpenMPI will not attempt to bind or
 set the affinity of the ranks that are created at launch.</p>
 <p>The second ensures that OpenMPI’s binding policy will propagate to MPI workers
-that are spawned by <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>’s <code class="docutils literal notranslate"><span class="pre">MPIPoolExecutor</span></code> class within TensorRT-LLM
+that are spawned by <code class="docutils literal notranslate"><span class="pre">mpi4py</span></code>’s <code class="docutils literal notranslate"><span class="pre">MPIPoolExecutor</span></code> class within TensorRT LLM
 (when using mpirun).</p>
 </section>
 <section id="slurm">
 <h3>Slurm<a class="headerlink" href="#slurm" title="Link to this heading">#</a></h3>
-<p>If Slurm is configured to use a affinity or cgroup task plugin, then Slurm may
+<p>If Slurm is configured to use an affinity or cgroup task plugin, then Slurm may
 also configure CPU affinity by default in a way that is not sensitized to NUMA
 topology. To prevent this, Slurm jobs should be launched accordingly:</p>
 <section id="srun">
@@ -621,13 +623,13 @@ topology. To prevent this, Slurm jobs should be launched accordingly:</p>
 <h2>CPU affinity configuration examples<a class="headerlink" href="#cpu-affinity-configuration-examples" title="Link to this heading">#</a></h2>
 <section id="using-numa-aware-autoconfiguration">
 <h3>Using NUMA-aware autoconfiguration<a class="headerlink" href="#using-numa-aware-autoconfiguration" title="Link to this heading">#</a></h3>
-<p>To explicitly enable the NUMA-aware autoconfiguration feature in TensorRT-LLM,
+<p>To explicitly enable the NUMA-aware autoconfiguration feature in TensorRT LLM,
 simply set <code class="docutils literal notranslate"><span class="pre">TLLM_NUMA_AWARE_WORKER_AFFINITY</span></code> in the launch script (prior to
 <code class="docutils literal notranslate"><span class="pre">trtllm-bench</span></code> or <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code>) as follows:</p>
 <div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_NUMA_AWARE_WORKER_AFFINITY</span><span class="o">=</span><span class="m">1</span>
 </pre></div>
 </div>
-<p>Because autoconfiguration happens within TensorRT-LLM itself, it will override
+<p>Because autoconfiguration happens within TensorRT LLM itself, it will override
 any CPU affinity or binding that has been previously set by OpenMPI or Slurm.</p>
 </section>
 <section id="numa-aware-cpu-affinity-using-bindpcie">
@@ -636,9 +638,9 @@ any CPU affinity or binding that has been previously set by OpenMPI or Slurm.</p
 for NUMA topology. While setting <code class="docutils literal notranslate"><span class="pre">TLLM_NUMA_AWARE_WORKER_AFFINITY=1</span></code> usually
 achieves the same result in terms of the CPU affinity that is set, this
 approach has the distinct advantage that the optimal CPU affinity gets set
-<em>upon launching</em> TensorRT-LLM, guaranteeing that each worker/rank executes on
+<em>upon launching</em> TensorRT LLM, guaranteeing that each worker/rank executes on
 the optimal NUMA node from inception. The NUMA-aware CPU affinity
-autoconfiguration mechanism in TensorRT-LLM, on the other hand, is triggered by
+autoconfiguration mechanism in TensorRT LLM, on the other hand, is triggered by
 each worker/rank upon its own PID <em>after</em> it has already launched. If the
 worker/rank executes on a NUMA node other than the optimal NUMA node at some
 point between the launch of the process and the NUMA-aware autoconfiguration,
@@ -650,7 +652,7 @@ performance due to remote NUMA node access is still theoretically possible.</p>
 <p>The <code class="docutils literal notranslate"><span class="pre">bindpcie</span></code> script can only be applied to deployments that make use of
 <code class="docutils literal notranslate"><span class="pre">trtllm-llmapi-launch</span></code> within an sbatch script. One example of how to apply
 bindpcie to <code class="docutils literal notranslate"><span class="pre">trtllm-serve</span></code> in an sbatch script is as follows:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prevent TensorRT LLM from autoconfiguring or clearing CPU affinity</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_NUMA_AWARE_WORKER_AFFINITY</span><span class="o">=</span><span class="m">0</span>
 
 <span class="c1"># Prevent OpenMPI from overriding affinity set by bindpcie</span>
@@ -688,7 +690,7 @@ within an existing sbatch script.</p>
 </section>
 <section id="using-numactl">
 <h3>Using <a class="reference external" href="https://github.com/numactl/numactl">numactl</a><a class="headerlink" href="#using-numactl" title="Link to this heading">#</a></h3>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prevent TensorRT LLM from autoconfiguring or clearing CPU affinity</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_NUMA_AWARE_WORKER_AFFINITY</span><span class="o">=</span><span class="m">0</span>
 
 <span class="c1"># Prevent OpenMPI from overriding affinity set by numactl</span>
@@ -710,7 +712,7 @@ numactl<span class="w"> </span>--physcpubind<span class="o">=</span><span class=
 single node with mpirun, this can be achieved most easily using an OpenMPI
 rankfile. The following is an example of how a rankfile can be used to
 arbitrarily map each of 4 MPI ranks to a distinct set of 4 cores:</p>
-<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prevent TensorRT-LLM from autoconfiguring or clearing CPU affinity</span>
+<div class="highlight-bash notranslate"><div class="highlight"><pre><span></span><span class="c1"># Prevent TensorRT LLM from autoconfiguring or clearing CPU affinity</span>
 <span class="nb">export</span><span class="w"> </span><span class="nv">TLLM_NUMA_AWARE_WORKER_AFFINITY</span><span class="o">=</span><span class="m">0</span>
 
 <span class="c1"># Not strictly needed here, since we are overriding with explicit bindings from</span>
@@ -789,7 +791,7 @@ more details on mapping and binding of MPI ranks.</p>
   </div>
   <nav class="bd-toc-nav page-toc" aria-labelledby="pst-page-navigation-heading-2">
     <ul class="visible nav section-nav flex-column">
-<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#numa-aware-affinity-in-tensorrt-llm">NUMA-aware affinity in TensorRT-LLM</a></li>
+<li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#numa-aware-affinity-in-tensorrt-llm">NUMA-aware affinity in TensorRT LLM</a></li>
 <li class="toc-h2 nav-item toc-entry"><a class="reference internal nav-link" href="#other-environmental-considerations">Other environmental considerations</a><ul class="nav section-nav flex-column">
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#openmpi">OpenMPI</a></li>
 <li class="toc-h3 nav-item toc-entry"><a class="reference internal nav-link" href="#slurm">Slurm</a><ul class="nav section-nav flex-column">
@@ -897,9 +899,9 @@ more details on mapping and binding of MPI ranks.</p>
         <div class="footer-item">
 <div class="extra_footer">
   
-  <p>Last updated on February 27, 2026.</p>
+  <p>Last updated on March 09, 2026.</p>
   
-  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/617440d">617440d</a>.</p>
+  <p>This page is generated by TensorRT-LLM commit <a href="https://github.com/NVIDIA/TensorRT-LLM/tree/69de4a6">69de4a6</a>.</p>
   
 </div></div>
       
