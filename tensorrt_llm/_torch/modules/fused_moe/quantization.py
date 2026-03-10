@@ -2573,17 +2573,23 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
 
     def get_weights_shapes(self, module: torch.nn.Module, weight_vec_size: int,
                            block_scales_vec_size: int):
-        # Pad expand_intermediate_size_per_partition to _scale_m_alignment
-        expand_intermediate_size_per_partition_padded = self._round_up(
-            module.expand_intermediate_size_per_partition,
-            self._scale_m_alignment)
-
-        # # For w2 scale, K = intermediate_size_per_partition / scaling_vector_size
-        # # / block_scales_vec_size. get_shuffle_matrix_sf_a_row_indices requires
-        # # K % 4 == 0, so pad intermediate_size_per_partition accordingly.
+        # Pad intermediate_size_per_partition to _scale_m_alignment // module.intermediate_size_expand_ratio
+        # since the expand_intermediate_size_per_partition requires _scale_m_alignment
+        assert self._scale_m_alignment % module.intermediate_size_expand_ratio == 0
         intermediate_size_per_partition_padded = self._round_up(
-            module.intermediate_size_per_partition, module.scaling_vector_size *
+            module.intermediate_size_per_partition,
+            self._scale_m_alignment // module.intermediate_size_expand_ratio)
+
+        # For w2 scale, K = intermediate_size_per_partition / scaling_vector_size
+        # / block_scales_vec_size. get_shuffle_matrix_sf_a_row_indices requires
+        # K % 4 == 0, so pad intermediate_size_per_partition accordingly.
+        intermediate_size_per_partition_padded = self._round_up(
+            intermediate_size_per_partition_padded, module.scaling_vector_size *
             block_scales_vec_size * self._scale_k_alignment)
+
+        expand_intermediate_size_per_partition_padded = (
+            intermediate_size_per_partition_padded *
+            module.intermediate_size_expand_ratio)
 
         w3_w1_weight_shape = (module.expert_size_per_partition,
                               expand_intermediate_size_per_partition_padded,
