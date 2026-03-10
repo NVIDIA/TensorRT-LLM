@@ -2,7 +2,7 @@
 
 verl_config:
   repo_url: "https://github.com/volcengine/verl.git"
-  repo_tag: "4ef45d0"
+  repo_tag: "4cda6af"
   test_dir: "tests"
 
   install_commands:
