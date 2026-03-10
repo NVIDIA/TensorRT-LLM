@@ -780,7 +780,8 @@ void NixlTransferAgent::invalidateRemoteAgent(std::string const& name)
         mExtraParams.hasNotif = false;
     }
     // Split transfer descriptors at VMM chunk boundaries to match registered memory.
-    // Only src is local — split src based on registry, dst follows with matching piece sizes.
+    // Both src and dst are split at chunk boundaries to ensure each descriptor
+    // falls within a single registered memory region on both local and remote sides.
     auto [splitSrc, splitDst] = splitTransferDescsFromRegistry(request.getSrcDescs(), request.getDstDescs());
 
     // Coalesce contiguous memory regions to reduce transfer count (disabled by default)
@@ -952,15 +953,19 @@ std::pair<MemoryDescs, MemoryDescs> NixlTransferAgent::splitTransferDescsFromReg
             continue;
         }
 
-        // Split src at chunk boundaries, dst follows with matching piece sizes
+        // Split at chunk boundaries for BOTH src and dst.
+        // Both sides may have VMM chunk boundaries that NIXL requires descriptors to respect.
         uintptr_t srcAddr = srcVec[i].getAddr();
         uintptr_t dstAddr = dstVec[i].getAddr();
         size_t remaining = srcVec[i].getLen();
 
         while (remaining > 0)
         {
-            size_t offsetInChunk = static_cast<size_t>(srcAddr % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
+            size_t srcOffsetInChunk = static_cast<size_t>(srcAddr % chunkSize);
+            size_t srcPieceSize = chunkSize - srcOffsetInChunk;
+            size_t dstOffsetInChunk = static_cast<size_t>(dstAddr % chunkSize);
+            size_t dstPieceSize = chunkSize - dstOffsetInChunk;
+            size_t pieceSize = std::min({remaining, srcPieceSize, dstPieceSize});
             splitSrc.emplace_back(srcAddr, pieceSize, srcVec[i].getDeviceId());
             splitDst.emplace_back(dstAddr, pieceSize, dstVec[i].getDeviceId());
             srcAddr += pieceSize;

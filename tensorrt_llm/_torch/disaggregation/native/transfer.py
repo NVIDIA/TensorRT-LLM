@@ -521,9 +521,7 @@ class Sender:
             peer_ri = self._registrar.get_peer_rank_info(
                 req_info.instance_name, req_info.instance_rank
             )
-            expected_count = len(
-                self._registrar.get_peer_overlap(peer_ri, req_info.instance_rank).ranks
-            )
+            expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
             if self._peer_reqs.is_ready(unique_rid, expected_count):
                 tx_session.state.status = SessionStatus.READY
         return
@@ -824,9 +822,7 @@ class Sender:
         req_info = peer_transfer_req_info
         self._peer_reqs.add_req_info(req_info.unique_rid, req_info.instance_rank, req_info)
         peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-        expected_transfers = len(
-            self._registrar.get_peer_overlap(peer_ri, req_info.instance_rank).ranks
-        )
+        expected_transfers = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
         if self._peer_reqs.is_ready(req_info.unique_rid, expected_transfers):
             if req_info.unique_rid in self._tx_sessions:
                 session = self._get_tx_session(req_info.unique_rid)
@@ -888,11 +884,16 @@ class TxSession(TxSessionBase):
         self.aux_slot = aux_slot
         self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
         self._exception = None
-        self._sender.setup_session(self)
         self._closed = False
         self._kv_tasks = []
         self._aux_task = None
         self._lock = threading.Lock()
+        # setup_session registers this session, making it visible to the
+        # listener thread.  All instance attributes that the listener may
+        # access (_kv_tasks, _lock, etc.) must be initialised BEFORE this call
+        # to avoid a race where the listener sees the session before its
+        # attributes are ready.
+        self._sender.setup_session(self)
 
     @property
     def state(self) -> SessionState:
@@ -1197,11 +1198,11 @@ class RxSession(RxSessionBase):
         self.aux_slot = aux_slot
         self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
         self._exception = None
-        self._receiver.setup_session(self)
         self._closed = False
         self._kv_tasks = []
         self._last_slice_counts = 0
         self._aux_counts = 0
+        self._receiver.setup_session(self)
 
     @property
     def state(self) -> SessionState:
