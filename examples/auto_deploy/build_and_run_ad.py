@@ -335,10 +335,11 @@ def _inject_registry_yaml_extra() -> None:
 
     yaml_extra_paths = get_registry_yaml_extra(model_name)
 
-    # Remove --use-registry and inject --yaml-extra <path0> <path1> ...
+    # Remove --use-registry and inject --yaml-extra <path0> --yaml-extra <path1> ...
+    # Each path needs its own flag because pydantic-settings CLI only captures one value per flag.
     argv = [a for a in sys.argv if a != "--use-registry"]
-    if yaml_extra_paths:
-        argv += ["--args.yaml-extra"] + yaml_extra_paths
+    for path in yaml_extra_paths:
+        argv += ["--args.yaml-extra", path]
     sys.argv = argv
 
 
