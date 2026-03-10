@@ -14,7 +14,8 @@
   * limitations under the License.
   */
 
-#pragma once
+#ifndef TRTLLM_CUDA_VMM_ARENA_H
+#define TRTLLM_CUDA_VMM_ARENA_H
 
 #include <cuda.h>
 #include <cstddef>
@@ -140,3 +141,5 @@ private:
 };
 
 } // namespace tensorrt_llm::batch_manager::vmm
+
+#endif // TRTLLM_CUDA_VMM_ARENA_H
