@@ -1436,6 +1436,231 @@ def compute_mrope_positions(
         return position_ids, mrope_position_deltas
 
 
+def _normalize_video_grid_for_mrope(
+    video_grid_thw: Optional[torch.Tensor],
+) -> Optional[torch.Tensor]:
+    if video_grid_thw is None:
+        return None
+    video_grid_thw = torch.repeat_interleave(video_grid_thw, video_grid_thw[:, 0], dim=0)
+    video_grid_thw = video_grid_thw.clone()
+    video_grid_thw[:, 0] = 1
+    return video_grid_thw
+
+
+def _compute_mm_item_special_counts(
+    mm_token_lengths: torch.Tensor,
+    mm_special_offsets_cu_seqlen: torch.Tensor,
+    mm_special_offsets: torch.Tensor,
+    req_idx: int,
+) -> List[int]:
+    item_lengths = mm_token_lengths.tolist()
+    special_start = int(mm_special_offsets_cu_seqlen[req_idx].item())
+    special_end = int(mm_special_offsets_cu_seqlen[req_idx + 1].item())
+    special_offsets = mm_special_offsets[special_start:special_end].tolist()
+    counts: List[int] = []
+    mm_offset = 0
+    for item_len in item_lengths:
+        item_end = mm_offset + int(item_len)
+        num_special = sum(1 for off in special_offsets if mm_offset <= int(off) < item_end)
+        counts.append(num_special)
+        mm_offset = item_end
+    return counts
+
+
+def _compute_request_mrope_delta(
+    mm_item_types: torch.Tensor,
+    mm_token_lengths: torch.Tensor,
+    special_counts: Sequence[int],
+    image_grid_thw: Optional[torch.Tensor],
+    video_grid_thw: Optional[torch.Tensor],
+    spatial_merge_size: int,
+) -> int:
+    image_idx = 0
+    video_idx = 0
+    total_delta = 0
+    for item_type, item_len, num_special in zip(
+        mm_item_types.tolist(), mm_token_lengths.tolist(), special_counts
+    ):
+        num_placeholders = int(item_len) - int(num_special)
+        if item_type == 0:
+            if image_grid_thw is None:
+                raise ValueError("Expected image_grid_thw for image multimodal item")
+            t, h, w = [int(v) for v in image_grid_thw[image_idx].tolist()]
+            image_idx += 1
+        else:
+            if video_grid_thw is None:
+                raise ValueError("Expected video_grid_thw for video multimodal item")
+            t, h, w = [int(v) for v in video_grid_thw[video_idx].tolist()]
+            video_idx += 1
+        llm_grid_t = int(t)
+        llm_grid_h = int(h) // spatial_merge_size
+        llm_grid_w = int(w) // spatial_merge_size
+        total_delta += max(llm_grid_t, llm_grid_h, llm_grid_w) - num_placeholders
+    return total_delta
+
+
+@torch.library.custom_op("auto_deploy::qwen3_mrope_delta", mutates_args=())
+def qwen3_mrope_delta(
+    batch_info_host: torch.Tensor,
+    mm_item_cu_seqlen: torch.Tensor,
+    mm_item_types: torch.Tensor,
+    mm_token_lengths: torch.Tensor,
+    mm_special_offsets_cu_seqlen: torch.Tensor,
+    mm_special_offsets: torch.Tensor,
+    image_grid_thw: Optional[torch.Tensor],
+    video_grid_thw: Optional[torch.Tensor],
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    device = mm_item_cu_seqlen.device
+    out = torch.zeros((num_seq, 1), dtype=torch.int32, device=device)
+    video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
+    img_idx = 0
+    vid_idx = 0
+    for req_idx in range(num_prefill):
+        item_start = int(mm_item_cu_seqlen[req_idx].item())
+        item_end = int(mm_item_cu_seqlen[req_idx + 1].item())
+        req_item_types = mm_item_types[item_start:item_end]
+        req_item_lengths = mm_token_lengths[item_start:item_end]
+        if req_item_lengths.numel() == 0:
+            continue
+        num_images = int((req_item_types == 0).sum().item())
+        num_videos = int((req_item_types == 1).sum().item())
+        req_image_grid = image_grid_thw[img_idx : img_idx + num_images] if num_images > 0 else None
+        req_video_grid = video_grid_norm[vid_idx : vid_idx + num_videos] if num_videos > 0 else None
+        special_counts = _compute_mm_item_special_counts(
+            req_item_lengths,
+            mm_special_offsets_cu_seqlen,
+            mm_special_offsets,
+            req_idx,
+        )
+        out[req_idx, 0] = _compute_request_mrope_delta(
+            req_item_types,
+            req_item_lengths,
+            special_counts,
+            req_image_grid,
+            req_video_grid,
+            spatial_merge_size,
+        )
+        img_idx += num_images
+        vid_idx += num_videos
+    return out
+
+
+@qwen3_mrope_delta.register_fake
+def qwen3_mrope_delta_fake(
+    batch_info_host: torch.Tensor,
+    mm_item_cu_seqlen: torch.Tensor,
+    mm_item_types: torch.Tensor,
+    mm_token_lengths: torch.Tensor,
+    mm_special_offsets_cu_seqlen: torch.Tensor,
+    mm_special_offsets: torch.Tensor,
+    image_grid_thw: Optional[torch.Tensor],
+    video_grid_thw: Optional[torch.Tensor],
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    return torch.zeros((num_seq, 1), dtype=torch.int32, device=batch_info_host.device)
+
+
+@torch.library.custom_op(
+    "auto_deploy::qwen3_mrope_delta_with_cache", mutates_args=("mrope_delta_cache",)
+)
+def qwen3_mrope_delta_with_cache(
+    batch_info_host: torch.Tensor,
+    slot_idx: torch.Tensor,
+    mm_item_cu_seqlen: Optional[torch.Tensor],
+    mm_item_types: Optional[torch.Tensor],
+    mm_token_lengths: Optional[torch.Tensor],
+    mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
+    mm_special_offsets: Optional[torch.Tensor],
+    image_grid_thw: Optional[torch.Tensor],
+    video_grid_thw: Optional[torch.Tensor],
+    mrope_delta_cache: torch.Tensor,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    out = torch.zeros((num_seq, 1), dtype=torch.int32, device=mrope_delta_cache.device)
+    video_grid_norm = _normalize_video_grid_for_mrope(video_grid_thw)
+    if num_prefill > 0:
+        has_mm_metadata = all(
+            arg is not None
+            for arg in (
+                mm_item_cu_seqlen,
+                mm_item_types,
+                mm_token_lengths,
+                mm_special_offsets_cu_seqlen,
+                mm_special_offsets,
+            )
+        )
+        if has_mm_metadata:
+            img_idx = 0
+            vid_idx = 0
+            for req_idx in range(num_prefill):
+                item_start = int(mm_item_cu_seqlen[req_idx].item())
+                item_end = int(mm_item_cu_seqlen[req_idx + 1].item())
+                req_item_types = mm_item_types[item_start:item_end]
+                req_item_lengths = mm_token_lengths[item_start:item_end]
+                if req_item_lengths.numel() == 0:
+                    continue
+                num_images = int((req_item_types == 0).sum().item())
+                num_videos = int((req_item_types == 1).sum().item())
+                req_image_grid = (
+                    image_grid_thw[img_idx : img_idx + num_images] if num_images > 0 else None
+                )
+                req_video_grid = (
+                    video_grid_norm[vid_idx : vid_idx + num_videos] if num_videos > 0 else None
+                )
+                special_counts = _compute_mm_item_special_counts(
+                    req_item_lengths,
+                    mm_special_offsets_cu_seqlen,
+                    mm_special_offsets,
+                    req_idx,
+                )
+                out[req_idx, 0] = _compute_request_mrope_delta(
+                    req_item_types,
+                    req_item_lengths,
+                    special_counts,
+                    req_image_grid,
+                    req_video_grid,
+                    spatial_merge_size,
+                )
+                img_idx += num_images
+                vid_idx += num_videos
+        mrope_delta_cache.index_copy_(
+            0,
+            slot_idx[:num_prefill].to(torch.long),
+            out[:num_prefill].to(mrope_delta_cache.dtype),
+        )
+    if num_decode > 0:
+        out[num_prefill:num_seq] = mrope_delta_cache[
+            slot_idx[num_prefill:num_seq].to(torch.long)
+        ].to(torch.int32)
+    return out
+
+
+@qwen3_mrope_delta_with_cache.register_fake
+def qwen3_mrope_delta_with_cache_fake(
+    batch_info_host: torch.Tensor,
+    slot_idx: torch.Tensor,
+    mm_item_cu_seqlen: Optional[torch.Tensor],
+    mm_item_types: Optional[torch.Tensor],
+    mm_token_lengths: Optional[torch.Tensor],
+    mm_special_offsets_cu_seqlen: Optional[torch.Tensor],
+    mm_special_offsets: Optional[torch.Tensor],
+    image_grid_thw: Optional[torch.Tensor],
+    video_grid_thw: Optional[torch.Tensor],
+    mrope_delta_cache: torch.Tensor,
+    spatial_merge_size: int,
+) -> torch.Tensor:
+    num_prefill, _, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    return torch.zeros((num_seq, 1), dtype=torch.int32, device=slot_idx.device)
+
+
 class Qwen3_5MoeModel(nn.Module):
     """Multimodal wrapper: vision tower + embedding merge + mRoPE + language model.
 
@@ -1598,6 +1823,7 @@ class Qwen3_5MoeModel(nn.Module):
         vision_grid = image_grid_thw if has_images else video_grid_thw if has_videos else None
         if batch_info is None:
             batch_info = kwargs.get("batch_info_host")
+        batch_info_host = kwargs.get("batch_info_host", batch_info)
         cu_seqlen = kwargs.get("cu_seqlen")
         if cu_seqlen is None:
             cu_seqlen = kwargs.get("cu_seqlen_host")
@@ -1614,8 +1840,11 @@ class Qwen3_5MoeModel(nn.Module):
         mm_item_cu_seqlen = kwargs.get("mm_item_cu_seqlen")
         mm_token_positions = kwargs.get("mm_token_positions")
         mm_token_lengths = kwargs.get("mm_token_lengths")
+        mm_item_types = kwargs.get("mm_item_types")
         mm_special_offsets_cu_seqlen = kwargs.get("mm_special_offsets_cu_seqlen")
         mm_special_offsets = kwargs.get("mm_special_offsets")
+        slot_idx = kwargs.get("slot_idx")
+        mrope_delta_cache = kwargs.get("mrope_delta_cache")
         has_chunk_mm_layout = (
             mm_item_cu_seqlen is not None
             and mm_token_positions is not None
@@ -1625,6 +1854,20 @@ class Qwen3_5MoeModel(nn.Module):
             and mm_token_positions.numel() > 0
             and mm_token_lengths.numel() > 0
         )
+        if mrope_delta_cache is not None and batch_info_host is not None and slot_idx is not None:
+            delta = torch.ops.auto_deploy.qwen3_mrope_delta_with_cache(
+                batch_info_host,
+                slot_idx,
+                mm_item_cu_seqlen,
+                mm_item_types,
+                mm_token_lengths,
+                mm_special_offsets_cu_seqlen,
+                mm_special_offsets,
+                image_grid_thw,
+                video_grid_thw,
+                mrope_delta_cache,
+                self.config.vision_config.spatial_merge_size,
+            ).to(input_ids.dtype)
 
         if (
             vision_grid is not None
@@ -1673,7 +1916,22 @@ class Qwen3_5MoeModel(nn.Module):
         else:
             if position_ids is None:
                 raise ValueError("position_ids is required for text-only or decode-only forward")
-            position_ids_3d = (position_ids + delta)[None].expand(3, -1, -1)
+            if position_ids.ndim == 1:
+                token_delta = torch.zeros_like(position_ids)
+                if (
+                    delta is not None
+                    and cu_seqlen is not None
+                    and delta.ndim == 2
+                    and delta.shape[0] == cu_seqlen.numel() - 1
+                ):
+                    seq_lens = (cu_seqlen[1:] - cu_seqlen[:-1]).to(torch.long)
+                    token_delta = torch.repeat_interleave(
+                        delta.squeeze(-1).to(position_ids.device, position_ids.dtype),
+                        seq_lens.to(position_ids.device),
+                    )
+                position_ids_3d = (position_ids + token_delta).view(1, 1, -1).expand(3, 1, -1)
+            else:
+                position_ids_3d = (position_ids + delta)[None].expand(3, -1, -1)
 
         for key in (
             "input_pos",
@@ -1681,10 +1939,12 @@ class Qwen3_5MoeModel(nn.Module):
             "mm_chunk_flat_start",
             "mm_chunk_count",
             "mm_item_cu_seqlen",
+            "mm_item_types",
             "mm_token_positions",
             "mm_token_lengths",
             "mm_special_offsets_cu_seqlen",
             "mm_special_offsets",
+            "mrope_delta_cache",
         ):
             kwargs.pop(key, None)
 
@@ -2054,18 +2314,20 @@ class Qwen3_5MoeADInputProcessor:
         self,
         token_ids: List[int],
         inputs: Dict[str, Any],
-    ) -> Optional[Tuple[MultimodalInput, List[int]]]:
+    ) -> Optional[Tuple[MultimodalInput, List[int], List[int]]]:
         mm_data = inputs.get("multi_modal_data")
-        if not mm_data or "image" not in mm_data:
+        if not mm_data or not any(k in mm_data for k in ("image", "video")):
             return None
 
         image_token_id = int(self.processor.image_token_id)
+        video_token_id = int(self.processor.video_token_id)
         vision_start_token_id = int(self.processor.vision_start_token_id)
         ids = token_ids
 
         starts: List[int] = []
         lengths: List[int] = []
         special_offsets: List[int] = []
+        item_types: List[int] = []
         mm_union_offset = 0
         i = 0
         while i < len(ids):
@@ -2073,8 +2335,22 @@ class Qwen3_5MoeADInputProcessor:
                 i += 1
                 continue
 
+            if i + 1 >= len(ids):
+                i += 1
+                continue
+
+            if ids[i + 1] == image_token_id:
+                item_token_id = image_token_id
+                item_type = 0
+            elif ids[i + 1] == video_token_id:
+                item_token_id = video_token_id
+                item_type = 1
+            else:
+                i += 1
+                continue
+
             j = i + 1
-            while j < len(ids) and ids[j] == image_token_id:
+            while j < len(ids) and ids[j] == item_token_id:
                 j += 1
             if j == i + 1:
                 i += 1
@@ -2083,22 +2359,59 @@ class Qwen3_5MoeADInputProcessor:
             starts.append(i)
             lengths.append(j - i)
             special_offsets.append(mm_union_offset)
+            item_types.append(item_type)
             mm_union_offset += j - i
             i = j
 
-        images = mm_data["image"]
-        image_items = images if isinstance(images, list) else [images]
-        if len(starts) != len(image_items):
+        image_items = []
+        if "image" in mm_data:
+            images = mm_data["image"]
+            image_items = images if isinstance(images, list) else [images]
+        video_items = []
+        if "video" in mm_data:
+            videos = mm_data["video"]
+            video_items = videos if isinstance(videos, list) else [videos]
+
+        if len(starts) != len(image_items) + len(video_items):
             raise ValueError(
-                f"Expected {len(image_items)} image multimodal spans, found {len(starts)} in tokenized prompt"
+                "Mismatch between multimodal prompt spans and multimodal items: "
+                f"spans={len(starts)}, images={len(image_items)}, videos={len(video_items)}"
             )
 
         mm_uuids = inputs.get("multi_modal_uuids", None)
-        mm_hashes, mm_uuid_list = apply_mm_hashes({"image": image_items}, mm_uuids)
-        mm_hashes_flat = [hexdigest_to_int32(h) for h in mm_hashes["image"]]
+        mm_hash_inputs = {}
+        if image_items:
+            mm_hash_inputs["image"] = image_items
+        if video_items:
+            mm_hash_inputs["video"] = video_items
+        mm_hashes, _ = apply_mm_hashes(mm_hash_inputs, mm_uuids)
+
+        image_hashes = [hexdigest_to_int32(h) for h in mm_hashes.get("image", [])]
+        video_hashes = [hexdigest_to_int32(h) for h in mm_hashes.get("video", [])]
+        image_uuids = list((mm_uuids or {}).get("image", [None] * len(image_items)))
+        video_uuids = list((mm_uuids or {}).get("video", [None] * len(video_items)))
+        image_idx = 0
+        video_idx = 0
+        mm_hashes_flat: List[List[int]] = []
+        mm_uuid_list: List[Optional[str]] = []
+        for item_type in item_types:
+            if item_type == 0:
+                mm_hashes_flat.append(image_hashes[image_idx])
+                mm_uuid_list.append(image_uuids[image_idx])
+                image_idx += 1
+            else:
+                mm_hashes_flat.append(video_hashes[video_idx])
+                mm_uuid_list.append(video_uuids[video_idx])
+                video_idx += 1
         return (
-            MultimodalInput.from_components(mm_hashes_flat, starts, lengths, mm_uuid_list),
+            MultimodalInput.from_components(
+                mm_hashes_flat,
+                starts,
+                lengths,
+                mm_uuid_list if mm_uuids is not None else None,
+            ),
             special_offsets,
+            item_types,
         )
 
     def __call__(self, inputs, sampling_params):
@@ -2110,12 +2423,13 @@ class Qwen3_5MoeADInputProcessor:
         if built is None:
             return token_ids, extra_processed_inputs
 
-        multimodal_input, special_offsets = built
+        multimodal_input, special_offsets, item_types = built
         if extra_processed_inputs is None:
             extra_processed_inputs = {}
         extra_processed_inputs["multimodal_input"] = multimodal_input
         multimodal_data = extra_processed_inputs.get("multimodal_data", {})
         multimodal_data["special_token_offsets"] = torch.tensor(special_offsets, dtype=torch.int32)
+        multimodal_data["item_types"] = torch.tensor(item_types, dtype=torch.int32)
         extra_processed_inputs["multimodal_data"] = multimodal_data
         return token_ids, extra_processed_inputs
 

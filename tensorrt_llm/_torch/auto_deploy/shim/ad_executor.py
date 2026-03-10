@@ -625,7 +625,7 @@ class ADEngine(ModelEngine):
             # store extra arguments
             if request.py_multimodal_data is not None:
                 for k, v in request.py_multimodal_data.items():
-                    if k == "special_token_offsets":
+                    if k in {"special_token_offsets", "item_types"}:
                         continue
                     extra_args[k].append(v)
 
@@ -703,17 +703,17 @@ class ADEngine(ModelEngine):
         batch_info.extend([num_extend, num_extend_tokens])
         batch_info.extend([num_decode, num_decode_tokens])
 
-        # Chunked prefill + multimodal: stage per-request multimodal layout metadata plus the
-        # per-prefill slice (flat_start, count) into full image embeddings so the VLM wrapper can
-        # reconstruct chunk-local mRoPE and scatter only the chunk's mm tokens.
-        if self._enable_chunked_prefill and num_prefill_seqs > 0:
-            flat_start_list: List[int] = []
-            count_list: List[int] = []
+        # Stage per-request multimodal layout metadata so the VLM wrapper can reconstruct
+        # chunk-local mRoPE and compute request-level mRoPE deltas from full multimodal state.
+        if num_prefill_seqs > 0:
             mm_item_cu_seqlen: List[int] = [0]
+            mm_item_types_flat: List[int] = []
             mm_token_positions_flat: List[int] = []
             mm_token_lengths_flat: List[int] = []
             mm_special_offsets_cu_seqlen: List[int] = [0]
             mm_special_offsets_flat: List[int] = []
+            flat_start_list: List[int] = []
+            count_list: List[int] = []
             cumsum_total_mm = 0
             for i in range(num_prefill_seqs):
                 req = ordered_requests[i]
@@ -721,6 +721,9 @@ class ADEngine(ModelEngine):
                 end_compute = begin_compute + (cu_seqlen[i + 1] - cu_seqlen[i])
                 mm_pos = getattr(req, "multimodal_positions", None)
                 mm_len = getattr(req, "multimodal_lengths", None)
+                mm_item_types = (
+                    req.py_multimodal_data.get("item_types", []) if req.py_multimodal_data else []
+                )
                 special_offsets = (
                     req.py_multimodal_data.get("special_token_offsets", [])
                     if req.py_multimodal_data
@@ -729,6 +732,7 @@ class ADEngine(ModelEngine):
                 mm_pos_list = list(mm_pos) if mm_pos is not None else []
                 mm_len_list = list(mm_len) if mm_len is not None else []
                 mm_item_cu_seqlen.append(mm_item_cu_seqlen[-1] + len(mm_pos_list))
+                mm_item_types_flat.extend(list(mm_item_types))
                 mm_token_positions_flat.extend(mm_pos_list)
                 mm_token_lengths_flat.extend(mm_len_list)
                 mm_special_offsets_cu_seqlen.append(
@@ -756,14 +760,11 @@ class ADEngine(ModelEngine):
                 flat_start_list.append(flat_start_i)
                 count_list.append(num_in_chunk - num_special_in_chunk)
                 cumsum_total_mm += total_mm_i - total_special_i
-            extra_args["mm_chunk_flat_start"] = [
-                torch.tensor(flat_start_list, dtype=torch.int64, device="cpu")
-            ]
-            extra_args["mm_chunk_count"] = [
-                torch.tensor(count_list, dtype=torch.int64, device="cpu")
-            ]
             extra_args["mm_item_cu_seqlen"] = [
                 torch.tensor(mm_item_cu_seqlen, dtype=torch.int32, device="cpu")
+            ]
+            extra_args["mm_item_types"] = [
+                torch.tensor(mm_item_types_flat, dtype=torch.int32, device="cpu")
             ]
             extra_args["mm_token_positions"] = [
                 torch.tensor(mm_token_positions_flat, dtype=torch.int32, device="cpu")
@@ -777,6 +778,13 @@ class ADEngine(ModelEngine):
             extra_args["mm_special_offsets"] = [
                 torch.tensor(mm_special_offsets_flat, dtype=torch.int32, device="cpu")
             ]
+            if self._enable_chunked_prefill:
+                extra_args["mm_chunk_flat_start"] = [
+                    torch.tensor(flat_start_list, dtype=torch.int64, device="cpu")
+                ]
+                extra_args["mm_chunk_count"] = [
+                    torch.tensor(count_list, dtype=torch.int64, device="cpu")
+                ]
 
         # update the sequence info object now (also triggers rescatter + host_prepare internally)
         self.cache_seq_interface.info.nest_sequences(

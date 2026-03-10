@@ -57,6 +57,8 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_qwen3_5_moe import (
     apply_rotary_pos_emb,
     apply_rotary_pos_emb_vision,
     compute_mrope_positions,
+    qwen3_mrope_delta,
+    qwen3_mrope_delta_with_cache,
 )
 
 
@@ -1513,6 +1515,129 @@ def test_compute_mrope_positions_matches_model_method():
 
     torch.testing.assert_close(pos_fn, pos_model)
     torch.testing.assert_close(deltas_fn, deltas_model)
+
+
+@torch.no_grad()
+def test_qwen3_mrope_delta_matches_compute_mrope_positions_for_mixed_items():
+    """The request-level mRoPE delta op should match the full reference delta."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+    video_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+
+    num_image_tokens = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+    num_video_tokens = int(
+        video_grid_thw[0, 0].item()
+        * (video_grid_thw[0, 1].item() // merge)
+        * (video_grid_thw[0, 2].item() // merge)
+    )
+
+    input_ids = torch.tensor(
+        [
+            [
+                1,
+                2,
+                config.vision_start_token_id,
+                *([config.image_token_id] * num_image_tokens),
+                3,
+                config.vision_start_token_id,
+                *([config.video_token_id] * num_video_tokens),
+                4,
+                5,
+            ]
+        ],
+        dtype=torch.long,
+    )
+
+    _, expected_delta = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw.to(torch.long),
+        video_grid_thw=video_grid_thw.to(torch.long),
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    actual_delta = qwen3_mrope_delta(
+        batch_info_host=torch.tensor([1, 0, 0], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_item_types=torch.tensor([0, 1], dtype=torch.int32),
+        mm_token_lengths=torch.tensor(
+            [1 + num_image_tokens, 1 + num_video_tokens], dtype=torch.int32
+        ),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 2], dtype=torch.int32),
+        mm_special_offsets=torch.tensor(
+            [0, 1 + num_image_tokens],
+            dtype=torch.int32,
+        ),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=video_grid_thw,
+        spatial_merge_size=merge,
+    )
+
+    torch.testing.assert_close(actual_delta, expected_delta.to(torch.int32))
+
+
+@torch.no_grad()
+def test_qwen3_mrope_delta_with_cache_writes_prefill_and_reads_decode():
+    """Prefill should write the per-slot delta and decode should read it back."""
+    config = _make_small_composite_config()
+    merge = config.vision_config.spatial_merge_size
+
+    image_grid_thw = torch.tensor([[1, 4, 4]], dtype=torch.int32)
+    num_image_tokens = int(
+        image_grid_thw[0, 0].item()
+        * (image_grid_thw[0, 1].item() // merge)
+        * (image_grid_thw[0, 2].item() // merge)
+    )
+
+    input_ids = torch.tensor(
+        [
+            [
+                10,
+                config.vision_start_token_id,
+                *([config.image_token_id] * num_image_tokens),
+                11,
+            ]
+        ],
+        dtype=torch.long,
+    )
+    _, expected_delta = compute_mrope_positions(
+        input_ids=input_ids,
+        image_grid_thw=image_grid_thw.to(torch.long),
+        video_grid_thw=None,
+        image_token_id=config.image_token_id,
+        video_token_id=config.video_token_id,
+        vision_start_token_id=config.vision_start_token_id,
+        spatial_merge_size=merge,
+    )
+
+    cache = torch.zeros((8, 1), dtype=torch.int32)
+    slot = 3
+    deltas = qwen3_mrope_delta_with_cache(
+        batch_info_host=torch.tensor([1, 0, 1], dtype=torch.int32),
+        slot_idx=torch.tensor([slot, slot], dtype=torch.int32),
+        mm_item_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
+        mm_item_types=torch.tensor([0], dtype=torch.int32),
+        mm_token_lengths=torch.tensor([1 + num_image_tokens], dtype=torch.int32),
+        mm_special_offsets_cu_seqlen=torch.tensor([0, 1], dtype=torch.int32),
+        mm_special_offsets=torch.tensor([0], dtype=torch.int32),
+        image_grid_thw=image_grid_thw,
+        video_grid_thw=None,
+        mrope_delta_cache=cache,
+        spatial_merge_size=merge,
+    )
+
+    expected_delta_i32 = expected_delta.to(torch.int32)
+    torch.testing.assert_close(deltas[0:1], expected_delta_i32)
+    torch.testing.assert_close(deltas[1:2], expected_delta_i32)
+    torch.testing.assert_close(cache[slot : slot + 1], expected_delta_i32)
 
 
 # =============================================================================
