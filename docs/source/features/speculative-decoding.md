@@ -48,6 +48,8 @@ speculative_config = Eagle3DecodingConfig(
 llm = LLM(model, speculative_config=speculative_config)
 ```
 
+EAGLE 3 can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
+
 ### NGram
 
 The NGram method is an implementation of [this Prompt Lookup Decoding algorithm](https://github.com/apoorvumang/prompt-lookup-decoding).
@@ -88,6 +90,29 @@ speculative_config = MTPDecodingConfig(
 llm = LLM("/path/to/deepseek_model", speculative_config=speculative_config)
 ```
 
+MTP can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
+
+### PARD
+
+PARD (PARallel Draft) is a target-independent speculative decoding method that predicts all draft tokens in a single forward pass using mask tokens. Unlike MTP or EAGLE 3 which generate drafts one token at a time, PARD produces K draft tokens in parallel.
+
+Reference: [PARD: Parallel Drafting for Speculative Decoding](https://arxiv.org/pdf/2504.18583)
+
+* `max_draft_len`: Maximum draft candidate length.
+* `speculative_model`: Path or HuggingFace model ID for the PARD draft model.
+* `mask_token_id`: Token ID used as the mask token for parallel prediction. If not set, it is read from the draft model config.
+
+```python
+from tensorrt_llm.llmapi import PARDDecodingConfig
+
+speculative_config = PARDDecodingConfig(
+    max_draft_len=4, speculative_model="/path/to/pard_model")
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
+PARD can be combined with the [Suffix Automaton enhancement](#suffix-automaton-sa-enhancement) for improved acceptance rates on repetitive content. See the SA section below for details.
+
 ### User-provided drafting
 A completely user-defined drafting method can be supplied with a `UserProvidedDecodingConfig` that includes
 * `max_draft_len`: Maximum draft candidate length.
@@ -99,6 +124,40 @@ from tensorrt_llm.llmapi import UserProvidedDecodingConfig
 
 speculative_config = UserProvidedDecodingConfig(
     max_draft_len=3, drafter=MyDrafter())
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
+## Suffix Automaton (SA) Enhancement
+
+The Suffix Automaton (SA) is a model-free, GPU-based pattern-matching draft enhancer. It finds suffix matches in previously generated tokens and proposes draft tokens when the match is long enough. SA is very accurate when it matches (exact pattern repetition), while neural methods are better for novel content — combining them gives the best of both worlds.
+
+SA can be combined with the following speculative decoding techniques:
+
+* **MTP** (`MTPDecodingConfig`)
+* **EAGLE 3** (`Eagle3DecodingConfig`)
+* **PARD** (`PARDDecodingConfig`)
+
+To enable SA combination, set `use_sa_spec=True` on the speculative config. The `sa_spec_threshold` parameter controls the minimum suffix match length required to override the neural draft (default: 4).
+
+```python
+from tensorrt_llm.llmapi import Eagle3DecodingConfig
+
+speculative_config = Eagle3DecodingConfig(
+    max_draft_len=4,
+    speculative_model="/path/to/eagle3_model",
+    use_sa_spec=True,
+    sa_spec_threshold=4)
+
+llm = LLM("/path/to/target_model", speculative_config=speculative_config)
+```
+
+SA can also be used as a standalone speculative decoding technique via `SADecodingConfig`:
+
+```python
+from tensorrt_llm.llmapi import SADecodingConfig
+
+speculative_config = SADecodingConfig(max_draft_len=4)
 
 llm = LLM("/path/to/target_model", speculative_config=speculative_config)
 ```
@@ -117,6 +176,8 @@ Speculative decoding options must be specified via `--config config.yaml` for bo
 * `Eagle3`
 * `NGram`
 * `DraftTarget`
+* `PARD`
+* `SA`
 
 > Note: The PyTorch backend supports only `Eagle3`. `decoding_type: Eagle` is accepted as a backward-compatible alias for `Eagle3`, but EAGLE (v1/v2) draft checkpoints are incompatible.
 
@@ -136,6 +197,16 @@ speculative_config:
   decoding_type: Eagle3
   max_draft_len: 4
   speculative_model: /path/to/draft/model
+```
+
+```yaml
+# SA combination: enable Suffix Automaton enhancement with any supported technique
+speculative_config:
+  decoding_type: Eagle3
+  max_draft_len: 4
+  speculative_model: /path/to/draft/model
+  use_sa_spec: true
+  sa_spec_threshold: 4
 ```
 
 ```{note}
