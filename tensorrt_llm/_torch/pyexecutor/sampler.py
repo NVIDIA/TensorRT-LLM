@@ -24,7 +24,6 @@ from typing import Any, Callable, Dict, Generic, List, Optional, Type, TypeAlias
 
 import numpy as np
 import torch
-import torch.nn.functional as F
 
 from tensorrt_llm._torch.pyexecutor.make_decoding_batch_input_output import (
     MakeDecodingBatchInputOutput,
@@ -78,6 +77,7 @@ from .sampling_utils import (
     Strategy,
     StrategyMetadata,
     UtilsSamplingParams,
+    _Fusions,
     get_rejected_indices,
     resolve_sampling_strategy,
     sample,
@@ -416,8 +416,8 @@ def _request_sampling_params_cachable(params: UtilsSamplingParams) -> bool:
 def _request_strategy(request: LlmRequest, *, vocab_size: int) -> Strategy:
     # We try to cache the resolved strategy on the request object, as it's not cheap enough to
     # resolve it on every iteration.
-    if hasattr(request, "py_sampling_strategy"):
-        return request.py_sampling_strategy
+    if (cached_sampling_strategy := getattr(request, "py_sampling_strategy", None)) is not None:
+        return cast(Strategy, cached_sampling_strategy)
 
     params = _request_get_sampling_params(request)
     sampling_strategy = resolve_sampling_strategy(params, vocab_size=vocab_size)
@@ -2189,7 +2189,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         """
         Check if we can use the fast argmax path for greedy sampling.
         """
-
         # Check if all requests use greedy sampling and don't require features
         # that the fast path skips
         for req in requests:
@@ -2379,28 +2378,45 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         sampled_log_probs_vals_list = logprobs_state_list.sampled_vals[req_seq_slot]
         sampled_log_probs_rank_list = logprobs_state_list.sampled_rank[req_seq_slot]
 
-        token_log_probs: list[list[dict[int, Logprob]]] = []
-        for beam_idx in range(beam_width):
-            beam_token_log_probs: list[dict[int, Logprob]] = []
-            for step_idx, (topk_token, topk_logprob) in enumerate(
-                zip(token_list[:count], logprobs_list[:count])
-            ):
-                logprobs = {
-                    token: Logprob(logprob=logprob, rank=rank + 1)
-                    for rank, (token, logprob) in enumerate(
-                        zip(topk_token[:num_topk_logprobs], topk_logprob[:num_topk_logprobs])
-                    )
-                }
-                if sampled_log_probs_indices_list[beam_idx][step_idx] not in logprobs:
-                    logprobs[sampled_log_probs_indices_list[beam_idx][step_idx]] = Logprob(
-                        logprob=sampled_log_probs_vals_list[beam_idx][step_idx],
-                        rank=max(
-                            len(token_list[step_idx]) + 1,
+        token_log_probs: list[list[dict[int, Logprob]]]
+        if num_topk_logprobs == 0:
+            token_log_probs = [
+                [
+                    {
+                        sampled_log_probs_indices_list[beam_idx][step_idx]: Logprob(
+                            sampled_log_probs_vals_list[beam_idx][step_idx],
                             sampled_log_probs_rank_list[beam_idx][step_idx] + 1,
+                        )
+                    }
+                    for step_idx in range(count)
+                ]
+                for beam_idx in range(beam_width)
+            ]
+        else:
+            token_log_probs = [[] for _ in range(beam_width)]
+            for step_idx in range(count):
+                topk_tokens = token_list[step_idx][:num_topk_logprobs]
+                topk_logprobs = logprobs_list[step_idx][:num_topk_logprobs]
+                min_rank = len(topk_tokens) + 1
+
+                topk_logprob_dict = {
+                    token: Logprob(logprob=logprob, rank=rank + 1)
+                    for rank, (token, logprob) in enumerate(zip(topk_tokens, topk_logprobs))
+                }
+
+                for beam_idx in range(beam_width):
+                    # NB: Keeps sampled token in the first position (cf. https://stackoverflow.com/a/67786863)
+                    logprobs = {
+                        sampled_log_probs_indices_list[beam_idx][step_idx]: Logprob(
+                            logprob=sampled_log_probs_vals_list[beam_idx][step_idx],
+                            rank=max(
+                                min_rank,
+                                sampled_log_probs_rank_list[beam_idx][step_idx] + 1,
+                            ),
                         ),
-                    )
-                beam_token_log_probs.append(logprobs)
-            token_log_probs.append(beam_token_log_probs)
+                        **topk_logprob_dict,
+                    }
+                    token_log_probs[beam_idx].append(logprobs)
 
         return token_log_probs
 
@@ -2821,7 +2837,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 request,
                 vocab_size=2**31,  # vocab_size does not affect greediness
             )
-        return get_draft_token_length(request) > 0 and strategy != GREEDY
+        return strategy != GREEDY and get_draft_token_length(request) > 0
 
     def process_draft_tokens(
         self,
@@ -3269,9 +3285,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                     finish_reasons=finish_reasons,
                     resource_manager=resource_manager,
                 )
-                if get_draft_token_length(req) > 0:
+                if (actual_draft_len := get_draft_token_length(req)) > 0:
                     req.py_num_accepted_draft_tokens = num_accepted
-                    actual_draft_len = get_draft_token_length(req)
                     req.py_rewind_len = actual_draft_len - num_accepted
                 else:
                     req.py_num_accepted_draft_tokens = 0
@@ -3717,11 +3732,15 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert logit_indices_for_processed_logprobs_cuda is not None
                 assert group_softmax_cuda is not None
                 assert batch_logits_for_logprobs_cuda is not None
+                # NB: The logits copy could be avoided by instead counting (and storing):
+                #        -  the number of unmasked tokens 'nu'
+                #        -  r := log(max(probs)) - max(logits)
+                #   Later, processed logprobs can be reconstructed from raw logits _after_ applying
+                #   top-k: Add 'r' and mask smallest entries so that only min(k, nu) tokens remain.
                 current_logits_cuda = group_logits_cuda[
                     group_logits_indices_for_processed_logprobs_cuda
                 ]
                 current_softmax_cuda = group_softmax_cuda[logit_indices_for_processed_logprobs_cuda]
-
                 # processed_logits_cuda is an alias to current_logits_cuda after this operation
                 processed_logits_cuda = current_logits_cuda.masked_fill_(
                     current_softmax_cuda == 0, float("-inf")
@@ -3742,10 +3761,21 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert group_logits_indices_for_raw_logprobs_cuda is not None
                 assert logit_indices_for_raw_logprobs_cuda is not None
                 assert batch_logits_for_logprobs_cuda is not None
-                raw_logits_cuda = group_logits_cuda[group_logits_indices_for_raw_logprobs_cuda]
+                if (
+                    group_logits_indices_for_raw_logprobs_cuda
+                    is logit_indices_for_raw_logprobs_cuda
+                ):
+                    group_logits_indices_for_raw_logprobs_cuda = (
+                        group_logits_indices_for_raw_logprobs_cuda.clone()
+                    )
                 logit_indices_for_raw_logprobs_cuda += batch_next_tokens_offset_start
-                batch_logits_for_logprobs_cuda[logit_indices_for_raw_logprobs_cuda] = (
-                    raw_logits_cuda
+                # NB: Copy could be avoided by storing logit indices (and temperature) instead (cf. comment on
+                #     processed logprobs above).
+                _Fusions.gather_scatter(
+                    batch_logits_for_logprobs_cuda,
+                    logit_indices_for_raw_logprobs_cuda,
+                    group_logits_cuda,
+                    group_logits_indices_for_raw_logprobs_cuda,
                 )
 
             # Set LlmRequest.py_target_probs
@@ -4061,9 +4091,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             # (batch_size, vocab_size)
-            group_logprobs_cuda = F.log_softmax(
-                batched_sampling_result.batch_logits_for_logprobs_cuda[group_logits_indices_cuda],
-                dim=-1,
+            group_logprobs_cuda = _Fusions.gather_log_softmax(
+                batched_sampling_result.batch_logits_for_logprobs_cuda, group_logits_indices_cuda
             )
 
             # Process the topk logprobs
@@ -4102,10 +4131,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Get the sampled logprobs indices
             sampled_indices_cuda = group_next_tokens_cuda.squeeze(1)
 
-            # NB: group_logprobs_cuda is not needed anymore and the storage can be safely reused.
             # sampled_rank_cuda contains the 0-based rank, it will be corrected to 1-based in handle_logprobs
-            group_logprobs_cuda.greater_(sampled_vals_cuda)
-            sampled_rank_cuda = group_logprobs_cuda.sum(dim=-1).to(torch.int32)
+            # NB: Computation of sampled rank could be lowered into GroupedStrategySampler, s.t., e.g., for
+            #     greedy sampling, logits management and log_softmax could be completely skipped (sampled rank
+            #     computation is trivial in this case).
+            sampled_rank_cuda = _Fusions.determine_sampled_rank(
+                group_logprobs_cuda, sampled_vals_cuda
+            )
 
             sampled_vals_cuda = sampled_vals_cuda.squeeze(1)
 

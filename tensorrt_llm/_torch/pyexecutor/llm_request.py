@@ -234,6 +234,8 @@ class LogProbStorage:
             if cum_log_probs is not None:
                 self.cum_log_probs[beam_idx] = cum_log_probs[beam_idx]
             else:
+                # FIXME: This relies on the ordering of LogProb's in the dictionary. TorchSampler ensures
+                #        that the sampled logprob is in the first position.
                 self.cum_log_probs[beam_idx] += sum(
                     next(iter(prob.values())).logprob for prob in probs)
 
