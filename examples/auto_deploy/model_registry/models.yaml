@@ -329,7 +329,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 # --- MiniMax M2 (2025) ---
 - name: MiniMaxAI/MiniMax-M2
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- Tencent Hunyuan small (2025) ---
 - name: tencent/Hunyuan-1.8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
