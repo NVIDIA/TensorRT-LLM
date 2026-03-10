@@ -1,43 +1,27 @@
-# Architecture Classes and Constants
+# Model-to-Source Mapping
 
-## How to Classify a Model
+Use exact checked-in configs and model-specific docs. Preserve explicit latency / balanced / throughput intent when current repo sources label it. Do **not** infer architecture classes from model names alone.
 
-| Check | Class |
-|---|---|
-| Has MoE experts AND Multi-head Latent Attention (MLA) | **MoE_MLA** |
-| Has MoE experts AND Grouped Query Attention (GQA) | **MoE_GQA** |
-| No MoE experts, uses GQA or MHA | **Dense_GQA** |
+## Current Source Anchors
 
-## Known Model Mappings
-
-| Model | Class |
-|---|---|
-| DeepSeek-R1 / DeepSeek-V3 / DeepSeek-V3.2-Exp | MoE_MLA |
-| Kimi-K2 | MoE_MLA |
-| Qwen3-235B-A22B | MoE_GQA |
-| Llama-3.3-70B / Llama-4-Scout | Dense_GQA |
-| GPT-OSS-120B | Dense_GQA |
-| Nemotron-3-Super-120B | Dense_GQA |
-
-## Pattern-Based Detection (Unknown Models)
-
-- `deepseek` or `kimi` in name → likely MoE_MLA
-- `qwen` + large param count suggesting MoE (e.g., 235B-A22B) → MoE_GQA
-- `llama`, `nemotron`, `falcon`, `gpt` → likely Dense_GQA
-- `moe` or `mixture` in name → MoE (check model config for MLA vs GQA attention)
-- If uncertain, default to **MoE_MLA** (most conservative — lowest KV memory overhead)
-
-## Constants (Set and Forget)
-
-Identical across all basic aggregate (IFB, PyTorch, non-speculative) benchmark-optimal configs:
-
-| Parameter | Value | Notes |
+| Model family | Primary sources to consult | Notes |
 |---|---|---|
-| `backend` | `pytorch` | PyTorch executor |
-| `cuda_graph_config.enable_padding` | `true` | Always on for throughput |
-| `kv_cache_config.dtype` | `fp8` | FP8 KV cache |
-| `trust_remote_code` | `true` | Required for most HF models |
-| `stream_interval` | `10` | Token streaming interval |
-| `moe_expert_parallel_size` | = `tensor_parallel_size` | EP = TP for MoE models |
-| `cuda_graph_config.max_batch_size` | = target concurrency (cap 512 MoE, 1024 Dense) | Matches concurrency; over-provisioning wastes graph memory |
-| `max_seq_len` | >= ISL + OSL + 68 | Total token budget; +68 empirical margin |
+| DeepSeek-R1 | `examples/configs/database/`, `examples/configs/curated/deepseek-*.yaml`, `docs/source/deployment-guide/deployment-guide-for-deepseek-r1-on-trtllm.md` | Current checked-in configs include model-specific MoE / ADP choices. Filter out speculative configs when staying in this skill's scope. |
+| DeepSeek-V3 / DeepSeek-V3.2-Exp | `examples/models/core/deepseek_v3/README.md` plus nearby checked-in DeepSeek configs | Prefer the shared DeepSeek-V3 README for V3-family behavior instead of routing through the R1 deployment guide alone. |
+| GPT-OSS-120B | `examples/configs/database/openai/gpt-oss-120b/`, `examples/configs/curated/gpt-oss-120b-*.yaml`, `docs/source/deployment-guide/deployment-guide-for-gpt-oss-on-trtllm.md` | Current repo configs/docs use MoE-related fields such as `moe_config` and `moe_expert_parallel_size`. |
+| Qwen3 | `examples/configs/curated/qwen3.yaml`, `docs/source/deployment-guide/deployment-guide-for-qwen3-on-trtllm.md`, model docs under `examples/models/core/qwen/` | Read the exact model's checked-in config/docs before tuning. |
+| Qwen3-Next | `examples/configs/curated/qwen3-next.yaml`, `docs/source/deployment-guide/deployment-guide-for-qwen3-next-on-trtllm.md`, model docs under `examples/models/core/qwen/` | Prefer the exact-model guide over the broader Qwen3 guide. |
+| Llama-4 Scout | `examples/configs/curated/llama-4-scout.yaml`, `docs/source/deployment-guide/deployment-guide-for-llama4-scout-on-trtllm.md` | Current checked-in docs/configs discuss MoE / EP tuning; do not treat it as a dense-only template. |
+| Llama-3.3-70B | `examples/configs/curated/llama-3.3-70b.yaml`, its deployment guide | Use current checked-in config/docs rather than family-level extrapolation. |
+| Kimi-K2 | `examples/configs/curated/kimi-k2-thinking.yaml`, `docs/source/deployment-guide/deployment-guide-for-kimi-k2-thinking-on-trtllm.md`, `examples/configs/curated/lookup.yaml` | Treat the current Kimi config as an exact-model `cache_transceiver_config` exception, not as a generic basic-agg template. The curated lookup maps Kimi-K2 to `DeepseekV3ForCausalLM`, so nearby DeepSeek-V3 / R1 configs are only secondary comparators for unverified interpolation. |
+
+## Conservative Rules
+
+- Prefer an exact scenario match over any family heuristic.
+- Preserve the user's explicit performance objective (`Min Latency`, `Balanced`, `Max Throughput`, or guide-labeled low-latency / max-throughput variants) when choosing between nearby configs.
+- If no exact match exists, choose the nearest checked-in config from the same model family and mark any interpolation as unverified.
+- If a same-model config is unlabeled for objective, treat it as a default starting point rather than claiming it satisfies a latency / throughput target.
+- If the nearest config contains out-of-scope sections such as `speculative_config`, skip it for this skill.
+- Treat `cache_transceiver_config` as requiring exact-model verification. It often appears in disaggregated setups, but an exact-model guide may still point to a config that contains it; do not exclude that config solely for that reason, and call out the exception explicitly instead of assuming it is a clean basic-agg default.
+- If a model has no deployment guide or nearby checked-in config, stop and label the output unverified instead of inventing an architecture class.
+- When docs and configs disagree, prefer the checked-in config for the exact scenario you are following and note the mismatch.
