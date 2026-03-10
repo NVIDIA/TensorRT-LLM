@@ -586,14 +586,14 @@ files = [
 
 [[package]]
 name = "filelock"
-version = "3.25.0"
+version = "3.25.1"
 description = "A platform independent file lock."
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "filelock-3.25.0-py3-none-any.whl", hash = "sha256:5ccf8069f7948f494968fc0713c10e5c182a9c9d9eef3a636307a20c2490f047"},
-    {file = "filelock-3.25.0.tar.gz", hash = "sha256:8f00faf3abf9dc730a1ffe9c354ae5c04e079ab7d3a683b7c32da5dd05f26af3"},
+    {file = "filelock-3.25.1-py3-none-any.whl", hash = "sha256:18972df45473c4aa2c7921b609ee9ca4925910cc3a0fb226c96b92fc224ef7bf"},
+    {file = "filelock-3.25.1.tar.gz", hash = "sha256:b9a2e977f794ef94d77cdf7d27129ac648a61f585bff3ca24630c1629f701aa9"},
 ]
 
 [[package]]
@@ -1729,14 +1729,14 @@ typing-extensions = ">=4.14.1"
 
 [[package]]
 name = "python-discovery"
-version = "1.1.1"
+version = "1.1.2"
 description = "Python interpreter discovery"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "python_discovery-1.1.1-py3-none-any.whl", hash = "sha256:69f11073fa2392251e405d4e847d60ffffd25fd762a0dc4d1a7d6b9c3f79f1a3"},
-    {file = "python_discovery-1.1.1.tar.gz", hash = "sha256:584c08b141c5b7029f206b4e8b78b1a1764b22121e21519b89dec56936e95b0a"},
+    {file = "python_discovery-1.1.2-py3-none-any.whl", hash = "sha256:d18edd61b382d62f8bcd004a71ebaabc87df31dbefb30aeed59f4fc6afa005be"},
+    {file = "python_discovery-1.1.2.tar.gz", hash = "sha256:c500bd2153e3afc5f48a61d33ff570b6f3e710d36ceaaf882fa9bbe5cc2cec49"},
 ]
 
 [package.dependencies]
@@ -2164,14 +2164,14 @@ zstd = ["backports-zstd (>=1.0.0) ; python_version < \"3.14\""]
 
 [[package]]
 name = "virtualenv"
-version = "21.1.0"
+version = "21.2.0"
 description = "Virtual Python Environment builder"
 optional = false
 python-versions = ">=3.8"
 groups = ["main"]
 files = [
-    {file = "virtualenv-21.1.0-py3-none-any.whl", hash = "sha256:164f5e14c5587d170cf98e60378eb91ea35bf037be313811905d3a24ea33cc07"},
-    {file = "virtualenv-21.1.0.tar.gz", hash = "sha256:1990a0188c8f16b6b9cf65c9183049007375b26aad415514d377ccacf1e4fb44"},
+    {file = "virtualenv-21.2.0-py3-none-any.whl", hash = "sha256:1bd755b504931164a5a496d217c014d098426cddc79363ad66ac78125f9d908f"},
+    {file = "virtualenv-21.2.0.tar.gz", hash = "sha256:1720dc3a62ef5b443092e3f499228599045d7fea4c79199770499df8becf9098"},
 ]
 
 [package.dependencies]
