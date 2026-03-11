@@ -129,6 +129,13 @@ void LRUEvictionPolicy::releaseBlock(BlockPtr block)
 
 void LRUEvictionPolicy::releaseBlock(BlockPtr block, bool toFront)
 {
+    // The dummy root block (kCachedBlocksRootId) is permanently attached to the lookup tree
+    // via setAsRoot() and must never enter the eviction queue — it is not a real cache block.
+    TLLM_CHECK_WITH_INFO(
+        block->getBlockId() != tensorrt_llm::batch_manager::kv_cache_manager::KVCacheBlock::kCachedBlocksRootId,
+        "Attempted to release the cached-blocks root into the eviction queue");
+    // Placeholder blocks have no physical GPU memory and must never enter the eviction queue.
+    TLLM_CHECK_WITH_INFO(!block->isPlaceholder(), "Attempted to release a placeholder block into the eviction queue");
     SizeType32 const cacheLevel = getCacheLevel(block);
     SizeType32 const id = block->getBlockId();
 

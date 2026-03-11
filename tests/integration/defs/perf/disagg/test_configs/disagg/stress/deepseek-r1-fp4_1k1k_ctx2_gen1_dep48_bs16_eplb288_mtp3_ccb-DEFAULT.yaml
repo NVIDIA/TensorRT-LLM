@@ -24,7 +24,7 @@ slurm:
   extra_args: "--gres=gpu:4"
   numa_bind: true
 benchmark:
-  mode: gen_only
+  mode: e2e
   use_nv_sa_benchmark: false
   multi_round: 20
   benchmark_ratio: 0.8
@@ -99,6 +99,7 @@ worker_config:
       max_tokens_in_buffer: 8320
       backend: DEFAULT
     stream_interval: 20
+    num_postprocess_workers: 4
   ctx:
     enable_layerwise_nvtx_marker: true
     max_batch_size: 4

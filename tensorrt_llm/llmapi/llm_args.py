@@ -275,6 +275,12 @@ class DeepSeekSparseAttentionConfig(BaseSparseAttentionConfig):
         default=True,
         description=
         "Whether to skip the MQA and Top-K in the indexer for short sequences.")
+    q_split_threshold: int = Field(
+        default=8192,
+        description=
+        "If number of packed tokens in prefill chunk exceeds this threshold, \
+            q tokens will be evenly distributed across ranks for indexer computation. \
+            If negative, q split will always be disabled.")
     indexer_rope_interleave: bool = Field(
         default=False,
         description="Whether to use interleaved RoPE layout for the indexer.")
@@ -1028,6 +1034,17 @@ class EagleDecodingConfig(DecodingBaseConfig):
 class Eagle3DecodingConfig(EagleDecodingConfig):
     decoding_type: Literal["Eagle3"] = "Eagle3"
 
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
+
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
     decoding_type: Literal["SaveState"] = "SaveState"
@@ -1254,7 +1271,7 @@ class MTPDecodingConfig(DecodingBaseConfig):
         default=False,
         status="beta",
         description="Combine with Suffix Automaton Decoding")
-    sa_spec_threshold: int = Field(
+    sa_spec_threshold: PositiveInt = Field(
         default=4,
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
@@ -1337,6 +1354,17 @@ class PARDDecodingConfig(DecodingBaseConfig):
     )
 
     decoding_type: Literal["PARD"] = "PARD"
+
+    # Suffix Automaton speculative decoding settings
+    use_sa_spec: Optional[bool] = Field(
+        default=False,
+        status="beta",
+        description="Combine with Suffix Automaton Decoding")
+    sa_spec_threshold: PositiveInt = Field(
+        default=4,
+        description="The threshold for the Suffix Automaton Decoding. If the"
+        " length of the suffix match exceeds the threshold, use"
+        " the suffix automaton output for the next draft tokens.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):
@@ -1683,6 +1711,10 @@ class SchedulerConfig(StrictBaseModel, PybindMirror):
     waiting_queue_policy: WaitingQueuePolicy = Field(
         default=WaitingQueuePolicy.FCFS,
         description="The waiting queue scheduling policy")
+
+    use_python_scheduler: bool = Field(
+        default=False,
+        description="Use pure-Python scheduler instead of C++ scheduler.")
 
     def _to_pybind(self):
         return _SchedulerConfig(

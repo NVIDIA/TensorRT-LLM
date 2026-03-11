@@ -196,7 +196,8 @@ def visual_gen_command(
     """Benchmark VisualGen (image/video generation) models offline."""
     import yaml
 
-    from tensorrt_llm.commands.utils import get_visual_gen_model_type, get_visual_gen_num_gpus
+    from tensorrt_llm._torch.visual_gen.config import VisualGenArgs
+    from tensorrt_llm.commands.utils import get_visual_gen_num_gpus
     from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
 
     if prompt is None and prompt_file is None:
@@ -207,18 +208,16 @@ def visual_gen_command(
     model = bench_env.model
     model_path = str(bench_env.checkpoint_path or model)
 
-    # Build diffusion config (same pattern as trtllm-serve _serve_visual_gen)
-    visual_gen_config: dict = {
-        "model": model_path,
-        "model_type": get_visual_gen_model_type(model_path),
-    }
+    # Build VisualGenArgs (same pattern as trtllm-serve _serve_visual_gen)
+    extra_args: dict = {}
     if extra_visual_gen_options is not None:
         with open(extra_visual_gen_options, "r") as f:
-            visual_gen_extra_args = yaml.safe_load(f) or {}
-        visual_gen_config.update(visual_gen_extra_args)
+            extra_args = yaml.safe_load(f) or {}
 
-    n_workers = get_visual_gen_num_gpus(visual_gen_config)
-    parallel_config = visual_gen_config.get("parallel", {})
+    diffusion_args = VisualGenArgs(**extra_args) if extra_args else None
+
+    n_workers = get_visual_gen_num_gpus(extra_args)
+    parallel_config = extra_args.get("parallel", {})
     if parallel_config:
         logger.info(f"World size: {n_workers}")
         logger.info(f"CFG size: {parallel_config.get('dit_cfg_size', 1)}")
@@ -265,8 +264,7 @@ def visual_gen_command(
     logger.info(f"Initializing VisualGen ({model_path})")
     visual_gen = VisualGen(
         model_path=model_path,
-        n_workers=n_workers,
-        diffusion_config=visual_gen_config,
+        diffusion_args=diffusion_args,
     )
 
     try:

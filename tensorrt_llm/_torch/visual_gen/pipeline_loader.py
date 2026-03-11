@@ -15,6 +15,7 @@ Dynamic Quantization:
 """
 
 import os
+import time
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -26,7 +27,7 @@ from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 
 from .checkpoints import WeightLoader
-from .config import DiffusionArgs, DiffusionModelConfig, PipelineComponent
+from .config import DiffusionModelConfig, PipelineComponent, VisualGenArgs
 from .models import AutoPipeline
 
 if TYPE_CHECKING:
@@ -42,7 +43,7 @@ class PipelineLoader:
     on-the-fly during loading.
 
     Example:
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path="/path/to/model",
             linear=LinearConfig(type="trtllm-fp8-blockwise"),
             parallel=ParallelConfig(dit_tp_size=2),
@@ -52,7 +53,7 @@ class PipelineLoader:
 
     def __init__(
         self,
-        args: Optional[DiffusionArgs] = None,
+        args: Optional[VisualGenArgs] = None,
         *,
         mapping: Optional[Mapping] = None,
         device: str = "cuda",
@@ -61,7 +62,7 @@ class PipelineLoader:
         Initialize model loader.
 
         Args:
-            args: DiffusionArgs containing all configuration (preferred)
+            args: VisualGenArgs containing all configuration (preferred)
             mapping: Tensor parallel mapping (fallback if args is None)
             device: Device to load model on (fallback if args is None)
         """
@@ -134,15 +135,17 @@ class PipelineLoader:
         # Resolve checkpoint_dir
         checkpoint_dir = checkpoint_dir or (self.args.checkpoint_path if self.args else None)
         if not checkpoint_dir:
-            raise ValueError("checkpoint_dir must be provided or set in DiffusionArgs")
+            raise ValueError("checkpoint_dir must be provided or set in VisualGenArgs")
         checkpoint_dir = self._resolve_checkpoint_dir(str(checkpoint_dir))
 
         # Get loading options from args
         skip_components = self.args.skip_components if self.args else []
 
+        load_start = time.time()
+
         # =====================================================================
         # STEP 1: Load Config (includes quant config parsing)
-        # Merge pretrained checkpoint config with user-provided DiffusionArgs
+        # Merge pretrained checkpoint config with user-provided VisualGenArgs
         # =====================================================================
         logger.info(f"Loading config from {checkpoint_dir}")
         config = DiffusionModelConfig.from_pretrained(
@@ -202,13 +205,16 @@ class PipelineLoader:
         # These are NOT quantized - loaded as-is from checkpoint
         # =====================================================================
         pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
-
-        if config.parallel.enable_parallel_vae:
-            pipeline.setup_parallel_vae()
+        logger.info("Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
         # STEP 5: Post-load Hooks (TeaCache setup, etc.)
         # =====================================================================
+
+        t0 = time.time()
+        if config.parallel.enable_parallel_vae:
+            pipeline.setup_parallel_vae()
+
         if hasattr(pipeline, "post_load_weights"):
             pipeline.post_load_weights()
 
@@ -227,6 +233,9 @@ class PipelineLoader:
                     pipeline.warmup()
             else:
                 pipeline.warmup()
+            logger.info(f"Warmup completed in {time.time() - t0:.2f}s")
+        else:
+            logger.info("Warmup skipped (skip_warmup=True)")
 
         if config.pipeline.enable_layerwise_nvtx_marker:
             from tensorrt_llm._torch.pyexecutor.layerwise_nvtx_marker import LayerwiseNvtxMarker
@@ -237,7 +246,10 @@ class PipelineLoader:
                 logger.info(f"Registering layerwise NVTX markers for {transformer_component}")
                 marker.register_hooks(getattr(pipeline, transformer_component), module_prefix)
 
-        logger.info(f"Pipeline loaded: {pipeline.__class__.__name__}")
+        logger.info(
+            f"Pipeline loaded: {pipeline.__class__.__name__} "
+            f"(total load time: {time.time() - load_start:.2f}s)"
+        )
         return pipeline
 
     def _materialize_meta_tensors(self, module: torch.nn.Module) -> None:
