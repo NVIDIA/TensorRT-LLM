@@ -4176,17 +4176,17 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
     ) -> tuple[list[LlmRequest], torch.Tensor, torch.Tensor, torch.Tensor]:
         raw_logits_cuda = model_outputs["logits"]
 
-        requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
+        sampling_requests, sampling_requests_metadata, logits_cuda = self._select_generated_logits(
             scheduled_requests,
             raw_logits_cuda,
             num_context_logits_prefix_sum=num_context_logits_prefix_sum,
         )
-        return_log_probs = self._return_log_probs(requests)
+        return_log_probs = self._return_log_probs(sampling_requests)
         if return_log_probs:
-            self._prepare_log_probs(requests)
+            self._prepare_log_probs(sampling_requests)
 
         seq_slots_host_int64 = torch.tensor(
-            [r.py_seq_slot for r in requests],
+            [r.py_seq_slot for r in sampling_requests],
             dtype=torch.int64,  # for index_fill_
             pin_memory=prefer_pinned(),
         )
@@ -4198,23 +4198,25 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         # necessary for beam search and max_length checks
         seq_lens_host = torch.tensor(
-            [r.max_beam_num_tokens for r in requests],
+            [r.max_beam_num_tokens for r in sampling_requests],
             dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
 
         # Handle embedding bias
-        self._apply_embedding_bias(logits_cuda, requests, sampling_requests_metadata.req_num_steps)
+        self._apply_embedding_bias(
+            logits_cuda, sampling_requests, sampling_requests_metadata.req_num_steps
+        )
 
         logits_cuda = self._apply_min_length_penalty(
             logits_cuda,
-            requests,
+            sampling_requests,
             sampling_requests_metadata.req_num_steps.tolist(),
             sampling_requests_metadata.req_num_beams.tolist(),
         )
 
         # Fast path for greedy sampling
-        if self._can_use_fast_greedy_path(requests):
+        if self._can_use_fast_greedy_path(sampling_requests):
             # Compute destination indices on CPU (same pattern as _unbatch_sampling_results)
             batch_destination_indexer = _UnpackedStepIndexer(
                 seq_slots=seq_slots_host_int32,
@@ -4241,7 +4243,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
-            return requests, seq_slots_host_int64, seq_lens_host, new_tokens_host
+            return sampling_requests, seq_slots_host_int64, seq_lens_host, new_tokens_host
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
@@ -4255,7 +4257,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Perform sampling in batches
         batched_sampling_result = self._sample_batched_by_strategy(
             logits_cuda,
-            requests,
+            sampling_requests,
             model_outputs,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=sampling_requests_metadata.req_offsets,
@@ -4271,7 +4273,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             self._process_logprobs(
                 batched_sampling_result,
                 seq_slots_host_int32,
-                requests,
+                sampling_requests,
                 sampling_requests_metadata.req_num_steps,
                 sampling_requests_metadata.req_num_generated_tokens_output,
             )
@@ -4285,7 +4287,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         # NB: update_requests syncs w/ device computation and async D2H copies
-        return requests, seq_slots_host_int64, seq_lens_host, new_tokens_host
+        return sampling_requests, seq_slots_host_int64, seq_lens_host, new_tokens_host
 
     @override
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
