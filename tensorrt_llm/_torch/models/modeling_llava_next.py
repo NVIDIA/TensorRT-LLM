@@ -111,17 +111,20 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         num_mm_tokens_per_placeholder: List[int],
     ) -> Tuple[List[int], List[int], List[int]]:
         """
-        Shared logic: replace each image placeholder token in prompt_token_ids
+        Shared logic (called by expand_prompt_token_ids_for_mm and get_prompt_token_ids):
+        replace each image placeholder token in prompt_token_ids
         with placeholder_id repeated num_mm_tokens_per_placeholder[i] times.
 
         Returns:
-            (expanded_ids, mm_token_length, mm_token_offsets)
+            expanded_ids (List[int]): The new prompt token IDs with each image placeholder replaced by the correct number of MM tokens.
+            mm_token_lengths (List[int]): Number of MM tokens inserted for each placeholder, in order.
+            mm_token_offsets (List[int]): Offset (position) in the expanded sequence where each MM token group (for each placeholder) begins.
         """
         image_token_id = self.config.image_token_index
         placeholder_id = self.vocab_size + 1
 
         expanded: List[int] = []
-        mm_token_length: List[int] = []
+        mm_token_lengths: List[int] = []
         mm_token_offsets: List[int] = []
         image_idx = 0
         for tok in prompt_token_ids:
@@ -129,11 +132,14 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 if image_idx >= len(num_mm_tokens_per_placeholder):
                     raise ValueError(
                         "More image placeholder tokens in prompt than "
-                        "num_mm_tokens_per_placeholder entries")
+                        "num_mm_tokens_per_placeholder entries: "
+                        f"found {image_idx + 1} placeholders, "
+                        f"num_mm_tokens_per_placeholder has {len(num_mm_tokens_per_placeholder)} entries."
+                    )
                 n = num_mm_tokens_per_placeholder[image_idx]
                 mm_token_offsets.append(len(expanded))
                 expanded.extend([placeholder_id] * n)
-                mm_token_length.append(n)
+                mm_token_lengths.append(n)
                 image_idx += 1
             else:
                 expanded.append(tok)
@@ -143,7 +149,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
                 f"Expected {len(num_mm_tokens_per_placeholder)} image placeholders, "
                 f"found {image_idx}. Ensure the prompt contains the model image "
                 f"placeholder (token id {image_token_id}).")
-        return expanded, mm_token_length, mm_token_offsets
+        return expanded, mm_token_lengths, mm_token_offsets
 
     def expand_prompt_token_ids_for_mm(
         self,
@@ -265,7 +271,7 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         """
         Build input token ids with multimodal placeholders expanded to the number of MM tokens.
 
-        Uses an already tokenized prompt or tokenizes the txt prompt first. Delegates expansion to _expand_image_placeholders_in_token_ids.
+        Uses an already tokenized prompt or tokenizes the txt prompt first.
 
         Args:
             inputs: Inputs containing an already tokenized text prompt or a text prompt string.
@@ -283,9 +289,9 @@ class LlavaNextInputProcessor(BaseMultimodalInputProcessor,
         if text_prompt:
             prompt_token_ids = self.tokenizer(
                 text_prompt, return_tensors="pt").input_ids[0].tolist()
-        elif not prompt_token_ids and not text_prompt:
+        elif not prompt_token_ids:
             raise ValueError(
-                "Text prompt or token IDs are required but not provided")
+                "Text prompt or token IDs are required but neither is provided")
 
         if not isinstance(mm_handles, list):
             raise ValueError("mm_handles must be a list")

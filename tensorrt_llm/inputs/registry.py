@@ -655,7 +655,7 @@ def create_input_processor(
 
 
 def _mm_data_to_counts(mm_data: Dict[str, Any]) -> Dict[str, int]:
-    """Normalize multi_modal_data to per-key counts (each value as list length)."""
+    """Normalize multimodal data to per-key counts (each value as list length)."""
     mm_items = {
         k: (v if isinstance(v, list) else [v])
         for k, v in mm_data.items()
@@ -677,6 +677,9 @@ def _process_multimodal_with_dummy_placeholders(
         multi_modal_data=mm_data,
         mm_processor_kwargs=mm_processor_kwargs,
     )
+    # input_processor runs the HF processor / vision encoder on mm_data (e.g. images).
+    # extra_processed_inputs contains the processed MM data keyed under "multimodal_data";
+    # it is reused later with the real token IDs so we do not run the vision encoder again.
     _, extra_processed_inputs = input_processor(dummy_inputs, sampling_params)
     if extra_processed_inputs is None:
         return {}
@@ -689,6 +692,9 @@ def _get_single_mm_token_lengths(
 ) -> Optional[List[int]]:
     """Get the single set of MM token lengths (first value from find_mm_token_lengths). Returns None if empty."""
     num_mm_tokens_by_key = find_mm_token_lengths(mm_data, input_processor)
+    # find_mm_token_lengths returns Dict[modality, List[int]], e.g. {"image": [2928, 2928]}.
+    # We need the list of per-item lengths (for find_mm_token_positions), We take the first modality's
+    # list; multi-modality is not yet supported (see TODO in multimodal_hashing_process).
     num_mm_tokens = next(iter(num_mm_tokens_by_key.values()))
     if len(num_mm_tokens) <= 0:
         return None
