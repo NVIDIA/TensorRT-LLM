@@ -17,6 +17,7 @@
 
 from __future__ import annotations
 
+import fnmatch
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import TYPE_CHECKING, Optional
@@ -34,6 +35,8 @@ from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 from tensorrt_llm._torch.visual_gen.parallelism import setup_sequence_parallelism
 from tensorrt_llm._torch.visual_gen.quantization.loader import DynamicLinearWeightLoader
 from tensorrt_llm.logger import logger
+from tensorrt_llm.models.modeling_utils import QuantConfig
+from tensorrt_llm.quantization.mode import QuantAlgo
 
 from .ltx2_core.adaln import AdaLayerNormSingle
 from .ltx2_core.modality import Modality
@@ -492,8 +495,9 @@ class BasicAVTransformerBlock(nn.Module):
 
         run_vx = video is not None and video.enabled and vx.numel() > 0
         run_ax = audio is not None and audio.enabled and ax.numel() > 0
-        run_a2v = run_vx and run_ax
-        run_v2a = run_ax and run_vx
+
+        run_a2v = run_vx and (audio is not None and ax.numel() > 0)
+        run_v2a = run_ax and (video is not None and vx.numel() > 0)
 
         has_perturbations = perturbations is not None and isinstance(
             perturbations, BatchedPerturbationConfig
@@ -859,22 +863,15 @@ class LTXModel(nn.Module):
         if quant_config is None or quant_config.exclude_modules is None:
             return
 
-        from tensorrt_llm.models.modeling_utils import QuantConfig
-
         kv_cache_quant_algo = quant_config.kv_cache_quant_algo if quant_config else None
         no_quant_config = QuantConfig(kv_cache_quant_algo=kv_cache_quant_algo)
 
-        # ====== FP8 static checkpoint: remap exclude names (see above) ======
-        import fnmatch
-
-        from tensorrt_llm.quantization.mode import QuantAlgo
-
         needs_remap = quant_config.quant_algo in (QuantAlgo.FP8,)
         if needs_remap:
+            # FP8 static checkpoint: remap exclude names (see above)
             all_patterns = self._remap_exclude_modules(quant_config.exclude_modules)
         else:
             all_patterns = list(quant_config.exclude_modules)
-        # ====================================================================
 
         for name, module in self.named_modules():
             if isinstance(module, Linear):

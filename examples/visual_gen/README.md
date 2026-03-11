@@ -125,9 +125,7 @@ python visual_gen_wan_t2v.py \
     --cfg_size 2 --ulysses_size 4 \
     --output_path output.mp4
 ```
-GPU Layout: GPU 0-3 (positive) | GPU 4-7 (negative)
 
----
 
 ## WAN (Image-to-Video)
 
@@ -141,45 +139,13 @@ python visual_gen_wan_i2v.py \
 ```
 
 
----
-
 ## LTX2 (Text/Image-to-Video with Audio)
 
 LTX2 generates video **with audio** from text prompts or input images.
 It uses a Gemma3 text encoder (provided separately via `--text_encoder_path`)
 and supports BF16, FP8, and FP4 precision checkpoints.
 
-### LTX-2 Specific Checkpoint Format
-
-LTX-2 specific checkpoints pack all model components into a **single safetensors
-file** with prefixed tensor keys. This document describes the layout using the
-BF16 checkpoint as a reference.
-
-#### File Overview
-
-```
-ltx-2-19b-dev.safetensors
-  Total tensors : 6,404
-  Metadata keys : license, encrypted_wandb_properties, _quantization_metadata, config
-```
-
-The `config` metadata key contains a JSON dict with per-component configuration
-(e.g., `config["transformer"]`). The `_quantization_metadata` key holds the
-ModelOpt quantization recipe (present only in quantized checkpoints).
-
-#### Component Prefixes
-
-Every tensor key is prefixed by its component name. The weight loader strips the
-prefix when loading (e.g., `model.diffusion_model.proj_out.weight` becomes
-`proj_out.weight` for the transformer).
-
-| Prefix | Component | Tensors | Description |
-|--------|-----------|---------|-------------|
-| `model.diffusion_model.` | Transformer (DiT) | 5,920 | Video + audio denoising transformer |
-| `vae.` | Video VAE | 187 | Video encoder/decoder |
-| `audio_vae.` | Audio VAE | 102 | Audio encoder/decoder |
-| `vocoder.` | Vocoder | 194 | Mel-spectrogram to waveform |
-| `text_embedding_projection.` | Text projection | 1 | Aggregated text embedding projection |
+Please refer to tensorrt_llm/_torch/visual_gen/models/ltx2/LTX_2_CHECKPOINT_FORMAT.md for model checkpoint info.
 
 ### Basic Usage
 
@@ -286,7 +252,7 @@ python visual_gen_ltx2.py \
 
 - **FLUX**: `.png` (image)
 - **WAN**: `.mp4` if FFmpeg is installed, otherwise `.avi` (video)
-- **LTX2**: `.mp4` (video with audio), `.gif` (animated), `.png` (single frame)
+- **LTX2**: `.mp4` (video with audio) if FFmpeg is installed, otherwise `.avi` (video)
 
 ## Serving
 

@@ -12,33 +12,20 @@ Requires LTX-2 checkpoint. Does NOT require the LTX-2 reference code.
 
 import gc
 import os
-from pathlib import Path
 
 import pytest
 import torch
 import torch.nn.functional as F
+from test_common.llm_data import llm_models_root
 
 from tensorrt_llm._torch.modules.linear import Linear
-from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionArgs, PipelineComponent
+from tensorrt_llm._torch.visual_gen.config import AttentionConfig, PipelineComponent, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.pipeline_loader import PipelineLoader
 
 os.environ.setdefault("TLLM_DISABLE_MPI", "1")
 
 
-def _llm_models_root() -> str:
-    """Return LLM_MODELS_ROOT path; assert when set but invalid."""
-    root = Path("/home/scratch.trt_llm_data_ci/llm-models/")
-    if "LLM_MODELS_ROOT" in os.environ:
-        root = Path(os.environ["LLM_MODELS_ROOT"])
-    if not root.exists():
-        root = Path("/scratch.trt_llm_data/llm-models/")
-    assert root.exists(), (
-        "You shall set LLM_MODELS_ROOT env or be able to access scratch.trt_llm_data to run this test"
-    )
-    return str(root)
-
-
-_LTX2_BASE = os.path.join(_llm_models_root(), "LTX-2")
+_LTX2_BASE = os.path.join(str(llm_models_root(check=True)), "LTX-2")
 
 CHECKPOINT_PATH_BF16 = os.environ.get(
     "LTX2_MODEL_PATH",
@@ -49,7 +36,7 @@ CHECKPOINT_PATH_FP8 = os.environ.get(
     os.path.join(_LTX2_BASE, "ltx-2-19b-dev-fp8.safetensors"),
 )
 
-# Skip non-transformer components.  DiffusionArgs.skip_components is a
+# Skip non-transformer components.  VisualGenArgs.skip_components is a
 # List[PipelineComponent] validated by Pydantic; LTX2-native components
 # (audio_vae, vocoder, connectors, video_encoder) will load from the
 # checkpoint automatically.
@@ -164,7 +151,7 @@ class TestLTX2Quantization:
     @pytest.mark.parametrize("quant_algo", ["FP8", "FP8_BLOCK_SCALES"])
     def test_load_with_quantization(self, ltx2_bf16_checkpoint_exists, quant_algo: str):
         """Test loading LTX2 with FP8 quantization and verify FP8 weights."""
-        args = DiffusionArgs(
+        args = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -222,7 +209,7 @@ class TestLTX2FP8NumericalCorrectness:
         3. Compare FP8 layer output against reference
         """
         print(f"\n[Compare {quant_algo}] Loading BF16 pipeline...")
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -231,7 +218,7 @@ class TestLTX2FP8NumericalCorrectness:
         pipeline_bf16 = PipelineLoader(args_bf16).load(skip_warmup=True)
 
         print(f"[Compare {quant_algo}] Loading {quant_algo} pipeline...")
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -299,7 +286,7 @@ class TestLTX2FP8Memory:
         torch.cuda.empty_cache()
         torch.cuda.reset_peak_memory_stats()
 
-        args_bf16 = DiffusionArgs(
+        args_bf16 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -315,7 +302,7 @@ class TestLTX2FP8Memory:
 
         torch.cuda.reset_peak_memory_stats()
 
-        args_fp8 = DiffusionArgs(
+        args_fp8 = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -352,7 +339,7 @@ class TestLTX2AttentionBackend:
         fit in GPU memory simultaneously).
         """
         print("\n[Attention Backend Test] Loading baseline transformer (VANILLA)...")
-        args_baseline = DiffusionArgs(
+        args_baseline = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",
@@ -375,7 +362,7 @@ class TestLTX2AttentionBackend:
         torch.cuda.empty_cache()
 
         print("[Attention Backend Test] Loading TRTLLM transformer...")
-        args_trtllm = DiffusionArgs(
+        args_trtllm = VisualGenArgs(
             checkpoint_path=CHECKPOINT_PATH_BF16,
             device="cuda",
             dtype="bfloat16",

@@ -64,7 +64,7 @@ Current supported & tested models:
 
 ### 1. Synchronous Image Generation (`sync_image_gen.py`)
 
-Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports FLUX.1, FLUX.2, and LTX-2.
+Demonstrates synchronous text-to-image generation using the OpenAI SDK. Supports FLUX.1 and FLUX.2.
 
 **Features:**
 - Generates images from text prompts
@@ -286,7 +286,7 @@ You can customize these by:
 - `input_reference`: Reference image file (for TI2V mode)
 
 > **Note:** LTX-2 generates video **with audio**. The `ltx2.yml` config must include
-> `text_encoder_path` pointing to a Gemma3 model (e.g., `gemma-3-12b-it`).
+> `text_encoder_path` pointing to a Gemma3 model (e.g., `google/gemma-3-12b-it`).
 
 ## Quick Reference - curl Examples
 

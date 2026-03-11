@@ -46,6 +46,11 @@ LTX2_T2V_HEIGHT = 512
 LTX2_T2V_WIDTH = 768
 LTX2_T2V_NUM_FRAMES = 121
 LTX2_T2V_STEPS = 40
+LTX2_T2V_GUIDANCE_SCALE = 4.0
+LTX2_T2V_MAX_SEQ_LEN = 1024
+LTX2_T2V_FRAME_RATE = 24.0
+LTX2_T2V_SEED = 42
+LTX2_T2V_NEGATIVE_PROMPT = "worst quality, inconsistent motion, blurry, jittery, distorted"
 
 # Dimensions to evaluate
 VBENCH_DIMENSIONS = [
@@ -242,12 +247,28 @@ def wan22_a14b_nvfp4_video_path(_visual_gen_deps, llm_venv, llm_root):
     return _generate_wan_video(llm_venv, llm_root, WAN22_A14B_NVFP4_MODEL_SUBPATH, "wan22_nvfp4")
 
 
-def _generate_ltx2_video(llm_venv, llm_root, output_subdir, linear_type="default"):
-    """Generate a video with visual_gen_ltx2.py.
+def _linear_type_to_quant_config(linear_type):
+    """Map linear_type shortcut to quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)
+
+
+def _generate_ltx2_video(llm_venv, output_subdir, linear_type="default"):
+    """Generate a video using the LTX-2 Python API directly.
+
+    Calls VisualGen / VisualGenArgs / VisualGenParams instead of shelling out
+    to examples/visual_gen/visual_gen_ltx2.py (which may be removed).
 
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     or text encoder is not found under LLM_MODELS_ROOT.
     """
+    from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams
+    from tensorrt_llm.serve.media_storage import MediaStorage
+
     scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, LTX2_MODEL_SUBPATH)
     text_encoder_path = os.path.join(scratch_space, LTX2_TEXT_ENCODER_SUBPATH)
@@ -266,46 +287,58 @@ def _generate_ltx2_video(llm_venv, llm_root, output_subdir, linear_type="default
     output_path = os.path.join(out_dir, VISUAL_GEN_OUTPUT_VIDEO)
     if os.path.isfile(output_path):
         return output_path
-    script_path = os.path.join(llm_root, "examples", "visual_gen", "visual_gen_ltx2.py")
-    assert os.path.isfile(script_path), f"LTX-2 script not found: {script_path}"
-    cmd = [
-        script_path,
-        "--model_path",
-        model_path,
-        "--text_encoder_path",
-        text_encoder_path,
-        "--prompt",
-        LTX2_T2V_PROMPT,
-        "--height",
-        str(LTX2_T2V_HEIGHT),
-        "--width",
-        str(LTX2_T2V_WIDTH),
-        "--num_frames",
-        str(LTX2_T2V_NUM_FRAMES),
-        "--steps",
-        str(LTX2_T2V_STEPS),
-        "--output_path",
-        output_path,
-    ]
-    if linear_type != "default":
-        cmd.extend(["--linear_type", linear_type])
+
+    vg_kwargs = dict(text_encoder_path=text_encoder_path)
+    quant_config = _linear_type_to_quant_config(linear_type)
+    if quant_config is not None:
+        vg_kwargs["quant_config"] = quant_config
     if torch.cuda.device_count() >= 2:
-        cmd.extend(["--cfg_size", "2"])
-    venv_check_call(llm_venv, cmd)
+        vg_kwargs["parallel"] = {"dit_cfg_size": 2}
+
+    diffusion_args = VisualGenArgs(**vg_kwargs)
+    visual_gen = VisualGen(model_path=model_path, diffusion_args=diffusion_args)
+
+    try:
+        params = VisualGenParams(
+            height=LTX2_T2V_HEIGHT,
+            width=LTX2_T2V_WIDTH,
+            num_frames=LTX2_T2V_NUM_FRAMES,
+            num_inference_steps=LTX2_T2V_STEPS,
+            guidance_scale=LTX2_T2V_GUIDANCE_SCALE,
+            max_sequence_length=LTX2_T2V_MAX_SEQ_LEN,
+            seed=LTX2_T2V_SEED,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+        )
+        output = visual_gen.generate(
+            inputs={
+                "prompt": LTX2_T2V_PROMPT,
+                "negative_prompt": LTX2_T2V_NEGATIVE_PROMPT,
+            },
+            params=params,
+        )
+        MediaStorage.save_video(
+            output.video,
+            output_path,
+            audio=output.audio,
+            frame_rate=LTX2_T2V_FRAME_RATE,
+        )
+    finally:
+        visual_gen.shutdown()
+
     assert os.path.isfile(output_path), f"LTX-2 visual gen did not produce {output_path}"
     return output_path
 
 
 @pytest.fixture(scope="session")
-def ltx2_bf16_video_path(_visual_gen_deps, llm_venv, llm_root):
+def ltx2_bf16_video_path(_visual_gen_deps, llm_venv):
     """Generate LTX-2 BF16 T2V video and return path."""
-    return _generate_ltx2_video(llm_venv, llm_root, "ltx2_bf16")
+    return _generate_ltx2_video(llm_venv, "ltx2_bf16")
 
 
 @pytest.fixture(scope="session")
-def ltx2_fp8_video_path(_visual_gen_deps, llm_venv, llm_root):
+def ltx2_fp8_video_path(_visual_gen_deps, llm_venv):
     """Generate LTX-2 FP8 T2V video and return path."""
-    return _generate_ltx2_video(llm_venv, llm_root, "ltx2_fp8", linear_type="trtllm-fp8-per-tensor")
+    return _generate_ltx2_video(llm_venv, "ltx2_fp8", linear_type="trtllm-fp8-per-tensor")
 
 
 def _normalize_score(val):

@@ -1,6 +1,14 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025–2026 Lightricks Ltd.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 Lightricks Ltd.
 # SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES.
 # SPDX-License-Identifier: LicenseRef-LTX-2
+"""LTX-2 core components ported from the official LTX-2 repository.
+
+Major modifications:
+- attention.py: Replaced nn.Linear with TRT-LLM Linear; removed standalone
+  attention computation (delegated to visual_gen attention backends).
+- transformer_args.py: Adapted mask preparation for TRT-LLM attention backends.
+- connector.py: Replaced nn.Linear with TRT-LLM Linear for quantization support.
+"""
 
 from .adaln import AdaLayerNormSingle
 from .attention import Attention, FeedForward, GELUApprox

@@ -527,7 +527,9 @@ class DiffusionModelConfig(BaseModel):
         qmeta: Dict,
         tensor_keys: List[str],
     ) -> Dict:
-        """Convert per-layer ``_quantization_metadata`` to ModelOpt format.
+        """
+        TODO: Consider refactor this to be a utility functions.
+        Convert per-layer ``_quantization_metadata`` to ModelOpt format.
 
         Some checkpoints (e.g. HuggingFace-quantized FP8) embed per-layer
         quantization info as::
