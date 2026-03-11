@@ -2704,7 +2704,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         # Used for all store updates
         seq_slots: list[int] = []
         # Used for beam search updates
-        prompt_lens: list[int] = []
+        max_prompt_len: int = 0
 
         # Prepare finish reasons handler
         self._finish_reasons_handler.setup_new_request_handling()
@@ -2719,7 +2719,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                 assert not (request.py_return_log_probs and request.py_num_logprobs > 1), (
                     "Beam search does not support returning multiple logprobs per request"
                 )
-                prompt_lens.append(request.py_prompt_len)
+                max_prompt_len = max(max_prompt_len, request.py_prompt_len)
 
             self._request_grouper.prepare_for_new_request(request, slot)
 
@@ -2727,8 +2727,6 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         end_ids = self._finish_reasons_handler.new_end_ids
         # Perform updates to the stores
         full_list = [seq_slots, max_lens, end_ids]
-        if self._use_beam_search:
-            full_list.append(prompt_lens)
         # perform only a single copy
         full_list_tensor_host = torch.tensor(
             full_list, device="cpu", dtype=torch.int32, pin_memory=prefer_pinned()
@@ -2747,14 +2745,13 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         )
 
         if self._use_beam_search:
-            prompt_lens_tensor_cuda = full_list_tensor_cuda[3]
             beam_search_store = self.store.beam_search_store
             assert beam_search_store is not None
             self._prepare_beam_search(
                 beam_search_store,
                 self.store.log_probs_store,
                 seq_slots=seq_slots_tensor_cuda,
-                prompt_lens=prompt_lens_tensor_cuda,
+                max_prompt_len=max_prompt_len,
             )
 
     @staticmethod
@@ -2762,7 +2759,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         beam_search_store: BeamSearchStore,
         log_probs_store: LogProbsStore,
         seq_slots: torch.Tensor,
-        prompt_lens: torch.Tensor,
+        max_prompt_len: int,
     ) -> None:
         """Prepare the beam search buffers for the requests
 
@@ -2770,8 +2767,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         initialize/reset the buffers for the request
         """
         cache_indirection = beam_search_store.cache_indirection
-        cache_indirection[seq_slots, :, prompt_lens] = torch.zeros(
-            (1, 1),
+        cache_indirection[seq_slots, :, :max_prompt_len] = torch.zeros(
+            (1),
             dtype=cache_indirection.dtype,
             device=cache_indirection.device,
         )
