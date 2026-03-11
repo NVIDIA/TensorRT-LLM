@@ -39,7 +39,7 @@ using heuristic_topk::TOP_K;
 
 // Multi-row kernel: thin wrapper that computes per-row parameters,
 // then calls heuristicTopKJob (independently optimized device function).
-__global__ void __launch_bounds__(BLOCK_SIZE, 1) heuristicTopKMultiRowKernel(
+__global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(
     float const* __restrict__ logits, int const* __restrict__ seqLens, int const* __restrict__ preIdx,
     float* __restrict__ scratchValues, int* __restrict__ outIndices, int stride0, int next_n, int topK,
     int preIdxStride, int preIdxCount)
