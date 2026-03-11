@@ -699,3 +699,74 @@ def torch_multi_arange(
     seq = seq.repeat_interleave(seq_repeats, output_size=output_length_arg)
     seq = seq.cumsum(0, dtype=ends.dtype)
     return seq
+
+
+class _Fusions:
+    @staticmethod
+    @torch.compile(dynamic=None, fullgraph=True)
+    def _gather_scatter_impl(
+        dst_cuda: torch.Tensor,
+        dst_index_cuda: torch.Tensor,
+        src_cuda: torch.Tensor,
+        src_index_cuda: torch.Tensor,
+    ) -> None:
+        # NB: helper function for TorchSampler._sample_batched_by_strategy, torch.compile is expected to avoid a copy
+        dst_cuda[dst_index_cuda] = src_cuda[src_index_cuda]
+
+    @staticmethod
+    def gather_scatter(
+        dst_cuda: torch.Tensor,
+        dst_index_cuda: torch.Tensor,
+        src_cuda: torch.Tensor,
+        src_index_cuda: torch.Tensor,
+    ) -> None:
+        torch._dynamo.mark_dynamic(dst_cuda, 0)
+        torch._dynamo.mark_dynamic(dst_index_cuda, 0)
+        torch._dynamo.mark_dynamic(src_cuda, 0)
+        torch._dynamo.mark_dynamic(src_index_cuda, 0)
+        _Fusions._gather_scatter_impl(dst_cuda, dst_index_cuda, src_cuda, src_index_cuda)
+
+    @staticmethod
+    @torch.compile(dynamic=None, fullgraph=True)
+    def _determine_sampled_rank_impl(
+        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
+    ) -> torch.Tensor:
+        sampled_rank_cuda = (
+            group_logprobs_cuda.greater(sampled_logprobs_cuda).count_nonzero(dim=-1).to(torch.int32)
+        )
+        return sampled_rank_cuda
+
+    @staticmethod
+    def determine_sampled_rank(
+        group_logprobs_cuda: torch.Tensor, sampled_logprobs_cuda: torch.Tensor
+    ) -> torch.Tensor:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     memory passes
+        torch._dynamo.mark_dynamic(group_logprobs_cuda, 0)
+        torch._dynamo.mark_dynamic(sampled_logprobs_cuda, 0)
+        return _Fusions._determine_sampled_rank_impl(group_logprobs_cuda, sampled_logprobs_cuda)
+
+    @staticmethod
+    @torch.compile(
+        dynamic=None,
+        fullgraph=True,
+        options=dict(
+            online_softmax=True,
+            split_reductions=False,  # https://github.com/pytorch/pytorch/issues/153241
+        ),
+    )
+    def _gather_log_softmax_impl(
+        inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor
+    ) -> torch.Tensor:
+        # NB: helper function for TorchSampler._process_logprobs, torch.compile is expected to avoid
+        #     materializing the index select
+        return torch.nn.functional.log_softmax(
+            inputs_cuda[indices_cuda],
+            dim=-1,
+        )
+
+    @staticmethod
+    def gather_log_softmax(inputs_cuda: torch.Tensor, indices_cuda: torch.Tensor) -> torch.Tensor:
+        torch._dynamo.mark_dynamic(inputs_cuda, 0)
+        torch._dynamo.mark_dynamic(indices_cuda, 0)
+        return _Fusions._gather_log_softmax_impl(inputs_cuda, indices_cuda)
