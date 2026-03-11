@@ -196,62 +196,13 @@ def benchmark_script():
 
 
 @pytest.mark.parametrize("backend", ["openai-videos"])
-def test_online_benchmark_video(
-    server: RemoteVisualGenServer,
-    benchmark_script: str,
-    backend: str,
-):
-    """Run benchmark_visual_gen.py for video generation and validate output."""
-    cmd = [
-        sys.executable,
-        benchmark_script,
-        "--backend",
-        backend,
-        "--model",
-        _WAN_T2V_MODEL,
-        "--host",
-        server.host,
-        "--port",
-        str(server.port),
-        "--prompt",
-        "A cat walking in a garden",
-        "--num-prompts",
-        "2",
-        "--size",
-        _SMALL_GEN_PARAMS["size"],
-        "--num-frames",
-        _SMALL_GEN_PARAMS["num_frames"],
-        "--fps",
-        _SMALL_GEN_PARAMS["fps"],
-        "--num-inference-steps",
-        _SMALL_GEN_PARAMS["num_inference_steps"],
-        "--seed",
-        _SMALL_GEN_PARAMS["seed"],
-        "--max-concurrency",
-        "1",
-        "--disable-tqdm",
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=True,
-    )
-
-    assert result.returncode == 0
-    assert "Benchmark Result (VisualGen)" in result.stdout
-
-
-@pytest.mark.parametrize("backend", ["openai-videos"])
-def test_online_benchmark_save_result(
+def test_online_benchmark(
     server: RemoteVisualGenServer,
     benchmark_script: str,
     backend: str,
     tmp_path,
 ):
-    """Verify online benchmark --save-result produces a valid JSON file."""
+    """Run benchmark_visual_gen.py and validate output and saved results."""
     result_dir = str(tmp_path / "results")
     cmd = [
         sys.executable,
@@ -313,53 +264,7 @@ def test_online_benchmark_save_result(
 
 
 def test_offline_benchmark(tmp_path):
-    """Run trtllm-bench visual-gen and validate output."""
-    model_path = _wan_t2v_path()
-    config_file = _write_config_file(_make_visual_gen_options(), tmp_path)
-
-    cmd = [
-        "trtllm-bench",
-        "--model",
-        str(model_path),
-        "--model_path",
-        str(model_path),
-        "visual-gen",
-        "--extra_visual_gen_options",
-        config_file,
-        "--prompt",
-        "A cat walking in a garden",
-        "--num_prompts",
-        "2",
-        "--size",
-        _SMALL_GEN_PARAMS["size"],
-        "--num_frames",
-        _SMALL_GEN_PARAMS["num_frames"],
-        "--fps",
-        _SMALL_GEN_PARAMS["fps"],
-        "--num_inference_steps",
-        _SMALL_GEN_PARAMS["num_inference_steps"],
-        "--seed",
-        _SMALL_GEN_PARAMS["seed"],
-        "--max_concurrency",
-        "1",
-        "--warmup",
-        "1",
-    ]
-
-    result = subprocess.run(
-        cmd,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        check=True,
-    )
-
-    assert result.returncode == 0
-    assert "Benchmark Result (VisualGen)" in result.stdout
-
-
-def test_offline_benchmark_save_result(tmp_path):
-    """Verify trtllm-bench visual-gen --save_result produces valid JSON."""
+    """Run trtllm-bench visual-gen and validate output and saved results."""
     model_path = _wan_t2v_path()
     config_file = _write_config_file(_make_visual_gen_options(), tmp_path)
     result_dir = str(tmp_path / "results")
