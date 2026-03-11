@@ -50,7 +50,7 @@ models:
 - name: google/gemma-1.1-7b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: google/gemma-2-2b-it
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/gemma-2-9b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: google/codegemma-7b-it
@@ -62,7 +62,7 @@ models:
 - name: TheBloke/Mistral-7B-Instruct-v0.2-GPTQ
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: bigcode/starcoder2-7b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: bigcode/starcoder2-15b
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'attn_backend_triton.yaml']
 - name: bigcode/starcoder2-15b-instruct-v0.1
@@ -94,9 +94,9 @@ models:
 - name: nvidia/Llama-3.1-8B-Instruct-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Depth-Base
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: nvidia/Llama-3.1-Minitron-4B-Width-Base
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: nvidia/Llama-3.1-Nemotron-Nano-8B-v1
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Mistral-NeMo-Minitron-8B-Base
@@ -248,9 +248,9 @@ models:
   yaml_extra: ['qwen3Next.yaml']
 # --- OLMo 3 (Nov 2025) ---
 - name: allenai/Olmo-3-7B-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: allenai/Olmo-3.1-32B-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Command A (2025) ---
 - name: CohereLabs/c4ai-command-a-03-2025
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
@@ -306,7 +306,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- JetBrains Mellum (Apr 2025) - code specialist ---
 - name: JetBrains/Mellum-4b-sft-all
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Qwen3 missing sizes (May 2025) ---
 - name: Qwen/Qwen3-1.7B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -364,9 +364,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 # --- OLMo 2 (Mar 2025) ---
 - name: allenai/OLMo-2-0325-32B-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: allenai/OLMo-2-0325-32B-DPO
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Command A variants (2025) ---
 - name: CohereLabs/command-a-translate-08-2025
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
@@ -394,7 +394,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 # --- OLMo 3 Think (Nov 2025) ---
 - name: allenai/Olmo-3-32B-Think
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Qwen3-14B (May 2025) ---
 - name: Qwen/Qwen3-14B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -438,7 +438,7 @@ models:
   yaml_extra: ['granite_4.0_tiny_preview.yaml']
 # --- OLMo 3 Think 7B (2025) ---
 - name: allenai/Olmo-3-7B-Think
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Nemotron-H reasoning 8B (2025) ---
 - name: nvidia/Nemotron-H-8B-Reasoning-128K
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -478,7 +478,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 # --- Molmo2 (2025) - fully open VLM ---
 - name: allenai/Molmo2-8B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml']
 # --- DeepSeek-VL2 (2025) - MoE VLM ---
 - name: deepseek-ai/deepseek-vl2-small
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
