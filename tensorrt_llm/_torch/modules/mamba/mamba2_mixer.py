@@ -406,10 +406,16 @@ class Mamba2Mixer(nn.Module):
             )
             # Need to keep the same dtype as self.dt_bias and self.D to avoid garbage outputs.
             dt_d = dt_d.to(dtype=torch.float32)
-            x_d = rearrange(x_d, "b (h p) -> b h p", p=self.head_dim)
+            # Use .contiguous() to ensure proper 128-byte alignment required by
+            # flashinfer's selective_state_update kernel. x_d, B_d, C_d are views
+            # into sliced tensors which may not be 128-byte aligned.
+            x_d = rearrange(x_d, "b (h p) -> b h p",
+                            p=self.head_dim).contiguous()
             dt_d = repeat(dt_d, "b h -> b h p", p=self.head_dim)
-            B_d = rearrange(B_d, "b (g n) -> b g n", g=self.tp_ngroups)
-            C_d = rearrange(C_d, "b (g n) -> b g n", g=self.tp_ngroups)
+            B_d = rearrange(B_d, "b (g n) -> b g n",
+                            g=self.tp_ngroups).contiguous()
+            C_d = rearrange(C_d, "b (g n) -> b g n",
+                            g=self.tp_ngroups).contiguous()
             z_d = rearrange(z_d, "b (h p) -> b h p", p=self.head_dim)
 
             A = repeat(self.A, "h -> h p n", p=self.head_dim,
