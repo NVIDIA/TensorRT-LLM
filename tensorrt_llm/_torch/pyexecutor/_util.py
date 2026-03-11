@@ -368,8 +368,8 @@ class KvCacheCreator:
         """
         mapping = self._mapping
 
-        # TODO: support CP by generating dummy requests for it.
-        assert 'cp_type' not in mapping.cp_config
+        if self._skip_est:
+            assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
 
