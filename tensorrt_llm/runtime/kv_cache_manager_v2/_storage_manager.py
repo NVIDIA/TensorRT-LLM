@@ -313,9 +313,15 @@ class StorageManager:
     def force_evict(
         self, level: CacheLevel, min_num_pages: TypedIndexList[PoolGroupIndex, int]
     ) -> None:
-        assert int(level) + 1 < self.num_cache_levels, "Cannot force eviction from last level"
-        next_lvl = CacheLevel(level + 1)
+        # If we break inside this function with debugpy, pages in `evicted` won't be
+        # released even after the function returns. This is a debugpy artifact.
         evicted = self._levels[level].controller.evict(min_num_pages)
+        if int(level) == self.num_cache_levels - 1:
+            assert all(p.status == PageStatus.DROPPABLE for pages in evicted for p in pages), (
+                "Corrupted eviction controller"
+            )
+            return
+        next_lvl = CacheLevel(level + 1)
         goals = filled_array2d(self.num_cache_levels, self.num_pool_groups, 0)
         self._prepare_free_slots(
             goals, next_lvl, cast(TypedIndexList[PoolGroupIndex, list[Page]], evicted)
@@ -570,6 +576,7 @@ class StorageManager:
         pool_group = self._levels[level].storage._pool_groups[pg_idx]
         assert new_num_slots < pool_group.num_slots, "Not required for expansion of pools"
         ctrl = self._levels[level].controller
+        # pages with overflow slots and their indices in the eviction queue.
         overflow_slots = deque[tuple[int, Page]]()
         for i, p in enumerate(cast(Iterator[Page], ctrl.page_iterator(pg_idx))):
             if p.slot_id >= new_num_slots:
@@ -582,10 +589,15 @@ class StorageManager:
         # prevent allocating slots with id >= new_num_slots
         allocator.prepare_for_shrink(new_num_slots)
         min_num_evicted = 0
+        # Need this because evicted overflow pages won't become free, because only free
+        # non-overflow slots can be used for defragmentation.
+        num_evicted_overflow_slots = 0
         while overflow_slots and len(overflow_slots) + num_overflow_persistent > min(
-            new_num_slots, overflow_slots[0][0] + allocator.num_free_slots
+            new_num_slots,
+            overflow_slots[0][0] + allocator.num_free_slots - num_evicted_overflow_slots,
         ):
             min_num_evicted = overflow_slots.popleft()[0] + 1
+            num_evicted_overflow_slots += 1
         self.force_evict(
             level, make_typed(lambda i: min_num_evicted if i == pg_idx else 0, self.num_pool_groups)
         )
