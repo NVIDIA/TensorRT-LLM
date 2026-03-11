@@ -124,6 +124,13 @@ Do NOT proceed to Phase 9 until the step 2 with full layers reports a successful
 ## Phase 9 — Summary Report
 Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified, (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took), (7) AD end-to-end run result (success/fail, number of iterations, final generation quality).
 
+## Phase 10 - Prepare a Pull Request
+
+Prepare a pull request against `origin` (https://github.com/nv-auto-deploy/TensorRT-LLM) targeting
+branch `feat/paperclip_maximizer`. Then, ask the user to provide feedback on the PR and wait for the
+user to get back to you when the feedback has been posted. Then continue iterating according to the
+user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
+
 ## Key Gotchas
 - **Self-contained files only**: Never import from other AD custom models. Each `modeling_{name}.py` is a standalone translation from HF source.
 - RoPE buffers: `_ad_` prefix, return full table (not sliced), slice by `position_ids` downstream.
