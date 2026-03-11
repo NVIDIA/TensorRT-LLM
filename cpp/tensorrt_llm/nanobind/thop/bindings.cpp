@@ -32,7 +32,7 @@ namespace tensorrt_llm::nanobind::thop
 void initBindings(nb::module_& m)
 {
     // Sync with torch_ext::BufferKind in tensorrt_llm/thop/outputTensor.h
-    nb::enum_<torch_ext::BufferKind>(m, "BufferKind")
+    nb::enum_<torch_ext::BufferKind>(m, "BufferKind", nb::is_arithmetic())
         .value("DEFAULT", torch_ext::BufferKind::Default)
         .value("USERBUFFERS", torch_ext::BufferKind::Userbuffers)
         .value("NCCL_WINDOW", torch_ext::BufferKind::NcclWindow);
