@@ -1008,7 +1008,7 @@ __device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elemen
         // Convert SrcT → DstT.
         vec_t<DstT, VEC_SIZE> out_vec;
 
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
         // SM89+: for bf16/fp16 → fp8_e4m3 with even VEC_SIZE, use paired PTX conversion.
         // cvt.rn.satfinite.e4m3x2.{bf16x2|f16x2} converts 2 values in one instruction:
         //   src u32: bf16/fp16[0] in bits 0:15, bf16/fp16[1] in bits 16:31
