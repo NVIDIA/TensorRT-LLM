@@ -8,6 +8,11 @@ from pydantic import Field
 from torch.fx import GraphModule, Node
 
 from tensorrt_llm._torch.utils import ActivationType
+from tensorrt_llm.quantization.utils.fp4_utils import (
+    get_reorder_rows_for_gated_act_gemm_row_indices,
+    get_shuffle_matrix_a_row_indices,
+    get_shuffle_matrix_sf_a_row_indices,
+)
 
 from ...custom_ops.quantization.quant import (
     TRTLLM_NVFP4_PACKING_FACTOR,
@@ -1968,7 +1973,7 @@ class FuseFP8Moe(BaseTransform):
         return gm, info
 
 
-def _stack_nvfp4_moe_weights(
+def _stack_nvfp4_cutlass_moe_weights(
     gm: GraphModule,
     allow_different_input_scales: bool = False,
 ) -> int:
@@ -2222,6 +2227,8 @@ def _stack_nvfp4_moe_weights(
         # Stack the actual tensor values (fast, like in quantize_moe.py)
         w1_stacked = _stack(w1_list, dim=0)
         w2_stacked = _stack(w2_list, dim=0)
+        if w1_stacked.numel() == 0 or w2_stacked.numel() == 0:
+            continue
         device, dtype = (w1_stacked.device, w1_stacked.dtype)
         w3_stacked = _stack(w3_list, dim=0, device=device, dtype=dtype)
 
@@ -2268,9 +2275,379 @@ def _stack_nvfp4_moe_weights(
     return fused_key_counter
 
 
+def _stack_nvfp4_trtllm_gen_moe_weights(
+    gm: GraphModule,
+    allow_different_input_scales: bool = False,
+    reverse_interleaved_input_scales: bool = True,
+) -> int:
+    def _register_parameter(target, value):
+        gm.register_parameter(target, torch.nn.Parameter(value, requires_grad=False))
+
+    def get_param_or_buffer(target):
+        try:
+            return gm.get_parameter(target)
+        except AttributeError:
+            parts = target.rsplit(".", 1)
+            if len(parts) == 2:
+                mod = gm.get_submodule(parts[0])
+                return getattr(mod, parts[1])
+            return getattr(gm, target)
+
+    def _extract_op_args(node):
+        return extract_op_args(
+            node,
+            "x",
+            "selected_experts",
+            "routing_weights",
+            "w1_weight",
+            "w2_weight",
+            "w3_weight",
+            "w1_input_scale",
+            "w2_input_scale",
+            "w3_input_scale",
+            "w1_weight_scale",
+            "w2_weight_scale",
+            "w3_weight_scale",
+            "w1_alpha",
+            "w2_alpha",
+            "w3_alpha",
+            "is_gated_mlp",
+            "act_fn",
+        )
+
+    def _stack(param_list, dim=0, device=None, dtype=None):
+        if param_list:
+            return torch.stack(
+                [get_param_or_buffer(element.target) for element in param_list], dim=dim
+            ).contiguous()
+        return torch.empty(0, device=device, dtype=dtype)
+
+    def _round_up(x, alignment):
+        return (x + alignment - 1) // alignment * alignment
+
+    EPILOGUE_TILE_M = 128
+
+    def _reverse_interleave_scale_stack(scale_3d_u8: torch.Tensor) -> torch.Tensor:
+        if scale_3d_u8.numel() == 0 or scale_3d_u8.shape[0] == 0:
+            return scale_3d_u8
+        # block_scale_interleave_reverse supports 3D [E, rows, cols] directly.
+        return torch.ops.trtllm.block_scale_interleave_reverse(scale_3d_u8).contiguous()
+
+    def _shuffle_weight_stack(weight_3d: torch.Tensor, is_gated: bool) -> torch.Tensor:
+        if weight_3d.numel() == 0:
+            return weight_3d
+        single_expert_weight = weight_3d[0]
+        if is_gated:
+            perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_weight).to(
+                single_expert_weight.device
+            )
+        else:
+            perm0 = torch.arange(
+                single_expert_weight.shape[0], dtype=torch.long, device=single_expert_weight.device
+            )
+        perm1 = get_shuffle_matrix_a_row_indices(
+            single_expert_weight, epilogue_tile_m=EPILOGUE_TILE_M
+        )
+        if perm1.device != single_expert_weight.device:
+            perm1 = perm1.to(single_expert_weight.device)
+        permute = perm0[perm1]
+        # shuffle_matrix expects 2D, so use index_select instead of shuffle_matrix
+        return torch.index_select(weight_3d, 1, permute)
+
+    def _shuffle_scale_stack(scale_3d_u8: torch.Tensor, is_gated: bool) -> torch.Tensor:
+        if scale_3d_u8.numel() == 0:
+            return scale_3d_u8.view(torch.float8_e4m3fn)
+        num_elts_per_sf = 16
+        scale_k_alignment = 4
+        e_count, m_dim, k_dim = scale_3d_u8.shape
+        if m_dim % EPILOGUE_TILE_M != 0 or k_dim % scale_k_alignment != 0:
+            raise ValueError(
+                "TRTLLM-Gen NVFP4 scale shuffle requires the scale stack shape "
+                f"[E, M, K] to satisfy M % {EPILOGUE_TILE_M} == 0 and "
+                f"K % {scale_k_alignment} == 0, but got {tuple(scale_3d_u8.shape)}."
+            )
+
+        single_expert_scale = scale_3d_u8[0]
+        if is_gated:
+            perm0 = get_reorder_rows_for_gated_act_gemm_row_indices(single_expert_scale.float()).to(
+                single_expert_scale.device
+            )
+        else:
+            perm0 = torch.arange(
+                single_expert_scale.shape[0], dtype=torch.long, device=single_expert_scale.device
+            )
+        perm1 = get_shuffle_matrix_sf_a_row_indices(
+            single_expert_scale, epilogue_tile_m=EPILOGUE_TILE_M, num_elts_per_sf=num_elts_per_sf
+        )
+        if perm1.device != single_expert_scale.device:
+            perm1 = perm1.to(single_expert_scale.device)
+        permute = perm0[perm1]
+        shuffled = torch.index_select(scale_3d_u8, 1, permute)
+        interleaved = torch.ops.trtllm.block_scale_interleave(shuffled)
+        return interleaved.reshape(e_count, m_dim, k_dim).view(torch.float8_e4m3fn).contiguous()
+
+    fused_key_counter = 0
+    graph = gm.graph
+    replacement_op = torch.ops.auto_deploy.trtllm_nvfp4_trtllm_gen_moe_fused
+    replaced_op = torch.ops.auto_deploy.torch_quant_nvfp4_moe
+
+    matched_nodes = [node for node in graph.nodes if is_op(node, replaced_op)]
+    for node in matched_nodes:
+        mapping_config = node.kwargs.get("mapping_config", "") if node.kwargs else ""
+        if mapping_config:
+            ad_logger.debug_once(
+                "Skip TRTLLM-Gen NVFP4 fusion: mapping_config is not supported.",
+                key="trtllm_gen_nvfp4_skip_mapping_config",
+            )
+            continue
+
+        (
+            hidden_states,
+            selected_experts,
+            routing_weights,
+            w1_list,
+            w2_list,
+            w3_list,
+            w1_input_scale,
+            w2_input_scale,
+            w3_input_scale,
+            w1_weight_scale,
+            w2_weight_scale,
+            w3_weight_scale,
+            w1_alpha,
+            w2_alpha,
+            w3_alpha,
+            is_gated_mlp,
+            act_fn,
+        ) = _extract_op_args(node)
+
+        w1_stacked = _stack(w1_list, dim=0)
+        w2_stacked = _stack(w2_list, dim=0)
+        device, dtype = (w1_stacked.device, w1_stacked.dtype)
+        w3_stacked = _stack(w3_list, dim=0, device=device, dtype=dtype)
+
+        if is_gated_mlp:
+            fc1_w_stacked = torch.cat([w3_stacked, w1_stacked], dim=1).contiguous()
+        else:
+            fc1_w_stacked = w1_stacked
+        fc2_w_stacked = w2_stacked
+
+        hidden_size = int(w1_stacked.shape[-1] * 2)
+        weight_alignment = 256 if hidden_size > 1024 and hidden_size % 256 != 0 else 32
+
+        fc1_w_n_dim = int(fc1_w_stacked.shape[1])
+        fc1_w_k_dim = int(fc1_w_stacked.shape[2] * 2)
+        fc1_w_n_padded = _round_up(fc1_w_n_dim, weight_alignment)
+        fc1_w_k_padded = _round_up(fc1_w_k_dim, weight_alignment)
+        if fc1_w_n_padded > fc1_w_n_dim or fc1_w_k_padded > fc1_w_k_dim:
+            fc1_w_stacked = torch.nn.functional.pad(
+                fc1_w_stacked,
+                (0, (fc1_w_k_padded - fc1_w_k_dim) // 2, 0, fc1_w_n_padded - fc1_w_n_dim),
+            )
+
+        fc2_w_n_dim = int(fc2_w_stacked.shape[1])
+        fc2_w_k_dim = int(fc2_w_stacked.shape[2] * 2)
+        fc2_w_n_padded = _round_up(fc2_w_n_dim, weight_alignment)
+        fc2_w_k_padded = _round_up(fc2_w_k_dim, weight_alignment)
+        if fc2_w_n_padded > fc2_w_n_dim or fc2_w_k_padded > fc2_w_k_dim:
+            fc2_w_stacked = torch.nn.functional.pad(
+                fc2_w_stacked,
+                (0, (fc2_w_k_padded - fc2_w_k_dim) // 2, 0, fc2_w_n_padded - fc2_w_n_dim),
+            )
+
+        fc1_shuffled = _shuffle_weight_stack(fc1_w_stacked, is_gated=is_gated_mlp)
+        fc2_shuffled = _shuffle_weight_stack(fc2_w_stacked, is_gated=False)
+
+        w1_bs_u8 = _stack(w1_weight_scale, dim=0)
+        w2_bs_u8 = _stack(w2_weight_scale, dim=0)
+        w3_bs_u8 = _stack(w3_weight_scale, dim=0, device=device, dtype=dtype)
+
+        # Keep fusion conservative: if checkpoint scale layout does not match TRTLLM-Gen
+        # kernel preconditions, skip and leave the safe per-expert path.
+        expected_scale_k = hidden_size // 16
+        if w1_bs_u8.ndim != 3 or w1_bs_u8.shape[2] != expected_scale_k:
+            ad_logger.debug_once(
+                f"Skip TRTLLM-Gen NVFP4 fusion: w1 scale dim2={w1_bs_u8.shape[2] if w1_bs_u8.ndim == 3 else 'NA'} "
+                f"!= hidden_size/16={expected_scale_k}",
+                key="trtllm_gen_nvfp4_skip_w1_scale_layout",
+            )
+            continue
+        if is_gated_mlp and (w3_stacked.numel() == 0 or w3_bs_u8.numel() == 0):
+            ad_logger.debug_once(
+                "Skip TRTLLM-Gen NVFP4 fusion: gated MLP requires non-empty w3 tensors/scales.",
+                key="trtllm_gen_nvfp4_skip_empty_w3",
+            )
+            continue
+        if is_gated_mlp and (w3_bs_u8.ndim != 3 or w3_bs_u8.shape[2] != expected_scale_k):
+            ad_logger.debug_once(
+                f"Skip TRTLLM-Gen NVFP4 fusion: w3 scale dim2={w3_bs_u8.shape[2] if w3_bs_u8.ndim == 3 else 'NA'} "
+                f"!= hidden_size/16={expected_scale_k}",
+                key="trtllm_gen_nvfp4_skip_w3_scale_layout",
+            )
+            continue
+
+        if reverse_interleaved_input_scales:
+            w1_bs_u8 = _reverse_interleave_scale_stack(w1_bs_u8)
+            w2_bs_u8 = _reverse_interleave_scale_stack(w2_bs_u8)
+            w3_bs_u8 = _reverse_interleave_scale_stack(w3_bs_u8)
+
+        if is_gated_mlp:
+            fc1_bs_u8 = torch.cat([w3_bs_u8, w1_bs_u8], dim=1).contiguous()
+        else:
+            fc1_bs_u8 = w1_bs_u8
+        fc2_bs_u8 = w2_bs_u8
+
+        expected_fc1_scale_n = fc1_w_n_padded
+        if fc1_bs_u8.shape[1] < expected_fc1_scale_n:
+            fc1_bs_u8 = torch.nn.functional.pad(
+                fc1_bs_u8, (0, 0, 0, expected_fc1_scale_n - fc1_bs_u8.shape[1]), value=0
+            )
+        expected_fc1_scale_k = fc1_w_k_padded // 16
+        if fc1_bs_u8.shape[2] < expected_fc1_scale_k:
+            fc1_bs_u8 = torch.nn.functional.pad(
+                fc1_bs_u8, (0, expected_fc1_scale_k - fc1_bs_u8.shape[2]), value=0
+            )
+
+        intermediate_size_for_kernel = fc1_w_n_padded // 2 if is_gated_mlp else fc1_w_n_padded
+        expected_fc2_scale_k = intermediate_size_for_kernel // 16
+        if fc2_bs_u8.shape[2] < expected_fc2_scale_k:
+            fc2_bs_u8 = torch.nn.functional.pad(
+                fc2_bs_u8, (0, expected_fc2_scale_k - fc2_bs_u8.shape[2]), value=0
+            )
+        if fc2_bs_u8.shape[1] < fc1_w_k_padded:
+            fc2_bs_u8 = torch.nn.functional.pad(
+                fc2_bs_u8, (0, 0, 0, fc1_w_k_padded - fc2_bs_u8.shape[1]), value=0
+            )
+
+        try:
+            fc1_weight_blockscale = _shuffle_scale_stack(fc1_bs_u8, is_gated=is_gated_mlp)
+            fc2_weight_blockscale = _shuffle_scale_stack(fc2_bs_u8, is_gated=False)
+        except ValueError as exc:
+            ad_logger.debug_once(
+                f"Skip TRTLLM-Gen NVFP4 fusion: {exc}",
+                key="trtllm_gen_nvfp4_skip_unshuffleable_scale_layout",
+            )
+            continue
+
+        w1_input_scale_stacked = _stack(w1_input_scale, dim=0).reshape(-1).to(torch.float32)
+        w2_input_scale_stacked = _stack(w2_input_scale, dim=0).reshape(-1).to(torch.float32)
+        w3_input_scale_stacked = _stack(w3_input_scale, dim=0).reshape(-1).to(torch.float32)
+        w1_alpha_stacked = _stack(w1_alpha, dim=0).reshape(-1).to(torch.float32)
+        w2_alpha_stacked = _stack(w2_alpha, dim=0).reshape(-1).to(torch.float32)
+        w3_alpha_stacked = _stack(w3_alpha, dim=0).reshape(-1).to(torch.float32)
+
+        if is_gated_mlp and not allow_different_input_scales:
+            assert torch.allclose(w1_input_scale_stacked, w3_input_scale_stacked), (
+                "TRTLLM-Gen NVFP4 expects w1 and w3 input scales to match per expert. "
+                "Set allow_different_input_scales=True to override."
+            )
+
+        if is_gated_mlp:
+            fc1_act_global = (
+                torch.minimum(w1_input_scale_stacked.min(), w3_input_scale_stacked.min())
+                .reshape(1)
+                .to(device=device, dtype=torch.float32)
+            )
+        else:
+            fc1_act_global = (
+                w1_input_scale_stacked.min().reshape(1).to(device=device, dtype=torch.float32)
+            )
+        fc2_input_scale_global = w2_input_scale_stacked.min().to(device=device, dtype=torch.float32)
+
+        fc1_act_global_1d = fc1_act_global.squeeze()
+        gate_alpha = (
+            w1_alpha_stacked.to(device=device)
+            * w1_input_scale_stacked.to(device=device)
+            / fc1_act_global_1d
+        ).to(dtype=torch.float32)
+        if is_gated_mlp:
+            up_alpha = (
+                w3_alpha_stacked.to(device=device)
+                * w3_input_scale_stacked.to(device=device)
+                / fc1_act_global_1d
+            ).to(dtype=torch.float32)
+        else:
+            up_alpha = gate_alpha
+        fc2_alpha = (
+            w2_alpha_stacked.to(device=device)
+            * w2_input_scale_stacked.to(device=device)
+            / fc2_input_scale_global
+        ).to(dtype=torch.float32)
+        if is_gated_mlp:
+            # SwiGLU: scale_c folds fc2 input quant and up-branch dequant.
+            fc1_scale_c = (fc2_input_scale_global * up_alpha).to(dtype=torch.float32)
+        else:
+            # Relu2/non-gated: keep per-expert fc2 input scales (matches previous AD behavior
+            # and avoids broadcasted stride-0 tensors being passed to the kernel).
+            fc1_scale_c = w2_input_scale_stacked.to(device=device, dtype=torch.float32)
+        fc1_alpha = gate_alpha
+
+        # Ensure kernel inputs are contiguous.
+        fc1_scale_c = fc1_scale_c.contiguous()
+        fc1_alpha = fc1_alpha.contiguous()
+        fc2_alpha = fc2_alpha.contiguous()
+
+        new_key_fc1 = f"trtllm_gen_nvfp4_moe_fc1_stacked_{fused_key_counter}"
+        new_key_fc2 = f"trtllm_gen_nvfp4_moe_fc2_stacked_{fused_key_counter}"
+        new_key_fc1_scale = f"trtllm_gen_nvfp4_moe_fc1_scale_{fused_key_counter}"
+        new_key_fc2_scale = f"trtllm_gen_nvfp4_moe_fc2_scale_{fused_key_counter}"
+        new_key_fc1_act_scale = f"trtllm_gen_nvfp4_moe_fc1_act_scale_{fused_key_counter}"
+        new_key_fc1_scale_c = f"trtllm_gen_nvfp4_moe_fc1_scale_c_{fused_key_counter}"
+        new_key_fc1_alpha = f"trtllm_gen_nvfp4_moe_fc1_alpha_{fused_key_counter}"
+        new_key_fc2_alpha = f"trtllm_gen_nvfp4_moe_fc2_alpha_{fused_key_counter}"
+
+        _register_parameter(new_key_fc1, fc1_shuffled)
+        _register_parameter(new_key_fc2, fc2_shuffled)
+        _register_parameter(new_key_fc1_scale, fc1_weight_blockscale)
+        _register_parameter(new_key_fc2_scale, fc2_weight_blockscale)
+        _register_parameter(new_key_fc1_act_scale, fc1_act_global)
+        _register_parameter(new_key_fc1_scale_c, fc1_scale_c)
+        _register_parameter(new_key_fc1_alpha, fc1_alpha)
+        _register_parameter(new_key_fc2_alpha, fc2_alpha)
+
+        with graph.inserting_before(node):
+            args = (
+                hidden_states,
+                selected_experts,
+                routing_weights,
+                graph.get_attr(new_key_fc1),
+                graph.get_attr(new_key_fc2),
+                graph.get_attr(new_key_fc1_scale),
+                graph.get_attr(new_key_fc2_scale),
+                graph.get_attr(new_key_fc1_act_scale),
+                graph.get_attr(new_key_fc1_scale_c),
+                graph.get_attr(new_key_fc1_alpha),
+                graph.get_attr(new_key_fc2_alpha),
+            )
+            kwargs = dict(node.kwargs) if node.kwargs else {}
+            kwargs.update(
+                {
+                    "is_gated_mlp": is_gated_mlp,
+                    "act_fn": act_fn,
+                }
+            )
+            new_node = graph.call_function(
+                replacement_op,
+                args=args,
+                kwargs=kwargs,
+            )
+
+        node.replace_all_uses_with(new_node)
+        graph.erase_node(node)
+        fused_key_counter += 1
+
+    eliminate_dead_code(gm)
+    delete_all_unused_submodules(gm)
+    return fused_key_counter
+
+
 class FuseNVFP4MoeConfig(TransformConfig):
     """Configuration for NVFP4 MoE fusion transform."""
 
+    backend: Literal["trtllm", "trtllm_gen"] = Field(
+        default="trtllm",
+        description="Backend to use for NVFP4 MoE computation ('trtllm' or 'trtllm_gen').",
+    )
     allow_different_input_scales: bool = Field(
         default=False,
         description=(
@@ -2279,6 +2656,14 @@ class FuseNVFP4MoeConfig(TransformConfig):
             "Note: NVFP4 uses min() (not max like FP8) because scales are in kernel format (2688/amax): "
             "smaller scale = larger amax = larger dynamic range. "
             "This may impact accuracy if scales differ significantly."
+        ),
+    )
+    reverse_interleaved_input_scales: bool = Field(
+        default=True,
+        description=(
+            "If True, assumes incoming NVFP4 block scales are already interleaved "
+            "(as produced by quantization load_hook), applies block_scale_interleave_reverse "
+            "before TRTLLM-Gen shuffle+interleave. Only used when backend='trtllm_gen'."
         ),
     )
 
@@ -2302,10 +2687,17 @@ class FuseNVFP4Moe(BaseTransform):
         shared_config: SharedConfig,
     ) -> Tuple[GraphModule, TransformInfo]:
         with cuda_memory_tracker():
-            fused_key_counter = _stack_nvfp4_moe_weights(
-                gm,
-                allow_different_input_scales=self.config.allow_different_input_scales,
-            )
+            if self.config.backend == "trtllm":
+                fused_key_counter = _stack_nvfp4_cutlass_moe_weights(
+                    gm,
+                    allow_different_input_scales=self.config.allow_different_input_scales,
+                )
+            else:
+                fused_key_counter = _stack_nvfp4_trtllm_gen_moe_weights(
+                    gm,
+                    allow_different_input_scales=self.config.allow_different_input_scales,
+                    reverse_interleaved_input_scales=self.config.reverse_interleaved_input_scales,
+                )
 
         info = TransformInfo(
             skipped=(fused_key_counter == 0),
