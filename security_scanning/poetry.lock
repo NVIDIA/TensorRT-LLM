@@ -1060,13 +1060,13 @@ cu13 = ["cuda-bindings[all] (==13.*)"]
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.4.1"
+version = "1.4.2"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 files = [
-    {file = "cuda_pathfinder-1.4.1-py3-none-any.whl", hash = "sha256:40793006082de88e0950753655e55558a446bed9a7d9d0bcb48b2506d50ed82a"},
+    {file = "cuda_pathfinder-1.4.2-py3-none-any.whl", hash = "sha256:eb354abc20278f8609dc5b666a24648655bef5613c6dfe78a238a6fd95566754"},
 ]
 
 [[package]]
@@ -1117,46 +1117,49 @@ tileiras = ["nvidia-cuda-nvcc (>=13.2,<13.3)", "nvidia-cuda-tileiras (>=13.2,<13
 
 [[package]]
 name = "cuda-toolkit"
-version = "13.1.1"
+version = "13.2.0"
 description = "CUDA Toolkit meta-package"
 optional = false
 python-versions = "*"
 groups = ["main"]
 files = [
-    {file = "cuda_toolkit-13.1.1-py2.py3-none-any.whl", hash = "sha256:aeda5a569e73d00c331bb8103974772fe645b31f3c7982a15738df1fc7b5e7ec"},
+    {file = "cuda_toolkit-13.2.0-py2.py3-none-any.whl", hash = "sha256:d749077fdf11010881c208978b5fdd3e302290cc2f141ae92ed6e989ea9a65c7"},
 ]
 
 [package.dependencies]
-nvidia-cuda-runtime = {version = "==13.1.80.*", optional = true, markers = "(sys_platform == \"linux\" or sys_platform == \"win32\") and extra == \"cudart\""}
+nvidia-cuda-runtime = {version = "==13.2.51.*", optional = true, markers = "(sys_platform == \"win32\" or sys_platform == \"linux\") and extra == \"cudart\""}
 
 [package.extras]
-all = ["nvidia-cublas (==13.2.1.1.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-cccl (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-crt (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-culibos (==13.1.115.*) ; sys_platform == \"linux\"", "nvidia-cuda-cupti (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-cuxxfilt (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-nvcc (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-nvrtc (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-opencl (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-profiler-api (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-runtime (==13.1.80.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-sanitizer-api (==13.1.118.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cuda-tileiras (==13.1.80.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cufft (==12.1.0.78.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cufile (==1.16.1.26.*) ; sys_platform == \"linux\"", "nvidia-curand (==10.4.1.81.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cusolver (==12.0.9.81.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-cusparse (==12.7.3.1.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-npp (==13.0.3.3.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvfatbin (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvjitlink (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvjpeg (==13.0.3.75.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvml-dev (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvptxcompiler (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvtx (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\"", "nvidia-nvvm (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cccl = ["nvidia-cuda-cccl (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-crt = ["nvidia-cuda-crt (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cublas = ["nvidia-cublas (==13.2.1.1.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cudart = ["nvidia-cuda-runtime (==13.1.80.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cufft = ["nvidia-cufft (==12.1.0.78.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cufile = ["nvidia-cufile (==1.16.1.26.*) ; sys_platform == \"linux\""]
-culibos = ["nvidia-cuda-culibos (==13.1.115.*) ; sys_platform == \"linux\""]
-cupti = ["nvidia-cuda-cupti (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-curand = ["nvidia-curand (==10.4.1.81.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cusolver = ["nvidia-cusolver (==12.0.9.81.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cusparse = ["nvidia-cusparse (==12.7.3.1.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-cuxxfilt = ["nvidia-cuda-cuxxfilt (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-npp = ["nvidia-npp (==13.0.3.3.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvcc = ["nvidia-cuda-nvcc (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvfatbin = ["nvidia-nvfatbin (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvjitlink = ["nvidia-nvjitlink (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvjpeg = ["nvidia-nvjpeg (==13.0.3.75.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvml = ["nvidia-nvml-dev (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvptxcompiler = ["nvidia-nvptxcompiler (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvrtc = ["nvidia-cuda-nvrtc (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvtx = ["nvidia-nvtx (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-nvvm = ["nvidia-nvvm (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-opencl = ["nvidia-cuda-opencl (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-profiler = ["nvidia-cuda-profiler-api (==13.1.115.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-sanitizer = ["nvidia-cuda-sanitizer-api (==13.1.118.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
-tileiras = ["nvidia-cuda-tileiras (==13.1.80.*) ; sys_platform == \"linux\" or sys_platform == \"win32\""]
+all = ["nvidia-cublas (==13.3.0.5.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-cccl (==13.2.27.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-crt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-culibos (==13.2.51.*) ; sys_platform == \"linux\"", "nvidia-cuda-cuobjdump (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-cupti (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-cuxxfilt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-nvcc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-nvdisasm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-nvrtc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-opencl (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-profiler-api (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-runtime (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-sanitizer-api (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cuda-tileiras (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cudla (==13.2.51.*) ; sys_platform == \"linux\"", "nvidia-cufft (==12.2.0.37.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cufile (==1.17.0.44.*) ; sys_platform == \"linux\"", "nvidia-curand (==10.4.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cusolver (==12.1.0.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-cusparse (==12.7.9.17.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-npp (==13.1.0.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvfatbin (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvjitlink (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvjpeg (==13.0.4.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvml-dev (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvptxcompiler (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvtx (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\"", "nvidia-nvvm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cccl = ["nvidia-cuda-cccl (==13.2.27.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+crt = ["nvidia-cuda-crt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cublas = ["nvidia-cublas (==13.3.0.5.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cudart = ["nvidia-cuda-runtime (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cudla = ["nvidia-cudla (==13.2.51.*) ; sys_platform == \"linux\""]
+cufft = ["nvidia-cufft (==12.2.0.37.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cufile = ["nvidia-cufile (==1.17.0.44.*) ; sys_platform == \"linux\""]
+culibos = ["nvidia-cuda-culibos (==13.2.51.*) ; sys_platform == \"linux\""]
+cuobjdump = ["nvidia-cuda-cuobjdump (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cupti = ["nvidia-cuda-cupti (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+curand = ["nvidia-curand (==10.4.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cusolver = ["nvidia-cusolver (==12.1.0.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cusparse = ["nvidia-cusparse (==12.7.9.17.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+cuxxfilt = ["nvidia-cuda-cuxxfilt (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+npp = ["nvidia-npp (==13.1.0.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvcc = ["nvidia-cuda-nvcc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvdisasm = ["nvidia-cuda-nvdisasm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvfatbin = ["nvidia-nvfatbin (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvjitlink = ["nvidia-nvjitlink (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvjpeg = ["nvidia-nvjpeg (==13.0.4.44.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvml = ["nvidia-nvml-dev (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvptxcompiler = ["nvidia-nvptxcompiler (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvrtc = ["nvidia-cuda-nvrtc (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvtx = ["nvidia-nvtx (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+nvvm = ["nvidia-nvvm (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+opencl = ["nvidia-cuda-opencl (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+profiler = ["nvidia-cuda-profiler-api (==13.2.20.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+sanitizer = ["nvidia-cuda-sanitizer-api (==13.2.23.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
+tileiras = ["nvidia-cuda-tileiras (==13.2.51.*) ; sys_platform == \"win32\" or sys_platform == \"linux\""]
 
 [[package]]
 name = "cycler"
@@ -3073,14 +3076,14 @@ dill = ">=0.3.8"
 
 [[package]]
 name = "narwhals"
-version = "2.17.0"
+version = "2.18.0"
 description = "Extremely lightweight compatibility layer between dataframe libraries"
 optional = false
 python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "narwhals-2.17.0-py3-none-any.whl", hash = "sha256:2ac5307b7c2b275a7d66eeda906b8605e3d7a760951e188dcfff86e8ebe083dd"},
-    {file = "narwhals-2.17.0.tar.gz", hash = "sha256:ebd5bc95bcfa2f8e89a8ac09e2765a63055162837208e67b42d6eeb6651d5e67"},
+    {file = "narwhals-2.18.0-py3-none-any.whl", hash = "sha256:68378155ee706ac9c5b25868ef62ecddd62947b6df7801a0a156bc0a615d2d0d"},
+    {file = "narwhals-2.18.0.tar.gz", hash = "sha256:1de5cee338bc17c338c6278df2c38c0dd4290499fcf70d75e0a51d5f22a6e960"},
 ]
 
 [package.extras]
@@ -3319,16 +3322,16 @@ files = [
 
 [[package]]
 name = "nvidia-cuda-runtime"
-version = "13.1.80"
+version = "13.2.51"
 description = "CUDA Runtime native Libraries"
 optional = false
 python-versions = ">=3"
 groups = ["main"]
 markers = "sys_platform == \"win32\" or sys_platform == \"linux\""
 files = [
-    {file = "nvidia_cuda_runtime-13.1.80-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:5f1aa8fd779cae1a78aa8fdbaa5e4f245300baff120099d9b5ee84e3f4506a29"},
-    {file = "nvidia_cuda_runtime-13.1.80-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:dac25b52e69050e5a7a84957e6df470a85b185f8f648a99a1ab1dfce027576cf"},
-    {file = "nvidia_cuda_runtime-13.1.80-py3-none-win_amd64.whl", hash = "sha256:00db7158108d3ec7fe213fa78e2640d664b5b1b6b85485007dde29ccaa6abef6"},
+    {file = "nvidia_cuda_runtime-13.2.51-py3-none-manylinux2014_aarch64.manylinux_2_17_aarch64.whl", hash = "sha256:dfcccf62936b211a86e3cbc5fcc30647af8e601744e987f6a5925ed045b58672"},
+    {file = "nvidia_cuda_runtime-13.2.51-py3-none-manylinux2014_x86_64.manylinux_2_17_x86_64.whl", hash = "sha256:9c43b06a52c5b9316e19abc047236932c4d5c729969918a83223c4d2a4132f9a"},
+    {file = "nvidia_cuda_runtime-13.2.51-py3-none-win_amd64.whl", hash = "sha256:2f12e8db61a90a15af531414f387635e1598e44a2702bc34c75eb926fc96fd5e"},
 ]
 
 [[package]]
@@ -6297,67 +6300,21 @@ dev = ["bitsandbytes", "blobfile", "cmake (>=3.19.0,<4.0.0)", "diskcache", "expe
 
 [[package]]
 name = "torchprofile"
-version = "0.0.4"
-description = ""
+version = "0.1.0"
+description = "Count the MACs / FLOPs of PyTorch models"
 optional = false
-python-versions = "*"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "torchprofile-0.0.4-py3-none-any.whl", hash = "sha256:7151fe88dc770f0eeec241244a4c7feaec2c5e8c7852386bc2d6a8d7dde7384d"},
-    {file = "torchprofile-0.0.4.tar.gz", hash = "sha256:96b6da17d752a06b02977e078aea95614893b31d4117dd5dcd081f30ce65611b"},
+    {file = "torchprofile-0.1.0-py3-none-any.whl", hash = "sha256:39aefcd194927befb0cfe7ed886be565dee384e3889d0b6890bace5ae1614578"},
+    {file = "torchprofile-0.1.0.tar.gz", hash = "sha256:aeb725e9446b3a6d8f82d0f0cf944a6ffb9cced4e5db1354ad3b9692ce820dac"},
 ]
 
 [package.dependencies]
-numpy = ">=1.14"
-torch = ">=1.4"
-torchvision = ">=0.4"
-
-[[package]]
-name = "torchvision"
-version = "0.24.1"
-description = "image and video datasets and models for torch deep learning"
-optional = false
-python-versions = ">=3.10"
-groups = ["main"]
-files = [
-    {file = "torchvision-0.24.1-cp310-cp310-macosx_11_0_arm64.whl", hash = "sha256:ded5e625788572e4e1c4d155d1bbc48805c113794100d70e19c76e39e4d53465"},
-    {file = "torchvision-0.24.1-cp310-cp310-manylinux_2_28_aarch64.whl", hash = "sha256:54ed17c3d30e718e08d8da3fd5b30ea44b0311317e55647cb97077a29ecbc25b"},
-    {file = "torchvision-0.24.1-cp310-cp310-manylinux_2_28_x86_64.whl", hash = "sha256:f476da4e085b7307aaab6f540219617d46d5926aeda24be33e1359771c83778f"},
-    {file = "torchvision-0.24.1-cp310-cp310-win_amd64.whl", hash = "sha256:fbdbdae5e540b868a681240b7dbd6473986c862445ee8a138680a6a97d6c34ff"},
-    {file = "torchvision-0.24.1-cp311-cp311-macosx_11_0_arm64.whl", hash = "sha256:056c525dc875f18fe8e9c27079ada166a7b2755cea5a2199b0bc7f1f8364e600"},
-    {file = "torchvision-0.24.1-cp311-cp311-manylinux_2_28_aarch64.whl", hash = "sha256:1e39619de698e2821d71976c92c8a9e50cdfd1e993507dfb340f2688bfdd8283"},
-    {file = "torchvision-0.24.1-cp311-cp311-manylinux_2_28_x86_64.whl", hash = "sha256:a0f106663e60332aa4fcb1ca2159ef8c3f2ed266b0e6df88de261048a840e0df"},
-    {file = "torchvision-0.24.1-cp311-cp311-win_amd64.whl", hash = "sha256:a9308cdd37d8a42e14a3e7fd9d271830c7fecb150dd929b642f3c1460514599a"},
-    {file = "torchvision-0.24.1-cp312-cp312-macosx_11_0_arm64.whl", hash = "sha256:e48bf6a8ec95872eb45763f06499f87bd2fb246b9b96cb00aae260fda2f96193"},
-    {file = "torchvision-0.24.1-cp312-cp312-manylinux_2_28_aarch64.whl", hash = "sha256:7fb7590c737ebe3e1c077ad60c0e5e2e56bb26e7bccc3b9d04dbfc34fd09f050"},
-    {file = "torchvision-0.24.1-cp312-cp312-manylinux_2_28_x86_64.whl", hash = "sha256:66a98471fc18cad9064123106d810a75f57f0838eee20edc56233fd8484b0cc7"},
-    {file = "torchvision-0.24.1-cp312-cp312-win_amd64.whl", hash = "sha256:4aa6cb806eb8541e92c9b313e96192c6b826e9eb0042720e2fa250d021079952"},
-    {file = "torchvision-0.24.1-cp313-cp313-macosx_12_0_arm64.whl", hash = "sha256:8a6696db7fb71eadb2c6a48602106e136c785642e598eb1533e0b27744f2cce6"},
-    {file = "torchvision-0.24.1-cp313-cp313-manylinux_2_28_aarch64.whl", hash = "sha256:db2125c46f9cb25dc740be831ce3ce99303cfe60439249a41b04fd9f373be671"},
-    {file = "torchvision-0.24.1-cp313-cp313-manylinux_2_28_x86_64.whl", hash = "sha256:f035f0cacd1f44a8ff6cb7ca3627d84c54d685055961d73a1a9fb9827a5414c8"},
-    {file = "torchvision-0.24.1-cp313-cp313-win_amd64.whl", hash = "sha256:16274823b93048e0a29d83415166a2e9e0bf4e1b432668357b657612a4802864"},
-    {file = "torchvision-0.24.1-cp313-cp313t-macosx_11_0_arm64.whl", hash = "sha256:e3f96208b4bef54cd60e415545f5200346a65024e04f29a26cd0006dbf9e8e66"},
-    {file = "torchvision-0.24.1-cp313-cp313t-manylinux_2_28_aarch64.whl", hash = "sha256:f231f6a4f2aa6522713326d0d2563538fa72d613741ae364f9913027fa52ea35"},
-    {file = "torchvision-0.24.1-cp313-cp313t-manylinux_2_28_x86_64.whl", hash = "sha256:1540a9e7f8cf55fe17554482f5a125a7e426347b71de07327d5de6bfd8d17caa"},
-    {file = "torchvision-0.24.1-cp313-cp313t-win_amd64.whl", hash = "sha256:d83e16d70ea85d2f196d678bfb702c36be7a655b003abed84e465988b6128938"},
-    {file = "torchvision-0.24.1-cp314-cp314-macosx_11_0_arm64.whl", hash = "sha256:cccf4b4fec7fdfcd3431b9ea75d1588c0a8596d0333245dafebee0462abe3388"},
-    {file = "torchvision-0.24.1-cp314-cp314-manylinux_2_28_aarch64.whl", hash = "sha256:1b495edd3a8f9911292424117544f0b4ab780452e998649425d1f4b2bed6695f"},
-    {file = "torchvision-0.24.1-cp314-cp314-manylinux_2_28_x86_64.whl", hash = "sha256:ab211e1807dc3e53acf8f6638df9a7444c80c0ad050466e8d652b3e83776987b"},
-    {file = "torchvision-0.24.1-cp314-cp314-win_amd64.whl", hash = "sha256:18f9cb60e64b37b551cd605a3d62c15730c086362b40682d23e24b616a697d41"},
-    {file = "torchvision-0.24.1-cp314-cp314t-macosx_11_0_arm64.whl", hash = "sha256:ec9d7379c519428395e4ffda4dbb99ec56be64b0a75b95989e00f9ec7ae0b2d7"},
-    {file = "torchvision-0.24.1-cp314-cp314t-manylinux_2_28_aarch64.whl", hash = "sha256:af9201184c2712d808bd4eb656899011afdfce1e83721c7cb08000034df353fe"},
-    {file = "torchvision-0.24.1-cp314-cp314t-manylinux_2_28_x86_64.whl", hash = "sha256:9ef95d819fd6df81bc7cc97b8f21a15d2c0d3ac5dbfaab5cbc2d2ce57114b19e"},
-    {file = "torchvision-0.24.1-cp314-cp314t-win_amd64.whl", hash = "sha256:480b271d6edff83ac2e8d69bbb4cf2073f93366516a50d48f140ccfceedb002e"},
-]
-
-[package.dependencies]
-numpy = "*"
-pillow = ">=5.3.0,<8.3.dev0 || >=8.4.dev0"
-torch = "2.9.1"
+torch = ">=2.0"
 
 [package.extras]
-gdown = ["gdown (>=4.7.3)"]
-scipy = ["scipy"]
+test = ["pytest", "torchvision (>=0.15)", "transformers"]
 
 [[package]]
 name = "tqdm"
@@ -6383,14 +6340,14 @@ telegram = ["requests"]
 
 [[package]]
 name = "transformers"
-version = "4.57.1"
+version = "4.57.3"
 description = "State-of-the-art Machine Learning for JAX, PyTorch and TensorFlow"
 optional = false
 python-versions = ">=3.9.0"
 groups = ["main"]
 files = [
-    {file = "transformers-4.57.1-py3-none-any.whl", hash = "sha256:b10d05da8fa67dc41644dbbf9bc45a44cb86ae33da6f9295f5fbf5b7890bd267"},
-    {file = "transformers-4.57.1.tar.gz", hash = "sha256:f06c837959196c75039809636cd964b959f6604b75b8eeec6fdfc0440b89cc55"},
+    {file = "transformers-4.57.3-py3-none-any.whl", hash = "sha256:c77d353a4851b1880191603d36acb313411d3577f6e2897814f333841f7003f4"},
+    {file = "transformers-4.57.3.tar.gz", hash = "sha256:df4945029aaddd7c09eec5cad851f30662f8bd1746721b34cc031d70c65afebc"},
 ]
 
 [package.dependencies]
@@ -6936,4 +6893,4 @@ type = ["pytest-mypy"]
 [metadata]
 lock-version = "2.1"
 python-versions = ">=3.10,<3.13"
-content-hash = "111050184484083bb4ff571668c1c74e98ad1dffc1dfa7032cd358c830b95951"
+content-hash = "f34e231d780dadda61250d242d7e2680b24c8be7e275654c1180c3698c276aca"
