@@ -45,25 +45,28 @@ class MTPHiddenStatesManager(BaseResourceManager):
         self.hidden_size = hidden_size
         self.max_num_requests = max_num_requests
         self.use_relaxed_acceptance_for_thinking = config.use_relaxed_acceptance_for_thinking
-        self.slot_manager = SlotManager(max_num_requests)
+        # Reserve one extra slot for the CUDA graph padding dummy request,
+        # which is kept alive permanently and must not consume a real slot.
+        slot_pool_size = max_num_requests + 1
+        self.slot_manager = SlotManager(slot_pool_size)
         # Optional SA manager for MTP+SA mode
         self.sa_manager = sa_manager
 
         # Since golden token's hidden state will always be generated after target model
         self.mtp_past_hidden_states_pool = torch.zeros(
-            (max_num_requests, self.num_nextn_predict_layers, self.hidden_size),
+            (slot_pool_size, self.num_nextn_predict_layers, self.hidden_size),
             device='cuda',
             dtype=self.dtype,
         )
         self.mtp_past_tokens_pool = torch.zeros(
-            (max_num_requests, self.num_nextn_predict_layers),
+            (slot_pool_size, self.num_nextn_predict_layers),
             device='cuda',
             dtype=torch.int,
         )
         if self.use_relaxed_acceptance_for_thinking:
             # The relaxed_delta for relaxed acceptance
             self.mtp_relaxed_delta_pool = torch.zeros(
-                (self.max_num_requests),
+                (slot_pool_size),
                 dtype=torch.float,
                 device='cuda',
             )
