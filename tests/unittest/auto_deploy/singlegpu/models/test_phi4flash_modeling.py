@@ -7,6 +7,7 @@ Hierarchical test levels:
 4. Export test — torch_export_to_gm with dynamic shapes
 """
 
+import copy
 import math
 from typing import Optional, Tuple
 
@@ -16,7 +17,6 @@ import torch.nn.functional as F
 from torch import nn
 from torch.export import Dim
 
-from tensorrt_llm._torch.auto_deploy.custom_ops.mamba.torch_mamba import _torch_ssm_prefill
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_phi4flash import (
     Phi4FlashAttention,
@@ -75,6 +75,54 @@ def _create_small_config() -> Phi4FlashConfig:
 
 def _lambda_init_fn(depth: int) -> float:
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
+
+
+def _swiglu(gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    return value * F.silu(gate)
+
+
+def _hf_phi4flash_ssm_prefill(
+    x: torch.Tensor,
+    z: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    yoco_kv: bool,
+) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+    batch_size, seq_len, d_inner = x.shape
+    d_state = B.shape[-1]
+    state = torch.zeros(batch_size, d_inner, d_state, device=x.device, dtype=torch.float32)
+    A_fp32 = A.to(torch.float32)
+    D_fp32 = D.to(torch.float32)
+    dt_bias_fp32 = dt_bias.to(torch.float32)
+
+    outputs = []
+    yoco_key_values = []
+    for token_idx in range(seq_len):
+        x_t = x[:, token_idx].to(torch.float32)
+        z_t = z[:, token_idx].to(torch.float32)
+        dt_t = F.softplus(dt[:, token_idx].to(torch.float32) + dt_bias_fp32)
+        B_t = B[:, token_idx].to(torch.float32)
+        C_t = C[:, token_idx].to(torch.float32)
+
+        dA = torch.exp(dt_t.unsqueeze(-1) * A_fp32.unsqueeze(0))
+        dB = dt_t.unsqueeze(-1) * B_t.unsqueeze(1)
+        state = state * dA + x_t.unsqueeze(-1) * dB
+
+        y_t = torch.einsum("bdn,bn->bd", state, C_t) + D_fp32.unsqueeze(0) * x_t
+        if yoco_kv:
+            yoco_key_values.append(y_t.to(dtype=x.dtype))
+            y_t = _swiglu(z_t, y_t)
+        else:
+            y_t = y_t * F.silu(z_t)
+        outputs.append(y_t.to(dtype=x.dtype))
+
+    y = torch.stack(outputs, dim=1)
+    yoco_out = torch.stack(yoco_key_values, dim=1) if yoco_kv else None
+    return y, yoco_out
 
 
 def _split_heads(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -238,6 +286,7 @@ class RefPhi4FlashMamba(nn.Module):
         self.d_model = config.hidden_size
         self.d_state = config.mamba_d_state
         self.d_conv = config.mamba_d_conv
+        self.expand = config.mamba_expand
         self.d_inner = config.mamba_expand * config.hidden_size
         self.num_heads = self.d_inner
         self.head_dim = 1
@@ -261,8 +310,8 @@ class RefPhi4FlashMamba(nn.Module):
             )
             self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
             self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-            A = torch.arange(1, self.num_heads + 1, dtype=torch.float32)
-            self.A_log = nn.Parameter(torch.log(A))
+            A = torch.arange(1, self.d_state + 1, dtype=torch.float32).unsqueeze(0)
+            self.A_log = nn.Parameter(torch.log(A.expand(self.d_inner, -1).contiguous()))
             self.D = nn.Parameter(torch.ones(self.d_inner))
         self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.mamba_proj_bias)
 
@@ -274,29 +323,24 @@ class RefPhi4FlashMamba(nn.Module):
         dtype = hidden_states.dtype
         if self.yoco_cross:
             out = self.in_proj(hidden_states)
-            out = out * torch.sigmoid(yoco_key_values)
+            out = _swiglu(out, yoco_key_values)
             return self.out_proj(out), yoco_key_values
 
         x, z = self.in_proj(hidden_states).chunk(2, dim=-1)
         x = self.conv1d(x.transpose(1, 2))[..., : hidden_states.shape[1]].transpose(1, 2)
         x = F.silu(x)
         dt, B, C = torch.split(self.x_proj(x), [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        y, _ = _torch_ssm_prefill(
-            hidden_states=x.view(
-                hidden_states.shape[0], hidden_states.shape[1], self.num_heads, self.head_dim
-            ),
+        y, yoco_out = _hf_phi4flash_ssm_prefill(
+            x=x,
+            z=z,
             A=-torch.exp(self.A_log.float()),
-            B=B.view(hidden_states.shape[0], hidden_states.shape[1], self.n_groups, self.d_state),
-            C=C.view(hidden_states.shape[0], hidden_states.shape[1], self.n_groups, self.d_state),
+            B=B,
+            C=C,
             D=self.D,
             dt=torch.matmul(dt, self.dt_proj.weight.t()),
             dt_bias=self.dt_proj.bias,
-            time_step_limit=[0.0, float("inf")],
-            chunk_size=256,
+            yoco_kv=self.yoco_kv,
         )
-        y = y.view(hidden_states.shape[0], hidden_states.shape[1], -1)
-        yoco_out = y if self.yoco_kv else None
-        y = y * (torch.sigmoid(z) if self.yoco_kv else F.silu(z))
         return self.out_proj(y.to(dtype)), yoco_out
 
 
@@ -356,6 +400,8 @@ class RefPhi4FlashForCausalLM(nn.Module):
         )
         self.model.final_layernorm = nn.LayerNorm(config.hidden_size, eps=config.layer_norm_eps)
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=config.lm_head_bias)
+        if config.tie_word_embeddings:
+            self.lm_head.weight = self.model.embed_tokens.weight
 
     def forward(self, input_ids: torch.Tensor, position_ids: torch.Tensor):
         del position_ids
@@ -374,6 +420,12 @@ class RefPhi4FlashForCausalLM(nn.Module):
 
 def _assert_same_state_dict(custom: nn.Module, ref: nn.Module):
     missing, unexpected = ref.load_state_dict(custom.state_dict(), strict=False)
+    assert not missing
+    assert not unexpected
+
+
+def _load_hf_reference_state_dict(custom: nn.Module, ref: nn.Module):
+    missing, unexpected = custom.load_state_dict(copy.deepcopy(ref.state_dict()), strict=False)
     assert not missing
     assert not unexpected
 
@@ -416,11 +468,29 @@ def test_phi4flash_mamba_equivalence(B, S):
         device=device, dtype=dtype
     )
     ref = RefPhi4FlashMamba(config, yoco_cross=False, yoco_kv=False).to(device=device, dtype=dtype)
-    _assert_same_state_dict(custom, ref)
+    _load_hf_reference_state_dict(custom, ref)
     x = torch.randn(B, S, config.hidden_size, device=device, dtype=dtype)
     custom_out, _ = custom(x)
     ref_out, _ = ref(x)
     assert_rmse_close(custom_out, ref_out, rmse_ratio_tol=0.05, msg="Mamba: ")
+
+
+@torch.no_grad()
+def test_phi4flash_mamba_load_preserves_hf_a_log():
+    config = _create_small_config()
+    dtype = torch.bfloat16
+    device = "cpu"
+    custom = Phi4FlashMamba(config, layer_idx=0, yoco_cross=False, yoco_kv=False).to(
+        device=device, dtype=dtype
+    )
+    ref = RefPhi4FlashMamba(config, yoco_cross=False, yoco_kv=False).to(device=device, dtype=dtype)
+    ref_state = copy.deepcopy(ref.state_dict())
+    expected = ref_state["A_log"]
+
+    missing, unexpected = custom.load_state_dict(ref_state, strict=False)
+    assert not missing
+    assert not unexpected
+    torch.testing.assert_close(custom.A_log, expected, rtol=0.0, atol=0.0)
 
 
 @torch.no_grad()
@@ -432,7 +502,7 @@ def test_phi4flash_shared_mamba_equivalence():
         device=device, dtype=dtype
     )
     ref = RefPhi4FlashMamba(config, yoco_cross=True, yoco_kv=True).to(device=device, dtype=dtype)
-    _assert_same_state_dict(custom, ref)
+    _load_hf_reference_state_dict(custom, ref)
     x = torch.randn(2, 6, config.hidden_size, device=device, dtype=dtype)
     ssm = torch.randn(2, 6, config.mamba_expand * config.hidden_size, device=device, dtype=dtype)
     custom_out, _ = custom(x, yoco_key_values=ssm)
@@ -448,7 +518,7 @@ def test_phi4flash_decoder_layer_equivalence(layer_idx):
     device = "cpu"
     layer = Phi4FlashDecoderLayer(config, layer_idx=layer_idx).to(device=device, dtype=dtype)
     ref = RefPhi4FlashDecoderLayer(config, layer_idx=layer_idx).to(device=device, dtype=dtype)
-    _assert_same_state_dict(layer, ref)
+    _load_hf_reference_state_dict(layer, ref)
     x = torch.randn(2, 6, config.hidden_size, device=device, dtype=dtype)
     ssm = torch.randn(2, 6, config.mamba_expand * config.hidden_size, device=device, dtype=dtype)
     head_dim = config.hidden_size // config.num_attention_heads
@@ -474,7 +544,7 @@ def test_phi4flash_full_model_equivalence(B, S):
     device = "cpu"
     custom = Phi4FlashForCausalLM(config).to(device=device, dtype=dtype)
     ref = RefPhi4FlashForCausalLM(config).to(device=device, dtype=dtype)
-    _assert_same_state_dict(custom, ref)
+    _load_hf_reference_state_dict(custom, ref)
     input_ids = torch.randint(0, config.vocab_size, (B, S), device=device)
     position_ids = torch.arange(S, device=device).unsqueeze(0).expand(B, -1)
     custom_out = custom(input_ids=input_ids, position_ids=position_ids)
