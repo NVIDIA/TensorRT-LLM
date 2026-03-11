@@ -667,11 +667,12 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         """
         num_local_layers = self.kv_cache_manager.num_local_layers
         max_pool_idx = self.kv_cache_manager.blocks_in_primary_pool - 1
+        # DSA uses SELFKONLY mode where only key cache is stored (kv_factor=1).
         # host_kv_cache_block_offsets shape: (num_pools, max_batch*beam, 2, max_blocks_per_seq)
-        # The kv_factor dimension (dim=2) must be 1 for SELFKONLY mode (MLA/DSA).
-        kv_factor = self.kv_cache_manager.host_kv_cache_block_offsets.shape[2]
-        assert kv_factor == 1, \
-            f"DSA requires SELFKONLY mode (kv_factor=1), got kv_factor={kv_factor}"
+        # Note: dim=2 is always 2 in the tensor layout (K and V slots), but for
+        # SELFKONLY only the K slot (index 0) contains valid data.
+        assert self.kv_cache_manager.kv_factor == 1, \
+            f"DSA requires SELFKONLY mode (kv_factor=1), got kv_factor={self.kv_cache_manager.kv_factor}"
         # Pool 0, first num_seqs entries, field 0 (key offsets)
         encoded = self.kv_cache_manager.host_kv_cache_block_offsets[
             0, :self.num_seqs, 0, :]
@@ -1284,7 +1285,7 @@ class Indexer(nn.Module):
             host_slot_mapping_scale_fullkv = torch.empty(
                 total_kv_len, dtype=torch.int64, pin_memory=prefer_pinned())
 
-            req_indices = torch.repeat_interleave(
+            fullkv_req_indices = torch.repeat_interleave(
                 torch.arange(num_contexts, dtype=torch.int64, device='cpu'),
                 total_kv_per_request)
 
@@ -1294,23 +1295,14 @@ class Indexer(nn.Module):
                              device='cpu') for i in range(num_contexts)
             ])
 
-            block_indices_in_seq = kv_positions // tokens_per_block
-            pos_in_blocks = kv_positions % tokens_per_block
-
-            max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
-            assert (block_indices_in_seq < max_blocks).all(), \
-                f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
-
-            # Gather block IDs
-            block_ids = metadata.host_indexer_k_cache_block_offsets[
-                req_indices, block_indices_in_seq]
-
-            assert (block_ids >= 0).all(), \
-                f"Unallocated block (block_id < 0) found at positions {torch.where(block_ids < 0)[0].tolist()}"
-
-            # Compute flat indices for all kv slots in the batch
-            fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
-            scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+            fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
+                kv_positions,
+                metadata.host_indexer_k_cache_block_offsets,
+                fullkv_req_indices,
+                head_dim,
+                tokens_per_block,
+                quant_block_size,
+            )
 
             host_slot_mapping_fp8_fullkv[:total_kv_len] = fp8_flat_indices
             host_slot_mapping_scale_fullkv[:total_kv_len] = scale_flat_indices
