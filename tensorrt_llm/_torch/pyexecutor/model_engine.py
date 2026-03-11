@@ -146,6 +146,8 @@ class PyTorchModelEngine(ModelEngine):
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
         checkpoint_loader: Optional[BaseCheckpointLoader] = None,
+        model_weights_memory_tag: Optional[str] = None,
+        model_weights_restore_mode=None,
     ):
         self.forward_pass_callable = None
         self.ub_buffers = None
@@ -212,6 +214,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
+                model_weights_memory_tag=model_weights_memory_tag,
+                model_weights_restore_mode=model_weights_restore_mode,
             )
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)

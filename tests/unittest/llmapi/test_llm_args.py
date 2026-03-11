@@ -1,4 +1,5 @@
 import tempfile
+from collections import defaultdict
 from dataclasses import is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -18,6 +19,7 @@ from tensorrt_llm._torch.auto_deploy.llm_args import \
     LlmArgs as AutoDeployLlmArgs
 from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.models.modeling_llama import LlamaForCausalLM
+from tensorrt_llm._torch.virtual_memory import RestoreMode
 from tensorrt_llm.builder import LoraConfig
 from tensorrt_llm.commands.serve import get_llm_args, is_non_default_or_required
 from tensorrt_llm.llmapi import (BuildConfig, CapacitySchedulerPolicy,
@@ -29,13 +31,15 @@ from tensorrt_llm.llmapi.llm_args import (BaseLlmArgs, CacheTransceiverConfig,
                                           DynamicBatchConfig,
                                           Eagle3DecodingConfig,
                                           EagleDecodingConfig,
+                                          ExecutorMemoryType,
                                           ExtendedRuntimePerfKnobConfig,
                                           KvCacheConfig,
                                           LookaheadDecodingConfig, MoeConfig,
                                           PeftCacheConfig, PybindMirror,
-                                          RayPlacementConfig, SpeculativeConfig,
-                                          StrictBaseModel, TorchCompileConfig,
-                                          TorchLlmArgs, TrtLlmArgs,
+                                          RayPlacementConfig, SleepConfig,
+                                          SpeculativeConfig, StrictBaseModel,
+                                          TorchCompileConfig, TorchLlmArgs,
+                                          TrtLlmArgs,
                                           UserProvidedDecodingConfig,
                                           update_llm_args_with_extra_dict)
 # fmt: on
@@ -347,6 +351,36 @@ def test_ContextChunkingPolicy():
     val = ContextChunkingPolicy.EQUAL_PROGRESS
     assert PybindMirror.maybe_to_pybind(
         val) == tle.ContextChunkingPolicy.EQUAL_PROGRESS
+
+
+def test_SleepConfig_restore_modes_normalized_from_dict():
+    sleep_config = SleepConfig(
+        restore_modes={
+            ExecutorMemoryType.KV_CACHE.value: "NONE",
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN.value: "CPU",
+        })
+
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.CPU
+    assert isinstance(sleep_config.restore_modes[ExecutorMemoryType.SAMPLER],
+                      RestoreMode)
+
+
+def test_SleepConfig_restore_modes_normalized_from_defaultdict():
+    sleep_config = SleepConfig(restore_modes=defaultdict(
+        lambda: RestoreMode.CPU, {
+            ExecutorMemoryType.KV_CACHE: RestoreMode.NONE,
+            ExecutorMemoryType.MODEL_WEIGHTS_MAIN: "PINNED",
+        }))
+
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.KV_CACHE] == RestoreMode.NONE
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.MODEL_WEIGHTS_MAIN] == RestoreMode.PINNED
+    assert sleep_config.restore_modes[
+        ExecutorMemoryType.SAMPLER] == RestoreMode.CPU
 
 
 def test_DynamicBatchConfig_declaration():
