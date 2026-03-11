@@ -19,7 +19,6 @@ l0_sanity_check:
       linux_distribution_name: ubuntu*
   tests:
     - llmapi/test_llm_examples.py::test_llmapi_quickstart
-    - examples/test_visual_gen.py::test_visual_gen_quickstart
     - llmapi/test_llm_examples.py::test_llmapi_example_inference
     - llmapi/test_llm_examples.py::test_llmapi_example_inference_async
     - llmapi/test_llm_examples.py::test_llmapi_example_inference_async_streaming

@@ -17,7 +17,10 @@
 #
 # Requirements:
 #   pip install git+https://github.com/huggingface/diffusers.git
-#   pip install av
+#
+# Optional (for MP4/H.264 video output):
+#   apt-get install ffmpeg   # or: conda install ffmpeg
+#   Without ffmpeg, videos are saved as AVI/MJPEG using a pure-Python encoder.
 
 set -euo pipefail
 
