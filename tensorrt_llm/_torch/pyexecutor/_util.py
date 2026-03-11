@@ -49,7 +49,12 @@ from .seq_slot_manager import SeqSlotManager
 GB = 1 << 30
 
 
-def get_kv_cache_manager_cls(model_config: ModelConfig):
+def ceil_div(a: int, b: int) -> int:
+    return (a + b - 1) // b
+
+
+def get_kv_cache_manager_cls(model_config: ModelConfig,
+                             kv_cache_config: KvCacheConfig):
     config = model_config.pretrained_config
     sparse_attn_config = model_config.sparse_attention_config
     if sparse_attn_config is not None:
@@ -57,7 +62,7 @@ def get_kv_cache_manager_cls(model_config: ModelConfig):
     elif is_nemotron_hybrid(config) or is_qwen3_next(config):
         return MambaHybridCacheManager
     else:
-        return KVCacheManager
+        return KVCacheManagerV2 if kv_cache_config.use_kv_cache_manager_v2 else KVCacheManager
 
 
 def is_vswa_enabled(kv_cache_config):
@@ -100,6 +105,8 @@ class KvCacheCreator:
         self._max_beam_width = max_beam_width
         self._kv_connector_manager = kv_connector_manager
         self._llm_args = llm_args
+        # For V2 fallback use only, will be removed after V2 is stable
+        self._cache_transceiver_config = llm_args.cache_transceiver_config
         self._speculative_config = speculative_config
         self._sparse_attention_config = sparse_attention_config
         self._tokens_per_block = tokens_per_block
@@ -109,10 +116,18 @@ class KvCacheCreator:
         self._dummy_reqs = None
         self._profiling_stage_data = profiling_stage_data
         self._kv_cache_manager_cls = get_kv_cache_manager_cls(
-            model_engine.model.model_config)
+            model_engine.model.model_config, kv_cache_config)
         self._execution_stream = execution_stream
-        if self._kv_cache_manager_cls == KVCacheManager and kv_cache_config.use_kv_cache_manager_v2:
-            self._kv_cache_manager_cls = KVCacheManagerV2
+        if self._kv_cache_manager_cls == KVCacheManagerV2:
+            if kv_connector_manager is not None or (
+                    max_beam_width is not None and max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "Falling back to KVCacheManager.")
+                self._kv_cache_manager_cls = KVCacheManager
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -150,8 +165,9 @@ class KvCacheCreator:
         logger.info(
             f"Peak memory during memory usage profiling (torch + non-torch): {peak_memory / (GB):.2f} GiB, "
             f"available KV cache memory when calculating max tokens: {available_kv_mem / (GB):.2f} GiB, "
-            f"fraction is set {fraction}, kv size is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
-            f", tmp kv_mem { (allocated_bytes) / (GB):.2f} GiB")
+            f"fraction is set {fraction}, kv size per token is {kv_size_per_token}. device total memory {total_gpu_memory / (GB):.2f} GiB, "
+            f"temporary kv cache memory during profiling {allocated_bytes / (GB):.2f} GiB"
+        )
         return int(available_kv_mem)
 
     def _create_dummy_mm_context_request(
@@ -297,15 +313,15 @@ class KvCacheCreator:
         for req in self._dummy_reqs:
             num_req_tokens = len(req.input_token_ids) + num_extra_tokens_per_seq
             # Requests cannot share KV cache blocks. Round up to nearest integer multiple of block size.
-            num_cache_blocks += (num_req_tokens + self._tokens_per_block -
-                                 1) // self._tokens_per_block
+            num_cache_blocks += ceil_div(num_req_tokens, self._tokens_per_block)
 
         # Max cuda graph warmup required tokens
         max_cuda_graph_bs = min(self._model_engine.batch_size,
                                 self._model_engine._max_cuda_graph_batch_size)
-        cuda_graph_warmup_block = (
-            self._model_engine.max_seq_len +
-            1) // self._tokens_per_block + max_cuda_graph_bs - 1
+        # Round up the max seq len to the block size
+        max_seq_len_blocks = ceil_div(self._model_engine.max_seq_len + 1,
+                                      self._tokens_per_block)
+        cuda_graph_warmup_block = max_seq_len_blocks + max_cuda_graph_bs - 1
         num_cache_blocks = max(cuda_graph_warmup_block, num_cache_blocks)
 
         # This is the minimal blocks required to run with max bs
@@ -401,6 +417,20 @@ class KvCacheCreator:
                 torch_used_bytes = torch.cuda.memory_stats(
                 )["allocated_bytes.all.current"]
             finally:
+                # get kv cache stats for both model and draft model
+                kv_stats = py_executor.resource_manager.resource_managers.get(
+                    ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
+                # Get draft KV cache stats if present (either from two-model mode or one-model
+                # mode with separate draft KV cache)
+                draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
+                    ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
+                kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
+                ) if draft_kv_cache_manager is not None else None
+
+                # get total allocated bytes
+                allocated_bytes = kv_stats.allocated_bytes + (
+                    kv_stats_draft.allocated_bytes
+                    if kv_stats_draft is not None else 0)
                 py_executor.is_warmup = False
                 py_executor.shutdown()
                 py_executor.enable_iter_perf_stats = origin_iter_stats
@@ -417,20 +447,6 @@ class KvCacheCreator:
                 f"Memory used outside torch (e.g., NCCL and CUDA graphs) in memory usage profiling: {extra_cost / (GB):.2f} GiB"
             )
 
-            # get kv cache stats for both model and draft model
-            kv_stats = py_executor.resource_manager.resource_managers.get(
-                ResourceManagerType.KV_CACHE_MANAGER).get_kv_cache_stats()
-            # Get draft KV cache stats if present (either from two-model mode or one-model
-            # mode with separate draft KV cache)
-            draft_kv_cache_manager = py_executor.resource_manager.resource_managers.get(
-                ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
-            kv_stats_draft = draft_kv_cache_manager.get_kv_cache_stats(
-            ) if draft_kv_cache_manager is not None else None
-
-            # get total allocated bytes
-            allocated_bytes = kv_stats.allocated_bytes + (
-                kv_stats_draft.allocated_bytes
-                if kv_stats_draft is not None else 0)
         else:
             peak_memory = total_used_bytes
             allocated_bytes = 0
@@ -442,34 +458,39 @@ class KvCacheCreator:
                                                    allocated_bytes)
 
         # NOTE:
-        # KvCacheCreator currently controls KV-cache capacity using two parameters in KVCacheConfig:
+        # For KVCacheManager, KvCacheCreator currently controls capacity using two parameters in KVCacheConfig:
         #   • max_tokens
         #   • max_gpu_total_bytes
-        # Ideally, the internal logic would rely solely on max_gpu_total_bytes,
-        # leaving max_tokens as a user-defined constraint.
+        # For KVCacheManagerV2, KvCacheCreator controls capacity using max_gpu_total_bytes only.
+        # This leaves max_tokens as a user-defined constraint.
 
         # ---------------------------handle max_tokens---------------------------------
-        # if user provided max_tokens, calculate max memory from max_tokens
-        if self._max_kv_tokens_in is not None:
-            # raise error if it is VSWA case
-            is_vswa = is_vswa_enabled(self._kv_cache_config)
+        if issubclass(self._kv_cache_manager_cls, KVCacheManagerV2):
+            # KVCacheManagerV2 doesn't rely on max_tokens to control capacity, so restore user provided value
+            self._kv_cache_config.max_tokens = self._max_kv_tokens_in
+        else:
+            # handle user provided max_tokens
+            if self._max_kv_tokens_in is not None:
+                # raise error if it is VSWA case
+                is_vswa = is_vswa_enabled(self._kv_cache_config)
 
-            # raise error if it is VSWA case
-            if is_vswa:
-                logger.warning(
-                    "max_tokens should not be set for VSWA case as it is ambiguous concept for VSWA."
+                # raise error if it is VSWA case
+                if is_vswa:
+                    logger.warning(
+                        "max_tokens should not be set for VSWA case as it is ambiguous concept for VSWA."
+                    )
+                # calculate max memory from max_tokens
+                kv_cache_max_memory_from_max_tokens = self._max_kv_tokens_in * self._get_kv_size_per_token(
                 )
-            # calculate max memory from max_tokens
-            kv_cache_max_memory_from_max_tokens = self._max_kv_tokens_in * self._get_kv_size_per_token(
-            )
-            kv_cache_max_memory = min(kv_cache_max_memory,
-                                      kv_cache_max_memory_from_max_tokens)
-            logger.info(
-                f"max_tokens={self._max_kv_tokens_in} is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
-            )
-        # For KvCacheManager, its logic still relies on max_tokens, need to improve in the future.
-        self._kv_cache_config.max_tokens = int(kv_cache_max_memory //
-                                               self._get_kv_size_per_token())
+                kv_cache_max_memory = min(kv_cache_max_memory,
+                                          kv_cache_max_memory_from_max_tokens)
+                logger.info(
+                    f"max_tokens={self._max_kv_tokens_in} is provided. It limits max memory to {kv_cache_max_memory_from_max_tokens / (GB):.2f} GiB. "
+                    f"New max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+                )
+            # For KvCacheManager, its logic still relies on max_tokens to control capacity
+            self._kv_cache_config.max_tokens = int(
+                kv_cache_max_memory // self._get_kv_size_per_token())
         # ---------------------------handle max_tokens---------------------------------
 
         # ---------------------------handle max_gpu_total_bytes---------------------------------
@@ -478,7 +499,7 @@ class KvCacheCreator:
             kv_cache_max_memory = min(kv_cache_max_memory,
                                       self._kv_cache_config.max_gpu_total_bytes)
             logger.info(
-                f"max_gpu_total_bytes={self._kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided, max_memory is set to {kv_cache_max_memory / (GB):.2f} GiB"
+                f"max_gpu_total_bytes={self._kv_cache_config.max_gpu_total_bytes / (GB):.2f} GiB is provided. New max memory is {kv_cache_max_memory / (GB):.2f} GiB"
             )
 
         logger.info(
@@ -595,9 +616,9 @@ class KvCacheCreator:
         target_pretrained_config = self._model_engine.model.model_config.pretrained_config
         target_num_layers = target_pretrained_config.num_hidden_layers
 
-        # PARD: draft is a separate model, layers start from 0.
+        # PARD, External Drafter: draft is a separate model, layers start from 0.
         # Other methods (EAGLE3, MTP): draft layers are appended after target layers.
-        if self._speculative_config.spec_dec_mode.is_pard():
+        if self._speculative_config.spec_dec_mode.is_external_drafter():
             num_draft_layers = self._draft_config.pretrained_config.num_hidden_layers
             spec_dec_layer_mask = [True] * num_draft_layers
         else:
@@ -612,11 +633,19 @@ class KvCacheCreator:
 
         # Get the appropriate KV cache manager class for the draft model
         draft_kv_cache_manager_cls = get_kv_cache_manager_cls(
-            effective_draft_config)
+            effective_draft_config, self._kv_cache_config)
 
         # Use V2 if enabled and the base class is KVCacheManager
-        if draft_kv_cache_manager_cls == KVCacheManager and self._kv_cache_config.use_kv_cache_manager_v2:
-            draft_kv_cache_manager_cls = KVCacheManagerV2
+        if draft_kv_cache_manager_cls == KVCacheManagerV2:
+            if self._kv_connector_manager is not None or (
+                    self._max_beam_width is not None and self._max_beam_width
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
+                        self._cache_transceiver_config is not None
+                        and self._cache_transceiver_config.backend is not None):
+                logger.warning(
+                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "Falling back to KVCacheManager for draft model.")
+                draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
         # Draft KV cache should never use block reuse — it is ephemeral and
@@ -864,6 +893,18 @@ def _create_kv_cache_manager(
             mamba_layer_mask = [
                 char == "M" for char in config.hybrid_override_pattern
             ]
+            # For hybrid models, hybrid_layer_mask is always passed as
+            # layer_mask to KVCacheManager, which means get_pp_layers
+            # sees a non-None layer_mask and won't auto-add spec layers.
+            # We must extend the masks here to include MTP spec layers
+            # (attention-only, no Mamba states) so they get KV cache entries.
+            if spec_config is not None:
+                from ..speculative.utils import get_num_spec_layers
+                num_spec_layers = get_num_spec_layers(spec_config)
+                if num_spec_layers > 0:
+                    hybrid_layer_mask.extend([True] * num_spec_layers)
+                    mamba_layer_mask.extend([False] * num_spec_layers)
+                    num_layers += num_spec_layers
         kv_cache_manager = kv_cache_manager_cls(
             # mamba cache parameters
             config.ssm_state_size,
@@ -1124,7 +1165,8 @@ def create_py_executor_instance(
             if peft_cache_manager is not None else None,
             scheduler_capacity=scheduler_capacity,
         )
-    elif os.getenv("TLLM_USE_PYTHON_SCHEDULER", "0") == "1":
+    elif (scheduler_config is not None
+          and scheduler_config.use_python_scheduler):
         scheduler = SimpleUnifiedScheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,

@@ -63,9 +63,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
         logger.info(
-            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, "
-            "max_batch_size=%s",
-            self.tokens_per_block, max_num_tokens, max_batch_size)
+            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s",
+            self.tokens_per_block,
+            max_num_tokens,
+            max_batch_size,
+        )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
             self.chunk_unit_size = ctx_chunk_config[1]
@@ -231,8 +233,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                         break
 
                     assert (
-                        self.max_context_length is None
-                        or context_tokens <= self.max_context_length
+                        self.max_context_length is None or context_tokens <= self.max_context_length
                     ), (
                         f"Context tokens ({context_tokens}) exceeds limit ({self.max_context_length})"
                     )
@@ -283,6 +284,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 else:
                     # Self-eviction: suspend this gen request to free its
                     # GPU pages so other requests can resume().
+                    import sys; print(
+                        f"[V2Scheduler] Self-evicting request {req.py_request_id} "
+                        f"(state={req.state}) to free GPU pages",
+                        file=sys.stderr, flush=True)
                     self.kv_cache_manager.suspend_request(req)
                     evicted.append(req)
 
@@ -433,6 +438,10 @@ class KVCacheV2Scheduler(RequestScheduler):
                 break
 
             victim = requests_list[victim_idx]
+            import sys; print(
+                f"[V2Scheduler] Evicting request {victim.py_request_id} "
+                f"(state={victim.state}) to free pages for request {req.py_request_id}",
+                file=sys.stderr, flush=True)
             self.kv_cache_manager.suspend_request(victim)
             evicted.append(victim)
             req_it_end = victim_idx

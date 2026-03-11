@@ -1568,6 +1568,7 @@ class TestMixedOrdering:
         started gen requests found backwards from tail). Still fails,
         so req0 self-evicts. All 3 paused.
         """
+
         def selective_gen_alloc(req):
             # req0 always fails, req1 and req2 succeed
             return req.request_id != 0
@@ -1731,12 +1732,11 @@ class TestBlockReuseBoundaryAlignment:
             req.context_remaining_length = 950  # 1000 - 50
             return True
 
-        mgr = make_kv_cache_manager(tokens_per_block=64,
-                                    prepare_context_fn=prepare_with_partial_reuse)
-        sched = make_scheduler(mgr, max_num_tokens=128,
-                               ctx_chunk_config=(None, 64))
-        req = make_ctx_request(0, context_remaining_length=1000,
-                               prompt_len=1000)
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64, prepare_context_fn=prepare_with_partial_reuse
+        )
+        sched = make_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
         # chunk_size should be 78 (aligned to block boundary at pos 128)
@@ -1751,12 +1751,9 @@ class TestBlockReuseBoundaryAlignment:
             req.context_remaining_length = 872  # 1000 - 128
             return True
 
-        mgr = make_kv_cache_manager(tokens_per_block=64,
-                                    prepare_context_fn=prepare_with_full_reuse)
-        sched = make_scheduler(mgr, max_num_tokens=300,
-                               ctx_chunk_config=(None, 64))
-        req = make_ctx_request(0, context_remaining_length=1000,
-                               prompt_len=1000)
+        mgr = make_kv_cache_manager(tokens_per_block=64, prepare_context_fn=prepare_with_full_reuse)
+        sched = make_scheduler(mgr, max_num_tokens=300, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
         # 300 // 64 * 64 = 256; end = 128 + 256 = 384, already aligned
@@ -1771,10 +1768,10 @@ class TestBlockReuseBoundaryAlignment:
             req.context_remaining_length = 80  # 130 - 50
             return True
 
-        mgr = make_kv_cache_manager(tokens_per_block=64,
-                                    prepare_context_fn=prepare_with_partial_reuse)
-        sched = make_scheduler(mgr, max_num_tokens=500,
-                               ctx_chunk_config=(None, 64))
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64, prepare_context_fn=prepare_with_partial_reuse
+        )
+        sched = make_scheduler(mgr, max_num_tokens=500, ctx_chunk_config=(None, 64))
         req = make_ctx_request(0, context_remaining_length=130, prompt_len=130)
         out = sched.schedule_request([req], set())
         assert ids(out.context_requests) == [0]
@@ -1795,13 +1792,13 @@ class TestBlockReuseBoundaryAlignment:
             resize_calls.append(n)
             return True
 
-        mgr = make_kv_cache_manager(tokens_per_block=64,
-                                    prepare_context_fn=prepare_with_partial_reuse,
-                                    resize_context_fn=track_resize)
-        sched = make_scheduler(mgr, max_num_tokens=128,
-                               ctx_chunk_config=(None, 64))
-        req = make_ctx_request(0, context_remaining_length=1000,
-                               prompt_len=1000)
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64,
+            prepare_context_fn=prepare_with_partial_reuse,
+            resize_context_fn=track_resize,
+        )
+        sched = make_scheduler(mgr, max_num_tokens=128, ctx_chunk_config=(None, 64))
+        req = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         sched.schedule_request([req], set())
         # resize should receive 78 (aligned), not 128 (pre-alignment)
         assert resize_calls == [78]
@@ -1820,17 +1817,14 @@ class TestBlockReuseBoundaryAlignment:
                 req.context_remaining_length = 950
             return True
 
-        mgr = make_kv_cache_manager(tokens_per_block=64,
-                                    prepare_context_fn=prepare_with_partial_reuse)
-        sched = make_scheduler(mgr, max_num_tokens=80,
-                               ctx_chunk_config=(None, 64))
-        ctx = make_ctx_request(0, context_remaining_length=1000,
-                               prompt_len=1000)
+        mgr = make_kv_cache_manager(
+            tokens_per_block=64, prepare_context_fn=prepare_with_partial_reuse
+        )
+        sched = make_scheduler(mgr, max_num_tokens=80, ctx_chunk_config=(None, 64))
+        ctx = make_ctx_request(0, context_remaining_length=1000, prompt_len=1000)
         gen = make_gen_request(1)  # 1 token
         out = sched.schedule_request([ctx, gen], set())
         assert ids(out.context_requests) == [0]
         assert ctx.context_chunk_size == 14
         # 14 + 1 = 15 <= 80: gen fits
         assert ids(out.generation_requests) == [1]
-
-

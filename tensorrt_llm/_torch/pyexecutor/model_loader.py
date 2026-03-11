@@ -75,17 +75,14 @@ def validate_and_set_kv_cache_quant(model_config: ModelConfig,
             f'"llm_args.KvCacheConfig.dtype="{pyt_kv_cache_dtype}" '
             f'Accepted types are "{_VALID_KV_CACHE_DTYPES}".')
 
-    # If we get to this point we have a valid quantization setting, but if
-    # we have an existing setting and it doesn't match we shouldn't proceed.
+    # If we get to this point we have a valid explicit quantization setting.
+    # Explicit kv_cache_dtype requests force override the checkpoint setting.
     if kv_cache_quant is not None and mapped_pyt_quant != kv_cache_quant:
-        raise RuntimeError(
-            "Attempting to override KV cache quantization "
-            f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
-            f'"{pyt_kv_cache_dtype}". You cannot override a checkpoint with a '
-            "pre-quantized KV cache that doesn't match.")
+        logger.warning("Overriding checkpoint KV cache quantization "
+                       f'"{kv_cache_quant}" with llm_args.KvCacheConfig.dtype='
+                       f'"{pyt_kv_cache_dtype}".')
 
-    # We have an open ended KV cache in the checkpoint
-    # and we have a specified override.
+    # Apply explicit override from kv_cache_config.dtype.
     model_config.quant_config.kv_cache_quant_algo = mapped_pyt_quant
 
 
