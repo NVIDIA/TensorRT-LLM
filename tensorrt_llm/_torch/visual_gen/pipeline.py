@@ -135,6 +135,11 @@ class BasePipeline(nn.Module):
 
     def validate_shape(self, height: int, width: int, num_frames: int) -> None:
         """Validate shape against model constraints. Raises ValueError."""
+        if height <= 0 or width <= 0 or num_frames <= 0:
+            raise ValueError(
+                f"Dimensions must be positive: height={height}, width={width}, "
+                f"num_frames={num_frames} for {self.__class__.__name__}."
+            )
         h_mul, w_mul = self.resolution_multiple_of
         if h_mul > 1 or w_mul > 1:
             if height % h_mul != 0 or width % w_mul != 0:

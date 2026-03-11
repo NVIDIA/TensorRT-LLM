@@ -184,19 +184,20 @@ class DiffusionExecutor:
 
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
-        self.pipeline.validate_shape(req.height, req.width, req.num_frames)
-
-        if (
-            self.pipeline._warmed_up_shapes
-            and (req.height, req.width, req.num_frames) not in self.pipeline._warmed_up_shapes
-        ):
-            logger.warning(
-                f"Requested shape ({req.height}x{req.width}, {req.num_frames} frames) "
-                f"was not warmed up. First request will be slower due to "
-                f"torch.compile recompilation. "
-                f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
-            )
         try:
+            self.pipeline.validate_shape(req.height, req.width, req.num_frames)
+
+            if (
+                self.pipeline._warmed_up_shapes
+                and (req.height, req.width, req.num_frames) not in self.pipeline._warmed_up_shapes
+            ):
+                logger.warning(
+                    f"Requested shape ({req.height}x{req.width}, {req.num_frames} frames) "
+                    f"was not warmed up. First request will be slower due to "
+                    f"torch.compile recompilation. "
+                    f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
+                )
+
             output = self.pipeline.infer(req)
             if self.rank == 0:
                 self.response_queue.put(DiffusionResponse(request_id=req.request_id, output=output))
