@@ -64,26 +64,27 @@ nvidia/Llama-4-Maverick-17B-128E-Instruct-FP8
 
 # Performance Summary - All Networks
 
-## Units
-
 All performance values are measured in `output tokens per second per GPU`, where `output tokens` includes the first and all subsequent generated tokens (input tokens are not included).
 
 Data in these tables is taken from the `Per GPU Output Throughput (tps/gpu)` metric reported by `trtllm-bench`.
-The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188)
+The calculations for metrics reported by trtllm-bench can be found in the dataclasses [reporting.py](../../../tensorrt_llm/bench/dataclasses/reporting.py#L570) and [statistics.py](../../../tensorrt_llm/bench/dataclasses/statistics.py#L188).
 
+## Units
+
+All performance values are measured in **output tokens per second per GPU**.
 
 ## Table of Contents
 
 - [Deepseek R1 0528](#deepseek-r1-0528)
+  - [Deepseek R1 0528 - RTX Configurations](#deepseek-r1-0528-rtx-configurations)
 - [GPT-OSS 120B](#gpt-oss-120b)
 - [GPT-OSS 20B](#gpt-oss-20b)
 - [LLaMA v3.3 70B](#llama-v33-70b)
-  - [LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition](#llama-v33-70b-rtx-configurations)
-- [LLaMA v4 Maverick](#llama-v4-maverick)
+  - [LLaMA v3.3 70B - RTX Configurations](#llama-v33-70b-rtx-configurations)
 - [Qwen3 235B A22B](#qwen3-235b-a22b)
-  - [Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition](#qwen3-235b-a22b-rtx-configurations)
+  - [Qwen3 235B A22B - RTX Configurations](#qwen3-235b-a22b-rtx-configurations)
 - [Qwen3 30B A3B](#qwen3-30b-a3b)
-  - [Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition](#qwen3-30b-a3b-rtx-configurations)
+  - [Qwen3 30B A3B - RTX Configurations](#qwen3-30b-a3b-rtx-configurations)
 
 ---
 
@@ -93,13 +94,27 @@ The calculations for metrics reported by trtllm-bench can be found in the datacl
 
 | Sequence Length (ISL/OSL) | B200<br/>DEP4 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP8 (FP8) |
 |---|---|---|---|
-| 1000/1000 | 6,463 | 6,939 | 1,627 |
-| 1024/1024 | 6,430 | 6,924 | 1,620 |
-| 1024/8192 | 3,862 | 4,379 | 1,218 |
-| 1024/32768 | 1,451 | 1,465 | 438 |
-| 8192/1024 | 1,168 | 1,192 | |
+| 1000/1000 | 5,760 | 4,814 | 1,738 |
+| 1024/1024 | 5,757 | 4,989 | 1,724 |
+| 1024/8192 | 4,228 | 4,474 | 1,335 |
+| 1024/32768 | 1,472 | 1,582 | |
+| 1279/1002 | 4,752 | | |
+| 8192/1024 | 1,176 | 1,276 | |
 
-unit: `output tokens per second per GPU`
+---
+
+<a id="deepseek-r1-0528-rtx-configurations"></a>
+
+# Deepseek R1 0528 - RTX Configurations (TP/PP)
+
+*Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
+
+| Sequence Length (ISL/OSL) | **8 GPUs**<br/>TP1,PP8 (FP4) |
+|---|---|
+| 1000/1000 | 713 |
+| 1024/1024 | 701 |
+| 1024/8192 | 340 |
+| 8192/1024 | 197 |
 
 ---
 
@@ -107,16 +122,14 @@ unit: `output tokens per second per GPU`
 
 # GPT-OSS 120B
 
-| Sequence Length (ISL/OSL) | B200<br/>DEP2 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) | H100<br/>DEP4 (FP8) |
-|---|---|---|---|---|
-| 1000/1000 | 25,943 | 27,198 | 6,868 | 4,685 |
-| 1024/1024 | 25,870 | 26,609 | 6,798 | 4,715 |
-| 1024/8192 | 17,289 | 14,800 | 3,543 | |
-| 1024/32768 | 6,279 | 5,556 | | 1,177 |
-| 8192/1024 | 6,111 | 6,835 | 1,828 | 1,169 |
-| 32768/1024 | 1,392 | 1,645 | 519 | 333 |
-
-unit: `output tokens per second per GPU`
+| Sequence Length (ISL/OSL) | B200<br/>DEP2 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>DEP2 (FP8) |
+|---|---|---|---|
+| 1000/1000 | 29,191 | 30,394 | 6,424 |
+| 1024/1024 | 29,061 | 29,056 | 6,391 |
+| 1024/8192 | 16,434 | 17,079 | 4,260 |
+| 1024/32768 | 7,020 | 6,313 | |
+| 8192/1024 | 6,938 | 7,874 | 1,881 |
+| 32768/1024 | 1,623 | 1,929 | 500 |
 
 ---
 
@@ -124,16 +137,15 @@ unit: `output tokens per second per GPU`
 
 # GPT-OSS 20B
 
-| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) | H100<br/>TP1 (FP8) |
-|---|---|---|---|---|
-| 1000/1000 | 53,812 | 55,823 | 13,858 | 11,557 |
-| 1024/1024 | 53,491 | 56,528 | 13,890 | 11,403 |
-| 1024/8192 | 34,702 | 38,100 | 12,743 | 8,617 |
-| 1024/32768 | 14,589 | 16,463 | | |
-| 8192/1024 | 11,904 | 12,941 | 4,015 | 3,366 |
-| 32768/1024 | 2,645 | 2,905 | 915 | 785 |
-
-unit: `output tokens per second per GPU`
+| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP1 (FP8) |
+|---|---|---|---|
+| 1000/1000 | 58,886 | 54,117 | 14,786 |
+| 1024/1024 | 59,084 | 51,870 | 14,719 |
+| 1024/8192 | 37,824 | 35,280 | 12,441 |
+| 1024/32768 | 15,799 | 17,414 | 4,240 |
+| 8192/1024 | 13,439 | 15,466 | 4,196 |
+| 8212/1027 | 12,963 | | |
+| 32768/1024 | 2,970 | 3,331 | 965 |
 
 ---
 
@@ -141,49 +153,29 @@ unit: `output tokens per second per GPU`
 
 # LLaMA v3.3 70B
 
-| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP2 (FP8) | H100<br/>TP2 (FP8) |
-|---|---|---|---|---|
-| 1000/1000 | 6,920 | 7,769 | 2,587 | 2,209 |
-| 1024/1024 | 6,842 | 7,751 | 2,582 | |
-| 1024/8192 | 3,242 | 3,805 | 2,009 | |
-| 8192/1024 | 1,362 | 1,491 | 537 | 398 |
-| 32768/1024 | 274 | 302 | 120 | |
-
-unit: `output tokens per second per GPU`
+| Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) | H200<br/>TP2 (FP8) |
+|---|---|---|---|
+| 1000/1000 | 7,058 | 8,137 | 2,666 |
+| 1024/1024 | 6,943 | 7,576 | 2,637 |
+| 1024/8192 | 3,270 | 3,856 | 1,995 |
+| 8192/1024 | 1,347 | 1,593 | 544 |
+| 32768/1024 | 279 | 315 | 120 |
 
 ---
 
 <a id="llama-v33-70b-rtx-configurations"></a>
 
-# LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition
+# LLaMA v3.3 70B - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
-| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) |
-|---|---|---|
-| 1000/1000 | 1,724 | 1,901 |
-| 1024/1024 | 1,708 | 1,887 |
-| 8192/1024 | 296 | 327 |
-| 32768/1024 | | 67 |
-
-unit: `output tokens per second per GPU`
-
----
-
-<a id="llama-v4-maverick"></a>
-
-# LLaMA v4 Maverick
-
-| Sequence Length (ISL/OSL) | B200<br/>DEP4 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP8 (FP8) |
-|---|---|---|---|
-| 1000/1000 | 11,337 | 11,828 | 4,146 |
-| 1024/1024 | 11,227 | 11,905 | 4,180 |
-| 1024/8192 | 5,174 | 5,508 | 1,157 |
-| 1024/32768 | 2,204 | 2,300 | 679 |
-| 8192/1024 | 3,279 | 3,444 | 1,276 |
-| 32768/1024 | 859 | 963 | |
-
-unit: `output tokens per second per GPU`
+| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) | **4 GPUs**<br/>TP1,PP4 (FP4) | **8 GPUs**<br/>TP1,PP8 (FP4) |
+|---|---|---|---|---|
+| 1000/1000 | 1,752 | 1,889 | 1,827 | 1,544 |
+| 1024/1024 | 1,724 | 1,881 | 1,798 | 1,545 |
+| 1024/8192 | | | 675 | 630 |
+| 8192/1024 | 306 | 329 | 323 | 307 |
+| 32768/1024 | | 66 | 66 | 64 |
 
 ---
 
@@ -191,33 +183,31 @@ unit: `output tokens per second per GPU`
 
 # Qwen3 235B A22B
 
-| Sequence Length (ISL/OSL) | B200<br/>DEP4 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP4 (FP8) | H100<br/>DEP8 (FP8) |
-|---|---|---|---|---|
-| 1000/1000 | 5,764 | 6,172 | 3,288 | 1,932 |
-| 1024/1024 | 5,756 | 5,862 | 3,268 | 1,935 |
-| 1024/8192 | 3,389 | 3,423 | 1,417 | 873 |
-| 1024/32768 | 1,255 | | | |
-| 8192/1024 | 1,410 | 1,464 | 627 | |
-| 32768/1024 | 319 | 333 | 134 | |
-
-unit: `output tokens per second per GPU`
+| Sequence Length (ISL/OSL) | B200<br/>DEP8 (FP4) | GB200<br/>DEP4 (FP4) | H200<br/>DEP4 (FP8) |
+|---|---|---|---|
+| 1000/1000 | 6,720 | 6,821 | 3,510 |
+| 1024/1024 | 6,660 | 6,777 | 3,494 |
+| 1024/8192 | 3,440 | 3,955 | 1,677 |
+| 1024/32768 | 1,373 | 1,240 | |
+| 1298/32771 | 1,183 | | |
+| 8192/1024 | 1,224 | 1,575 | 679 |
+| 32768/1024 | 295 | 342 | 143 |
 
 ---
 
 <a id="qwen3-235b-a22b-rtx-configurations"></a>
 
-# Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition
+# Qwen3 235B A22B - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
-| Sequence Length (ISL/OSL) | **4 GPUs**<br/>DEP2,PP2 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) |
+| Sequence Length (ISL/OSL) | **4 GPUs**<br/>TP1,PP4 (FP4) | **8 GPUs**<br/>TP1,PP8 (FP4) |
 |---|---|---|
-| 1000/1000 | 1,731 | 969 |
-| 1024/1024 | 1,732 | 963 |
-| 1024/8192 | 644 | 711 |
-| 32768/1024 | 70 | |
-
-unit: `output tokens per second per GPU`
+| 1000/1000 | 1,535 | 1,202 |
+| 1024/1024 | 1,529 | 1,185 |
+| 1024/8192 | 495 | 495 |
+| 8192/1024 | 343 | 337 |
+| 32768/1024 | 81 | 83 |
 
 ---
 
@@ -227,36 +217,32 @@ unit: `output tokens per second per GPU`
 
 | Sequence Length (ISL/OSL) | B200<br/>TP1 (FP4) | GB200<br/>TP1 (FP4) |
 |---|---|---|
-| 1000/1000 | 26,971 | 22,856 |
-| 1024/1024 | 26,611 | 22,201 |
-| 1024/8192 | 13,497 | 14,272 |
-| 1024/32768 | 4,494 | 4,925 |
-| 8192/1024 | 5,735 | 6,201 |
-| 32768/1024 | 1,265 | 1,380 |
-
-unit: `output tokens per second per GPU`
+| 1000/1000 | 26,645 | 21,614 |
+| 1024/1024 | 26,431 | 19,682 |
+| 1024/8192 | 13,940 | 14,916 |
+| 1024/32768 | 4,570 | |
+| 1304/8195 | 12,958 | |
+| 8192/1024 | 5,945 | 6,450 |
+| 32768/1024 | 1,284 | 1,398 |
 
 ---
 
 <a id="qwen3-30b-a3b-rtx-configurations"></a>
 
-# Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition
+# Qwen3 30B A3B - RTX Configurations (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
-| Sequence Length (ISL/OSL) | **2 GPUs**<br/>DEP2,PP1 (FP4) | **4 GPUs**<br/>DEP2,PP2 (FP4) | **8 GPUs**<br/>DEP8,PP1 (FP4) | **1 GPUs**<br/>TP1,PP1 (FP4) |
+| Sequence Length (ISL/OSL) | **1 GPUs**<br/>TP1,PP1 (FP4) | **2 GPUs**<br/>TP1,PP2 (FP4) | **4 GPUs**<br/>TP1,PP4 (FP4) | **8 GPUs**<br/>TP1,PP8 (FP4) |
 |---|---|---|---|---|
-| 1000/1000 | 8,409 | 7,059 | 3,985 | 9,938 |
-| 1024/1024 | | 7,019 | | 9,755 |
-| 1024/8192 | 3,577 | | 2,406 | 3,621 |
-| 8192/1024 | | 1,416 | | 1,914 |
-| 32768/1024 | | | 180 | 374 |
-
-unit: `output tokens per second per GPU`
+| 1000/1000 | 10,038 | 8,294 | 6,855 | 3,170 |
+| 1024/1024 | 9,908 | 8,187 | 6,931 | 3,065 |
+| 1024/8192 | 3,628 | 3,281 | 3,024 | 1,968 |
+| 1024/32768 | | | | 918 |
+| 8192/1024 | 1,925 | 1,805 | 1,656 | 1,193 |
+| 32768/1024 | 372 | 356 | 349 | 318 |
 
 ---
-
-
 
 ## Reproducing Benchmarked Results
 
