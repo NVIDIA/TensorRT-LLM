@@ -111,7 +111,7 @@ public:
         NB_OVERRIDE_PURE(addToken, requestId);
     }
 
-    bool addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
+    void addSequence(tb::LlmRequest::RequestIdType requestId, SizeType32 inputLength, SizeType32 beamWidth,
         tensorrt_llm::common::OptionalRef<tb::LlmRequest> llmRequest = std::nullopt) override
     {
         NB_OVERRIDE_PURE(addSequence, requestId, inputLength, beamWidth, llmRequest);
