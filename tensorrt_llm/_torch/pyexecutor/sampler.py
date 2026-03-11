@@ -2298,6 +2298,34 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         return False
 
+    def _handle_finish_reasons_impl(
+        self,
+        request: LlmRequest,
+        beam_width: int,
+        finish_reasons: torch.Tensor,
+        finish_reasons_list: list[int],
+    ) -> bool:
+        """Check if all beams of a request have finished and set the request state accordingly
+
+        Args:
+            request: LlmRequest. The request to check.
+            beam_width: int. The beam width of the request.
+            finish_reasons: torch.Tensor. Shape: (beam_width)
+                            The finish reasons for each beam.
+            finish_reasons_list: list[int]. The finish reasons for each beam.
+        Returns:
+            True if all beams have finished, False otherwise.
+        """
+        if (finish_reasons[:beam_width] != FinishReason.NOT_FINISHED.value).sum() == beam_width:
+            request.state = LlmRequestState.GENERATION_COMPLETE
+            for beam_idx in range(beam_width):
+                request.set_finished_reason(
+                    FinishReason(finish_reasons_list[beam_idx]),
+                    beam_idx,
+                )
+            return True
+        return False
+
     def _handle_finish_reasons(
         self,
         request: LlmRequest,
@@ -2310,26 +2338,43 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             request: LlmRequest. The request to check.
             finish_reasons: torch.Tensor. Shape: (max_tokens, max_batch_size, max_beam_width)
                             The finish reasons for each beam.
+            finish_reasons_list: list[list[list[int]]]. The finish reasons for each beam.
         Returns:
             True if all beams have finished, False otherwise.
         """
-        if (
-            finish_reasons[
-                DEFAULT_STEP_IDX, request.py_seq_slot, : request.sampling_config.beam_width
-            ]
-            != FinishReason.NOT_FINISHED.value
-        ).sum() == request.sampling_config.beam_width:
-            request.state = LlmRequestState.GENERATION_COMPLETE
-            assert request.py_seq_slot is not None
-            for beam_idx in range(request.sampling_config.beam_width):
-                request.set_finished_reason(
-                    FinishReason(
-                        finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX][beam_idx]
-                    ),
-                    beam_idx,
-                )
-            return True
-        return False
+        assert request.py_seq_slot is not None
+        beam_width = request.sampling_config.beam_width
+        return self._handle_finish_reasons_impl(
+            request,
+            beam_width,
+            finish_reasons[DEFAULT_STEP_IDX, request.py_seq_slot],
+            finish_reasons_list[request.py_seq_slot][DEFAULT_STEP_IDX],
+        )
+
+    def _handle_first_finish_reasons(
+        self,
+        request: LlmRequest,
+        finish_reasons: torch.Tensor,
+        finish_reasons_list: list[list[int]],
+    ) -> bool:
+        """Check if all beams of a request have finished and set the request state accordingly
+
+        Args:
+            request: LlmRequest. The request to check.
+            finish_reasons: torch.Tensor. Shape: (max_batch_size, max_beam_width)
+                            The finish reasons for each beam.
+            finish_reasons_list: list[list[int]]. The finish reasons for each beam.
+        Returns:
+            True if all beams have finished, False otherwise.
+        """
+        assert request.py_seq_slot is not None
+        beam_width = request.sampling_config.beam_width
+        return self._handle_finish_reasons_impl(
+            request,
+            beam_width,
+            finish_reasons[request.py_seq_slot, :beam_width],
+            finish_reasons_list[request.py_seq_slot],
+        )
 
     @nvtx_range("update_original_tokens")
     @staticmethod
@@ -3251,6 +3296,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         assert state.host is not None
         new_tokens = state.host.new_tokens
         finish_reasons = state.host.finish_reasons_list()
+        first_finish_reasons = (
+            state.host.first_finish_reasons.tolist()
+            if state.host.first_finish_reasons is not None
+            else []
+        )
 
         new_tokens_list = new_tokens.tolist()
 
@@ -3282,9 +3332,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                         # Beam search does not support speculative decoding.
                         add_token(req, new_tokens_list, beam_idx=beam_idx)
                     self.handle_logprobs(req, logprobs_state_list=logprobs_state_list, count=1)
-                finish_reasons_host = state.host.finish_reasons
-                assert finish_reasons_host is not None
-                self._handle_finish_reasons(req, finish_reasons_host, finish_reasons)
+                first_finish_reasons_host = state.host.first_finish_reasons
+                assert first_finish_reasons_host is not None
+                self._handle_first_finish_reasons(
+                    req, first_finish_reasons_host, first_finish_reasons
+                )
                 req.py_num_accepted_draft_tokens = 0
                 req.py_rewind_len = 0
             else:

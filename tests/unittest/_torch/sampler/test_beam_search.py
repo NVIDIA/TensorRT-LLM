@@ -390,6 +390,7 @@ def test_beam_search_e2e(
         logprobs=return_log_probs,
         end_id=-1,
         stop_token_ids=stop_token_ids,
+        include_stop_str_in_output=True,
         additional_model_outputs=["cache_indirection"],
     )
     validate_outputs(

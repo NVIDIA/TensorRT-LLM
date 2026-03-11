@@ -23,15 +23,20 @@ def backend(request):
     return request.param
 
 
+@pytest.fixture(scope="module", params=[False, True])
+def use_beam_search(request):
+    return request.param
+
+
 @pytest.fixture(scope="module")
-def server(model_name: str, backend: str):
+def server(model_name: str, backend: str, use_beam_search: bool):
     # Skip specific model/backend combinations
     if model_name == "Qwen3/Qwen3-0.6B" and backend == "trt":
         pytest.skip("Qwen3 model not supported with trt backend")
 
     model_path = get_model_path(model_name)
     args = ["--backend", f"{backend}"]
-    max_beam_width = 1 if backend == "pytorch" else 2
+    max_beam_width = 2 if use_beam_search else 1
     args.extend(["--max_beam_width", str(max_beam_width)])
     args.extend(["--max_batch_size", "2", "--max_seq_len", "1024"])
     if model_name.startswith("Qwen3"):
@@ -43,13 +48,14 @@ def server(model_name: str, backend: str):
 
 
 @pytest.fixture(scope="module")
-def client(server: RemoteOpenAIServer) -> openai.OpenAI:
+def client(server: RemoteOpenAIServer, use_beam_search: bool) -> openai.OpenAI:
     return server.get_client()
 
 
-def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str):
+def test_reasoning_parser(client: openai.OpenAI, model_name: str, backend: str,
+                          use_beam_search: bool):
     messages = [{"role": "user", "content": "hi"}]
-    if backend == "pytorch":
+    if not use_beam_search:
         n, extra_body = 1, None
     else:
         n, extra_body = 2, dict(use_beam_search=True)
@@ -92,7 +98,11 @@ async def process_stream(
 
 @pytest.mark.asyncio(loop_scope="module")
 async def test_reasoning_parser_streaming(async_client: openai.AsyncOpenAI,
-                                          model_name: str):
+                                          model_name: str, backend: str,
+                                          use_beam_search: bool):
+    if use_beam_search:
+        pytest.skip("Beam search is not supported in this test case.")
+
     messages = [{"role": "user", "content": "hi"}]
     stream = await async_client.chat.completions.create(
         model=model_name,
