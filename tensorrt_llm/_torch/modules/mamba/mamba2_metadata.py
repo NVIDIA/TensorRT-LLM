@@ -257,10 +257,10 @@ class Mamba2Metadata:
             initial_states = [
                 num_cached_tokens_per_seq[i] > 0 for i in range(num_contexts)
             ]
+            self.has_initial_states[:num_contexts] = torch.tensor(
+                initial_states, dtype=torch.bool)
             self.use_initial_states = any(initial_states)
             if self.use_initial_states:
-                self.has_initial_states[:num_contexts] = torch.tensor(
-                    initial_states, dtype=torch.bool)
                 self.chunk_indices, self.chunk_offsets = cu_seqlens_to_chunk_indices_offsets_triton(
                     self.cu_seqlens[:num_contexts + 1], self.chunk_size)
             else:

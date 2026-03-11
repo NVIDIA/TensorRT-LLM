@@ -197,6 +197,19 @@ class NemotronHMOE(nn.Module):
             moe_backend=model_config.moe_backend,
         )
 
+        # For MIXED_PRECISION models, the global quant_config has quant_algo=MIXED_PRECISION
+        # which maps to QuantMode(0) (no quant). This would cause the MoE backend to select
+        # UnquantizedFusedMoEMethod and allocate BF16 weight buffers, causing a shape mismatch
+        # when loading NVFP4/W4A8_NVFP4_FP8 quantized expert weights.
+        # Look up the per-expert quant config from quant_config_dict and use it for create_moe.
+        moe_model_config = model_config
+        if model_config.quant_config_dict is not None:
+            experts_prefix = f"model.layers.{layer_idx}.mixer.experts."
+            for key, cfg in model_config.quant_config_dict.items():
+                if key.startswith(experts_prefix):
+                    moe_model_config = replace(model_config, quant_config=cfg)
+                    break
+
         # Setup MoE experts.
         self.experts = create_moe(
             routing_method=self.gate.routing_method,
@@ -206,7 +219,7 @@ class NemotronHMOE(nn.Module):
             aux_stream_dict=aux_stream_dict,
             dtype=config.torch_dtype,
             reduce_results=self.reduce_results,
-            model_config=model_config,
+            model_config=moe_model_config,
             layer_idx=self.layer_idx,
             weight_loading_mode=MoEWeightLoadingMode.VANILLA,
             bias=self.mlp_bias,
@@ -276,7 +289,7 @@ class NemotronHMOE(nn.Module):
 
         def _compute_shared_output():
             if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states)
+                shared_expert_output = self.shared_experts(hidden_states_hp)
             else:
                 shared_expert_output = 0
             return shared_expert_output
@@ -336,9 +349,17 @@ class NemotronHLayer(DecoderLayer):
         self.layer_idx = layer_idx
         self.layer_type = layer_type
 
-        self.is_nvfp4 = (model_config.quant_config is not None
-                         and model_config.quant_config.quant_mode is not None
-                         and model_config.quant_config.quant_mode.has_nvfp4())
+        quant_mode = (model_config.quant_config.quant_mode
+                      if model_config.quant_config is not None else None)
+        self.is_nvfp4 = quant_mode is not None and quant_mode.has_nvfp4()
+        # For MIXED_PRECISION models, the global quant_mode is QuantMode(0). Check per-layer
+        # quant_config_dict to see if this specific layer is NVFP4-quantized.
+        if not self.is_nvfp4 and model_config.quant_config_dict is not None:
+            layer_prefix = f"model.layers.{layer_idx}."
+            for key, cfg in model_config.quant_config_dict.items():
+                if key.startswith(layer_prefix) and cfg.quant_mode.has_nvfp4():
+                    self.is_nvfp4 = True
+                    break
         # The fused RMSNorm+NVFP4 CUDA kernel requires hidden_size to be
         # a supported tile size. Non-power-of-2 hidden sizes within tile
         # ranges may cause kernel hangs. Disable fused NVFP4 for such cases.
@@ -575,6 +596,17 @@ class NemotronHForCausalLM(SpecDecOneEngineForCausalLM[NemotronHModel,
                 re.sub(r"(model\.layers\.)?backbone", "model", k)
                 for k in model_config.quant_config.exclude_modules
             ]
+
+        # Rename quant_config_dict keys from 'backbone.layers.' to 'model.layers.' so that
+        # apply_layerwise_quant_config() can correctly match TRT-LLM module names, which use
+        # 'model.layers.' as root rather than 'backbone.layers.' from the HF checkpoint.
+        if model_config.quant_config_dict is not None:
+            model_config._frozen = False
+            model_config.quant_config_dict = {
+                re.sub(r"(model\.layers\.)?backbone", "model", k): v
+                for k, v in model_config.quant_config_dict.items()
+            }
+            model_config._frozen = True
 
         super().__init__(
             model=NemotronHModel(model_config),

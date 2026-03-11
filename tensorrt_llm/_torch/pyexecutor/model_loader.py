@@ -37,8 +37,11 @@ _KV_CACHE_MAP = {
 _VALID_KV_CACHE_DTYPES = ("fp8", "nvfp4", "auto")
 
 
-def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
-                                           mamba_ssm_cache_dtype: str) -> None:
+def validate_and_set_mamba_ssm_cache_dtype(
+        config: ModelConfig,
+        mamba_ssm_cache_dtype: str,
+        mamba_ssm_stochastic_rounding: bool = False,
+        mamba_ssm_philox_rounds: int = 10) -> None:
     if mamba_ssm_cache_dtype == "auto":
         hf_dtype = getattr(config.pretrained_config, "mamba_ssm_cache_dtype",
                            None)
@@ -50,6 +53,8 @@ def validate_and_set_mamba_ssm_cache_dtype(config: ModelConfig,
         mamba_ssm_cache_dtype = str_dtype_to_torch(mamba_ssm_cache_dtype)
 
     config.quant_config.mamba_ssm_cache_dtype = mamba_ssm_cache_dtype
+    config.quant_config.mamba_ssm_stochastic_rounding = mamba_ssm_stochastic_rounding
+    config.quant_config.mamba_ssm_philox_rounds = mamba_ssm_philox_rounds
 
 
 def validate_and_set_kv_cache_quant(model_config: ModelConfig,
@@ -495,7 +500,9 @@ class ModelLoader:
         validate_and_set_kv_cache_quant(config,
                                         self.llm_args.kv_cache_config.dtype)
         validate_and_set_mamba_ssm_cache_dtype(
-            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype)
+            config, self.llm_args.kv_cache_config.mamba_ssm_cache_dtype,
+            self.llm_args.kv_cache_config.mamba_ssm_stochastic_rounding,
+            self.llm_args.kv_cache_config.mamba_ssm_philox_rounds)
 
         # Allow overriding the number of layers via environment variable
         # Note: This is kept for backward compatibility, but model_kwargs is preferred
