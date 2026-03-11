@@ -19,8 +19,10 @@
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/executor/serializeUtils.h"
 
+#include <algorithm>
 #include <cuda.h>
 #include <dlfcn.h>
+#include <numeric>
 #include <sstream>
 
 namespace tensorrt_llm::executor::kv_cache
@@ -100,7 +102,7 @@ AgentDesc AgentDesc::deserialize(std::string const& data)
 
 // ── VmmDescSplitter utilities (backend-agnostic, no NIXL dependency) ──
 
-std::pair<size_t, uintptr_t> VmmDescSplitter::lookupChunkInfo(uintptr_t addr, VramRegionMap const& regionMap)
+VmmDescSplitter::RegionLookupResult VmmDescSplitter::lookupChunkInfo(uintptr_t addr, VramRegionMap const& regionMap)
 {
     auto it = regionMap.upper_bound(addr);
     if (it != regionMap.begin())
@@ -108,10 +110,10 @@ std::pair<size_t, uintptr_t> VmmDescSplitter::lookupChunkInfo(uintptr_t addr, Vr
         --it;
         if (addr >= it->first && addr < it->first + it->second.totalLen)
         {
-            return {it->second.chunkSize, it->first};
+            return {it->second.chunkSize, it->first, it->second.totalLen};
         }
     }
-    return {0, 0};
+    return {0, 0, 0};
 }
 
 MemoryDescs VmmDescSplitter::splitDescsWithRegionMap(MemoryDescs const& descs, VramRegionMap const& regionMap)
@@ -128,21 +130,32 @@ MemoryDescs VmmDescSplitter::splitDescsWithRegionMap(MemoryDescs const& descs, V
 
     for (auto const& desc : descVec)
     {
-        auto [chunkSize, regionBase] = lookupChunkInfo(desc.getAddr(), regionMap);
-        if (chunkSize == 0)
-        {
-            result.push_back(desc);
-            continue;
-        }
-
         uintptr_t addr = desc.getAddr();
         size_t remaining = desc.getLen();
         uint32_t deviceId = desc.getDeviceId();
 
         while (remaining > 0)
         {
-            size_t offsetInChunk = static_cast<size_t>((addr - regionBase) % chunkSize);
-            size_t pieceSize = std::min(remaining, chunkSize - offsetInChunk);
+            auto lookup = lookupChunkInfo(addr, regionMap);
+            if (lookup.regionBase == 0)
+            {
+                // Not in any known region — emit remainder as-is.
+                result.emplace_back(addr, remaining, deviceId);
+                break;
+            }
+
+            // Respect region boundary.
+            size_t regionRemaining = static_cast<size_t>((lookup.regionBase + lookup.regionTotalLen) - addr);
+            size_t pieceSize = std::min(remaining, regionRemaining);
+
+            // Also respect chunk boundary when chunks are present.
+            if (lookup.chunkSize > 0)
+            {
+                size_t offsetInChunk = static_cast<size_t>((addr - lookup.regionBase) % lookup.chunkSize);
+                size_t chunkRemaining = lookup.chunkSize - offsetInChunk;
+                pieceSize = std::min(pieceSize, chunkRemaining);
+            }
+
             result.emplace_back(addr, pieceSize, deviceId);
             addr += pieceSize;
             remaining -= pieceSize;
@@ -152,54 +165,192 @@ MemoryDescs VmmDescSplitter::splitDescsWithRegionMap(MemoryDescs const& descs, V
     return MemoryDescs{descs.getType(), std::move(result)};
 }
 
+namespace
+{
+
+/// Compute the maximum piece size at @p addr that does not cross any region or chunk boundary.
+/// Returns @p remaining when no region info is available.
+size_t computePieceLimit(uintptr_t addr, size_t remaining, VmmDescSplitter::RegionLookupResult const& lookup)
+{
+    if (lookup.regionBase == 0)
+    {
+        return remaining;
+    }
+    // Respect region boundary.
+    size_t regionRemaining = static_cast<size_t>((lookup.regionBase + lookup.regionTotalLen) - addr);
+    size_t limit = std::min(remaining, regionRemaining);
+    // Also respect chunk boundary when chunks are present.
+    if (lookup.chunkSize > 0)
+    {
+        size_t offsetInChunk = static_cast<size_t>((addr - lookup.regionBase) % lookup.chunkSize);
+        size_t chunkRemaining = lookup.chunkSize - offsetInChunk;
+        limit = std::min(limit, chunkRemaining);
+    }
+    return limit;
+}
+
+/// Check whether a piece starting at @p addr can be merged with the previous piece
+/// (same registered memory region and same physical chunk).
+bool canCoalesceWith(VmmDescSplitter::RegionLookupResult const& curLookup,
+    VmmDescSplitter::RegionLookupResult const& prevLookup, uintptr_t addr)
+{
+    // Both must be in a known registered region, and the same one.
+    // If either side has no region info, we cannot verify boundaries → refuse merge.
+    if (curLookup.regionBase == 0 || prevLookup.regionBase == 0)
+    {
+        return false;
+    }
+    if (curLookup.regionBase != prevLookup.regionBase)
+    {
+        return false;
+    }
+    // Same region. Check chunk boundary: addr must NOT be on a chunk boundary.
+    // If addr is exactly on a chunk boundary, the previous piece ended at one physical
+    // chunk and this piece starts the next → different physical chunks → refuse merge.
+    if (curLookup.chunkSize > 0)
+    {
+        if ((addr - curLookup.regionBase) % curLookup.chunkSize == 0)
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+} // namespace
+
+namespace
+{
+
+/// Split a single (src, dst) descriptor pair at chunk and region boundaries.
+/// When @p enableCoalesce is true, tries to merge the emitted pieces with the
+/// last piece already in splitSrc / splitDst.
+template <bool kEnableCoalesce>
+void splitOnePair(MemoryDesc const& srcDesc, MemoryDesc const& dstDesc, VramRegionMap const& localRegionMap,
+    VramRegionMap const& remoteRegionMap, VmmDescSplitter::RegionLookupResult& cachedSrcLookup,
+    VmmDescSplitter::RegionLookupResult& cachedDstLookup, std::vector<MemoryDesc>& splitSrc,
+    std::vector<MemoryDesc>& splitDst)
+{
+    uintptr_t srcAddr = srcDesc.getAddr();
+    uintptr_t dstAddr = dstDesc.getAddr();
+    size_t remaining = srcDesc.getLen();
+    uint32_t srcDeviceId = srcDesc.getDeviceId();
+    uint32_t dstDeviceId = dstDesc.getDeviceId();
+
+    auto srcLookup = VmmDescSplitter::lookupChunkInfo(srcAddr, localRegionMap);
+    auto dstLookup = VmmDescSplitter::lookupChunkInfo(dstAddr, remoteRegionMap);
+
+    // Fast path: neither side in any known region → emit as-is, skip while loop.
+    if (srcLookup.regionBase == 0 && dstLookup.regionBase == 0)
+    {
+        splitSrc.emplace_back(srcAddr, remaining, srcDeviceId);
+        splitDst.emplace_back(dstAddr, remaining, dstDeviceId);
+        return;
+    }
+
+    while (remaining > 0)
+    {
+        // Re-lookup if address has advanced past its current region.
+        if (srcLookup.regionBase != 0 && srcAddr >= srcLookup.regionBase + srcLookup.regionTotalLen)
+        {
+            srcLookup = VmmDescSplitter::lookupChunkInfo(srcAddr, localRegionMap);
+        }
+        if (dstLookup.regionBase != 0 && dstAddr >= dstLookup.regionBase + dstLookup.regionTotalLen)
+        {
+            dstLookup = VmmDescSplitter::lookupChunkInfo(dstAddr, remoteRegionMap);
+        }
+
+        size_t srcLimit = computePieceLimit(srcAddr, remaining, srcLookup);
+        size_t dstLimit = computePieceLimit(dstAddr, remaining, dstLookup);
+        size_t pieceSize = std::min({remaining, srcLimit, dstLimit});
+
+        // Try to coalesce with the last emitted piece.
+        bool merged = false;
+        if constexpr (kEnableCoalesce)
+        {
+            if (!splitSrc.empty())
+            {
+                auto const& lastSrc = splitSrc.back();
+                auto const& lastDst = splitDst.back();
+
+                bool srcContig
+                    = (lastSrc.getAddr() + lastSrc.getLen() == srcAddr) && (lastSrc.getDeviceId() == srcDeviceId);
+                bool dstContig
+                    = (lastDst.getAddr() + lastDst.getLen() == dstAddr) && (lastDst.getDeviceId() == dstDeviceId);
+
+                if (srcContig && dstContig && canCoalesceWith(srcLookup, cachedSrcLookup, srcAddr)
+                    && canCoalesceWith(dstLookup, cachedDstLookup, dstAddr))
+                {
+                    splitSrc.back() = MemoryDesc(lastSrc.getAddr(), lastSrc.getLen() + pieceSize, srcDeviceId);
+                    splitDst.back() = MemoryDesc(lastDst.getAddr(), lastDst.getLen() + pieceSize, dstDeviceId);
+                    merged = true;
+                }
+            }
+        }
+
+        if (!merged)
+        {
+            splitSrc.emplace_back(srcAddr, pieceSize, srcDeviceId);
+            splitDst.emplace_back(dstAddr, pieceSize, dstDeviceId);
+            cachedSrcLookup = srcLookup;
+            cachedDstLookup = dstLookup;
+        }
+
+        srcAddr += pieceSize;
+        dstAddr += pieceSize;
+        remaining -= pieceSize;
+    }
+}
+
+} // namespace
+
 std::pair<MemoryDescs, MemoryDescs> VmmDescSplitter::splitTransferDescsWithRegionMaps(MemoryDescs const& srcDescs,
-    MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap)
+    MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap, VramRegionMap const& remoteRegionMap,
+    bool enableCoalesce)
 {
     if (srcDescs.getType() != MemoryType::kVRAM)
         return {srcDescs, dstDescs};
 
     auto const& srcVec = srcDescs.getDescs();
     auto const& dstVec = dstDescs.getDescs();
-    TLLM_CHECK(srcVec.size() == dstVec.size());
+    size_t const numDescs = srcVec.size();
+    TLLM_CHECK(numDescs == dstVec.size());
 
     std::vector<MemoryDesc> splitSrc, splitDst;
-    splitSrc.reserve(srcVec.size());
-    splitDst.reserve(dstVec.size());
+    splitSrc.reserve(numDescs);
+    splitDst.reserve(numDescs);
 
-    for (size_t i = 0; i < srcVec.size(); ++i)
+    RegionLookupResult cachedSrcLookup{0, 0, 0};
+    RegionLookupResult cachedDstLookup{0, 0, 0};
+
+    if (enableCoalesce)
     {
-        auto [srcChunkSize, srcBase] = lookupChunkInfo(srcVec[i].getAddr(), localRegionMap);
-        if (srcChunkSize == 0)
-        {
-            splitSrc.push_back(srcVec[i]);
-            splitDst.push_back(dstVec[i]);
-            continue;
-        }
-
-        auto [dstChunkSize, dstBase] = lookupChunkInfo(dstVec[i].getAddr(), remoteRegionMap);
-
-        uintptr_t srcAddr = srcVec[i].getAddr();
-        uintptr_t dstAddr = dstVec[i].getAddr();
-        size_t remaining = srcVec[i].getLen();
-
-        while (remaining > 0)
-        {
-            size_t srcOffsetInChunk = static_cast<size_t>((srcAddr - srcBase) % srcChunkSize);
-            size_t srcPieceSize = srcChunkSize - srcOffsetInChunk;
-
-            size_t dstPieceSize = remaining;
-            if (dstChunkSize > 0)
+        // Sort descriptor pairs by (src deviceId, src addr) so that contiguous
+        // KV blocks become adjacent regardless of upper-layer ordering.
+        std::vector<size_t> order(numDescs);
+        std::iota(order.begin(), order.end(), 0);
+        std::sort(order.begin(), order.end(),
+            [&srcVec](size_t lhs, size_t rhs)
             {
-                size_t dstOffsetInChunk = static_cast<size_t>((dstAddr - dstBase) % dstChunkSize);
-                dstPieceSize = dstChunkSize - dstOffsetInChunk;
-            }
-
-            size_t pieceSize = std::min({remaining, srcPieceSize, dstPieceSize});
-            splitSrc.emplace_back(srcAddr, pieceSize, srcVec[i].getDeviceId());
-            splitDst.emplace_back(dstAddr, pieceSize, dstVec[i].getDeviceId());
-            srcAddr += pieceSize;
-            dstAddr += pieceSize;
-            remaining -= pieceSize;
+                if (srcVec[lhs].getDeviceId() != srcVec[rhs].getDeviceId())
+                {
+                    return srcVec[lhs].getDeviceId() < srcVec[rhs].getDeviceId();
+                }
+                return srcVec[lhs].getAddr() < srcVec[rhs].getAddr();
+            });
+        for (size_t idx = 0; idx < numDescs; ++idx)
+        {
+            splitOnePair<true>(srcVec[order[idx]], dstVec[order[idx]], localRegionMap, remoteRegionMap, cachedSrcLookup,
+                cachedDstLookup, splitSrc, splitDst);
+        }
+    }
+    else
+    {
+        // Fast path: no allocation, no sort, coalesce code compiled out via template.
+        for (size_t i = 0; i < numDescs; ++i)
+        {
+            splitOnePair<false>(srcVec[i], dstVec[i], localRegionMap, remoteRegionMap, cachedSrcLookup, cachedDstLookup,
+                splitSrc, splitDst);
         }
     }
 

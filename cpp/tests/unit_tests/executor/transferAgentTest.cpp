@@ -480,9 +480,10 @@ TEST(VmmDescSplitterTest, LookupChunkInfoHit)
 {
     VramRegionMap regionMap;
     regionMap[0x100000] = {0x300000, 0x100000}; // base=1MB, len=3MB, chunk=1MB
-    auto [chunkSize, base] = VmmDescSplitter::lookupChunkInfo(0x200000, regionMap);
-    EXPECT_EQ(chunkSize, 0x100000);
-    EXPECT_EQ(base, 0x100000);
+    auto result = VmmDescSplitter::lookupChunkInfo(0x200000, regionMap);
+    EXPECT_EQ(result.chunkSize, 0x100000);
+    EXPECT_EQ(result.regionBase, 0x100000);
+    EXPECT_EQ(result.regionTotalLen, 0x300000);
 }
 
 TEST(VmmDescSplitterTest, LookupChunkInfoMiss)
@@ -490,9 +491,10 @@ TEST(VmmDescSplitterTest, LookupChunkInfoMiss)
     VramRegionMap regionMap;
     regionMap[0x100000] = {0x100000, 0x100000};
     // Address outside the region
-    auto [chunkSize, base] = VmmDescSplitter::lookupChunkInfo(0x300000, regionMap);
-    EXPECT_EQ(chunkSize, 0u);
-    EXPECT_EQ(base, 0u);
+    auto result = VmmDescSplitter::lookupChunkInfo(0x300000, regionMap);
+    EXPECT_EQ(result.chunkSize, 0u);
+    EXPECT_EQ(result.regionBase, 0u);
+    EXPECT_EQ(result.regionTotalLen, 0u);
 }
 
 TEST(VmmDescSplitterTest, LookupChunkInfoMultipleRegions)
@@ -501,17 +503,17 @@ TEST(VmmDescSplitterTest, LookupChunkInfoMultipleRegions)
     regionMap[0x100000] = {0x200000, 0x100000}; // region1: [0x100000, 0x300000)
     regionMap[0x400000] = {0x200000, 0x80000};  // region2: [0x400000, 0x600000)
 
-    auto [cs1, b1] = VmmDescSplitter::lookupChunkInfo(0x150000, regionMap);
-    EXPECT_EQ(cs1, 0x100000);
-    EXPECT_EQ(b1, 0x100000);
+    auto r1 = VmmDescSplitter::lookupChunkInfo(0x150000, regionMap);
+    EXPECT_EQ(r1.chunkSize, 0x100000);
+    EXPECT_EQ(r1.regionBase, 0x100000);
 
-    auto [cs2, b2] = VmmDescSplitter::lookupChunkInfo(0x500000, regionMap);
-    EXPECT_EQ(cs2, 0x80000);
-    EXPECT_EQ(b2, 0x400000);
+    auto r2 = VmmDescSplitter::lookupChunkInfo(0x500000, regionMap);
+    EXPECT_EQ(r2.chunkSize, 0x80000);
+    EXPECT_EQ(r2.regionBase, 0x400000);
 
     // Gap between regions
-    auto [cs3, b3] = VmmDescSplitter::lookupChunkInfo(0x350000, regionMap);
-    EXPECT_EQ(cs3, 0u);
+    auto r3 = VmmDescSplitter::lookupChunkInfo(0x350000, regionMap);
+    EXPECT_EQ(r3.chunkSize, 0u);
 }
 
 TEST(VmmDescSplitterTest, SplitDescsAlignedBase)
@@ -666,6 +668,457 @@ TEST(VmmDescSplitterTest, SplitTransferDescsNoDstRegion)
     EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x100000);
     EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
     EXPECT_EQ(splitDst.getDescs()[1].getLen(), 0x100000);
+}
+
+// ── splitDescsWithRegionMap: region boundary tests ──
+
+TEST(VmmDescSplitterTest, SplitDescsRegionBoundaryNoChunks)
+{
+    // Two adjacent regions with chunkSize=0 (cudaMalloc).
+    // A descriptor spanning both should be split at the region boundary.
+    VramRegionMap regionMap;
+    regionMap[0x100000] = {0x100000, 0};                    // regionA: [0x100000, 0x200000), no chunks
+    regionMap[0x200000] = {0x100000, 0};                    // regionB: [0x200000, 0x300000), no chunks
+
+    std::vector<MemoryDesc> descs{{0x100000, 0x200000, 0}}; // spans both regions
+    MemoryDescs input{MemoryType::kVRAM, descs};
+
+    auto result = VmmDescSplitter::splitDescsWithRegionMap(input, regionMap);
+    auto const& out = result.getDescs();
+
+    ASSERT_EQ(out.size(), 2);
+    EXPECT_EQ(out[0].getAddr(), 0x100000);
+    EXPECT_EQ(out[0].getLen(), 0x100000); // regionA portion
+    EXPECT_EQ(out[1].getAddr(), 0x200000);
+    EXPECT_EQ(out[1].getLen(), 0x100000); // regionB portion
+}
+
+TEST(VmmDescSplitterTest, SplitDescsRegionBoundaryWithChunks)
+{
+    // Region with chunks: desc spans chunks AND region boundary.
+    VramRegionMap regionMap;
+    regionMap[0x100000] = {0x200000, 0x100000}; // [0x100000, 0x300000), 1MB chunks
+    regionMap[0x300000] = {0x100000, 0};        // [0x300000, 0x400000), no chunks
+
+    // Desc spans from middle of first region into second region
+    std::vector<MemoryDesc> descs{{0x100000, 0x280000, 0}}; // 2.5MB from 0x100000
+    MemoryDescs input{MemoryType::kVRAM, descs};
+
+    auto result = VmmDescSplitter::splitDescsWithRegionMap(input, regionMap);
+    auto const& out = result.getDescs();
+
+    // First region: 2 chunks of 1MB each
+    // Second region: remainder 0x80000
+    ASSERT_EQ(out.size(), 3);
+    EXPECT_EQ(out[0].getAddr(), 0x100000);
+    EXPECT_EQ(out[0].getLen(), 0x100000); // chunk 0
+    EXPECT_EQ(out[1].getAddr(), 0x200000);
+    EXPECT_EQ(out[1].getLen(), 0x100000); // chunk 1 (ends at region boundary)
+    EXPECT_EQ(out[2].getAddr(), 0x300000);
+    EXPECT_EQ(out[2].getLen(), 0x80000);  // into second region
+}
+
+// ── splitTransferDescsWithRegionMaps: coalesce tests ──
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceDisabled)
+{
+    // Two contiguous descs within same chunk, coalesce=false → no merging.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x400000}; // 4MB, single 4MB chunk
+    remoteMap[0x800000] = {0x400000, 0x400000};
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x80000, 0}, {0x180000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x80000, 0}, {0x880000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/false);
+
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceContiguousSameChunk)
+{
+    // Two contiguous descs within same chunk, coalesce=true → merged into one.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x400000}; // 4MB, single 4MB chunk
+    remoteMap[0x800000] = {0x400000, 0x400000};
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x80000, 0}, {0x180000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x80000, 0}, {0x880000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    ASSERT_EQ(splitSrc.getDescs().size(), 1);
+    EXPECT_EQ(splitSrc.getDescs()[0].getAddr(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000); // 512KB + 512KB = 1MB
+    ASSERT_EQ(splitDst.getDescs().size(), 1);
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x800000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceAcrossChunkBoundary)
+{
+    // Two contiguous descs that each fill one chunk → NOT merged (chunk boundary).
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x100000}; // 4MB, 1MB chunks
+    remoteMap[0x800000] = {0x400000, 0x100000};
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x100000, 0}, {0x200000, 0x100000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x100000, 0}, {0x900000, 0x100000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // Not merged: 0x200000 is on a chunk boundary
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x100000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceAcrossRegionBoundary)
+{
+    // Two contiguous descs in different regions (chunkSize=0) → NOT merged.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x100000, 0}; // regionA: [0x100000, 0x200000)
+    localMap[0x200000] = {0x100000, 0}; // regionB: [0x200000, 0x300000)
+    remoteMap[0x800000] = {0x100000, 0};
+    remoteMap[0x900000] = {0x100000, 0};
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x100000, 0}, {0x200000, 0x100000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x100000, 0}, {0x900000, 0x100000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // Not merged: different regions
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalescePartialMerge)
+{
+    // Three descs: [0]+[1] contiguous in same chunk, [2] in next chunk.
+    // With coalesce: [0]+[1] merge, [2] stays separate → 2 pieces.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x200000}; // 4MB, 2MB chunks
+    remoteMap[0x800000] = {0x400000, 0x200000};
+
+    std::vector<MemoryDesc> srcDescs{
+        {0x100000, 0x80000, 0}, // [0] starts at chunk 0
+        {0x180000, 0x80000, 0}, // [1] still in chunk 0, contiguous with [0]
+        {0x300000, 0x80000, 0}, // [2] in chunk 1 (starts at 0x300000)
+    };
+    std::vector<MemoryDesc> dstDescs{
+        {0x800000, 0x80000, 0},
+        {0x880000, 0x80000, 0},
+        {0xA00000, 0x80000, 0},
+    };
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // [0]+[1] merged (contiguous, same chunk), [2] separate (gap, different chunk)
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    EXPECT_EQ(splitSrc.getDescs()[0].getAddr(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000); // merged [0]+[1]
+    EXPECT_EQ(splitSrc.getDescs()[1].getAddr(), 0x300000);
+    EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x80000);  // [2]
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceNonContiguous)
+{
+    // Two descs in same chunk but NOT contiguous (gap) → NOT merged.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x400000}; // single chunk
+    remoteMap[0x800000] = {0x400000, 0x400000};
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x80000, 0}, {0x200000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x80000, 0}, {0x900000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // Not merged: gap between descs
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceSrcOnlyChunkBoundary)
+{
+    // src crosses chunk boundary, dst doesn't → NOT merged.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x100000};  // 1MB chunks
+    remoteMap[0x800000] = {0x400000, 0x400000}; // single 4MB chunk
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x100000, 0}, {0x200000, 0x100000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x100000, 0}, {0x900000, 0x100000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // src at 0x200000 is on a chunk boundary → NOT merged
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsNoSrcRegionWithCoalesce)
+{
+    // src has no region info (chunkSize=0, not in map) → split still respects dst boundaries.
+    VramRegionMap localMap;                     // empty — src not registered
+    VramRegionMap remoteMap;
+    remoteMap[0x800000] = {0x400000, 0x100000}; // dst: 4MB, 1MB chunks
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x200000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x200000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // dst has 1MB chunks → 2 pieces
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceUnsortedInput)
+{
+    // Descs given in reverse order — internal sort brings them in order → merged.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x400000}; // single 4MB chunk
+    remoteMap[0x800000] = {0x400000, 0x400000};
+
+    // Reverse order: second half first, first half second.
+    std::vector<MemoryDesc> srcDescs{{0x180000, 0x80000, 0}, {0x100000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x880000, 0x80000, 0}, {0x800000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // After internal sort by src addr: (0x100000) then (0x180000) → contiguous → merged.
+    ASSERT_EQ(splitSrc.getDescs().size(), 1);
+    EXPECT_EQ(splitSrc.getDescs()[0].getAddr(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000);
+    ASSERT_EQ(splitDst.getDescs().size(), 1);
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x800000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
+}
+
+// ── Coalesce within chunkSize=0 (cudaMalloc) region ──
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceWithinCudaMallocRegion)
+{
+    // Two contiguous descs in the same chunkSize=0 region → MERGED.
+    // chunkSize=0 means no chunk boundaries to respect, only region boundaries.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0}; // 4MB, no chunks (cudaMalloc)
+    remoteMap[0x800000] = {0x400000, 0};
+
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x80000, 0}, {0x180000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x80000, 0}, {0x880000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // Both contiguous in same region with no chunk boundaries → merged
+    ASSERT_EQ(splitSrc.getDescs().size(), 1);
+    EXPECT_EQ(splitSrc.getDescs()[0].getAddr(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000); // 512KB + 512KB
+    ASSERT_EQ(splitDst.getDescs().size(), 1);
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x800000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
+}
+
+// ── Coalesce across original descriptor boundaries ──
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceAcrossOriginalDescBoundary)
+{
+    // desc[0] ends where desc[1] begins, both in the same chunk.
+    // The coalesce logic checks splitSrc.back() regardless of which original desc
+    // produced it, so the last piece of desc[0] and the first piece of desc[1]
+    // should merge.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x400000}; // 4MB, single 4MB chunk
+    remoteMap[0x800000] = {0x400000, 0x400000};
+
+    // desc[0]: [0x100000, 0x180000)  desc[1]: [0x180000, 0x200000)
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x80000, 0}, {0x180000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x80000, 0}, {0x880000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // Merged across desc boundary
+    ASSERT_EQ(splitSrc.getDescs().size(), 1);
+    EXPECT_EQ(splitSrc.getDescs()[0].getAddr(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000);
+    ASSERT_EQ(splitDst.getDescs().size(), 1);
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x800000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x100000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceAcrossDescBoundaryBlocked)
+{
+    // desc[0] ends at chunk boundary, desc[1] starts at next chunk.
+    // Even though they are contiguous in virtual address, they span a chunk
+    // boundary → NOT merged.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x100000};  // 4MB, 1MB chunks
+    remoteMap[0x800000] = {0x400000, 0x400000}; // single 4MB chunk
+
+    // desc[0] fills chunk [0x100000, 0x200000), desc[1] starts chunk [0x200000, 0x300000)
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x100000, 0}, {0x200000, 0x80000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x100000, 0}, {0x900000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // src at 0x200000 is on a chunk boundary → NOT merged across desc boundary
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x80000);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+}
+
+// ── Different deviceId prevents coalesce ──
+
+TEST(VmmDescSplitterTest, SplitTransferDescsCoalesceDifferentDeviceId)
+{
+    // Two contiguous descs in same chunk but with different deviceIds → NOT merged.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x400000, 0x400000}; // single chunk
+    remoteMap[0x800000] = {0x400000, 0x400000};
+
+    // Same addresses but different src deviceIds
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x80000, /*deviceId=*/0}, {0x180000, 0x80000, /*deviceId=*/1}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x80000, 0}, {0x880000, 0x80000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/true);
+
+    // Different src deviceIds → NOT merged
+    ASSERT_EQ(splitSrc.getDescs().size(), 2);
+    EXPECT_EQ(splitSrc.getDescs()[0].getDeviceId(), 0u);
+    EXPECT_EQ(splitSrc.getDescs()[1].getDeviceId(), 1u);
+    ASSERT_EQ(splitDst.getDescs().size(), 2);
+}
+
+// ── Transfer desc spanning multiple regions (re-lookup path) ──
+
+TEST(VmmDescSplitterTest, SplitTransferDescsRelookupAcrossRegions)
+{
+    // A single large transfer desc that spans 3 regions on the src side.
+    // Verifies the re-lookup logic in splitTransferDescsWithRegionMaps when
+    // srcAddr advances past the current region boundary.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x100000, 0x100000}; // regionA: [0x100000, 0x200000), 1MB chunks
+    localMap[0x200000] = {0x100000, 0};        // regionB: [0x200000, 0x300000), no chunks
+    localMap[0x300000] = {0x100000, 0x80000};  // regionC: [0x300000, 0x400000), 512KB chunks
+    remoteMap[0x800000] = {0x400000, 0};       // single dst region, no chunks
+
+    // src desc spans all 3 regions: 3MB from 0x100000
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x300000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x300000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/false);
+
+    // regionA: 1 chunk of 1MB → 1 piece
+    // regionB: 1MB, no chunks → 1 piece
+    // regionC: 1MB with 512KB chunks → 2 pieces
+    // Total: 4 pieces
+    ASSERT_EQ(splitSrc.getDescs().size(), 4);
+    ASSERT_EQ(splitDst.getDescs().size(), 4);
+
+    // regionA chunk
+    EXPECT_EQ(splitSrc.getDescs()[0].getAddr(), 0x100000);
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x100000);
+    // regionB whole
+    EXPECT_EQ(splitSrc.getDescs()[1].getAddr(), 0x200000);
+    EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x100000);
+    // regionC chunk 0
+    EXPECT_EQ(splitSrc.getDescs()[2].getAddr(), 0x300000);
+    EXPECT_EQ(splitSrc.getDescs()[2].getLen(), 0x80000);
+    // regionC chunk 1
+    EXPECT_EQ(splitSrc.getDescs()[3].getAddr(), 0x380000);
+    EXPECT_EQ(splitSrc.getDescs()[3].getLen(), 0x80000);
+
+    // dst pieces should sum correctly
+    size_t totalDst = 0;
+    for (auto const& d : splitDst.getDescs())
+    {
+        totalDst += d.getLen();
+    }
+    EXPECT_EQ(totalDst, 0x300000);
+}
+
+TEST(VmmDescSplitterTest, SplitTransferDescsRelookupBothSides)
+{
+    // Both src AND dst span multiple regions simultaneously.
+    // Verifies re-lookup happens independently on each side.
+    VramRegionMap localMap, remoteMap;
+    localMap[0x100000] = {0x100000, 0};  // srcA: [0x100000, 0x200000), no chunks
+    localMap[0x200000] = {0x100000, 0};  // srcB: [0x200000, 0x300000), no chunks
+    remoteMap[0x800000] = {0x80000, 0};  // dstA: [0x800000, 0x880000), no chunks
+    remoteMap[0x880000] = {0x180000, 0}; // dstB: [0x880000, 0xA00000), no chunks
+
+    // 2MB transfer: src spans srcA+srcB, dst spans dstA+dstB
+    std::vector<MemoryDesc> srcDescs{{0x100000, 0x200000, 0}};
+    std::vector<MemoryDesc> dstDescs{{0x800000, 0x200000, 0}};
+    MemoryDescs srcInput{MemoryType::kVRAM, srcDescs};
+    MemoryDescs dstInput{MemoryType::kVRAM, dstDescs};
+
+    auto [splitSrc, splitDst] = VmmDescSplitter::splitTransferDescsWithRegionMaps(
+        srcInput, dstInput, localMap, remoteMap, /*enableCoalesce=*/false);
+
+    // First piece: min(srcA remaining=1MB, dstA remaining=512KB) = 512KB
+    // Second piece: min(srcA remaining=512KB, dstB remaining=1.5MB) = 512KB
+    // Third piece: min(srcB remaining=1MB, dstB remaining=1MB) = 1MB
+    // Total: 3 pieces
+    ASSERT_EQ(splitSrc.getDescs().size(), 3);
+    ASSERT_EQ(splitDst.getDescs().size(), 3);
+
+    EXPECT_EQ(splitSrc.getDescs()[0].getLen(), 0x80000);  // 512KB
+    EXPECT_EQ(splitSrc.getDescs()[1].getLen(), 0x80000);  // 512KB
+    EXPECT_EQ(splitSrc.getDescs()[2].getLen(), 0x100000); // 1MB
+
+    EXPECT_EQ(splitDst.getDescs()[0].getAddr(), 0x800000);
+    EXPECT_EQ(splitDst.getDescs()[0].getLen(), 0x80000);
+    EXPECT_EQ(splitDst.getDescs()[1].getAddr(), 0x880000);
+    EXPECT_EQ(splitDst.getDescs()[1].getLen(), 0x80000);
+    EXPECT_EQ(splitDst.getDescs()[2].getAddr(), 0x900000);
+    EXPECT_EQ(splitDst.getDescs()[2].getLen(), 0x100000);
 }
 
 // Skip LoopbackAgentTest for mooncake backend for now

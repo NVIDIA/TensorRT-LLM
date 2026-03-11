@@ -208,20 +208,30 @@ using VramRegionMap = std::map<uintptr_t, VramRegionInfo>;
 /// Backend-agnostic VMM descriptor split utilities (no NIXL dependency).
 struct VmmDescSplitter
 {
-    /// @brief Look up VMM chunk info for an address from a region map.
-    /// @return {chunkSize, regionBase}. Returns {0, 0} if address is not in any region.
-    [[nodiscard]] static std::pair<size_t, uintptr_t> lookupChunkInfo(uintptr_t addr, VramRegionMap const& regionMap);
+    /// Result of looking up region/chunk info for a virtual address.
+    struct RegionLookupResult
+    {
+        size_t chunkSize;      ///< 0 = no chunks (cudaMalloc or not found)
+        uintptr_t regionBase;  ///< 0 if address not in any known region
+        size_t regionTotalLen; ///< 0 if address not in any known region
+    };
 
-    /// @brief Split VRAM descs at chunk boundaries using a pre-built region map.
+    /// @brief Look up region and chunk info for an address from a region map.
+    /// @return RegionLookupResult with chunkSize/regionBase/regionTotalLen. All zeros if not found.
+    [[nodiscard]] static RegionLookupResult lookupChunkInfo(uintptr_t addr, VramRegionMap const& regionMap);
+
+    /// @brief Split VRAM descs at chunk and region boundaries using a pre-built region map.
     /// For non-VRAM or addresses not in the map, descs pass through unchanged.
     [[nodiscard]] static MemoryDescs splitDescsWithRegionMap(MemoryDescs const& descs, VramRegionMap const& regionMap);
 
     /// @brief Split paired src/dst descs using local and remote region maps.
     /// src is split by localRegionMap, dst is split by remoteRegionMap.
     /// The final piece size is min(srcPiece, dstPiece, remaining).
+    /// When enableCoalesce is true, consecutive contiguous pieces within the same
+    /// chunk and registered region are merged to reduce transfer count.
     [[nodiscard]] static std::pair<MemoryDescs, MemoryDescs> splitTransferDescsWithRegionMaps(
         MemoryDescs const& srcDescs, MemoryDescs const& dstDescs, VramRegionMap const& localRegionMap,
-        VramRegionMap const& remoteRegionMap);
+        VramRegionMap const& remoteRegionMap, bool enableCoalesce = false);
 
     /// @brief Split VRAM descs at VMM chunk boundaries detected via cuMemGetAddressRange.
     /// For cudaMalloc memory (single allocation), descs pass through unchanged.
