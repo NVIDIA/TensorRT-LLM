@@ -1434,7 +1434,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             # Handle stop words only if any new ones are added
-            if len(temp_data.stop_word_seq_slots) > 0:
+            if temp_data.stop_word_seq_slots:
                 self._update_stop_words_buffer(
                     all_sampling_requests,
                     temp_data.total_max_length,
@@ -3211,7 +3211,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         state: SampleStateTorch,
         resource_manager: Optional[ResourceManager] = None,
     ) -> None:
-        if len(state.requests) == 0:
+        if not state.requests:
             return
 
         if state.sampler_event:
@@ -3325,7 +3325,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         finish_reasons_host: torch.Tensor | None = None
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
-        if len(requests) > 0:
+        if requests:
             seq_slots_cuda = seq_slots_host.to(device="cuda", non_blocking=True)
             seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
@@ -3923,7 +3923,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         generation_requests_total_steps = (
             # NB: requests == finished_context_requests + scheduled_requests.generation_requests
             sum_num_generated_tokens - cast(int, req_offsets[len(finished_context_requests)].item())
-            if len(scheduled_requests.generation_requests) > 0
+            if scheduled_requests.generation_requests
             else 0
         )
 
@@ -4617,7 +4617,7 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
     ):
         # resource_manager will not be used in this function, just for interface consistency.
         assert isinstance(state, SampleStateTRTLLM)
-        if len(state.requests) == 0:
+        if not state.requests:
             return
 
         if state.sampler_event:
