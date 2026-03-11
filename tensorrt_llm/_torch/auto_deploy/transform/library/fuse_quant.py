@@ -487,6 +487,12 @@ class FuseFineGrainedFP8Linear(BaseTransform):
         if self.config.backend.lower() != "trtllm":
             raise ValueError(f"Unsupported FineGrained FP8 backend: {self.config.backend}")
 
+        # fp8_block_scaling_gemm requires SM >= 100 (Blackwell+)
+        if torch.cuda.is_available():
+            major, _ = torch.cuda.get_device_capability(0)
+            if major < 10:
+                return gm, TransformInfo(skipped=True, num_matches=0)
+
         patterns = ADPatternMatcherPass()
         _register_finegrained_fp8_linear_patterns(patterns)
         cnt = patterns.apply(gm.graph)

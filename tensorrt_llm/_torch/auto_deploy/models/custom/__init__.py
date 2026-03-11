@@ -5,6 +5,7 @@ from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
+from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 
 __all__ = (
@@ -17,6 +18,7 @@ __all__ = (
     "NemotronFlashForCausalLM",
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",
+    "Qwen3ForCausalLM",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
 )
