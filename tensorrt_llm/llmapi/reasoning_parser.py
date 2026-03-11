@@ -1,5 +1,7 @@
+import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Optional, Type
 
 
@@ -165,6 +167,41 @@ class DeepSeekR1Parser(BaseReasoningParser):
                                          reasoning_content=reasoning_content)
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
+
+
+MODEL_TYPE_TO_REASONING_PARSER: dict[str, str] = {
+    "qwen3": "qwen3",
+    "qwen3_moe": "qwen3",
+    "qwen3_5": "qwen3",
+    "qwen3_5_moe": "qwen3",
+    "qwen3_next": "qwen3",
+    "deepseek_v3": "deepseek-r1",
+    "deepseek_v32": "deepseek-r1",
+    "nemotron_h": "nano-v3",
+}
+
+
+def resolve_auto_reasoning_parser(model: str) -> Optional[str]:
+    """Resolve 'auto' reasoning parser by reading the model's HF config.
+
+    For DeepSeek models, only maps to deepseek-r1 if the model path
+    suggests it is a reasoning model (contains 'R1' in the name).
+    """
+    config_path = Path(model) / "config.json"
+    if not config_path.exists():
+        return None
+
+    with open(config_path) as f:
+        config = json.load(f)
+
+    model_type = config.get("model_type", "")
+
+    if model_type in ("deepseek_v3", "deepseek_v32"):
+        model_name = Path(model).name.lower()
+        if "r1" not in model_name:
+            return None
+
+    return MODEL_TYPE_TO_REASONING_PARSER.get(model_type)
 
 
 @register_reasoning_parser("nano-v3")
