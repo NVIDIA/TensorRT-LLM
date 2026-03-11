@@ -1909,10 +1909,6 @@ class KVCacheManagerV2(BaseResourceManager):
         # (e.g. CUDA graph warmup) don't exceed the GPU pool.
         if self._gpu_max_tokens is not None:
             clamped = min(clamped, self._gpu_max_tokens)
-        logger.info(
-            f"get_num_available_tokens: upper_bound={token_num_upper_bound}, "
-            f"batch_size={batch_size}, extra_tokens={extra_tokens}, "
-            f"clamped={clamped}, _gpu_max_tokens={self._gpu_max_tokens}")
         return clamped
 
     def get_num_free_blocks(self) -> int:
@@ -2057,11 +2053,6 @@ class KVCacheManagerV2(BaseResourceManager):
             # know about the draft manager).
             self._prepare_draft_resources(scheduled_batch)
             return
-
-        # KV allocation is handled by KVCacheV2Scheduler via try_allocate_*.
-        # Block reuse boundary alignment is handled inside the scheduler
-        # (_schedule_context_chunked) before resize, so allocation, token
-        # budget, and forward pass all use the same chunk_size.
 
     def _prepare_draft_resources(self, scheduled_batch: ScheduledRequests):
         """Create/resize KV caches in the draft V2 manager for scheduled requests.
