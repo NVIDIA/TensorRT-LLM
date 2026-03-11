@@ -1,0 +1,15 @@
+# Configuration for granite-4.0-h-small (GraniteMoeHybrid with Mamba+MoE)
+# Uses flashinfer attention backend (trtllm backend produces garbled output with muP scaling)
+# Attention-DP + EP mode: Mamba/Attention layers replicated (not TP-sharded),
+# MoE experts distributed via EP across 4 GPUs. This avoids the TP incompatibility
+# where n_groups=1 makes Mamba B/C SSM dimensions non-shardable.
+runtime: trtllm
+attn_backend: flashinfer
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+max_seq_len: 512
+world_size: 4
+transforms:
+  detect_sharding:
+    enable_attention_dp: true
