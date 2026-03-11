@@ -524,7 +524,9 @@ class DecoderModelForCausalLM(nn.Module,
                 module.create_weights()
 
     @classmethod
-    def get_model_defaults(cls, llm_args: 'TorchLlmArgs') -> dict:
+    def get_model_defaults(cls,
+                           llm_args: 'TorchLlmArgs',
+                           pretrained_config=None) -> dict:
         """Return model-specific LLM API default overrides.
 
         Subclasses can override this to provide defaults that are applied
@@ -540,6 +542,13 @@ class DecoderModelForCausalLM(nn.Module,
 
         Model authors are encouraged to override this method for tuning default behavior
         informed by the model's capabilities and hardware.
+
+        Args:
+            llm_args: The user-provided LLM arguments (with Pydantic defaults).
+            pretrained_config: The loaded pretrained model config from the
+                checkpoint. Allows model-specific defaults to inspect model
+                architecture details (e.g., attention type, hidden sizes)
+                and hardware context for informed decision-making.
 
         The returned dict is deep-merged with the user's llm_args, with
         user-set values taking priority over these defaults.

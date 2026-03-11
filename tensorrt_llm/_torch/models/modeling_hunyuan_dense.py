@@ -8,6 +8,7 @@ from transformers import PretrainedConfig
 from tensorrt_llm._torch.distributed import AllReduceParams
 from tensorrt_llm._torch.models.checkpoints.base_weight_loader import \
     ConsumableWeightsDict
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.functional import PositionEmbeddingType
 
 from ..attention_backend import AttentionMetadata
@@ -624,6 +625,33 @@ class HunYuanDenseV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                          hidden_size=model_config.pretrained_config.hidden_size,
                          vocab_size=model_config.pretrained_config.vocab_size)
         self._execution_stats = None
+
+    @classmethod
+    def get_model_defaults(cls,
+                           llm_args: 'TorchLlmArgs',
+                           pretrained_config=None) -> dict:
+        """Model-specific defaults for HunyuanDense (MLA architecture).
+
+        When MLA is enabled, applies hardware-aware defaults:
+        - KV cache block reuse requires SM90/SM100/SM103/SM120.
+        - Chunked prefill for MLA requires SM90/SM100/SM103/SM120.
+        """
+        if pretrained_config is None:
+            return {}
+
+        use_mla = getattr(pretrained_config, 'use_mla', False)
+        if not use_mla:
+            return {}
+
+        defaults = {}
+        sm_version = get_sm_version()
+        mla_supported_sm = {90, 100, 103, 120}
+
+        if sm_version not in mla_supported_sm:
+            defaults["kv_cache_config"] = {"enable_block_reuse": False}
+            defaults["enable_chunked_prefill"] = False
+
+        return defaults
 
     def load_weights(self, weights: ConsumableWeightsDict):
         tp_size = self.model_config.mapping.tp_size

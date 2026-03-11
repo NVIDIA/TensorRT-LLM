@@ -309,6 +309,126 @@ class TestModelDefaults:
         error_str = str(exc_info.value)
         assert "enable_block_reuse" in error_str or "max_tokens" in error_str
 
+    def test_get_model_defaults_accepts_pretrained_config(self):
+        """Test that get_model_defaults accepts the new pretrained_config param."""
+        from tensorrt_llm._torch.models.modeling_utils import \
+            DecoderModelForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        # Base class should return empty dict with or without pretrained_config
+        result = DecoderModelForCausalLM.get_model_defaults(llm_args)
+        assert result == {}
+        result = DecoderModelForCausalLM.get_model_defaults(
+            llm_args, pretrained_config=None)
+        assert result == {}
+
+    @pytest.mark.parametrize("sm_version,expect_disabled", [
+        (80, True),
+        (86, True),
+        (89, True),
+        (90, False),
+        (100, False),
+        (103, False),
+        (120, False),
+    ])
+    def test_deepseekv3_mla_defaults_sm_aware(self, sm_version,
+                                              expect_disabled):
+        """Test DeepseekV3 returns SM-version-aware MLA defaults."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        with patch(
+                'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                return_value=sm_version):
+            defaults = DeepseekV3ForCausalLM.get_model_defaults(llm_args)
+
+        if expect_disabled:
+            assert defaults.get("kv_cache_config",
+                                {}).get("enable_block_reuse") is False
+            assert defaults.get("enable_chunked_prefill") is False
+        else:
+            assert "kv_cache_config" not in defaults
+            assert "enable_chunked_prefill" not in defaults
+
+    def test_deepseekv3_defaults_applied_without_user_override(self):
+        """Test DeepseekV3 defaults are applied when user doesn't set them."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        with patch(
+                'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                return_value=80):
+            defaults = DeepseekV3ForCausalLM.get_model_defaults(llm_args)
+            applied = apply_model_defaults_to_llm_args(llm_args, defaults)
+
+        assert applied["kv_cache_config"]["enable_block_reuse"] is False
+        assert applied["enable_chunked_prefill"] is False
+        assert llm_args.kv_cache_config.enable_block_reuse is False
+        assert llm_args.enable_chunked_prefill is False
+
+    def test_deepseekv3_defaults_respect_user_override(self):
+        """Test DeepseekV3 defaults don't override explicit user settings."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+
+        # User explicitly enables block reuse and chunked prefill
+        llm_args = TorchLlmArgs(
+            model="/tmp/test",
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True),
+            enable_chunked_prefill=True)
+        with patch(
+                'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                return_value=80):
+            defaults = DeepseekV3ForCausalLM.get_model_defaults(llm_args)
+            applied = apply_model_defaults_to_llm_args(llm_args, defaults)
+
+        # User overrides should win
+        assert llm_args.kv_cache_config.enable_block_reuse is True
+        assert llm_args.enable_chunked_prefill is True
+        # Applied dict should be empty since user overrode everything
+        assert "enable_chunked_prefill" not in applied
+
+    @pytest.mark.parametrize("use_mla,sm_version,expect_disabled", [
+        (False, 80, False),
+        (True, 80, True),
+        (True, 90, False),
+        (False, 90, False),
+    ])
+    def test_hunyuan_dense_mla_defaults_config_aware(self, use_mla, sm_version,
+                                                     expect_disabled):
+        """Test HunyuanDense applies MLA defaults only when use_mla=True."""
+        from types import SimpleNamespace
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_hunyuan_dense import \
+            HunYuanDenseV1ForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        pretrained_config = SimpleNamespace(use_mla=use_mla)
+
+        with patch(
+                'tensorrt_llm._torch.models.modeling_hunyuan_dense.get_sm_version',
+                return_value=sm_version):
+            defaults = HunYuanDenseV1ForCausalLM.get_model_defaults(
+                llm_args, pretrained_config=pretrained_config)
+
+        if expect_disabled:
+            assert defaults.get("kv_cache_config",
+                                {}).get("enable_block_reuse") is False
+            assert defaults.get("enable_chunked_prefill") is False
+        else:
+            assert defaults.get("kv_cache_config",
+                                {}).get("enable_block_reuse") is None
+            assert defaults.get("enable_chunked_prefill") is None
+
 
 def test_KvCacheConfig_declaration():
     config = KvCacheConfig(enable_block_reuse=True,

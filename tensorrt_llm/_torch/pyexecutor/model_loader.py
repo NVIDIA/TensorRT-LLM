@@ -266,7 +266,8 @@ class ModelLoader:
 
         # model_cls is None when the architecture is unknown/unsupported.
         if model_cls and hasattr(model_cls, 'get_model_defaults'):
-            model_defaults = model_cls.get_model_defaults(llm_args)
+            model_defaults = model_cls.get_model_defaults(
+                llm_args, pretrained_config=config)
             if model_defaults:
                 applied_defaults = apply_model_defaults_to_llm_args(
                     llm_args, model_defaults)
