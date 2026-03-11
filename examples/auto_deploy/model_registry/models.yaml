@@ -267,7 +267,7 @@ models:
 - name: tencent/Hunyuan-A13B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: tencent/Hunyuan-7B-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Nemotron-H (2025) - hybrid Mamba-Transformer ---
 - name: nvidia/Nemotron-H-8B-Base-8K
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
@@ -332,9 +332,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- Tencent Hunyuan small (2025) ---
 - name: tencent/Hunyuan-1.8B-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: tencent/Hunyuan-MT-7B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- UI-TARS (2025) - GUI agent VLM ---
 - name: ByteDance-Seed/UI-TARS-1.5-7B
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
@@ -459,7 +459,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 # --- Tencent Hunyuan translation (2025) ---
 - name: tencent/Hunyuan-MT-Chimera-7B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Phi-4-mini flash reasoning (2025) ---
 - name: microsoft/Phi-4-mini-flash-reasoning
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']

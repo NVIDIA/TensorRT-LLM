@@ -1,5 +1,6 @@
 from .modeling_deepseek import DeepSeekV3ForCausalLM
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
+from .modeling_hunyuan_dense_v1 import HunYuanDenseV1ForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_mistral3 import Mistral3ForConditionalGenerationAD, Mistral4ForCausalLM
@@ -10,6 +11,7 @@ from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditiona
 __all__ = (
     "DeepSeekV3ForCausalLM",
     "Glm4MoeLiteForCausalLM",
+    "HunYuanDenseV1ForCausalLM",
     "GraniteMoeHybridForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",

@@ -87,6 +87,11 @@ class ADInputProcessor(DefaultInputProcessor):
         if all_args is not None:
             # TODO: is there a more reliable way to avoid the attention_mask here?
             all_args.pop("attention_mask", None)
+            # token_type_ids is produced by some tokenizers (e.g. Hunyuan) but is not
+            # a graph input for decoder-only causal LMs; drop it here so it does not get
+            # forwarded as an extra_arg to the exported model, which would cause a kwarg
+            # keyword mismatch at inference time.
+            all_args.pop("token_type_ids", None)
 
             # TODO: can we avoid the extra tolist() here eventually?
             token_ids = all_args.pop("input_ids")
