@@ -1049,6 +1049,11 @@ class Eagle3DecodingConfig(EagleDecodingConfig):
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
         " the suffix automaton output for the next draft tokens.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True and use_sa_spec is enabled, each request "
+        "searches all active SA states for the longest match, not just its "
+        "own. Improves acceptance rates when requests share common patterns.")
 
 
 class SaveHiddenStatesDecodingConfig(DecodingBaseConfig):
@@ -1196,6 +1201,13 @@ class SADecodingConfig(DecodingBaseConfig):
         default=-1,
         description="Positive value (e.g., 3): fixed-size ngram matching. "
         "-1: longest possible match via suffix automaton. 0 is invalid.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True, each request searches all active SA states "
+        "for the longest match, not just its own. Improves acceptance rates "
+        "when requests share common patterns. "
+        "Limitations: at most 1024 concurrent slots; suffix matching is "
+        "capped at 64 tokens per request.")
 
     @model_validator(mode='after')
     def validate_sa_config(self):
@@ -1281,6 +1293,11 @@ class MTPDecodingConfig(DecodingBaseConfig):
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
         " the suffix automaton output for the next draft tokens.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True and use_sa_spec is enabled, each request "
+        "searches all active SA states for the longest match, not just its "
+        "own. Improves acceptance rates when requests share common patterns.")
 
     # TODO: remove this after distinguishing `max_draft_len` and `num_nextn_predict_layers`
     # Now we need a flag when MTPDecodingConfig is updated by PyTorchModelEngine.
@@ -1370,6 +1387,11 @@ class PARDDecodingConfig(DecodingBaseConfig):
         description="The threshold for the Suffix Automaton Decoding. If the"
         " length of the suffix match exceeds the threshold, use"
         " the suffix automaton output for the next draft tokens.")
+    enable_global_pool: bool = Field(
+        default=False,
+        description="When True and use_sa_spec is enabled, each request "
+        "searches all active SA states for the longest match, not just its "
+        "own. Improves acceptance rates when requests share common patterns.")
 
     @model_validator(mode="after")
     def set_max_total_draft_tokens(self):

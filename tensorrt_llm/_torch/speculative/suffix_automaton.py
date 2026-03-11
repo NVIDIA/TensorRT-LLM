@@ -46,6 +46,9 @@ class SAConfig:
     # Minimum match length to use SA draft tokens
     threshold: int = 4
 
+    # Enable global pool search across all active SA states
+    enable_global_pool: bool = False
+
 
 class SuffixAutomatonManager(BaseResourceManager):
     """
@@ -84,12 +87,14 @@ class SuffixAutomatonManager(BaseResourceManager):
                 max_seq_len=max_seq_len,
                 max_slots=max_num_requests,
                 threshold=getattr(config, "sa_spec_threshold", 4),
+                enable_global_pool=getattr(config, "enable_global_pool", False),
             )
         )
 
         self.config = sa_config
         self.max_num_requests = max_num_requests
         self.max_seq_len = sa_config.max_seq_len
+        self.enable_global_pool = sa_config.enable_global_pool
 
         # Calculate per-state size based on max_seq_len
         self.state_size = _sa_native.get_state_size(self.max_seq_len)
@@ -122,6 +127,11 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_match_len: Optional[torch.Tensor] = None
         self._gpu_draft_tokens: Optional[torch.Tensor] = None
         self._gpu_batch_indices: Optional[torch.Tensor] = None
+
+        # Global pool buffers (allocated lazily in _ensure_workspace)
+        self._gpu_active_slot_mask: Optional[torch.Tensor] = None
+        self._gpu_match_slot: Optional[torch.Tensor] = None
+        self._pending_mask_updates: Dict[int, int] = {}
 
         # Track which requests have been initialized (for prepare_resources)
         self._initialized_requests: Set[int] = set()
@@ -164,6 +174,15 @@ class SuffixAutomatonManager(BaseResourceManager):
             self._gpu_slots = _sa_native.allocate_workspace(
                 self.max_num_requests + 1, self.max_seq_len
             )
+
+            # Global pool buffers
+            if self.enable_global_pool:
+                self._gpu_active_slot_mask = torch.zeros(
+                    (self.max_num_requests + 1,), dtype=torch.int32, device="cuda"
+                )
+                self._gpu_match_slot = torch.zeros(
+                    (self.max_num_requests,), dtype=torch.int32, device="cuda"
+                )
 
             self._allocated_max_draft_len = max_draft_len
             self._workspace_allocated = True
@@ -209,12 +228,18 @@ class SuffixAutomatonManager(BaseResourceManager):
         )
         self._pending_copies.add(request_id)
 
+        if self.enable_global_pool:
+            self._pending_mask_updates[slot] = 1
+
     def remove_request(self, request_id: int):
         """Remove a request and free its resources."""
         if request_id not in self._request_to_slot:
             return
 
         slot = self._request_to_slot.pop(request_id)
+
+        if self.enable_global_pool:
+            self._pending_mask_updates[slot] = 0
 
         if request_id in self._dummy_request_ids:
             # Dummy slot is reserved; never return it to the free pool.
@@ -253,6 +278,14 @@ class SuffixAutomatonManager(BaseResourceManager):
                         self.max_seq_len,
                     )
             self._pending_copies.clear()
+
+        # Flush deferred active-slot-mask updates.  add_request/remove_request
+        # queue updates because the GPU tensor may not exist yet at that point;
+        # here _ensure_workspace has already run so the tensor is available.
+        if self._pending_mask_updates and self._gpu_active_slot_mask is not None:
+            for slot, value in self._pending_mask_updates.items():
+                self._gpu_active_slot_mask[slot] = value
+            self._pending_mask_updates.clear()
 
         # Map each request ID to its slot. Unknown IDs (e.g. CUDA graph
         # warmup dummies that skipped the context phase) are routed to the
@@ -398,6 +431,65 @@ class SuffixAutomatonManager(BaseResourceManager):
 
         return match_len, draft_tokens
 
+    def extend_global(
+        self,
+        request_ids: List[int],
+        accepted_tokens: torch.Tensor,
+        num_accepted_tokens: torch.Tensor,
+        max_draft_len: int,
+        max_ngram_size: int = -1,
+    ) -> tuple:
+        """
+        Extend SA states and search across all active SAs for the best match.
+
+        Each request's SA is extended with accepted tokens, then all active
+        SA states are searched in parallel to find the longest match across
+        the pool. CUDA graph compatible (two kernel launches on same stream).
+
+        Args:
+            request_ids: List of request IDs in the batch
+            accepted_tokens: [batch_size, max_draft_len + 1] accepted token tensor
+            num_accepted_tokens: [batch_size] number of accepted tokens per request
+            max_draft_len: Maximum draft length
+            max_ngram_size: Max ngram size for suffix extraction (-1 = full)
+
+        Returns:
+            Tuple of (match_len, draft_tokens) tensors
+        """
+        self._ensure_workspace(max_draft_len)
+
+        batch_size = len(request_ids)
+
+        match_len = self._gpu_match_len[:batch_size]
+        match_slot = self._gpu_match_slot[:batch_size]
+        draft_tokens = self._gpu_draft_tokens[:batch_size, :max_draft_len]
+
+        if accepted_tokens.dtype != torch.int32:
+            accepted_tokens = accepted_tokens.to(torch.int32)
+        if num_accepted_tokens.dtype != torch.int32:
+            num_accepted_tokens = num_accepted_tokens.to(torch.int32)
+
+        # Zero out dummy entries (see extend() for rationale).
+        num_accepted_tokens = num_accepted_tokens * self._gpu_nondummy_mask[:batch_size]
+
+        _sa_native.invoke_global_search(
+            batch_size,
+            max_draft_len,
+            max_ngram_size,
+            self.max_num_requests + 1,
+            self.max_seq_len,
+            self._gpu_slots,
+            self._gpu_batch_indices[:batch_size],
+            self._gpu_active_slot_mask,
+            match_len,
+            match_slot,
+            draft_tokens,
+            accepted_tokens,
+            num_accepted_tokens,
+        )
+
+        return match_len, draft_tokens
+
     # --- BaseResourceManager interface ---
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -452,6 +544,9 @@ class SuffixAutomatonManager(BaseResourceManager):
         self._gpu_match_len = None
         self._gpu_draft_tokens = None
         self._gpu_batch_indices = None
+        self._gpu_active_slot_mask = None
+        self._gpu_match_slot = None
+        self._pending_mask_updates.clear()
         self._workspace_allocated = False
         self._allocated_max_draft_len = 0
 

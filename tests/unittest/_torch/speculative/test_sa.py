@@ -231,5 +231,129 @@ def test_sa_config_invalid_zero():
         )
 
 
+def test_sa_config_global_pool():
+    """Test SADecodingConfig with enable_global_pool."""
+    config = SADecodingConfig(
+        max_draft_len=4,
+        enable_global_pool=True,
+    )
+    assert config.enable_global_pool is True
+
+    config_off = SADecodingConfig(
+        max_draft_len=4,
+        enable_global_pool=False,
+    )
+    assert config_off.enable_global_pool is False
+
+    # Default should be False
+    config_default = SADecodingConfig(max_draft_len=4)
+    assert config_default.enable_global_pool is False
+
+
+@pytest.mark.parametrize("disable_overlap_scheduler,use_cuda_graph", [
+    [False, False],
+    [False, True],
+])
+@pytest.mark.high_cuda_memory
+def test_llama_sa_global_pool(disable_overlap_scheduler: bool,
+                              use_cuda_graph: bool):
+    """Test SA speculative decoding with global pool enabled.
+
+    Verifies:
+    1. Speculative decoding with global pool produces identical results to baseline
+    2. SA drafting produces draft tokens that get accepted
+    """
+    total_mem_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+    if total_mem_gb < 20:
+        pytest.skip("Not enough memory to load target model")
+
+    print(
+        f"\nTest config: disable_overlap_scheduler={disable_overlap_scheduler}, "
+        f"use_cuda_graph={use_cuda_graph}, enable_global_pool=True")
+
+    max_batch_size = 2
+    max_draft_len = 4
+    kv_cache_config = KvCacheConfig(enable_block_reuse=False, max_tokens=8192)
+    cuda_graph_config = CudaGraphConfig(
+        batch_sizes=[1, 2]) if use_cuda_graph else None
+
+    llm_common_config = dict(
+        model=llm_models_root() / "llama-3.1-model" / "Meta-Llama-3.1-8B",
+        backend='pytorch',
+        attn_backend='TRTLLM',
+        disable_overlap_scheduler=disable_overlap_scheduler,
+        cuda_graph_config=cuda_graph_config,
+        max_batch_size=max_batch_size,
+        kv_cache_config=kv_cache_config,
+        max_num_tokens=2048,
+        enable_iter_perf_stats=True,
+    )
+
+    spec_config = SADecodingConfig(
+        max_draft_len=max_draft_len,
+        max_matching_ngram_size=-1,
+        enable_global_pool=True,
+    )
+
+    # Use two prompts with similar patterns so global pool can help
+    prompts = [
+        "Count from 1 to 50: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, "
+        "14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,",
+        "Count from 1 to 50: 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, "
+        "14, 15, 16, 17, 18, 19, 20, 21, 22, 23,",
+    ]
+    sampling_params = SamplingParams(max_tokens=64,
+                                     ignore_eos=True,
+                                     temperature=0,
+                                     return_perf_metrics=True)
+
+    # Run with speculative decoding + global pool
+    llm_spec = LLM(**llm_common_config, speculative_config=spec_config)
+    results_spec = llm_spec.generate(prompts, sampling_params)
+    generated_text_spec = [result.outputs[0].text for result in results_spec]
+
+    stats = llm_spec.get_stats(timeout=5)
+    iterations_with_spec = []
+    for stat in stats:
+        if 'specDecodingStats' in stat:
+            spec_stats = stat['specDecodingStats']
+            if spec_stats.get('numDraftTokens', 0) > 0:
+                iterations_with_spec.append(spec_stats)
+
+    llm_spec.shutdown()
+
+    # Run reference without speculative decoding
+    llm_ref = LLM(**llm_common_config)
+    results_ref = llm_ref.generate(prompts, sampling_params)
+    generated_text_ref = [result.outputs[0].text for result in results_ref]
+    llm_ref.shutdown()
+
+    # Verify 1: Identical results (correctness)
+    for i, (text_spec,
+            text_ref) in enumerate(zip(generated_text_spec,
+                                       generated_text_ref)):
+        assert text_spec == text_ref, (
+            f"Prompt {i}: Global pool spec decode differs from baseline.\n"
+            f"Spec: {text_spec}\nRef: {text_ref}")
+    print("Correctness verified: global pool spec decode matches baseline")
+
+    # Verify 2: Spec decoding stats show drafting occurred
+    assert len(iterations_with_spec) > 0, (
+        "SA global pool should have iterations with specDecodingStats.")
+
+    total_draft = sum(s['numDraftTokens'] for s in iterations_with_spec)
+    total_accepted = sum(s['numAcceptedTokens'] for s in iterations_with_spec)
+
+    print(f"Global pool spec decoding stats:")
+    print(f"  Iterations with drafting: {len(iterations_with_spec)}")
+    print(f"  Total draft tokens: {total_draft}")
+    print(f"  Total accepted tokens: {total_accepted}")
+
+    assert total_draft > 0, "SA global pool should produce draft tokens"
+    assert total_accepted > 0, "SA global pool should accept some draft tokens"
+
+    torch.cuda.synchronize()
+
+
 if __name__ == "__main__":
     unittest.main()

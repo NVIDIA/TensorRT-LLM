@@ -86,12 +86,20 @@ class SADraftEnhancer:
             # slice + .contiguous() below compacts memory so the stride
             # matches the kernel expectation.
             gen_accepted = accepted_tokens[num_contexts:, : max_draft_len + 1].contiguous()
-            match_len, draft_tokens_sa = sa_manager.extend(
-                gen_request_ids,
-                gen_accepted,
-                num_accepted_tokens[num_contexts:],
-                max_draft_len,
-            )
+            if sa_manager.enable_global_pool:
+                match_len, draft_tokens_sa = sa_manager.extend_global(
+                    gen_request_ids,
+                    gen_accepted,
+                    num_accepted_tokens[num_contexts:],
+                    max_draft_len,
+                )
+            else:
+                match_len, draft_tokens_sa = sa_manager.extend(
+                    gen_request_ids,
+                    gen_accepted,
+                    num_accepted_tokens[num_contexts:],
+                    max_draft_len,
+                )
             self.sa_match_len.copy_(match_len)
             self.sa_draft_tokens.copy_(draft_tokens_sa)
 

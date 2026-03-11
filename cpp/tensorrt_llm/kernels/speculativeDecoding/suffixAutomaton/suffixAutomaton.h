@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ * SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
  * SPDX-License-Identifier: Apache-2.0
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
@@ -370,6 +370,84 @@ struct SuffixAutomaton
                 break;
             }
             state = *linkOpt;
+        }
+
+        return SAOptional<LookupResult>();
+    }
+
+    /**
+     * @brief Find the longest suffix of an external token sequence that appears
+     *        as a substring in this SA's text, then return its continuation position.
+     *
+     * Uses the standard longest-common-substring algorithm: process suffix tokens
+     * in forward order through the SA, following suffix links on mismatch.
+     *
+     * Time complexity: O(suffixLen) amortized. Each token either advances the
+     * match or triggers suffix link fallbacks. Since matchedLen increases at most
+     * suffixLen times and never goes below 0, total suffix link hops is bounded
+     * by suffixLen.
+     *
+     * @param suffix Pointer to the suffix tokens (forward order: oldest to newest)
+     * @param suffixLen Number of tokens in the suffix
+     * @return Optional LookupResult with continuation position and match length
+     */
+    SA_CUDA_CALLABLE SAOptional<LookupResult> lookupWithSuffix(Token const* suffix, int suffixLen) const
+    {
+        if (mStates.empty() || suffixLen <= 0)
+        {
+            return SAOptional<LookupResult>();
+        }
+
+        NodeIndex state = NodeIndex(0);
+        int matchedLen = 0;
+
+        for (int i = 0; i < suffixLen; i++)
+        {
+            Token token = suffix[i];
+
+            while (state != NodeIndex(0) && mStates.at(state, token) == nullptr)
+            {
+                state = *mStates.at(state).link;
+                matchedLen = mStates.at(state).len;
+            }
+
+            NodeIndex const* nextPtr = mStates.at(state, token);
+            if (nextPtr != nullptr)
+            {
+                state = *nextPtr;
+                matchedLen++;
+            }
+        }
+
+        if (matchedLen == 0 || state == NodeIndex(0))
+        {
+            return SAOptional<LookupResult>();
+        }
+
+        while (state != NodeIndex(0))
+        {
+            auto& nodeData = mStates.at(state);
+            SAOptional<TextIndex> posOpt = nodeData.pos;
+
+            if (posOpt.hasValue())
+            {
+                TextIndex pos = *posOpt;
+                if (+pos + 1 < +mTokens.size())
+                {
+                    LookupResult result;
+                    result.pos = TextIndex(+pos + 1);
+                    result.len = matchedLen;
+                    return SAOptional<LookupResult>(result);
+                }
+            }
+
+            auto linkOpt = nodeData.link;
+            if (!linkOpt.hasValue())
+            {
+                break;
+            }
+            state = *linkOpt;
+            matchedLen = mStates.at(state).len;
         }
 
         return SAOptional<LookupResult>();
