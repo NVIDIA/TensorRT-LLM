@@ -47,6 +47,49 @@ except ImportError:
     HAS_FAST_HADAMARD = False
 
 
+def _compute_slot_mappings(
+    global_positions: torch.Tensor,
+    block_offsets: torch.Tensor,
+    req_indices: torch.Tensor,
+    head_dim: int,
+    tokens_per_block: int,
+    quant_block_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Compute flat byte indices for FP8 data and scales from global token positions.
+
+    Shared by Indexer.prepare() (CPU) and on_update_kv_lens() (GPU) to avoid
+    duplicating the slot mapping arithmetic.
+
+    Args:
+        global_positions: Per-token absolute position in the KV sequence.
+        block_offsets: [num_seqs, max_blocks_per_seq] block offset table.
+        req_indices: Per-token request index.
+        head_dim: Indexer head dimension.
+        tokens_per_block: Tokens stored per cache block.
+        quant_block_size: Quantization block size.
+
+    Returns:
+        (fp8_indices, scale_indices): Flat byte offsets into the cache pool.
+    """
+    scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
+    block_stride = tokens_per_block * (head_dim + scale_size)
+    scale_base_offset = tokens_per_block * head_dim
+
+    block_indices_in_seq = global_positions // tokens_per_block
+    pos_in_blocks = global_positions % tokens_per_block
+
+    max_blocks = block_offsets.shape[1]
+    assert (block_indices_in_seq < max_blocks).all(), \
+        f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+
+    block_ids = block_offsets[req_indices, block_indices_in_seq].to(torch.int64)
+
+    fp8_indices = block_ids * block_stride + pos_in_blocks * head_dim
+    scale_indices = (block_ids * block_stride + scale_base_offset +
+                     pos_in_blocks * scale_size)
+    return fp8_indices, scale_indices
+
+
 def _unravel_indices(flat_indices: torch.Tensor,
                      shape: Tuple[int, ...]) -> Tuple[torch.Tensor, ...]:
     """
@@ -625,6 +668,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         num_local_layers = self.kv_cache_manager.num_local_layers
         max_pool_idx = self.kv_cache_manager.blocks_in_primary_pool - 1
         # host_kv_cache_block_offsets shape: (num_pools, max_batch*beam, 2, max_blocks_per_seq)
+        # The kv_factor dimension (dim=2) must be 1 for SELFKONLY mode (MLA/DSA).
+        kv_factor = self.kv_cache_manager.host_kv_cache_block_offsets.shape[2]
+        assert kv_factor == 1, \
+            f"DSA requires SELFKONLY mode (kv_factor=1), got kv_factor={kv_factor}"
         # Pool 0, first num_seqs entries, field 0 (key offsets)
         encoded = self.kv_cache_manager.host_kv_cache_block_offsets[
             0, :self.num_seqs, 0, :]
@@ -686,6 +733,10 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
             self.indexer_k_cache_block_offsets[:self.num_seqs].copy_(
                 self.host_indexer_k_cache_block_offsets[:self.num_seqs],
                 non_blocking=True)
+            # Safety clamp: prevent OOB from CUDA graph padding entries which
+            # may contain stale negative or out-of-range values after block
+            # eviction/onboarding with host cache offload.
+            self.indexer_k_cache_block_offsets.clamp_(min=0)
 
         # Build req_idx_per_token for topk_indices conversion
         host_req_idx_per_token = torch.repeat_interleave(torch.arange(
@@ -803,6 +854,7 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 self.block_table_expanded[:num_tokens].copy_(
                     self.host_block_table_expanded[:num_tokens],
                     non_blocking=True)
+                self.block_table_expanded.clamp_(min=0)
 
         # Prepare metadata for indexer
         Indexer.prepare(metadata=self)
@@ -817,13 +869,6 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
         # slot_mapping_* buffers also depend on these effective cached lengths. If we do not
         # refresh slot mappings here, indexer K-cache updates can be written with stale offsets.
         if self.kv_cache_manager is not None and self.num_tokens > 0:
-            head_dim = self.kv_cache_manager.index_head_dim
-            tokens_per_block = self.kv_cache_manager.tokens_per_block
-            quant_block_size = self.kv_cache_manager.quant_block_size
-            scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
-            block_stride = tokens_per_block * (head_dim + scale_size)
-            scale_base_offset = tokens_per_block * head_dim
-
             seq_lens = self.seq_lens_cuda[:self.num_seqs]
             # Runtime cached lengths after overlap/spec-dec correction.
             start_positions = self.kv_lens_cuda[:self.num_seqs] - seq_lens
@@ -839,16 +884,16 @@ class DSAtrtllmAttentionMetadata(TrtllmAttentionMetadata):
                 dtype=torch.int64) - seq_starts[req_indices]
 
             global_positions = start_positions[req_indices] + token_offsets
-            block_indices_in_seq = global_positions // tokens_per_block
-            pos_in_blocks = global_positions % tokens_per_block
-
-            block_ids = self.indexer_k_cache_block_offsets[
-                req_indices, block_indices_in_seq].to(torch.int64)
-            self.slot_mapping_fp8[:self.num_tokens] = (
-                block_ids * block_stride + pos_in_blocks * head_dim)
-            self.slot_mapping_scale[:self.num_tokens] = (
-                block_ids * block_stride + scale_base_offset +
-                pos_in_blocks * scale_size)
+            fp8_indices, scale_indices = _compute_slot_mappings(
+                global_positions,
+                self.indexer_k_cache_block_offsets,
+                req_indices,
+                self.kv_cache_manager.index_head_dim,
+                self.kv_cache_manager.tokens_per_block,
+                self.kv_cache_manager.quant_block_size,
+            )
+            self.slot_mapping_fp8[:self.num_tokens] = fp8_indices
+            self.slot_mapping_scale[:self.num_tokens] = scale_indices
 
         if self.num_generations > 0:
             torch.cumsum(
@@ -923,8 +968,7 @@ class Indexer(nn.Module):
                  sparse_attention_config: "SparseAttentionConfig",
                  dtype: Optional[torch.dtype],
                  layer_idx: int = 0,
-                 aux_stream: Optional[torch.cuda.Stream] = None,
-                 indexer_rope_interleave: bool = False):
+                 aux_stream: Optional[torch.cuda.Stream] = None):
         super().__init__()
         self.hidden_size = mla_params.hidden_size
         self.q_lora_rank = mla_params.q_lora_rank
@@ -960,6 +1004,8 @@ class Indexer(nn.Module):
             skip_create_weights_in_init=skip_create_weights_in_init,
             use_custom_cublas_mm=True)
 
+        indexer_rope_interleave = getattr(sparse_attention_config,
+                                          'indexer_rope_interleave', False)
         self.rotary_emb = RotaryEmbedding(
             pos_embd_params.rope,
             head_dim=self.rope_dim,
@@ -1194,10 +1240,6 @@ class Indexer(nn.Module):
         # Compute slot_mapping for all requests (both context and generation)
         # This maps each token to its flat cache position for vectorized KV cache updates
         start_positions = torch.tensor(cached_tokens, dtype=torch.int32)
-        scale_size = head_dim // quant_block_size * 4  # float32 = 4 bytes
-        block_stride = tokens_per_block * (head_dim + scale_size
-                                           )  # Bytes per block
-        scale_base_offset = tokens_per_block * head_dim  # Offset to scale region in block
 
         batch_size = len(request_ids)
 
@@ -1212,24 +1254,14 @@ class Indexer(nn.Module):
         # Compute global positions for all tokens in the batch
         global_positions = start_positions[req_indices] + token_offsets
 
-        # Block indices/pos for all tokens in the batch
-        block_indices_in_seq = global_positions // tokens_per_block
-        pos_in_blocks = global_positions % tokens_per_block
-
-        max_blocks = metadata.host_indexer_k_cache_block_offsets.shape[1]
-        assert (block_indices_in_seq < max_blocks).all(), \
-            f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
-
-        # Gather block IDs
-        block_ids = metadata.host_indexer_k_cache_block_offsets[
-            req_indices, block_indices_in_seq]
-
-        assert (block_ids >= 0).all(), \
-            f"Unallocated block (block_id < 0) found at positions {torch.where(block_ids < 0)[0].tolist()}"
-
-        # Compute flat indices for all tokens in the batch
-        fp8_flat_indices = block_ids * block_stride + pos_in_blocks * head_dim
-        scale_flat_indices = block_ids * block_stride + scale_base_offset + pos_in_blocks * scale_size
+        fp8_flat_indices, scale_flat_indices = _compute_slot_mappings(
+            global_positions,
+            metadata.host_indexer_k_cache_block_offsets,
+            req_indices,
+            head_dim,
+            tokens_per_block,
+            quant_block_size,
+        )
 
         metadata.host_slot_mapping_fp8[:total_tokens] = fp8_flat_indices
         metadata.host_slot_mapping_scale[:total_tokens] = scale_flat_indices
@@ -1538,11 +1570,6 @@ class Indexer(nn.Module):
                 block_table = metadata.block_table_expanded[:num_tokens]
                 scheduler_metadata_buffer = metadata.scheduler_metadata_buffer_expanded
 
-            # Safety clamp: prevent OOB from CUDA graph padding entries which
-            # may contain stale negative or out-of-range values after block
-            # eviction/onboarding with host cache offload.
-            block_table = block_table.clamp(min=0)
-
             assert num_gen_tokens == batch_size * next_n
             weights_decode = weights[num_ctx_tokens:num_ctx_tokens +
                                      num_gen_tokens, ...]
@@ -1692,7 +1719,6 @@ class DSATrtllmAttention(TrtllmAttention):
             sparse_attention_config: Optional["SparseAttentionConfig"] = None,
             dtype: Optional[torch.dtype] = None,
             aux_stream: Optional[torch.cuda.Stream] = None,
-            indexer_rope_interleave: bool = False,
             **kwargs):
         if sparse_attention_config is None:
             raise ValueError(
@@ -1716,7 +1742,7 @@ class DSATrtllmAttention(TrtllmAttention):
         self.indexer = Indexer(quant_config, pos_embd_params, mla_params,
                                skip_create_weights_in_init,
                                sparse_attention_config, dtype, layer_idx,
-                               aux_stream, indexer_rope_interleave)
+                               aux_stream)
 
     def sparse_attn_predict(
         self,

@@ -1259,8 +1259,6 @@ class MLA(nn.Module):
             sparse_attention_config=config.sparse_attention_config,
             dtype=dtype,
             aux_stream=aux_stream,
-            indexer_rope_interleave=getattr(config.pretrained_config,
-                                            'indexer_rope_interleave', False),
         )
 
         self.softmax_scale = 1.0 / (math.sqrt(self.qk_head_dim) * q_scaling)
