@@ -228,7 +228,6 @@ def _torch_cached_ssm(
         slot_idx,
         use_initial_states,
     ) = _split_cached_ssm_batch(batch_info_host, seq_len, cu_seqlen, slot_idx, use_initial_states)
-    num_seq = num_prefill + num_decode
 
     if s == 1:
         # Generate-only batch: gather cache slices for slots (already sanitized by metadata)
@@ -276,7 +275,6 @@ def _torch_cached_ssm(
     C_flat = C.reshape(bs, *C.shape[2:])
     dt_flat = dt.reshape(bs, *dt.shape[2:])
 
-    num_total_tokens = num_prefill_tokens + num_decode
     # NOTE: need contiguous format to process it sequentially
     y = torch.zeros_like(hidden_states, memory_format=torch.contiguous_format)
     y_flat = y.view(bs, *y.shape[2:])
@@ -311,33 +309,6 @@ def _torch_cached_ssm(
         # Scatter the final state to the slot-indexed cache using device index
         slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
         ssm_state_cache.index_copy_(0, slot_i, ssm_state_i.to(ssm_state_cache.dtype))
-
-    if num_decode > 0:
-        decode_slice = slice(num_prefill_tokens, num_total_tokens)
-        decode_slot_idx = slot_idx[num_prefill:num_seq]
-        hs_decode = hs_flat[decode_slice].unsqueeze(1)
-        B_decode = B_flat[decode_slice].unsqueeze(1)
-        C_decode = C_flat[decode_slice].unsqueeze(1)
-        dt_decode = dt_flat[decode_slice].unsqueeze(1)
-        ssm_batch = ssm_state_cache.index_select(0, decode_slot_idx)
-        y_decode, updated_state = _torch_cached_ssm_decode(
-            hs_decode,
-            A,
-            B_decode,
-            C_decode,
-            D,
-            dt_decode,
-            dt_bias,
-            time_step_limit,
-            chunk_size,
-            ssm_batch,
-        )
-        y_flat.index_copy_(
-            0,
-            torch.arange(num_prefill_tokens, num_total_tokens, device=y.device),
-            y_decode[:, 0].to(y_flat.dtype),
-        )
-        ssm_state_cache.index_copy_(0, decode_slot_idx, updated_state.to(ssm_state_cache.dtype))
 
     return y
 
