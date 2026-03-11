@@ -22,7 +22,33 @@ huggingface-cli download {org}/{model} --exclude "*.safetensors" "*.bin" "*.pt" 
 ```
 This downloads config, code, and tokenizer files into the standard HF cache (`$HF_HOME` or `~/.cache/huggingface/`) while skipping large weight files. Files cached here are automatically found by `transformers.AutoConfig.from_pretrained` and similar APIs — no extra path wiring needed. Once downloaded you can work fully offline — read `config.json` and `modeling_*.py` from the cache snapshot directory printed by the command.
 
-## Phase 1 — Analyze HF Model
+## Phase 1 — Survey Existing Coverage & Analyze HF Model
+
+### Step 1 — Check for existing AD custom modeling code
+
+Before writing anything, check if an AD custom model already covers this architecture:
+
+1. Read the model's `config.json` to find its `model_type` and `architectures` fields.
+2. Search `tensorrt_llm/_torch/auto_deploy/models/custom/` for existing `modeling_*.py` files that register the same config class name (grep for the `architectures` value or `model_type`).
+3. Also check `tensorrt_llm/_torch/auto_deploy/models/custom/__init__.py` for existing registrations.
+
+**If existing code is found:**
+- Read it carefully. It may already handle this exact model — in which case no new modeling file is needed, only registry entries and possibly tests.
+- If the existing code covers a closely related model in the same family but needs adaptation (e.g., the family added MoE in a newer variant, or changed the attention type), decide whether to **extend** the existing file or create a new one. Prefer extending if the changes are minor; create a new file if the architecture diverges significantly. Report the decision and rationale to the user before proceeding.
+
+**If no existing code is found:** proceed to write a new model file in Phase 2.
+
+### Step 2 — Survey the model family in the registry
+
+Check `examples/auto_deploy/model_registry/models.yaml` for **other models from the same family** (e.g., if asked to onboard `Qwen/Qwen3-8B`, look for `Qwen/Qwen3-0.6B`, `Qwen/Qwen3-32B`, `Qwen/Qwen3-235B-A22B`, etc.). Also check HuggingFace for the full set of model sizes/variants in the family.
+
+- **Identify which family members already have registry entries** and which are missing.
+- **Identify which family members share the same architecture** (same `model_type` / `architectures` in their config) — these can all use a single modeling file.
+- **Plan to onboard the entire family cohesively**: one modeling file + one test file should cover all members that share an architecture. The registry should have entries for all commonly-used sizes.
+- Report the family survey findings to the user: which models exist, which are missing, and the proposed plan for covering them all.
+
+### Step 3 — Analyze HF model architecture
+
 Study the locally-available `config.json` and `modeling_*.py` (NOT from `tensorrt_llm/_torch/models/`). Identify attention type (MHA/GQA/MLA), MoE config, RoPE variant, normalization, activation, and any data-dependent ops that break `torch.export` (e.g. `torch.nonzero`, data-conditioned `if`).
 
 ## Phase 2 — Write a Lean Prefill-Only Model
@@ -113,9 +139,11 @@ If the reviewer returns **FAIL** on any item:
 
 Do NOT proceed to Phase 8 until the reviewer returns PASS.
 
-## Phase 8 — Create or Update the Model Registry Entry
+## Phase 8 — Create or Update Model Registry Entries (Including Family)
 
-Before running the model end-to-end, ensure it has a valid entry in the AutoDeploy model registry at `examples/auto_deploy/model_registry/`.
+Before running the model end-to-end, ensure it **and all identified family members from Phase 1** have valid entries in the AutoDeploy model registry at `examples/auto_deploy/model_registry/`.
+
+For **each model** (the requested model + any family members identified in Phase 1 Step 2):
 
 1. **Check `examples/auto_deploy/model_registry/models.yaml`** for an existing entry matching the model's HF id.
 2. **If the entry is missing**, add it with the appropriate `yaml_extra` list:
@@ -124,6 +152,8 @@ Before running the model end-to-end, ensure it has a valid entry in the AutoDepl
    - Add model-specific YAML if the model needs custom settings (e.g., `model_kwargs`, non-default transforms).
 3. **If a model-specific config YAML is needed** and doesn't exist, create it under `examples/auto_deploy/model_registry/configs/`. See existing configs for format examples.
 4. **If the entry exists but needs changes** (e.g., wrong world_size, missing model-specific config), update it.
+
+Family members that share the same architecture should all use the same modeling code. Different sizes only need different `world_size_N.yaml` entries and maybe different sharding configurations.
 
 See `examples/auto_deploy/model_registry/README.md` for full documentation on the registry format and best practices.
 
