@@ -807,7 +807,7 @@ def test_trtllm_fused_moe_nvfp4(
     reason="Requires fp4 and trtllm support",
 )
 def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size):
-    """Test _stack_nvfp4_moe_weights transform with non-gated MLP (Relu2).
+    """Test NVFP4 Cutlass fusion with non-gated MLP (Relu2).
 
     Tests both:
     - 128x128: No padding needed
@@ -818,7 +818,8 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
     """
     import torch.fx as fx
 
-    from tensorrt_llm._torch.auto_deploy.transform.library.fused_moe import _stack_nvfp4_moe_weights
+    from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
+    from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
 
     torch.manual_seed(42)
 
@@ -981,11 +982,16 @@ def test_stack_nvfp4_moe_weights_transform_relu2(hidden_size, intermediate_size)
     module = MoEModule().cuda()
     gm = fx.symbolic_trace(module)
 
-    # Apply the transform
-    num_transformed = _stack_nvfp4_moe_weights(gm)
-    gm.recompile()
+    # Apply the transform through the public optimizer entrypoint.
+    gm = InferenceOptimizer(
+        None,
+        {"fuse_nvfp4_moe": {"stage": "post_load_fusion"}},
+    )(None, gm)
 
-    assert num_transformed == 1, f"Expected 1 transform, got {num_transformed}"
+    has_fused = any(
+        is_op(n, torch.ops.auto_deploy.trtllm_quant_nvfp4_moe_fused) for n in gm.graph.nodes
+    )
+    assert has_fused, "Expected trtllm_quant_nvfp4_moe_fused after fusion"
 
     # Run the transformed graph
     transformed_output = gm(x, selected_experts, routing_weights)
