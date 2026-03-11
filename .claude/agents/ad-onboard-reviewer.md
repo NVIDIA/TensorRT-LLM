@@ -23,27 +23,38 @@ Read every file yourself, line by line, and verify each checklist item with conc
 Read the actual source code for each check. Cite `file:line_number` for every PASS and FAIL.
 
 
-### B. Self-Containment
+### B. Self-Containment & Config
 
 | # | Check | How to verify |
 |---|-------|---------------|
 | B1 | No imports from other AD custom models (`from .modeling_*`) | Grep for `from .modeling_` — only `from .` imports of non-model utilities are OK (e.g., `mla_rope_utils`) |
-| B2 | Config class is defined in the file OR imported from transformers (not from another AD model) | Check where the config class comes from |
-| B3 | If config not in installed transformers, file has `AutoConfig.register()` | Grep for `AutoConfig.register` |
+| B2 | Config class is imported from `transformers` whenever possible — NOT recreated/copied into the modeling file when it already exists in transformers or is bundled with the checkpoint | Check where the config class comes from. If a `from transformers import ...Config` would work, the file should use it. A locally-defined config class when one is available in `transformers` is a FAIL. |
+| B3 | If config is truly unavailable (not in `transformers`, not in checkpoint), file defines a minimal config class and calls `AutoConfig.register()` | Grep for `AutoConfig.register` — should only exist when the config is genuinely missing from transformers |
 
 ### BA Checkpoint compatibility
 | BA1 | Make sure the custom modeling code nn.module hierarchy matches the model hierarchy that is expected in the checkpoint safetensor json. |
 | BA2 | If our modeling code has expert-list style moe experts and the checkpoint has fused moe experts, add a load hook to load the safetensors correctly into our expert list weights.
 
-### C. Ops & Compatibility
+### C. Ops & Compatibility (STRICT — canonical ops are the backbone of AD)
 
 | # | Check | How to verify |
 |---|-------|---------------|
-| C1 | Only uses `torch_*` reference ops from `auto_deploy.custom_ops` or plain PyTorch | Grep for `torch.ops.` calls — only `torch.ops.auto_deploy.torch_*` allowed |
-| C2 | No `triton_*`, `flashinfer_*`, `trtllm.*` ops (no exception for routers or router gemms all must be CPU compatible torch ops) | Grep for these prefixes |
-| C3 | No KV cache logic (no `past_key_values`, no cache classes) | Grep for `past_key_value`, `cache`, `DynamicCache` |
-| C4 | No training paths (no `self.training` checks, no `dropout`) | Grep for `self.training`, `dropout`, `Dropout` |
-| C5 | No flash attention variants (`flash_attn`, `sdpa`, `_flash_attention`) | Grep for these strings |
+| C1 | **Canonical ops used WHENEVER POSSIBLE**: `torch.ops.auto_deploy.torch_*` canonical ops MUST be used for any operation where one exists. Attention → `torch_attention` / `torch_attention_sdpa` / `torch_mla`. RoPE → `torch_rope_with_explicit_cos_sin` / `torch_rope_with_complex_freqs` / `torch_rope_with_qk_interleaving`. MoE → `torch_moe` / `torch_moe_fused` / `torch_moe_router`. RMSNorm → `torch_rmsnorm`. Linear → `torch_linear_simple`. SSM → `torch_ssm` / `torch_causal_conv1d`. Plain PyTorch reimplementations of these operations are a FAIL. | Identify all attention, RoPE, MoE, normalization, and linear blocks in the model. For each, verify it calls the corresponding `torch.ops.auto_deploy.torch_*` op. Cross-reference against `tensorrt_llm/_torch/auto_deploy/custom_ops/README.md`. |
+| C2 | Only `torch_*` reference ops or plain PyTorch for ops without a canonical equivalent | Grep for `torch.ops.` calls — only `torch.ops.auto_deploy.torch_*` allowed |
+| C3 | No `triton_*`, `flashinfer_*`, `trtllm.*` ops (no exception for routers or router gemms — all must be CPU compatible torch ops) | Grep for these prefixes |
+| C4 | No KV cache logic (no `past_key_values`, no cache classes) | Grep for `past_key_value`, `cache`, `DynamicCache` |
+| C5 | No training paths (no `self.training` checks, no `dropout`) | Grep for `self.training`, `dropout`, `Dropout` |
+| C6 | No flash attention variants (`flash_attn`, `sdpa`, `_flash_attention`) | Grep for these strings |
+| C7 | Plain PyTorch is used ONLY for operations without a canonical op (e.g., activation functions, embedding, basic arithmetic, routing logic like sigmoid + topk) | Review any plain PyTorch math blocks — verify no canonical op equivalent was missed |
+| C8 | **No `repeat_interleave` or `repeat_kv` for GQA**: AD attention ops handle different Q/KV head counts natively. Manual KV head repetition is unnecessary and prevents AD optimization. | Grep for `repeat_interleave`, `repeat_kv`, `expand(...).reshape` patterns on K/V tensors |
+
+### CA. Model Leanness & Input Contract
+
+| # | Check | How to verify |
+|---|-------|---------------|
+| CA1 | **`position_ids` is asserted not None**: The forward method must contain `assert position_ids is not None` (or equivalent). No fallback logic to generate position_ids from input_ids. | Grep for `assert position_ids` or check the forward entry point for a None guard. Fallback code like `position_ids = torch.arange(...)` is a FAIL. |
+| CA2 | **No dead code paths**: No optional HF features gated on config flags irrelevant to prefill export (e.g., `if self.config.use_sliding_window`, `if output_attentions`). The code should only contain what's needed for prefill. | Scan forward methods for conditional branches that serve non-export purposes |
+| CA3 | **No HF runtime features**: No `attention_mask` parameter, no `past_key_values`, no `use_cache`, no `output_attentions`, no `output_hidden_states` in the forward signature | Grep for these parameter names in forward signatures |
 
 ### D. RoPE & MoE Conventions
 

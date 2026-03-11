@@ -25,27 +25,48 @@ This downloads config, code, and tokenizer files into the standard HF cache (`$H
 ## Phase 1 — Analyze HF Model
 Study the locally-available `config.json` and `modeling_*.py` (NOT from `tensorrt_llm/_torch/models/`). Identify attention type (MHA/GQA/MLA), MoE config, RoPE variant, normalization, activation, and any data-dependent ops that break `torch.export` (e.g. `torch.nonzero`, data-conditioned `if`).
 
-## Phase 2 — Write Prefill-Only Model
-Create `tensorrt_llm/_torch/auto_deploy/models/custom/modeling_{name}.py`. Use `modeling_glm4_moe_lite.py` as a **structural template only** (class layout, dataclass outputs, forward signature). Strip: KV cache, training paths, dropout, flash attention variants. Keep: `PreTrainedModel` hierarchy, `ModelOutput` dataclass, minimal forward `(input_ids, position_ids, inputs_embeds=None, **kwargs)`.
+## Phase 2 — Write a Lean Prefill-Only Model
+Create `tensorrt_llm/_torch/auto_deploy/models/custom/modeling_{name}.py`. Use `modeling_glm4_moe_lite.py` as a **structural template only** (class layout, dataclass outputs, forward signature).
 
-**Critical**
-Make sure the custom modeling code matches the model hierarchy that is expected in the checkpoint safetensor json.
+**The goal is a minimal prefill-only model for `torch.export` with AD canonical IR ops.** Keep the code as lean as possible — every line should serve the export path. Do not port HF features that AD doesn't need.
+
+Strip: KV cache, training paths, dropout, flash attention variants, `repeat_interleave`/`repeat_kv` for GQA (AD attention ops handle this natively), fallback logic for generating `position_ids` (assert instead), optional code paths gated on config flags irrelevant to prefill export.
+
+Keep: `PreTrainedModel` hierarchy, `ModelOutput` dataclass, minimal forward `(input_ids, position_ids, inputs_embeds=None, **kwargs)`.
+
+**Critical:** Make sure the custom modeling code nn.Module hierarchy matches what the checkpoint safetensor json expects.
 
 **Critical rule: Do NOT import or reuse existing AD custom model code** (e.g. `from .modeling_deepseek import ...`). Every `modeling_{name}.py` must be self-contained. Use the HF source (`$CLONE_DIR/modeling_*.py`) as the source of truth for the model's logic and translate it fresh — even if a structurally similar AD model already exists. This prevents hidden coupling, makes each model auditable on its own, and ensures model-specific quirks are captured correctly.
 
-## Phase 3 — Use Reference Custom Ops Only
-Replace HF ops with `torch_*` prefixed AD reference ops. **Never** use `triton_*`/`flashinfer_*`/`trtllm_*` — backend selection happens later in AD transforms. Browse `tensorrt_llm/_torch/auto_deploy/custom_ops/` for all available reference ops and their exact signatures. For vanilla components (RMSNorm, MLP), plain PyTorch is also fine — AD fusion passes replace them.
+## Phase 3 — Use AutoDeploy Canonical Ops (CRITICAL)
+**Use `torch.ops.auto_deploy.torch_*` canonical ops WHENEVER POSSIBLE.** These are the IR nodes that AD transforms later replace with optimized backends (triton, flashinfer, trtllm) at deployment time. If a canonical op exists for an operation, you MUST use it — do not reimplement the logic in plain PyTorch.
+
+Available canonical ops (see `tensorrt_llm/_torch/auto_deploy/custom_ops/README.md` for full list):
+- **Attention:** `torch_attention`, `torch_attention_sdpa`, `torch_attention_repeat_kv`
+- **MLA:** `torch_mla`
+- **RoPE:** `torch_rope_with_explicit_cos_sin`, `torch_rope_with_complex_freqs`, `torch_rope_with_qk_interleaving`
+- **MoE:** `torch_moe`, `torch_moe_fused`, `torch_moe_router`, `torch_moe_dense_mlp`
+- **Normalization:** `torch_rmsnorm`, `torch_rmsnorm_gated`, `torch_l2norm`
+- **Linear:** `torch_linear_simple`
+- **SSM/Mamba:** `torch_ssm`, `torch_causal_conv1d`
+- **FLA:** `torch_gated_delta_rule`
+- **Quantization:** `torch_quant_fp8_linear`, `torch_quant_nvfp4_linear`, etc.
+
+**Never** use `triton_*`/`flashinfer_*`/`trtllm_*` — backend selection happens later in AD transforms. Plain PyTorch is acceptable ONLY for operations where no canonical op exists (e.g., simple activation functions, embedding lookups, basic tensor arithmetic). If you find yourself writing manual attention, MoE routing, RoPE, or normalization in plain PyTorch, stop and use the canonical op instead.
+
+**Do NOT use `repeat_interleave` or `repeat_kv` for GQA.** HF reference code often repeats K/V heads to match the Q head count before attention. The AD canonical attention ops (`torch_attention`, `torch_attention_sdpa`) handle GQA natively — they accept Q, K, V with different head counts and do the right thing internally. Manually repeating K/V heads is unnecessary bloat and prevents AD from optimizing the attention path.
 
 ## Phase 4 — Register
 1. Bottom of model file: `AutoModelForCausalLMFactory.register_custom_model_cls("ConfigClassName", ForCausalLM)`.
 2. Add import + `__all__` entry in `models/custom/__init__.py`.
-3. If config not in installed transformers, bundle config class and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`.
+3. **Prefer reusing the existing config class** — if the config can be loaded via `AutoConfig.from_pretrained(model_id)` (either from the installed `transformers` or from files in the HF cache downloaded in Phase 0), import it from `transformers` and use it directly. Do NOT recreate or copy the config class into the modeling file when it is already available.
+4. Only if the config is truly not available (not in `transformers` and not bundled with the checkpoint), define a minimal config class in the modeling file and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`.
 
 ## Phase 5 — Model Input Contract
 The custom model's forward signature must follow these rules:
 
 1. **Always `input_ids`** — The top-level model always receives `input_ids`. A submodule graph may internally receive `inputs_embeds` (e.g., after the embedding layer), but the exported entry point takes token IDs.
-2. **Always `position_ids`** — Vanilla sequential `position_ids` are always provided. If the model uses a non-standard RoPE variant or custom position encoding, the model must compute it internally on top of these vanilla `position_ids`.
+2. **Always `position_ids`** — Vanilla sequential `position_ids` are always provided. **Assert `position_ids is not None`** at the top of the forward method — it is a required input, never optional. Do not include fallback logic to generate `position_ids` from `input_ids` (HF models often do this; strip it). If the model uses a non-standard RoPE variant or custom position encoding, the model must compute it internally on top of the provided vanilla `position_ids`.
 3. **Multi-modal inputs** — If the model supports vision/audio/etc., those additional inputs are passed during prefill alongside `input_ids`.
 4. **No attention mask, no cache inputs, no HF-runtime features** — Do not accept `attention_mask`, `past_key_values`, `use_cache`, or similar HF-runtime arguments. AD manages masking and caching via its own transforms and runtime.
 
@@ -92,49 +113,82 @@ If the reviewer returns **FAIL** on any item:
 
 Do NOT proceed to Phase 8 until the reviewer returns PASS.
 
-## Phase 8 — AutoDeploy End-to-End Run
+## Phase 8 — Create or Update the Model Registry Entry
+
+Before running the model end-to-end, ensure it has a valid entry in the AutoDeploy model registry at `examples/auto_deploy/model_registry/`.
+
+1. **Check `examples/auto_deploy/model_registry/models.yaml`** for an existing entry matching the model's HF id.
+2. **If the entry is missing**, add it with the appropriate `yaml_extra` list:
+   - Always include `dashboard_default.yaml` first.
+   - Pick `world_size_N.yaml` based on model size (1 for <2B, 2 for 2-15B, 4 for 20-80B, 8 for 80B+). The `world_size` determines how many GPUs are needed for the run.
+   - Add model-specific YAML if the model needs custom settings (e.g., `model_kwargs`, non-default transforms).
+3. **If a model-specific config YAML is needed** and doesn't exist, create it under `examples/auto_deploy/model_registry/configs/`. See existing configs for format examples.
+4. **If the entry exists but needs changes** (e.g., wrong world_size, missing model-specific config), update it.
+
+See `examples/auto_deploy/model_registry/README.md` for full documentation on the registry format and best practices.
+
+## Phase 9 — AutoDeploy End-to-End Run
 
 Invoke the `ad-run-agent` subagent to run the model through AutoDeploy on GPU. Pass it:
 
 Step 1: Reduced num layers
-Run with reduced num layer - to test e2e flow for issues and iterate faster. 
+Run with reduced num layers to test the e2e flow for issues and iterate faster.
 The generation will be bad in step 1 because we are not loading all layers.
 
 Step 2: Full layers
 Run with full num layers. The generation should be coherent in step 2.
 
 - **Model HF ID:** the HuggingFace model-id (or local checkpoint path) used throughout onboarding
-- **Config YAML:** the AD config yaml file for this model (from `examples/auto_deploy/model_registry/configs/`)
 - **Description:** a short description of the current state, e.g.:
   - "first try after onboarding"
   - "updated yaml with reduced layers"
   - "changed attention backend to torch_mha"
   - "fixed weight loading hooks"
 
+The model is run via:
+```bash
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+```
+The `--use-registry` flag automatically resolves the model's config from `models.yaml`, so no manual `--args.yaml-extra` is needed. The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
+
 The ad-run-agent will build+run the model, check generation quality, archive logs, and update its worklog.
 
 If the run **fails** or produces **bad generation**:
 1. Read the ad-run-agent's worklog and log file to understand the error
-2. Fix the issue (model code, config yaml, weight hooks, etc.)
+2. Fix the issue (model code, registry config yaml, weight hooks, etc.)
 3. Re-invoke the ad-run-agent with an updated description reflecting the change (e.g., "retry after fixing RoPE scaling in config")
 4. Repeat until the run succeeds with meaningful generation
 
-Do NOT proceed to Phase 9 until the step 2 with full layers reports a successful run with coherent generation.
+Do NOT proceed to Phase 10 until the step 2 with full layers reports a successful run with coherent generation.
 
-## Phase 9 — Summary Report
-Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified, (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took), (7) AD end-to-end run result (success/fail, number of iterations, final generation quality).
+## Phase 10 — Summary Report
+Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified (including any new registry configs), (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took), (7) AD end-to-end run result (success/fail, number of iterations, final generation quality), (8) registry entry added/updated in `models.yaml` and any new config YAMLs created.
 
-## Phase 10 - Prepare a Pull Request
+## Phase 11 — Prepare a Pull Request
+
+**GitHub CLI config:** Before running any `gh` command, confirm which `GH_CONFIG_DIR` to use. The default is `~/.config/gh`, but a different directory may be needed when targeting a fork (e.g., `nv-auto-deploy/TensorRT-LLM` vs `NVIDIA/TensorRT-LLM`). Check if the user has specified a custom `GH_CONFIG_DIR` (e.g., in `CLAUDE.local.md` or environment). If not, **ask the user** before proceeding. Prefix all `gh` commands with: `GH_CONFIG_DIR=<path> gh ...`
 
 Prepare a pull request against `origin` (https://github.com/nv-auto-deploy/TensorRT-LLM) targeting
 branch `feat/paperclip_maximizer`. Then, ask the user to provide feedback on the PR and wait for the
 user to get back to you when the feedback has been posted. Then continue iterating according to the
 user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
+When you post a PR, make sure to include the results from running `build_and_run_ad.py` with the configs
+in the model registry as well as a reproducible command along the lines of
+```
+python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+```
+to give a set of instructions for the user to reproduce the test. Also include a detailed pytest
+command for the unit tests you added so they can be run by the reviewer as well.
 
 ## Key Gotchas
+- **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
+- **No `repeat_interleave`:** AD attention ops handle GQA natively. Never repeat K/V heads manually.
+- **Lean code:** Every line should serve prefill export. No optional HF features, no dead code paths, no fallback logic.
+- **Reuse config classes:** Import from `transformers` or load from checkpoint whenever possible. Only bundle a config class if it truly doesn't exist anywhere.
+- **Assert `position_ids`:** Always assert `position_ids is not None` — it is a required input, never optional.
 - **Self-contained files only**: Never import from other AD custom models. Each `modeling_{name}.py` is a standalone translation from HF source.
 - RoPE buffers: `_ad_` prefix, return full table (not sliced), slice by `position_ids` downstream.
 - MoE weights: use `nn.ModuleList` per-expert for checkpoint compatibility. Write test-only state_dict converters for HF stacked format.
 - `noaux_tc` routers (DeepSeek-V3 style): use vanilla PyTorch (sigmoid + bias + group topk + normalize + scale). AD transforms can replace with fused `trtllm` kernels at deployment time.
 - Vision towers are typically **not** exported. Keep vision logic in eager PyTorch and export only the text path unless explicitly requested otherwise.
-- Model code and tests must run on CPU. Use only torch reference ops in AutoDeploy (e.g., `torch_rmsnorm`, `torch_mla`, `torch_moe`) and avoid CUDA-only kernels in the modeling path.
+- Model code and tests must run on CPU. Use only `torch_*` prefixed reference ops in AutoDeploy — never `triton_*`, `flashinfer_*`, or `trtllm_*`.
