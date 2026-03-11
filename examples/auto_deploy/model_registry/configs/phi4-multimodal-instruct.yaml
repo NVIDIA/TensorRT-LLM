@@ -1,0 +1,8 @@
+# Phi-4 multimodal uses a remote-code text+media wrapper, but the AD onboarding path
+# exports the prefill-only causal LM entrypoint registered via AutoModelForCausalLMFactory.
+# This is only a model-construction/runtime config override for the e2e AD run.
+model_factory: AutoModelForCausalLM
+world_size: 1
+model_kwargs:
+  attn_implementation: eager
+  embd_layer: null
