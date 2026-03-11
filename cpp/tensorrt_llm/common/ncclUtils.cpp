@@ -421,8 +421,8 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     // Synchronize the per-rank alloc status across all ranks before proceeding.
     // Use a small cudaMalloc buffer (not ncclMemAlloc) so OOM on symmetric memory
     // does not prevent us from allocating the flag.
-    int* dFlag = nullptr;
-    if (cudaMalloc(&dFlag, sizeof(int)) != cudaSuccess)
+    int* rankSyncFlag = nullptr;
+    if (cudaMalloc(&rankSyncFlag, sizeof(int)) != cudaSuccess)
     {
         // This should be essentially impossible (4 bytes of regular device memory),
         // but if it happens we cannot safely coordinate — abort on this rank.
@@ -435,12 +435,24 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
 
     // Populate flag on device, reduce with min (0 if any rank failed), then read back.
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    cudaMemcpy(dFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
-    ncclAllReduce(dFlag, dFlag, 1, ncclInt32, ncclMin, comm, stream);
+    cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
+    ncclResult_t reduceResult = ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream);
     cudaStreamSynchronize(stream);
-    int allAllocOk = 1;
-    cudaMemcpy(&allAllocOk, dFlag, sizeof(int), cudaMemcpyDeviceToHost);
-    cudaFree(dFlag);
+    int allAllocOk = 0;
+    cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(rankSyncFlag);
+    if (reduceResult != ncclSuccess)
+    {
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] ncclAllReduce for rank-sync flag failed (error: %d); "
+            "aborting window registration on this rank.",
+            reduceResult);
+        if (localAllocOk)
+        {
+            ncclMemFree(buffer.ptr);
+        }
+        return NCCLWindowBuffer();
+    }
 
     if (!allAllocOk)
     {
