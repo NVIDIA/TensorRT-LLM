@@ -17,6 +17,8 @@ For DeepSeek R1 performance, please check out our [performance guide](../blogs/B
 
 For more information on benchmarking with `trtllm-bench` see this NVIDIA [blog post](https://developer.nvidia.com/blog/llm-inference-benchmarking-performance-tuning-with-tensorrt-llm/).
 
+For NUMA systems, we recommend consulting the ["CPU Affinity configuration in TensorRT LLM"](../deployment-guide/configuring-cpu-affinity.md) guide to achieve best performance. These options were enabled for relevant tests.
+
 ## Throughput Measurements
 
 The below table shows performance data where a local inference client is fed requests at an high rate / no delay between messages,
@@ -34,7 +36,9 @@ The following GPU variants were used for testing:
 - H100 SXM 80GB (DGX H100)
 - H200 SXM 141GB (DGX H200)
 - B200 180GB (DGX B200)
+- B300 288GB (DGX B300)
 - GB200 192GB (GB200 NVL72)
+- GB300 (GB300 NVL72)
 - RTX 6000 Pro Blackwell Server Edition
 
 Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.
