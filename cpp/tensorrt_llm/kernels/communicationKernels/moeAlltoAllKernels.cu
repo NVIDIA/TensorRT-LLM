@@ -1063,7 +1063,6 @@ __device__ void vectorized_quant(DstT* dst, SrcT const* src, int num_elements)
         vectorized_quant_impl<1, ThreadingPolicy, SrcT, DstT>(dst, src, num_elements);
 }
 
-// Unified prepare-combine kernel.
 // LOW_PRECISION=false: vectorized byte-copy (SrcT = payload dtype).
 // LOW_PRECISION=true:  vectorized SrcT→FP8 quantization via vectorized_quant<SrcT, fp8_e4m3>.
 // stride_per_token: byte distance between tokens in recv_buffer_bytes (host-computed, avoids
@@ -1134,8 +1133,7 @@ template <typename T, typename ThreadingPolicy, int TOP_K>
 __global__ void moeA2ACombineKernel(
     const CombineKernelPointers ptrs, // Combine-specific struct, src_data_ptrs[0] is output
     int max_tokens_per_rank, int elements_per_token, int local_num_tokens, int rank_id, int ep_size,
-    int stride_per_token)             // byte stride between tokens in recv buffer; equals size_per_token normally,
-                                      // but differs for FP8 in-place (BF16-stride workspace, FP8-sized payload)
+    int stride_per_token)
 {
     int local_token_idx = ThreadingPolicy::token_idx();
     int const size_per_token = elements_per_token * static_cast<int>(sizeof(T));
