@@ -47,7 +47,9 @@ def test_paged_handler_allocate_with_blocks(kv_layout):
     """Verify KVPagedResourceHandler.allocate() returns correct shape."""
     handler = KVPagedResourceHandler(8, 64, dtype=torch.float16, kv_layout=kv_layout)
     tokens_per_block = 32
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, tokens_per_block=tokens_per_block)
+    seq_info = SequenceInfo(
+        max_seq_len=128, max_batch_size=4, max_num_tokens=129 * 4, tokens_per_block=tokens_per_block
+    )
     seq_info.to("cuda")
     # Set up num_blocks via update_cache_information
     seq_info.update_cache_information(num_blocks=10)
@@ -118,7 +120,7 @@ def test_state_handler_ssm_state_shape():
 def test_state_handler_allocate_creates_tensor():
     """Verify StateResourceHandler.allocate() creates tensor with correct shape."""
     handler = StateResourceHandler(4, 64, 16, dtype=torch.bfloat16)
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4)
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, max_num_tokens=129 * 4)
     seq_info.to("cuda")
 
     tensor = handler.allocate(seq_info)
@@ -169,7 +171,11 @@ def test_unpaged_handler_allocate_returns_correct_shape(num_kv_heads, head_dim, 
     max_seq_len = 128
 
     handler = UnpagedResourceHandler(num_kv_heads, head_dim, dtype=dtype)
-    seq_info = SequenceInfo(max_seq_len=max_seq_len, max_batch_size=max_batch_size)
+    seq_info = SequenceInfo(
+        max_seq_len=max_seq_len,
+        max_batch_size=max_batch_size,
+        max_num_tokens=(max_seq_len + 1) * max_batch_size,
+    )
     seq_info.to("cuda")
 
     tensor = handler.allocate(seq_info)
@@ -183,7 +189,7 @@ def test_unpaged_handler_allocate_returns_correct_shape(num_kv_heads, head_dim, 
 def test_unpaged_handler_allocate_correct_device():
     """Verify UnpagedResourceHandler allocated tensor is on the correct device."""
     handler = UnpagedResourceHandler(8, 64, dtype=torch.float16)
-    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4)
+    seq_info = SequenceInfo(max_seq_len=128, max_batch_size=4, max_num_tokens=129 * 4)
     seq_info.to("cuda")
 
     tensor = handler.allocate(seq_info)
