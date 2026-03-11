@@ -300,13 +300,6 @@ GH_CONFIG_DIR=<path> gh pr view <PR_NUMBER> --json reviews,state
 
 **Do NOT stop polling prematurely.** The loop must continue until the PR is approved or a clear termination signal is received. If polling has been running for an extended period (e.g., >2 hours) with no new activity, inform the user that you are still monitoring and ask if they want you to continue or stop.
 
-## Phase 10 - Prepare a Pull Request
-
-Prepare a pull request against `origin` (https://github.com/nv-auto-deploy/TensorRT-LLM) targeting
-branch `feat/paperclip_maximizer`. Then, ask the user to provide feedback on the PR and wait for the
-user to get back to you when the feedback has been posted. Then continue iterating according to the
-user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
-
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
 - **No `repeat_interleave`:** AD attention ops handle GQA natively. Never repeat K/V heads manually.
