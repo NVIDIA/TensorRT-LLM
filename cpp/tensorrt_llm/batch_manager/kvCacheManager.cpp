@@ -1773,17 +1773,14 @@ void WindowBlockManager::releaseLastBlock(GenerationRequest& sequence)
     sequence.removeLastBlock(mWindowSize);
 }
 
-[[nodiscard]] SizeType32 WindowBlockManager::getNumFreeBlocks() const noexcept
+[[nodiscard]] SizeType32 WindowBlockManager::getNumFreeBlocks() const
 {
     auto const numFree = mEvictionPolicy->getNumFreeBlocks(kPrimaryLevel);
-    if (numFree > getMaxNumBlocks())
-    {
-        TLLM_LOG_WARNING(
-            "%s::getNumFreeBlocks - primary free block count (%d) exceeds total block count (%d). "
-            "This indicates a block accounting inconsistency, likely caused by block pool swaps "
-            "during offload/onboard operations. numPrimaryBlocks=%d, numSecondaryBlocks=%d",
-            mLogPrefix.c_str(), numFree, getMaxNumBlocks(), mNumPrimaryBlocks, mNumSecondaryBlocks);
-    }
+    TLLM_CHECK_WITH_INFO(numFree <= getMaxNumBlocks(),
+        "%s::getNumFreeBlocks - primary free block count (%d) exceeds total block count (%d). "
+        "This indicates a block accounting inconsistency, likely caused by block pool swaps "
+        "during offload/onboard operations. numPrimaryBlocks=%d, numSecondaryBlocks=%d",
+        mLogPrefix.c_str(), numFree, getMaxNumBlocks(), mNumPrimaryBlocks, mNumSecondaryBlocks);
     return numFree;
 }
 

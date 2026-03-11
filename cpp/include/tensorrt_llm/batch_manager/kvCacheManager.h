@@ -699,7 +699,7 @@ public:
         return mLogPrefix;
     }
 
-    [[nodiscard]] SizeType32 getNumFreeBlocks() const noexcept;
+    [[nodiscard]] SizeType32 getNumFreeBlocks() const;
 
     [[nodiscard]] SizeType32 getNumAllocTotalBlocks() const
     {
@@ -716,9 +716,9 @@ public:
         return mReusedBlocks;
     }
 
-    [[nodiscard]] SizeType32 getNumAllocatedBlocks() const noexcept
+    [[nodiscard]] SizeType32 getNumAllocatedBlocks() const
     {
-        return std::max(SizeType32{0}, getMaxNumBlocks() - getNumFreeBlocks());
+        return getMaxNumBlocks() - getNumFreeBlocks();
     }
 
     [[nodiscard]] SizeType32 getNumMissedBlocks() const noexcept
@@ -726,7 +726,7 @@ public:
         return mMissedBlocks;
     }
 
-    [[nodiscard]] bool hasFreeBlocks(SizeType32 numRequired = 1) const noexcept
+    [[nodiscard]] bool hasFreeBlocks(SizeType32 numRequired = 1) const
     {
         return getNumFreeBlocks() >= numRequired;
     }
