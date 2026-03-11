@@ -313,7 +313,6 @@ def echoNodeAndGpuInfo(pipeline, stageName)
 
 def setupPipelineEnvironment(pipeline, testFilter, globalVars)
 {
-    sh "apt update && apt install python3"
     sh "env | sort"
     if (!GEN_POST_MERGE_BUILDS_ONLY) {
         updateGitlabCommitStatus name: "${BUILD_STATUS_NAME}", state: 'running'
