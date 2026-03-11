@@ -435,12 +435,31 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
 
     // Populate flag on device, reduce with min (0 if any rank failed), then read back.
     auto stream = at::cuda::getCurrentCUDAStream().stream();
-    cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
+    cudaError_t memcpyErr = cudaMemcpy(rankSyncFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
+    if (memcpyErr != cudaSuccess)
+    {
+        cudaFree(rankSyncFlag);
+        if (localAllocOk)
+        {
+            ncclMemFree(buffer.ptr);
+        }
+        TLLM_THROW("[NCCLUtil] cudaMemcpy H2D for rank-sync flag failed: %s", cudaGetErrorString(memcpyErr));
+    }
     ncclResult_t reduceResult = ncclAllReduce(rankSyncFlag, rankSyncFlag, 1, ncclInt32, ncclMin, comm, stream);
     cudaStreamSynchronize(stream);
     int allAllocOk = 0;
-    cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
+    memcpyErr = cudaMemcpy(&allAllocOk, rankSyncFlag, sizeof(int), cudaMemcpyDeviceToHost);
     cudaFree(rankSyncFlag);
+    if (memcpyErr != cudaSuccess)
+    {
+        TLLM_LOG_WARNING("[NCCLUtil] cudaMemcpy D2H for rank-sync flag failed: %s; assuming allocation failed.",
+            cudaGetErrorString(memcpyErr));
+        if (localAllocOk)
+        {
+            ncclMemFree(buffer.ptr);
+        }
+        return NCCLWindowBuffer();
+    }
     if (reduceResult != ncclSuccess)
     {
         TLLM_LOG_WARNING(
