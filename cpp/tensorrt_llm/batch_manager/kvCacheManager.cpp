@@ -2581,18 +2581,17 @@ bool KVCacheManager::addSequence(
 void KVCacheManager::storeContextBlocks(LlmRequest const& llmRequest)
 {
     auto const requestId = llmRequest.mRequestId;
-    bool found = false;
+    // Hold the lock for the entire find-and-use operation to eliminate the TOCTOU race
+    // between the existence check and the subsequent access: removeSequence() could extract
+    // the node from mSequences between a two-step check-then-get, leaving a dangling reference.
+    // mBlockManager.storeContextBlocks() does not acquire mSequencesMtx, so no deadlock.
+    std::scoped_lock lock(mSequencesMtx);
+    auto const it = mSequences.find(requestId);
+    if (it != mSequences.end())
     {
-        // protect the mSequences
-        std::scoped_lock lock(mSequencesMtx);
-        found = mSequences.find(requestId) != mSequences.end();
-    }
-    if (found)
-    {
-        auto& sequence = getSequence(requestId);
         if (mEnableBlockReuse && !llmRequest.isDummyRequest())
         {
-            mBlockManager.storeContextBlocks(sequence, llmRequest);
+            mBlockManager.storeContextBlocks(it->second, llmRequest);
         }
     }
     else
