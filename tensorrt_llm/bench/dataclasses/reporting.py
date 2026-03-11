@@ -778,7 +778,9 @@ class ReportUtility:
             spec_config = self.kwargs["speculative_config"]
             # Handle both dict (from YAML) and object types
             if isinstance(spec_config, dict):
-                return spec_config.get("max_draft_len") or 0
+                draft_len = (spec_config.get("max_draft_len")
+                             or spec_config.get("num_nextn_predict_layers"))
+                return draft_len or 0
             return spec_config.max_draft_len or 0
 
         return 0
