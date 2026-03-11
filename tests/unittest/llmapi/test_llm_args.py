@@ -429,6 +429,109 @@ class TestModelDefaults:
                                 {}).get("enable_block_reuse") is None
             assert defaults.get("enable_chunked_prefill") is None
 
+    def test_hunyuan_dense_no_pretrained_config_returns_empty(self):
+        """Test HunyuanDense returns empty dict when pretrained_config is None."""
+        from tensorrt_llm._torch.models.modeling_hunyuan_dense import \
+            HunYuanDenseV1ForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        defaults = HunYuanDenseV1ForCausalLM.get_model_defaults(llm_args)
+        assert defaults == {}
+        defaults = HunYuanDenseV1ForCausalLM.get_model_defaults(
+            llm_args, pretrained_config=None)
+        assert defaults == {}
+
+    def test_kimi_k25_inherits_deepseekv3_mla_defaults(self):
+        """Test KimiK25 inherits SM-aware MLA defaults from DeepseekV3."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            KimiK25ForConditionalGeneration
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+
+        # On unsupported SM, Kimi K2.5 should disable MLA features
+        with patch(
+                'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                return_value=80):
+            defaults = KimiK25ForConditionalGeneration.get_model_defaults(
+                llm_args)
+        assert defaults.get("kv_cache_config",
+                            {}).get("enable_block_reuse") is False
+        assert defaults.get("enable_chunked_prefill") is False
+
+        # On supported SM, no defaults
+        with patch(
+                'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                return_value=90):
+            defaults = KimiK25ForConditionalGeneration.get_model_defaults(
+                llm_args)
+        assert defaults == {}
+
+    def test_nemotron_h_accepts_pretrained_config(self):
+        """Test NemotronH still works with the new pretrained_config param."""
+        from tensorrt_llm._torch.models.modeling_nemotron_h import \
+            NemotronHForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        # Without pretrained_config (backward compat)
+        defaults = NemotronHForCausalLM.get_model_defaults(llm_args)
+        assert defaults == {"kv_cache_config": {"enable_block_reuse": False}}
+        # With pretrained_config (new signature)
+        defaults = NemotronHForCausalLM.get_model_defaults(
+            llm_args, pretrained_config=object())
+        assert defaults == {"kv_cache_config": {"enable_block_reuse": False}}
+
+    def test_qwen3_next_accepts_pretrained_config(self):
+        """Test Qwen3Next still works with the new pretrained_config param."""
+        from tensorrt_llm._torch.models.modeling_qwen3_next import \
+            Qwen3NextForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        defaults = Qwen3NextForCausalLM.get_model_defaults(llm_args)
+        assert defaults == {"kv_cache_config": {"enable_block_reuse": False}}
+        defaults = Qwen3NextForCausalLM.get_model_defaults(
+            llm_args, pretrained_config=object())
+        assert defaults == {"kv_cache_config": {"enable_block_reuse": False}}
+
+    def test_deepseekv3_partial_user_override(self):
+        """Test partial override: user sets one field, other gets default."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+
+        # User only sets enable_block_reuse, leaves enable_chunked_prefill
+        llm_args = TorchLlmArgs(
+            model="/tmp/test",
+            kv_cache_config=KvCacheConfig(enable_block_reuse=True))
+        with patch(
+                'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                return_value=80):
+            defaults = DeepseekV3ForCausalLM.get_model_defaults(llm_args)
+            applied = apply_model_defaults_to_llm_args(llm_args, defaults)
+
+        # User override wins for block_reuse
+        assert llm_args.kv_cache_config.enable_block_reuse is True
+        # Default applied for chunked_prefill (user didn't set it)
+        assert llm_args.enable_chunked_prefill is False
+        assert applied.get("enable_chunked_prefill") is False
+
+    def test_deepseekv3_supported_sm_returns_empty_dict(self):
+        """Test DeepseekV3 returns exactly empty dict on supported SM."""
+        from unittest.mock import patch
+
+        from tensorrt_llm._torch.models.modeling_deepseekv3 import \
+            DeepseekV3ForCausalLM
+
+        llm_args = TorchLlmArgs(model="/tmp/test")
+        for sm in [90, 100, 103, 120]:
+            with patch(
+                    'tensorrt_llm._torch.models.modeling_deepseekv3.get_sm_version',
+                    return_value=sm):
+                defaults = DeepseekV3ForCausalLM.get_model_defaults(llm_args)
+            assert defaults == {}, f"SM{sm}: expected empty dict, got {defaults}"
+
 
 def test_KvCacheConfig_declaration():
     config = KvCacheConfig(enable_block_reuse=True,
