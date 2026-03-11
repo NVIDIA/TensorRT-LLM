@@ -104,6 +104,7 @@ transforms:
     stage: pattern_matcher
   quantize_nvfp4_moe:
     stage: pattern_matcher
+    run_shape_prop: true
   quantize_mxfp4_moe:
     stage: pattern_matcher
   detect_hidden_states_for_capture:
