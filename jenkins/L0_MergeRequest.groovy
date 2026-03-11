@@ -1365,6 +1365,23 @@ pipeline {
                 if (!isReleaseCheckMode && !GEN_POST_MERGE_BUILDS_ONLY) {
                     collectTestResults(this, testFilter)
                 }
+                stage("Upload Build Info") {
+                    try {
+                        def branch = env.gitlabBranch ? env.gitlabBranch : "main"
+                        if (globalVars[GITHUB_PR_API_URL]) {
+                            branch = "github-pr-" + globalVars[GITHUB_PR_API_URL].split('/').last()
+                        }
+                        def buildInfo = "commit=${env.gitlabCommit}\n" +
+                            "branch=${branch}\n" +
+                            "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
+                            "jenkins_url=${env.BUILD_URL}"
+                        writeFile file: 'build_info.txt', text: buildInfo
+                        trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
+                        echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
+                    } catch (Exception e) {
+                        echo "Upload Build Info failed: ${e.toString()}"
+                    }
+                }
             }
         }
     }
@@ -1399,19 +1416,6 @@ pipeline {
                         globalVars[CACHED_CHANGED_FILE_LIST] = null
                         launchStages(this, reuseBuild, testFilter, enableFailFast, globalVars)
                     }
-                }
-            }
-        }
-        stage("Upload Build Info") {
-            steps {
-                script {
-                    def buildInfo = "commit=${env.gitlabCommit}\n" +
-                        "branch=${env.gitlabTargetBranch ?: env.BRANCH_NAME ?: 'unknown'}\n" +
-                        "date=${new Date().format('yyyy-MM-dd HH:mm:ss z', TimeZone.getTimeZone('UTC'))}\n" +
-                        "jenkins_url=${env.BUILD_URL}"
-                    writeFile file: 'build_info.txt', text: buildInfo
-                    trtllm_utils.uploadArtifacts("build_info.txt", "${UPLOAD_PATH}/")
-                    echo "Build info: https://urm.nvidia.com/artifactory/${UPLOAD_PATH}/build_info.txt"
                 }
             }
         }
