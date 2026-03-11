@@ -2136,7 +2136,8 @@ def test_disaggregated_logprobs(disaggregated_test_root,
     _, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=llm_venv._new_env,
                              model_name=deepseek_v3_model_root,
-                             cwd=llm_venv.get_working_directory())
+                             cwd=llm_venv.get_working_directory(),
+                             server_start_timeout=600)
 
     try:
         server_url = f"http://localhost:{server_port}"
