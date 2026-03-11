@@ -103,7 +103,7 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         shifted = tl.where(start_bit == 0, v1,
                            (v1 >> start_bit) | (v2 << (32 - start_bit)))
 
-        # write back in place; bits past the region are already zero
+        # write back in place; _routing_clear_bitmatrix zeroes stale bits after
         tl.store(Bitmatrix + pid_m * stride_bm + w * stride_bn,
                  shifted.to(tl.int32),
                  mask=dst_mask)
@@ -123,27 +123,57 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
         tl.store(ptr, yi, mask=mask_i)
 
 
+# After shifting the bitmatrix so that the local expert slice starts at bit 0,
+# clear all bits at positions >= cutoff (n_expts_local).  Without this, stale
+# bits from out-of-slice experts remain set and corrupt the subsequent
+# compaction and routing.
+# This kernel was removed from triton_kernels in 3.6.0, so we keep a local
+# copy here.
+@triton.jit
+def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn,
+                              cutoff, BLOCK_N: tl.constexpr):
+    pid_m = tl.program_id(0)
+    cutoff_word = cutoff // 32
+    cutoff_bit = cutoff % 32
+    cutoff_mask = (1 << (cutoff_bit)) - 1
+    for start_n in range(0, shape_bn, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        values = tl.load(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                         mask=offs_n < shape_bn)
+        values = tl.where(offs_n == cutoff_word, values & cutoff_mask, values)
+        values = tl.where(offs_n > cutoff_word, 0, values)
+        tl.store(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn, values,
+                 mask=offs_n < shape_bn)
+
+
 class TritonEPRouter():
 
     def prune_routing_ep(self, expt_scal, expt_indx, bitmatrix, n_expts_tot,
                          slice_start, slice_end):
         from triton_kernels.compaction import compaction
         n_tokens_pad = expt_scal.shape[0]
+        bitmask_data = bitmatrix.mask.storage.data
         _routing_shift_bitmatrix_range[(n_tokens_pad, )](
-            bitmatrix.mask.storage.data,
-            bitmatrix.mask.storage.data.stride(0),
-            bitmatrix.mask.storage.data.stride(1),
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
             expt_indx,
             expt_indx.stride(0),
             expt_indx.stride(1),
-            bitmatrix.mask.storage.data.shape[1],
+            bitmask_data.shape[1],
             expt_indx.shape[1],
             slice_start,
             slice_end,
             BLOCK_N=512,
         )
-        # _routing_clear_bitmatrix removed in triton_kernels 3.6.0
-        # compaction handles inactive entries via sentinel values
+        _routing_clear_bitmatrix[(n_tokens_pad, )](
+            bitmask_data,
+            bitmask_data.stride(0),
+            bitmask_data.stride(1),
+            bitmask_data.shape[1],
+            slice_end - slice_start,
+            BLOCK_N=512,
+        )
         expt_scal, expt_indx = compaction(expt_scal, expt_indx, bitmatrix.mask)
         n_expts_tot = slice_end - slice_start
         bitmatrix.mask.shape[-1] = n_expts_tot
@@ -182,8 +212,13 @@ class TritonEPRouter():
             expt_scal, expt_indx, bitmatrix = self.prune_routing_ep(
                 expt_scal, expt_indx, bitmatrix, n_expts_tot, slice_start,
                 slice_end)
-
-        metadata = bitmatrix.mask_metadata
+            # mask_metadata was computed eagerly in SparseMatrix.__post_init__
+            # before pruning mutated the bitmatrix.  Recompute it now.
+            from triton_kernels.tensor_details.bitmatrix import \
+                make_bitmatrix_metadata
+            metadata = make_bitmatrix_metadata(expt_indx, bitmatrix.mask)
+        else:
+            metadata = bitmatrix.mask_metadata
 
         expt_data = make_ragged_tensor_metadata(metadata.col_sum,
                                                 logits.shape[0] * n_expts_act)
@@ -366,7 +401,8 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit))
+                        ("alpha", "limit"), reduction_n=2),
+                (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -601,7 +637,8 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit))
+                        ("alpha", "limit"), reduction_n=2),
+                (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -1234,7 +1271,8 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         if beta == 1.0:
             act = FusedActivation(
                 FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit")), (alpha, module.swiglu_limit))
+                        ("alpha", "limit"), reduction_n=2),
+                (alpha, module.swiglu_limit))
 
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
