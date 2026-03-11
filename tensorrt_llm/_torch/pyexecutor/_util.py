@@ -648,6 +648,11 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
+        # the draft layers share the same architecture as the target model and need
+        # the sparse_attention_config. Get it from effective_draft_config which
+        # falls back to the target model's config for MTP mode.
+        sparse_attn_config = effective_draft_config.sparse_attention_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
@@ -657,7 +662,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=None,  # Not applicable for draft in one-model mode
+            sparse_attn_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
