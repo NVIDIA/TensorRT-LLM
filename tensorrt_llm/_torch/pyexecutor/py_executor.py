@@ -1636,25 +1636,30 @@ class PyExecutor:
             self._check_disagg_gen_transfer_status()
             self._check_kv_transfer_timeout()
 
-        # In gen-only benchmark mode with disaggregated serving, keep fetching
-        # until all real requests have arrived before adding ADP dummies.
-        # This ensures the benchmark starts with the exact number of real
-        # requests specified, since dummies only get added after this loop.
+        # In benchmark disagg mode, fetch requests in batches to avoid
+        # blocking the CTX→GEN KV cache pipeline. With ADP, fetch tp_size
+        # requests per batch (one per rank) for even distribution; without
+        # ADP, fetch 1 request per batch.
         if not self.is_warmup and self.benchmark_req_queues_size > 0 \
                 and self.kv_cache_transceiver \
                 and self.num_fetch_requests < self.benchmark_req_queues_size:
+            batch_size = min(
+                self.dist.tp_size if self.enable_attention_dp else 1,
+                self.benchmark_req_queues_size)
+            fill_target = min(self.num_fetch_requests + batch_size,
+                              self.benchmark_req_queues_size)
             if self.dist.rank == 0:
                 logger.info(f"Starting benchmark fill loop, "
                             f"num_fetch_requests={self.num_fetch_requests}/"
-                            f"{self.benchmark_req_queues_size}, "
+                            f"{fill_target}, "
                             f"len(active_requests)={len(self.active_requests)}")
-            while self.num_fetch_requests < self.benchmark_req_queues_size:
+            while self.num_fetch_requests < fill_target:
                 iter_requests = self._fetch_and_activate_new_requests()
                 if self.should_stop_processing:
                     return None, None
                 new_requests += iter_requests
                 self.hang_detector.checkpoint()
-                if self.num_fetch_requests < self.benchmark_req_queues_size:
+                if self.num_fetch_requests < fill_target:
                     time.sleep(1)
 
         iter_stats = None
