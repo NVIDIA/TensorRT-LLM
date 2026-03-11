@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 from typing import Any, Dict, Union
 
+from tokenizers import Tokenizer as RustTokenizer
 from transformers import PreTrainedTokenizerFast
 
 from ..tokenizer import TransformersTokenizer
@@ -73,7 +74,6 @@ class GlmMoeDsaTokenizer(TransformersTokenizer):
                 f"Expected tokenizer.json at {tokenizer_json}. "
                 "GlmMoeDsaTokenizer loads from tokenizer.json only."
             )
-        from tokenizers import Tokenizer as RustTokenizer
 
         rust_tok = RustTokenizer.from_file(str(tokenizer_json))
         init_kwargs: Dict[str, Any] = {}

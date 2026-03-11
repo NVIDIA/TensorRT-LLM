@@ -95,7 +95,7 @@ def prepare_attn_metadata_for_draft_replay(attn_metadata,
         m.indexer_k_cache_block_offsets[:m.num_seqs].copy_(
             m.host_indexer_k_cache_block_offsets[:m.num_seqs],
             non_blocking=True)
-        Indexer.prepare(m)
+        Indexer.recompute_slot_mappings(m)
     return saved
 
 
