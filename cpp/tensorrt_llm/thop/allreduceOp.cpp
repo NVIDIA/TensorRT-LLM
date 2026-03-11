@@ -523,7 +523,7 @@ private:
             {
                 // Large buffer: create window buffer and copy input (can swap inputTensor reference)
                 auto [symmetricInput, symmetricBuffer0]
-                    = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+                    = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
                 if (!symmetricBuffer0.isValid())
                 {
                     TLLM_LOG_DEBUG(
@@ -549,7 +549,7 @@ private:
         }
 
         // Use window-backed output buffer
-        auto [normOut, windowBuffer1] = createNCCLWindowTensor(comm, input.sizes(), input.scalar_type());
+        auto [normOut, windowBuffer1] = createNCCLWindowTensor(rawComm, input.sizes(), input.scalar_type());
         torch::Tensor outputTensor = windowBuffer1.isValid() ? normOut : torch::empty_like(inputTensor);
         void* outputPtr = windowBuffer1.isValid() ? windowBuffer1.ptr : outputTensor.data_ptr();
         if (!windowBuffer1.isValid())
