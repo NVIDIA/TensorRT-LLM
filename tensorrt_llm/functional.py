@@ -3923,6 +3923,7 @@ class AllReduceFusionOp(IntEnum):
     RESIDUAL_RMS_NORM_OUT_QUANT_FP8 = 6
     RESIDUAL_RMS_NORM_OUT_QUANT_NVFP4 = 7
     MOE_FINALIZE_ALLREDUCE_RESIDUAL_RMS_NORM = 8
+    RMS_NORM = 9
 
 
 class AllReduceParams():
@@ -3949,8 +3950,9 @@ class AllReduceParams():
         # For torch path only, has no effect on TRT path
         self.enable_allreduce = enable_allreduce
         self.trigger_completion_at_end = trigger_completion_at_end
-        assert fusion_op == AllReduceFusionOp.NONE.value or (residual
-                                                             is not None)
+        assert fusion_op in (AllReduceFusionOp.NONE.value,
+                             AllReduceFusionOp.RMS_NORM.value) or (residual
+                                                                   is not None)
 
     def has_affine(self):
         return 1 if self.norm_weight is not None else 0
@@ -4058,7 +4060,8 @@ def create_allreduce_plugin(
     if all_reduce_params.fusion_op != AllReduceFusionOp.NONE:
         if all_reduce_params.has_bias() == 1:
             plug_inputs.append(all_reduce_params.bias.trt_tensor)
-        plug_inputs.append(all_reduce_params.residual.trt_tensor)
+        if all_reduce_params.residual is not None:
+            plug_inputs.append(all_reduce_params.residual.trt_tensor)
         if all_reduce_params.has_affine() == 1:
             plug_inputs.append(all_reduce_params.norm_weight.trt_tensor)
             if all_reduce_params.fusion_op == AllReduceFusionOp.RESIDUAL_RMS_PREPOST_NORM:
@@ -4757,6 +4760,7 @@ class RopeEmbeddingUtils:
             scale_type: RotaryScalingType = RotaryScalingType.none,
             # Other scaling configs that only used by certain scaling types.
             rope_scaling_config: dict = None,
+            duplicate_data: bool = False,
             dtype=np.float32):
         if scale_type == RotaryScalingType.linear:
             scale = 1.0 / scale
@@ -4782,6 +4786,8 @@ class RopeEmbeddingUtils:
                                                 inv_freq,
                                                 dtype=dtype),
                                       axis=-1)
+        if duplicate_data:
+            sinusoid_inp = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
         # fuse cos/sin into float2 (cos, sin).
         concat = np.concatenate(
             (np.cos(sinusoid_inp), np.sin(sinusoid_inp)),
@@ -4876,15 +4882,15 @@ class RopeEmbeddingUtils:
                         scaling_long_factors, False, True), short_mscale
 
     @staticmethod
-    def create_sinusoidal_positions_long_rope(
-            num_pos: int,
-            dim: int,
-            theta: float,
-            original_max_pos: int,
-            short_factor: List[float],
-            long_factor: List[float],
-            dtype=np.float32,
-            max_seq_len: Optional[int] = None):
+    def create_sinusoidal_positions_long_rope(num_pos: int,
+                                              dim: int,
+                                              theta: float,
+                                              original_max_pos: int,
+                                              short_factor: List[float],
+                                              long_factor: List[float],
+                                              dtype=np.float32,
+                                              max_seq_len: Optional[int] = None,
+                                              duplicate_data: bool = False):
         short_factor = np.array(short_factor, dtype=np.float32)
         long_factor = np.array(long_factor, dtype=np.float32)
 
@@ -4904,6 +4910,9 @@ class RopeEmbeddingUtils:
         else:
             scaling_factor = np.sqrt(1.0 +
                                      np.log(scale) / np.log(original_max_pos))
+
+        if duplicate_data:
+            sinusoid_inp = np.concatenate((sinusoid_inp, sinusoid_inp), axis=-2)
 
         # fuse cos/sin into float2 (cos, sin).
         concat = np.concatenate(

@@ -232,6 +232,28 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
+    def _(
+        X: torch.Tensor,
+        input_scale: torch.Tensor,
+        reorder_index: torch.Tensor,
+        KE: int,
+        is_act: bool,
+    ):
+        M = X.size(0)
+        KQ = X.size(1)
+        K = KQ + KE
+
+        # QX shape: [M, K/2]
+        QX = X.new_empty((M, K // 2), dtype=torch.uint8)
+
+        # SFX shape: swizzled layout size for scale factors
+        # isSfSwizzledLayout = True, sf_vec_size = 16
+        SFSize = fp4_utils.pad_up(M, 128) * fp4_utils.pad_up(K // 16, 4)
+        SFX = X.new_empty((SFSize, ), dtype=torch.uint8)
+
+        return QX, SFX
+
     @torch.library.register_fake("trtllm::mxfp8_quantize")
     def _(
         input: torch.Tensor,
@@ -374,6 +396,7 @@ def _register_fake():
         top_k: int,
         combine_payload_offset: int,
         payload_in_workspace: bool,
+        use_low_precision: bool = False,
     ) -> torch.Tensor:
         return payload.new_empty((local_num_tokens, payload.shape[2]))
 
@@ -1068,3 +1091,17 @@ def _register_fake():
         output_fp4 = input.new_empty(output_shape, dtype=torch.uint8)
         output_sf = input.new_empty((scale_shape, ), dtype=torch.uint8)
         return output_fp4, output_sf
+
+    @torch.library.register_fake("trtllm::build_decoder_info")
+    def _(seq_q_offsets, seq_kv_offsets, padding_offsets, tokens_info,
+          encoder_padding_offsets, packed_mask_row_offsets,
+          seq_cp_partial_offsets, attention_mask, seq_q_lengths, seq_kv_lengths,
+          fmha_tile_counter, dequant_scale_qkv, quant_scale_o, fmha_bmm1_scale,
+          fmha_bmm2_scale, rotary_embedding_inv_freq,
+          rotary_embedding_inv_freq_cache, cp_size, separate_qkv_scales,
+          fmha_host_bmm1_scale, batch_size, max_q_seq_length,
+          max_encoder_q_seq_length, attention_window_size, sink_token_length,
+          num_tokens, remove_padding, attention_mask_type,
+          rotary_embedding_scale, rotary_embedding_base, rotary_embedding_dim,
+          rotary_scaling_type, rotary_embedding_max_positions):
+        return True

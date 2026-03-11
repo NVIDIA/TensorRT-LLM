@@ -137,7 +137,7 @@ class TestIsDynamicCachedOp:
         assert is_dynamic_cached_op(node) is True
 
     def test_known_logits_gather_op_returns_true(self):
-        target = _FakeOpOverload("auto_deploy::gather_logits_before_lm_head")
+        target = _FakeOpOverload("auto_deploy::gather_tokens")
         node = _make_mock_node("call_function", target=target)
         assert is_dynamic_cached_op(node) is True
 

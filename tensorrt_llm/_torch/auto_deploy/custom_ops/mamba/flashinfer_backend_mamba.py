@@ -13,13 +13,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List
+from typing import List, Optional
 
 import torch
 from torch.fx import Node
 
 from .....llmapi.llm_args import KvCacheConfig
-from ..attention_interface import AttentionRegistry, MHACallable, ResourceHandlerDict
+from ..attention_interface import AttentionRegistry, BatchInfo, MHACallable, ResourceHandlerDict
 from .mamba_backend_common import (
     BaseBackendSSM,
     _flatten_ssm_inputs,
@@ -28,7 +28,7 @@ from .mamba_backend_common import (
 )
 
 
-@torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args={})
+@torch.library.custom_op("auto_deploy::flashinfer_cached_ssm", mutates_args=("ssm_state_cache",))
 def _flashinfer_cached_ssm(
     # INPUTS (dense but may be flattened across sequences)
     hidden_states: torch.Tensor,  # [b, s, num_heads, head_dim]
@@ -43,6 +43,7 @@ def _flashinfer_cached_ssm(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     chunk_indices: torch.Tensor,  # [num_logical_chunks]
     chunk_offsets: torch.Tensor,  # [num_logical_chunks]
@@ -52,21 +53,24 @@ def _flashinfer_cached_ssm(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     b, s, num_heads, head_dim, bs, hs_flat, B_flat, C_flat, dt_flat = _flatten_ssm_inputs(
         hidden_states, B, C, dt
     )
     ssm_state_size = B.shape[3]
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    batch_info = BatchInfo(batch_info_host)
+    num_prefill, num_prefill_tokens, num_decode = batch_info.get_absorbed_info()
     num_seq = num_prefill + num_decode
     num_total_tokens = num_prefill_tokens + num_decode
-    # Preallocate output tensor (zeros so padding positions are clean)
-    preallocated_ssm_out = torch.zeros(
-        [bs, num_heads, head_dim],
-        dtype=hidden_states.dtype,
-        device=hidden_states.device,
-    )
-    preallocated_ssm_out_p = preallocated_ssm_out[:num_prefill_tokens]
+    if out is not None:
+        preallocated_ssm_out = out.view(bs, num_heads, head_dim)
+    else:
+        preallocated_ssm_out = torch.zeros(
+            [bs, num_heads, head_dim],
+            dtype=hidden_states.dtype,
+            device=hidden_states.device,
+        )
 
     num_prefill, num_prefill_tokens, num_total_tokens, num_seq = _run_ssm_prefill(
         hs_flat,
@@ -80,13 +84,14 @@ def _flashinfer_cached_ssm(
         cu_seqlen,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         chunk_indices,
         chunk_offsets,
         seq_idx_prefill,
         ssm_state_cache,
         time_step_limit,
         chunk_size,
-        preallocated_ssm_out_p.unsqueeze(0),
+        preallocated_ssm_out[:num_prefill_tokens].unsqueeze(0),
     )
 
     num_decode = num_total_tokens - num_prefill_tokens
@@ -108,7 +113,6 @@ def _flashinfer_cached_ssm(
         ssm_state_size,
     )
 
-    y_decode = None
     if decode_inputs is not None:
         (
             slot_idx_decode,
@@ -138,13 +142,15 @@ def _flashinfer_cached_ssm(
             state_batch_indices=slot_idx_decode_i32,
         )
         preallocated_ssm_out[num_prefill_tokens:num_total_tokens].copy_(y_decode)
-    if num_total_tokens > 0:
-        # Cast to input dtype if needed (prefill may compute in higher precision)
-        if preallocated_ssm_out.dtype != hidden_states.dtype:
-            preallocated_ssm_out = preallocated_ssm_out.to(hidden_states.dtype)
-        return preallocated_ssm_out.view(b, s, num_heads, head_dim)
-    else:
-        return torch.zeros_like(hidden_states)
+
+    if out is not None:
+        # out is reused across CUDA graph replays with varying num_total_tokens,
+        # so stale data from prior replays can linger in the padding region.
+        if num_total_tokens < bs:
+            preallocated_ssm_out[num_total_tokens:].zero_()
+        return out.new_empty(0)
+
+    return preallocated_ssm_out.view(b, s, num_heads, head_dim)
 
 
 @_flashinfer_cached_ssm.register_fake
@@ -162,6 +168,7 @@ def _flashinfer_cached_ssm_fake(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     chunk_indices: torch.Tensor,  # [num_logical_chunks]
     chunk_offsets: torch.Tensor,  # [num_logical_chunks]
@@ -171,7 +178,10 @@ def _flashinfer_cached_ssm_fake(
     # CONSTANTS
     time_step_limit: List[float],
     chunk_size: int,
+    out: Optional[torch.Tensor] = None,
 ):
+    if out is not None:
+        return out.new_empty(0)
     # Return a correctly-shaped tensor for tracing with fake tensors
     return torch.empty_like(
         hidden_states,

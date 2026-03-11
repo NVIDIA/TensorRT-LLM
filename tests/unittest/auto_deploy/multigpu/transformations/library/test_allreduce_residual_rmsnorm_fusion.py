@@ -8,7 +8,7 @@ from torch.export import export
 from tensorrt_llm._torch.auto_deploy.custom_ops.distributed.trtllm_dist import (
     is_trtllm_op_available,
 )
-from tensorrt_llm._torch.auto_deploy.distributed.common import initialize_or_skip
+from tensorrt_llm._torch.auto_deploy.distributed.common import cleanup, initialize_or_skip
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
 from tensorrt_llm._torch.auto_deploy.transform.optimizer import InferenceOptimizer
 from tensorrt_llm._torch.auto_deploy.utils.node_utils import is_op
@@ -71,68 +71,71 @@ def _test_allreduce_fusion(port: int, ModuleCls, strategy: str):
 
     _, _ = initialize_or_skip(port=port)
 
-    # Testing tensors
-    dtype = torch.float16
-    x = torch.randn(16, 16).to(dtype).cuda()
-    residual = torch.randn(16, 16).to(dtype).cuda()
+    try:
+        # Testing tensors
+        dtype = torch.float16
+        x = torch.randn(16, 16).to(dtype).cuda()
+        residual = torch.randn(16, 16).to(dtype).cuda()
 
-    # Trace the original model
-    model = ModuleCls(16, dtype, strategy=strategy)
-    args = (
-        x,
-        residual,
-    )
-    gm = torch_export_to_gm(model, args=args, clone=True)
-    # Run the original
-    original_outputs, residual_original = gm(x, residual)
+        # Trace the original model
+        model = ModuleCls(16, dtype, strategy=strategy)
+        args = (
+            x,
+            residual,
+        )
+        gm = torch_export_to_gm(model, args=args, clone=True)
+        # Run the original
+        original_outputs, residual_original = gm(x, residual)
 
-    # Fuse ops with the specified strategy
-    gm_transformed = InferenceOptimizer(
-        None,
-        {
-            "match_rmsnorm_pattern": {
-                "stage": "pattern_matcher",
+        # Fuse ops with the specified strategy
+        gm_transformed = InferenceOptimizer(
+            None,
+            {
+                "match_rmsnorm_pattern": {
+                    "stage": "pattern_matcher",
+                },
+                "detect_sharding": {
+                    "stage": "post_export",
+                    "allreduce_strategy": strategy,
+                },
+                "fuse_allreduce_residual_rmsnorm": {
+                    "stage": "post_load_fusion",
+                },
             },
-            "detect_sharding": {
-                "stage": "post_export",
-                "allreduce_strategy": strategy,
-            },
-            "fuse_allreduce_residual_rmsnorm": {
-                "stage": "post_load_fusion",
-            },
-        },
-    )(None, gm)
+        )(None, gm)
 
-    # Run the fused graph
-    fused_outputs, residual_fused = gm_transformed(x, residual)
+        # Run the fused graph
+        fused_outputs, residual_fused = gm_transformed(x, residual)
 
-    # Check if fused node in the graph and verify strategy
-    has_fused_node = False
-    fused_node_strategy = None
-    for node in gm_transformed.graph.nodes:
-        if is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm):
-            has_fused_node = True
-            # The fused node should have the strategy as the last argument
-            # args: (x, residual, weight, eps, strategy)
-            if len(node.args) >= 5:
-                fused_node_strategy = node.args[4]
+        # Check if fused node in the graph and verify strategy
+        has_fused_node = False
+        fused_node_strategy = None
+        for node in gm_transformed.graph.nodes:
+            if is_op(node, torch.ops.dist.trtllm_fused_allreduce_residual_rmsnorm):
+                has_fused_node = True
+                # The fused node should have the strategy as the last argument
+                # args: (x, residual, weight, eps, strategy)
+                if len(node.args) >= 5:
+                    fused_node_strategy = node.args[4]
 
-    assert has_fused_node, "Fused node not found."
-    assert fused_node_strategy == strategy, (
-        f"Fused node strategy mismatch: expected '{strategy}', got '{fused_node_strategy}'"
-    )
+        assert has_fused_node, "Fused node not found."
+        assert fused_node_strategy == strategy, (
+            f"Fused node strategy mismatch: expected '{strategy}', got '{fused_node_strategy}'"
+        )
 
-    # Verify outputs are consistent
-    assert torch.allclose(residual_original, residual_fused, atol=1e-5), (
-        "Outputs differ between original and fused models."
-    )
-    assert torch.allclose(original_outputs, fused_outputs, atol=1e-5), (
-        "Outputs differ between original and fused models."
-    )
+        # Verify outputs are consistent
+        assert torch.allclose(residual_original, residual_fused, atol=1e-5), (
+            "Outputs differ between original and fused models."
+        )
+        assert torch.allclose(original_outputs, fused_outputs, atol=1e-5), (
+            "Outputs differ between original and fused models."
+        )
 
-    # check if we can still export the model as expected
-    export(gm_transformed, args=args)
-    torch_export_to_gm(gm_transformed, args=args)
+        # check if we can still export the model as expected
+        export(gm_transformed, args=args)
+        torch_export_to_gm(gm_transformed, args=args)
+    finally:
+        cleanup()
 
 
 @pytest.mark.parametrize("device_count", get_device_counts())
@@ -153,4 +156,12 @@ def test_allreduce_fusion(device_count, ModuleCls, strategy):
 
     n_workers = device_count
     mpi_pool = MpiPoolSession(n_workers=n_workers)
-    mpi_pool.submit_sync(_test_allreduce_fusion, port=port, ModuleCls=ModuleCls, strategy=strategy)
+    try:
+        mpi_pool.submit_sync(
+            _test_allreduce_fusion,
+            port=port,
+            ModuleCls=ModuleCls,
+            strategy=strategy,
+        )
+    finally:
+        mpi_pool.shutdown()
