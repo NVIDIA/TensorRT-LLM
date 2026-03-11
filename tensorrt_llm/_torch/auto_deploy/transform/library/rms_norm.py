@@ -276,6 +276,10 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    # Preserve fake-tensor metadata so downstream transforms
+                    # (e.g. insert_cached_attention) can still read shape info.
+                    if "val" in node.meta:
+                        new_node.meta["val"] = node.meta["val"]
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1
@@ -290,6 +294,10 @@ class FuseRMSNorm(BaseTransform):
                         args=node.args,
                         kwargs=node.kwargs,
                     )
+                    # Preserve fake-tensor metadata so downstream transforms
+                    # (e.g. insert_cached_attention) can still read shape info.
+                    if "val" in node.meta:
+                        new_node.meta["val"] = node.meta["val"]
                     node.replace_all_uses_with(new_node)
                     graph.erase_node(node)
                     cnt += 1
