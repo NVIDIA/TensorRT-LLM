@@ -2915,9 +2915,11 @@ class Linear(nn.Module):
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
                     window_success = window_attempted and window_out is not None
-                    logger.debug(
-                        "Linear GEMM NCCL window output buffer: %s (path=%s)",
-                        "success" if window_success else "failure", window_path)
+                    if logger.level in ('verbose', 'debug', 'trace'):
+                        logger.debug(
+                            "Linear GEMM NCCL window output buffer: %s (path=%s)",
+                            "success" if window_success else "failure",
+                            window_path)
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:
