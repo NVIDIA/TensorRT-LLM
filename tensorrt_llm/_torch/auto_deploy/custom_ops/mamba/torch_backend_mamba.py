@@ -162,26 +162,6 @@ def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) ->
     ssm_cache.copy_(ssm_state)
 
 
-def _split_cached_ssm_batch(
-    batch_info_host: torch.Tensor,
-    seq_len: torch.Tensor,
-    cu_seqlen: torch.Tensor,
-    slot_idx: torch.Tensor,
-    use_initial_states: torch.Tensor,
-) -> Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
-    num_seq = num_prefill + num_decode
-    return (
-        num_prefill,
-        num_prefill_tokens,
-        num_decode,
-        seq_len[:num_seq],
-        cu_seqlen[:num_seq],
-        slot_idx[:num_seq].to(torch.long),
-        use_initial_states[:num_seq],
-    )
-
-
 # ---------------------------------------------------------------
 # Metadata + flattened cached op that integrates with the AD i/f
 # ---------------------------------------------------------------
@@ -219,15 +199,12 @@ def _torch_cached_ssm(
       describe per-sequence segments. We'll process each segment and scatter final states to caches.
     """
     b, s = hidden_states.shape[:2]
-    (
-        num_prefill,
-        num_prefill_tokens,
-        num_decode,
-        seq_len,
-        seq_start,
-        slot_idx,
-        use_initial_states,
-    ) = _split_cached_ssm_batch(batch_info_host, seq_len, cu_seqlen, slot_idx, use_initial_states)
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+    slot_idx = slot_idx[:num_seq].to(torch.long)
+    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         # Generate-only batch: gather cache slices for slots (already sanitized by metadata)
@@ -332,16 +309,12 @@ def _torch_cached_ysamba_ssm(
     chunk_size: int,
 ) -> torch.Tensor:
     b, s = hidden_states.shape[:2]
-    (
-        num_prefill,
-        num_prefill_tokens,
-        num_decode,
-        seq_len,
-        seq_start,
-        slot_idx,
-        use_initial_states,
-    ) = _split_cached_ssm_batch(batch_info_host, seq_len, cu_seqlen, slot_idx, use_initial_states)
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
+    seq_len = seq_len[:num_seq]
+    seq_start = cu_seqlen[:num_seq]
+    slot_idx = slot_idx[:num_seq].to(torch.long)
+    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         slot_idx_long = slot_idx.to(torch.long)
