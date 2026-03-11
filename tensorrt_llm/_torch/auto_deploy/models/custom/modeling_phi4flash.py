@@ -137,6 +137,10 @@ def _lambda_init_fn(depth: int) -> float:
     return 0.8 - 0.6 * math.exp(-0.3 * depth)
 
 
+def _swiglu(gate: torch.Tensor, value: torch.Tensor) -> torch.Tensor:
+    return value * ACT2FN["silu"](gate)
+
+
 def _split_heads(x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
     x = x.view(*x.shape[:-2], x.shape[-2] // 2, 2, x.shape[-1])
     return x[..., 0, :], x[..., 1, :]
@@ -323,31 +327,15 @@ class Phi4FlashMamba(nn.Module):
             )
             self.x_proj = nn.Linear(self.d_inner, self.dt_rank + self.d_state * 2, bias=False)
             self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True)
-            A = torch.arange(1, self.num_heads + 1, dtype=torch.float32)
+            A = (
+                torch.arange(1, self.d_state + 1, dtype=torch.float32)
+                .unsqueeze(0)
+                .expand(self.d_inner, -1)
+                .contiguous()
+            )
             self.A_log = nn.Parameter(torch.log(A))
             self.D = nn.Parameter(torch.ones(self.d_inner))
             self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=config.mamba_proj_bias)
-            self._register_load_state_dict_pre_hook(self._load_state_dict_pre_hook)
-
-    def _load_state_dict_pre_hook(
-        self,
-        state_dict,
-        prefix,
-        local_metadata,
-        strict,
-        missing_keys,
-        unexpected_keys,
-        error_msgs,
-    ):
-        del local_metadata, strict, missing_keys, unexpected_keys, error_msgs
-        a_log_key = f"{prefix}A_log"
-        if a_log_key not in state_dict:
-            return
-        a_log = state_dict[a_log_key]
-        if a_log.ndim == 2 and a_log.shape[0] == self.num_heads:
-            # Phi4Flash checkpoints store A_log as [d_inner, d_state]. The AD SSM backend
-            # expects one decay scalar per head, so collapse the state dimension here.
-            state_dict[a_log_key] = a_log.to(torch.float32).mean(dim=-1).to(a_log.dtype)
 
     def forward(
         self,
@@ -357,7 +345,7 @@ class Phi4FlashMamba(nn.Module):
         dtype = hidden_states.dtype
         if self.yoco_cross:
             out = self.in_proj(hidden_states)
-            out = out * torch.sigmoid(yoco_key_values)
+            out = _swiglu(out, yoco_key_values)
             return self.out_proj(out), yoco_key_values
 
         xz = self.in_proj(hidden_states)
@@ -375,7 +363,7 @@ class Phi4FlashMamba(nn.Module):
         x = self.act(x)
         x_dbl = self.x_proj(x)
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        y = torch.ops.auto_deploy.torch_ssm(
+        y = torch.ops.auto_deploy.torch_ysamba_ssm(
             hidden_states=x.view(
                 hidden_states.shape[0], hidden_states.shape[1], self.num_heads, self.head_dim
             ),
@@ -389,10 +377,11 @@ class Phi4FlashMamba(nn.Module):
             chunk_size=256,
         ).view(hidden_states.shape[0], hidden_states.shape[1], -1)
 
-        yoco_out = y if self.yoco_kv else None
         if self.yoco_kv:
-            y = y * torch.sigmoid(z)
+            yoco_out = y
+            y = _swiglu(z, y)
         else:
+            yoco_out = None
             y = y * self.act(z)
         return self.out_proj(y.to(dtype)), yoco_out
 

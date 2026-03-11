@@ -38,7 +38,7 @@ from ..attention_interface import (
     ResourceHandlerDict,
     SSMResourceHandler,
 )
-from .torch_mamba import _torch_ssm_prefill
+from .torch_mamba import _torch_ssm_prefill, _torch_ysamba_ssm_prefill
 
 
 def _torch_cached_ssm_decode(
@@ -115,8 +115,71 @@ def _torch_cached_ssm_decode(
     return y, updated_ssm_state
 
 
+def _torch_cached_ysamba_ssm_decode(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    time_step_limit: List[float],
+    chunk_size: int,
+    ssm_state_cache: torch.Tensor,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del chunk_size
+    batch_size, _, num_heads, head_dim = hidden_states.shape
+    d_inner = num_heads * head_dim
+    n_groups, ssm_state_size = B.shape[2:]
+
+    hidden_states_flat = hidden_states.reshape(batch_size, d_inner).to(torch.float32)
+    dt = dt[:, 0].to(torch.float32)
+    dt = torch.nn.functional.softplus(dt + dt_bias.to(torch.float32))
+    dt = torch.clamp(dt, time_step_limit[0], time_step_limit[1])
+
+    B = B[:, 0].reshape(batch_size, n_groups, ssm_state_size).to(torch.float32)
+    C = C[:, 0].reshape(batch_size, n_groups, ssm_state_size).to(torch.float32)
+    if n_groups != d_inner:
+        repeat_factor = d_inner // n_groups
+        B = B.repeat_interleave(repeat_factor, dim=1, output_size=d_inner)
+        C = C.repeat_interleave(repeat_factor, dim=1, output_size=d_inner)
+
+    A = A.to(torch.float32).reshape(d_inner, ssm_state_size)
+    D = D.to(torch.float32).reshape(d_inner)
+    ssm_state_flat = ssm_state_cache.reshape(batch_size, d_inner, ssm_state_size).to(torch.float32)
+
+    dA = torch.exp(dt.unsqueeze(-1) * A.unsqueeze(0))
+    dB = dt.unsqueeze(-1) * B
+    updated_state = ssm_state_flat * dA + hidden_states_flat.unsqueeze(-1) * dB
+    y = torch.einsum("bdn,bdn->bd", updated_state, C) + D.unsqueeze(0) * hidden_states_flat
+    return (
+        y.reshape(batch_size, 1, num_heads, head_dim).to(hidden_states.dtype),
+        updated_state.reshape(batch_size, num_heads, head_dim, ssm_state_size),
+    )
+
+
 def _update_ssm_state_cache(ssm_cache: torch.Tensor, ssm_state: torch.Tensor) -> None:
     ssm_cache.copy_(ssm_state)
+
+
+def _split_cached_ssm_batch(
+    batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+) -> Tuple[int, int, int, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    num_seq = num_prefill + num_decode
+    return (
+        num_prefill,
+        num_prefill_tokens,
+        num_decode,
+        seq_len[:num_seq],
+        cu_seqlen[:num_seq],
+        slot_idx[:num_seq].to(torch.long),
+        use_initial_states[:num_seq],
+    )
 
 
 # ---------------------------------------------------------------
@@ -156,15 +219,16 @@ def _torch_cached_ssm(
       describe per-sequence segments. We'll process each segment and scatter final states to caches.
     """
     b, s = hidden_states.shape[:2]
-    num_seq = seq_len.shape[0]
-
-    # get cleaned up metadata
-    num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_decode,
+        seq_len,
+        seq_start,
+        slot_idx,
+        use_initial_states,
+    ) = _split_cached_ssm_batch(batch_info_host, seq_len, cu_seqlen, slot_idx, use_initial_states)
     num_seq = num_prefill + num_decode
-    seq_len = seq_len[:num_seq]
-    seq_start = cu_seqlen[:num_seq]
-    slot_idx = slot_idx[:num_seq].to(torch.long)
-    use_initial_states = use_initial_states[:num_seq]
 
     if s == 1:
         # Generate-only batch: gather cache slices for slots (already sanitized by metadata)
@@ -190,8 +254,9 @@ def _torch_cached_ssm(
         # return in the same dtype as the input
         return y.to(hidden_states.dtype)
 
-    # Prefill
-    if any(use_initial_states):
+    # Chunked prefill is only relevant to context sequences, not decode sequences flattened into
+    # the same batch. Decode requests legitimately have `use_initial_states=True`.
+    if torch.any(use_initial_states[:num_prefill]):
         # TODO(https://github.com/NVIDIA/TensorRT-LLM/issues/8170): update torch
         # reference implementation to support chunked prefill.
         raise ValueError(
@@ -211,11 +276,12 @@ def _torch_cached_ssm(
     C_flat = C.reshape(bs, *C.shape[2:])
     dt_flat = dt.reshape(bs, *dt.shape[2:])
 
+    num_total_tokens = num_prefill_tokens + num_decode
     # NOTE: need contiguous format to process it sequentially
-    y = torch.empty_like(hidden_states, memory_format=torch.contiguous_format)
+    y = torch.zeros_like(hidden_states, memory_format=torch.contiguous_format)
     y_flat = y.view(bs, *y.shape[2:])
 
-    for i in range(num_seq):
+    for i in range(num_prefill):
         length_i = seq_len[i]
         # Skip empty sequences without synchronizing to host
         if length_i.eq(0):
@@ -246,6 +312,148 @@ def _torch_cached_ssm(
         slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
         ssm_state_cache.index_copy_(0, slot_i, ssm_state_i.to(ssm_state_cache.dtype))
 
+    if num_decode > 0:
+        decode_slice = slice(num_prefill_tokens, num_total_tokens)
+        decode_slot_idx = slot_idx[num_prefill:num_seq]
+        hs_decode = hs_flat[decode_slice].unsqueeze(1)
+        B_decode = B_flat[decode_slice].unsqueeze(1)
+        C_decode = C_flat[decode_slice].unsqueeze(1)
+        dt_decode = dt_flat[decode_slice].unsqueeze(1)
+        ssm_batch = ssm_state_cache.index_select(0, decode_slot_idx)
+        y_decode, updated_state = _torch_cached_ssm_decode(
+            hs_decode,
+            A,
+            B_decode,
+            C_decode,
+            D,
+            dt_decode,
+            dt_bias,
+            time_step_limit,
+            chunk_size,
+            ssm_batch,
+        )
+        y_flat.index_copy_(
+            0,
+            torch.arange(num_prefill_tokens, num_total_tokens, device=y.device),
+            y_decode[:, 0].to(y_flat.dtype),
+        )
+        ssm_state_cache.index_copy_(0, decode_slot_idx, updated_state.to(ssm_state_cache.dtype))
+
+    return y
+
+
+@torch.library.custom_op("auto_deploy::torch_cached_ysamba_ssm", mutates_args={})
+def _torch_cached_ysamba_ssm(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    time_step_limit: List[float],
+    chunk_size: int,
+) -> torch.Tensor:
+    b, s = hidden_states.shape[:2]
+    (
+        num_prefill,
+        num_prefill_tokens,
+        num_decode,
+        seq_len,
+        seq_start,
+        slot_idx,
+        use_initial_states,
+    ) = _split_cached_ssm_batch(batch_info_host, seq_len, cu_seqlen, slot_idx, use_initial_states)
+    num_seq = num_prefill + num_decode
+
+    if s == 1:
+        slot_idx_long = slot_idx.to(torch.long)
+        ssm_batch = ssm_state_cache.index_select(dim=0, index=slot_idx_long)
+        y, updated_state = _torch_cached_ysamba_ssm_decode(
+            hidden_states,
+            A,
+            B,
+            C,
+            D,
+            dt,
+            dt_bias,
+            time_step_limit,
+            chunk_size,
+            ssm_batch,
+        )
+        ssm_state_cache.index_copy_(0, slot_idx_long, updated_state.to(ssm_state_cache.dtype))
+        return y.to(hidden_states.dtype)
+
+    if torch.any(use_initial_states[:num_prefill]):
+        raise ValueError(
+            "torch ySamba backend does not yet support chunked prefill and can not correctly "
+            "handle initial states."
+        )
+
+    bs = b * s
+    num_total_tokens = num_prefill_tokens + num_decode
+    flat_idx = torch.arange(bs, device=hidden_states.device, dtype=torch.long)
+    hs_flat = hidden_states.reshape(bs, *hidden_states.shape[2:])
+    B_flat = B.reshape(bs, *B.shape[2:])
+    C_flat = C.reshape(bs, *C.shape[2:])
+    dt_flat = dt.reshape(bs, *dt.shape[2:])
+    y = torch.zeros_like(hidden_states, memory_format=torch.contiguous_format)
+    y_flat = y.view(bs, *y.shape[2:])
+
+    for i in range(num_prefill):
+        length_i = seq_len[i]
+        if length_i.eq(0):
+            continue
+        start_i = seq_start[i]
+        end_i = start_i + length_i
+        mask_i = (flat_idx >= start_i.to(torch.long)) & (flat_idx < end_i.to(torch.long))
+        idx_i = torch.nonzero(mask_i, as_tuple=False).squeeze(-1)
+
+        hs_seq = hs_flat.index_select(0, idx_i).unsqueeze(0)
+        B_seq = B_flat.index_select(0, idx_i).unsqueeze(0)
+        C_seq = C_flat.index_select(0, idx_i).unsqueeze(0)
+        dt_seq = dt_flat.index_select(0, idx_i).unsqueeze(0)
+
+        y_seq, ssm_state_i = _torch_ysamba_ssm_prefill(
+            hs_seq, A, B_seq, C_seq, D, dt_seq, dt_bias, time_step_limit, chunk_size
+        )
+        y_flat.index_copy_(0, idx_i, y_seq[0].to(y_flat.dtype))
+        slot_i = slot_idx[i].to(torch.long).unsqueeze(0)
+        ssm_state_cache.index_copy_(0, slot_i, ssm_state_i.to(ssm_state_cache.dtype))
+
+    if num_decode > 0:
+        decode_slice = slice(num_prefill_tokens, num_total_tokens)
+        decode_slot_idx = slot_idx[num_prefill:num_seq]
+        hs_decode = hs_flat[decode_slice].unsqueeze(1)
+        B_decode = B_flat[decode_slice].unsqueeze(1)
+        C_decode = C_flat[decode_slice].unsqueeze(1)
+        dt_decode = dt_flat[decode_slice].unsqueeze(1)
+        ssm_batch = ssm_state_cache.index_select(0, decode_slot_idx)
+        y_decode, updated_state = _torch_cached_ysamba_ssm_decode(
+            hs_decode,
+            A,
+            B_decode,
+            C_decode,
+            D,
+            dt_decode,
+            dt_bias,
+            time_step_limit,
+            chunk_size,
+            ssm_batch,
+        )
+        y_flat.index_copy_(
+            0,
+            torch.arange(num_prefill_tokens, num_total_tokens, device=y.device),
+            y_decode[:, 0].to(y_flat.dtype),
+        )
+        ssm_state_cache.index_copy_(0, decode_slot_idx, updated_state.to(ssm_state_cache.dtype))
+
     return y
 
 
@@ -270,6 +478,31 @@ def _torch_cached_ssm_fake(
     # CACHES
     ssm_state_cache: torch.Tensor,  # [max_batch_size, num_heads, head_dim, ssm_state_size]
     # CONSTANTS
+    time_step_limit: List[float],
+    chunk_size: int,
+):
+    return torch.empty_like(
+        hidden_states,
+        memory_format=torch.contiguous_format,
+        dtype=torch.float32,
+    )
+
+
+@_torch_cached_ysamba_ssm.register_fake
+def _torch_cached_ysamba_ssm_fake(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    batch_info_host: torch.Tensor,
+    seq_len: torch.Tensor,
+    cu_seqlen: torch.Tensor,
+    slot_idx: torch.Tensor,
+    use_initial_states: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
     time_step_limit: List[float],
     chunk_size: int,
 ):
@@ -342,3 +575,14 @@ class TorchBackendSSM(AttentionDescriptor):
             source_attn_node, "time_step_limit", "chunk_size"
         )
         return [time_step_limit, chunk_size]
+
+
+@AttentionRegistry.register("torch_ysamba_ssm")
+class TorchBackendYSambaSSM(TorchBackendSSM):
+    @classmethod
+    def get_source_attention_op(cls) -> OpOverloadPacket:
+        return torch.ops.auto_deploy.torch_ysamba_ssm
+
+    @classmethod
+    def get_cached_attention_op(cls) -> MHACallable:
+        return torch.ops.auto_deploy.torch_cached_ysamba_ssm.default

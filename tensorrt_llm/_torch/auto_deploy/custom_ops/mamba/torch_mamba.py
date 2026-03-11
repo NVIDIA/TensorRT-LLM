@@ -177,6 +177,59 @@ def _torch_ssm_prefill(
     return y, ssm_state
 
 
+def _torch_ysamba_ssm_prefill(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    time_step_limit: List[float],
+    chunk_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    del chunk_size
+    batch_size, seq_len, num_heads, head_dim = hidden_states.shape
+    d_inner = num_heads * head_dim
+    n_groups, ssm_state_size = B.shape[2:]
+
+    hidden_states_flat = hidden_states.reshape(batch_size, seq_len, d_inner).to(torch.float32)
+    dt = torch.nn.functional.softplus(dt.to(torch.float32) + dt_bias.to(torch.float32))
+    dt = torch.clamp(dt, time_step_limit[0], time_step_limit[1])
+    B = B.reshape(batch_size, seq_len, n_groups, ssm_state_size).to(torch.float32)
+    C = C.reshape(batch_size, seq_len, n_groups, ssm_state_size).to(torch.float32)
+    if n_groups != d_inner:
+        repeat_factor = d_inner // n_groups
+        B = B.repeat_interleave(repeat_factor, dim=2, output_size=d_inner)
+        C = C.repeat_interleave(repeat_factor, dim=2, output_size=d_inner)
+
+    A = A.to(torch.float32).reshape(d_inner, ssm_state_size)
+    D = D.to(torch.float32).reshape(d_inner)
+
+    ssm_state = torch.zeros(
+        batch_size,
+        d_inner,
+        ssm_state_size,
+        device=hidden_states.device,
+        dtype=torch.float32,
+    )
+    outputs = []
+    for token_idx in range(seq_len):
+        x_t = hidden_states_flat[:, token_idx]
+        dt_t = dt[:, token_idx]
+        B_t = B[:, token_idx]
+        C_t = C[:, token_idx]
+
+        dA = torch.exp(dt_t.unsqueeze(-1) * A.unsqueeze(0))
+        dB = dt_t.unsqueeze(-1) * B_t
+        ssm_state = ssm_state * dA + x_t.unsqueeze(-1) * dB
+        y_t = torch.einsum("bdn,bdn->bd", ssm_state, C_t) + D.unsqueeze(0) * x_t
+        outputs.append(y_t)
+
+    y = torch.stack(outputs, dim=1).reshape(batch_size, seq_len, num_heads, head_dim)
+    return y, ssm_state.reshape(batch_size, num_heads, head_dim, ssm_state_size)
+
+
 @torch.library.custom_op("auto_deploy::torch_ssm", mutates_args={})
 def _torch_ssm(
     hidden_states: torch.Tensor,
@@ -195,8 +248,41 @@ def _torch_ssm(
     return y
 
 
+@torch.library.custom_op("auto_deploy::torch_ysamba_ssm", mutates_args={})
+def _torch_ysamba_ssm(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    time_step_limit: List[float],
+    chunk_size: int,
+) -> torch.Tensor:
+    y, _ = _torch_ysamba_ssm_prefill(
+        hidden_states, A, B, C, D, dt, dt_bias, time_step_limit, chunk_size
+    )
+    return y.to(hidden_states.dtype)
+
+
 @_torch_ssm.register_fake
 def _torch_ssm_meta(
+    hidden_states: torch.Tensor,
+    A: torch.Tensor,
+    B: torch.Tensor,
+    C: torch.Tensor,
+    D: torch.Tensor,
+    dt: torch.Tensor,
+    dt_bias: torch.Tensor,
+    time_step_limit: List[float],
+    chunk_size: int,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states, dtype=torch.float32)
+
+
+@_torch_ysamba_ssm.register_fake
+def _torch_ysamba_ssm_meta(
     hidden_states: torch.Tensor,
     A: torch.Tensor,
     B: torch.Tensor,
