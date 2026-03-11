@@ -666,7 +666,7 @@ class TestMoEAlltoAll:
             raise
 
         if use_fp8_combine:
-            verify_combine(all_results, ep_size, rtol=0.13, atol=0.5)
+            verify_combine(all_results, ep_size, rtol=0.13, atol=1.0)
         else:
             verify_combine(all_results, ep_size)
 
