@@ -123,7 +123,7 @@ class TrtllmGenSupportChecker:
         mask_type: int = 1,
         beam_width: int = 1,
         sink_token_length: int = 0,
-        tokens_per_block: int = 64,
+        tokens_per_block: Optional[int] = 64,
         use_paged_kv_cache: bool = True,
         is_mla_enable: bool = False,
         is_fused_qkv: bool = True,
@@ -134,11 +134,31 @@ class TrtllmGenSupportChecker:
         is_padded: bool = False,
         position_shift_enabled: bool = False,
         quant_config: Optional[QuantConfig] = None,
+        sparse_kv_indices: Optional[torch.Tensor] = None,
+        sparse_attn_indices: Optional[torch.Tensor] = None,
+        skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
+        skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
     ) -> Tuple[bool, str]:
+        if tokens_per_block is None:
+            tokens_per_block = 0
+
         sm = get_sm_version()
         if not is_sm_100f(sm):
             return (False, f"trtllm-gen requires SM100 or SM103 (Blackwell). Current: SM{sm}.")
 
+        if (
+            skip_softmax_threshold_scale_factor_prefill is not None
+            or skip_softmax_threshold_scale_factor_decode is not None
+        ):
+            return (
+                False,
+                "Skip-softmax attention is not supported by trtllm-gen backend.",
+            )
+
+        has_sparse_kv = sparse_kv_indices is not None and sparse_kv_indices.numel() > 0
+        has_sparse_attn = sparse_attn_indices is not None and sparse_attn_indices.numel() > 0
+        if has_sparse_kv or has_sparse_attn:
+            return False, "Sparse attention is not supported by trtllm-gen backend."
         if is_mla_enable:
             return False, "MLA is not supported by trtllm-gen backend."
         if not is_fused_qkv:
@@ -821,6 +841,7 @@ class EnqueueParams:
     kv_cache_quant_mode: int = 0
     position_embedding_type: int = 0
     layer_idx: int = 0
+    global_layer_idx: int = 0
     kv_scale_orig_quant: Optional[torch.Tensor] = None
     kv_scale_quant_orig: Optional[torch.Tensor] = None
     attention_output_orig_quant: Optional[torch.Tensor] = None
@@ -842,14 +863,16 @@ class EnqueueParams:
 class EnqueueContextParams(EnqueueParams):
     batch_size: int = 0
     mrope_rotary_cos_sin: Optional[torch.Tensor] = None
-    skip_softmax_threshold_scale_factor: Optional[float] = None
 
 
 @dataclass
 class EnqueueGenerationParams(EnqueueParams):
     beam_width: int = 1
     num_requests: int = 0
-    skip_softmax_threshold_scale_factor: Optional[float] = None
+    predicted_tokens_per_seq: int = 1
+    spec_decoding_generation_lengths: Optional[torch.Tensor] = None
+    spec_decoding_position_offsets: Optional[torch.Tensor] = None
+    spec_decoding_packed_mask: Optional[torch.Tensor] = None
 
 
 class FlashInferTrtllmGenAttention:
@@ -902,6 +925,7 @@ class FlashInferTrtllmGenAttention:
         kv_cache_block_offsets,
         host_kv_cache_pool_mapping,
         layer_idx: int,
+        global_layer_idx: int,
         batch_start: int,
         batch_size: int,
     ):
@@ -927,12 +951,27 @@ class FlashInferTrtllmGenAttention:
 
         The unified formula k_offsets // (stride(0) // single_kv_block_elems)
         handles both layouts without branching.
+
+        TODO: This conversion exists because FlashInfer's trtllm-gen FMHA
+        kernels use a shared paged KV cache index (one page index covers both
+        K and V), while TRT-LLM's KVBlockArray uses separate K/V global
+        block offsets (K at offset N, V at offset N+1). Once the trtllm-gen
+        kernels natively support TRT-LLM's separate K/V index layout (i.e.,
+        accepting kv_cache_block_offsets directly with independent K and V
+        columns and pool-pointer-based addressing), this entire method can be
+        removed and kv_cache_block_offsets can be passed through directly.
+        Tracking: https://github.com/flashinfer-ai/flashinfer/issues/2694
+
+        Args:
+            layer_idx: Local layer offset used to index host_kv_cache_pool_mapping.
+            global_layer_idx: Global layer index used as key in
+                kv_cache_manager.get_buffers() / layer_offsets.
         """
         if kv_cache_block_offsets is None:
             return None
         pool_idx = int(host_kv_cache_pool_mapping[layer_idx, 0])
         k_offsets = kv_cache_block_offsets[pool_idx, batch_start : batch_start + batch_size, 0, :]
-        kv_buf = self._kv_cache_manager.get_buffers(layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
+        kv_buf = self._kv_cache_manager.get_buffers(global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT)
         single_kv_block_elems = kv_buf.shape[2] * kv_buf.shape[3] * kv_buf.shape[4]
         divisor = kv_buf.stride(0) // single_kv_block_elems
         return k_offsets // divisor
@@ -942,6 +981,7 @@ class FlashInferTrtllmGenAttention:
             params.kv_cache_block_offsets,
             params.host_kv_cache_pool_mapping,
             params.layer_idx,
+            params.global_layer_idx,
             params.seq_offset,
             params.batch_size,
         )
@@ -1072,7 +1112,7 @@ class FlashInferTrtllmGenAttention:
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
             query=q_processed,
             kv_cache=self._kv_cache_manager.get_buffers(
-                params.layer_idx, kv_layout=DEFAULT_KV_LAYOUT
+                params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
             ),
             workspace_buffer=ctx_ws.trtllm_gen_workspace,
             block_tables=block_tables,
@@ -1088,7 +1128,6 @@ class FlashInferTrtllmGenAttention:
             out=params.context_buf,
             kv_layout=self._layout,
             sinks=params.attention_sinks,
-            skip_softmax_threshold_scale_factor=params.skip_softmax_threshold_scale_factor,
         )
 
         torch.ops.trtllm.kv_cache_postprocessing(**ctx_qkv_args)
@@ -1099,6 +1138,7 @@ class FlashInferTrtllmGenAttention:
             params.kv_cache_block_offsets,
             params.host_kv_cache_pool_mapping,
             params.layer_idx,
+            params.global_layer_idx,
             params.seq_offset,
             batch_beam,
         )
@@ -1106,6 +1146,11 @@ class FlashInferTrtllmGenAttention:
             params.cyclic_attention_window_size,
             params.max_past_kv_length,
             params.attention_chunk_size,
+        )
+
+        is_multi_token_gen = (
+            params.spec_decoding_generation_lengths is not None
+            and params.predicted_tokens_per_seq > 1
         )
 
         gen_ws = WorkspaceManager.split_generation_workspace(
@@ -1119,9 +1164,6 @@ class FlashInferTrtllmGenAttention:
             num_kv_heads=params.num_kv_heads,
         )
 
-        # build_decoder_info returns True if the kernel was needed and executed,
-        # False if isBuildDecoderInfoKernelNeeded() determined it was not needed,
-        # and the kernel was not executed (output buffers stay uninitialised in that case).
         is_build_decoder_info_kernel_needed = torch.ops.trtllm.build_decoder_info(
             seq_q_offsets=gen_ws.cu_seqlens,
             seq_kv_offsets=gen_ws.cu_kv_seqlens,
@@ -1131,7 +1173,7 @@ class FlashInferTrtllmGenAttention:
             packed_mask_row_offsets=None,
             seq_cp_partial_offsets=None,
             attention_mask=None,
-            seq_q_lengths=None,
+            seq_q_lengths=(params.spec_decoding_generation_lengths if is_multi_token_gen else None),
             seq_kv_lengths=params.sequence_lengths,
             fmha_tile_counter=None,
             dequant_scale_qkv=None,
@@ -1183,10 +1225,8 @@ class FlashInferTrtllmGenAttention:
             fmha_bmm2_scale=gen_ws.bmm2_scale,
             fmha_tile_counter=None,
             logn_scaling=None,
-            # Align with XQA generation preprocessing path: no tokens_info/seq_lens
-            # for regular decode (non-spec-decoding).
-            tokens_info=None,
-            seq_lens=None,
+            tokens_info=(gen_ws.tokens_info if is_multi_token_gen else None),
+            seq_lens=(params.spec_decoding_generation_lengths if is_multi_token_gen else None),
             cache_seq_lens=params.sequence_lengths,
             encoder_seq_lens=None,
             cu_seq_lens=cu_seqlens,
@@ -1195,7 +1235,9 @@ class FlashInferTrtllmGenAttention:
             sparse_kv_indices=None,
             rotary_embedding_inv_freq=rotary_inv_freq_buf,
             rotary_coef_cache_buffer=params.rotary_cos_sin,
-            spec_decoding_position_offsets=None,
+            spec_decoding_position_offsets=(
+                params.spec_decoding_position_offsets if is_multi_token_gen else None
+            ),
             mrope_rotary_cos_sin=None,
             mrope_position_deltas=None,
             batch_size=batch_beam,
@@ -1238,21 +1280,69 @@ class FlashInferTrtllmGenAttention:
         q_processed = gen_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
         gen_ws.trtllm_gen_workspace.zero_()
 
-        flashinfer.decode.trtllm_batch_decode_with_kv_cache(
-            query=q_processed,
-            kv_cache=self._kv_cache_manager.get_buffers(params.layer_idx, kv_layout=self._layout),
-            workspace_buffer=gen_ws.trtllm_gen_workspace,
-            block_tables=block_tables,
-            seq_lens=params.sequence_lengths,
-            max_seq_len=params.max_past_kv_length,
-            out=params.context_buf,
-            bmm1_scale=params.bmm1_scale,
-            bmm2_scale=params.bmm2_scale,
-            window_left=window_left,
-            kv_layout=self._layout,
-            sinks=params.attention_sinks,
-            skip_softmax_threshold_scale_factor=params.skip_softmax_threshold_scale_factor,
-        )
+        # FlashInfer's trtllm-gen decode kernel needs to know the actual
+        # number of query tokens per request to correctly derive batch_size
+        # from the flattened query tensor:
+        #
+        #   query.shape = [num_tokens, num_heads, head_dim]
+        #     where num_tokens = batch_size * input_seq_length
+        #
+        # FlashInfer computes batch_size internally as:
+        #   - If q_len_per_req is set:  batch_size = num_tokens / q_len_per_req
+        #   - If q_len_per_req is None: batch_size = cum_seq_lens_q.size(0) - 1
+        #
+        # This is critical for speculative decoding (e.g., Eagle3) where each
+        # request may have multiple query tokens (input_seq_length > 1) even when
+        # predicted_tokens_per_seq == 1 (as on Blackwell where
+        # is_spec_decoding_enabled is forced False). Without the correct
+        # q_len_per_req, FlashInfer would compute batch_size = num_tokens
+        # (assuming 1 token/req), causing out-of-bounds reads on block_tables
+        # which only has batch_size rows.
+        #
+        # Two branches handle different query-length distributions:
+        #   - is_multi_token_gen (variable lengths): use cum_seq_lens_q from
+        #     build_decoder_info, which encodes per-request query lengths.
+        #   - else (uniform lengths): use q_len_per_req = input_seq_length.
+        #     This covers both normal single-token decode (input_seq_length=1)
+        #     and uniform multi-token decode (input_seq_length>1).
+        if is_multi_token_gen:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                kv_cache=self._kv_cache_manager.get_buffers(
+                    params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
+                ),
+                workspace_buffer=gen_ws.trtllm_gen_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=params.max_past_kv_length,
+                out=params.context_buf,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                window_left=window_left,
+                kv_layout=self._layout,
+                sinks=params.attention_sinks,
+                q_len_per_req=None,
+                max_q_len=params.input_seq_length,
+                cum_seq_lens_q=cu_seqlens,
+            )
+        else:
+            flashinfer.decode.trtllm_batch_decode_with_kv_cache(
+                query=q_processed,
+                kv_cache=self._kv_cache_manager.get_buffers(
+                    params.global_layer_idx, kv_layout=DEFAULT_KV_LAYOUT
+                ),
+                workspace_buffer=gen_ws.trtllm_gen_workspace,
+                block_tables=block_tables,
+                seq_lens=params.sequence_lengths,
+                max_seq_len=params.max_past_kv_length,
+                out=params.context_buf,
+                bmm1_scale=params.bmm1_scale,
+                bmm2_scale=params.bmm2_scale,
+                window_left=window_left,
+                kv_layout=self._layout,
+                sinks=params.attention_sinks,
+                q_len_per_req=params.input_seq_length,
+            )
 
 
 def _parse_request_types(host_request_types: torch.Tensor) -> Tuple[int, int]:
@@ -1282,7 +1372,7 @@ def is_supported(
     has_alibi: bool = False,
     is_padded: bool = False,
     use_paged_kv_cache: bool = True,
-    tokens_per_block: int = 64,
+    tokens_per_block: Optional[int] = 64,
     beam_width: int = 1,
     position_shift_enabled: bool = False,
     sink_token_length: int = 0,
@@ -1295,6 +1385,10 @@ def is_supported(
     quant_config: Optional[QuantConfig] = None,
     kv_cache_manager: Optional[KVCacheManager] = None,
     phase: str = "both",
+    sparse_kv_indices: Optional[torch.Tensor] = None,
+    sparse_attn_indices: Optional[torch.Tensor] = None,
+    skip_softmax_threshold_scale_factor_prefill: Optional[float] = None,
+    skip_softmax_threshold_scale_factor_decode: Optional[float] = None,
 ) -> Tuple[bool, str]:
     """
     Check if trtllm-gen backend supports the given configuration.
@@ -1324,6 +1418,12 @@ def is_supported(
         quant_config: Quantization configuration (QuantConfig).
         kv_cache_manager: KV cache manager (its .dtype provides KV cache DataType).
         phase: Phase to check ("context", "generation", or "both").
+        sparse_kv_indices: Sparse KV indices tensor for context phase.
+        sparse_attn_indices: Sparse attention indices tensor for generation phase.
+        skip_softmax_threshold_scale_factor_prefill: Scale factor for the skip-softmax
+            threshold in prefill phase. Non-None indicates skip-softmax is enabled.
+        skip_softmax_threshold_scale_factor_decode: Scale factor for the skip-softmax
+            threshold in decode phase. Non-None indicates skip-softmax is enabled.
 
     Returns:
         Tuple of (is_supported, reason_if_not_supported).
@@ -1356,6 +1456,10 @@ def is_supported(
         is_padded=is_padded,
         position_shift_enabled=position_shift_enabled,
         quant_config=quant_config,
+        sparse_kv_indices=sparse_kv_indices,
+        sparse_attn_indices=sparse_attn_indices,
+        skip_softmax_threshold_scale_factor_prefill=skip_softmax_threshold_scale_factor_prefill,
+        skip_softmax_threshold_scale_factor_decode=skip_softmax_threshold_scale_factor_decode,
     )
 
 
@@ -1440,6 +1544,7 @@ def trtllm_gen_attention(
     quant_q_buffer: Optional[torch.Tensor],
     quant_config: Optional[QuantConfig],
     kv_cache_manager: Optional[KVCacheManager],
+    global_layer_idx: Optional[int] = None,
 ) -> None:
     """
     TrtLLM-Gen attention using flashinfer backend.
@@ -1644,6 +1749,7 @@ def trtllm_gen_attention(
         kv_cache_quant_mode=quant_mode,
         position_embedding_type=position_embedding_type,
         layer_idx=layer_idx,
+        global_layer_idx=global_layer_idx if global_layer_idx is not None else layer_idx,
         kv_scale_orig_quant=resolved_kv_scale_orig_quant,
         kv_scale_quant_orig=resolved_kv_scale_quant_orig,
         attention_output_orig_quant=out_scale,
@@ -1685,7 +1791,6 @@ def trtllm_gen_attention(
             input_seq_length=max_context_q_len,
             batch_size=num_seqs,
             mrope_rotary_cos_sin=mrope_rotary_cos_sin,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor_prefill,
         )
         backend.run_context(ctx_params)
 
@@ -1697,6 +1802,21 @@ def trtllm_gen_attention(
 
         max_past_kv_len = int(host_past_key_value_lengths[seq_offset : seq_offset + num_seqs].max())
         input_seq_length = num_gen_tokens // num_seqs if num_seqs > 0 else 1
+
+        spec_gen_lengths = None
+        spec_pos_offsets = None
+        spec_packed_mask = None
+        if (
+            spec_decoding_bool_params
+            and len(spec_decoding_bool_params) >= 2
+            and spec_decoding_bool_params[0]
+            and spec_decoding_bool_params[1]
+            and predicted_tokens_per_seq > 1
+        ):
+            if spec_decoding_tensor_params and len(spec_decoding_tensor_params) >= 3:
+                spec_gen_lengths = spec_decoding_tensor_params[0]
+                spec_pos_offsets = spec_decoding_tensor_params[1]
+                spec_packed_mask = spec_decoding_tensor_params[2]
 
         gen_params = EnqueueGenerationParams(
             **common_params,
@@ -1711,7 +1831,10 @@ def trtllm_gen_attention(
             input_seq_length=input_seq_length,
             beam_width=beam_width,
             num_requests=num_seqs // beam_width,
-            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor_decode,
+            predicted_tokens_per_seq=predicted_tokens_per_seq,
+            spec_decoding_generation_lengths=spec_gen_lengths,
+            spec_decoding_position_offsets=spec_pos_offsets,
+            spec_decoding_packed_mask=spec_packed_mask,
         )
         backend.run_generation(gen_params)
 

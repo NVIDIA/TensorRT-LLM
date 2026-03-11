@@ -259,7 +259,7 @@ public:
     template <typename T>
     int getKvCacheElemSizeInBits() const
     {
-        return getKvCacheElemSizeInBits(mKVCacheQuantMode, sizeof(T) * 8);
+        return getKvCacheElemSizeInBits(mKVCacheQuantMode, sizeof(T));
     }
 
     static int getKvCacheElemSizeInBits(tensorrt_llm::common::QuantMode quantMode, size_t dTypeSize)
