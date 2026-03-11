@@ -406,15 +406,59 @@ NCCLWindowBuffer NCCLWindowAllocator::allocateAndRegisterBuffer(ncclComm_t comm,
     NCCLWindowBuffer buffer;
     buffer.handle = handle;
 
-    // Allocate device memory using ncclMemAlloc
+    // Allocate device memory using ncclMemAlloc (per-rank, non-collective — can fail asymmetrically)
     ncclResult_t allocResult = ncclMemAlloc(&buffer.ptr, size);
-    if (allocResult != ncclSuccess)
+    int localAllocOk = (allocResult == ncclSuccess) ? 1 : 0;
+    if (!localAllocOk)
     {
-        TLLM_THROW("ncclMemAlloc failed with error: %d", allocResult);
+        TLLM_LOG_WARNING(
+            "[NCCLUtil] ncclMemAlloc failed on this rank (error: %d, size=%zu); "
+            "synchronizing with other ranks before aborting window registration.",
+            allocResult, size);
     }
+
+    // ncclCommWindowRegister is collective: if any rank skips it, all other ranks hang.
+    // Synchronize the per-rank alloc status across all ranks before proceeding.
+    // Use a small cudaMalloc buffer (not ncclMemAlloc) so OOM on symmetric memory
+    // does not prevent us from allocating the flag.
+    int* dFlag = nullptr;
+    if (cudaMalloc(&dFlag, sizeof(int)) != cudaSuccess)
+    {
+        // This should be essentially impossible (4 bytes of regular device memory),
+        // but if it happens we cannot safely coordinate — abort on this rank.
+        if (localAllocOk)
+        {
+            ncclMemFree(buffer.ptr);
+        }
+        TLLM_THROW("[NCCLUtil] cudaMalloc for rank-sync flag failed; cannot coordinate safely across ranks.");
+    }
+
+    // Populate flag on device, reduce with min (0 if any rank failed), then read back.
+    auto stream = at::cuda::getCurrentCUDAStream().stream();
+    cudaMemcpy(dFlag, &localAllocOk, sizeof(int), cudaMemcpyHostToDevice);
+    ncclAllReduce(dFlag, dFlag, 1, ncclInt32, ncclMin, comm, stream);
+    cudaStreamSynchronize(stream);
+    int allAllocOk = 1;
+    cudaMemcpy(&allAllocOk, dFlag, sizeof(int), cudaMemcpyDeviceToHost);
+    cudaFree(dFlag);
+
+    if (!allAllocOk)
+    {
+        if (localAllocOk)
+        {
+            TLLM_LOG_WARNING(
+                "[NCCLUtil] ncclMemAlloc failed on at least one other rank; "
+                "freeing local allocation (size=%zu) and aborting window registration on all ranks.",
+                size);
+            ncclMemFree(buffer.ptr);
+        }
+        // Return an empty buffer — callers fall back to regular (non-symmetric) allreduce.
+        return NCCLWindowBuffer();
+    }
+
     buffer.size = size;
 
-    // Register the buffer with NCCL as a window
+    // Register the buffer with NCCL as a window (collective — all ranks must reach this call)
     ncclResult_t regResult = ncclCommWindowRegister(comm, buffer.ptr, size, &buffer.window, NCCL_WIN_COLL_SYMMETRIC);
     if (regResult != ncclSuccess)
     {
