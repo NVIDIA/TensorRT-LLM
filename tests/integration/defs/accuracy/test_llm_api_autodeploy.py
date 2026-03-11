@@ -588,8 +588,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                     "num_moe_experts_for_export": 2,
                 },
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
             },
         }

@@ -15,7 +15,11 @@ kv_cache_config:
 transforms:
   detect_sharding:
     allreduce_strategy: SYMM_MEM
+    # NOTE: add 'tp' to sharding dims only for high-throughput runs
+    # For low-latency, keep mamba and attention replicated
     sharding_dims: ['ep', 'bmm']
+    # NOTE: sharding_source applies only to TP sharding
+    sharding_source: ['manual']
     manual_config:
       head_dim: 128
       tp_plan:

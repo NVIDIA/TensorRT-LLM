@@ -25,15 +25,28 @@ def test_fp4_scale_sharding(dim):
 
     weight_scale_cutlass = modelopt_fp4_scale_to_cutlass_fp4_scale(weight_scale_modelopt)
 
+    # Original uint8 weight shape (FP4 packs 2 elements per byte, so last dim is halved)
+    original_uint8_weight_shape = (130, 32)
+
     if dim == 0:
-        uint8_weight_shape = (65, 32)
         expected_sharded_weight_scale_shape = 128 * 4
     elif dim == 1:
-        uint8_weight_shape = (130, 16)
         expected_sharded_weight_scale_shape = 256 * 4
 
-    fp4_scale_rank_0 = _shard_fp4_weight_scale(weight_scale_cutlass, uint8_weight_shape, dim, 0, 2)
-    fp4_scale_rank_1 = _shard_fp4_weight_scale(weight_scale_cutlass, uint8_weight_shape, dim, 1, 2)
+    fp4_scale_rank_0 = _shard_fp4_weight_scale(
+        weight_scale_cutlass,
+        original_uint8_weight_shape,
+        dim,
+        0,
+        world_size=2,
+    )
+    fp4_scale_rank_1 = _shard_fp4_weight_scale(
+        weight_scale_cutlass,
+        original_uint8_weight_shape,
+        dim,
+        1,
+        world_size=2,
+    )
     assert (
         tuple(fp4_scale_rank_0.shape)
         == tuple(fp4_scale_rank_1.shape)
