@@ -3585,7 +3585,7 @@ class TestKimiK2(LlmapiAccuracyTestHarness):
 class TestKimiK25(LlmapiAccuracyTestHarness):
 
     @skip_pre_blackwell
-    @pytest.mark.skip_less_device(8)
+    @pytest.mark.skip_less_mpi_world_size(8)
     @pytest.mark.skip_less_device_memory(120000)
     @pytest.mark.parametrize(
         "ep_size,attention_dp",
