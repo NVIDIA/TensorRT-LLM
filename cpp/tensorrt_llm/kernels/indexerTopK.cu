@@ -671,7 +671,8 @@ void invokeIndexerTopKDecode(float const* logits, int const* seqLens, int* indic
     int const preIdxCount, cudaStream_t const stream)
 {
 
-    constexpr int kSortingAlgorithmThreshold = 12288;
+    //constexpr int kSortingAlgorithmThreshold = 12288;
+    constexpr int kSortingAlgorithmThreshold = 131073;
     constexpr int kDefaultSplitWorkThreshold = 200 * 1000;
     constexpr int kNumThreadsPerBlock = 512;
     int const effectiveSplitWorkThreshold = splitWorkThreshold > 0 ? splitWorkThreshold : kDefaultSplitWorkThreshold;
