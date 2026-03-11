@@ -547,6 +547,9 @@ class CustomChatCompletionMessageParam(TypedDict, total=False):
 class ReasoningAssistantMessage(ChatCompletionAssistantMessageParam):
     """Assistant message that includes reasoning tokens."""
     reasoning: Optional[str]
+    # NOTE: some older benchmarks and chat templates assume the below, which has been deprecated
+    # in other inference frameworks in favor of the above `reasoning` field.
+    reasoning_content: Optional[str]
 
 
 ChatCompletionMessageParam = Union[OpenAIChatCompletionMessageParam,
