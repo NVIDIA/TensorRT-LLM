@@ -19,19 +19,12 @@ from tensorrt_llm._torch.modules.rms_norm import RMSNorm
 # Flash Attention 4 availability
 # ============================================================================
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
-from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
-    _flash_attn_fwd_import_error as _fa4_import_error,
-)
 from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 
 # Import new integrated versions
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode, apply_rotary_emb
 
 _flash_attn4_available = _fa4_fwd is not None
-requires_flash_attn4 = pytest.mark.skipif(
-    not _flash_attn4_available,
-    reason=f"FlashAttention 4 not available: {_fa4_import_error}",
-)
 
 # ============================================================================
 # Original naive implementations for comparison
@@ -209,16 +202,12 @@ def generate_rope_embeddings(
 # ============================================================================
 # Test functions
 # ============================================================================
-@pytest.mark.parametrize(
-    "attn_backend",
-    [
-        "VANILLA",
-        "TRTLLM",
-        pytest.param("FA4", marks=requires_flash_attn4),
-    ],
-)
+@pytest.mark.parametrize("attn_backend", ["VANILLA", "TRTLLM", "FA4"])
 def test_self_attention_equivalence(attn_backend: str):
     """Test that integrated self-attention produces same output as naive."""
+    if attn_backend == "FA4" and not _flash_attn4_available:
+        pytest.fail("FlashAttention 4 backend is required for FA4 self-attention test")
+
     print("\n" + "=" * 60)
     print("Testing Self-Attention Equivalence")
     print("=" * 60)
@@ -289,7 +278,7 @@ def test_self_attention_equivalence(attn_backend: str):
 def test_cross_attention_equivalence(attn_backend: str):
     """Test that integrated cross-attention produces same output as naive."""
     if attn_backend == "FA4" and not _flash_attn4_available:
-        pytest.skip("FlashAttention 4 not installed")
+        pytest.fail("FlashAttention 4 backend is required for FA4 cross-attention test")
 
     print("\n" + "=" * 60)
     print("Testing Cross-Attention Equivalence")
@@ -359,7 +348,6 @@ def test_cross_attention_equivalence(attn_backend: str):
     return is_close
 
 
-@requires_flash_attn4
 @pytest.mark.parametrize(
     "batch,seq_len_q,seq_len_kv,num_heads,head_dim",
     [
@@ -371,6 +359,9 @@ def test_fa4_cross_attention_wan_shapes(
     batch: int, seq_len_q: int, seq_len_kv: int, num_heads: int, head_dim: int
 ):
     """Test FA4 cross-attention correctness at Wan-realistic shapes."""
+    if not _flash_attn4_available:
+        pytest.fail("FlashAttention 4 backend is required for FA4 Wan-shape tests")
+
     hidden_size = num_heads * head_dim
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     dtype = torch.bfloat16

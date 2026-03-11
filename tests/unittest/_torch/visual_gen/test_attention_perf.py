@@ -40,14 +40,13 @@ import torch
 # Flash Attention 4 availability
 # ============================================================================
 from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import _flash_attn_fwd as _fa4_fwd
+from tensorrt_llm._torch.visual_gen.attention_backend.flash_attn4 import (
+    _flash_attn_fwd_import_error as _fa4_import_error,
+)
 from tensorrt_llm._torch.visual_gen.config import AttentionConfig, DiffusionModelConfig
 from tensorrt_llm._torch.visual_gen.modules.attention import Attention, QKVMode
 
 _flash_attn4_available = _fa4_fwd is not None
-requires_flash_attn4 = pytest.mark.skipif(
-    not _flash_attn4_available,
-    reason="FlashAttention 4 not installed",
-)
 
 # NVTX support for profiling
 try:
@@ -613,17 +612,23 @@ class TestWanAttentionPerformance:
     @pytest.mark.parametrize("backend", ["VANILLA", "TRTLLM", "FA4"])
     def test_self_attention_perf(self, backend: str):
         """Test that attention backend runs without errors."""
+        if backend == "FA4" and not _flash_attn4_available:
+            pytest.fail(
+                "FlashAttention 4 backend is required for FA4 self-attention perf test"
+                + (f": {_fa4_import_error}" if _fa4_import_error else "")
+            )
+
         batch_size, num_heads, seq_len, head_dim = 1, 24, 1024, 64
 
         result = self.benchmark.benchmark_single(
             batch_size, num_heads, seq_len, head_dim, backend, verbose=True
         )
 
-        if result is not None:
-            assert result["avg_ms"] > 0, "Average time should be positive"
-            assert result["min_ms"] <= result["avg_ms"], "Min should be <= avg"
-            assert result["max_ms"] >= result["avg_ms"], "Max should be >= avg"
-            print(f"  {backend}: avg={result['avg_ms']:.3f}ms OK")
+        assert result is not None, f"{backend} benchmark failed to produce results"
+        assert result["avg_ms"] > 0, "Average time should be positive"
+        assert result["min_ms"] <= result["avg_ms"], "Min should be <= avg"
+        assert result["max_ms"] >= result["avg_ms"], "Max should be >= avg"
+        print(f"  {backend}: avg={result['avg_ms']:.3f}ms OK")
 
     @pytest.mark.parametrize(
         "batch_size,num_heads,seq_len,head_dim",
@@ -670,6 +675,8 @@ class TestFlashAttn4Performance:
     @pytest.fixture(autouse=True)
     def setup(self):
         """Setup benchmark with FA4 and VANILLA backends."""
+        if not _flash_attn4_available:
+            pytest.fail("FlashAttention 4 backend is required for TestFlashAttn4Performance")
         self.benchmark = WanAttentionPerformanceBenchmark(
             warmup_iterations=5,
             benchmark_iterations=20,
@@ -677,7 +684,6 @@ class TestFlashAttn4Performance:
         # Override backends so benchmark_comparison covers VANILLA and FA4
         self.benchmark.backends = ["VANILLA", "FA4"]
 
-    @requires_flash_attn4
     @pytest.mark.parametrize(
         "model_name,batch,seq_len,num_heads,head_dim",
         [
@@ -741,6 +747,8 @@ class TestFlashAttn4CrossAttnPerformance:
     @pytest.fixture(autouse=True)
     def setup(self):
         """Setup benchmark with FA4 and VANILLA backends."""
+        if not _flash_attn4_available:
+            pytest.fail("FlashAttention 4 backend is required for TestFlashAttn4Performance")
         self.benchmark = WanAttentionPerformanceBenchmark(
             warmup_iterations=5,
             benchmark_iterations=20,
@@ -748,7 +756,6 @@ class TestFlashAttn4CrossAttnPerformance:
         self.device = self.benchmark.device
         self.dtype = self.benchmark.dtype
 
-    @requires_flash_attn4
     @pytest.mark.parametrize(
         "model_name,batch,seq_len_q,seq_len_kv,num_heads,head_dim",
         [
@@ -790,7 +797,6 @@ class TestFlashAttn4CrossAttnPerformance:
         print(f"    VANILLA: avg={vanilla['avg_ms']:.3f}ms  p95={vanilla['p95_ms']:.3f}ms")
         print(f"    FA4:     avg={fa4['avg_ms']:.3f}ms  p95={fa4['p95_ms']:.3f}ms")
 
-    @requires_flash_attn4
     @pytest.mark.parametrize(
         "batch,seq_len_q,seq_len_kv,num_heads,head_dim",
         [
