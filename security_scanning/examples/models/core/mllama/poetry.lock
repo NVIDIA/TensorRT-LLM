@@ -216,14 +216,14 @@ test = ["cython (>=3.1,<3.2)", "numpy (>=1.21.1)", "pyglet (>=2.1.9)", "pytest (
 
 [[package]]
 name = "cuda-pathfinder"
-version = "1.4.1"
+version = "1.4.2"
 description = "Pathfinder for CUDA components"
 optional = false
 python-versions = ">=3.10"
 groups = ["main"]
 markers = "platform_system == \"Linux\" and platform_machine == \"x86_64\""
 files = [
-    {file = "cuda_pathfinder-1.4.1-py3-none-any.whl", hash = "sha256:40793006082de88e0950753655e55558a446bed9a7d9d0bcb48b2506d50ed82a"},
+    {file = "cuda_pathfinder-1.4.2-py3-none-any.whl", hash = "sha256:eb354abc20278f8609dc5b666a24648655bef5613c6dfe78a238a6fd95566754"},
 ]
 
 [[package]]
@@ -1724,20 +1724,21 @@ pyyaml = ["pyyaml"]
 
 [[package]]
 name = "torchprofile"
-version = "0.0.4"
-description = ""
+version = "0.1.0"
+description = "Count the MACs / FLOPs of PyTorch models"
 optional = false
-python-versions = "*"
+python-versions = ">=3.9"
 groups = ["main"]
 files = [
-    {file = "torchprofile-0.0.4-py3-none-any.whl", hash = "sha256:7151fe88dc770f0eeec241244a4c7feaec2c5e8c7852386bc2d6a8d7dde7384d"},
-    {file = "torchprofile-0.0.4.tar.gz", hash = "sha256:96b6da17d752a06b02977e078aea95614893b31d4117dd5dcd081f30ce65611b"},
+    {file = "torchprofile-0.1.0-py3-none-any.whl", hash = "sha256:39aefcd194927befb0cfe7ed886be565dee384e3889d0b6890bace5ae1614578"},
+    {file = "torchprofile-0.1.0.tar.gz", hash = "sha256:aeb725e9446b3a6d8f82d0f0cf944a6ffb9cced4e5db1354ad3b9692ce820dac"},
 ]
 
 [package.dependencies]
-numpy = ">=1.14"
-torch = ">=1.4"
-torchvision = ">=0.4"
+torch = ">=2.0"
+
+[package.extras]
+test = ["pytest", "torchvision (>=0.15)", "transformers"]
 
 [[package]]
 name = "torchvision"
