@@ -175,6 +175,66 @@ def test_connector_manager_take_scheduled_requests(mpi_pool_executor):
     run_across_mpi(mpi_pool_executor, test, 2)
 
 
+def test_abort_request_cleans_async_state():
+    """Verify abort_request removes a request from all async tracking structures."""
+    worker = MagicMock()
+    scheduler = MagicMock()
+
+    manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+    req = MagicMock()
+    req.request_id = 42
+
+    # Manually populate every tracking structure as if a transfer was in flight.
+    for store in (manager.new_async_requests, manager.pending_async_requests,
+                  manager.local_finished_async_requests):
+        store.loading[42] = req
+        store.saving[42] = req
+    manager.scheduler_output_manager.requests[42] = req
+    manager.scheduler_output_manager.external_loads[42] = req
+
+    manager.abort_request(req)
+
+    for store in (manager.new_async_requests, manager.pending_async_requests,
+                  manager.local_finished_async_requests):
+        assert 42 not in store.loading
+        assert 42 not in store.saving
+    assert 42 not in manager.scheduler_output_manager.requests
+    assert 42 not in manager.scheduler_output_manager.external_loads
+
+
+@pytest.mark.parametrize("mpi_pool_executor", [2], indirect=True)
+@pytest.mark.threadleak(enabled=False)
+def test_connector_manager_get_finished_exception_unblocks_allgather(
+        mpi_pool_executor):
+    """Verify that a worker.get_finished() exception on rank 0 does not cause a collective stall."""
+
+    def test():
+        worker = MagicMock()
+
+        if mpi_rank() == 0:
+            scheduler = MagicMock()
+            scheduler.request_finished.return_value = True
+            # Simulate a Rust/KVBM panic on rank 0.
+            worker.get_finished.side_effect = RuntimeError(
+                "simulated KVBM worker failure")
+        else:
+            scheduler = None
+            worker.get_finished.return_value = ([], [])
+
+        manager = KvCacheConnectorManager(worker, scheduler=scheduler)
+
+        req = MagicMock()
+        req.request_id = 42
+        manager.request_finished(req, [])
+
+        # Should not raise, return empty, and both ranks must reach this point.
+        result = manager.get_finished()
+        assert result == []
+
+    run_across_mpi(mpi_pool_executor, test, 2)
+
+
 def test_scheduler_output_num_scheduled_tokens_with_mtp():
     """Test that num_scheduled_tokens is correctly set for MTP (multi-token prediction)."""
     NUM_DRAFT_TOKENS = 3
