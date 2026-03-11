@@ -31,8 +31,7 @@ import yaml
 from defs.common import get_free_port_in_ci as get_free_port
 from defs.common import parse_gsm8k_output, wait_for_server
 from defs.conftest import (get_sm_version, llm_models_root, skip_arm,
-                           skip_no_hopper, skip_pre_blackwell,
-                           skip_pre_hopper)
+                           skip_no_hopper, skip_pre_blackwell)
 from defs.trt_test_alternative import check_call, check_output, print_info
 from disagg_test_utils import (ProcessWrapper, run_ctx_worker,
                                run_disagg_server, run_gen_worker, terminate,
@@ -233,6 +232,8 @@ def get_test_config(test_desc, example_dir, test_root):
         f"{test_configs_root}/disagg_config_cancel_stress_test.yaml",
         "cancel_stress_test_large":
         f"{test_configs_root}/disagg_config_cancel_stress_test_large.yaml",
+        "llama31_8b_nixl":
+        f"{test_configs_root}/disagg_config_ctxtp2_gentp2_llama31_8b_nixl.yaml",
     }
 
     if test_desc not in config_map:
@@ -2107,17 +2108,16 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@skip_pre_hopper
 @pytest.mark.parametrize("streaming", [False, True],
                          ids=["non_streaming", "streaming"])
-@pytest.mark.parametrize("deepseek_v3_model_root", ['DeepSeek-V3-Lite-fp8'],
+@pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
                          indirect=True)
 def test_disaggregated_logprobs(disaggregated_test_root,
                                 disaggregated_example_root, llm_venv,
-                                deepseek_v3_model_root, streaming):
+                                llama_model_root, streaming):
     """Test that logprobs work correctly in disaggregated serving mode.
 
-    Uses DeepSeek-V3-Lite-fp8 with TP2 (ctx) + TP2 (gen) on 4 GPUs to cover
+    Uses Llama-3.1-8B-Instruct with TP2 (ctx) + TP2 (gen) on 4 GPUs to cover
     the customer-reported bug where 'LogProbStorage' object has no attribute
     'cum_log_probs' when logprobs are requested via the OpenAI API in
     disaggregated serving mode with multi-GPU tensor parallelism.
@@ -2127,15 +2127,15 @@ def test_disaggregated_logprobs(disaggregated_test_root,
     1. The request completes without server errors
     2. The response contains logprobs for each token
     """
-    setup_model_symlink(llm_venv, deepseek_v3_model_root,
-                        "DeepSeek-V3-Lite/fp8")
+    setup_model_symlink(llm_venv, llama_model_root,
+                        "llama-3.1-model/Llama-3.1-8B-Instruct")
 
-    config_file = get_test_config("deepseek_v3_lite_fp8_nixl",
+    config_file = get_test_config("llama31_8b_nixl",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
     _, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=llm_venv._new_env,
-                             model_name=deepseek_v3_model_root,
+                             model_name=llama_model_root,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
 
@@ -2152,7 +2152,7 @@ def test_disaggregated_logprobs(disaggregated_test_root,
             async with aiohttp.ClientSession() as session:
                 for prompt in prompts:
                     payload = {
-                        "model": "DeepSeek-V3-Lite/fp8",
+                        "model": "llama-3.1-model/Llama-3.1-8B-Instruct",
                         "prompt": prompt,
                         "max_tokens": max_tokens,
                         "logprobs": 1,
