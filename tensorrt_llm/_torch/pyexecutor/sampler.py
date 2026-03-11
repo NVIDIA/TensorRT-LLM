@@ -1403,7 +1403,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_lengths_cuda: torch.Tensor,
             end_ids_cuda: torch.Tensor,
             seq_slots_host: torch.Tensor,
-            requests: list[LlmRequest],
+            all_sampling_requests: list[LlmRequest],
         ) -> None:
             """Update tensors of this store with the new request data.
 
@@ -1421,8 +1421,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
                   Shape: [len(requests)]
                 seq_slots_host: The sequence slots of the processed requests. Used for accessing host buffers.
                   Shape: [len(requests)]
-                requests: The requests to update the finish reasons handler for. Only used if a resize of the stop words
-                  related buffers is necessary
+                all_sampling_requests: If a resize of the stop words related buffers is necessary, all sampling requests
+                    need to be re-processed.
             """
 
             temp_data = self._temp_data
@@ -1436,7 +1436,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # Handle stop words only if any new ones are added
             if len(temp_data.stop_word_seq_slots) > 0:
                 self._update_stop_words_buffer(
-                    requests,
+                    all_sampling_requests,
                     temp_data.total_max_length,
                     temp_data.total_max_num_stop_words,
                     temp_data.stop_words_cuda_list,
@@ -1497,7 +1497,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
 
         def _update_stop_words_buffer(
             self,
-            requests: list[LlmRequest],
+            all_sampling_requests: list[LlmRequest],
             total_max_length: int,
             total_max_num_stop_words: int,
             stop_words_cuda_list: list[torch.Tensor],
@@ -1507,7 +1507,8 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             """Updates the stop words buffer with the new maximum values
 
             Args:
-                requests: The requests to update the stop words buffer for.
+                all_sampling_requests: If a resize of the stop words related buffers is necessary, all sampling requests
+                    need to be re-processed.
                 total_max_length: The maximum length of the stop words in this batch.
                 total_max_num_stop_words: The maximum number of stop words of a request in this batch.
                 stop_words_cuda_list: A list of device tensors containing the stop words per request with stop words.
@@ -1520,7 +1521,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             # In case of a resize all requests in the batch need to be re-processed
             if self._maybe_resize_stop_words_buffer(total_max_length, total_max_num_stop_words):
                 stop_words_cuda_list, past_tokens_cuda_list, stop_word_seq_slots = (
-                    self._reprocess_stop_words_buffer(requests)
+                    self._reprocess_stop_words_buffer(all_sampling_requests)
                 )
 
             # Host Tensor for host access of self.store.num_accepted_draft_tokens
@@ -2666,7 +2667,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             max_lengths_cuda=max_lens_tensor_cuda,
             end_ids_cuda=end_ids_tensor_cuda,
             seq_slots_host=seq_slots_tensor_host,
-            requests=new_requests + scheduled_requests.generation_requests,
+            all_sampling_requests=new_requests + scheduled_requests.generation_requests,
         )
 
         if self._use_beam_search:
