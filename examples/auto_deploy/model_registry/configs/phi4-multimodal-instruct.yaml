@@ -2,7 +2,10 @@
 # exports the prefill-only causal LM entrypoint registered via AutoModelForCausalLMFactory.
 # This is only a model-construction/runtime config override for the e2e AD run.
 model_factory: AutoModelForCausalLM
-world_size: 1
 model_kwargs:
+  # HF tries to dispatch Phi4MM to flash-attention 2 during model construction, which fails before
+  # the AD custom model can be built. Force eager attention for this text-only validation path.
   attn_implementation: eager
+  # The onboarding e2e validates only the exported text path. Keep the multimodal embedding wrapper
+  # disabled here so image/audio tower hooks do not participate in text-only AD export.
   embd_layer: null
