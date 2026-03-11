@@ -288,7 +288,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: Skywork/Skywork-SWE-32B
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
-# --- Seed (2025) ---
+# --- Seed-Coder (2025) ---
+- name: ByteDance-Seed/Seed-Coder-8B-Base
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ByteDance-Seed/Seed-Coder-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ByteDance-Seed/Seed-OSS-36B-Instruct
