@@ -154,7 +154,7 @@ def _run_pattern_detection_job(num_experts: int, rank: int, world_size: int) -> 
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = optimizer.shared_config.sharding_transform_container.ep_transforms
+    detected_transformations = gm._sharding_transform_container.ep_transforms
 
     # Run pattern detection test
     run_sharding_pattern_detection_test(detected_transformations, expected_transformations)
@@ -232,7 +232,7 @@ def test_llama4_stacked_moe_pattern_detection():
     _ = optimizer(None, gm)
 
     # Verify torch_moe with stacked format is detected for EP sharding
-    detected = optimizer.shared_config.sharding_transform_container.ep_transforms
+    detected = gm._sharding_transform_container.ep_transforms
     assert len(detected) == 1, f"Expected 1 EP transform, got {len(detected)}"
     assert detected[0].target_node == moe_node.name
 
