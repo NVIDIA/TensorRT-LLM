@@ -467,7 +467,7 @@ def test_connector_priorities(enforce_single_worker, model_with_connector):
     # - First 32 tokens (block 0): high priority (e.g., system prompt)
     # - Remaining tokens (block 1+): low priority (e.g., user input)
     retention_config = KvCacheRetentionConfig(
-        token_range_retention_priorities=[
+        token_range_retention_configs=[
             KvCacheRetentionConfig.TokenRangeRetentionConfig(
                 token_start=0,
                 token_end=32,
