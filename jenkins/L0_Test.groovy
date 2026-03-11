@@ -2554,9 +2554,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
     stage ("[${stageName}] Run Pytest")
     {
-        def noRegularTests = false
-        def noIsolateTests = false
-        def rerunFailed = false
         def testDBList = renderTestDB(testList, llmSrc, stageName)
 
         // Download and Merge waives.txt
@@ -2569,7 +2566,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
 
         // Process shard test list and create separate files for regular and isolate tests
         def processScriptPath = "${llmSrc}/jenkins/scripts/process_test_list.py"
-        // default paths (fallback)
         def regularTestList = testDBList.replaceAll('\\.txt$', '_regular.txt')
         def isolateTestList = testDBList.replaceAll('\\.txt$', '_isolate.txt')
         def regularCount = 0
@@ -2593,19 +2589,6 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                   "Please check if the test list '${testDBList}' is valid and try again."
         }
 
-        // Test Coverage
-        def TRTLLM_WHL_PATH = sh(returnStdout: true, script: "pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2").replaceAll("\\s","")
-        sh "echo ${TRTLLM_WHL_PATH}"
-        def coverageConfigFile = "${llmSrc}/${stageName}/.coveragerc"
-        sh "mkdir -p ${llmSrc}/${stageName} && touch ${coverageConfigFile}"
-        sh """
-            echo '[run]' > ${coverageConfigFile}
-            echo 'branch = True' >> ${coverageConfigFile}
-            echo 'data_file = ${WORKSPACE}/${stageName}/.coverage.${stageName}' >> ${coverageConfigFile}
-            echo '[paths]' >> ${coverageConfigFile}
-            echo 'source =\n    ${llmSrc}/tensorrt_llm/\n    ${TRTLLM_WHL_PATH}/tensorrt_llm/' >> ${coverageConfigFile}
-            cat ${coverageConfigFile}
-        """
         echoNodeAndGpuInfo(pipeline, stageName)
 
         // Allocate a unique port section for this container to avoid port conflicts
@@ -2613,28 +2596,7 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
         def containerPortStart = getStartingPortForHost(hostNodeName, stageName)
         def containerPortNum = GlobalState.PORT_SECTION_SIZE
 
-        // Some clusters do not allow dmesg -C so we add || true
-        // Temporarily disable to reduce the log size
-        // sh 'if [ "$(id -u)" -eq 0 ]; then dmesg -C || true; fi'
-        def pytestCommand = getPytestBaseCommandLine(
-            llmSrc,
-            stageName,
-            "${llmSrc}/tests/integration/test_lists/waives.txt",
-            perfMode,
-            "${WORKSPACE}/${stageName}",
-            TRTLLM_WHL_PATH,
-            coverageConfigFile,
-            "",  // pytestUtil
-            [],  // extraArgs
-            containerPortStart,
-            containerPortNum
-        )
-
-        // Only add --test-list if there are regular tests to run
-        if (regularCount > 0) {
-            pytestCommand += ["--test-list=${regularTestList}"]
-        }
-
+        def failSignaturesList = trtllm_utils.getFailSignaturesList().join(",")
         def containerPIP_LLM_LIB_PATH = sh(script: "pip3 show tensorrt_llm | grep \"Location\" | awk -F\":\" '{ gsub(/ /, \"\", \$2); print \$2\"/tensorrt_llm/libs\"}'", returnStdout: true).replaceAll("\\s","")
         def containerLD_LIBRARY_PATH = sh(script: "echo \${LD_LIBRARY_PATH}", returnStdout: true).replaceAll("\\s","")
         if (!containerLD_LIBRARY_PATH.contains("${containerPIP_LLM_LIB_PATH}:")) {
@@ -2653,62 +2615,28 @@ def runLLMTestlistOnPlatformImpl(pipeline, platform, testList, config=VANILLA_CO
                 string(credentialsId: 'llm_evaltool_repo_url', variable: 'EVALTOOL_REPO_URL')
             ]) {
                 sh "env | sort"
-                try {
-                    if (regularCount > 0) {
-                        sh """
-                            rm -rf ${stageName}/ && \
-                            cd ${llmSrc}/tests/integration/defs && \
-                            ${pytestCommand.join(" ")}
-                        """
-                    } else {
-                        echo "No regular tests to run for stage ${stageName}"
-                        noRegularTests = true
-                        sh "mkdir -p ${stageName}"
-                        // Create an empty results.xml file for consistency
-                        sh """
-                            echo '<?xml version="1.0" encoding="UTF-8"?>' > ${stageName}/results.xml
-                            echo '<testsuites>' >> ${stageName}/results.xml
-                            echo '<testsuite name="${stageName}" errors="0" failures="0" skipped="0" tests="0" time="0.0">' >> ${stageName}/results.xml
-                            echo '</testsuite>' >> ${stageName}/results.xml
-                            echo '</testsuites>' >> ${stageName}/results.xml
-                        """
-                    }
-                } catch (InterruptedException e) {
-                    throw e
-                } catch (Exception e) {
-                    def isRerunFailed = rerunFailedTests(stageName, llmSrc, pytestCommand, "results.xml", "regular")
-                    if (isRerunFailed) {
-                        catchError(buildResult: 'SUCCESS', stageResult: 'FAILURE') {
-                            error "Regular tests failed after rerun attempt"
-                        }
-                        rerunFailed = true
-                    }
-                }
-
-                // Run the isolated tests if exists
-                if (isolateCount > 0) {
-                    stage ("[${stageName}] Run Pytest (Isolated)") {
-                        echo "There are ${isolateCount} isolated tests to run"
-                        rerunFailed = runIsolatedTests(isolateTestList, pytestCommand, llmSrc, stageName) || rerunFailed
-                    }
-                } else {
-                    echo "No isolated tests to run for stage ${stageName}"
-                    noIsolateTests = true
-                }
-
-                if (noRegularTests && noIsolateTests) {
-                    error "No tests were executed for stage ${stageName}, please check the test list and test-db rendering result."
-                }
+                def runIntegrationScript = "${llmSrc}/jenkins/scripts/run_integration_tests.py"
+                def perfModeFlag = perfMode ? '--perf-mode' : ''
+                def detailedLogFlag = testFilter[(DETAILED_LOG)] ? '--detailed-log' : ''
+                def runRayFlag = stageName.contains("-Ray-") ? '--run-ray' : ''
+                sh """
+                    python3 '${runIntegrationScript}' \
+                      --llm-src '${llmSrc}' \
+                      --stage-name '${stageName}' \
+                      --output-dir '${WORKSPACE}/${stageName}' \
+                      --waives-file '${llmSrc}/tests/integration/test_lists/waives.txt' \
+                      --regular-test-list '${regularTestList}' \
+                      --isolate-test-list '${isolateTestList}' \
+                      --fail-signatures '${failSignaturesList}' \
+                      ${perfModeFlag} \
+                      ${detailedLogFlag} \
+                      ${runRayFlag} \
+                      --tester-cores ${TESTER_CORES} \
+                      --container-port-start ${containerPortStart} \
+                      --container-port-num ${containerPortNum} \
+                      --model-cache-dir '${MODEL_CACHE_DIR}'
+                """
             }
-        }
-
-        // Generate comprehensive rerun report if any reruns occurred
-        stage ("Generate Report") {
-            generateRerunReport(stageName, llmSrc)
-        }
-
-        if (rerunFailed) {
-            error "Some tests still failed after rerun attempts, please check the test report."
         }
 
         if (perfMode) {
