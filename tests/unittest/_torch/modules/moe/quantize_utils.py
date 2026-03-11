@@ -577,7 +577,7 @@ class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
     expected_quant_algo = QuantAlgo.NVFP4
 
-    def __init__(self, *args, swiglu_gptoss_style: Optional[bool] = False, **kwargs):
+    def __init__(self, *args, swiglu_gptoss_style: bool = False, **kwargs):
         super().__init__(*args, **kwargs)
         self.swiglu_gptoss_style = swiglu_gptoss_style
 
