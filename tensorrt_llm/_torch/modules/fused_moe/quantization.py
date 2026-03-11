@@ -1900,7 +1900,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
             [torch.stack(all_w3_scales),
              torch.stack(all_w1_scales)], dim=-2)
 
-        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16).view(module.dtype)
+        w3_w1_scales = all_w3_w1_scales.to(torch.bfloat16)
         w3_w1_s_shape = w3_w1_scales.shape
         w3_w1_scales_interleaved = w3_w1_scales.reshape(
             w3_w1_s_shape[0], w3_w1_s_shape[1],
@@ -1928,8 +1928,7 @@ class WFP4A16FusedMoEMethod(FusedMoEMethodBase):
                 w2_scales_shard, (0, pad_size_inter, 0, pad_size_hidden))
             all_w2_scales.append(w2_scales_shard)
 
-        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16).view(
-            module.dtype)
+        w2_scales = torch.stack(all_w2_scales).to(torch.bfloat16)
         w2_s_shape = w2_scales.shape
         w2_scales_interleaved = w2_scales.reshape(
             w2_s_shape[0], w2_s_shape[1],
@@ -2205,6 +2204,9 @@ class NVFP4FusedMoEMethod(FusedMoEMethodBase):
 
         # Load pre_quant_scale if it exists (for NVFP4_AWQ)
         if has_pre_quant_scale:
+            assert module.is_gated_activation, (
+                "pre_quant_scale (NVFP4_AWQ) is not supported with non-gated activations"
+            )
             from ..linear import TensorParallelMode, load_weight_shard
 
             device = module.fc31_act_scale.device
@@ -2826,10 +2828,11 @@ class NVFP4TRTLLMGenFusedMoEBaseMethod(NVFP4FusedMoEMethod):
         # last step: load fc31_scale_c
         # c_global_sf: fc2_input_scale
         # For gated activations (SwiGlu), scale_c_fc1 includes both input and weight scales
-        # For non-gated activations (Relu2), scale_c_fc1 is just the input scale
+        # For non-gated activations (Relu2 or Silu), scale_c_fc1 is just the input scale
         from ...utils import ActivationType
-        if hasattr(module, 'activation_type'
-                   ) and module.activation_type == ActivationType.Relu2:
+        if hasattr(module, 'activation_type') and module.activation_type in [
+                ActivationType.Relu2, ActivationType.Silu
+        ]:
             # For Relu2: scale_c_fc1 = fc2_input_scale (broadcast to all experts)
             module.fc31_scale_c.data.copy_(module.fc2_input_scale.data.expand(
                 module.expert_size_per_partition),
@@ -3105,21 +3108,23 @@ class NVFP4TRTLLMGenFusedMoEMethod(NVFP4TRTLLMGenFusedMoEBaseMethod):
             w1_weight_scale,
             self.input_hidden_alignment // module.scaling_vector_size,
             alignment)
-        w3_weight_scale = maybe_pad_for_mxfp4(
-            w3_weight_scale,
-            self.input_hidden_alignment // module.scaling_vector_size,
-            alignment)
+        if module.is_gated_activation:
+            w3_weight_scale = maybe_pad_for_mxfp4(
+                w3_weight_scale,
+                self.input_hidden_alignment // module.scaling_vector_size,
+                alignment)
 
         w1_weight_scale = load_weight_shard(w1_weight_scale,
                                             module.tp_size,
                                             module.tp_rank,
                                             TensorParallelMode.COLUMN,
                                             device=device)
-        w3_weight_scale = load_weight_shard(w3_weight_scale,
-                                            module.tp_size,
-                                            module.tp_rank,
-                                            TensorParallelMode.COLUMN,
-                                            device=device)
+        if module.is_gated_activation:
+            w3_weight_scale = load_weight_shard(w3_weight_scale,
+                                                module.tp_size,
+                                                module.tp_rank,
+                                                TensorParallelMode.COLUMN,
+                                                device=device)
 
         # Check if w3 is empty (for non-gated activations like ReLU2 in Nemotron H)
         w3_size = w3_weight_scale.shape[0] if w3_weight_scale.numel() > 0 else 0

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -20,8 +20,8 @@ import os
 
 import pytest
 import torch
+from defs import conftest
 from defs.common import venv_check_call
-from defs.conftest import llm_models_root
 from defs.trt_test_alternative import check_call
 
 WAN_T2V_MODEL_SUBPATH = "Wan2.1-T2V-1.3B-Diffusers"
@@ -163,7 +163,7 @@ def _generate_wan_video(llm_venv, llm_root, model_subpath, output_subdir):
     Returns the path to the generated .mp4, or calls pytest.skip if the model
     is not found under LLM_MODELS_ROOT.
     """
-    scratch_space = llm_models_root()
+    scratch_space = conftest.llm_models_root()
     model_path = os.path.join(scratch_space, model_subpath)
     if not os.path.isdir(model_path):
         pytest.skip(
@@ -373,3 +373,25 @@ def test_vbench_dimension_score_wan22_a14b_nvfp4(
         golden_scores=VBENCH_WAN22_A14B_NVFP4_GOLDEN_SCORES,
         max_score_diff=0.05,
     )
+
+
+def test_visual_gen_quickstart(_visual_gen_deps, llm_root, llm_venv):
+    """Run examples/visual_gen/quickstart_example.py end-to-end."""
+    scratch_space = conftest.llm_models_root()
+    model_src = os.path.join(scratch_space, WAN_T2V_MODEL_SUBPATH)
+    if not os.path.isdir(model_src):
+        pytest.skip(
+            f"Model not found: {model_src} "
+            f"(set LLM_MODELS_ROOT or place {WAN_T2V_MODEL_SUBPATH} under scratch)"
+        )
+
+    model_dst = os.path.join(llm_venv.get_working_directory(), "Wan-AI", WAN_T2V_MODEL_SUBPATH)
+    if not os.path.islink(model_dst):
+        os.makedirs(os.path.dirname(model_dst), exist_ok=True)
+        os.symlink(model_src, model_dst, target_is_directory=True)
+
+    script_path = os.path.join(llm_root, "examples", "visual_gen", "quickstart_example.py")
+    venv_check_call(llm_venv, [script_path])
+
+    output_path = os.path.join(llm_venv.get_working_directory(), "output.avi")
+    assert os.path.isfile(output_path), f"Quickstart did not produce output.avi at {output_path}"

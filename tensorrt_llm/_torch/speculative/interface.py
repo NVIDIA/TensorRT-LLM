@@ -63,7 +63,9 @@ class SpeculativeDecodingMode(IntEnum):
     EAGLE3 = auto()
     EAGLE3_ONE_MODEL = auto()
     NGRAM = auto()
+    SA = auto()
     DRAFT_TARGET = auto()
+    DRAFT_TARGET_ONE_MODEL = auto()
     USER_PROVIDED = auto()
     SAVE_HIDDEN_STATES = auto()
     PARD = auto()
@@ -87,7 +89,7 @@ class SpeculativeDecodingMode(IntEnum):
 
     def use_one_engine(self):
         return self.is_eagle3_one_model() or self.is_mtp_one_model(
-        ) or self.is_pard()
+        ) or self.is_external_drafter() or self.is_sa()
 
     def is_eagle3_one_model(self):
         return self == SpeculativeDecodingMode.EAGLE3_ONE_MODEL
@@ -98,6 +100,9 @@ class SpeculativeDecodingMode(IntEnum):
     def is_ngram(self):
         return self == SpeculativeDecodingMode.NGRAM
 
+    def is_sa(self):
+        return self == SpeculativeDecodingMode.SA
+
     def is_user_provided(self):
         return self == SpeculativeDecodingMode.USER_PROVIDED
 
@@ -107,27 +112,34 @@ class SpeculativeDecodingMode(IntEnum):
     def is_draft_target(self):
         return self == SpeculativeDecodingMode.DRAFT_TARGET
 
+    def is_draft_target_one_model(self):
+        return self == SpeculativeDecodingMode.DRAFT_TARGET_ONE_MODEL
+
     def is_save_hidden_states(self):
         return self == SpeculativeDecodingMode.SAVE_HIDDEN_STATES
 
+    def is_external_drafter(self):
+        return self.is_pard() or self.is_draft_target_one_model()
+
     def without_logits(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_pard()
+        ) or self.is_external_drafter() or self.is_sa()
 
     def needs_kv_cache_rewind(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_ngram() or self.is_pard()
+        ) or self.is_ngram() or self.is_sa() or self.is_external_drafter()
 
     def support_overlap_scheduler(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.has_draft_model() or self.is_pard()
+        ) or self.is_sa() or self.has_draft_model() or self.is_external_drafter(
+        )
 
     def support_guided_decoder(self):
         return self.is_none() or self.has_spec_drafter()
 
     def support_capturable_guided_decoder(self):
         return self.is_mtp_one_model() or self.is_eagle3_one_model(
-        ) or self.is_pard()
+        ) or self.is_external_drafter() or self.is_sa()
 
     def has_draft_model(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_mtp_eagle()
@@ -145,11 +157,12 @@ class SpeculativeDecodingMode(IntEnum):
         Whether the draft model and target model are in the same model engine,
         and the draft model needs to load weights from the separate checkpoint.
         """
-        return self.is_eagle3_one_model() or self.is_pard()
+        return self.is_eagle3_one_model() or self.is_external_drafter()
 
     def has_spec_decoder(self):
         return self.is_mtp_one_model() or self.is_mtp_eagle() or self.is_eagle3(
-        ) or self.is_eagle3_one_model() or self.is_pard()
+        ) or self.is_eagle3_one_model() or self.is_external_drafter(
+        ) or self.is_sa()
 
     def has_spec_drafter(self):
         return self.is_eagle3() or self.is_draft_target() or self.is_ngram(
@@ -699,6 +712,7 @@ class SpecWorkerBase(nn.Module, ABC):
             top_ps = spec_metadata.top_ps[:num_tokens]
 
             if self.use_flashinfer:
+                top_ks = top_ks.clamp(min=1, max=logits.shape[-1] - 1)
                 # Lazily initialize seed/offset tensors on correct device
                 if self.seed is None:
                     self.seed = torch.tensor([0],

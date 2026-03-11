@@ -4,19 +4,25 @@ import os
 
 # GPU resource configuration - centralized config for all GPU-specific parameters
 GPU_RESOURCE_CONFIG = {
-    "GB200": {  # OCI GB200
+    "GB200-OCI": {  # OCI GB200
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": True,
         "lock_freq_graphics_mhz": 2062,
         "lock_freq_memory_mhz": 3996,
     },
-    "GB200_LYRIS": {  # Lyris GB200
+    "GB200-LYRIS": {  # Lyris GB200
         "slurm_extra_args": "",
         "set_segment": True,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    "GB300": {  # Lyris GB300
+    "GB300-LYRIS": {  # Lyris GB300
+        "slurm_extra_args": "",
+        "set_segment": True,
+        "lock_freq_graphics_mhz": None,
+        "lock_freq_memory_mhz": None,
+    },
+    "GB300": {  # GB300 on dlcluster
         "slurm_extra_args": "",
         "set_segment": True,
         "lock_freq_graphics_mhz": None,
@@ -28,13 +34,13 @@ GPU_RESOURCE_CONFIG = {
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    "B200": {  # OCI B200
+    "B200": {  # B200 on computelab
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
         "lock_freq_memory_mhz": None,
     },
-    "B300": {  # OCI B300
+    "B300": {  # B300 on computelab
         "slurm_extra_args": "--gres=gpu:4",
         "set_segment": False,
         "lock_freq_graphics_mhz": None,
@@ -48,7 +54,7 @@ class EnvManager:
 
     @staticmethod
     def get_gpu_type() -> str:
-        return os.getenv("GPU_TYPE", "GB200")
+        return os.getenv("GPU_TYPE", "GB200-OCI")
 
     @staticmethod
     def get_slurm_partition() -> str:

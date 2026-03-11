@@ -1030,6 +1030,7 @@ common-files: &common_files |
         tests/unittest/_torch/speculative/test_kv_cache_reuse.py |
         tests/unittest/_torch/speculative/test_mtp.py |
         tests/unittest/_torch/speculative/test_ngram.py |
+        tests/unittest/_torch/speculative/test_sa.py |
         tests/unittest/_torch/speculative/test_save_state.py |
         tests/unittest/_torch/speculative/test_spec_gate.py |
         tests/unittest/_torch/speculative/test_torch_rejection_sampling.py |
@@ -1458,6 +1459,14 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: model-registry-check
+        name: Validate AutoDeploy model registry
+        entry: python scripts/check_model_registry.py
+        language: python
+        additional_dependencies:
+        - PyYAML
+        files: ^examples/auto_deploy/model_registry/models\.yaml$
+        pass_filenames: false
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py

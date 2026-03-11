@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
 """WAN Text-to-Video generation using TensorRT-LLM Visual Generation."""
 
 import argparse
 import time
 
-from output_handler import OutputHandler
-
-from tensorrt_llm import logger
-from tensorrt_llm.llmapi.visual_gen import VisualGen, VisualGenParams
+from tensorrt_llm import VisualGen, VisualGenArgs, VisualGenParams, logger
+from tensorrt_llm.serve.media_storage import MediaStorage
 
 logger.set_level("info")
 
@@ -84,6 +85,12 @@ def parse_args():
         default=0.2,
         help="TeaCache similarity threshold (rel_l1_thresh)",
     )
+    parser.add_argument(
+        "--use_ret_steps",
+        action="store_true",
+        help="Use ret_steps mode for TeaCache. "
+        "Using Retention Steps will result in faster generation speed and better generation quality.",
+    )
 
     # Quantization
     parser.add_argument(
@@ -127,6 +134,7 @@ def parse_args():
         "Example: ulysses_size=2 on 4 GPUs with cfg_size=2 -> "
         "2 CFG groups × 2 Ulysses ranks = 4 GPUs total.",
     )
+    parser.add_argument("--disable_parallel_vae", action="store_true", help="Disable parallel VAE")
 
     # CUDA graph
     parser.add_argument(
@@ -136,13 +144,6 @@ def parse_args():
     # torch.compile
     parser.add_argument(
         "--disable_torch_compile", action="store_true", help="Disable TorchCompile acceleration"
-    )
-    parser.add_argument(
-        "--torch_compile_models",
-        type=str,
-        nargs="+",
-        default=[],
-        help="Components to torch.compile (empty = auto detect transformer components)",
     )
     parser.add_argument(
         "--enable_fullgraph", action="store_true", help="Enable fullgraph for TorchCompile"
@@ -161,10 +162,18 @@ def parse_args():
     return parser.parse_args()
 
 
+def _linear_type_to_quant_config(linear_type: str):
+    """Map --linear_type CLI shortcut to quant_config dict for VisualGenArgs."""
+    mapping = {
+        "trtllm-fp8-per-tensor": {"quant_algo": "FP8", "dynamic": True},
+        "trtllm-fp8-blockwise": {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True},
+        "trtllm-nvfp4": {"quant_algo": "NVFP4", "dynamic": True},
+    }
+    return mapping.get(linear_type)
+
+
 def main():
     args = parse_args()
-
-    n_workers = args.cfg_size * args.ulysses_size
 
     if args.ulysses_size > 1:
         num_heads = 12
@@ -174,54 +183,41 @@ def main():
             f"{num_heads // args.ulysses_size} heads per GPU"
         )
 
-    # Convert linear_type to quant_config
-    quant_config = None
-    if args.linear_type == "trtllm-fp8-per-tensor":
-        quant_config = {"quant_algo": "FP8", "dynamic": True}
-    elif args.linear_type == "trtllm-fp8-blockwise":
-        quant_config = {"quant_algo": "FP8_BLOCK_SCALES", "dynamic": True}
-    elif args.linear_type == "trtllm-nvfp4":
-        quant_config = {"quant_algo": "NVFP4", "dynamic": True}
-
-    diffusion_config = {
-        "model_type": "wan2",
-        "revision": args.revision,
-        "attention": {
-            "backend": args.attention_backend,
-        },
-        "teacache": {
+    kwargs = dict(
+        revision=args.revision,
+        attention={"backend": args.attention_backend},
+        teacache={
             "enable_teacache": args.enable_teacache,
             "teacache_thresh": args.teacache_thresh,
+            "use_ret_steps": args.use_ret_steps,
         },
-        "parallel": {
+        parallel={
             "dit_cfg_size": args.cfg_size,
             "dit_ulysses_size": args.ulysses_size,
+            "enable_parallel_vae": not args.disable_parallel_vae,
         },
-        "torch_compile": {
+        torch_compile={
             "enable_torch_compile": not args.disable_torch_compile,
-            "torch_compile_models": args.torch_compile_models,
             "enable_fullgraph": args.enable_fullgraph,
             "enable_autotune": not args.disable_autotune,
         },
-        "cuda_graph": {
-            "enable_cuda_graph": args.enable_cudagraph,
-        },
-        "pipeline": {
-            "enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker,
-        },
-    }
-
+        cuda_graph={"enable_cuda_graph": args.enable_cudagraph},
+        pipeline={"enable_layerwise_nvtx_marker": args.enable_layerwise_nvtx_marker},
+    )
+    quant_config = _linear_type_to_quant_config(args.linear_type)
     if quant_config is not None:
-        diffusion_config["quant_config"] = quant_config
+        kwargs["quant_config"] = quant_config
+
+    diffusion_args = VisualGenArgs(**kwargs)
 
     logger.info(
-        f"Initializing VisualGen: world_size={n_workers} "
-        f"(cfg_size={args.cfg_size}, ulysses_size={args.ulysses_size})"
+        f"Initializing VisualGen: "
+        f"cfg_size={diffusion_args.parallel.dit_cfg_size}, "
+        f"ulysses_size={diffusion_args.parallel.dit_ulysses_size}"
     )
     visual_gen = VisualGen(
         model_path=args.model_path,
-        n_workers=n_workers,
-        diffusion_config=diffusion_config,
+        diffusion_args=diffusion_args,
     )
 
     try:
@@ -252,7 +248,7 @@ def main():
 
         logger.info(f"Generation completed in {time.time() - start_time:.2f}s")
 
-        OutputHandler.save(output, args.output_path, frame_rate=16.0)
+        MediaStorage.save_video(output.video, args.output_path, audio=output.audio, frame_rate=16.0)
 
     finally:
         visual_gen.shutdown()
