@@ -16,3 +16,5 @@ l0_verl:
       orchestrator: mpi
   tests:
   - verl/test_verl_cases.py::test_async_server
+  - verl/test_verl_cases.py::test_adapter
+  - verl/test_verl_cases.py::test_rollout_utils

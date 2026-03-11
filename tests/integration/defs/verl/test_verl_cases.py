@@ -39,7 +39,6 @@ def _export_env_vars(config):
     """Export env vars from config into the current process environment."""
     for entry in config.get("env_vars", []):
         key, val = entry.split("=", 1)
-        # Resolve shell-style variable references against current env
         val = val.strip('"')
         val = os.path.expandvars(val)
         os.environ[key] = val
@@ -71,25 +70,31 @@ def _clone_verl_repo(config):
     )
 
 
-def _download_models(config):
-    """Download required HF models to TRTLLM_TEST_MODEL_PATH_ROOT."""
+def _setup_model_symlinks(config):
+    """Create symlinks from HF-style paths to CI cache paths.
+
+    Verl tests expect models at {root}/Qwen/ModelName but the CI cache
+    stores them at {root}/ModelName (flat structure).
+    """
     model_root = os.environ.get("TRTLLM_TEST_MODEL_PATH_ROOT", "")
     if not model_root:
         return
     for model_id in config.get("required_models", []):
-        local_dir = os.path.join(model_root, model_id)
-        if os.path.isdir(local_dir):
-            print(f"[verl setup] Model {model_id} already at {local_dir}")
+        if "/" not in model_id:
             continue
-        print(f"[verl setup] Downloading {model_id} to {local_dir}")
-        subprocess.check_call(
-            [
-                sys.executable,
-                "-c",
-                f"from huggingface_hub import snapshot_download; "
-                f"snapshot_download('{model_id}', local_dir='{local_dir}')",
-            ],
-        )
+        namespace, name = model_id.split("/", 1)
+        ns_dir = os.path.join(model_root, namespace)
+        src = os.path.join(model_root, name)
+        dst = os.path.join(ns_dir, name)
+        if os.path.exists(dst):
+            print(f"[verl setup] Model symlink already exists: {dst}")
+            continue
+        if not os.path.isdir(src):
+            print(f"[verl setup] Model not found in CI cache: {src}, skipping")
+            continue
+        os.makedirs(ns_dir, exist_ok=True)
+        os.symlink(src, dst)
+        print(f"[verl setup] Created symlink: {dst} -> {src}")
 
 
 @pytest.fixture(scope="session", autouse=True)
@@ -99,16 +104,19 @@ def verl_setup():
     _export_env_vars(config)
     _run_install_commands(config)
     _clone_verl_repo(config)
-    _download_models(config)
+    _setup_model_symlinks(config)
     yield VERL_ROOT
 
 
-def _run_verl_test(test_path, timeout=600):
+def _run_verl_test(test_path, extra_args=None, timeout=600):
     """Run a test from the verl repo via subprocess."""
     full_path = os.path.join(VERL_ROOT, test_path)
     assert os.path.exists(full_path), f"Verl test not found: {full_path}"
+    cmd = [sys.executable, "-m", "pytest", full_path, "-v", "--tb=short"]
+    if extra_args:
+        cmd.extend(extra_args)
     result = subprocess.run(
-        [sys.executable, "-m", "pytest", full_path, "-v", "--tb=short"],
+        cmd,
         cwd=VERL_ROOT,
         env=os.environ.copy(),
         timeout=timeout,
@@ -118,3 +126,18 @@ def _run_verl_test(test_path, timeout=600):
 
 def test_async_server():
     _run_verl_test("tests/workers/rollout/rollout_trtllm/test_async_server.py")
+
+
+def test_adapter():
+    _run_verl_test("tests/workers/rollout/rollout_trtllm/test_adapter.py")
+
+
+def test_rollout_utils():
+    _run_verl_test(
+        "tests/workers/rollout/rollout_trtllm/test_trtllm_rollout_utils.py",
+        extra_args=[
+            "-k",
+            "not (test_unimodal_generate or test_unimodal_batch_generate)",
+        ],
+        timeout=900,
+    )
