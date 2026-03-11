@@ -32,8 +32,13 @@ METRIC_PREFIX = "trtllm_"
 METRICS_URL = "http://localhost:8000/prometheus/metrics"
 
 
-def fetch_metrics() -> dict | None:
-    """Fetch metrics from the Prometheus endpoint."""
+def fetch_metrics() -> str | None:
+    """Fetch raw Prometheus exposition text from the metrics endpoint.
+
+    Returns:
+        The decoded response body as a string, or None if the request
+        failed or returned a non-200 status.
+    """
     try:
         response = urlopen(METRICS_URL)
         if response.status == 200:
@@ -46,8 +51,16 @@ def fetch_metrics() -> dict | None:
         return None
 
 
-def parse_and_display_metrics(metrics_data: dict) -> None:
-    """Parse and display relevant TensorRT-LLM metrics."""
+def parse_and_display_metrics(metrics_data: str) -> None:
+    """Parse Prometheus exposition text and print TensorRT-LLM metrics.
+
+    Searches the raw text for a predefined set of metrics (request counts,
+    latency histograms, KV cache stats). Found metrics are printed with
+    their sample lines; missing metrics are listed separately.
+
+    Args:
+        metrics_data: Raw Prometheus exposition text returned by fetch_metrics().
+    """
     if not metrics_data:
         return
 
@@ -62,6 +75,8 @@ def parse_and_display_metrics(metrics_data: dict) -> None:
         f"{METRIC_PREFIX}time_to_first_token_seconds": "Time to first token",
         f"{METRIC_PREFIX}request_queue_time_seconds": "Request queue time",
         f"{METRIC_PREFIX}kv_cache_hit_rate": "KV cache hit rate",
+        f"{METRIC_PREFIX}kv_cache_reused_blocks_total": "KV cache reused blocks (cumulative)",
+        f"{METRIC_PREFIX}kv_cache_missed_blocks_total": "KV cache missed blocks (cumulative)",
         f"{METRIC_PREFIX}kv_cache_utilization": "KV cache utilization",
     }
 
@@ -100,10 +115,16 @@ def parse_and_display_metrics(metrics_data: dict) -> None:
 
 
 def main():
+    """Send completion requests to a running TensorRT-LLM server and display Prometheus metrics.
+
+    Sends 10 completion requests sequentially, fetching and printing
+    the Prometheus metrics after each response to show how counters, histograms,
+    and gauges evolve over time.
+    """
     print("Prometheus Metrics Example")
     print("=" * 80)
     print("This script will:")
-    print("1. Send several completion requests to a running TensorRT-LLM server")
+    print("1. Send 10 completion requests to a running TensorRT-LLM server")
     print(
         "2. After each response, fetch and display Prometheus metrics from the /prometheus/metrics endpoint"
     )
@@ -111,8 +132,8 @@ def main():
 
     # Make several completion requests to generate metrics
     print("Sending completion requests...")
-    num_requests = 10
-    for i in range(num_requests):
+    NUM_REQUESTS = 10
+    for i in range(NUM_REQUESTS):
         try:
             response = client.completions.create(
                 model="Server",
@@ -124,7 +145,7 @@ def main():
                 stream=False,
             )
             print(
-                f"  Request {i + 1}/{num_requests} completed. Response: {response.choices[0].text[:50]}..."
+                f"  Request {i + 1}/{NUM_REQUESTS} completed. Response: {response.choices[0].text[:50]}..."
             )
 
             # Fetch and display metrics after each response
