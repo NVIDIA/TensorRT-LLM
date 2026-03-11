@@ -275,9 +275,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # --- Granite 4.0 (2025) - hybrid Mamba/Transformer ---
 - name: ibm-granite/granite-4.0-micro
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['granite_4.0_micro.yaml']
 - name: ibm-granite/granite-4.0-h-small
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+  yaml_extra: ['granite_4.0_h_small.yaml']
 # --- AI21 Jamba (2025) - hybrid SSM-Transformer ---
 - name: ai21labs/AI21-Jamba-Large-1.7
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
@@ -439,9 +439,9 @@ models:
 # --- Qwen3-VL 2B (2025) ---
 - name: Qwen/Qwen3-VL-2B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
-# --- Granite 4.0 tiny (2025) ---
+# --- Granite 4.0 tiny (2025) - hybrid Mamba/Transformer + MoE ---
 - name: ibm-granite/granite-4.0-tiny-preview
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['granite_4.0_tiny_preview.yaml']
 # --- OLMo 3 Think 7B (2025) ---
 - name: allenai/Olmo-3-7B-Think
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']

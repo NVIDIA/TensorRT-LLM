@@ -1,0 +1,12 @@
+# Configuration for granite-4.0-tiny-preview (GraniteMoeHybrid with Mamba+MoE)
+# Uses flashinfer attention backend (trtllm backend produces garbled output with muP scaling)
+# dtype is missing from config for this model, so we provide it explicitly.
+runtime: trtllm
+attn_backend: flashinfer
+compile_backend: torch-cudagraph
+model_factory: AutoModelForCausalLM
+skip_loading_weights: false
+max_seq_len: 512
+world_size: 1
+model_kwargs:
+  torch_dtype: bfloat16
