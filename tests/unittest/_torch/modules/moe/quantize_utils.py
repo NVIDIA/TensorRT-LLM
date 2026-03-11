@@ -31,6 +31,8 @@ from tensorrt_llm._torch.model_config import ModelConfig
 from tensorrt_llm._torch.modules.fused_moe import BaseMoeRoutingMethod
 from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
+from tensorrt_llm._torch.modules.mlp import MLP
+from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -177,9 +179,9 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
     return quantize_util_cls, quant_config, quant_kwargs
 
 
-class RefGatedMLPFusedMoE(nn.Module):
+class RefMLPFusedMoE(nn.Module):
     """
-    RefGatedMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
+    RefMLPFusedMoE serves as a reference implementation with Gated MLPs designed for correctness testing.
     It utilizes derived classes to provide extensible support for various quantization algorithms.
 
     Subclasses can override `scale_keys` to specify which scale fields to load:
@@ -203,6 +205,7 @@ class RefGatedMLPFusedMoE(nn.Module):
         model_config: Optional[ModelConfig] = None,
         bias=False,
         use_cute_dsl_blockscaling_mm=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
@@ -217,39 +220,62 @@ class RefGatedMLPFusedMoE(nn.Module):
         if model_config is None:
             model_config = ModelConfig()
         self.quant_config = model_config.quant_config
+        self.activation_type = activation_type
+        self._is_gated = is_gated_activation(activation_type)
 
         skip_if_insufficient_gpu_memory(
             num_experts, hidden_size, intermediate_size, dtype or torch.float32
         )
 
-        # Custom swiglu activation for swiglu_gptoss_style
-        def custom_swiglu(x):
-            gate, value = x.chunk(2, dim=-1)
-            if swiglu_limit is not None and swiglu_limit != float("inf"):
-                gate = gate.clamp(max=swiglu_limit)
-                value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
+        if self._is_gated:
+            # Custom swiglu activation for swiglu_gptoss_style
+            def custom_swiglu(x):
+                gate, value = x.chunk(2, dim=-1)
+                if swiglu_limit is not None and swiglu_limit != float("inf"):
+                    gate = gate.clamp(max=swiglu_limit)
+                    value = value.clamp(min=-swiglu_limit, max=swiglu_limit)
 
-            alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
-            gate_act = gate * torch.sigmoid(gate * alpha)
+                alpha = swiglu_alpha if swiglu_alpha is not None else 1.0
+                gate_act = gate * torch.sigmoid(gate * alpha)
 
-            beta = swiglu_beta if swiglu_beta is not None else 0.0
+                beta = swiglu_beta if swiglu_beta is not None else 0.0
 
-            return gate_act * (value + beta)
+                return gate_act * (value + beta)
 
-        self.experts = nn.ModuleList(
-            [
-                GatedMLP(
-                    hidden_size=self.hidden_size,
-                    intermediate_size=self.intermediate_size,
-                    bias=bias,
-                    dtype=self.dtype,
-                    config=model_config,
-                    use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
-                    activation=custom_swiglu if swiglu_alpha is not None else F.silu,
-                )
-                for _ in range(self.num_experts)
-            ]
-        )
+            self.experts = nn.ModuleList(
+                [
+                    GatedMLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=bias,
+                        dtype=self.dtype,
+                        config=model_config,
+                        use_cute_dsl_blockscaling_mm=use_cute_dsl_blockscaling_mm,
+                        activation=custom_swiglu if swiglu_alpha is not None else F.silu,
+                    )
+                    for _ in range(self.num_experts)
+                ]
+            )
+        else:
+            if activation_type == ActivationType.Relu2:
+                element_wise_activation = relu2
+            elif activation_type == ActivationType.Silu:
+                element_wise_activation = F.silu
+            else:
+                raise ValueError(f"Unsupported non-gated activation type: {activation_type}")
+            self.experts = nn.ModuleList(
+                [
+                    MLP(
+                        hidden_size=self.hidden_size,
+                        intermediate_size=self.intermediate_size,
+                        bias=bias,
+                        activation=element_wise_activation,
+                        dtype=self.dtype,
+                        config=model_config,
+                    )
+                    for _ in range(self.num_experts)
+                ]
+            )
 
     def forward(self, hidden_states: torch.Tensor, router_logits: torch.Tensor) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_size
@@ -279,27 +305,38 @@ class RefGatedMLPFusedMoE(nn.Module):
 
     def _load_expert_weights_with_scales(self, weights: Dict, expert: int):
         """Load weights for a single expert with configured scale keys."""
-        gate_up_proj_weights = [{}, {}]
+        up_proj_weights = [{}, {}] if self._is_gated else [{}]
         down_proj_weights = [{}]
-
-        # Load base weights
-        gate_up_proj_weights[0]["weight"] = weights[f"{expert}.w1.weight"]
-        gate_up_proj_weights[1]["weight"] = weights[f"{expert}.w3.weight"]
+        # Load down_proj weights
         down_proj_weights[0]["weight"] = weights[f"{expert}.w2.weight"]
 
         # Load bias if enabled
         if self.bias:
-            gate_up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
-            gate_up_proj_weights[1]["bias"] = weights[f"{expert}.w3.bias"]
             down_proj_weights[0]["bias"] = weights[f"{expert}.w2.bias"]
 
         # Load scale keys defined by subclass
         for scale_key in self.scale_keys:
-            gate_up_proj_weights[0][scale_key] = weights[f"{expert}.w1.{scale_key}"]
-            gate_up_proj_weights[1][scale_key] = weights[f"{expert}.w3.{scale_key}"]
             down_proj_weights[0][scale_key] = weights[f"{expert}.w2.{scale_key}"]
 
-        self.experts[expert].gate_up_proj.load_weights(gate_up_proj_weights)
+        # Load up_proj weights
+        if self._is_gated:
+            up_proj_weights[0]["weight"] = weights[f"{expert}.w1.weight"]
+            up_proj_weights[1]["weight"] = weights[f"{expert}.w3.weight"]
+            if self.bias:
+                up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
+                up_proj_weights[1]["bias"] = weights[f"{expert}.w3.bias"]
+            for scale_key in self.scale_keys:
+                up_proj_weights[0][scale_key] = weights[f"{expert}.w1.{scale_key}"]
+                up_proj_weights[1][scale_key] = weights[f"{expert}.w3.{scale_key}"]
+            self.experts[expert].gate_up_proj.load_weights(up_proj_weights)
+        else:
+            up_proj_weights[0]["weight"] = weights[f"{expert}.w1.weight"]
+            if self.bias:
+                up_proj_weights[0]["bias"] = weights[f"{expert}.w1.bias"]
+            for scale_key in self.scale_keys:
+                up_proj_weights[0][scale_key] = weights[f"{expert}.w1.{scale_key}"]
+            self.experts[expert].up_proj.load_weights(up_proj_weights)
+
         self.experts[expert].down_proj.load_weights(down_proj_weights)
 
     def load_weights(self, weights_list: List[Dict]):
@@ -342,6 +379,7 @@ class BaseQuantizeUtil(ABC):
         swiglu_beta: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
         num_local_experts: Optional[int] = None,
+        activation_type: ActivationType = ActivationType.Swiglu,
     ):
         self.num_experts = num_experts
         self.dtype = dtype
@@ -349,6 +387,8 @@ class BaseQuantizeUtil(ABC):
         self.hidden_size = hidden_size
         self.quant_config = quant_config
         self.bias = bias
+        self.activation_type = activation_type
+        self._is_gated = is_gated_activation(activation_type)
         self._swiglu_gptoss_style = swiglu_gptoss_style
         self.swiglu_alpha = swiglu_alpha
         self.swiglu_beta = swiglu_beta
@@ -410,22 +450,21 @@ class BaseQuantizeUtil(ABC):
         assert self.quant_config is None, "quant_config should be None for BaseQuantizeUtil"
         weights = {}
         for expert_id in range(self.num_experts):
-            w1_weight = torch.randn(
+            weights[f"{expert_id}.w1.weight"] = torch.randn(
                 (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
             )
-            w2_weight = torch.randn(
+            weights[f"{expert_id}.w2.weight"] = torch.randn(
                 (self.hidden_size, self.intermediate_size), dtype=self.dtype, device="cuda"
             )
-            w3_weight = torch.randn(
-                (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
-            )
-
-            weights[f"{expert_id}.w1.weight"] = w1_weight
-            weights[f"{expert_id}.w2.weight"] = w2_weight
-            weights[f"{expert_id}.w3.weight"] = w3_weight
+            if self._is_gated:
+                weights[f"{expert_id}.w3.weight"] = torch.randn(
+                    (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+                )
+            else:
+                weights[f"{expert_id}.w3.weight"] = torch.empty(0, dtype=self.dtype, device="cuda")
         return weights
 
-    def create_ref_module(self, routing_method, ref_cls=RefGatedMLPFusedMoE) -> torch.nn.Module:
+    def create_ref_module(self, routing_method, ref_cls=RefMLPFusedMoE) -> torch.nn.Module:
         """
         Create a reference module for correctness testing.
         """
@@ -437,6 +476,7 @@ class BaseQuantizeUtil(ABC):
             dtype=self.dtype,
             model_config=ModelConfig(quant_config=self.quant_config),
             bias=self.bias,
+            activation_type=self.activation_type,
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
@@ -444,7 +484,7 @@ class BaseQuantizeUtil(ABC):
         return ref_fused_moe
 
 
-class FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of FP8 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale"]
@@ -531,7 +571,7 @@ class FP8QuantizeUtil(BaseQuantizeUtil):
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class NVFP4RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class NVFP4RefMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of NVFP4 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
@@ -556,6 +596,7 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
     """
     NVFP4QuantizeUtil inherits from BaseQuantizeUtil to support correctness testing for NVFP4 quantized MoE modules.
     Supports swiglu_gptoss_style with custom swiglu parameters (inherited from BaseQuantizeUtil).
+    Supports element-wise activations (Relu2, Silu) via activation_type.
     """
 
     def create_weights(self, **quant_kwargs) -> Dict[str, torch.Tensor]:
@@ -579,12 +620,17 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 )
                 * 0.05
             )
-            w3_weight = (
-                torch.randn(
-                    (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+            if self._is_gated:
+                w3_weight = (
+                    torch.randn(
+                        (self.intermediate_size, self.hidden_size), dtype=self.dtype, device="cuda"
+                    )
+                    * 0.05
                 )
-                * 0.05
-            )
+                w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
+            else:
+                w3_weight = torch.empty(0, dtype=self.dtype, device="cuda")
+                w3_sf_global = None
 
             assert "x_sf_global" in quant_kwargs, "x_sf_global is required for NVFP4 quant"
 
@@ -593,11 +639,10 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
 
             w1_sf_global = (448 * 6) / w1_weight.abs().max().float()
             w2_sf_global = (448 * 6) / w2_weight.abs().max().float()
-            w3_sf_global = (448 * 6) / w3_weight.abs().max().float()
 
-            w3_w1_global = min(
-                w1_sf_global, w3_sf_global
-            )  # w3 global and w1 global must be the same
+            w3_w1_global = w1_sf_global
+            if w3_sf_global is not None:
+                w3_w1_global = min(w1_sf_global, w3_sf_global)
 
             # start to quantize
             w1_weight_nvfp4, w1_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
@@ -610,10 +655,14 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             )
             w2_sf_block_unswizzled = w2_sf_block_unswizzled.view(self.hidden_size, -1)
 
-            w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
-                w3_weight, w3_w1_global, scaling_vector_size, False, False
-            )
-            w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(self.intermediate_size, -1)
+            if self._is_gated:
+                w3_weight_nvfp4, w3_sf_block_unswizzled = torch.ops.trtllm.fp4_quantize(
+                    w3_weight, w3_w1_global, scaling_vector_size, False, False
+                )
+                w3_sf_block_unswizzled = w3_sf_block_unswizzled.view(self.intermediate_size, -1)
+            else:
+                w3_weight_nvfp4 = torch.empty(0, dtype=torch.uint8, device="cuda")
+                w3_sf_block_unswizzled = torch.empty(0, dtype=torch.float8_e4m3fn, device="cuda")
 
             w1_input_scale = x_sf_global.cuda()
             w2_input_scale = x_sf_global.cuda()
@@ -646,18 +695,21 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
                 weights[f"{expert_id}.w2.bias"] = torch.randn(
                     self.hidden_size, device="cuda", dtype=torch.float
                 )
-                weights[f"{expert_id}.w3.bias"] = torch.randn(
-                    self.intermediate_size, device="cuda", dtype=torch.float
-                )
+                if self._is_gated:
+                    weights[f"{expert_id}.w3.bias"] = torch.randn(
+                        self.intermediate_size, device="cuda", dtype=torch.float
+                    )
+                else:
+                    weights[f"{expert_id}.w3.bias"] = torch.empty(
+                        0, device="cuda", dtype=torch.float
+                    )
         return weights
 
-    def create_ref_module(
-        self, routing_method, ref_cls=NVFP4RefGatedMLPFusedMoE
-    ) -> torch.nn.Module:
+    def create_ref_module(self, routing_method, ref_cls=NVFP4RefMLPFusedMoE) -> torch.nn.Module:
         """
-        Create a reference module for correctness testing with swiglu_gptoss_style support.
+        Create a reference module for correctness testing.
         """
-        ref_fused_moe = ref_cls(
+        kwargs = dict(
             num_experts=self.num_experts,
             routing_method=routing_method,
             hidden_size=self.hidden_size,
@@ -669,11 +721,12 @@ class NVFP4QuantizeUtil(BaseQuantizeUtil):
             swiglu_alpha=self.swiglu_alpha,
             swiglu_beta=self.swiglu_beta,
             swiglu_limit=self.swiglu_limit,
+            activation_type=self.activation_type,
         )
-        return ref_fused_moe
+        return ref_cls(**kwargs)
 
 
-class FP8BlockScalesRefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class FP8BlockScalesRefGatedMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of FP8 block-wise quantization for correctness testing."""
 
     scale_keys = ["weight_scale"]
@@ -1058,7 +1111,7 @@ class TRTLLMGenFP8BlockScalesRefModule(FP8BlockScalesRefGatedMLPFusedMoE):
         check_accuracy(output, ref_output, atol=0.1, rtol=0.85, percent=0.925)
 
 
-class W4A8NVFP4FP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class W4A8NVFP4FP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """Reference implementation of W4A8_NVFP4_FP8 quantization for correctness testing."""
 
     scale_keys = ["weight_scale", "input_scale", "weight_scale_2"]
@@ -1159,7 +1212,7 @@ class W4A8NVFP4FP8QuantizeUtil(BaseQuantizeUtil):
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class MXFP4MXFP8RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class MXFP4MXFP8RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
     Reference implementation of W4A8_MXFP4_MXFP8 quantization for correctness testing.
 
@@ -1510,9 +1563,9 @@ class MXFP4MXFP8QuantizeUtil(BaseQuantizeUtil):
         return ref_fused_moe
 
 
-class WFP4A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class WFP4A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
-    A derived class of RefGatedMLPFusedMoE serves as a reference implementation of W4A16_MXFP4
+    A derived class of RefMLPFusedMoE serves as a reference implementation of W4A16_MXFP4
     quantization for correctness testing.
 
     Since GatedMLP doesn't support wfp4a16 quantization, we dequantize the weights
@@ -1528,10 +1581,14 @@ class WFP4A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         dtype: Optional[torch.dtype] = None,
         model_config: Optional[ModelConfig] = None,
         bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_alpha: Optional[float] = None,
         swiglu_beta: Optional[float] = None,
         swiglu_limit: Optional[float] = None,
     ):
+        assert activation_type == ActivationType.Swiglu, (
+            "Only Swiglu activation is supported for WFP4A16RefGatedMLPFusedMoE"
+        )
         # Store the original quant_config for assertion in load_weights
         self._original_quant_config = model_config.quant_config if model_config else None
         # Create experts without quantization config since we'll dequantize weights
@@ -1710,9 +1767,9 @@ class WFP4A16QuantizeUtil(BaseQuantizeUtil):
         return super().create_ref_module(routing_method, ref_cls)
 
 
-class W8A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
+class W8A16RefGatedMLPFusedMoE(RefMLPFusedMoE):
     """
-    A derived class of RefGatedMLPFusedMoE serves as a reference implementation of W8A16
+    A derived class of RefMLPFusedMoE serves as a reference implementation of W8A16
     quantization for correctness testing.
 
     Since GatedMLP doesn't support W8A16 quantization, we dequantize the weights
@@ -1728,10 +1785,14 @@ class W8A16RefGatedMLPFusedMoE(RefGatedMLPFusedMoE):
         dtype: Optional[torch.dtype] = None,
         model_config: Optional[ModelConfig] = None,
         bias=False,
+        activation_type: ActivationType = ActivationType.Swiglu,
         swiglu_alpha: Optional[torch.Tensor] = None,
         swiglu_beta: Optional[torch.Tensor] = None,
         swiglu_limit: Optional[torch.Tensor] = None,
     ):
+        assert activation_type == ActivationType.Swiglu, (
+            "Only Swiglu activation is supported for W8A16RefGatedMLPFusedMoE"
+        )
         # Store the original quant_config for assertion in load_weights
         self._original_quant_config = model_config.quant_config if model_config else None
         # Create experts without quantization config since we'll dequantize weights
@@ -1848,7 +1909,7 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
     """
     A reference implementation of W4A8_AWQ quantization for MoE correctness testing.
 
-    IMPORTANT: This class does NOT inherit from RefGatedMLPFusedMoE because W4A8_AWQ
+    IMPORTANT: This class does NOT inherit from RefMLPFusedMoE because W4A8_AWQ
     cannot be correctly reproduced by simply dequantizing weights and using non-quantized
     GatedMLP forward. The reasons are:
 

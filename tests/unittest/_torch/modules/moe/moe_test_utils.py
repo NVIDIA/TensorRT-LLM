@@ -46,6 +46,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
+from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
 
 G_LOGGER = logging.getLogger(__name__)
@@ -909,6 +910,7 @@ def should_skip_to_accelerate_ci(
     seq_len: Optional[int] = None,
     swiglu_gptoss_style: bool = False,
     parallel_mode: Optional[str] = None,
+    activation_type: Optional[ActivationType] = ActivationType.Swiglu,
 ) -> Optional[str]:
     """
     Skip low-information-density test combinations to accelerate CI.
@@ -943,8 +945,8 @@ def should_skip_to_accelerate_ci(
     if model_config is None:
         return None
 
-    # --- Rule 0: Skip unquantized (quant=None) ---
-    if quant_algo is None:
+    # --- Rule 0: Skip gated and unquantized (quant=None) ---
+    if quant_algo is None and is_gated_activation(activation_type):
         return "[CI accel] Skip unquantized (quant=None) in CI"
 
     is_large_model = model_config.num_experts >= 256 and model_config.hidden_size >= 7168
