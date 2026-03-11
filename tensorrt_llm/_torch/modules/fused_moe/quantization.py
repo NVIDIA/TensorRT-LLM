@@ -908,6 +908,7 @@ class FP8QDQFusedMoEMethod(FusedMoEMethodBase):
 
 class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
     eplb_support_status = EplbSupportStatus.NOT_VERIFIED
+    fp8_block_size = 128
 
     def create_weights(self, module: torch.nn.Module):
         weight_dtype = torch.float8_e4m3fn
@@ -926,16 +927,18 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
         cell_div = lambda x, y: (x + y - 1) // y
         w3_w1_weight_scaling_factor = nn.Parameter(torch.empty(
             (module.expert_size_per_partition,
-             cell_div(module.intermediate_size_per_partition, 128) * 2,
-             cell_div(w3_w1_weight_shape[2], 128)),
+             cell_div(module.intermediate_size_per_partition,
+                      self.fp8_block_size) * 2,
+             cell_div(w3_w1_weight_shape[2], self.fp8_block_size)),
             dtype=torch.float32),
                                                    requires_grad=False)
         module.register_parameter("w3_w1_weight_scaling_factor",
                                   w3_w1_weight_scaling_factor)
 
         w2_weight_scaling_factor = nn.Parameter(torch.empty(
-            (module.expert_size_per_partition, cell_div(
-                w2_weight_shape[1], 128), cell_div(w2_weight_shape[2], 128)),
+            (module.expert_size_per_partition,
+             cell_div(w2_weight_shape[1], self.fp8_block_size),
+             cell_div(w2_weight_shape[2], self.fp8_block_size)),
             dtype=torch.float32),
                                                 requires_grad=False)
         module.register_parameter("w2_weight_scaling_factor",
@@ -986,6 +989,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethod(FusedMoEMethodBase):
                     f"{expert_id}.w2.weight_scale_inv"] if f"{expert_id}.w2.weight_scale_inv" in weights else None
                 dst_w3_weight_scale, dst_w1_weight_scale = dst_w3_w1_weight_scale[
                     local_slot_id].chunk(2, dim=0)
+                assert module.intermediate_size_per_partition % self.fp8_block_size == 0, "For DeepSeekFP8BlockScalesFusedMoEMethod, intermediate_size_per_partition should be divisible by fp8_block_size."
                 if w1_scale is not None:
                     w1_scale_shard = load_weight_shard(
                         w1_scale,
