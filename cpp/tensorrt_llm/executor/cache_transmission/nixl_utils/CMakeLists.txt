@@ -41,6 +41,7 @@ if(NIXL_ROOT)
 
   # Link against CUDA
   target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cudart)
+  target_link_libraries(${NIXL_WRAPPER_TARGET} PRIVATE CUDA::cuda_driver)
 
   set(NIXL_ENABLED TRUE)
 else()

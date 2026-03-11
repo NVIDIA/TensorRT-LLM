@@ -9,6 +9,7 @@ import tensorrt_llm
 from tensorrt_llm import logger
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
+from tensorrt_llm._torch.disaggregation.resource.utils import get_global_layer_ids
 from tensorrt_llm._torch.distributed.communicator import Distributed
 from tensorrt_llm._torch.pyexecutor.kv_cache_transceiver import KvCacheTransceiver
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest
@@ -64,7 +65,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.context_info_endpoint = None
         self.dp_rank = self.mapping.tp_rank if self.mapping.enable_attention_dp else 0
         if self.dist.rank == 0:
-            self.context_info_endpoint = self.transfer_worker._instance_info_server.endpoint
+            self.context_info_endpoint = self.transfer_worker._rank_info_server.endpoint
             self.dist.broadcast(self.context_info_endpoint, 0)
         else:
             self.context_info_endpoint = self.dist.broadcast(self.context_info_endpoint, 0)
@@ -97,10 +98,56 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.recv_task_ids = {}  # request_id to recv_task_id
         self.send_req_id_to_request = {}  # request_id to request (for send)
         self.recv_req_id_to_request = {}  # request_id to request (for recv)
+        self.page_table = self.transfer_worker._rank_info.page_table
+        # Check if using V2 manager (has kv_cache_map attribute)
+        self.is_v2_manager = hasattr(self.kv_cache_manager, "kv_cache_map")
+
+    def shutdown(self):
+        if self.transfer_worker is not None:
+            self.transfer_worker.shutdown()
 
     def _create_kv_slice(self, req: LlmRequest):
-        block_ids = self.kv_cache_manager.get_batch_cache_indices([req.py_request_id])[0]
-        return KVSlice(is_last_slice=True, block_ids=block_ids)
+        # Get block_ids for each layer group
+        block_ids_per_layer_groups: List[List[int]] = []
+        tokens_per_block = self.kv_cache_manager.tokens_per_block
+
+        for group_idx, lg in enumerate(self.page_table.layer_groups):
+            if self.is_v2_manager:
+                # V2: Use get_aggregated_page_indices for efficient slot indices
+                group_id = group_idx
+                block_ids = list(
+                    self.kv_cache_manager.kv_cache_map[
+                        req.py_request_id
+                    ].get_aggregated_page_indices(group_id, valid_only=True)
+                )
+            else:
+                # V1: Use get_batch_cache_indices
+                first_global_layer_id = get_global_layer_ids(lg)[0]
+                block_ids = self.kv_cache_manager.get_batch_cache_indices(
+                    [req.py_request_id], layer_idx=first_global_layer_id
+                )[0]
+
+            # Filter to only window-relevant blocks for sliding window layer groups.
+            # Computes the expected number of non-stale blocks (using the same
+            # eviction formula as update_resources) and keeps only the tail.
+            # This works correctly regardless of whether update_resources has
+            # been called:
+            #   - Pre-eviction: all blocks present → trim to last N.
+            #   - Post-eviction (V2 valid_only=True): stale blocks already
+            #     removed → len == expected_valid, so the condition is false.
+            window_size = lg.sliding_window_size
+            if window_size is not None:
+                total_blocks = (req.prompt_len + tokens_per_block - 1) // tokens_per_block
+                stale_end = max(0, (req.prompt_len + 1 - window_size) // tokens_per_block)
+                expected_valid = total_blocks - stale_end
+                if expected_valid <= 0:
+                    block_ids = []
+                elif len(block_ids) > expected_valid:
+                    block_ids = block_ids[-expected_valid:]
+
+            block_ids_per_layer_groups.append(list(block_ids))
+
+        return KVSlice(is_last_slice=True, block_ids_per_layer_groups=block_ids_per_layer_groups)
 
     def respond_and_send_async(self, req: LlmRequest):
         req.state = LlmRequestState.DISAGG_CONTEXT_TRANS_IN_PROGRESS
@@ -275,7 +322,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
     def cancel_request(self, req: LlmRequest):
         raise NotImplementedError("cancel_request is not implemented")
-        # self.transfer_worker.cancel_request(req)
 
     def get_disaggregated_params(self) -> Dict[str, Any]:
         raise NotImplementedError("get_disaggregated_params is not implemented")
@@ -289,9 +335,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
                 f"PyNativeCacheTransceiver: _check_compatible: only support context parallelism is 1: "
                 f"cp_size: {self.mapping.cp_size}"
             )
-
-        if self.kv_cache_manager.is_vswa:
-            raise ValueError("PyNativeCacheTransceiver: _check_compatible: VSWA is not supported")
         return
 
     def get_context_state(self):

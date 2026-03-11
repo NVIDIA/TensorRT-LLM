@@ -127,7 +127,9 @@ class VirtMem:
         assert vm_size % phys_mem_allocator.phys_mem_size == 0
         self._allocator = phys_mem_allocator
         device_id = phys_mem_allocator.device_id
-        self._address = _unwrap(drv.cuMemAddressReserve(vm_size, 0, 0, 0))
+        self._address = _unwrap(
+            drv.cuMemAddressReserve(vm_size, phys_mem_allocator.phys_mem_size, 0, 0)
+        )
         self._vm_size = vm_size
         self._pm_stack = []
         self._access_desc = drv.CUmemAccessDesc()

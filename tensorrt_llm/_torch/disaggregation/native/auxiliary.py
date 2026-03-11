@@ -99,15 +99,27 @@ class AuxBuffer(AuxBufferBase):
             self._max_slot_num, self._max_draft_len, dtype=data_type, device=self._device
         )
 
+        # Stores (first_tokens_len, draft_tokens_len) per slot as a tensor so it
+        # gets transferred via RDMA alongside the token data.
+        self._token_counts_buffer = torch.zeros(
+            self._max_slot_num, 2, dtype=data_type, device=self._device
+        )
+
         self._meta = AuxBufferMeta(
-            ptrs=[self._first_tokens_buffer.data_ptr(), self._draft_tokens_buffer.data_ptr()],
+            ptrs=[
+                self._first_tokens_buffer.data_ptr(),
+                self._draft_tokens_buffer.data_ptr(),
+                self._token_counts_buffer.data_ptr(),
+            ],
             size=[
                 self._first_tokens_buffer.numel() * self._first_tokens_buffer.element_size(),
                 self._draft_tokens_buffer.numel() * self._draft_tokens_buffer.element_size(),
+                self._token_counts_buffer.numel() * self._token_counts_buffer.element_size(),
             ],
             item_sizes=[
                 self._first_tokens_buffer[0].numel() * self._first_tokens_buffer.element_size(),
                 self._draft_tokens_buffer[0].numel() * self._draft_tokens_buffer.element_size(),
+                self._token_counts_buffer[0].numel() * self._token_counts_buffer.element_size(),
             ],
             device=self._device,
         )
@@ -126,6 +138,7 @@ class AuxBuffer(AuxBufferBase):
                 "This indicates a bug in slot management."
             )
         self._occupied_slots.add(slot_id)
+        self._slot_token_counts[slot_id] = (0, 0)
         return slot_id
 
     def free_slot(self, slot: int) -> None:
@@ -139,6 +152,7 @@ class AuxBuffer(AuxBufferBase):
                 f"Invalid slot id {slot}. Valid slot indices are in the range 0..{self._max_slot_num - 1}."
             )
         self._occupied_slots.remove(slot)
+        self._slot_token_counts.pop(slot, None)
         self._free_slots.append(slot)
 
     @property
@@ -172,11 +186,16 @@ class AuxBuffer(AuxBufferBase):
             torch.tensor(draft_tokens, dtype=torch.int32, device=self._device)
         )
         self._slot_token_counts[slot] = (len(first_gen_tokens), len(draft_tokens))
+        self._token_counts_buffer[slot].copy_(
+            torch.tensor(
+                [len(first_gen_tokens), len(draft_tokens)], dtype=torch.int32, device=self._device
+            )
+        )
 
     def get_slot_tokens(self, slot: int) -> tuple[list[int], list[int]]:
-        first_len, draft_len = self._slot_token_counts.get(
-            slot, (self._beam_width, self._max_draft_len)
-        )
+        if slot not in self._occupied_slots:
+            raise ValueError(f"Cannot read slot {slot}: slot is not currently allocated.")
+        first_len, draft_len = self._token_counts_buffer[slot].tolist()
         first_gen_tokens = self._first_tokens_buffer[slot][:first_len].tolist()
         draft_tokens = self._draft_tokens_buffer[slot][:draft_len].tolist()
 
