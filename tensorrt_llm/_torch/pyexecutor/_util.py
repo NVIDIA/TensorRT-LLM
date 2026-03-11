@@ -121,13 +121,10 @@ class KvCacheCreator:
         if self._kv_cache_manager_cls == KVCacheManagerV2:
             if kv_connector_manager is not None or (
                     max_beam_width is not None and max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
                     "Falling back to KVCacheManager.")
-                self._kv_cache_manager_cls = KVCacheManager
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -648,6 +645,11 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
+        # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
+        # the draft layers share the same architecture as the target model and need
+        # the sparse_attention_config. Get it from effective_draft_config which
+        # falls back to the target model's config for MTP mode.
+        sparse_attn_config = effective_draft_config.sparse_attention_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
@@ -657,7 +659,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=None,  # Not applicable for draft in one-model mode
+            sparse_attn_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
