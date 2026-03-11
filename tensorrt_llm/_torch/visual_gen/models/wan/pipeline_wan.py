@@ -1,5 +1,5 @@
 import time
-from typing import Optional
+from typing import List, Optional, Union
 
 import diffusers
 import torch
@@ -314,7 +314,7 @@ class WanPipeline(BasePipeline):
     @torch.no_grad()
     def forward(
         self,
-        prompt: str,
+        prompt: Union[str, List[str]],
         negative_prompt: Optional[str] = None,
         height: int = 720,
         width: int = 1280,
@@ -327,6 +327,13 @@ class WanPipeline(BasePipeline):
         max_sequence_length: int = 512,
     ):
         pipeline_start = time.time()
+
+        # Determine batch size
+        if isinstance(prompt, str):
+            batch_size = 1
+        else:
+            batch_size = len(prompt)
+
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
@@ -377,7 +384,7 @@ class WanPipeline(BasePipeline):
         logger.info(f"Prompt encoding completed in {time.time() - encode_start:.2f}s")
 
         # Prepare Latents
-        latents = self._prepare_latents(height, width, num_frames, generator)
+        latents = self._prepare_latents(batch_size, height, width, num_frames, generator)
         logger.debug(f"Latents shape: {latents.shape}")
 
         self.scheduler.set_timesteps(num_inference_steps, device=self.device)
@@ -477,7 +484,7 @@ class WanPipeline(BasePipeline):
         # Decode
         logger.info("Decoding video...")
         decode_start = time.time()
-        video = self.decode_latents(latents, self._decode_latents)
+        video = self.decode_latents(latents, lambda lat: self._decode_latents(lat, batch_size))
 
         if self.rank == 0:
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
@@ -486,7 +493,12 @@ class WanPipeline(BasePipeline):
         return MediaOutput(video=video)
 
     @nvtx_range("_encode_prompt", color="blue")
-    def _encode_prompt(self, prompt, negative_prompt, max_sequence_length):
+    def _encode_prompt(
+        self,
+        prompt: Union[str, List[str]],
+        negative_prompt: Optional[str],
+        max_sequence_length: int,
+    ):
         prompt = [prompt] if isinstance(prompt, str) else prompt
 
         def get_embeds(texts):
@@ -534,21 +546,31 @@ class WanPipeline(BasePipeline):
         return prompt_embeds, neg_embeds
 
     @nvtx_range("_prepare_latents", color="blue")
-    def _prepare_latents(self, height, width, num_frames, generator):
+    def _prepare_latents(
+        self,
+        batch_size: int,
+        height: int,
+        width: int,
+        num_frames: int,
+        generator: torch.Generator,
+    ) -> torch.Tensor:
+        """Prepare random latents for video generation."""
         num_channels_latents = 16
         num_latent_frames = (num_frames - 1) // self.vae_scale_factor_temporal + 1
 
         shape = (
-            1,
+            batch_size,
             num_channels_latents,
             num_latent_frames,
             height // self.vae_scale_factor_spatial,
             width // self.vae_scale_factor_spatial,
         )
+
         return randn_tensor(shape, generator=generator, device=self.device, dtype=self.dtype)
 
     @nvtx_range("_decode_latents", color="blue")
-    def _decode_latents(self, latents):
+    def _decode_latents(self, latents: torch.Tensor, batch_size: int = 1) -> torch.Tensor:
+        """Decode latents to video tensor."""
         latents = latents.to(self.vae.dtype)
 
         # Denormalization
@@ -572,7 +594,8 @@ class WanPipeline(BasePipeline):
         # VAE decode: returns (B, C, T, H, W)
         video = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process video tensor: (B, C, T, H, W) -> (T, H, W, C) uint8
-        video = postprocess_video_tensor(video, remove_batch_dim=True)
+        # Post-process video tensor
+        # (B, C, T, H, W) -> (T, H, W, C) for batch=1, (B, T, H, W, C) for batch>1
+        video = postprocess_video_tensor(video, remove_batch_dim=(batch_size == 1))
 
         return video
