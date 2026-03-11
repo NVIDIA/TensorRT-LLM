@@ -1464,11 +1464,6 @@ class Indexer(nn.Module):
                     # Gather K from cache for this chunk (dual to _update_k_cache)
                     chunk_k_fp8, chunk_k_scale = self._gather_k_cache_for_chunk(
                         metadata, chunk)
-                    # Drain all streams before launching persistent kernel that
-                    # claims all SMs — prevents deadlock with any concurrent
-                    # persistent kernel on another stream (e.g. from previous
-                    # MTP iteration or aux_stream overlap).
-                    torch.cuda.synchronize()
                     logits = fp8_mqa_logits(
                         q_fp8[chunk.token_start:chunk.token_end, ...],
                         (chunk_k_fp8, chunk_k_scale),
