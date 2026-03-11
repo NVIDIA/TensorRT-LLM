@@ -18,8 +18,7 @@ from _torch.helpers import (calc_woq_tolerence, per_block_cast_to_fp8,
 from mpi4py import MPI
 from mpi4py.futures import MPIPoolExecutor
 from transformers.configuration_utils import PretrainedConfig
-from utils.util import (check_accuracy, getSMVersion, skip_blackwell,
-                        skip_blackwell_geforce,
+from utils.util import (check_accuracy, skip_blackwell, skip_blackwell_geforce,
                         skip_neither_ada_nor_hopper_unittest, skip_no_hopper,
                         skip_pre_blackwell, skip_pre_hopper)
 

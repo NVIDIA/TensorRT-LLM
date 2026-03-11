@@ -714,8 +714,11 @@ void gemm_dispatch_sm89(void* mat_a, void* mat_b, void* mat_d, float* scales_a, 
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm89 gemm kernel runtime error: %s", cudaGetErrorString(result));
 }
 
-void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
-    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+template <int TileM, int TileN, int NumStages>
+void launch_sm120_gemm_kernel(__nv_fp8_e4m3* mat_a, int64_t ld_a, int64_t stride_a, __nv_fp8_e4m3* mat_b, int64_t ld_b,
+    int64_t stride_b, __nv_bfloat16* mat_d, int64_t ld_d, int64_t stride_d, float* scales_a, int64_t stride_scales_a,
+    float* scales_b, int64_t stride_scales_b, uint32_t num_problems, uint32_t shape_m, uint32_t shape_n,
+    uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
 {
     if (num_device_sms < 0)
     {
@@ -725,12 +728,12 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     using ElementOutput = cute::bfloat16_t;
     using ElementAccum = float;
     using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<TileM, TileN, NumStages>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
     using ProblemShape = typename GemmKernel::ProblemShape;
-    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, 1);
+    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, (int) num_problems);
 
     auto ptr_A = reinterpret_cast<ElementInput*>(mat_a);
     auto ptr_B = reinterpret_cast<ElementInput*>(mat_b);
@@ -738,12 +741,6 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
     auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
     auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
 
-    int64_t ld_a = static_cast<int64_t>(shape_k);
-    int64_t ld_b = static_cast<int64_t>(shape_k);
-    int64_t ld_d = static_cast<int64_t>(shape_n);
-    int64_t stride_a = static_cast<int64_t>(shape_m) * ld_a;
-    int64_t stride_b = static_cast<int64_t>(shape_n) * ld_b;
-    int64_t stride_d = static_cast<int64_t>(shape_m) * ld_d;
     typename KT::StrideA dA = make_stride(ld_a, Int<1>{}, stride_a);
     typename KT::StrideB dB = make_stride(ld_b, Int<1>{}, stride_b);
     typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(problem_shape).stride();
@@ -775,6 +772,35 @@ void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a,
 
     result = cudaGetLastError();
     TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
+}
+
+void gemm_dispatch_sm120(void* mat_a, void* mat_b, void* mat_d, float* scales_a, float* scales_b, uint32_t shape_m,
+    uint32_t shape_n, uint32_t shape_k, cudaStream_t stream, int num_device_sms = kNumDeviceSMs)
+{
+    if (num_device_sms < 0)
+    {
+        num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
+    }
+
+    auto* a = reinterpret_cast<__nv_fp8_e4m3*>(mat_a);
+    auto* b = reinterpret_cast<__nv_fp8_e4m3*>(mat_b);
+    auto* d = reinterpret_cast<__nv_bfloat16*>(mat_d);
+    int64_t ld_a = shape_k;
+    int64_t ld_b = shape_k;
+    int64_t ld_d = shape_n;
+    constexpr int64_t stride = 0;
+    constexpr uint32_t num_problems = 1;
+
+    if (shape_m <= 64)
+    {
+        launch_sm120_gemm_kernel<32, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
+    else
+    {
+        launch_sm120_gemm_kernel<64, 128, 4>(a, ld_a, stride, b, ld_b, stride, d, ld_d, stride, scales_a, stride,
+            scales_b, stride, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
 }
 
 void fp8_gemm_run(__nv_fp8_e4m3* mat_a, int ld_a, __nv_fp8_e4m3* mat_b, int ld_b, __nv_bfloat16* mat_d, int ld_d,
@@ -882,7 +908,7 @@ void grouped_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, __nv_fp8_e4m3* mat_b, __n
     // so we can promise m_padded < max_shape_m_padded
     int64_t m_padded = sm120_blockscaled_gemm::compute_padded_offset(max_shape_m, num_problems);
 
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
+    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<32, 128, 4>;
     using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledMoeKernel<KT>;
     using Params = typename GemmKernel::Params;
     using Arguments = typename GemmKernel::Arguments;
@@ -1104,54 +1130,17 @@ void strided_batch_gemm_dispatch_sm120(__nv_fp8_e4m3* mat_a, int ld_a, int strid
     {
         num_device_sms = kNumDeviceSMs = tensorrt_llm::common::getMultiProcessorCount();
     }
-    using ElementInput = cute::float_e4m3_t;
-    using ElementOutput = cute::bfloat16_t;
-    using ElementAccum = float;
-    using ElementBlockScale = int32_t;
-    using KT = sm120_blockscaled_gemm::SM120BlockScaledBuilder<64, 128, 4>;
-    using GemmKernel = sm120_blockscaled_gemm::SM120BlockScaledKernel<KT>;
-    using Params = typename GemmKernel::Params;
-    using Arguments = typename GemmKernel::Arguments;
-    using ProblemShape = typename GemmKernel::ProblemShape;
-    ProblemShape problem_shape = make_shape((int) shape_m, (int) shape_n, (int) shape_k, (int) num_problems);
 
-    auto ptr_A = reinterpret_cast<ElementInput*>(mat_a);
-    auto ptr_B = reinterpret_cast<ElementInput*>(mat_b);
-    auto ptr_SFA = reinterpret_cast<ElementBlockScale*>(scales_a);
-    auto ptr_SFB = reinterpret_cast<ElementBlockScale*>(scales_b);
-    auto ptr_D = reinterpret_cast<ElementOutput*>(mat_d);
-
-    typename KT::StrideA dA = make_stride(static_cast<int64_t>(ld_a), Int<1>{}, static_cast<int64_t>(stride_a));
-    typename KT::StrideB dB = make_stride(static_cast<int64_t>(ld_b), Int<1>{}, static_cast<int64_t>(stride_b));
-    typename KT::StrideSFA dSFA = KT::deduce_sfa_layout(problem_shape).stride();
-    typename KT::StrideSFB dSFB = KT::deduce_sfb_layout(problem_shape).stride();
-    typename KT::StrideD dD = make_stride(static_cast<int64_t>(ld_d), Int<1>{}, static_cast<int64_t>(stride_d));
-
-    Arguments args = {ptr_A, dA, ptr_B, dB, ptr_SFA, dSFA, ptr_SFB, dSFB, ptr_D, dD};
-
-    Params kernel_params = GemmKernel::to_underlying_arguments(problem_shape, args);
-    auto kernel_ptr = &cutlass::device_kernel<GemmKernel>;
-
-    cudaFuncSetAttribute(kernel_ptr, cudaFuncAttributeMaxDynamicSharedMemorySize, GemmKernel::kSmemSize);
-    auto result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel cannot launch: %s", cudaGetErrorString(result));
-
-    cudaLaunchConfig_t launch_config;
-    cudaLaunchAttribute attrs[1];
-    attrs[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
-    attrs[0].val.programmaticStreamSerializationAllowed = 1;
-
-    launch_config.gridDim = dim3(num_device_sms, 1, 1);
-    launch_config.blockDim = GemmKernel::get_block_shape();
-    launch_config.dynamicSmemBytes = GemmKernel::kSmemSize;
-    launch_config.stream = stream;
-    launch_config.attrs = attrs;
-    launch_config.numAttrs = 1;
-
-    cudaLaunchKernelEx(&launch_config, kernel_ptr, kernel_params);
-
-    result = cudaGetLastError();
-    TLLM_CHECK_WITH_INFO(result == cudaSuccess, "sm120 gemm kernel runtime error: %s", cudaGetErrorString(result));
+    if (shape_m <= 64)
+    {
+        launch_sm120_gemm_kernel<32, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
+    else
+    {
+        launch_sm120_gemm_kernel<64, 128, 4>(mat_a, ld_a, stride_a, mat_b, ld_b, stride_b, mat_d, ld_d, stride_d,
+            scales_a, stride_scales_a, scales_b, 0, num_problems, shape_m, shape_n, shape_k, stream, num_device_sms);
+    }
 }
 
 void fp8_stride_batch_gemm_run(__nv_bfloat16 const* mat_a, __nv_fp8_e4m3* fp8_mat_a, float* scales_a, int ld_a,
