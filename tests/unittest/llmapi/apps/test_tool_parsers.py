@@ -191,8 +191,11 @@ class TestBaseToolParser:
 
         results = parser.parse_base_json(action, sample_tools)
 
-        # Should return empty list and log warning
-        assert len(results) == 0
+        # Should return the tool call with tool_index=-1 and log warning.
+        assert len(results) == 1
+        assert results[0].name == "undefined_function"
+        assert results[0].tool_index == -1
+        assert json.loads(results[0].parameters) == {}
 
     def test_parse_base_json_missing_parameters(self, sample_tools):
         """Test parse_base_json handles missing parameters."""
@@ -299,14 +302,14 @@ class TestBaseToolParser:
         """Test streaming parser handles invalid tool name."""
         parser = ConcreteToolParser()
 
-        # Send invalid tool name
+        # Send invalid tool name - parser streams it through.
         result = parser.parse_streaming_increment(
             '[TOOL_CALLS] {"name":"invalid_tool"', sample_tools)
 
-        # Should reset state
-        assert len(result.calls) == 0
-        assert parser._buffer == ""
-        assert parser.current_tool_id == -1
+        # Should still return the tool call.
+        assert len(result.calls) == 1
+        assert result.calls[0].name == "invalid_tool"
+        assert result.calls[0].tool_index == 0
 
     def test_supports_structural_tag(self):
         """Test supports_structural_tag returns True."""
@@ -470,8 +473,9 @@ class BaseToolParserTestClass:
 
         result = parser.detect_and_parse(text, sample_tools)
 
-        # Should not return any calls for undefined function
-        assert len(result.calls) == 0
+        # Should return the tool call with tool_index=-1.
+        assert len(result.calls) == 1
+        assert result.calls[0].tool_index == -1
 
 
 class TestKimiK2ToolParser(BaseToolParserTestClass):
@@ -603,6 +607,14 @@ class TestKimiK2ToolParser(BaseToolParserTestClass):
         assert "get_weather" in info1.begin
         assert "search_web" in info2.begin
         assert info1.end == info2.end == "<|tool_call_end|><|tool_calls_section_end|>"
+
+    def test_undefined_tool(self, sample_tools, parser, tool_parser_test_cases):
+        """KimiK2 has custom detect_and_parse that filters undefined tools."""
+        text = tool_parser_test_cases.undefined_tool
+
+        result = parser.detect_and_parse(text, sample_tools)
+
+        assert len(result.calls) == 0
 
     def test_kimi_k2_format_compliance(self, sample_tools, parser):
         """Test that KimiK2ToolParser follows the documented format structure."""

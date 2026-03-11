@@ -94,6 +94,17 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
         (f"a b {R1_END}", f"a b {R1_END}", "", {
             "enable_thinking": False
         }),
+        # force_nonempty_content swaps reasoning into content when content is
+        # empty (reasoning_at_start stays True, so parsing is unchanged).
+        ("a b", "a b", "", {
+            "force_nonempty_content": True
+        }),
+        (f"a {R1_END} b", " b", "a ", {
+            "force_nonempty_content": True
+        }),
+        (f"a b {R1_END}", "a b ", "", {
+            "force_nonempty_content": True
+        }),
     ])
 def test_nano_v3_reasoning_parser(text: str, content: str,
                                   reasoning_context: str,

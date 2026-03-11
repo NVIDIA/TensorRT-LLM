@@ -70,7 +70,10 @@ class BaseToolParser(ABC):
         results = []
         for act in action:
             name = act.get("name")
-            if name and name in tool_indices:
+            if name:
+                if name not in tool_indices:
+                    logger.warning(
+                        f"Model attempted to call undefined function: {name}")
                 results.append(
                     ToolCallItem(
                         tool_index=
@@ -81,9 +84,6 @@ class BaseToolParser(ABC):
                             ensure_ascii=False,
                         ),
                     ))
-            else:
-                logger.warning(
-                    f"Model attempted to call undefined function: {name}")
 
         return results
 
@@ -173,16 +173,6 @@ class BaseToolParser(ABC):
                 is_current_complete = is_complete_json(
                     current_text[start_idx:start_idx + end_idx])
 
-                # Validate tool name if present
-                if "name" in obj and obj["name"] not in self._tool_indices:
-                    # Invalid tool name - reset state
-                    self._buffer = ""
-                    self.current_tool_id = -1
-                    self.current_tool_name_sent = False
-                    if self.streamed_args_for_tool:
-                        self.streamed_args_for_tool.pop()
-                    return StreamingParseResult()
-
                 # Handle parameters/arguments consistency
                 # NOTE: we assume here that the obj is always partial of a single tool call
                 if "parameters" in obj:
@@ -203,7 +193,7 @@ class BaseToolParser(ABC):
             if not self.current_tool_name_sent:
                 function_name = current_tool_call.get("name")
 
-                if function_name and function_name in self._tool_indices:
+                if function_name:
                     # If this is a new tool (current_tool_id was -1), initialize it
                     if self.current_tool_id == -1:
                         self.current_tool_id = 0
