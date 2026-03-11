@@ -86,6 +86,13 @@ All published functionality in the Release Notes has been fully tested and verif
   - **DGX Spark:** DGX Spark support is in beta. Only single-node configurations and the models listed above have been validated in this release.
   - **Disaggregated Serving:** A hang may occur in disaggregated serving with context pipeline parallelism and generation tensor parallelism configurations.
 
+- **Known Vulnerabilities**
+  - This release provides security updates. For the latest NVIDIA Vulnerability Disclosure Information visit https://www.nvidia.com/en-us/security/.
+  - These vulnerabilities are present in some recent versions of TensorRT-LLM's dependencies:
+    - **PyTorch (CVE-2026-24747):** This vulnerability may involve loading malicious model data. Consider using only trusted models.
+    - **Pillow (CVE-2026-25990):** This vulnerability may involve malicious images provided at inference time. Consider sanitizing inference inputs before passing them to TensorRT-LLM.
+    - **XGrammar (CVE-2026-25048):** This vulnerability may involve malicious EBNF grammars provided at inference time. Consider sanitizing inference inputs before passing them to TensorRT-LLM.
+
 ## TensorRT-LLM Release 1.1
 
 ### Key Features and Enhancements
