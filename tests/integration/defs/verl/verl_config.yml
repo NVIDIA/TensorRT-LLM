@@ -39,7 +39,10 @@ verl_config:
     - "NVSHMEM_DIR=/usr/local/lib/python3.12/dist-packages/nvidia/nvshmem"
     - "LD_LIBRARY_PATH=\"${NVSHMEM_DIR}/lib:$LD_LIBRARY_PATH\""
     - "PATH=\"${NVSHMEM_DIR}/bin:$PATH\""
-    - "TRTLLM_TEST_MODEL_PATH_ROOT=/scratch.trt_llm_data/llm-models"
+    - "TRTLLM_TEST_MODEL_PATH_ROOT=/tmp/verl-models"
+
+  # Read-only CI model cache (flat layout: /scratch.../ModelName)
+  ci_model_cache: "/scratch.trt_llm_data/llm-models"
 
   # Models needed by verl tests (symlinks created from HF-style to CI cache paths)
   required_models:

@@ -73,18 +73,20 @@ def _clone_verl_repo(config):
 def _setup_model_symlinks(config):
     """Create symlinks from HF-style paths to CI cache paths.
 
-    Verl tests expect models at {root}/Qwen/ModelName but the CI cache
-    stores them at {root}/ModelName (flat structure).
+    Verl tests expect models at {model_root}/Qwen/ModelName but the CI cache
+    stores them at {ci_cache}/ModelName (flat structure). We create symlinks
+    in a writable staging directory that point to the read-only CI cache.
     """
     model_root = os.environ.get("TRTLLM_TEST_MODEL_PATH_ROOT", "")
-    if not model_root:
+    ci_cache = config.get("ci_model_cache", "")
+    if not model_root or not ci_cache:
         return
     for model_id in config.get("required_models", []):
         if "/" not in model_id:
             continue
         namespace, name = model_id.split("/", 1)
         ns_dir = os.path.join(model_root, namespace)
-        src = os.path.join(model_root, name)
+        src = os.path.join(ci_cache, name)
         dst = os.path.join(ns_dir, name)
         if os.path.exists(dst):
             print(f"[verl setup] Model symlink already exists: {dst}")
