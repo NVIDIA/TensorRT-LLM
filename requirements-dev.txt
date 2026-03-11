@@ -39,5 +39,8 @@ fuzzywuzzy==0.18.0
 aiperf==0.4.0
 nanobind>=2.9.0
 nixl==0.8.0
+cupti-python>=13.0,<13.2
+nvidia-cuda-cupti>=13.0,<13.2
+cxxfilt
 hf-transfer==0.1.9
 line_profiler
