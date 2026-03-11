@@ -62,8 +62,7 @@ class RayWorkerWrapper:
 
         # Per-worker DeepGemm JIT cache to avoid rename race across co-located workers
         os.environ["DG_JIT_CACHE_DIR"] = os.path.join(
-            tempfile.gettempdir(),
-            f"deep_gemm_rank{rank}_gpu{self.gpu}")
+            tempfile.gettempdir(), f"deep_gemm_rank{rank}_gpu{self.gpu}")
 
         torch.cuda.set_device(self.local_gpu)
 
