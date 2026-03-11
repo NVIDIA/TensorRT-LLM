@@ -12,7 +12,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests that TRTLLM and FlashInfer FP4 quantization kernels produce identical output."""
+"""Tests for tunable FP4 quantization (TRTLLM vs FlashInfer backends)."""
 
 import unittest
 
@@ -31,15 +31,15 @@ except ImportError:
     HAS_FLASHINFER = False
 
 
-@pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
 class TestFp4QuantizeFlashinfer(unittest.TestCase):
-    """Compare TRTLLM and FlashInfer FP4 quantization kernels."""
+    """Test tunable FP4 quantization across TRTLLM and FlashInfer backends."""
 
     def setUp(self):
         tensorrt_llm.logger.set_level("warning")
         torch.manual_seed(42)
         torch.cuda.manual_seed(42)
 
+    @pytest.mark.skipif(not HAS_FLASHINFER, reason="flashinfer not available")
     @parameterized.expand(
         [
             # [M, K, scaling_vector_size, dtype]
@@ -90,14 +90,18 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
             msg=f"FP4 quantized values differ for shape [{m}, {k}]",
         )
 
-        # Scale factors should also match exactly
-        # Handle potential shape differences by flattening
+        # Scale factors should match exactly (shape and values)
         trtllm_sf_flat = trtllm_sf.reshape(-1)
         fi_sf_flat = fi_sf.reshape(-1)
-        min_len = min(trtllm_sf_flat.shape[0], fi_sf_flat.shape[0])
+        self.assertEqual(
+            trtllm_sf_flat.numel(),
+            fi_sf_flat.numel(),
+            f"Scale factor sizes differ for shape [{m}, {k}]: "
+            f"trtllm={trtllm_sf_flat.numel()}, flashinfer={fi_sf_flat.numel()}",
+        )
         torch.testing.assert_close(
-            trtllm_sf_flat[:min_len],
-            fi_sf_flat[:min_len],
+            trtllm_sf_flat,
+            fi_sf_flat,
             atol=0,
             rtol=0,
             msg=f"Scale factors differ for shape [{m}, {k}]",
@@ -111,7 +115,7 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
         name_func=unittest_name_func,
     )
     def test_tunable_fp4_quantize_op(self, m, k, sf_vec_size, dtype):
-        """Verify the tunable custom op returns valid output."""
+        """Verify the tunable custom op returns valid output matching TRTLLM."""
         input_tensor = torch.randn([m, k], dtype=dtype, device="cuda")
 
         FP8_MAX, E2M1_MAX = 448.0, 6.0
@@ -129,12 +133,24 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
         self.assertEqual(act_fp4.shape[1], k // 2)
         self.assertEqual(act_fp4.dtype, torch.uint8)
 
-        # Compare with direct TRTLLM call
+        # Compare with direct TRTLLM call (both fp4 and scale factors)
         ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(
             input_tensor, input_scale, sf_vec_size, False
         )
 
         torch.testing.assert_close(act_fp4, ref_fp4, atol=0, rtol=0)
+        self.assertEqual(
+            act_sf.shape,
+            ref_sf.shape,
+            f"Scale factor shapes differ: tunable={act_sf.shape}, ref={ref_sf.shape}",
+        )
+        torch.testing.assert_close(
+            act_sf,
+            ref_sf,
+            atol=0,
+            rtol=0,
+            msg="Scale factors from tunable op differ from TRTLLM reference",
+        )
 
     @parameterized.expand(
         [
@@ -167,7 +183,7 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
         ref_fp4, ref_sf = torch.ops.trtllm.fp4_quantize(
             input_tensor, input_scale, sf_vec_size, False
         )
-        # Allow match with either backend (both should be numerically equivalent)
+
         if HAS_FLASHINFER:
             fi_fp4, fi_sf = flashinfer_nvfp4_quantize(
                 input_tensor,
@@ -176,14 +192,30 @@ class TestFp4QuantizeFlashinfer(unittest.TestCase):
                 sf_vec_size=sf_vec_size,
                 enable_pdl=False,
             )
+            # act_fp4 must match either backend
             matches_trtllm = torch.equal(act_fp4, ref_fp4)
             matches_flashinfer = torch.equal(act_fp4, fi_fp4)
             self.assertTrue(
                 matches_trtllm or matches_flashinfer,
-                "Autotuned result doesn't match either TRTLLM or FlashInfer",
+                "Autotuned FP4 values don't match either TRTLLM or FlashInfer",
+            )
+            # act_sf must also match the corresponding backend
+            sf_matches_trtllm = torch.equal(act_sf.reshape(-1), ref_sf.reshape(-1))
+            sf_matches_flashinfer = torch.equal(act_sf.reshape(-1), fi_sf.reshape(-1))
+            self.assertTrue(
+                sf_matches_trtllm or sf_matches_flashinfer,
+                "Autotuned scale factors don't match either TRTLLM or FlashInfer",
             )
         else:
+            # Without FlashInfer, must match TRTLLM exactly
             torch.testing.assert_close(act_fp4, ref_fp4, atol=0, rtol=0)
+            torch.testing.assert_close(
+                act_sf,
+                ref_sf,
+                atol=0,
+                rtol=0,
+                msg="Scale factors from tunable op differ from TRTLLM reference",
+            )
 
 
 if __name__ == "__main__":
