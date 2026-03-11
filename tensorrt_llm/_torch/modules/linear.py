@@ -1289,7 +1289,7 @@ class NVFP4LinearMethod(LinearMethodBase):
                 input_scale = module.input_scale
                 alpha = module.alpha
 
-            act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
+            act_fp4, act_sf = torch.ops.trtllm.tunable_fp4_quantize(
                 input, input_scale, module.scaling_vector_size, False)
             return act_fp4, act_sf, alpha
 
