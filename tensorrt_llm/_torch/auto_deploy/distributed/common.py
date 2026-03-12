@@ -133,10 +133,13 @@ def _set_distributed_env_vars(local_rank: int, world_size: int, port: int) -> No
 
 
 def _is_port_available(port: int) -> bool:
-    """Lightweight check: try to bind to the port and release immediately."""
+    """Lightweight check: try to bind to the port and release immediately.
+
+    Does NOT set SO_REUSEADDR so that ports in TIME_WAIT (from recently
+    terminated processes) are correctly rejected.
+    """
     try:
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-            s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             s.bind((_MASTER_ADDR, port))
             return True
     except OSError:

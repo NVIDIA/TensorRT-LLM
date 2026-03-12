@@ -792,8 +792,18 @@ def create_py_executor(
         assert kv_cache_creator is not None
         with allocation_scope(ExecutorMemoryType.MODEL_EXTRA):
             kv_cache_creator.configure_kv_cache_capacity(py_executor)
-        kv_cache_creator.teardown_managers(resources)
+        # Shut down the transceiver before tearing down KV cache managers so
+        # that NIXL-registered (pinned) GPU memory is deregistered first;
+        # otherwise the old KV cache memory stays pinned and the subsequent
+        # KV cache allocation will OOM.
+        try:
+            if hasattr(py_executor, 'kv_cache_transceiver'
+                       ) and py_executor.kv_cache_transceiver is not None:
+                py_executor.kv_cache_transceiver.shutdown()
+        finally:
+            kv_cache_creator.teardown_managers(resources)
         del py_executor  # free before constructing new
+        gc.collect()
 
         with allocation_scope(ExecutorMemoryType.KV_CACHE):
             # Before estimating KV cache size, a minimal KV cache has been allocated using
