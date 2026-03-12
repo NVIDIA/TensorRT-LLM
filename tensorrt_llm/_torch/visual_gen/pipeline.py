@@ -195,7 +195,7 @@ class BasePipeline(nn.Module):
         return valid_shapes, self.default_warmup_steps
 
     @property
-    def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:
+    def vae_adapter_class(self) -> Type[ParallelVAEFactory] | None:
         """Return the VAE adapter class for the pipeline."""
         return None
 
