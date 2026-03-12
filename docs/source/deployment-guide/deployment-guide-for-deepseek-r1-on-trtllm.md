@@ -446,17 +446,3 @@ The following sections help you pick a known-good `trtllm-serve --config` for yo
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
 ```
-
-### Recipe database
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-deepseek-ai/DeepSeek-R1-0528
-   :end-before: .. end-deepseek-ai/DeepSeek-R1-0528
-```
-
-```{eval-rst}
-.. include:: config_table.rst
-   :start-after: .. start-nvidia/DeepSeek-R1-0528-FP4-v2
-   :end-before: .. end-nvidia/DeepSeek-R1-0528-FP4-v2
-```

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -145,83 +145,6 @@ def build_rows(yaml_path) -> list[RecipeRow]:
     return rows
 
 
-def generate_rst(yaml_path, output_file=None):
-    rows = build_rows(yaml_path)
-    model_groups = defaultdict(list)
-    for row in rows:
-        model_groups[row.model].append(row)
-
-    lines = []
-
-    lines.append(".. start-config-table-note")
-    lines.append(".. include:: ../_includes/note_sections.rst")
-    lines.append("   :start-after: .. start-note-traffic-patterns")
-    lines.append("   :end-before: .. end-note-traffic-patterns")
-    lines.append(".. end-config-table-note")
-    lines.append("")
-
-    sorted_models = sorted(model_groups.keys())
-
-    for model in sorted_models:
-        lines.append(f".. start-{model}")
-        lines.append("")
-
-        model_display_name, model_url = _model_display_and_url(model)
-        if model_url:
-            title_text = f"`{model_display_name} <{model_url}>`_"
-        else:
-            title_text = model
-
-        lines.append(f".. _{model}:")
-        lines.append("")
-        lines.append(title_text)
-        lines.append("~" * len(title_text))
-        lines.append("")
-
-        lines.append(".. list-table::")
-        lines.append("   :width: 100%")
-        lines.append("   :header-rows: 1")
-        lines.append("   :widths: 10 15 15 13 18 29")
-        lines.append("")
-        lines.append("   * - GPU")
-        lines.append("     - Performance Profile")
-        lines.append("     - ISL / OSL")
-        lines.append("     - Concurrency")
-        lines.append("     - Config")
-        lines.append("     - Command")
-
-        entries = sorted(
-            model_groups[model],
-            key=lambda r: (
-                str(r.gpu),
-                int(r.num_gpus or 0),
-                int(r.isl or 0),
-                int(r.osl or 0),
-                int(r.concurrency or 0),
-            ),
-        )
-
-        for row in entries:
-            config_link = f"`{row.config_filename} <{row.config_github_url}>`_"
-            lines.append(f"   * - {row.gpu_display}")
-            lines.append(f"     - {row.performance_profile}")
-            lines.append(f"     - {row.isl} / {row.osl}")
-            lines.append(f"     - {row.concurrency}")
-            lines.append(f"     - {config_link}")
-            lines.append(f"     - ``{row.command}``")
-
-        lines.append("")
-        lines.append(f".. end-{model}")
-        lines.append("")
-
-    output_text = "\n".join(lines)
-    if output_file:
-        with open(output_file, "w") as f:
-            f.write(output_text)
-    else:
-        print(output_text)
-
-
 def generate_json(yaml_path, output_file):
     rows = build_rows(yaml_path)
 
@@ -255,7 +178,5 @@ if __name__ == "__main__":
     if not yaml_path.exists():
         print(f"Error: YAML file not found at {yaml_path}", file=sys.stderr)
         sys.exit(1)
-    output_path = REPO_ROOT / "docs/source/deployment-guide/config_table.rst"
     json_output_path = REPO_ROOT / "docs/source/_static/config_db.json"
-    generate_rst(yaml_path, output_file=output_path)
     generate_json(yaml_path, output_file=json_output_path)

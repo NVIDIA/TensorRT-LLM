@@ -125,12 +125,3 @@ Recipe selector
 .. include:: ../_includes/note_sections.rst
    :start-after: .. start-note-traffic-patterns
    :end-before: .. end-note-traffic-patterns
-
-.. _recipe-database:
-
-Recipe database
-^^^^^^^^^^^^^^^
-
-For a complete listing of all pre-configured model scenarios, browse the
-`configuration database on GitHub <https://github.com/NVIDIA/TensorRT-LLM/tree/main/examples/configs/database>`_
-or use the interactive recipe selector above.
