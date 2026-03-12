@@ -1,5 +1,5 @@
 import time
-from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple, Type
+from typing import TYPE_CHECKING, Any, Callable, Dict, Optional, Tuple
 
 import torch
 import torch.distributed as dist
@@ -11,8 +11,7 @@ from tensorrt_llm.mapping import Mapping
 
 from .config import PipelineComponent
 from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig, SharedGraphPool
-from .modules.vae import BaseParallelVAEAdapter
-from .parallelism import setup_parallel_vae
+from .modules.vae.parallel_vae_interface import ParallelVAEFactory
 from .teacache import TeaCacheBackend
 
 if TYPE_CHECKING:
@@ -109,11 +108,6 @@ class BasePipeline(nn.Module):
         """
         return []
 
-    @property
-    def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:
-        """Return the VAE adapter class for the pipeline."""
-        return None
-
     def infer(self, req: Any):
         raise NotImplementedError
 
@@ -207,27 +201,28 @@ class BasePipeline(nn.Module):
         if self.vae is None:
             return
 
-        adapter_cls = self.vae_adapter_class
-        if adapter_cls is None:
+        # Uses all ranks today; replace with a subset to dedicate specific ranks to VAE.
+        pg = dist.new_group(list(range(dist.get_world_size())))
+        try:
+            self.vae = ParallelVAEFactory.from_vae(
+                self.vae,
+                split_dim=self.model_config.parallel.parallel_vae_split_dim,
+                pg=pg,
+            )
+        except ValueError:
             logger.warning(
-                f"Parallel VAE not supported for {self.__class__.__name__}. "
-                "Implement vae_adapter_class in your pipeline to enable parallel VAE."
+                f"Parallel VAE not supported for {self.__class__.__name__} "
+                f"(VAE type: {type(self.vae).__name__}). "
+                "Add an entry to ParallelVAEFactory._LAZY_REGISTRY to enable "
+                "parallel VAE for this VAE type."
             )
             return
 
-        vae_rank, vae_world_size, adj_groups = setup_parallel_vae(self.model_config)
-        adapter_cls(
-            self.vae,
-            self.model_config.parallel.parallel_vae_split_dim,
-            vae_rank,
-            vae_world_size,
-            adj_groups,
-        )
         self._parallel_vae_enabled = True
         logger.info(
-            f"Parallel VAE enabled: {adapter_cls.__name__}, "
+            f"Parallel VAE enabled: {type(self.vae).__name__}, "
             f"split_dim={self.model_config.parallel.parallel_vae_split_dim}, "
-            f"world_size={vae_world_size}"
+            f"world_size={dist.get_world_size(pg)}"
         )
 
     def torch_compile(self) -> None:
