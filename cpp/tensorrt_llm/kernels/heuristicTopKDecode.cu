@@ -39,17 +39,16 @@ using heuristic_topk::TOP_K;
 
 // Multi-row kernel: thin wrapper that computes per-row parameters,
 // then calls heuristicTopKJob (independently optimized device function).
-__global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(
-    float const* __restrict__ logits, int const* __restrict__ seqLens, int const* __restrict__ preIdx,
-    float* __restrict__ scratchValues, int* __restrict__ outIndices, int stride0, int next_n, int topK,
-    int preIdxStride, int preIdxCount)
+__global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(float const* __restrict__ logits,
+    int const* __restrict__ seqLens, int const* __restrict__ preIdx, float* __restrict__ scratchValues,
+    int* __restrict__ outIndices, int stride0, int next_n, int topK, int preIdxStride, int preIdxCount)
 {
     int const rowIdx = blockIdx.x;
     int const seq_len = seqLens[rowIdx / next_n];
     int const N = seq_len - next_n + (rowIdx % next_n) + 1;
 
     float const* __restrict__ input = logits + static_cast<int64_t>(rowIdx) * stride0;
-    int const* __restrict__ rowPreIdx = preIdx + static_cast<int64_t>(rowIdx) * preIdxStride;
+    int const* __restrict__ rowPreIdx = preIdx + static_cast<int64_t>(rowIdx / next_n) * preIdxStride;
     float* __restrict__ outputValues = scratchValues + static_cast<int64_t>(rowIdx) * topK;
     int* __restrict__ outputIndices = outIndices + static_cast<int64_t>(rowIdx) * topK;
 
@@ -77,8 +76,8 @@ __global__ void __launch_bounds__(BLOCK_SIZE) heuristicTopKMultiRowKernel(
 
 } // anonymous namespace
 
-void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices,
-    int stride0, int next_n, int topK, int preIdxStride, int preIdxCount, int numRows, cudaStream_t stream)
+void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int const* preIdx, int* outIndices, int stride0,
+    int next_n, int topK, int preIdxStride, int preIdxCount, int numRows, cudaStream_t stream)
 {
     size_t const smemSize = sizeof(KernelSmem);
 
@@ -91,8 +90,8 @@ void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int cons
         cudaDeviceGetAttribute(&maxSmem, cudaDevAttrMaxSharedMemoryPerBlockOptin, device);
         if (smemSize > 48u * 1024u && smemSize <= static_cast<size_t>(maxSmem))
         {
-            cudaFuncSetAttribute(heuristicTopKMultiRowKernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
-                static_cast<int>(smemSize));
+            cudaFuncSetAttribute(
+                heuristicTopKMultiRowKernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smemSize));
         }
         configured = true;
     }
@@ -118,9 +117,8 @@ void launchHeuristicTopKDecode(float const* logits, int const* seqLens, int cons
         kernelStride = alignedStride;
     }
 
-    heuristicTopKMultiRowKernel<<<numRows, BLOCK_SIZE, smemSize, stream>>>(
-        kernelLogits, seqLens, preIdx, scratchValues, outIndices, kernelStride, next_n, topK, preIdxStride,
-        preIdxCount);
+    heuristicTopKMultiRowKernel<<<numRows, BLOCK_SIZE, smemSize, stream>>>(kernelLogits, seqLens, preIdx, scratchValues,
+        outIndices, kernelStride, next_n, topK, preIdxStride, preIdxCount);
 
     cudaFreeAsync(scratchValues, stream);
     if (alignedLogits)
