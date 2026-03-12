@@ -30,6 +30,7 @@ set(SRCS
     capacityScheduler.cpp
     createNewDecoderRequests.cpp
     contextProgress.cpp
+    cudaVmmArena.cpp
     dataTransceiver.cpp
     decoderBuffers.cpp
     encoderBuffers.cpp
