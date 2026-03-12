@@ -80,14 +80,14 @@ __device__ __forceinline__ float4 get_neg_zero()
     return vec;
 }
 
-// __device__ __forceinline__ float4 ld_global_volatile(float4* addr)
-// {
-//     float4 val;
-//     asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
-//                  : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
-//                  : "l"(addr));
-//     return val;
-// }
+__device__ __forceinline__ float4 ld_global_volatile(float4* addr)
+{
+    float4 val;
+    asm volatile("ld.volatile.global.v4.f32 {%0, %1, %2, %3}, [%4];"
+                 : "=f"(val.x), "=f"(val.y), "=f"(val.z), "=f"(val.w)
+                 : "l"(addr));
+    return val;
+}
 
 __device__ __forceinline__ float ld_global_volatile(float* addr)
 {
@@ -245,6 +245,157 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
 #endif
 }
 
+/**
+ * Float4 variant: process 4 rows at once, allreduce variance sums as float4 for better memory coalescing.
+ * sum_variance is always float; applies to all DTypes (half, bf16, float).
+ * When tot_tokens % 4 != 0, the last group pads rows with zeros; padded rows are not written to rms_norm_out.
+ */
+template <typename DType, int NRanks, bool TriggerCompletionAtEnd = true>
+__global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4(MiniMaxReduceRMSParams params)
+{
+    int tot_tokens = params.size / params.hidden_dim;
+    int tot_groups = (tot_tokens + 3) / 4; // ceiling: last group may have 1-3 valid rows
+    int access_per_row = params.hidden_dim / kElemsPerAccess<DType>;
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    namespace cg = cooperative_groups;
+    cg::cluster_group cluster = cg::this_cluster();
+    cg::grid_group grid = cg::this_grid();
+    int group_id = grid.cluster_rank();
+    int access_id_in_token = cluster.thread_rank();
+    int group_stride = grid.num_clusters();
+#else
+    int group_id = blockIdx.x;
+    int access_id_in_token = threadIdx.x;
+    int group_stride = gridDim.x;
+#endif
+    float4 clear_vec = get_neg_zero();
+
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    cudaGridDependencySynchronize();
+    if constexpr (!TriggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+    LamportComm<NRanks> comm(params.workspace, params.rank);
+
+    for (int g = group_id; g < tot_groups; g += group_stride)
+    {
+        alignas(16) DType vals[4][kElemsPerAccess<DType>];
+        float sum_variance[4] = {0.F, 0.F, 0.F, 0.F};
+
+        // Load 4 rows and compute partial sum of squares per row (sum_variance always float)
+        for (int r = 0; r < 4; ++r)
+        {
+            int token_r = g * 4 + r;
+            if (token_r < tot_tokens)
+            {
+                int idx_r = token_r * access_per_row + access_id_in_token;
+                *reinterpret_cast<float4*>(&vals[r][0]) = reinterpret_cast<float4 const*>(params.allreduce_in)[idx_r];
+#pragma unroll
+                for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+                {
+                    sum_variance[r] += static_cast<float>(vals[r][i]) * static_cast<float>(vals[r][i]);
+                }
+            }
+            else
+            {
+                *reinterpret_cast<float4*>(&vals[r][0]) = make_float4(0.F, 0.F, 0.F, 0.F);
+                sum_variance[r] = 0.F;
+            }
+        }
+
+        tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_variance);
+#pragma unroll
+        for (int r = 0; r < 4; ++r)
+        {
+            if (is_neg_zero(sum_variance[r]))
+            {
+                sum_variance[r] = 0.F;
+            }
+        }
+
+        // Allreduce: write float4, volatile read float4 from each rank, component-wise sum
+        if (threadIdx.x == 0)
+        {
+            float4 sum4;
+            sum4.x = sum_variance[0];
+            sum4.y = sum_variance[1];
+            sum4.z = sum_variance[2];
+            sum4.w = sum_variance[3];
+            for (int r = 0; r < NRanks; ++r)
+            {
+                reinterpret_cast<float4*>(comm.data_bufs[r])[(params.rank * tot_groups) + g] = sum4;
+            }
+        }
+
+        bool done = false;
+        float4 vars_all_ranks[NRanks];
+        while (!done)
+        {
+            done = true;
+#pragma unroll
+            for (int r = 0; r < NRanks; ++r)
+            {
+                vars_all_ranks[r]
+                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[(r * tot_groups) + g]);
+                done &= !is_neg_zero(vars_all_ranks[r]);
+            }
+        }
+
+        sum_variance[0] = 0.F;
+        sum_variance[1] = 0.F;
+        sum_variance[2] = 0.F;
+        sum_variance[3] = 0.F;
+#pragma unroll
+        for (int r = 0; r < NRanks; ++r)
+        {
+            sum_variance[0] += vars_all_ranks[r].x;
+            sum_variance[1] += vars_all_ranks[r].y;
+            sum_variance[2] += vars_all_ranks[r].z;
+            sum_variance[3] += vars_all_ranks[r].w;
+        }
+
+        // Load norm weight (same column for all 4 rows)
+        __nv_bfloat16 norm_weight[kElemsPerAccess<DType>];
+        *reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type*>(norm_weight)
+            = reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type const*>(
+                params.rms_gamma)[access_id_in_token];
+
+        // RMS norm and store 4 rows (skip write for padded rows)
+        for (int r = 0; r < 4; ++r)
+        {
+            int token_r = g * 4 + r;
+            if (token_r >= tot_tokens)
+            {
+                continue;
+            }
+            float scale = rsqrtf((sum_variance[r] / static_cast<float>(params.hidden_dim) / NRanks) + params.rms_eps);
+#pragma unroll
+            for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+            {
+                vals[r][i]
+                    = static_cast<DType>(static_cast<float>(vals[r][i]) * scale * static_cast<float>(norm_weight[i]));
+            }
+            int idx_out = token_r * access_per_row + access_id_in_token;
+            reinterpret_cast<float4*>(params.rms_norm_out)[idx_out] = *reinterpret_cast<float4*>(&vals[r][0]);
+        }
+    }
+
+    // Clear comm buffer (tot_groups float4s per rank)
+    for (int g = group_id; g < tot_groups; g += group_stride)
+    {
+        reinterpret_cast<float4*>(comm.clear_buf)[g] = clear_vec;
+    }
+    comm.update(params.size * NRanks);
+#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
+    if constexpr (TriggerCompletionAtEnd)
+    {
+        cudaTriggerProgrammaticLaunchCompletion();
+    }
+#endif
+}
+
 int get_sm_count()
 {
     static int sm_count = 0;
@@ -301,20 +452,93 @@ void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params)
     }
 }
 
+template <typename DType, int NRanks>
+void minimax_reduce_rms_kernel_launcher_float4(MiniMaxReduceRMSParams const& params)
+{
+    TLLM_CHECK(params.size % params.hidden_dim == 0);
+    TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
+    int token_num = params.size / params.hidden_dim;
+    int tot_groups = (token_num + 3) / 4; // ceiling
+    if (tot_groups == 0)
+    {
+        return;
+    }
+    static int SM = tensorrt_llm::common::getSMVersion();
+    int sm_count = get_sm_count();
+    int cluster_size = 1;
+    int cluster_num = tot_groups;
+    int threads_per_token = params.hidden_dim / kElemsPerAccess<DType>;
+    int block_size = threads_per_token;
+    int grid_size = (std::min(sm_count, cluster_num * cluster_size) / cluster_size) * cluster_size;
+
+    cudaLaunchConfig_t cfg;
+    cfg.gridDim = grid_size;
+    cfg.blockDim = block_size;
+    cfg.dynamicSmemBytes = 0;
+    cfg.stream = params.stream;
+
+    cudaLaunchAttribute attribute[2];
+    attribute[0].id = cudaLaunchAttributeProgrammaticStreamSerialization;
+    attribute[0].val.programmaticStreamSerializationAllowed = tensorrt_llm::common::getEnvEnablePDL() ? 1 : 0;
+    attribute[1].id = cudaLaunchAttributeClusterDimension;
+    attribute[1].val.clusterDim.x = cluster_size;
+    attribute[1].val.clusterDim.y = 1;
+    attribute[1].val.clusterDim.z = 1;
+    cfg.attrs = attribute;
+    cfg.numAttrs = SM >= 90 ? 2 : 0;
+
+    bool trigger_completion_at_end = params.trigger_completion_at_end;
+    if (trigger_completion_at_end)
+    {
+        TLLM_CUDA_CHECK(
+            cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, true>, params));
+    }
+    else
+    {
+        TLLM_CUDA_CHECK(
+            cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, false>, params));
+    }
+}
+
 template <int NRanks>
 void dispatch_dtype(MiniMaxReduceRMSParams const& params)
 {
+    int token_num = params.size / params.hidden_dim;
+    constexpr int kFloat4MinTokens = 32;
+    bool use_float4 = (token_num >= kFloat4MinTokens);
+
     if (params.dtype == nvinfer1::DataType::kHALF)
     {
-        minimax_reduce_rms_kernel_launcher<half, NRanks>(params);
+        if (use_float4)
+        {
+            minimax_reduce_rms_kernel_launcher_float4<half, NRanks>(params);
+        }
+        else
+        {
+            minimax_reduce_rms_kernel_launcher<half, NRanks>(params);
+        }
     }
     else if (params.dtype == nvinfer1::DataType::kBF16)
     {
-        minimax_reduce_rms_kernel_launcher<__nv_bfloat16, NRanks>(params);
+        if (use_float4)
+        {
+            minimax_reduce_rms_kernel_launcher_float4<__nv_bfloat16, NRanks>(params);
+        }
+        else
+        {
+            minimax_reduce_rms_kernel_launcher<__nv_bfloat16, NRanks>(params);
+        }
     }
     else if (params.dtype == nvinfer1::DataType::kFLOAT)
     {
-        minimax_reduce_rms_kernel_launcher<float, NRanks>(params);
+        if (use_float4)
+        {
+            minimax_reduce_rms_kernel_launcher_float4<float, NRanks>(params);
+        }
+        else
+        {
+            minimax_reduce_rms_kernel_launcher<float, NRanks>(params);
+        }
     }
     else
     {
