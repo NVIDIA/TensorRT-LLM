@@ -77,6 +77,34 @@ class OpenAIBaseModel(BaseModel):
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
+class ThinkingParams(OpenAIBaseModel):
+    """Parameters for controlling interleaved thinking in reasoning models."""
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+    type: Literal["enabled", "disabled"] = "enabled"
+    budget_tokens: Optional[int] = Field(
+        default=None,
+        description=("Maximum number of thinking tokens the model may produce. "
+                     "Passed to the chat template as `thinking_budget`."),
+    )
+
+
+class ThinkingContentBlock(OpenAIBaseModel):
+    """A content block containing thinking/reasoning text."""
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["thinking"] = "thinking"
+    thinking: str
+
+
+class TextContentBlock(OpenAIBaseModel):
+    """A content block containing regular text."""
+    model_config = ConfigDict(extra="forbid")
+    type: Literal["text"] = "text"
+    text: str
+
+
+ContentBlock = Union[ThinkingContentBlock, TextContentBlock]
+
+
 class StreamOptions(OpenAIBaseModel):
     include_usage: Optional[bool] = True
     continuous_usage_stats: Optional[bool] = False
@@ -495,7 +523,7 @@ class DeltaToolCall(OpenAIBaseModel):
 
 class ChatMessage(OpenAIBaseModel):
     role: str
-    content: Optional[str] = None
+    content: Optional[Union[str, List[ContentBlock]]] = None
     reasoning_content: Optional[str] = None
     reasoning: Optional[str] = None
     tool_calls: List[ToolCall] = Field(default_factory=list)
@@ -589,7 +617,7 @@ class ChatCompletionResponse(OpenAIBaseModel):
 
 class DeltaMessage(OpenAIBaseModel):
     role: Optional[str] = None
-    content: Optional[str] = None
+    content: Optional[Union[str, List[ContentBlock]]] = None
     reasoning_content: Optional[str] = None
     # For GPT-OSS style reasoning
     reasoning: Optional[str] = None
@@ -669,6 +697,15 @@ class ChatCompletionRequest(OpenAIBaseModel):
                 "reasoning is shown in the model's response. Options: "
                 "'low', 'medium', 'high'."),
         )
+    thinking: Optional[ThinkingParams] = Field(
+        default=None,
+        description=(
+            "Controls interleaved thinking for reasoning models. "
+            "When type is 'enabled', the model's thinking/reasoning tokens "
+            "are included in the response as typed content blocks. "
+            "When type is 'disabled', thinking tokens are suppressed. "
+            "When not set, the existing reasoning_content behavior is used."),
+    )
     prompt_ignore_length: Optional[int] = 0
 
     # doc: begin-chat-completion-sampling-params

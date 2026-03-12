@@ -1,12 +1,23 @@
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from typing import Any, Optional, Type
+from dataclasses import dataclass, field
+from typing import Any, List, Literal, Optional, Type
+
+
+@dataclass
+class ContentBlock:
+    """Typed content block for interleaved thinking responses."""
+    type: Literal["thinking", "text"]
+    content: str
 
 
 @dataclass
 class ReasoningParserResult:
     content: str = ""
     reasoning_content: str = ""
+    # For interleaved thinking: the ordered list of content blocks.
+    content_blocks: List[ContentBlock] = field(default_factory=list)
+    # For streaming: indicates what type of content the current delta belongs to.
+    current_block_type: Optional[Literal["thinking", "text"]] = None
 
 
 def register_reasoning_parser(*keys: str, **default_kwargs):
@@ -69,6 +80,21 @@ class BaseReasoningParser(ABC):
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         raise NotImplementedError
 
+    def parse_to_blocks(self, text: str) -> List[ContentBlock]:
+        """Parse text into a list of interleaved thinking/text content blocks.
+
+        Default implementation delegates to parse() and converts to blocks.
+        Subclasses may override for more accurate multi-block parsing.
+        """
+        result = self.parse(text)
+        blocks: List[ContentBlock] = []
+        if result.reasoning_content:
+            blocks.append(
+                ContentBlock(type="thinking", content=result.reasoning_content))
+        if result.content:
+            blocks.append(ContentBlock(type="text", content=result.content))
+        return blocks
+
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
 @register_reasoning_parser("qwen3")
@@ -117,6 +143,84 @@ class DeepSeekR1Parser(BaseReasoningParser):
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)
 
+    def parse_to_blocks(self, text: str) -> List[ContentBlock]:
+        """Parse text into interleaved thinking/text content blocks.
+
+        Handles multiple <think>...</think> blocks, producing alternating
+        thinking and text blocks while preserving ordering.
+        """
+        blocks: List[ContentBlock] = []
+        remaining = text
+        in_reasoning = self.reasoning_at_start
+
+        if in_reasoning:
+            # Text starts in reasoning mode (e.g., deepseek-r1)
+            end_idx = remaining.find(self.reasoning_end)
+            if end_idx == -1:
+                # Entire text is reasoning
+                if remaining:
+                    blocks.append(
+                        ContentBlock(type="thinking", content=remaining))
+                return blocks
+            thinking_text = remaining[:end_idx]
+            if thinking_text:
+                blocks.append(
+                    ContentBlock(type="thinking", content=thinking_text))
+            remaining = remaining[end_idx + len(self.reasoning_end):]
+        else:
+            # For models like qwen3 where reasoning doesn't start immediately,
+            # find the first <think> tag
+            start_idx = remaining.find(self.reasoning_start)
+            if start_idx == -1:
+                # No thinking blocks at all
+                if remaining:
+                    blocks.append(ContentBlock(type="text", content=remaining))
+                return blocks
+            # Text before first <think> is dropped (consistent with parse())
+            remaining = remaining[start_idx + len(self.reasoning_start):]
+            end_idx = remaining.find(self.reasoning_end)
+            if end_idx == -1:
+                if remaining:
+                    blocks.append(
+                        ContentBlock(type="thinking", content=remaining))
+                return blocks
+            thinking_text = remaining[:end_idx]
+            if thinking_text:
+                blocks.append(
+                    ContentBlock(type="thinking", content=thinking_text))
+            remaining = remaining[end_idx + len(self.reasoning_end):]
+
+        # Process remaining text for interleaved blocks
+        while remaining:
+            start_idx = remaining.find(self.reasoning_start)
+            if start_idx == -1:
+                # No more thinking blocks, rest is text
+                if remaining:
+                    blocks.append(ContentBlock(type="text", content=remaining))
+                break
+
+            # Text before the next <think> tag
+            text_before = remaining[:start_idx]
+            if text_before:
+                blocks.append(ContentBlock(type="text", content=text_before))
+
+            remaining = remaining[start_idx + len(self.reasoning_start):]
+            end_idx = remaining.find(self.reasoning_end)
+            if end_idx == -1:
+                # Unclosed thinking block
+                if remaining:
+                    blocks.append(
+                        ContentBlock(type="thinking", content=remaining))
+                break
+
+            thinking_text = remaining[:end_idx]
+            if thinking_text:
+                blocks.append(
+                    ContentBlock(type="thinking", content=thinking_text))
+            remaining = remaining[end_idx + len(self.reasoning_end):]
+
+        return blocks
+
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         self._buffer += delta_text
         delta_text = self._buffer
@@ -131,7 +235,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
             begin_idx = delta_text.find(self.reasoning_start)
             if begin_idx == -1:
                 self._buffer = ""
-                return ReasoningParserResult(content=delta_text)
+                return ReasoningParserResult(content=delta_text,
+                                             current_block_type="text")
             self.in_reasoning = True
             # set reasoning_content, will be processed by the next block
             reasoning_content = delta_text[begin_idx +
@@ -150,13 +255,18 @@ class DeepSeekR1Parser(BaseReasoningParser):
                     self._buffer = ""
                     reasoning_content = delta_text
                 return ReasoningParserResult(
-                    reasoning_content=reasoning_content)
+                    reasoning_content=reasoning_content,
+                    current_block_type="thinking")
             reasoning_content = delta_text[:end_idx]
             content = delta_text[end_idx + len(self.reasoning_end):]
             self.in_reasoning = False
             self._buffer = ""
+            # Determine block type: if there's content after </think>, it's text;
+            # if only reasoning, it's thinking
+            block_type = "text" if content else "thinking"
             return ReasoningParserResult(content=content,
-                                         reasoning_content=reasoning_content)
+                                         reasoning_content=reasoning_content,
+                                         current_block_type=block_type)
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
 

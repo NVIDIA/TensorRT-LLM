@@ -32,8 +32,10 @@ from .openai_protocol import (ChatCompletionLogProbs,
                               CompletionStreamResponse, DeltaFunctionCall,
                               DeltaMessage, DeltaToolCall, FunctionCall,
                               PromptTokensDetails, ResponsesRequest,
-                              ResponsesResponse, StreamOptions, ToolCall,
-                              UsageInfo, to_disaggregated_params)
+                              ResponsesResponse, StreamOptions,
+                              TextContentBlock, ThinkingContentBlock,
+                              ThinkingParams, ToolCall, UsageInfo,
+                              to_disaggregated_params)
 from .tool_parser.base_tool_parser import BaseToolParser
 from .tool_parser.core_types import ToolCallItem
 from .tool_parser.tool_parser_factory import ToolParserFactory
@@ -62,6 +64,7 @@ class ChatPostprocArgs(PostprocArgs):
     has_tool_call: dict[int, bool] = field(default_factory=dict)
     tool_call_id_type: str = "random"
     chat_template_kwargs: Optional[dict[str, Any]] = None
+    thinking: Optional[ThinkingParams] = None
 
     @classmethod
     def from_request(cls, request: ChatCompletionRequest):
@@ -77,6 +80,7 @@ class ChatPostprocArgs(PostprocArgs):
             return_logprobs=bool(request.logprobs),
             top_logprobs=bool(request.top_logprobs),
             chat_template_kwargs=request.chat_template_kwargs,
+            thinking=request.thinking,
         )
 
 
@@ -111,16 +115,21 @@ def create_logprobs(token_ids: List[int], tokenizer: TransformersTokenizer,
     return chat_logprobs
 
 
+def _get_or_create_reasoning_parser(args: ChatPostprocArgs, output_index: int):
+    """Get or create a reasoning parser for the given output index."""
+    if args.reasoning_parser is None:
+        return None
+    if output_index not in args.reasoning_parser_dict:
+        chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
+        args.reasoning_parser_dict[
+            output_index] = ReasoningParserFactory.create_reasoning_parser(
+                args.reasoning_parser, chat_template_kwargs)
+    return args.reasoning_parser_dict[output_index]
+
+
 def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
                            streaming: bool) -> Tuple[str, str]:
-    reasoning_parser = None
-    if args.reasoning_parser is not None:
-        if output_index not in args.reasoning_parser_dict:
-            chat_template_kwargs = getattr(args, "chat_template_kwargs", None)
-            args.reasoning_parser_dict[
-                output_index] = ReasoningParserFactory.create_reasoning_parser(
-                    args.reasoning_parser, chat_template_kwargs)
-        reasoning_parser = args.reasoning_parser_dict[output_index]
+    reasoning_parser = _get_or_create_reasoning_parser(args, output_index)
 
     if reasoning_parser is not None:
         if not streaming:
@@ -132,6 +141,40 @@ def apply_reasoning_parser(args: ChatPostprocArgs, output_index: int, text: str,
         content, reasoning_content = text, ""
 
     return content, reasoning_content
+
+
+def apply_reasoning_parser_with_blocks(args: ChatPostprocArgs,
+                                       output_index: int, text: str,
+                                       streaming: bool) -> Tuple[str, str, Any]:
+    """Apply reasoning parser and return content, reasoning_content, and extra info.
+
+    When thinking is enabled:
+    - For non-streaming: returns (content, reasoning_content, content_blocks)
+    - For streaming: returns (content, reasoning_content, current_block_type)
+    When thinking is not enabled:
+    - Returns (content, reasoning_content, None)
+    """
+    reasoning_parser = _get_or_create_reasoning_parser(args, output_index)
+    thinking_enabled = (args.thinking is not None
+                        and args.thinking.type == "enabled")
+
+    if reasoning_parser is not None:
+        if not streaming:
+            if thinking_enabled:
+                content_blocks = reasoning_parser.parse_to_blocks(text)
+                result = reasoning_parser.parse(text)
+                return result.content, result.reasoning_content, content_blocks
+            else:
+                result = reasoning_parser.parse(text)
+                return result.content, result.reasoning_content, None
+        else:
+            result = reasoning_parser.parse_delta(text)
+            if thinking_enabled:
+                return (result.content, result.reasoning_content,
+                        result.current_block_type)
+            return result.content, result.reasoning_content, None
+    else:
+        return text, "", None
 
 
 def apply_tool_parser(args: ChatPostprocArgs, output_index: int, text: str,
@@ -205,6 +248,9 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                 )
         args.first_iteration = False
 
+    thinking_enabled = (args.thinking is not None
+                        and args.thinking.type == "enabled")
+
     for output in rsp.outputs:
         i = output.index
 
@@ -213,8 +259,8 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
 
         delta_text = output.text_diff
 
-        delta_text, reasoning_delta_text = apply_reasoning_parser(
-            args, i, delta_text, True)
+        delta_text, reasoning_delta_text, block_type = \
+            apply_reasoning_parser_with_blocks(args, i, delta_text, True)
 
         if args.tool_choice and type(
                 args.tool_choice) is ChatCompletionNamedToolChoiceParam:
@@ -253,10 +299,22 @@ def chat_stream_post_processor(rsp: GenerationResultBase,
                         ),
                     ))
             if tool_calls or delta_text or reasoning_delta_text or output.finish_reason:
-                delta_message = DeltaMessage(
-                    content=delta_text,
-                    reasoning_content=reasoning_delta_text,
-                    tool_calls=tool_calls if tool_calls else None)
+                if thinking_enabled and block_type is not None:
+                    # Use typed content blocks for interleaved thinking
+                    content_blocks = []
+                    if reasoning_delta_text:
+                        content_blocks.append(
+                            ThinkingContentBlock(thinking=reasoning_delta_text))
+                    if delta_text:
+                        content_blocks.append(TextContentBlock(text=delta_text))
+                    delta_message = DeltaMessage(
+                        content=content_blocks if content_blocks else None,
+                        tool_calls=tool_calls if tool_calls else None)
+                else:
+                    delta_message = DeltaMessage(
+                        content=delta_text,
+                        reasoning_content=reasoning_delta_text,
+                        tool_calls=tool_calls if tool_calls else None)
             else:
                 continue
 
@@ -315,9 +373,11 @@ def chat_response_post_processor(
         args: ChatPostprocArgs) -> ChatCompletionResponse:
     choices: List[ChatCompletionResponseChoice] = []
     role = args.role
+    thinking_enabled = (args.thinking is not None
+                        and args.thinking.type == "enabled")
     for output in rsp.outputs:
-        text, reasoning_text = apply_reasoning_parser(args, output.index,
-                                                      output.text, False)
+        text, reasoning_text, extra = apply_reasoning_parser_with_blocks(
+            args, output.index, output.text, False)
 
         if args.tool_choice and isinstance(args.tool_choice,
                                            ChatCompletionNamedToolChoiceParam):
@@ -337,10 +397,22 @@ def chat_response_post_processor(
                                                arguments=call.parameters))
                 for call in calls
             ]
-            message = ChatMessage(role=role,
-                                  content=text,
-                                  reasoning_content=reasoning_text,
-                                  tool_calls=tool_calls)
+            if thinking_enabled and extra is not None:
+                # extra is content_blocks from parse_to_blocks
+                content_blocks = [
+                    ThinkingContentBlock(thinking=b.content) if b.type
+                    == "thinking" else TextContentBlock(text=b.content)
+                    for b in extra
+                ]
+                message = ChatMessage(
+                    role=role,
+                    content=content_blocks if content_blocks else text,
+                    tool_calls=tool_calls)
+            else:
+                message = ChatMessage(role=role,
+                                      content=text,
+                                      reasoning_content=reasoning_text,
+                                      tool_calls=tool_calls)
         disaggregated_params = to_disaggregated_params(
             output.disaggregated_params)
         choice = ChatCompletionResponseChoice(

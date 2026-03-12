@@ -820,6 +820,17 @@ class OpenAIServer:
             disaggregated_params = to_llm_disaggregated_params(
                 request.disaggregated_params)
 
+            # Handle interleaved thinking parameters
+            chat_template_kwargs = dict(request.chat_template_kwargs or {})
+            if request.thinking is not None:
+                if request.thinking.type == "enabled":
+                    chat_template_kwargs.setdefault("enable_thinking", True)
+                    if request.thinking.budget_tokens is not None:
+                        chat_template_kwargs.setdefault(
+                            "thinking_budget", request.thinking.budget_tokens)
+                elif request.thinking.type == "disabled":
+                    chat_template_kwargs.setdefault("enable_thinking", False)
+
             try:
                 conversation, mm_coroutines, mm_placeholder_counts = parse_chat_messages_coroutines(
                     request.messages, self.model_config,
@@ -845,7 +856,7 @@ class OpenAIServer:
                     tools=tool_dicts,
                     documents=request.documents,
                     chat_template=request.chat_template or self.chat_template,
-                    chat_template_kwargs=request.chat_template_kwargs or {},
+                    chat_template_kwargs=chat_template_kwargs,
                 )
             prompt = prompt_inputs(prompt)
 
@@ -862,6 +873,9 @@ class OpenAIServer:
             postproc_args.reasoning_parser = self.generator.args.reasoning_parser
             postproc_args.tool_parser = self.tool_parser
             postproc_args.tool_call_id_type = self.tool_call_id_type
+            # Update chat_template_kwargs on postproc_args to include
+            # thinking-derived kwargs for the reasoning parser.
+            postproc_args.chat_template_kwargs = chat_template_kwargs
             if conversation and conversation[-1].get(
                     "content") and conversation[-1].get("role") == get_role():
                 postproc_args.last_message_content = conversation[-1]["content"]
