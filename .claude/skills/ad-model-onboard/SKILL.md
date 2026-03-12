@@ -159,6 +159,21 @@ See `examples/auto_deploy/model_registry/README.md` for full documentation on th
 
 ## Phase 9 — AutoDeploy End-to-End Run
 
+### ⚠️ MANDATORY: You MUST use `build_and_run_ad.py --use-registry` EXACTLY AS-IS ⚠️
+
+**You MUST run the model using the model registry YAML configs. No exceptions. No workarounds. No manual `--args.yaml-extra` overrides. The command is:**
+
+```bash
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+```
+
+**The `--use-registry` flag resolves ALL configuration from the model's entry in `examples/auto_deploy/model_registry/models.yaml` and its referenced YAML files under `examples/auto_deploy/model_registry/configs/`. This is the production path. You MUST validate the model works through it.**
+
+**If the run FAILS with `--use-registry`:**
+1. **DO NOT bypass the registry.** DO NOT fall back to manual `--args.yaml-extra` flags.
+2. Instead, **fix the registry configs** — update the model's entry in `models.yaml`, modify or create config YAMLs under `configs/`, and re-run with `--use-registry` again.
+3. The registry configs are the source of truth. If they are wrong, fix them. If they are missing, add them. The model MUST work via `--use-registry` before you are done.
+
 Invoke the `ad-run-agent` subagent to run the model through AutoDeploy on GPU. Pass it:
 
 Step 1: Reduced num layers
@@ -175,24 +190,34 @@ Run with full num layers. The generation should be coherent in step 2.
   - "changed attention backend to torch_mha"
   - "fixed weight loading hooks"
 
-The model is run via:
-```bash
-CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
-```
-The `--use-registry` flag automatically resolves the model's config from `models.yaml`, so no manual `--args.yaml-extra` is needed. The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
+The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
 
 The ad-run-agent will build+run the model, check generation quality, archive logs, and update its worklog.
 
 If the run **fails** or produces **bad generation**:
 1. Read the ad-run-agent's worklog and log file to understand the error
-2. Fix the issue (model code, registry config yaml, weight hooks, etc.)
+2. Fix the issue (model code, **registry config yaml**, weight hooks, etc.)
 3. Re-invoke the ad-run-agent with an updated description reflecting the change (e.g., "retry after fixing RoPE scaling in config")
-4. Repeat until the run succeeds with meaningful generation
+4. **Always re-run with `--use-registry`.** Never bypass the registry.
+5. Repeat until the run succeeds with meaningful generation
 
 Do NOT proceed to Phase 10 until the step 2 with full layers reports a successful run with coherent generation.
 
 ## Phase 10 — Summary Report
-Print (not file) after completion: (1) model overview + unique features, (2) tricky parts needing human review, (3) files created/modified (including any new registry configs), (4) test results table (name | validates | PASS/FAIL), (5) known limitations, (6) reviewer result (PASS + how many review iterations it took), (7) AD end-to-end run result (success/fail, number of iterations, final generation quality), (8) registry entry added/updated in `models.yaml` and any new config YAMLs created.
+
+### ⚠️ MANDATORY: You MUST include ALL raw prompts and generated outputs from the final `build_and_run_ad.py` run ⚠️
+
+Print (not file) after completion:
+
+1. Model overview + unique features
+2. Tricky parts needing human review
+3. Files created/modified (including any new registry configs)
+4. Test results table (name | validates | PASS/FAIL)
+5. Known limitations
+6. Reviewer result (PASS + how many review iterations it took)
+7. AD end-to-end run result (success/fail, number of iterations, final generation quality)
+8. Registry entry added/updated in `models.yaml` and any new config YAMLs created
+9. **ALL raw prompts and their corresponding generated outputs from the final successful `build_and_run_ad.py --use-registry` run.** Copy-paste the COMPLETE prompt→output pairs verbatim from the run log. Do NOT summarize, truncate, or paraphrase them. The user needs to see exactly what the model generated to judge quality.
 
 ## Phase 11 — Prepare a Pull Request
 
@@ -202,13 +227,13 @@ Prepare a pull request against `origin` (https://github.com/nv-auto-deploy/Tenso
 branch `feat/paperclip_maximizer`. Then, ask the user to provide feedback on the PR and wait for the
 user to get back to you when the feedback has been posted. Then continue iterating according to the
 user's feedback. For any comment or other post, please prepend your message with "[AGENT]" so that it is clear that this was a coding agent posting the comment.
-When you post a PR, make sure to include the results from running `build_and_run_ad.py` with the configs
-in the model registry as well as a reproducible command along the lines of
+When you post a PR, you **MUST** include:
+1. **ALL raw prompts and their complete generated outputs** from the final successful `build_and_run_ad.py --use-registry` run. Copy-paste the COMPLETE prompt→output pairs verbatim — do NOT summarize, truncate, or paraphrase. The reviewer needs to see exactly what the model generated.
+2. A reproducible command:
 ```
 python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
-to give a set of instructions for the user to reproduce the test. Also include a detailed pytest
-command for the unit tests you added so they can be run by the reviewer as well.
+3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well.
 
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
@@ -217,7 +242,7 @@ command for the unit tests you added so they can be run by the reviewer as well.
 - **Reuse config classes:** Import from `transformers` or load from checkpoint whenever possible. Only bundle a config class if it truly doesn't exist anywhere.
 - **Assert `position_ids`:** Always assert `position_ids is not None` — it is a required input, never optional.
 - **Self-contained files only**: Never import from other AD custom models. Each `modeling_{name}.py` is a standalone translation from HF source.
-- RoPE buffers: `_ad_` prefix. The `RotaryEmbedding.forward(x, position_ids)` should slice by `position_ids` once and return pre-sliced `(cos, sin)` to all layers. Do NOT pass `position_ids` through to every attention forward — that is wasteful redundant slicing.
+- **RoPE cos/sin: slice ONCE, not per layer.** `_ad_` prefix for RoPE buffers. `RotaryEmbedding.forward(x, position_ids)` MUST slice by `position_ids` once and return pre-sliced `(cos, sin)`. Pass those tensors to all layers. NEVER pass `position_ids` through to each layer/attention forward to re-index — that is redundant compute that bloats the exported graph. See Phase 2 for the full pattern.
 - MoE weights: use `nn.ModuleList` per-expert for checkpoint compatibility. Write test-only state_dict converters for HF stacked format.
 - `noaux_tc` routers (DeepSeek-V3 style): use vanilla PyTorch (sigmoid + bias + group topk + normalize + scale). AD transforms can replace with fused `trtllm` kernels at deployment time.
 - Vision towers are typically **not** exported. Keep vision logic in eager PyTorch and export only the text path unless explicitly requested otherwise.
