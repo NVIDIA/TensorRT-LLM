@@ -1039,6 +1039,8 @@ class FlashInferTrtllmGenAttention:
             rotary_embedding_max_positions=params.rotary_embedding_max_positions,
         )
 
+        separate_q_kv_output = params.paged_context_fmha or params.cross_attention
+
         ctx_qkv_args = dict(
             qkv_input=params.qkv_input,
             cross_kv_input=None,
@@ -1090,7 +1092,7 @@ class FlashInferTrtllmGenAttention:
             rotary_embedding_max_positions=params.rotary_embedding_max_positions,
             position_embedding_type=params.position_embedding_type,
             position_shift_enabled=params.position_shift_enabled,
-            separate_q_kv_output=True,
+            separate_q_kv_output=separate_q_kv_output,
             quantized_fp8_output=params.fp8_context_fmha,
             generation_phase=False,
             rotary_vision_start=0,
@@ -1106,7 +1108,24 @@ class FlashInferTrtllmGenAttention:
         )
         torch.ops.trtllm.qkv_preprocessing(**ctx_qkv_args)
 
-        q_processed = ctx_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
+        # Extract Q for FlashInfer prefill. Two cases depending on whether
+        # qkv_preprocessing wrote Q to a separate buffer:
+        #
+        # separate_q_kv_output=True (FP8/FP4 quantized, or cross-attention):
+        #   qkv_preprocessing wrote RoPE'd Q into ctx_ws.q_buf. Read from it.
+        #
+        # separate_q_kv_output=False (BF16/FP16 non-quantized):
+        #   Q stays in the packed QKV buffer after RoPE. Extract Q as a
+        #   zero-copy strided view: qkv_input[:, :q_hidden_size].
+        #   The view's stride(0) = full QKV hidden size, which the trtllm-gen
+        #   kernel handles correctly via qStrideTokens / qStrideHeads.
+        #   This matches thop's context-phase behavior where FMHA reads Q
+        #   directly from the packed QKV buffer (fmhaParams.qkvPtr).
+        if separate_q_kv_output:
+            q_processed = ctx_ws.q_buf.view(params.num_tokens, params.num_heads, params.head_size)
+        else:
+            q_size = params.num_heads * params.head_size
+            q_processed = params.qkv_input[:, :q_size].view(-1, params.num_heads, params.head_size)
         ctx_ws.trtllm_gen_workspace.zero_()
 
         flashinfer.prefill.trtllm_batch_context_with_kv_cache(
