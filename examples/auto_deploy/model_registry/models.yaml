@@ -118,7 +118,7 @@ models:
 - name: google/gemma-3-27b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'deepseek_v2_ep.yaml']
 - name: ai21labs/AI21-Jamba-1.5-Mini
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-11B-Vision-Instruct
@@ -184,7 +184,7 @@ models:
 - name: deepseek-ai/DeepSeek-R1
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 - name: deepseek-ai/DeepSeek-Coder-V2-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'deepseek_v2_ep.yaml']
 - name: Qwen/Qwen3-VL-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'qwen3_vl.yaml']
 - name: Qwen/Qwen2-VL-72B-Instruct-GPTQ-Int4
@@ -455,7 +455,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 # --- DeepSeek Coder V2 Lite (2025) ---
 - name: deepseek-ai/DeepSeek-Coder-V2-Lite-Instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'deepseek_v2_ep.yaml']
 # --- Seed-Coder reasoning (2025) ---
 - name: ByteDance-Seed/Seed-Coder-8B-Reasoning
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
