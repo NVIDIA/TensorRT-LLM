@@ -189,9 +189,10 @@ class DiffusionExecutor:
             and (req.height, req.width, req.num_frames) not in self.pipeline._warmed_up_shapes
         ):
             logger.warning(
-                f"Requested shape ({req.height}x{req.width}, {req.num_frames} frames) "
-                f"was not warmed up. First request will be slower due to "
-                f"torch.compile recompilation. "
+                f"Requested shape (height={req.height}, width={req.width}, "
+                f"num_frames={req.num_frames}) "
+                f"was not warmed up. First request with this shape will be slower due to "
+                f"torch.compile recompilation or CUDA graph capture."
                 f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
             )
         try:

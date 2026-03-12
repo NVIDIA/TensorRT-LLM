@@ -235,10 +235,6 @@ class CompilationConfig(StrictBaseModel):
     More warmup shapes = slower startup, but lower risk of torch.compile
     recompilation delays on first requests. Fewer shapes = faster startup,
     but first request with an un-warmed shape triggers recompilation.
-
-    Note: torch.compile has a cache size limit (cache_size_limit). Adding too
-    many warmup shapes may fill the compile cache. See TorchCompileConfig for
-    torch.compile-specific settings and CudaGraphConfig for CUDA graph settings.
     """
 
     resolutions: Optional[List[Tuple[int, int]]] = PydanticField(
