@@ -17,7 +17,7 @@ import platform
 from pathlib import Path
 from typing import List
 
-from setuptools import find_packages, setup
+from setuptools import Extension, find_packages, setup
 from setuptools.dist import Distribution
 
 
@@ -382,6 +382,13 @@ else:
 # internal absolute imports (e.g., "from triton_kernels.foo import bar") work.
 packages += find_packages(include=["triton_kernels", "triton_kernels.*"])
 
+# x86-only C extension for CPUID-based CPU feature detection (e.g. PCT)
+ext_modules = []
+if platform.machine() in ('x86_64', 'AMD64'):
+    ext_modules.append(
+        Extension('tensorrt_llm.llmapi._cpuid_utils',
+                  sources=['tensorrt_llm/llmapi/cpuid_utils.c']))
+
 # https://setuptools.pypa.io/en/latest/references/keywords.html
 setup(
     name='tensorrt_llm',
@@ -404,6 +411,7 @@ setup(
         "Programming Language :: Python :: 3.10",
         "Programming Language :: Python :: 3.12",
     ],
+    ext_modules=ext_modules,
     distclass=BinaryDistribution,
     license="Apache License 2.0",
     keywords="nvidia tensorrt deeplearning inference",
