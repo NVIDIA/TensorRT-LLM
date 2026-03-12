@@ -104,7 +104,7 @@ def get_llm(runtime_config: RuntimeConfig, kwargs: dict):
     """
     llm_cls = LLM
 
-    if runtime_config.backend != None:
+    if runtime_config.backend is not None:
         ignore_trt_only_args(kwargs, runtime_config.backend)
 
     if runtime_config.iteration_log is not None:

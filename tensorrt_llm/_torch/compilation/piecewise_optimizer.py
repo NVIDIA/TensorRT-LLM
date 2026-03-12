@@ -137,7 +137,7 @@ class PiecewiseRunner(object):
         is_first_runner: bool,
         is_last_runner: bool,
     ):
-        if runtime_num_tokens_idx != None:
+        if runtime_num_tokens_idx is not None:
             assert isinstance(compile_time_num_tokens, torch.SymInt)
 
         self.graph = graph
@@ -162,7 +162,7 @@ class PiecewiseRunner(object):
 
     def __call__(self, *args):
         runtime_num_of_token = None
-        if self.runtime_num_tokens_idx != None:
+        if self.runtime_num_tokens_idx is not None:
             runtime_num_of_token = int(
                 args[self.runtime_num_tokens_idx[0]].shape[
                     self.runtime_num_tokens_idx[1]])
