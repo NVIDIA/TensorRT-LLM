@@ -143,18 +143,28 @@ def torch_gated_delta_rule(
     """Gated Delta Rule custom op for linear attention (torch reference implementation).
 
     All inputs use the autodeploy [B, S, H, D] (bsnd) layout convention.
+    Supports GQA where Q/K have fewer heads than V (num_k_heads < num_v_heads).
+    In this case Q/K are expanded via repeat_interleave internally.
 
     Args:
-        q:    [B, S, H, K] - query states (should be l2-normalized before calling)
-        k:    [B, S, H, K] - key states (should be l2-normalized before calling)
-        v:    [B, S, H, V] - value states
-        g:    [B, S, H]    - gating/decay values
-        beta: [B, S, H]    - beta scaling values
+        q:    [B, S, H_k, K] - query states (should be l2-normalized before calling)
+        k:    [B, S, H_k, K] - key states (should be l2-normalized before calling)
+        v:    [B, S, H_v, V] - value states
+        g:    [B, S, H_v]    - gating/decay values
+        beta: [B, S, H_v]    - beta scaling values
         scale: optional query scaling factor (defaults to K^-0.5)
 
     Returns:
-        output: [B, S, H, V]
+        output: [B, S, H_v, V]
     """
+    # Handle GQA: expand Q/K heads to match V heads if needed
+    num_k_heads = q.shape[2]
+    num_v_heads = v.shape[2]
+    if num_v_heads > num_k_heads:
+        n_rep = num_v_heads // num_k_heads
+        q = q.repeat_interleave(n_rep, dim=2)
+        k = k.repeat_interleave(n_rep, dim=2)
+
     # Transpose from bsnd -> bhsd for internal computation
     q_t = q.transpose(1, 2)
     k_t = k.transpose(1, 2)

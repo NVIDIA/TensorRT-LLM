@@ -61,18 +61,20 @@ def fla_cached_gated_delta_rule(
     # CONSTANTS
     scale: float,
 ) -> torch.Tensor:
-    b, s, num_heads, _ = q.shape
+    b, s, num_k_heads, _ = q.shape
+    num_v_heads = v.shape[2]
 
     # flatten batch and sequence dims
-    q_flat = q.view(b * s, num_heads, -1)
-    k_flat = k.view(b * s, num_heads, -1)
-    v_flat = v.view(b * s, num_heads, -1)
-    g_flat = g.view(b * s, num_heads)
-    beta_flat = beta.view(b * s, num_heads)
+    # Note: Q/K have num_k_heads, V/g/beta have num_v_heads (GQA handled by FLA kernel)
+    q_flat = q.view(b * s, num_k_heads, -1)
+    k_flat = k.view(b * s, num_k_heads, -1)
+    v_flat = v.view(b * s, num_v_heads, -1)
+    g_flat = g.view(b * s, num_v_heads)
+    beta_flat = beta.view(b * s, num_v_heads)
 
     # pre-allocate output
     y = torch.empty_like(v, memory_format=torch.contiguous_format)
-    y_flat = y.view(b * s, num_heads, -1)
+    y_flat = y.view(b * s, num_v_heads, -1)
 
     num_prefill, num_prefill_tokens, num_decode = batch_info_host.tolist()
     num_seq = num_prefill + num_decode
@@ -181,7 +183,9 @@ class FlaGatedDeltaBackend(AttentionDescriptor):
     ) -> ResourceHandlerDict:
         key_node = source_attn_node.args[1]
         value_node = source_attn_node.args[2]
-        num_heads = key_node.meta["val"].shape[-2]
+        # Use V's head count for the cache — the FLA kernel's recurrent state
+        # has shape [H_v, K, V] since it handles GQA internally
+        num_heads = value_node.meta["val"].shape[-2]
         key_dim = key_node.meta["val"].shape[-1]
         value_dim = value_node.meta["val"].shape[-1]
         key_dtype = key_node.meta["val"].dtype
