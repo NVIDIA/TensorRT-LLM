@@ -13,15 +13,13 @@
 # limitations under the License.
 
 model_kwargs:
+  # The remote Phi-4 reasoning-vision wrapper defaults to FA2-backed attention construction,
+  # but the AD text-only onboarding path keeps the VLM wrapper and exports only the text stack.
+  # Force eager attention so model construction succeeds on this registry path.
   attn_implementation: eager
 
 trust_remote_code: true
 skip_tokenizer_init: false
-
-max_batch_size: 1
-max_seq_len: 4096
-max_num_tokens: 4096
-enable_chunked_prefill: false
 
 kv_cache_config:
   enable_block_reuse: false
