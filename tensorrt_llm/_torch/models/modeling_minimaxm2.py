@@ -59,9 +59,14 @@ class MiniMaxM2MoE(nn.Module):
         self.gate = Linear(
             self.hidden_dim, self.num_experts, bias=False, dtype=torch.float32, quant_config=None
         )
+        self.moe_backend = model_config.moe_backend
+        if self.moe_backend == 'TRTLLM':
+            bias_dtype = torch.bfloat16
+        else:
+            bias_dtype = torch.float32
 
         self.e_score_correction_bias = nn.Parameter(
-            torch.empty((self.num_experts), dtype=torch.float32), requires_grad=False
+            torch.empty((self.num_experts), dtype=bias_dtype), requires_grad=False
         )
 
         reduce_results = True
