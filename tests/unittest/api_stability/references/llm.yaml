@@ -215,9 +215,9 @@ methods:
         annotation: Optional[dict[str, str]]
         default: null
         status: prototype
-      enable_sleep:
-        annotation: bool
-        default: False
+      sleep_config:
+        annotation: Optional[tensorrt_llm.llmapi.llm_args.SleepConfig]
+        default: null
         status: prototype
       env_overrides:
         annotation: Optional[Dict[str, str]]

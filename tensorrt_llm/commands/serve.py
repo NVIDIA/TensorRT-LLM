@@ -659,7 +659,7 @@ class ChoiceWithAlias(click.Choice):
         "prototype"))
 @click.option(
     "--reasoning_parser",
-    type=click.Choice(ReasoningParserFactory.parsers.keys()),
+    type=click.Choice(ReasoningParserFactory.keys()),
     default=None,
     help=help_info_with_stability_tag(
         "Specify the parser for reasoning models.", "prototype"),

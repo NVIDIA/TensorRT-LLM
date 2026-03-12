@@ -1046,9 +1046,7 @@ def _run_pattern_detection_job(
     optimizer.shared_config.local_rank = rank
     optimizer.shared_config.world_size = world_size
     _ = optimizer(None, gm)
-    detected_transformations = (
-        optimizer.shared_config.sharding_transform_container.weight_sharding_transforms
-    )
+    detected_transformations = gm._sharding_transform_container.weight_sharding_transforms
 
     print(f"detected_transformations: {detected_transformations}")
     print(f"expected_transformations: {expected_transformations}")

@@ -12,12 +12,12 @@ import torch
 from tensorrt_llm._ray_utils import control_action_decorator
 from tensorrt_llm._torch.utils import get_device_uuid
 from tensorrt_llm._torch.virtual_memory import (materialize_with_tag,
-                                                release_with_tag,
-                                                verify_sleep_wakeup_tags)
+                                                release_with_tag)
 
+from .. import TorchLlmArgs
 from ..bindings import executor as tllm
 from ..builder import Engine
-from ..llmapi.llm_args import BaseLlmArgs
+from ..llmapi.llm_args import BaseLlmArgs, ExecutorMemoryType
 from ..llmapi.tokenizer import TokenizerBase
 from ..sampling_params import BatchedLogitsProcessor
 from .base_worker import BaseWorker
@@ -257,12 +257,15 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
     @control_action_decorator
     def sleep(self, sleep_tags: List[str]):
-        if not self.llm_args.enable_sleep:
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "sleep() only available for TorchLLM"
+
+        if self.llm_args.sleep_config is None:
             raise ValueError(
-                "Sleep feature is not enabled, please set enable_sleep=True in the LLM arguments."
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
         try:
-            tags = verify_sleep_wakeup_tags(sleep_tags)
+            tags = [ExecutorMemoryType(tag) for tag in sleep_tags]
             logger.info(f"Sleep: {tags}")
             torch.cuda.synchronize()
             release_with_tag(*tags)
@@ -275,12 +278,15 @@ class RayGPUWorker(RpcWorkerMixin, BaseWorker):
 
     @control_action_decorator
     def wakeup(self, wakeup_tags: List[str]):
-        if not self.llm_args.enable_sleep:
+        assert isinstance(self.llm_args,
+                          TorchLlmArgs), "wakeup() only available for TorchLLM"
+
+        if self.llm_args.sleep_config is None:
             raise ValueError(
-                "Sleep feature is not enabled, please set enable_sleep=True in the LLM arguments."
+                "Sleep feature is not enabled, please set sleep_config in the LLM arguments."
             )
         try:
-            tags = verify_sleep_wakeup_tags(wakeup_tags)
+            tags = [ExecutorMemoryType(tag) for tag in wakeup_tags]
             logger.info(f"Wakeup: {tags}")
             torch.cuda.synchronize()
             materialize_with_tag(*tags)
