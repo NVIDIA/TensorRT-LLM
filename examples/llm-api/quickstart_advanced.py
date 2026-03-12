@@ -106,6 +106,20 @@ def add_llm_args(parser):
                         default='bfloat16',
                         choices=['auto', 'float16', 'bfloat16', 'float32'],
                         help='Data type for Mamba SSM cache.')
+    parser.add_argument(
+        '--mamba_ssm_stochastic_rounding',
+        default=False,
+        action='store_true',
+        help=
+        'Enable stochastic rounding for Mamba SSM state updates (fp16 only, FlashInfer limitation).'
+    )
+    parser.add_argument(
+        '--mamba_ssm_philox_rounds',
+        type=int,
+        default=10,
+        help=
+        'Number of Philox rounds for stochastic rounding PRNG (default: 10). Higher values give better randomness.'
+    )
     parser.add_argument('--log_kv_cache_events',
                         default=False,
                         action='store_true')
@@ -222,6 +236,8 @@ def setup_llm(args, **kwargs):
         tokens_per_block=args.tokens_per_block,
         use_kv_cache_manager_v2=args.use_kv_cache_manager_v2,
         mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype,
+        mamba_ssm_stochastic_rounding=args.mamba_ssm_stochastic_rounding,
+        mamba_ssm_philox_rounds=args.mamba_ssm_philox_rounds,
         event_buffer_max_size=1024 if args.log_kv_cache_events else 0)
 
     spec_decode_algo = args.spec_decode_algo.upper(

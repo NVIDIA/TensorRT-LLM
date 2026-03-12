@@ -242,6 +242,13 @@ def parse_chat_message_content(
 # Adapted from: https://github.com/vllm-project/vllm/blob/4574d48bab9c4e38b7c0a830eeefc8f0980e8c58/vllm/entrypoints/chat_utils.py#L1406
 def _parse_assistant_message_content(message: Dict[str, Any]) -> Dict[str, Any]:
     result = {}
+    # Include reasoning if present for interleaved thinking.
+    reasoning_content = message.get("reasoning")
+    if reasoning_content is None:
+        reasoning_content = message.get("reasoning_content")
+    if reasoning_content is not None:
+        result["reasoning_content"] = reasoning_content
+
     tool_calls = message.get("tool_calls")
     if tool_calls is not None:
         # Materialize Pydantic v2 ValidatorIterator (single-use) to a list.
