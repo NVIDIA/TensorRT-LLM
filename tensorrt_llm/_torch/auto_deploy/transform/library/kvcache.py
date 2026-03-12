@@ -137,6 +137,7 @@ class _InsertCachedOperator(BaseTransform):
         self,
         gm: GraphModule,
         attn_node: Node,
+        cached_attn_op,
         qkv_nodes: List[Node],
         meta_nodes_std: List[Node],
         meta_nodes_extra: List[Node],
@@ -146,7 +147,7 @@ class _InsertCachedOperator(BaseTransform):
         """Insert a cached attention node into the graph."""
         with gm.graph.inserting_before(attn_node):
             cached_attn_node = gm.graph.call_function(
-                self.attn_descriptor.get_cached_attention_op(),
+                cached_attn_op,
                 args=(
                     *qkv_nodes,
                     *meta_nodes_std,
@@ -169,10 +170,10 @@ class _InsertCachedOperator(BaseTransform):
         attn_descriptor = self.attn_descriptor
 
         # Get all attention nodes and their info objects
-        source_op = attn_descriptor.get_source_attention_op()
+        source_ops = attn_descriptor.get_source_attention_ops()
 
         # look for relevant source attention nodes
-        source_attn_nodes = [n for n in gm.graph.nodes if is_op(n, source_op)]
+        source_attn_nodes = [n for n in gm.graph.nodes if any(is_op(n, source_op) for source_op in source_ops)]
 
         if not source_attn_nodes:
             # If there are no nodes for kv cache insertion found, return current graph
@@ -191,16 +192,32 @@ class _InsertCachedOperator(BaseTransform):
 
         # replace fused attention node with attention node that has kv cache
         num_cached_attn_replacements = 0
-        for attn_node in source_attn_nodes:
+        cache_nodes_by_layer_idx = {}
+        for idx, attn_node in enumerate(source_attn_nodes):
             # pick out GEMMs
             qkv = attn_node.args[: attn_descriptor.get_num_qkv_args()]
 
-            # setup + store cache resource handlers and caches as input nodes
-            resources_dict = attn_descriptor.get_cache_initializers(attn_node, cm.kv_cache_config)
-            cache_in_nodes = [
-                self._process_cache_node(gm, cm.add_resource(k, resource_handler))
-                for k, resource_handler in resources_dict.items()
-            ]
+            layer_idx = attn_descriptor.get_layer_idx(attn_node)
+            shared_kv_source_layer_idx = attn_descriptor.get_shared_kv_source_layer_idx(attn_node)
+
+            if shared_kv_source_layer_idx is not None:
+                if shared_kv_source_layer_idx not in cache_nodes_by_layer_idx:
+                    raise RuntimeError(
+                        f"Shared-KV attention node requested source layer {shared_kv_source_layer_idx}, "
+                        "but no cache owner for that layer has been processed yet."
+                    )
+                cache_in_nodes = cache_nodes_by_layer_idx[shared_kv_source_layer_idx]
+            else:
+                # setup + store cache initializers and caches as input nodes
+                cache_in_nodes = []
+                for k, resource_handler in attn_descriptor.get_cache_initializers(
+                    attn_node, cm.kv_cache_config
+                ).items():
+                    k_indexed = f"{k}_{idx}"
+                    cm.add_resource(k_indexed, resource_handler)
+                    cache_in_nodes.append(self._process_cache_node(gm, k_indexed))
+                if layer_idx is not None:
+                    cache_nodes_by_layer_idx[layer_idx] = cache_in_nodes
 
             # allow backend-specific prep before constants are extracted
             attn_descriptor.prepare_node_for_cache_insertion(gm, attn_node)
@@ -212,6 +229,7 @@ class _InsertCachedOperator(BaseTransform):
             self._insert_cached_attn_node(
                 gm,
                 attn_node,
+                attn_descriptor.get_cached_attention_op_for_source_node(attn_node),
                 qkv,
                 meta_nodes_std,
                 meta_nodes_extra,

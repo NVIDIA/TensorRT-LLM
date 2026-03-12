@@ -1829,6 +1829,11 @@ class AttentionDescriptor(ABC):
         """Get the source attention op that we target for replacement."""
 
     @classmethod
+    def get_source_attention_ops(cls) -> List[OpOverloadPacket]:
+        """Get all source attention ops targeted for replacement."""
+        return [cls.get_source_attention_op()]
+
+    @classmethod
     @abstractmethod
     def get_cached_attention_op(cls) -> MHACallable:
         """Get the cached attention op .
@@ -1853,6 +1858,12 @@ class AttentionDescriptor(ABC):
 
         """
         raise NotImplementedError
+
+    @classmethod
+    def get_cached_attention_op_for_source_node(cls, source_attn_node: Node) -> MHACallable:
+        """Get the cached attention op for a specific source node."""
+        del source_attn_node
+        return cls.get_cached_attention_op()
 
     @classmethod
     @abstractmethod
@@ -1920,6 +1931,18 @@ class AttentionDescriptor(ABC):
         caches. The constants are expected to be of type int, float, str, or None.
         """
         return []
+
+    @classmethod
+    def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
+        """Return the logical layer index associated with a source attention node, if any."""
+        del source_attn_node
+        return None
+
+    @classmethod
+    def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
+        """Return the KV source layer for a shared-KV attention node, if any."""
+        del source_attn_node
+        return None
 
     @staticmethod
     def resolve_cache_dtype(dtype_config: str, fallback_dtype: torch.dtype) -> torch.dtype:

@@ -132,6 +132,48 @@ def _extended_text_config(num_hidden_layers: int) -> Gemma3nTextConfig:
     return config
 
 
+def _shared_kv_text_config() -> Gemma3nTextConfig:
+    config = Gemma3nTextConfig(
+        vocab_size=256,
+        vocab_size_per_layer_input=256,
+        hidden_size=64,
+        hidden_size_per_layer_input=8,
+        intermediate_size=[128] * 6,
+        num_hidden_layers=6,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=16,
+        hidden_activation="gelu_pytorch_tanh",
+        max_position_embeddings=64,
+        rms_norm_eps=1e-6,
+        rope_theta=10000.0,
+        rope_local_base_freq=1000.0,
+        attention_bias=False,
+        attention_dropout=0.0,
+        sliding_window=16,
+        layer_types=[
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+            "sliding_attention",
+            "full_attention",
+        ],
+        final_logit_softcapping=30.0,
+        altup_active_idx=0,
+        altup_correct_scale=True,
+        altup_num_inputs=3,
+        num_kv_shared_layers=2,
+        laurel_rank=8,
+        activation_sparsity_pattern=[0.0] * 6,
+        pad_token_id=0,
+        eos_token_id=1,
+        bos_token_id=2,
+    )
+    config._attn_implementation = "eager"
+    return config
+
+
 def _position_ids(batch_size: int, seq_len: int, device: str) -> torch.Tensor:
     return torch.arange(seq_len, device=device).unsqueeze(0).expand(batch_size, -1)
 
@@ -316,6 +358,51 @@ def test_gemma3n_reduced_layer_load_hook_slices_per_layer_weights():
 
     assert missing == []
     assert "model.layers.3.self_attn.q_proj.weight" in unexpected
+
+
+def test_gemma3n_shared_kv_layer_metadata_matches_config():
+    model = Gemma3nForCausalLM(_shared_kv_text_config())
+    layer_expectations = [
+        (False, None),
+        (False, None),
+        (False, None),
+        (False, None),
+        (True, 2),
+        (True, 3),
+    ]
+
+    for layer, (is_shared, source_idx) in zip(model.model.layers, layer_expectations):
+        assert layer.self_attn.is_kv_shared_layer is is_shared
+        assert layer.self_attn.kv_shared_layer_index == source_idx
+
+
+def test_gemma3n_export_uses_shared_kv_attention_for_shared_layers():
+    config = _shared_kv_text_config()
+    model = Gemma3nForCausalLM(config).eval()
+    input_ids = torch.randint(0, config.vocab_size, (1, 4))
+    position_ids = _position_ids(1, 4, "cpu")
+
+    gm = torch_export_to_gm(
+        model,
+        args=tuple(),
+        kwargs={"input_ids": input_ids, "position_ids": position_ids},
+    )
+
+    attn_nodes = [node for node in gm.graph.nodes if node.op == "call_function"]
+    regular_nodes = [
+        node for node in attn_nodes if node.target == torch.ops.auto_deploy.torch_attention.default
+    ]
+    shared_nodes = [
+        node
+        for node in attn_nodes
+        if node.target == torch.ops.auto_deploy.torch_attention_shared_kv.default
+    ]
+
+    assert len(regular_nodes) == config.num_hidden_layers - config.num_kv_shared_layers
+    assert len(shared_nodes) == config.num_kv_shared_layers
+    assert [regular.args[-1] for regular in regular_nodes] == [0, 1, 2, 3]
+    assert [shared.args[-2] for shared in shared_nodes] == [4, 5]
+    assert [shared.args[-1] for shared in shared_nodes] == [2, 3]
 
 
 def test_gemma3n_model_can_be_exported():
