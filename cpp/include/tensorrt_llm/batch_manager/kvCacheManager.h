@@ -243,9 +243,6 @@ public:
     //! NOTE: return type is by value (not const&) because the result is computed on the fly.
     [[nodiscard]] BlockPtr getPrevBlock() const;
 
-    //! Returns true when the block is currently attached to the lookup tree (mLookupNode != nullptr).
-    [[nodiscard]] bool isInLookupTree() const;
-
     BlockPtr const& getPrevBlockInSeq() const;
 
     void setPrevBlockInSeq(BlockPtr prevBlock);
@@ -867,7 +864,7 @@ public:
     //! \param pinBlocks If true, increment ref count for blocks while storing.
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks = false);
+        std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity() const;
 
@@ -1138,11 +1135,10 @@ public:
     void offloadBlock(BlockPtr const& block, SizeType32 windowSize,
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
-    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<BlockPtr> const& blocks, SizeType32 windowSize,
-        bool pinBlocks = false)
+    [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(std::vector<BlockKey> blockKeys,
+        std::vector<BlockPtr> const& blocks, SizeType32 windowSize, bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blocks, pinBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), blocks, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize) const;

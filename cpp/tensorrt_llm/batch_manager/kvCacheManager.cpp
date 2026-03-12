@@ -326,11 +326,6 @@ BlockPtr KVCacheBlock::getPrevBlock() const
     return optBlock.value_or(nullptr);
 }
 
-bool KVCacheBlock::isInLookupTree() const
-{
-    return mLookupNode != nullptr;
-}
-
 BlockPtr const& KVCacheBlock::getPrevBlockInSeq() const
 {
     return mPrevBlockInSeq;
@@ -1615,7 +1610,7 @@ void WindowBlockManager::allocateBlock(GenerationRequest& sequence, bool shareAm
 }
 
 std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::storeBlocks(
-    std::vector<BlockKey> const& blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks)
+    std::vector<BlockKey> blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks)
 {
     SizeType32 numBlocksStoredForReuse = 0;
     std::lock_guard<std::mutex> lock(mLookupTree->getMutex());
@@ -1642,8 +1637,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
             // evicted (no trie entry), the chain is broken — stop.
             if (block->isPlaceholder())
             {
-                auto [partialMatchOow, numMatchedOow, matchedOow]
-                    = searchRoot->findMatchingBlock(blockKey, false, false);
+                auto const matchedOow = std::get<2>(searchRoot->findMatchingBlock(blockKey, false, false));
                 if (matchedOow != nullptr)
                 {
                     TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, found anchor block %d in trie",
