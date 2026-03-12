@@ -84,6 +84,8 @@ def allocate_gpus(
             server_allocation["nodes"][hostname].append(gpu_id)
             global_gpu_cursor += 1
 
+    port = base_port
+
     def assign_servers(
         server_allocations: Dict[str, Any],
         server_type: str,
@@ -91,11 +93,13 @@ def allocate_gpus(
         world_size: int,
         gpus_per_node: int,
     ):
+        nonlocal port
         if server_type not in server_allocations:
             server_allocations[server_type] = {}
         for i in range(num_servers):
+            port += 1
             server_allocation = {
-                "port": base_port + i,
+                "port": port,
                 "nodes": {},
             }
             assign_server(server_allocation, world_size, gpus_per_node)
@@ -217,20 +221,36 @@ def build_worker_environment(worker_config, env_config, role, benchmark_mode,
             key, val = var_string.split('=', 1)
             env[key] = val
 
+    # Helper: prepend to env_config key only if not already present (avoids duplicate when called multiple times)
+    def _append_to_env_config(config_key, key_prefix, value_str):
+        s = env_config.get(config_key, '')
+        if key_prefix not in s:
+            env_config[config_key] = f"{value_str} {s}".strip()
+
     # 4. Add mode-based env vars
     if benchmark_mode == "gen_only_no_context":
         env["TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"] = "1"
+        _append_to_env_config('worker_env_var', 'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY', 'TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1')
     if benchmark_mode == "gen_only":
         env["TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP"] = "1"
+        _append_to_env_config('worker_env_var', 'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP', 'TRTLLM_DISABLE_KV_CACHE_TRANSFER_OVERLAP=1')
         if role == "GEN":
             env["TLLM_BENCHMARK_REQ_QUEUES_SIZE"] = str(concurrency)
+            _append_to_env_config('gen_worker_env_var', 'TLLM_BENCHMARK_REQ_QUEUES_SIZE', f'TLLM_BENCHMARK_REQ_QUEUES_SIZE={concurrency}')
 
     # 5. Add profiling env vars (conditional)
     if nsys_on:
         env["TLLM_PROFILE_RECORD_GC"] = "1"
+        _append_to_env_config('worker_env_var', 'TLLM_PROFILE_RECORD_GC', 'TLLM_PROFILE_RECORD_GC=1')
         env["TLLM_NVTX_DEBUG"] = "1"
+        _append_to_env_config('worker_env_var', 'TLLM_NVTX_DEBUG', 'TLLM_NVTX_DEBUG=1')
         env["NSYS_MPI_STORE_TEAMS_PER_RANK"] = "1"
+        _append_to_env_config('worker_env_var', 'NSYS_MPI_STORE_TEAMS_PER_RANK', 'NSYS_MPI_STORE_TEAMS_PER_RANK=1')
         env["TLLM_PROFILE_START_STOP"] = profile_range
+        if role == "CTX":
+            _append_to_env_config('ctx_worker_env_var', 'TLLM_PROFILE_START_STOP', f"TLLM_PROFILE_START_STOP='{profile_range}'")
+        elif role == "GEN":
+            _append_to_env_config('gen_worker_env_var', 'TLLM_PROFILE_START_STOP', f"TLLM_PROFILE_START_STOP='{profile_range}'")
 
     return env
 
@@ -254,9 +274,11 @@ def build_server_environment(env_config, benchmark_mode):
             key, val = var_string.split('=', 1)
             env[key] = val
 
-    # Add mode-based env vars
+    # Add mode-based env vars (update env_config so they are written to env_vars.json)
     if benchmark_mode == "gen_only_no_context":
         env["TRTLLM_DISAGG_BENCHMARK_GEN_ONLY"] = "1"
+        if "TRTLLM_DISAGG_BENCHMARK_GEN_ONLY" not in env_config.get('server_env_var', ''):
+            env_config["server_env_var"] = f"TRTLLM_DISAGG_BENCHMARK_GEN_ONLY=1 {env_config.get('server_env_var', '')}".strip()
 
     return env
 
@@ -429,14 +451,6 @@ def submit_job(config, log_dir, dry_run):
     os.makedirs(log_dir, exist_ok=True)
     print(f"Log will be saved to: {log_dir}")
 
-    # Save environment variables (for record-keeping only)
-    worker_env_var = env_config.get('worker_env_var', '')
-    ctx_worker_env_var = env_config.get('ctx_worker_env_var', '')
-    gen_worker_env_var = env_config.get('gen_worker_env_var', '')
-    server_env_var = env_config.get('server_env_var', '')
-    save_env_file(os.path.join(log_dir, "env_vars.json"), server_env_var,
-                  worker_env_var, ctx_worker_env_var, gen_worker_env_var)
-
     # Setup config file paths and save worker configs
     ctx_config_path = os.path.join(log_dir, 'ctx_config.yaml')
     gen_config_path = os.path.join(log_dir, 'gen_config.yaml')
@@ -545,6 +559,15 @@ def submit_job(config, log_dir, dry_run):
         f"&> {log_dir}/4_output_server.log &",
     ]
     start_server_cmds.append(" ".join(cmd))
+
+    # Read env_config after worker/server env build so env_vars.json includes runtime-added vars
+    save_env_file(
+        os.path.join(log_dir, "env_vars.json"),
+        env_config.get('server_env_var', ''),
+        env_config.get('worker_env_var', ''),
+        env_config.get('ctx_worker_env_var', ''),
+        env_config.get('gen_worker_env_var', ''),
+    )
 
     # Generate wait server command (use script_dir for wait_server.sh)
     cmd = [
