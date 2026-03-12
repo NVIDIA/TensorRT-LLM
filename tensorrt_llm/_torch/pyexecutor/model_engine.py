@@ -3,7 +3,6 @@ import contextlib
 import functools
 import gc
 import inspect
-import itertools
 import math
 import os
 import weakref
@@ -64,6 +63,7 @@ from .cuda_graph_runner import CUDAGraphRunner, CUDAGraphRunnerConfig
 from .guided_decoder import CapturableGuidedDecoder
 from .layerwise_nvtx_marker import LayerwiseNvtxMarker
 from .llm_request import LlmRequest, get_draft_token_length
+from .mamba_cache_manager import MambaHybridCacheManager
 from .model_loader import ModelLoader, _construct_checkpoint_loader
 from .resource_manager import (BaseResourceManager, KVCacheManager,
                                KVCacheManagerV2, PeftCacheManager,
@@ -146,6 +146,8 @@ class PyTorchModelEngine(ModelEngine):
                                                  torch.nn.Module]] = None,
         model: Optional[torch.nn.Module] = None,
         checkpoint_loader: Optional[BaseCheckpointLoader] = None,
+        model_weights_memory_tag: Optional[str] = None,
+        model_weights_restore_mode=None,
     ):
         self.forward_pass_callable = None
         self.ub_buffers = None
@@ -212,6 +214,8 @@ class PyTorchModelEngine(ModelEngine):
                 max_num_tokens=self.max_num_tokens,
                 max_seq_len=self.max_seq_len,
                 lora_config=lora_config,
+                model_weights_memory_tag=model_weights_memory_tag,
+                model_weights_restore_mode=model_weights_restore_mode,
             )
             self.model, moe_load_balancer = self.model_loader.load(
                 checkpoint_dir=model_path, checkpoint_loader=checkpoint_loader)
@@ -678,7 +682,8 @@ class PyTorchModelEngine(ModelEngine):
             self._run_autotuner_warmup(resource_manager)
         self._run_cuda_graph_warmup(resource_manager)
         if not self.is_draft_model and not self.mapping.has_cp_helix(
-        ) and self.guided_decoder is None:
+        ) and self.guided_decoder is None and not isinstance(
+                kv_cache_manager, MambaHybridCacheManager):
             # Run extra general warmup to warmup memory pool before running real requests to reduce memory fragmentation.
             self._general_warmup(resource_manager, reverse=True)
 
@@ -3489,21 +3494,28 @@ class PyTorchModelEngine(ModelEngine):
                 raise NotImplementedError(
                     f"Unsupported cp_type {getattr(cp_type, 'name', cp_type)}.")
 
-        # Initialize SA state for new requests (MTP+SA path)
+        # Initialize SA state for new requests (MTP+SA, EAGLE3+SA, PARD+SA, etc.)
         use_sa_spec = (self.spec_config is not None
                        and getattr(self.spec_config, 'use_sa_spec', False))
-        if (use_sa_spec and spec_metadata is not None
-                and hasattr(spec_metadata, 'sa_manager')
-                and spec_metadata.sa_manager is not None
-                and self.mapping.is_last_pp_rank()):
-            sa_manager = spec_metadata.sa_manager
-            for request in itertools.chain(
-                    scheduled_requests.context_requests,
-                    scheduled_requests.generation_requests):
-                if request.py_request_id not in sa_manager._initialized_requests:
-                    sa_manager.add_request(request.py_request_id,
-                                           request.get_tokens(0))
-                    sa_manager._initialized_requests.add(request.py_request_id)
+        if use_sa_spec and resource_manager is not None and self.mapping.is_last_pp_rank(
+        ):
+            from tensorrt_llm._torch.speculative.suffix_automaton import \
+                SuffixAutomatonManager
+            spec_rm = resource_manager.get_resource_manager(
+                ResourceManagerType.SPEC_RESOURCE_MANAGER)
+            sa_manager = None
+            if spec_rm is not None:
+                if isinstance(spec_rm, SuffixAutomatonManager):
+                    sa_manager = spec_rm
+                else:
+                    sa_manager = getattr(spec_rm, 'sa_manager', None)
+            if sa_manager is not None:
+                for request in scheduled_requests.all_requests():
+                    if request.py_request_id not in sa_manager._initialized_requests:
+                        sa_manager.add_request(request.py_request_id,
+                                               request.get_tokens(0))
+                        sa_manager._initialized_requests.add(
+                            request.py_request_id)
 
         return self._prepare_tp_inputs(
             scheduled_requests, kv_cache_manager, attn_metadata, spec_metadata,

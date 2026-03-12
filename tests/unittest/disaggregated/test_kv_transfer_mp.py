@@ -11,7 +11,7 @@ import tensorrt_llm.bindings
 import tensorrt_llm.bindings.executor as trtllm
 from tensorrt_llm import DisaggregatedParams, Mapping, SamplingParams
 from tensorrt_llm._torch.disaggregation.base.transfer import KVSlice, SessionStatus
-from tensorrt_llm._torch.disaggregation.native.region.aux_ import AuxBuffer
+from tensorrt_llm._torch.disaggregation.native.auxiliary import AuxBuffer
 from tensorrt_llm._torch.disaggregation.native.transfer import TransferWorker
 from tensorrt_llm._torch.pyexecutor.llm_request import LlmRequest, LlmRequestType
 from tensorrt_llm._torch.pyexecutor.resource_manager import KVCacheManager
@@ -219,7 +219,7 @@ def worker_fn(
 
         # Get ctx_info_endpoint (only rank 0 has the real value)
         if local_rank == 0:
-            ctx_info_endpoint = transfer_worker._instance_info_server.endpoint
+            ctx_info_endpoint = transfer_worker._rank_info_server.endpoint
         else:
             ctx_info_endpoint = None
 
@@ -331,7 +331,7 @@ def worker_fn(
 
             # Get block ids and send
             block_ids = kv_cache_manager.get_batch_cache_indices([ctx_request.py_request_id])[0]
-            send_kv_slice = KVSlice(is_last_slice=True, block_ids=block_ids)
+            send_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
             send_slice_task = sender_session._kv_tasks[sender_session.send(send_kv_slice)]
 
             # Wait for send to complete
@@ -370,7 +370,7 @@ def worker_fn(
 
             # Get block ids and receive
             block_ids = kv_cache_manager.get_batch_cache_indices([gen_request.py_request_id])[0]
-            recv_kv_slice = KVSlice(is_last_slice=True, block_ids=block_ids)
+            recv_kv_slice = KVSlice(is_last_slice=True, block_ids_per_layer_groups=[block_ids])
             recv_slice_task = receiver_session._kv_tasks[receiver_session.receive(recv_kv_slice)]
 
             # Wait for receive to complete
