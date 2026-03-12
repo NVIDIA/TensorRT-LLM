@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import enum
+import os
 import sys
 from abc import ABC, abstractmethod
 from collections import defaultdict
@@ -70,6 +71,7 @@ from tensorrt_llm.bindings.internal.runtime import (
 )
 from tensorrt_llm.executor.result import Logprob
 from tensorrt_llm.llmapi.llm_args import KvCacheConfig
+from tensorrt_llm.logger import logger
 from tensorrt_llm.mapping import Mapping
 from tensorrt_llm.sampling_params import LogprobMode, SamplingParams
 
@@ -4742,6 +4744,23 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         # [maxTokensPerStep, batchSize, maxBeamWidth]
         new_tokens = state.host.new_tokens[0, seq_slots, 0].tolist()
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
+
+        if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
+            token_by_slot = dict(zip(seq_slots, new_tokens))
+            debug_rows = []
+            for request in reqs:
+                assert request.py_seq_slot is not None
+                debug_rows.append(
+                    {
+                        "request_id": request.py_request_id,
+                        "slot": request.py_seq_slot,
+                        "new_token": token_by_slot.get(request.py_seq_slot),
+                        "seq_len_host": sequence_lengths_host_data[request.py_seq_slot],
+                        "num_tokens": request.get_num_tokens(0),
+                        "finish_reason": finish_reasons[request.py_seq_slot],
+                    }
+                )
+            logger.info("[GEMMA3N_SAMPLE_DEBUG] %s", debug_rows)
 
         # Log probs
         assert state.host is not None
