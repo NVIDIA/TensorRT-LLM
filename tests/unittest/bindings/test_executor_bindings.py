@@ -102,6 +102,31 @@ def test_executor_with_managed_weights(model_files, model_path):
     assert executor.can_enqueue_requests() == True
 
 
+def test_executor_with_torch_managed_weights(model_files, model_path):
+    """Test executor constructor with torch.Tensor managed weights."""
+
+    executor_config = trtllm.ExecutorConfig(
+        1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
+    engine_buffer = open(model_path / "rank0.engine", mode="rb").read()
+    json_config_str = open(model_path / "config.json", 'r').read()
+
+    managed_weights = {
+        "weight_float32":
+        torch.tensor([[1.0, 2.0], [3.0, 4.0]], dtype=torch.float32),
+        "weight_int32":
+        torch.tensor([[1, 2], [3, 4]], dtype=torch.int32),
+    }
+    if torch.cuda.is_available():
+        managed_weights["weight_fp16_cuda"] = torch.tensor(
+            [[1.0, 2.0], [3.0, 4.0]], dtype=torch.float16, device="cuda")
+
+    executor = trtllm.Executor(engine_buffer, json_config_str,
+                               trtllm.ModelType.DECODER_ONLY, executor_config,
+                               managed_weights)
+
+    assert executor.can_enqueue_requests() == True
+
+
 def test_executor_invalid_ctor():
     executor_config = trtllm.ExecutorConfig(
         1, kv_cache_config=trtllm.KvCacheConfig(free_gpu_memory_fraction=0.5))
@@ -1748,6 +1773,7 @@ def test_executor_config():
     assert config.additional_model_outputs is None
     assert config.gather_generation_logits is False
     assert config.use_gpu_direct_storage is False
+    assert config.alias_managed_weights_from_gpu is False
     assert config.mm_embedding_offloading is False
     assert config.enable_trt_overlap is False
 
@@ -1800,6 +1826,8 @@ def test_executor_config():
         True,
         "use_gpu_direct_storage":
         True,
+        "alias_managed_weights_from_gpu":
+        True,
         "mm_embedding_offloading":
         True,
         "enable_trt_overlap":
@@ -1827,6 +1855,7 @@ def test_executor_config():
     assert config.additional_model_outputs[0].gather_context is False
     assert config.gather_generation_logits is True
     assert config.use_gpu_direct_storage is True
+    assert config.alias_managed_weights_from_gpu is True
     assert config.mm_embedding_offloading is True
     assert config.enable_trt_overlap is True
 
@@ -2632,6 +2661,8 @@ def test_executor_config_pickle():
         [trtllm.AdditionalModelOutput("topKLogits")],
         "gather_generation_logits":
         True,
+        "alias_managed_weights_from_gpu":
+        True,
         "mm_embedding_offloading":
         True,
         "enable_trt_overlap":
@@ -2665,6 +2696,7 @@ def test_executor_config_pickle():
     assert config.backend == config_copy.backend
     assert config.spec_dec_config.fast_logits == config_copy.spec_dec_config.fast_logits
     assert config.use_gpu_direct_storage == config_copy.use_gpu_direct_storage
+    assert config.alias_managed_weights_from_gpu == config_copy.alias_managed_weights_from_gpu
 
     assert config_copy.guided_decoding_config.backend == config.guided_decoding_config.backend
     assert config_copy.guided_decoding_config.encoded_vocab == config.guided_decoding_config.encoded_vocab

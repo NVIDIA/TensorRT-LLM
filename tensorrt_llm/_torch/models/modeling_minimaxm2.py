@@ -31,7 +31,12 @@ from ..modules.fused_moe import MiniMaxM2MoeRoutingMethod, create_moe
 from ..modules.linear import Linear
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    maybe_alias_or_copy_tensor,
+    register_auto_model,
+)
 
 
 # MiniMax M2/M2.1 requires the implementation of the following two additional components:
@@ -81,8 +86,9 @@ class MiniMaxM2MoE(nn.Module):
     def load_weights(self, weights: List[Dict]):
         assert len(weights) == 1
 
-        self.e_score_correction_bias.copy_(
-            weights[0]["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype)
+        maybe_alias_or_copy_tensor(
+            self.e_score_correction_bias,
+            weights[0]["e_score_correction_bias"][:].to(self.e_score_correction_bias.dtype),
         )
 
     def forward(

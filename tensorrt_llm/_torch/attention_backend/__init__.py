@@ -22,3 +22,12 @@ if IS_FLASHINFER_AVAILABLE:
         "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
         "StarAttentionMetadata"
     ]
+else:
+    FlashInferAttention = TrtllmAttention
+    FlashInferAttentionMetadata = TrtllmAttentionMetadata
+    StarAttention = TrtllmAttention
+    StarAttentionMetadata = TrtllmAttentionMetadata
+    __all__ += [
+        "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
+        "StarAttentionMetadata"
+    ]

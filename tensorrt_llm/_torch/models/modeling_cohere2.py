@@ -22,7 +22,12 @@ from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.layer_norm import LayerNorm
 from ..modules.linear import Linear, TensorParallelMode
-from .modeling_utils import DecoderModel, DecoderModelForCausalLM, register_auto_model
+from .modeling_utils import (
+    DecoderModel,
+    DecoderModelForCausalLM,
+    maybe_alias_or_copy_tensor,
+    register_auto_model,
+)
 
 
 class Cohere2MLP(nn.Module):
@@ -305,4 +310,4 @@ class Cohere2ForCausalLM(DecoderModelForCausalLM[Cohere2Model, Cohere2Config]):
                 else:
                     for n, p in module._parameters.items():
                         if p is not None:
-                            p.data.copy_(module_weights[n][:])
+                            maybe_alias_or_copy_tensor(p, module_weights[n][:])

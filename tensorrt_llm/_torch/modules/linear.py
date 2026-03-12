@@ -157,11 +157,15 @@ def load_weight_shard(
 
 
 def copy_weight(dst: Parameter, src: torch.Tensor):
-    # TODO check that is it a reasonable change or not
+    dst_tensor = dst.data
+    if (src.device == dst_tensor.device and src.shape == dst_tensor.shape
+            and src.dtype == dst_tensor.dtype and src.is_contiguous()):
+        dst.data = src
+        return
     if dst.dtype != src.dtype:
         src = src.to(dst.dtype)
     assert dst.dtype == src.dtype, f"Incompatible dtype. dst: {dst.dtype}, src: {src.dtype}"
-    dst.data.copy_(src)
+    dst_tensor.copy_(src)
 
 
 def copy_weight_shard(dst: Parameter, src: torch.Tensor, shard_offset: int,

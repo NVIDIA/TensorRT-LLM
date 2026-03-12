@@ -230,6 +230,8 @@ class NemotronNASModel(DecoderModel):
                         model_config.mapping.tp_rank,
                         dim=0)  # split by vocabulary dimension
                 x = weight.to(self.embed_tokens.dtype)
+                # Keep a dedicated embedding buffer here; aliasing would
+                # introduce tied storage instead of a one-time initialization.
                 self.embed_tokens.weight.data.copy_(x)
 
         self.layers = nn.ModuleList([

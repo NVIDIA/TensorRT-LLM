@@ -186,11 +186,12 @@ void assessLikelihoodOfRuntimeAllocation(
 } // namespace
 
 TllmRuntime::TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, bool useGpuDirectStorage,
-    float gpuWeightsPercent, bool useShapeInference)
+    float gpuWeightsPercent, bool aliasManagedWeightsFromGpu, bool useShapeInference)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
     , mUseShapeInference{useShapeInference}
+    , mAliasManagedWeightsFromGpu{aliasManagedWeightsFromGpu}
     , mUserBufferEnabled{false}
 {
     auto const startTime = std::chrono::high_resolution_clock::now();
@@ -803,7 +804,15 @@ void TllmRuntime::loadManagedWeights(RawEngine const& rawEngine, int localRank)
         {
             TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
             auto iTensor = tensorrt_llm::executor::detail::toITensor(weight);
-            auto weightsDevice = std::shared_ptr<ITensor>{manager.copyFrom(*iTensor, MemoryType::kGPU)};
+            std::shared_ptr<ITensor> weightsDevice;
+            if (mAliasManagedWeightsFromGpu && iTensor->getMemoryType() == MemoryType::kGPU)
+            {
+                weightsDevice = iTensor;
+            }
+            else
+            {
+                weightsDevice = std::shared_ptr<ITensor>{manager.copyFrom(*iTensor, MemoryType::kGPU)};
+            }
             mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
         }
     }

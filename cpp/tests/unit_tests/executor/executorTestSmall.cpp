@@ -95,11 +95,11 @@ std::unique_ptr<DecoderTestShared<TLogits>> SetupDecoderTest(TrivialConstantDeco
     auto kvCacheConfig = executor::KvCacheConfig{};
     kvCacheConfig.setMaxTokens(DecoderTestShared<TLogits>::kKvCacheMaxTokens);
 
-    auto const executorConfig
-        = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(), kvCacheConfig, true,
-            true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize, params.maxNumTokens, std::nullopt,
-            std::nullopt, std::nullopt, std::nullopt, false, 1, std::nullopt, executor::ExtendedRuntimePerfKnobConfig(),
-            std::nullopt, 0, executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
+    auto const executorConfig = tensorrt_llm::executor::ExecutorConfig(params.maxBeamWidth, executor::SchedulerConfig(),
+        kvCacheConfig, true, true, 1, 1, executor::BatchingType::kINFLIGHT, params.maxBatchSize, params.maxNumTokens,
+        std::nullopt, std::nullopt, std::nullopt, std::nullopt, false, 1, false, std::nullopt,
+        executor::ExtendedRuntimePerfKnobConfig(), std::nullopt, 0,
+        executor::ExecutorConfig::kDefaultMaxSeqIdleMicroseconds, std::nullopt, std::nullopt);
 
     auto model = std::make_shared<batch_manager::TrtGptModelInflightBatching>(
         logger, modelConfig, worldConfig, engine, false, executorConfig, false);

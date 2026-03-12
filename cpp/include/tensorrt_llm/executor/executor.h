@@ -1542,7 +1542,8 @@ public:
         std::optional<PeftCacheConfig> const& peftCacheConfig = std::nullopt,
         std::optional<LogitsPostProcessorConfig> logitsPostProcessorConfig = std::nullopt,
         std::optional<DecodingConfig> decodingConfig = std::nullopt, bool useGpuDirectStorage = false,
-        float gpuWeightsPercent = 1, std::optional<SizeType32> maxQueueSize = std::nullopt,
+        float gpuWeightsPercent = 1, bool aliasManagedWeightsFromGpu = false,
+        std::optional<SizeType32> maxQueueSize = std::nullopt,
         ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig = ExtendedRuntimePerfKnobConfig(),
         std::optional<DebugConfig> debugConfig = std::nullopt, SizeType32 recvPollPeriodMs = 0,
         uint64_t maxSeqIdleMicroseconds = kDefaultMaxSeqIdleMicroseconds,
@@ -1574,6 +1575,7 @@ public:
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] bool getUseGpuDirectStorage() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
+    [[nodiscard]] bool getAliasManagedWeightsFromGpu() const;
     [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
     [[nodiscard]] ExtendedRuntimePerfKnobConfig getExtendedRuntimePerfKnobConfig() const;
     [[nodiscard]] std::optional<DebugConfig> getDebugConfig() const;
@@ -1604,6 +1606,7 @@ public:
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setUseGpuDirectStorage(bool const& useGpuDirectStorage);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
+    void setAliasManagedWeightsFromGpu(bool const& aliasManagedWeightsFromGpu);
     void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
     void setDebugConfig(DebugConfig const& debugConfig);
@@ -1666,6 +1669,9 @@ private:
 
     /// @brief GPU weights percent for weight streaming.
     float mGpuWeightsPercent;
+
+    /// @brief Alias managed GPU weights directly when loading from engine buffer instead of making a device copy.
+    bool mAliasManagedWeightsFromGpu;
 
     /// @brief The maximum number of requests allowed in queue before rejecting new requests.
     std::optional<SizeType32> mMaxQueueSize;

@@ -26,7 +26,8 @@ from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
 from ..utils import AuxStreamType, Fp4QuantizedTensor
 from .modeling_utils import (DecoderModel, DecoderModelForCausalLM,
-                             duplicate_kv_weight, register_auto_model)
+                             duplicate_kv_weight, maybe_alias_or_copy_tensor,
+                             register_auto_model)
 
 
 class HunyuanMoE(nn.Module):
@@ -429,7 +430,8 @@ class HunYuanMoEV1ForCausalLM(DecoderModelForCausalLM[HunYuanModel,
                     else:
                         for n, p in module._parameters.items():
                             if p is not None:
-                                p.data.copy_(module_weights[n][:])
+                                maybe_alias_or_copy_tensor(
+                                    p, module_weights[n][:])
                     # Mark consumed weights
                     if can_mark_consumed:
                         weights.mark_consumed(original_name)
