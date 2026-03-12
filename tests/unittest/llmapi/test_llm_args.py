@@ -1308,7 +1308,7 @@ class TestPyTorchBackendModelDefaults:
         self.get_model_defaults_called = False
         self.tmp_path = tmp_path
 
-        def mock_get_model_defaults(cls, llm_args):
+        def mock_get_model_defaults(cls, llm_args, pretrained_config=None):
             self.get_model_defaults_called = True
             return {
                 "enable_chunked_prefill": True,
