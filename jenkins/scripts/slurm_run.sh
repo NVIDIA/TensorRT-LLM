@@ -54,6 +54,45 @@ llmapiLaunchScript="$llmSrcNode/tensorrt_llm/llmapi/trtllm-llmapi-launch"
 chmod +x $llmapiLaunchScript
 cd $llmSrcNode/tests/integration/defs
 
+# Process test list to separate regular and isolated tests
+echo "Processing test list to extract regular and isolated tests..."
+processScriptPath="$llmSrcNode/jenkins/scripts/process_test_list.py"
+
+# Get the test list path from pytestCommand
+# Extract --test-list parameter value
+testListPath=$(echo "$pytestCommand" | grep -oP '(?<=--test-list=)[^ ]+' | head -1)
+if [ -z "$testListPath" ]; then
+    echo "WARNING: Could not extract test list path from command, skipping test list processing"
+    testListPath=""
+fi
+
+regularTestList=""
+isolateTestList=""
+
+if [ -n "$testListPath" ] && [ -f "$testListPath" ]; then
+    # Run process_test_list.py to separate tests
+    processOutput=$(python3 "$processScriptPath" \
+        --llm-src "$llmSrcNode" \
+        --test-list "$testListPath" \
+        --perf-mode)
+
+    echo "$processOutput"
+
+    # Extract paths from output
+    while IFS='=' read -r key value; do
+        if [ "$key" = "REGULAR_TEST_LIST" ]; then
+            regularTestList="$value"
+        elif [ "$key" = "ISOLATE_TEST_LIST" ]; then
+            isolateTestList="$value"
+        fi
+    done <<< "$processOutput"
+
+    echo "Regular tests: $regularTestList"
+    echo "Isolated tests: $isolateTestList"
+else
+    echo "WARNING: Test list not found, will run all tests"
+fi
+
 # get trtllm wheel path and add to pytest command
 trtllmWhlPath=$(pip3 show tensorrt_llm | grep Location | cut -d ' ' -f 2)
 trtllmWhlPath=$(echo "$trtllmWhlPath" | sed 's/[[:space:]]+/_/g')
@@ -86,6 +125,74 @@ env | sort
 
 echo "Full Command: $pytestCommand"
 
+# Separate handling for regular and isolated tests
+regular_tests_exit_code=0
+isolated_tests_exit_code=0
+
+# Run regular tests (if there are any)
+if [ -z "$regularTestList" ] || [ ! -f "$regularTestList" ] || [ ! -s "$regularTestList" ]; then
+    echo "No regular tests to run or test list processing failed, running all tests with original command"
+
+    # For single-node test runs, clear all environment variables related to Slurm and MPI.
+    # This prevents test processes (e.g., pytest) from incorrectly initializing MPI
+    # when running under a single-node srun environment.
+    # TODO: check if we can take advantage of --export=None arg when execute srun instead
+    # of unset them in the script
+    if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
+        for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+            if [ "$v" != "SLURM_PROCID" ]; then
+                unset "$v"
+            fi
+        done
+    fi
+
+    set +e
+    eval $pytestCommand
+    regular_tests_exit_code=$?
+    set -e
+    echo "Rank${SLURM_PROCID} Regular tests (all) finished with exit code $regular_tests_exit_code"
+else
+    # Run regular tests only
+    echo "Running regular tests from: $regularTestList"
+    regularPytestCommand=$(echo "$pytestCommand" | sed "s|--test-list=[^ ]*|--test-list=$regularTestList|")
+    echo "Regular tests command: $regularPytestCommand"
+
+    # For single-node test runs, clear all environment variables related to Slurm and MPI.
+    if [ "${SLURM_JOB_NUM_NODES:-1}" -eq 1 ]; then
+        for v in ${!PMI@} ${!PMIX@} ${!MPI@} ${!OMPI@} ${!SLURM@}; do
+            if [ "$v" != "SLURM_PROCID" ]; then
+                unset "$v"
+            fi
+        done
+    fi
+
+    set +e
+    eval $regularPytestCommand
+    regular_tests_exit_code=$?
+    set -e
+    echo "Rank${SLURM_PROCID} Regular tests finished with exit code $regular_tests_exit_code"
+
+    # Run isolated tests (if there are any)
+    if [ -f "$isolateTestList" ] && [ -s "$isolateTestList" ]; then
+        echo "Running isolated tests from: $isolateTestList"
+
+        # Extract base command from pytestCommand (without --test-list and related args)
+        basePytestCommand=$(echo "$pytestCommand" | sed 's|--test-list=[^ ]*||g' | sed 's|--csv=[^ ]*||g' | sed 's|--periodic-junit-xmlpath [^ ]*||g')
+
+        # Run isolated tests
+        set +e
+        python3 "$llmSrcNode/jenkins/scripts/run_isolated_tests.py" \
+            --llm-src "$llmSrcNode" \
+            --isolate-list "$isolateTestList" \
+            --stage-name "$stageName" \
+            --output-dir "$stageName" \
+            --base-cmd "$basePytestCommand"
+        isolated_tests_exit_code=$?
+        set -e
+        echo "Rank${SLURM_PROCID} Isolated tests finished with exit code $isolated_tests_exit_code"
+    fi
+fi
+
 # For single-node test runs, clear all environment variables related to Slurm and MPI.
 # This prevents test processes (e.g., pytest) from incorrectly initializing MPI
 # when running under a single-node srun environment.
@@ -106,8 +213,13 @@ pytest_exit_code=0
 perf_check_exit_code=0
 perf_report_exit_code=0
 
-eval $pytestCommand
-pytest_exit_code=$?
+# Combine exit codes from regular and isolated tests
+if [ "$regular_tests_exit_code" -ne 0 ]; then
+    pytest_exit_code=$regular_tests_exit_code
+elif [ "$isolated_tests_exit_code" -ne 0 ]; then
+    pytest_exit_code=$isolated_tests_exit_code
+fi
+
 echo "Rank${SLURM_PROCID} Pytest finished execution with exit code $pytest_exit_code"
 
 # DEBUG: Diagnose intermittent "unrecognized arguments" failure (Exit Code 4)
