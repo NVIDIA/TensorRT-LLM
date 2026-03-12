@@ -296,8 +296,8 @@ def generate_sbatch_params(args, hardware_config, work_dir):
 
 def generate_srun_args(args, runtime_mode, timestamp):
     """Generate srun arguments."""
-    is_disagg = runtime_mode == "disaggregated"
-    container_name = f"{'disagg' if is_disagg else 'aggr'}_test-{timestamp}"
+    is_aggr = runtime_mode == "aggregated"
+    container_name = f"{'aggr' if is_aggr else 'disagg'}_test-{timestamp}"
 
     lines = [
         f"--container-name={container_name}",
@@ -312,9 +312,7 @@ def generate_srun_args(args, runtime_mode, timestamp):
 
     lines.append("--container-env=NVIDIA_IMEX_CHANNELS")
 
-    if is_disagg:
-        lines.append("--mpi=pmix")
-    else:
+    if is_aggr:
         lines.append("--mpi=pmi2")
 
     return lines

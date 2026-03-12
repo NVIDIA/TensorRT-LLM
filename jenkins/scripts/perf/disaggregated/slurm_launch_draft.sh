@@ -22,7 +22,7 @@ for i in $(seq 0 $((numGenServers - 1))); do
     gen_world_size=$((nodesPerGenServer * gpusPerNodePerGenServer))
     export DISAGG_SERVING_TYPE="GEN_$i"
     export pytestCommand="$pytestCommandGENWorker"
-    srun "${srunArgs[@]}" --kill-on-bad-exit=1 \
+    srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
         -N $nodesPerGenServer \
         --ntasks=$gen_world_size \
         --ntasks-per-node=$gpusPerNodePerGenServer \
@@ -37,7 +37,7 @@ if [ "${TRTLLM_DISAGG_BENCHMARK_GEN_ONLY:-0}" != "1" ]; then
         ctx_world_size=$((nodesPerCtxServer * gpusPerNodePerCtxServer))
         export DISAGG_SERVING_TYPE="CTX_$i"
         export pytestCommand="$pytestCommandCTXWorker"
-        srun "${srunArgs[@]}" --kill-on-bad-exit=1 \
+        srun "${srunArgs[@]}" --mpi=pmix --kill-on-bad-exit=1 \
             -N $nodesPerCtxServer \
         --ntasks=$ctx_world_size \
         --ntasks-per-node=$gpusPerNodePerCtxServer \

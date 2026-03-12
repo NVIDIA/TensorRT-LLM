@@ -84,6 +84,46 @@ Shared module imported by `get_post_merge_html.py`, `get_pre_merge_html.py`, and
 - **HTML dashboard**: `generate_post_merge_html()` produces a full interactive
   report with three-way cascading filters and click-to-inspect data-point popups.
 
+## MPI/PMI Handling in Disaggregated Tests
+
+### Background
+
+Disaggregated tests run four srun steps within a single SLURM job. Only CTX/GEN workers
+need MPI (they use `trtllm-llmapi-launch`). The disagg server (`trtllm-serve
+disaggregated`) and benchmark client are single-process, non-MPI tasks.
+
+When srun launches a process with `--mpi=pmix`, it sets PMI/PMIx environment variables.
+If the launched process imports libraries with MPI support (e.g., PyTorch links Open MPI),
+`MPI_Init` may be triggered automatically. If the container's MPI build lacks SLURM PMI
+support, this causes:
+```
+PMI2_Init failed to initialize.  Return code: 14
+```
+
+### Solution
+
+The `--mpi=pmix` flag is added **only** to the CTX/GEN worker srun commands in
+`slurm_launch_draft.sh`, not to the shared `srunArgs` array. This way, the disagg server
+and benchmark srun steps never see MPI flags.
+
+**Where MPI is configured:**
+- `jenkins/scripts/perf/disaggregated/slurm_launch_draft.sh` — `--mpi=pmix` on
+  ctx/gen srun commands only
+- `jenkins/scripts/perf/local/submit.py` — `--mpi=pmi2` for aggregated mode only,
+  no MPI flag for disaggregated mode (handled by the draft template)
+- `jenkins/L0_Test.groovy` — `--mpi=pmi2` for non-disagg multi-node only
+
+### Key Rules
+
+When modifying disaggregated SLURM scripts, keep these invariants:
+
+1. **srunArgs are shared**: All srun steps in `slurm_launch_draft.sh` use the same
+   `"${srunArgs[@]}"`. Never add MPI flags to srunArgs for disaggregated mode.
+2. **Only CTX/GEN workers need MPI**: Add `--mpi=pmix` directly on their srun command
+   lines in `slurm_launch_draft.sh`, not in the shared srunArgs.
+3. **Non-MPI roles must stay MPI-free**: The disagg server and benchmark steps must
+   not receive `--mpi` flags. If adding a new srun step, consider whether it needs MPI.
+
 ## Post-Processing and Triage
 
 ### `get_pre_merge_html.py`
