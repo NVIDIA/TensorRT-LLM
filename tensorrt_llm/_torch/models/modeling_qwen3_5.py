@@ -459,26 +459,34 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             ssm_states[state_indices_p] = torch.zeros((),
                                                       dtype=ssm_states.dtype,
                                                       device=ssm_states.device)
-
-        # def _compute_projected_states_qkvz():
-        #     return self.in_proj_qkvz(hidden_states)
-
-        # def _compute_projected_states_ba():
-        #     return self.in_proj_ba(hidden_states)
-
-        # projected_states_qkvz, projected_states_ba = maybe_execute_in_parallel(
-        #     _compute_projected_states_qkvz,
-        #     _compute_projected_states_ba,
-        #     self.event_dict[EventType.Main],
-        #     self.event_dict[EventType.Attention],
-        #     self.aux_stream,
-        # )
         
-        mixed_qkv = self.in_proj_qkv(hidden_states)
-        z = self.in_proj_z(hidden_states)
+        def _compute_projected_states_qkv():
+            return self.in_proj_qkv(hidden_states)
+
+        def _compute_projected_states_z():
+            return self.in_proj_z(hidden_states)
+        
+        def _compute_projected_states_b():
+            return self.in_proj_b(hidden_states)
+
+        def _compute_projected_states_a():
+            return self.in_proj_a(hidden_states)
+        
+        mixed_qkv, z = maybe_execute_in_parallel(
+            _compute_projected_states_qkv,
+            _compute_projected_states_z,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.Attention],
+            self.aux_stream,
+        )
+        b, a = maybe_execute_in_parallel(
+            _compute_projected_states_b,
+            _compute_projected_states_a,
+            self.event_dict[EventType.Main],
+            self.event_dict[EventType.Attention],
+            self.aux_stream,
+        )
         z = z.view(z.size(0), -1, self.head_v_dim)
-        b = self.in_proj_b(hidden_states)
-        a = self.in_proj_a(hidden_states)
 
         kwargs = {
             "mixed_qkv": mixed_qkv,
