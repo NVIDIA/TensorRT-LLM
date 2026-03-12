@@ -590,6 +590,8 @@ class TestGenerateValidation:
                 async for _ in servicer.Generate(request, ctx):
                     pass
             except grpc.aio.AbortError:
+                # context.abort() raises AbortError to stop the RPC;
+                # we catch it so we can inspect ctx.code / ctx.details below.
                 pass
             return ctx.code, ctx.details
 
