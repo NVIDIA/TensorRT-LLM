@@ -106,9 +106,6 @@ class FluxPipeline(BasePipeline):
     def default_warmup_num_frames(self):
         return [1]
 
-    def is_valid_frame_count(self, num_frames):
-        return num_frames == 1
-
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")

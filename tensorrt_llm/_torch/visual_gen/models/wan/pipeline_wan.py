@@ -147,9 +147,6 @@ class WanPipeline(BasePipeline):
             self.vae_scale_factor_spatial * patch_size[2],
         )
 
-    def is_valid_frame_count(self, num_frames):
-        return (num_frames - 1) % self.vae_scale_factor_temporal == 0
-
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")
         self.transformer = WanTransformer3DModel(model_config=self.model_config)
@@ -338,6 +335,8 @@ class WanPipeline(BasePipeline):
     ):
         pipeline_start = time.time()
         generator = torch.Generator(device=self.device).manual_seed(seed)
+
+        self.validate_resolution(height, width, num_frames)
 
         # Use user-provided boundary_ratio if given, otherwise fall back to model config
         boundary_ratio = boundary_ratio if boundary_ratio is not None else self.boundary_ratio

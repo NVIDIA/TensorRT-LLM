@@ -129,12 +129,14 @@ class BasePipeline(nn.Module):
         """(h_multiple, w_multiple) resolution constraint. Subclass override."""
         return (1, 1)
 
-    def is_valid_frame_count(self, num_frames: int) -> bool:
-        """Check if frame count is valid for this model. Subclass override."""
-        return True
+    def validate_resolution(self, height: int, width: int, num_frames: int) -> None:
+        """Validate resolution against model constraints. Raises ValueError.
 
-    def validate_shape(self, height: int, width: int, num_frames: int) -> None:
-        """Validate shape against model constraints. Raises ValueError."""
+        Only checks resolution constraints (must be positive and divisible by
+        model-specific multiples). Frame count is NOT validated here — following
+        HuggingFace diffusers convention, invalid frame counts are silently
+        rounded in forward() instead of rejected.
+        """
         if height <= 0 or width <= 0 or num_frames <= 0:
             raise ValueError(
                 f"Dimensions must be positive: height={height}, width={width}, "
@@ -147,8 +149,6 @@ class BasePipeline(nn.Module):
                     f"Resolution ({height}x{width}) must be multiples of "
                     f"({h_mul}x{w_mul}) for {self.__class__.__name__}."
                 )
-        if not self.is_valid_frame_count(num_frames):
-            raise ValueError(f"Invalid num_frames={num_frames} for {self.__class__.__name__}.")
 
     def resolve_warmup_plan(self) -> Tuple[List[Tuple[int, int, int]], int]:
         """Resolve warmup shapes and steps from config or model defaults.
@@ -187,7 +187,7 @@ class BasePipeline(nn.Module):
         valid_shapes = []
         for h, w, f in all_shapes:
             try:
-                self.validate_shape(h, w, f)
+                self.validate_resolution(h, w, f)
                 valid_shapes.append((h, w, f))
             except ValueError as e:
                 logger.warning(f"Skipping invalid warmup shape ({h}x{w}, {f} frames): {e}")

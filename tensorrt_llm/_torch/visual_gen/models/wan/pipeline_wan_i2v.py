@@ -167,9 +167,6 @@ class WanImageToVideoPipeline(BasePipeline):
             self.vae_scale_factor_spatial * patch_size[2],
         )
 
-    def is_valid_frame_count(self, num_frames):
-        return (num_frames - 1) % self.vae_scale_factor_temporal == 0
-
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")
         self.transformer = WanTransformer3DModel(model_config=self.model_config)
@@ -447,7 +444,17 @@ class WanImageToVideoPipeline(BasePipeline):
             )
             guidance_scale_2 = None
 
-        self.validate_shape(height, width, num_frames)
+        self.validate_resolution(height, width, num_frames)
+
+        if num_frames % self.vae_scale_factor_temporal != 1:
+            logger.warning(
+                f"`num_frames - 1` must be divisible by {self.vae_scale_factor_temporal}. "
+                f"Rounding {num_frames} to nearest valid value."
+            )
+            num_frames = (
+                num_frames // self.vae_scale_factor_temporal * self.vae_scale_factor_temporal + 1
+            )
+        num_frames = max(num_frames, 1)
 
         # Encode Prompt
         logger.info("Encoding prompts...")

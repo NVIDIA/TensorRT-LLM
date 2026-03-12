@@ -92,7 +92,7 @@ class TestVisualGenArgsWarmup:
 
 
 # ---------------------------------------------------------------------------
-# Stub pipelines for testing resolve_warmup_plan() and validate_shape()
+# Stub pipelines for testing resolve_warmup_plan() and validate_resolution()
 # without loading a real model.
 # ---------------------------------------------------------------------------
 
@@ -134,9 +134,6 @@ def _make_stub_pipeline(warmup_cfg=None):
         def resolution_multiple_of(self):
             return (16, 16)
 
-        def is_valid_frame_count(self, num_frames):
-            return (num_frames - 1) % 4 == 0
-
     return WanStub(warmup_cfg)
 
 
@@ -151,9 +148,6 @@ def _make_flux_stub_pipeline(warmup_cfg=None):
         @property
         def default_warmup_num_frames(self):
             return [1]
-
-        def is_valid_frame_count(self, num_frames):
-            return num_frames == 1
 
     return FluxStub(warmup_cfg)
 
@@ -222,12 +216,12 @@ class TestResolveWarmupPlan:
         assert (481, 832, 33) not in shapes
         assert (481, 832, 81) not in shapes
 
-    def test_invalid_user_num_frames_skipped(self):
-        """User num_frames not valid → warning, shape skipped."""
-        cfg = CompilationConfig(num_frames=[30])  # (30-1)%4 != 0
+    def test_any_user_num_frames_accepted(self):
+        """Any num_frames accepted in warmup (rounded in forward)."""
+        cfg = CompilationConfig(num_frames=[30])
         pipe = _make_stub_pipeline(cfg)
         shapes, _ = pipe.resolve_warmup_plan()
-        assert len(shapes) == 0
+        assert len(shapes) == 2  # 2 resolutions x 1 frame count
 
     def test_flux_default(self):
         """Flux default: 1 resolution x 1 frame = 1 shape."""
@@ -236,51 +230,38 @@ class TestResolveWarmupPlan:
         assert shapes == [(1024, 1024, 1)]
         assert steps == 2
 
-    def test_flux_skips_video_frames(self):
-        """Flux: num_frames != 1 → warning, shape skipped."""
+    def test_flux_any_num_frames_accepted(self):
+        """Flux: any num_frames accepted in warmup (no frame validation)."""
         cfg = CompilationConfig(num_frames=[81])
         pipe = _make_flux_stub_pipeline(cfg)
         shapes, _ = pipe.resolve_warmup_plan()
-        assert len(shapes) == 0
+        assert len(shapes) == 1  # 1 resolution x 1 frame count
 
 
 class TestValidateShape:
-    """validate_shape() model constraint checks."""
+    """validate_resolution() model constraint checks."""
 
     def test_valid_wan_shape(self):
         pipe = _make_stub_pipeline()
-        pipe.validate_shape(480, 832, 33)
-        pipe.validate_shape(720, 1280, 81)
+        pipe.validate_resolution(480, 832, 33)
+        pipe.validate_resolution(720, 1280, 81)
 
     def test_invalid_resolution_height(self):
         pipe = _make_stub_pipeline()
         with pytest.raises(ValueError, match="must be multiples of"):
-            pipe.validate_shape(481, 832, 33)
+            pipe.validate_resolution(481, 832, 33)
 
     def test_invalid_resolution_width(self):
         pipe = _make_stub_pipeline()
         with pytest.raises(ValueError, match="must be multiples of"):
-            pipe.validate_shape(480, 833, 33)
+            pipe.validate_resolution(480, 833, 33)
 
-    def test_invalid_frame_count(self):
+    def test_any_frame_count_accepted(self):
+        """validate_resolution does not check frame counts (silently rounded in forward)."""
         pipe = _make_stub_pipeline()
-        with pytest.raises(ValueError, match="Invalid num_frames"):
-            pipe.validate_shape(480, 832, 30)
-
-    def test_valid_frame_count_edge_cases(self):
-        pipe = _make_stub_pipeline()
-        pipe.validate_shape(480, 832, 1)  # (1-1)%4 == 0
-        pipe.validate_shape(480, 832, 5)  # (5-1)%4 == 0
-        pipe.validate_shape(480, 832, 9)  # (9-1)%4 == 0
-
-    def test_flux_valid_single_frame(self):
-        pipe = _make_flux_stub_pipeline()
-        pipe.validate_shape(1024, 1024, 1)
-
-    def test_flux_rejects_multi_frame(self):
-        pipe = _make_flux_stub_pipeline()
-        with pytest.raises(ValueError, match="Invalid num_frames"):
-            pipe.validate_shape(1024, 1024, 2)
+        pipe.validate_resolution(480, 832, 30)
+        pipe.validate_resolution(480, 832, 1)
+        pipe.validate_resolution(480, 832, 8)
 
 
 class TestWarmupExecution:
@@ -307,7 +288,7 @@ class TestWarmupExecution:
 
 
 class TestRequestValidation:
-    """Request-level validation: validate_shape() + _warmed_up_shapes check."""
+    """Request-level validation: validate_resolution() + _warmed_up_shapes check."""
 
     def test_valid_warmed_shape_no_warning(self, caplog):
         """Request with a warmed-up shape → no warning."""
@@ -317,7 +298,7 @@ class TestRequestValidation:
         req = MagicMock()
         req.height, req.width, req.num_frames = 480, 832, 33
 
-        pipe.validate_shape(req.height, req.width, req.num_frames)
+        pipe.validate_resolution(req.height, req.width, req.num_frames)
         shape = (req.height, req.width, req.num_frames)
         assert shape in pipe._warmed_up_shapes
 
@@ -327,7 +308,7 @@ class TestRequestValidation:
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
 
-        pipe.validate_shape(720, 1280, 81)
+        pipe.validate_resolution(720, 1280, 81)
         assert (720, 1280, 81) not in pipe._warmed_up_shapes
 
     def test_invalid_shape_raises_before_warmup_check(self):
@@ -336,4 +317,4 @@ class TestRequestValidation:
         pipe.warmup()
 
         with pytest.raises(ValueError, match="must be multiples of"):
-            pipe.validate_shape(481, 832, 33)
+            pipe.validate_resolution(481, 832, 33)
