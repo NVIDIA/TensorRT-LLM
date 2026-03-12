@@ -27,8 +27,6 @@ class CpType(StrEnum):
     ULYSSES = "ULYSSES"
     # CP type for star attention
     STAR = "STAR"
-    # CP type for ring attention
-    RING = "RING"
     # CP type for helix parallelism
     HELIX = "HELIX"
 

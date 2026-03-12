@@ -357,6 +357,16 @@ class DecoderModelForCausalLM(nn.Module,
         self.pp_size = config.mapping.pp_size
         self.has_custom_lm_head = False
 
+        if config.mapping.enable_lm_head_tp_in_adp:
+            has_mtp = (config.spec_config is not None
+                       and (config.spec_config.spec_dec_mode.is_mtp_one_model()
+                            or config.spec_config.spec_dec_mode.is_mtp_eagle()))
+            if not has_mtp:
+                logger.warning(
+                    "enable_lm_head_tp_in_adp is set but MTP speculative "
+                    "decoding is not configured. This option only takes effect "
+                    "with MTP enabled. The flag will have no effect.")
+
         if config.mapping.enable_attention_dp and not config.mapping.enable_lm_head_tp_in_adp:
             self.lm_head = LMHead(
                 vocab_size,

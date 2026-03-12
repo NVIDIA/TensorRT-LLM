@@ -509,8 +509,14 @@ class AttentionDpConfig(StrictBaseModel):
 
 
 class CpConfig(StrictBaseModel):
-    """
-    Configuration for context parallelism.
+    """Configuration for context parallelism.
+
+    Available cp_types:
+    - ULYSSES: Default when cp_size=1 (no context parallelism). Not supported
+      by the attention layer when cp_size > 1.
+    - HELIX: Required for context parallelism (cp_size > 1). Designed for
+      models using Multi-head Latent Attention (MLA) such as DeepSeek-V3/R1.
+      Requires Blackwell GPUs.
     """
     # TODO: given that multiple fields here are only used with specific cp_types, consider
     # making this a Pydantic discriminated union.
@@ -2370,7 +2376,10 @@ class BaseLlmArgs(StrictBaseModel):
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
         description="The cluster parallel size for MoE model's expert weights.",
-        status="beta")
+        status="deprecated",
+        deprecated=
+        "moe_cluster_parallel_size is deprecated and will be removed in a future release."
+    )
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
@@ -2381,13 +2390,15 @@ class BaseLlmArgs(StrictBaseModel):
         description="The expert parallel size for MoE model's expert weights.")
 
     enable_attention_dp: bool = Field(
-        default=False,
-        description="Enable attention data parallel.",
-        status="beta")
+        default=False, description="Enable attention data parallel.")
 
     enable_lm_head_tp_in_adp: bool = Field(
         default=False,
-        description="Enable LM head TP in attention dp.",
+        description=
+        "Enable tensor parallelism for the LM head when attention data parallelism (ADP) is enabled. "
+        "This reduces LM head latency in wide expert-parallel MoE scenarios by splitting the LM head "
+        "weight matrix across GPUs. Requires enable_attention_dp=True and MTP speculative decoding. "
+        "Supported for MoE models with MTP enabled (e.g. DeepSeek-V3/R1, GLM-4-MoE, ExaoneMoE, NemotronH).",
         status="prototype")
 
     pp_partition: Optional[List[int]] = Field(
@@ -2398,7 +2409,10 @@ class BaseLlmArgs(StrictBaseModel):
 
     cp_config: Optional[CpConfig] = Field(
         default=None,
-        description="Context parallel config.",
+        description=
+        "Context parallel config. Available cp_types: ULYSSES (default when cp_size=1) "
+        "and HELIX (required for context parallelism with cp_size > 1, designed for models using "
+        "Multi-head Latent Attention such as DeepSeek-V3/R1, requires Blackwell GPUs).",
         status="prototype")
 
     load_format: Literal['auto', 'dummy'] = Field(
@@ -2435,12 +2449,12 @@ class BaseLlmArgs(StrictBaseModel):
     iter_stats_max_iterations: Optional[int] = Field(
         default=None,
         description="The maximum number of iterations for iter stats.",
-        status="prototype")
+        status="beta")
 
     request_stats_max_iterations: Optional[int] = Field(
         default=None,
         description="The maximum number of iterations for request stats.",
-        status="prototype")
+        status="beta")
 
     # A handful of options from PretrainedConfig
     peft_cache_config: Optional[PeftCacheConfig] = Field(
@@ -2525,7 +2539,7 @@ class BaseLlmArgs(StrictBaseModel):
         default=None,
         description="Target URL to which OpenTelemetry traces will be sent.",
         alias="otlp_traces_endpoint",
-        status="prototype")
+        status="beta")
 
     backend: Optional[str] = Field(
         default=None,
@@ -2537,12 +2551,12 @@ class BaseLlmArgs(StrictBaseModel):
 
     return_perf_metrics: bool = Field(default=False,
                                       description="Return perf metrics.",
-                                      status="prototype")
+                                      status="beta")
 
     perf_metrics_max_requests: NonNegativeInt = Field(
         default=0,
         description=
-        "The maximum number of requests for perf metrics. Must also set return_perf_metrics to true to get perf metrics.",
+        "The maximum number of responses to retain perf metrics for. Must also set return_perf_metrics to true to get perf metrics.",
         status="prototype")
 
     orchestrator_type: Optional[Literal["rpc", "ray"]] = Field(
@@ -2629,6 +2643,16 @@ class BaseLlmArgs(StrictBaseModel):
 
     @model_validator(mode="after")
     def validate_parallel_config(self):
+        if self.enable_lm_head_tp_in_adp and not self.enable_attention_dp:
+            logger.warning(
+                "enable_lm_head_tp_in_adp has no effect without enable_attention_dp=True."
+            )
+
+        if "moe_cluster_parallel_size" in self.model_fields_set:
+            logger.warning(
+                "moe_cluster_parallel_size is deprecated and will be removed in a future release."
+            )
+
         if self.moe_cluster_parallel_size is None:
             self.moe_cluster_parallel_size = -1
 
@@ -2765,7 +2789,10 @@ class TrtLlmArgs(BaseLlmArgs):
         default=False,
         description=
         "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
-        status="prototype")
+        status="deprecated",
+        deprecated=
+        "fail_fast_on_attention_window_too_large is deprecated and will be removed in a future release."
+    )
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: Union[BuildCacheConfig,
@@ -2811,6 +2838,14 @@ class TrtLlmArgs(BaseLlmArgs):
     # This is used to hold the options for convert_checkpoint
     _convert_checkpoint_options: Dict[str,
                                       Any] = PrivateAttr(default_factory=dict)
+
+    @model_validator(mode="after")
+    def warn_deprecated_fields(self):
+        if "fail_fast_on_attention_window_too_large" in self.model_fields_set:
+            logger.warning(
+                "fail_fast_on_attention_window_too_large is deprecated and will be removed in a future release."
+            )
+        return self
 
     @model_validator(mode="after")
     def init_build_config(self):
@@ -3231,13 +3266,13 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype")
 
     torch_compile_config: Optional[TorchCompileConfig] = Field(
-        default=None, description="Torch compile config.", status="prototype")
+        default=None, description="Torch compile config.", status="beta")
 
     enable_autotuner: bool = Field(
         default=True,
         description=
         "Enable autotuner for all tunable ops. This flag is for debugging purposes only, and the performance may significantly degrade if set to false.",
-        status="prototype")
+        status="beta")
 
     enable_layerwise_nvtx_marker: bool = Field(
         default=False,
@@ -3297,12 +3332,13 @@ class TorchLlmArgs(BaseLlmArgs):
     checkpoint_format: Optional[str] = Field(
         default=None,
         description=
-        "The format of the provided checkpoint. You may use a custom checkpoint format by subclassing "
+        "The format of the provided checkpoint. Available formats: 'HF', 'mistral', 'mistral_large_3'. "
+        "You may use a custom checkpoint format by subclassing "
         "`BaseCheckpointLoader` and registering it with `register_checkpoint_loader`.\n"
         "If neither checkpoint_format nor checkpoint_loader are provided, checkpoint_format will be set to HF "
         "and the default HfCheckpointLoader will be used.\n"
         "If checkpoint_format and checkpoint_loader are both provided, checkpoint_loader will be ignored.",
-        status="prototype",
+        status="beta",
     )
 
     kv_connector_config: Optional[KvCacheConnectorConfig] = Field(
