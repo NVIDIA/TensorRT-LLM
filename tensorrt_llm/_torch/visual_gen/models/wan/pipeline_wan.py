@@ -1,5 +1,5 @@
 import time
-from typing import Optional, Type
+from typing import Optional
 
 import diffusers
 import torch
@@ -17,7 +17,6 @@ from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm._utils import nvtx_range
 from tensorrt_llm.logger import logger
 
-from .parallel_vae import WanParallelVAEAdapter
 from .transformer_wan import WanTransformer3DModel
 
 # Supported Wan T2V models:
@@ -128,10 +127,6 @@ class WanPipeline(BasePipeline):
     def common_warmup_shapes(self) -> list:
         """Return list of common warmup shapes for the pipeline."""
         return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
-
-    @property
-    def vae_adapter_class(self) -> Type[WanParallelVAEAdapter]:
-        return WanParallelVAEAdapter
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN transformer with quantization support...")

@@ -1,13 +1,17 @@
 from typing import Literal
 
+import torch
 import torch.nn as nn
 from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, WanCausalConv3d
 
 from tensorrt_llm._torch.visual_gen.modules.vae import (
-    BaseParallelVAEAdapter,
     HaloExchangeConv,
     HaloExchangeConv2dStride2,
     ParallelVaeAttentionBlock,
+)
+from tensorrt_llm._torch.visual_gen.modules.vae.parallel_vae_interface import (
+    ParallelVAEBase,
+    SplitSpec,
 )
 from tensorrt_llm._torch.visual_gen.utils import as_tuple
 
@@ -26,29 +30,49 @@ class WanCausalConvHalo(HaloExchangeConv):
         return self._strip_halo(result)
 
 
-class WanParallelVAEAdapter(BaseParallelVAEAdapter):
-    """Parallel VAE adapter for ``AutoencoderKLWan``."""
+class ParallelVAE_Wan(ParallelVAEBase):
+    """Parallel VAE wrapper for ``AutoencoderKLWan``."""
 
-    def _get_chunk_dims(self, split_dim: Literal["height", "width"]) -> dict:
+    @staticmethod
+    def make_spec(split_dim: Literal["height", "width"]) -> SplitSpec:
         # WAN tensor shapes:
-        #   5D latent/video : (B, C, T, H, W)  → H=dim3, W=dim4
-        #   4D per-frame    : (B*T, C, H, W)   → H=dim2, W=dim3
-        #   5D attention in : (B, C, T, H, W)   → H=dim3, W=dim4
+        #   5D latent/video : (B, C, T, H, W)  -> H=dim3, W=dim4
+        #   4D per-frame    : (B*T, C, H, W)   -> H=dim2, W=dim3
+        #   5D attention in : (B, C, T, H, W)   -> H=dim3, W=dim4
         if split_dim == "height":
-            return {"input": 3, "conv3d": 3, "conv2d": 2, "attn": 3}
-        elif split_dim == "width":
-            return {"input": 4, "conv3d": 4, "conv2d": 3, "attn": 4}
+            return SplitSpec(split_dim, input_dim=3, conv3d_dim=3, conv2d_dim=2, attn_dim=3)
+        if split_dim == "width":
+            return SplitSpec(split_dim, input_dim=4, conv3d_dim=4, conv2d_dim=3, attn_dim=4)
         raise ValueError(f"Invalid split_dim: {split_dim}")
 
-    def _parallelize_decoder(self) -> None:
-        self._replace_conv3d(self.vae.decoder)
-        self._replace_attention(self.vae.decoder)
-        self._replace_resample_conv2d(self.vae.decoder)
+    # ------------------------------------------------------------------
+    # encode / decode
+    # ------------------------------------------------------------------
 
-    def _parallelize_encoder(self) -> None:
-        self._replace_conv3d(self.vae.encoder)
-        self._replace_attention(self.vae.encoder)
-        self._replace_resample_conv2d_stride2(self.vae.encoder)
+    def _encode_impl(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        x_local, _ = self._split_tensor(x)
+        z_local = self.vae_backend.encode(x_local, **kwargs)
+        if isinstance(z_local, (tuple, list)):
+            z_local = z_local[0]
+        return self._gather_tensor(z_local)
+
+    def _decode_impl(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        z_local, _ = self._split_tensor(z)
+        out = self.vae_backend.decode(z_local, **kwargs)
+        x_local = out[0] if isinstance(out, (tuple, list)) else out
+        return self._gather_tensor(x_local)
+
+    # ------------------------------------------------------------------
+    # Module parallelisation
+    # ------------------------------------------------------------------
+
+    def _parallelize_modules(self) -> None:
+        self._replace_conv3d(self.vae_backend.decoder)
+        self._replace_attention(self.vae_backend.decoder)
+        self._replace_resample_conv2d(self.vae_backend.decoder)
+        self._replace_conv3d(self.vae_backend.encoder)
+        self._replace_attention(self.vae_backend.encoder)
+        self._replace_resample_conv2d_stride2(self.vae_backend.encoder)
 
     def _replace_conv3d(self, model: nn.Module) -> None:
         """Replace WanCausalConv3d (kernel > 1) with WanCausalConvHalo."""
@@ -63,15 +87,15 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
                 name,
                 WanCausalConvHalo(
                     module,
-                    self.chunk_dims["conv3d"],
-                    self.adj_groups,
+                    self.spec.conv3d_dim,
+                    self._adj_groups,
                     self.rank,
                     self.world_size,
                 ),
             )
 
     def _replace_attention(self, model: nn.Module) -> None:
-        """Replace WanAttentionBlock with GatherAttention."""
+        """Replace WanAttentionBlock with parallel gather-attention."""
         targets = [
             (name, module)
             for name, module in model.named_modules()
@@ -83,19 +107,14 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
                 name,
                 ParallelVaeAttentionBlock(
                     module,
-                    self.chunk_dims["attn"],
+                    self.spec.attn_dim,
                     self.rank,
                     self.world_size,
                 ),
             )
 
     def _replace_resample_conv2d(self, model: nn.Module) -> None:
-        """Replace stride-1 Conv2d inside WanResample upsample paths.
-
-        WanResample.resample for upsample modes is:
-            Sequential(WanUpsample, Conv2d(dim, out, 3, padding=1))
-        The Conv2d is a standard 2D conv on per-frame data (B*T, C, H, W).
-        """
+        """Replace stride-1 Conv2d inside WanResample upsample paths."""
         targets = [
             (name, module)
             for name, module in model.named_modules()
@@ -110,21 +129,15 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
                 name,
                 HaloExchangeConv(
                     module,
-                    self.chunk_dims["conv2d"],
-                    self.adj_groups,
+                    self.spec.conv2d_dim,
+                    self._adj_groups,
                     self.rank,
                     self.world_size,
                 ),
             )
 
     def _replace_resample_conv2d_stride2(self, model: nn.Module) -> None:
-        """Replace stride-2 Conv2d inside WanResample downsample paths.
-
-        WanResample.resample for downsample modes is:
-            Sequential(ZeroPad2d((0,1,0,1)), Conv2d(dim, dim, 3, stride=(2,2)))
-        We replace the entire Sequential with HaloExchangeConv2dStride2, which
-        absorbs the ZeroPad2d logic.
-        """
+        """Replace stride-2 Conv2d inside WanResample downsample paths."""
         targets = [
             (name, module)
             for name, module in model.named_modules()
@@ -142,8 +155,8 @@ class WanParallelVAEAdapter(BaseParallelVAEAdapter):
                 name,
                 HaloExchangeConv2dStride2(
                     conv_module,
-                    self.chunk_dims["conv2d"],
-                    self.adj_groups,
+                    self.spec.conv2d_dim,
+                    self._adj_groups,
                     self.rank,
                     self.world_size,
                     pad_before_conv=pad_module.padding,

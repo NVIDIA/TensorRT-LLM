@@ -1,113 +1,191 @@
-from abc import ABC, abstractmethod
-from typing import List, Literal
+from dataclasses import dataclass
+from typing import Dict, List, Literal, Tuple, Type
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from diffusers.models.autoencoders.vae import DecoderOutput
 
 
-class BaseParallelVAEAdapter(ABC):
-    """Interface that every VAE-family adapter must implement.
+@dataclass(frozen=True)
+class SplitSpec:
+    """Describes how tensors are split across ranks for parallel VAE."""
 
-    Subclasses override ``_parallelize_decoder``, ``_parallelize_encoder``,
-    and ``_get_chunk_dims`` for their specific module tree.  The base class
-    provides the common ``setup`` / ``decode`` / ``encode`` orchestration.
+    split_dim: Literal["height", "width"]
+    input_dim: int
+    conv3d_dim: int
+    conv2d_dim: int
+    attn_dim: int
+
+
+class ParallelVAEBase(nn.Module):
+    """nn.Module wrapper that parallelises a VAE across a process group.
+
+    Subclasses implement ``_encode_impl`` / ``_decode_impl`` for their
+    specific VAE family and override ``_parallelize_modules`` to swap
+    internal layers (convolutions, attention, norm) with parallel variants.
     """
 
     def __init__(
         self,
-        vae: nn.Module,
-        split_dim: Literal["height", "width"],
-        rank: int,
-        world_size: int,
-        adj_groups: List[dist.ProcessGroup],
+        vae_backend: nn.Module,
+        pg: dist.ProcessGroup,
+        spec: SplitSpec,
     ) -> None:
-        self.vae = vae
-        self.split_dim = split_dim
-        self.rank = rank
-        self.world_size = world_size
-        self.adj_groups = adj_groups
-        self.chunk_dims = self._get_chunk_dims(split_dim)
+        super().__init__()
+        self.vae_backend = vae_backend
+        self.pg = pg
+        self.spec = spec
+        self.rank = dist.get_rank(pg)
+        self.world_size = dist.get_world_size(pg)
+        self._adj_groups = self._build_adj_groups(pg)
+        self._parallelize_modules()
 
-        self._parallelize_decoder()
-        self._parallelize_encoder()
-        self._wrap_decode()
-        self._wrap_encode()
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
 
-    @abstractmethod
-    def _get_chunk_dims(self, split_dim: Literal["height", "width"]) -> dict:
-        """Return a dict mapping layer role to the tensor dim to split.
+    def encode(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self._encode_impl(x, **kwargs)
 
-        Example for WAN with split_dim="height":
-            {"input": 3, "conv3d": 3, "conv2d": 2, "attn": 3}
-        The exact keys depend on the VAE architecture.
+    def decode(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        return self._decode_impl(z, **kwargs)
+
+    # ------------------------------------------------------------------
+    # Subclass hooks
+    # ------------------------------------------------------------------
+
+    def _encode_impl(self, x: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _decode_impl(self, z: torch.Tensor, **kwargs) -> torch.Tensor:
+        raise NotImplementedError
+
+    def _parallelize_modules(self) -> None:
+        """Replace internal layers with parallel variants.  Called at end of ``__init__``."""
+
+    @staticmethod
+    def make_spec(split_dim: Literal["height", "width"]) -> "SplitSpec":
+        """Build a ``SplitSpec`` for the given split dimension.
+
+        Every concrete subclass must override this.
         """
-        ...
+        raise NotImplementedError
 
-    @abstractmethod
-    def _parallelize_decoder(self) -> None:
-        """Walk the VAE's decoder module tree and replace layers in-place."""
-        ...
+    # ------------------------------------------------------------------
+    # Attribute delegation
+    # ------------------------------------------------------------------
 
-    @abstractmethod
-    def _parallelize_encoder(self) -> None:
-        """Walk the VAE's encoder module tree and replace layers in-place.
-        Optional — can be a no-op if only decode parallelism is needed.
+    def __getattr__(self, name: str):
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            return getattr(self.vae_backend, name)
+
+    # ------------------------------------------------------------------
+    # Tensor helpers
+    # ------------------------------------------------------------------
+
+    def _split_tensor(self, x: torch.Tensor) -> Tuple[torch.Tensor, int]:
+        """Chunk ``x`` along the input split dimension and return this rank's slice.
+
+        Returns:
+            (local_chunk, full_size) where *full_size* is the original extent
+            along the split dim so callers can pass it to ``_gather_tensor``.
         """
-        ...
+        dim = self.spec.input_dim
+        full_size = x.shape[dim]
+        if full_size % self.world_size != 0:
+            raise ValueError(
+                f"Dim {dim} (size {full_size}) not divisible by world_size {self.world_size}"
+            )
+        return x.chunk(self.world_size, dim=dim)[self.rank], full_size
 
-    def _wrap_decode(self) -> None:
-        """Replace ``vae._decode`` with a parallel version."""
-        original_decode = self.vae._decode
-        input_dim = self.chunk_dims["input"]
-        rank = self.rank
-        world_size = self.world_size
+    def _gather_tensor(self, x_local: torch.Tensor) -> torch.Tensor:
+        """All-gather ``x_local`` along the input split dimension."""
+        dim = self.spec.input_dim
+        gathered = [torch.empty_like(x_local) for _ in range(self.world_size)]
+        dist.all_gather(gathered, x_local, group=self.pg)
+        return torch.cat(gathered, dim=dim)
 
-        def parallel_decode(latents, return_dict=True):
-            if latents.shape[input_dim] % world_size != 0:
-                raise ValueError(
-                    f"Dim {input_dim} (size {latents.shape[input_dim]}) "
-                    f"not divisible by world_size {world_size}"
-                )
-            local_latents = latents.chunk(world_size, dim=input_dim)[rank]
-            local_out = original_decode(local_latents, return_dict=False)
-            local_video = local_out[0] if isinstance(local_out, tuple) else local_out
-            gathered = [torch.empty_like(local_video) for _ in range(world_size)]
-            dist.all_gather(gathered, local_video)
-            video = torch.cat(gathered, dim=input_dim)
-            if not return_dict:
-                return (video,)
-            return DecoderOutput(sample=video)
-
-        self.vae._decode = parallel_decode
-
-    def _wrap_encode(self) -> None:
-        """Replace ``vae._encode`` with a parallel version."""
-        original_encode = self.vae._encode
-        input_dim = self.chunk_dims["input"]
-        rank = self.rank
-        world_size = self.world_size
-
-        def parallel_encode(video, **kwargs):
-            if video.shape[input_dim] % world_size != 0:
-                raise ValueError(
-                    f"Dim {input_dim} (size {video.shape[input_dim]}) "
-                    f"not divisible by world_size {world_size}"
-                )
-            local_video = video.chunk(world_size, dim=input_dim)[rank]
-            local_latents = original_encode(local_video, **kwargs)
-            gathered = [torch.empty_like(local_latents) for _ in range(world_size)]
-            dist.all_gather(gathered, local_latents)
-            return torch.cat(gathered, dim=input_dim)
-
-        self.vae._encode = parallel_encode
+    # ------------------------------------------------------------------
+    # Module-replacement helper
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _replace_module(root: nn.Module, target_name: str, new_module: nn.Module):
-        """Replace a named module inside ``root`` in-place."""
+        """Replace a named submodule inside *root* in-place."""
         attrs = target_name.split(".")
         parent = root
         for attr in attrs[:-1]:
             parent = getattr(parent, attr)
         setattr(parent, attrs[-1], new_module)
+
+    # ------------------------------------------------------------------
+    # Process-group helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _build_adj_groups(pg: dist.ProcessGroup) -> List[dist.ProcessGroup]:
+        """Create pairwise adjacent-rank groups from *pg*.
+
+        Returns a list where ``adj_groups[i]`` is a group containing global
+        ranks ``ranks[i]`` and ``ranks[i+1]`` from *pg*.
+        """
+        world_size = dist.get_world_size(pg)
+        ranks = list(range(world_size))
+
+        adj_groups: List[dist.ProcessGroup] = []
+        for i in range(world_size - 1):
+            adj_groups.append(
+                dist.new_group(
+                    [ranks[i], ranks[i + 1]],
+                    use_local_synchronization=False,
+                )
+            )
+        return adj_groups
+
+
+class ParallelVAEFactory:
+    """Factory that maps VAE classes to their parallel wrappers via lazy imports.
+
+    The mapping is keyed by the fully-qualified VAE class name
+    (``module.ClassName``) so the parallel implementation module is only
+    imported when actually needed -- no side-effect imports required.
+    """
+
+    # "vae_module.VaeClass" -> (parallel_module, parallel_class)
+    _LAZY_REGISTRY: Dict[str, Tuple[str, str]] = {
+        "diffusers.models.autoencoders.autoencoder_kl_wan.AutoencoderKLWan": (
+            "tensorrt_llm._torch.visual_gen.models.wan.parallel_vae",
+            "ParallelVAE_Wan",
+        ),
+    }
+
+    @classmethod
+    def from_vae(
+        cls,
+        vae: nn.Module,
+        split_dim: Literal["height", "width"],
+        pg: dist.ProcessGroup,
+    ) -> ParallelVAEBase:
+        parallel_cls = cls._resolve(type(vae))
+        if parallel_cls is None:
+            raise ValueError(
+                f"No parallel VAE registered for {type(vae).__name__}. "
+                f"Known VAE types: {list(cls._LAZY_REGISTRY.keys())}"
+            )
+        spec = parallel_cls.make_spec(split_dim)
+        return parallel_cls(vae, pg, spec)
+
+    @classmethod
+    def _resolve(cls, vae_type: type) -> Type[ParallelVAEBase] | None:
+        """Walk the MRO of *vae_type* and return the first matching parallel class."""
+        import importlib
+
+        for klass in vae_type.__mro__:
+            key = f"{klass.__module__}.{klass.__qualname__}"
+            if key in cls._LAZY_REGISTRY:
+                mod_path, cls_name = cls._LAZY_REGISTRY[key]
+                mod = importlib.import_module(mod_path)
+                return getattr(mod, cls_name)
+        return None

@@ -1,6 +1,6 @@
 """Utilities for distributed parallelism setup in diffusion models."""
 
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import torch.distributed as dist
 
@@ -98,33 +98,3 @@ def setup_sequence_parallelism(
     model_config.ulysses_process_group = ulysses_pg
 
     return True, ulysses_size, ulysses_pg, ulysses_rank
-
-
-def setup_parallel_vae(
-    model_config: DiffusionModelConfig,
-) -> Tuple[int, int, List[dist.ProcessGroup]]:
-    """Create process groups for parallel VAE decoding.
-
-    Uses all ranks in the global group.
-
-    Args:
-        model_config: Model configuration containing parallel settings.
-
-    Returns:
-        Tuple of (vae_rank, vae_world_size, adj_groups)
-    """
-    if not dist.is_initialized():
-        raise RuntimeError(
-            "torch.distributed.init_process_group() must be called before "
-            "setting up VAE parallelism"
-        )
-
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-
-    adj_groups = []
-    for i in range(world_size - 1):
-        pg = dist.new_group([i, i + 1], use_local_synchronization=False)
-        adj_groups.append(pg)
-
-    return rank, world_size, adj_groups
