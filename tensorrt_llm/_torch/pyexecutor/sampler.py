@@ -3326,7 +3326,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         first_finish_reasons_host: torch.Tensor | None = None
         beam_history_builders: list[BeamHistoryBuilder | None] | None = None
         if requests:
-            seq_slots_cuda = seq_slots_host.to(device="cuda", non_blocking=True)
+            seq_slots_cuda = seq_slots_host.to(
+                device="cuda",
+                dtype=torch.int64,  # for index_fill_
+                non_blocking=True,
+            )
             seq_lens_cuda = seq_lens_host.to(device="cuda", non_blocking=True)
 
             beam_search_store = self.store.beam_search_store
@@ -4176,16 +4180,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._prepare_log_probs(sampling_requests)
 
-        seq_slots_host_int64 = torch.tensor(
+        seq_slots_host = torch.tensor(
             [r.py_seq_slot for r in sampling_requests],
-            dtype=torch.int64,  # for index_fill_
+            dtype=torch.int32,
             pin_memory=prefer_pinned(),
         )
-
-        seq_slots_host_int32 = torch.empty_like(
-            seq_slots_host_int64, dtype=torch.int32, pin_memory=prefer_pinned()
-        )  # int32 suffices here
-        seq_slots_host_int32[:] = seq_slots_host_int64
 
         # necessary for beam search and max_length checks
         seq_lens_host = torch.tensor(
@@ -4210,7 +4209,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if self._can_use_fast_greedy_path(sampling_requests):
             # Compute destination indices on CPU (same pattern as _unbatch_sampling_results)
             batch_destination_indexer = _UnpackedStepIndexer(
-                seq_slots=seq_slots_host_int32,
+                seq_slots=seq_slots_host,
                 num_steps=sampling_requests_metadata.req_num_generated_tokens,
                 steps_dim_size=new_tokens_cuda.size(0),
                 slots_dim_size=new_tokens_cuda.size(1),
@@ -4234,7 +4233,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             )
 
             new_tokens_host = self._copy_to_host(new_tokens_cuda)
-            return sampling_requests, seq_slots_host_int64, seq_lens_host, new_tokens_host
+            return sampling_requests, seq_slots_host, seq_lens_host, new_tokens_host
 
         # Indexer for accessing tokens in 'logits_cuda', corresponding to the
         # requests in 'requests'.
@@ -4252,7 +4251,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             model_outputs,
             logits_cuda_indexer=logits_cuda_indexer,
             req_offsets=sampling_requests_metadata.req_offsets,
-            seq_slots=seq_slots_host_int32,
+            seq_slots=seq_slots_host,
             seq_lens=seq_lens_host,
             req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
             req_num_steps=sampling_requests_metadata.req_num_steps,
@@ -4263,7 +4262,7 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
         if return_log_probs:
             self._process_logprobs(
                 batched_sampling_result,
-                seq_slots_host_int32,
+                seq_slots_host,
                 sampling_requests,
                 sampling_requests_metadata.req_num_steps,
                 sampling_requests_metadata.req_num_generated_tokens_output,
@@ -4274,11 +4273,11 @@ class TorchSampler(Sampler[SampleStateTorch], AsyncWorkerMixin):
             batched_sampling_result,
             new_tokens_cuda=new_tokens_cuda,
             req_num_generated_tokens=sampling_requests_metadata.req_num_generated_tokens,
-            seq_slots=seq_slots_host_int32,
+            seq_slots=seq_slots_host,
         )
 
         # NB: update_requests syncs w/ device computation and async D2H copies
-        return sampling_requests, seq_slots_host_int64, seq_lens_host, new_tokens_host
+        return sampling_requests, seq_slots_host, seq_lens_host, new_tokens_host
 
     @override
     def should_provide_draft_probs(self, request: LlmRequest) -> bool:
