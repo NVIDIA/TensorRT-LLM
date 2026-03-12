@@ -106,9 +106,7 @@ args = VisualGenArgs(
 ```
 
 Serve-mode YAML via `trtllm-serve --extra_visual_gen_options` follows the same
-`VisualGenArgs` schema. Dynamic backends must be configured with `quant_config`;
-the legacy `linear.type` field is not accepted. For default or static/pre-quantized
-checkpoints, omit quantization fields entirely.
+`VisualGenArgs` schema. Dynamic backends must be configured with `quant_config`. For default or static/pre-quantized checkpoints, omit quantization fields.
 
 Example serve config enabling dynamic FP8 blockwise quantization:
 
