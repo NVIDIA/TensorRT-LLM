@@ -207,6 +207,19 @@ For local SLURM job submission (supports both aggregated and disaggregated tests
 python jenkins/scripts/perf/local/submit.py --help
 ```
 
+## Disaggregated Test SLURM Execution
+
+A disaggregated test runs **four srun steps** within a single multi-node SLURM job allocation. Each step has a different role set via `DISAGG_SERVING_TYPE`:
+
+| Step | `DISAGG_SERVING_TYPE` | Needs MPI | Notes |
+|------|-----------------------|-----------|-------|
+| Context worker(s) | `CTX_0`, `CTX_1`, ... | Yes | Launched via `trtllm-llmapi-launch`, multi-GPU |
+| Generation worker(s) | `GEN_0`, `GEN_1`, ... | Yes | Launched via `trtllm-llmapi-launch`, multi-GPU |
+| Disagg server | `DISAGG_SERVER` | No | Runs `trtllm-serve disaggregated`, single process |
+| Benchmark client | `BENCHMARK` | No | Runs benchmark pytest, single process |
+
+All four srun steps share the same `srunArgs` array, but `--mpi=pmix` is added **only** to the CTX/GEN worker srun commands in `slurm_launch_draft.sh` (not in srunArgs). This prevents unwanted MPI initialization in the disagg server and benchmark processes. See the MPI/PMI section in `jenkins/scripts/perf/README.md` for details.
+
 ## Quick Reference for AI Agents
 
 When working with perf sanity tests, use these paths:
