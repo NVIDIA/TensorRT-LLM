@@ -344,6 +344,8 @@ async def async_load_audio(
         async with aiohttp.ClientSession() as session:
             async with session.get(audio) as response:
                 audio = BytesIO(await response.content.read())
+    elif parsed_url.scheme == "file":
+        audio = parsed_url.path
 
     audio = soundfile.read(audio)
     return audio
