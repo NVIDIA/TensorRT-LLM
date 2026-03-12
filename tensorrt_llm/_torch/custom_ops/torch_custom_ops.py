@@ -2269,13 +2269,19 @@ class Fp4QuantKernelRunner(TunableRunner):
 
     Selects between TRTLLM CUDA and FlashInfer quantization backends.
     Uses empty gen_tuning_buckets so only actual M values are profiled.
+    CUDA graph is disabled for profiling because the FlashInfer TMA
+    kernel may cache internal state (e.g. TMA descriptors) that references
+    memory from the graph pool; after graph destruction, this stale state
+    causes TMA encoding failures on the subsequent real call.
     """
 
     TACTIC_TRTLLM = 0
     TACTIC_FLASHINFER = 1
 
-    tuning_config = TuningConfig(dynamic_tensor_specs=(DynamicTensorSpec(
-        0, 0, ()), ), )
+    tuning_config = TuningConfig(
+        dynamic_tensor_specs=(DynamicTensorSpec(0, 0, ()), ),
+        use_cuda_graph=False,
+    )
 
     def __init__(self,
                  scaling_vector_size: int = 16,
@@ -2348,9 +2354,20 @@ def tunable_fp4_quantize(
     if best_tactic == -1:
         best_tactic = Fp4QuantKernelRunner.TACTIC_TRTLLM
 
-    act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
-                                             scaling_vector_size,
-                                             is_sf_swizzled_layout, best_tactic)
+    try:
+        act_fp4, act_sf = _fp4_quantize_dispatch(input, input_scale,
+                                                 scaling_vector_size,
+                                                 is_sf_swizzled_layout,
+                                                 best_tactic)
+    except Exception:
+        if best_tactic != Fp4QuantKernelRunner.TACTIC_TRTLLM:
+            logger.warning(f"FlashInfer FP4 quantize failed for input shape "
+                           f"{input.shape}, falling back to TRTLLM kernel.")
+            act_fp4, act_sf = _fp4_quantize_dispatch(
+                input, input_scale, scaling_vector_size, is_sf_swizzled_layout,
+                Fp4QuantKernelRunner.TACTIC_TRTLLM)
+        else:
+            raise
     return [act_fp4, act_sf]
 
 
