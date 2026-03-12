@@ -78,9 +78,12 @@ def _compute_slot_mappings(
     block_indices_in_seq = global_positions // tokens_per_block
     pos_in_blocks = global_positions % tokens_per_block
 
-    max_blocks = block_offsets.shape[1]
-    assert (block_indices_in_seq < max_blocks).all(), \
-        f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
+    # on_update_kv_lens() calls this during CUDA graph capture;
+    # .all()/.item() would trigger host-device sync and invalidate capture.
+    if not torch.cuda.is_current_stream_capturing():
+        max_blocks = block_offsets.shape[1]
+        assert (block_indices_in_seq < max_blocks).all(), \
+            f"Block index out of bounds: max={max_blocks}, got indices up to {block_indices_in_seq.max().item()}"
 
     block_ids = block_offsets[req_indices, block_indices_in_seq].to(torch.int64)
 
