@@ -41,7 +41,6 @@ class ADInputProcessor(DefaultInputProcessor):
                 "truncation": True,
                 "max_length": sampling_params.truncate_prompt_tokens,
             }
-
         # check for messages field and if yes, use the apply_chat_template method
         if "messages" in inputs:
             # multi_modal_data should not be present in the messages field
