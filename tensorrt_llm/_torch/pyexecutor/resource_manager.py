@@ -2072,23 +2072,42 @@ class KVCacheManagerV2(BaseResourceManager):
                     kv_cache.stop_committing()
                     success = kv_cache.resume(self._stream.cuda_stream)
                     if not success:
-                        logger.warning(
-                            f"Draft KV cache resume failed for request "
-                            f"{req.py_request_id}")
                         continue
+                    self._restore_page_index_bufs(req.py_request_id, kv_cache)
+                elif not kv_cache.is_active:
+                    # Existing but suspended (evicted by main scheduler) —
+                    # resume before resize.
+                    if not kv_cache.resume(self._stream.cuda_stream):
+                        continue
+                    self._restore_page_index_bufs(req.py_request_id, kv_cache)
                 capacity = (req.context_current_position +
                             req.context_chunk_size + self.num_extra_kv_tokens)
-                success = kv_cache.resize(capacity)
-                if not success:
-                    logger.warning(
-                        f"Draft KV cache resize failed for request "
-                        f"{req.py_request_id}, target capacity {capacity}")
+                kv_cache.resize(capacity)
 
             for req in scheduled_batch.generation_requests:
                 kv_cache = self.kv_cache_map.get(req.py_request_id)
                 if kv_cache is None:
                     continue
-                new_cap = (kv_cache.capacity + 1 + get_draft_token_length(req))
+                if not kv_cache.is_active:
+                    if not kv_cache.resume(self._stream.cuda_stream):
+                        continue
+                    self._restore_page_index_bufs(req.py_request_id, kv_cache)
+                draft_len = get_draft_token_length(req)
+                old_cap = kv_cache.capacity
+                new_cap = (old_cap + 1 + draft_len)
+                # The model engine computes kv_lens as:
+                #   (max_beam_num_tokens - 1) + (1 + num_draft_tokens) + extra
+                # But max_beam_num_tokens may increase by tokens_per_first_draft
+                # (= max_draft_len + 1) between prepare_resources and forward,
+                # because the current iteration's accepted tokens are committed.
+                # Account for this growth to ensure sufficient block allocation.
+                max_draft_len = self.num_extra_kv_tokens + 1
+                tokens_per_first_draft = max_draft_len + 1
+                main_kv_len = req.max_beam_num_tokens
+                needed_cap = (main_kv_len + tokens_per_first_draft + draft_len +
+                              self.num_extra_kv_tokens)
+                if new_cap < needed_cap:
+                    new_cap = needed_cap
                 kv_cache.resize(new_cap)
 
     def get_kv_cache_stats(self):

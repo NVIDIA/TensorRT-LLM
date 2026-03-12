@@ -520,14 +520,23 @@ class TestKVCacheV2DSv3Lite:
     def test_mtp_chunked_draft_tokens(self):
         self._compare([LONG_PROMPT], enable_chunked_prefill=True, max_num_tokens=256)
 
-    # MTP + eviction — both V1 and V2 complete
     def test_mtp_eviction(self):
+        # Eviction parameters for DeepSeek-V3-Lite MTP (tokens_per_block=32):
+        # max_seq_len=512   → per-request max 16 blocks. Caps warmup dummy.
+        # max_tokens=8192   → 256 GPU blocks.
+        #   Warmup: 15 short(1 block) + 1 long(16 blocks) = 31 < 256 ✓
+        # 40 prompts, gen=256 → 16 concurrent × ~9 blocks = 144 at peak.
+        #   With draft KV doubling pressure → eviction expected.
+        # host_cache_size=512MB → host tier for evicted blocks.
         self._compare(
-            SHORT_PROMPTS * 2,  # 20 prompts for memory pressure
+            SHORT_PROMPTS * 4,  # 40 prompts for memory pressure
+            max_tokens=256,  # longer generation to fill KV pool
             kv_extra={
                 "free_gpu_memory_fraction": 0.3,
+                "max_tokens": 4096,  # constrain KV pool to ~128 blocks
                 "host_cache_size": 512 * 1024 * 1024,  # 512 MiB host tier
             },
             max_batch_size=16,
             max_num_tokens=4096,
+            max_seq_len=512,  # cap warmup dummy request size
         )

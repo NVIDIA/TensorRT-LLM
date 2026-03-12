@@ -1155,6 +1155,8 @@ def create_py_executor_instance(
 
     if isinstance(kv_cache_manager, KVCacheManagerV2):
         # V2: interleaved scheduler handles both capacity and budget
+        draft_kv_cache_manager = resources.get(
+            ResourceManagerType.DRAFT_KV_CACHE_MANAGER)
         scheduler = KVCacheV2Scheduler(
             max_batch_size=max_batch_size,
             max_num_tokens=max_num_tokens,
@@ -1164,6 +1166,7 @@ def create_py_executor_instance(
             peft_cache_manager=peft_cache_manager.impl
             if peft_cache_manager is not None else None,
             scheduler_capacity=scheduler_capacity,
+            draft_kv_cache_manager=draft_kv_cache_manager,
         )
     elif (scheduler_config is not None
           and scheduler_config.use_python_scheduler):

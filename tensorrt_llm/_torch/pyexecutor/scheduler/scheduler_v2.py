@@ -40,6 +40,7 @@ class KVCacheV2Scheduler(RequestScheduler):
         scheduler_capacity: Optional[int] = None,
         no_schedule_until_state: LlmRequestState = LlmRequestState.CONTEXT_INIT,
         no_schedule_after_state: LlmRequestState = LlmRequestState.GENERATION_TO_COMPLETE,
+        draft_kv_cache_manager=None,  # KVCacheManagerV2 for MTP draft layers
     ):
         self.max_num_tokens = max_num_tokens
         self.max_num_requests = (
@@ -51,6 +52,7 @@ class KVCacheV2Scheduler(RequestScheduler):
             f"KVCacheV2Scheduler requires KVCacheManagerV2, got {type(kv_cache_manager).__name__}"
         )
         self.kv_cache_manager = kv_cache_manager
+        self.draft_kv_cache_manager = draft_kv_cache_manager
         if scheduler_policy != CapacitySchedulerPolicy.MAX_UTILIZATION:
             logger.warning(
                 "KVCacheV2Scheduler only supports MAX_UTILIZATION for now, got %s, setting to MAX_UTILIZATION",
@@ -65,10 +67,11 @@ class KVCacheV2Scheduler(RequestScheduler):
         self.max_context_length = max_num_tokens
         self.tokens_per_block = kv_cache_manager.tokens_per_block
         logger.info(
-            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s",
+            "KVCacheV2Scheduler: tokens_per_block=%d, max_num_tokens=%s, max_batch_size=%s, draft_mgr=%s",
             self.tokens_per_block,
             max_num_tokens,
             max_batch_size,
+            type(draft_kv_cache_manager).__name__ if draft_kv_cache_manager is not None else "None",
         )
         if ctx_chunk_config is not None:
             self.chunking_enabled = True
@@ -291,7 +294,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                         req.py_request_id,
                         req.state,
                     )
-                    self.kv_cache_manager.suspend_request(req)
+                    self._suspend_request(req)
                     evicted.append(req)
 
             if scheduled:
@@ -404,6 +407,12 @@ class KVCacheV2Scheduler(RequestScheduler):
             req.is_context_init_state and not req.is_first_context_chunk
         ) or req.is_generation_in_progress_state
 
+    def _suspend_request(self, req: LlmRequest) -> None:
+        """Suspend a request's KV cache in both main and draft managers."""
+        self.kv_cache_manager.suspend_request(req)
+        if self.draft_kv_cache_manager is not None:
+            self.draft_kv_cache_manager.suspend_request(req)
+
     def _is_evictable(self, req: LlmRequest) -> bool:
         """A started request whose KV cache is still active on GPU.
 
@@ -447,7 +456,7 @@ class KVCacheV2Scheduler(RequestScheduler):
                 victim.state,
                 req.py_request_id,
             )
-            self.kv_cache_manager.suspend_request(victim)
+            self._suspend_request(victim)
             evicted.append(victim)
             req_it_end = victim_idx
 
