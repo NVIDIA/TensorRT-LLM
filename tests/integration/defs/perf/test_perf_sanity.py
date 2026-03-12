@@ -620,7 +620,7 @@ class DisaggTestCmds(NamedTuple):
         with open(hostname_file, "w") as f:
             f.write(f"{self.hostname}:{port}")
 
-    def _generate_disagg_server_config(self, server_idx: int, disagg_server_port: int) -> str:
+    def _generate_disagg_server_config(self, server_idx: int) -> str:
         """Generate disagg server config from hostname files."""
         print_info(f"Generating disagg server config for server index {server_idx}")
         hostnames_folder = os.path.join(self.test_output_dir, f"hostnames-{server_idx}")
@@ -657,6 +657,11 @@ class DisaggTestCmds(NamedTuple):
                 ctx_hostnames.append(hostname_port)
             elif hostname_file.startswith("GEN"):
                 gen_hostnames.append(hostname_port)
+
+        # Allocate port here (after waiting) to minimize the window between
+        # port allocation and actual use, avoiding TOCTOU race conditions
+        # where another process on the same node grabs the port.
+        disagg_server_port = get_free_port()
 
         server_config = {
             "hostname": self.hostname,
@@ -738,10 +743,9 @@ class DisaggTestCmds(NamedTuple):
         benchmark_status_file = os.path.join(
             self.test_output_dir, f"benchmark_status.{server_idx}.txt"
         )
-        port = get_free_port()
-
         ctx_cmd, gen_cmd, disagg_cmd = self.server_cmds[server_idx]
         if "CTX" in self.disagg_serving_type or "GEN" in self.disagg_serving_type:
+            port = get_free_port()
             self._generate_hostname_file(server_idx, port)
             is_ctx = "CTX" in self.disagg_serving_type
             server_cmd = ctx_cmd if is_ctx else gen_cmd
@@ -769,7 +773,7 @@ class DisaggTestCmds(NamedTuple):
 
         elif self.disagg_serving_type == "DISAGG_SERVER":
             try:
-                self._generate_disagg_server_config(server_idx, port)
+                self._generate_disagg_server_config(server_idx)
                 print_info(f"Starting disagg server. cmd is {disagg_cmd}")
                 disagg_server_file_path = os.path.join(
                     self.test_output_dir,
