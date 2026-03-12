@@ -186,6 +186,15 @@ class Communication(ABC):
         """
         raise NotImplementedError
 
+    def destroy(self):
+        """Synchronously release resources held by this communication strategy.
+
+        Must be called on ALL ranks before the object is discarded.
+        Subclasses holding collective resources (e.g. DeepEP Buffers whose
+        destructors invoke intranode::barrier) override this to release them
+        explicitly, avoiding non-deterministic GC timing across ranks.
+        """
+
     def get_eplb_gathered_statistics(self) -> Optional[torch.Tensor]:
         """
         Return gathered EPLB statistics from the last dispatch, if available.

@@ -76,6 +76,15 @@ class DeepEP(Communication):
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
+    def destroy(self):
+        """Release the DeepEP buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
+
     @staticmethod
     def is_platform_supported() -> bool:
         """

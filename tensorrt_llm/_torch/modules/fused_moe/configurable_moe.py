@@ -375,8 +375,33 @@ class ConfigurableMoE(MoE):
                 f"Falling back to AllGatherReduceScatter."
             )
 
-            # Switch to AllGather (always works)
+            # Explicitly destroy the old strategy before replacing it.
+            # DeepEP/DeepEPLowLatency Buffer.__del__ calls intranode::barrier
+            # (collective op); without explicit synchronous release, GC timing
+            # differences across ranks cause indefinite hangs.
+            self.comm.destroy()
             self.comm = AllGatherReduceScatter(mapping=self.mapping)
+
+    def destroy(self):
+        """Release communication resources.
+
+        Must be called on ALL ranks before the module is discarded.
+        DeepEP Buffer.__del__ calls intranode::barrier (a collective op);
+        without an explicit, synchronous release, non-deterministic GC
+        timing across ranks causes some to enter the barrier while others
+        proceed, resulting in an indefinite hang.
+
+        Prefer using ConfigurableMoE as a context manager (``with``) so
+        that destroy() is called automatically on scope exit.
+        """
+        if self.comm is not None:
+            self.comm.destroy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.destroy()
 
     def _create_comm_strategy_auto(self) -> Communication:
         """

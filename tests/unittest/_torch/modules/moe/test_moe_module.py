@@ -825,17 +825,22 @@ def _get_comm_method_skip_reason(
                 f"Not supported on this platform."
             )
 
-    # DeepEP normal mode: is_workload_feasible (deep_ep.py:127) rejects
-    # non-bfloat16, causing a runtime fallback to AllGather. The fallback
-    # replaces self.comm, and when the old DeepEP object is GC'd its
-    # Buffer destructor calls intranode::barrier (deep_ep.cpp:90) which
-    # requires all ranks simultaneously -- non-deterministic GC timing
-    # across MPI ranks causes the barrier to timeout and crash.
-    if comm_method == "DEEPEP" and dtype is not None and dtype != torch.bfloat16:
+    # DeepEP and DeepEPLowLatency: is_workload_feasible
+    # (deep_ep.py:127, deep_ep_low_latency.py:155) rejects non-bfloat16,
+    # causing a runtime fallback to AllGather. The fallback replaces
+    # self.comm, and when the old DeepEP/DeepEPLowLatency object is GC'd
+    # its Buffer destructor calls intranode::barrier (deep_ep.cpp:90)
+    # which requires all ranks simultaneously -- non-deterministic GC
+    # timing across MPI ranks causes the barrier to timeout and hang.
+    if (
+        comm_method in ("DEEPEP", "DEEPEPLOWLATENCY")
+        and dtype is not None
+        and dtype != torch.bfloat16
+    ):
         return (
-            f"DeepEP is_workload_feasible rejects dtype={dtype} "
+            f"{comm_method} is_workload_feasible rejects dtype={dtype} "
             f"(requires bfloat16), and the runtime fallback triggers an "
-            f"unsafe Buffer destruction that crashes all ranks."
+            f"unsafe Buffer destruction that hangs all ranks."
         )
 
     if comm_method == "DEEPEPLOWLATENCY":
