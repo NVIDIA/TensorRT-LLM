@@ -2967,7 +2967,7 @@ class TestDeepSeekV3(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.70,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.60,
                                         enable_block_reuse=False)
 
         sm_version = get_sm_version()
@@ -4682,7 +4682,7 @@ class TestQwen3_30B_A3B_Instruct_2507(LlmapiAccuracyTestHarness):
                 "prefill": thr_prefill,
                 "decode": thr_decode,
             })
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.45,
                                         enable_block_reuse=False)
 
         with LLM(self.MODEL_PATH,

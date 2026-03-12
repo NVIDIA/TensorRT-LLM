@@ -368,7 +368,7 @@ class KvCacheCreator:
         """
         mapping = self._mapping
 
-        if self._skip_est:
+        if not self._skip_est:
             assert 'cp_type' not in mapping.cp_config
 
         fraction = self._kv_cache_config.free_gpu_memory_fraction
