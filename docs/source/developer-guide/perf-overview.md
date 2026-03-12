@@ -38,7 +38,7 @@ The following GPU variants were used for testing:
 - B200 180GB (DGX B200)
 - B300 288GB (DGX B300)
 - GB200 192GB (GB200 NVL72)
-- GB300 (GB300 NVL72)
+- GB300 288 GB (GB300 NVL72)
 - RTX 6000 Pro Blackwell Server Edition
 
 Other hardware variants may have different TDP, memory bandwidth, core count, or other features leading to performance differences on these workloads.
