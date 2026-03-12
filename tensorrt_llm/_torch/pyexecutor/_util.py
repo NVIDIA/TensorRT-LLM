@@ -654,7 +654,7 @@ class KvCacheCreator:
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
             mapping=self._mapping,
-            kv_cache_config=draft_kv_cache_config,
+            kv_cache_config=self._kv_cache_config,
             tokens_per_block=self._tokens_per_block,
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,

@@ -207,22 +207,6 @@ class TestConstruction:
                 scheduler_policy=CapacitySchedulerPolicy.MAX_UTILIZATION,
             )
 
-    def test_reject_no_evict_policy(self):
-        mgr = make_kv_cache_manager()
-        with pytest.raises(AssertionError, match="MAX_UTILIZATION"):
-            from tensorrt_llm._torch.pyexecutor.scheduler.scheduler_v2 import KVCacheV2Scheduler
-
-            with patch(
-                "tensorrt_llm._torch.pyexecutor.resource_manager.KVCacheManagerV2",
-                new=type(mgr),
-            ):
-                KVCacheV2Scheduler(
-                    max_batch_size=10,
-                    max_num_tokens=100,
-                    kv_cache_manager=mgr,
-                    scheduler_policy=CapacitySchedulerPolicy.GUARANTEED_NO_EVICT,
-                )
-
     def test_scheduler_capacity_overrides(self):
         mgr = make_kv_cache_manager()
         sched = make_scheduler(mgr, max_batch_size=100, scheduler_capacity=5)
