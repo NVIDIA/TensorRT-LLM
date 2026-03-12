@@ -121,13 +121,10 @@ class KvCacheCreator:
         if self._kv_cache_manager_cls == KVCacheManagerV2:
             if kv_connector_manager is not None or (
                     max_beam_width is not None and max_beam_width
-                    > 1) or self._kv_cache_config.event_buffer_max_size > 0 or (
-                        self._cache_transceiver_config is not None
-                        and self._cache_transceiver_config.backend is not None):
+                    > 1) or self._kv_cache_config.event_buffer_max_size > 0:
                 logger.warning(
-                    "KVCacheManagerV2 is not supported with disaggregated serving or beam width > 1 or event buffer max size > 0 or disagg config. "
+                    "KVCacheManagerV2 is not supported with kv_connector_manager or beam width > 1 or event buffer max size > 0. "
                     "Falling back to KVCacheManager.")
-                self._kv_cache_manager_cls = KVCacheManager
         self._draft_config = draft_config
         self._skip_est = skip_est
 
@@ -648,15 +645,11 @@ class KvCacheCreator:
                 draft_kv_cache_manager_cls = KVCacheManager
 
         estimating_kv_cache = estimating_kv_cache and not self._skip_est
-        # Draft KV cache should never use block reuse — it is ephemeral and
-        # does not participate in the radix tree.  Passing enable_block_reuse
-        # to the draft V2 manager causes CUDA errors during event recording
-        # when the internal commit/stop_committing machinery fires on close().
-        draft_kv_cache_config = self._kv_cache_config.model_copy(
-            update={
-                'enable_block_reuse': False,
-                'enable_partial_reuse': False
-            })
+        # For MTP with models using sparse attention (e.g., DeepSeek V3 with DSA),
+        # the draft layers share the same architecture as the target model and need
+        # the sparse_attention_config. Get it from effective_draft_config which
+        # falls back to the target model's config for MTP mode.
+        sparse_attn_config = effective_draft_config.sparse_attention_config
         return _create_kv_cache_manager(
             model_engine=None,
             kv_cache_manager_cls=draft_kv_cache_manager_cls,
@@ -666,7 +659,7 @@ class KvCacheCreator:
             max_seq_len=self._max_seq_len,
             max_batch_size=self._max_batch_size,
             spec_config=self._speculative_config,
-            sparse_attn_config=None,  # Not applicable for draft in one-model mode
+            sparse_attn_config=sparse_attn_config,
             max_num_tokens=self._max_num_tokens,
             max_beam_width=self._max_beam_width,
             kv_connector_manager=self._kv_connector_manager,
@@ -1087,22 +1080,64 @@ def create_py_executor_instance(
             # all layers have the same number of KV heads
             num_kv_attention_heads = num_kv_attention_heads_per_layer[0]
 
+        pretrained_config = model_engine.model.model_config.pretrained_config
+
+        # Derive shared expert intermediate size from the LoRA adapter
+        # weights, which are the source of truth for dimension validation.
+        # The model config's shared_expert_intermediate_size may not match
+        # the adapter (e.g., upcycled models).
+        shared_expert_hidden_size = 0
+        if lora_config.lora_dir:
+            shared_expert_global = _infer_shared_expert_size_from_adapter(
+                lora_config.lora_dir[0])
+            if shared_expert_global > 0:
+                shared_expert_hidden_size = shared_expert_global // mapping.tp_size
+
+        moe_hidden_size = 0
+        moe_intermediate = getattr(pretrained_config, 'moe_intermediate_size',
+                                   None)
+        if moe_intermediate is not None and moe_intermediate > 0:
+            moe_hidden_size = moe_intermediate // mapping.tp_size
+
+        # For MoE models with shared experts: replace mlp_* target modules with
+        # shared_expert_* equivalents. The shared expert uses different LoRA
+        # module types with their own intermediate size. For pure MoE models
+        # (no dense MLP layers), mlp_* modules don't exist in the model.
+        target_modules = list(lora_config.lora_target_modules)
+        if shared_expert_hidden_size > 0:
+            has_dense_mlp = bool(
+                getattr(pretrained_config, 'mlp_only_layers', None))
+            mlp_to_shared_expert = {
+                'mlp_h_to_4h': 'shared_expert_h_to_4h',
+                'mlp_4h_to_h': 'shared_expert_4h_to_h',
+                'mlp_gate': 'shared_expert_gate',
+            }
+            for mlp_mod, se_mod in mlp_to_shared_expert.items():
+                if mlp_mod in target_modules:
+                    if se_mod not in target_modules:
+                        target_modules.append(se_mod)
+                    if not has_dense_mlp:
+                        target_modules.remove(mlp_mod)
+
         lora_modules = LoraModule.create_lora_modules(
-            lora_module_names=lora_config.lora_target_modules,
+            lora_module_names=target_modules,
             hidden_size=model_binding_config.hidden_size,
             mlp_hidden_size=model_binding_config.mlp_hidden_size,
             num_attention_heads=model_binding_config.num_heads,
             num_kv_attention_heads=num_kv_attention_heads,
             attention_head_size=model_binding_config.head_size,
             tp_size=mapping.tp_size,
-            num_experts=num_experts)
+            num_experts=num_experts,
+            shared_expert_hidden_size=shared_expert_hidden_size,
+            moe_hidden_size=moe_hidden_size)
+
         model_binding_config.use_lora_plugin = True
         model_binding_config.lora_modules = lora_modules
         model_binding_config.max_lora_rank = lora_config.max_lora_rank
 
         max_lora_rank = lora_config.max_lora_rank
         num_lora_modules = model_engine.model.model_config.pretrained_config.num_hidden_layers * \
-            len(lora_config.lora_target_modules + lora_config.missing_qkv_modules)
+            len(target_modules + lora_config.missing_qkv_modules)
 
         peft_cache_config_model = PeftCacheConfig(
         ) if peft_cache_config is None else peft_cache_config
@@ -1130,8 +1165,7 @@ def create_py_executor_instance(
         )
         resources[ResourceManagerType.PEFT_CACHE_MANAGER] = peft_cache_manager
         model_engine.set_lora_model_config(
-            lora_config.lora_target_modules,
-            lora_config.trtllm_modules_to_hf_modules,
+            target_modules, lora_config.trtllm_modules_to_hf_modules,
             lora_config.swap_gate_up_proj_lora_b_weight)
         if isinstance(model_engine, PyTorchModelEngine):
             model_engine._init_cuda_graph_lora_manager(lora_config)
@@ -1345,6 +1379,38 @@ def get_decoding_mode(
         decoding_mode = DecodingMode.TopKTopP()
 
     return decoding_mode
+
+
+def _infer_shared_expert_size_from_adapter(adapter_dir: str) -> int:
+    """Infer shared expert intermediate size from LoRA adapter weights.
+
+    Scans the adapter for shared_expert.down_proj lora_A weights and
+    returns the global (unsharded) intermediate size. This is more reliable
+    than the model config, which may not match the adapter (e.g., upcycled
+    models).
+    """
+    import json
+
+    try:
+        from tensorrt_llm.lora_manager import get_model_path, load_state_dict
+        model_path = get_model_path(adapter_dir, "adapter_model")
+        if model_path is None:
+            return 0
+        adapter_weights = load_state_dict(model_path)
+        if adapter_weights is None:
+            return 0
+        for key, tensor in adapter_weights.items():
+            if 'shared_expert' in key and 'down_proj' in key and 'lora_A' in key:
+                adapter_config_path = os.path.join(adapter_dir,
+                                                   "adapter_config.json")
+                with open(adapter_config_path) as f:
+                    rank = json.load(f).get("r", 0)
+                if rank > 0:
+                    return tensor.shape[1] if tensor.shape[
+                        0] == rank else tensor.shape[0]
+    except Exception as e:
+        logger.debug(f"Failed to infer shared expert size from adapter: {e}")
+    return 0
 
 
 def _try_infer_num_experts(model_config: ModelConfig) -> int:

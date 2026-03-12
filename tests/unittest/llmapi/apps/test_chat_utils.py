@@ -158,6 +158,56 @@ class TestParseAssistantMessages:
         }
         assert result == expected
 
+    @pytest.mark.parametrize(
+        "message_extra_fields, expected_reasoning",
+        [
+            # reasoning field is used directly.
+            ({"reasoning": "Let me think step by step..."}, "Let me think step by step..."),
+            # reasoning field falls back to reasoning_content.
+            ({"reasoning_content": "Let me think step by step..."}, "Let me think step by step..."),
+            # reasoning takes priority over reasoning_content.
+            (
+                {"reasoning": "Primary reasoning.", "reasoning_content": "Fallback reasoning."},
+                "Primary reasoning.",
+            ),
+            # Neither field provided -> key absent.
+            ({}, None),
+        ],
+    )
+    def test_assistant_message_reasoning(
+        self, mock_mm_data_tracker, message_extra_fields, expected_reasoning
+    ):
+        """Test parsing assistant messages with various reasoning field combinations."""
+        message = {"role": "assistant", "content": "The answer is 42.", **message_extra_fields}
+
+        result = parse_chat_message_content(message, mock_mm_data_tracker)
+
+        assert result["role"] == "assistant"
+        assert result["content"] == "The answer is 42."
+        assert result["media"] == []
+        assert result.get("reasoning_content", None) == expected_reasoning
+
+    def test_assistant_message_with_reasoning_and_tool_calls(self, mock_mm_data_tracker):
+        """Test parsing an assistant message with both reasoning and tool calls."""
+        message = {
+            "role": "assistant",
+            "content": None,
+            "reasoning_content": "I need to check the weather.",
+            "tool_calls": [
+                {
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {"name": "get_weather", "arguments": '{"city": "NYC"}'},
+                }
+            ],
+        }
+
+        result = parse_chat_message_content(message, mock_mm_data_tracker)
+
+        assert result["reasoning_content"] == "I need to check the weather."
+        assert len(result["tool_calls"]) == 1
+        assert result["tool_calls"][0]["function"]["arguments"] == {"city": "NYC"}
+
 
 class TestParseToolMessages:
     """Test suite for tool role messages."""
