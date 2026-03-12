@@ -22,6 +22,7 @@ from .modeling_phi4flash import Phi4FlashForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
+from .modeling_smollm3 import SmolLM3ForCausalLM
 from .modeling_starcoder2 import Starcoder2ForCausalLM
 
 __all__ = (
@@ -55,5 +56,6 @@ __all__ = (
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "SkyworkR1V2ForConditionalGeneration",
+    "SmolLM3ForCausalLM",
     "Starcoder2ForCausalLM",
 )
