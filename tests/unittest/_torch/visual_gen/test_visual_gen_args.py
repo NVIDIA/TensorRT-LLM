@@ -10,13 +10,13 @@ from pydantic import ValidationError
 
 from tensorrt_llm._torch.visual_gen.config import (
     AttentionConfig,
+    CompilationConfig,
     CudaGraphConfig,
     ParallelConfig,
     PipelineConfig,
     TeaCacheConfig,
     TorchCompileConfig,
     VisualGenArgs,
-    WarmupConfig,
 )
 
 
@@ -56,7 +56,7 @@ class TestVisualGenArgsStrictValidation:
 
     def test_nested_warmup_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            WarmupConfig(resolutions=[(480, 832)], bad_field=True)
+            CompilationConfig(resolutions=[(480, 832)], bad_field=True)
 
     def test_nested_pipeline_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):

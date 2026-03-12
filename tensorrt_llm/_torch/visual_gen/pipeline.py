@@ -156,7 +156,7 @@ class BasePipeline(nn.Module):
         Shapes are the Cartesian product of resolutions x num_frames.
 
         Priority:
-            1. User-specified: model_config.warmup.resolutions / num_frames
+            1. User-specified: model_config.compilation.resolutions / num_frames
             2. Model defaults: default_warmup_resolutions / default_warmup_num_frames
             3. Empty: skip warmup
 
@@ -165,7 +165,7 @@ class BasePipeline(nn.Module):
         Returns:
             (shapes, steps) tuple where shapes = list of (h, w, f)
         """
-        warmup_cfg = self.model_config.warmup
+        warmup_cfg = self.model_config.compilation
 
         if warmup_cfg.resolutions is not None or warmup_cfg.num_frames is not None:
             resolutions = (
@@ -182,12 +182,17 @@ class BasePipeline(nn.Module):
             resolutions = self.default_warmup_resolutions
             num_frames_list = self.default_warmup_num_frames
 
-        shapes = [(h, w, f) for (h, w), f in itertools.product(resolutions, num_frames_list)]
+        all_shapes = [(h, w, f) for (h, w), f in itertools.product(resolutions, num_frames_list)]
 
-        for h, w, f in shapes:
-            self.validate_shape(h, w, f)
+        valid_shapes = []
+        for h, w, f in all_shapes:
+            try:
+                self.validate_shape(h, w, f)
+                valid_shapes.append((h, w, f))
+            except ValueError as e:
+                logger.warning(f"Skipping invalid warmup shape ({h}x{w}, {f} frames): {e}")
 
-        return shapes, self.default_warmup_steps
+        return valid_shapes, self.default_warmup_steps
 
     @property
     def vae_adapter_class(self) -> Type[BaseParallelVAEAdapter] | None:

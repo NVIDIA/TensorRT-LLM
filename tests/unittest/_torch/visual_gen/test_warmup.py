@@ -8,20 +8,20 @@ from unittest.mock import MagicMock
 import pytest
 from pydantic import ValidationError
 
-from tensorrt_llm._torch.visual_gen.config import VisualGenArgs, WarmupConfig
+from tensorrt_llm._torch.visual_gen.config import CompilationConfig, VisualGenArgs
 from tensorrt_llm._torch.visual_gen.pipeline import BasePipeline
 
 
-class TestWarmupConfig:
-    """WarmupConfig construction and validation."""
+class TestCompilationConfig:
+    """CompilationConfig construction and validation."""
 
     def test_default_values(self):
-        cfg = WarmupConfig()
+        cfg = CompilationConfig()
         assert cfg.resolutions is None
         assert cfg.num_frames is None
 
     def test_explicit_values(self):
-        cfg = WarmupConfig(
+        cfg = CompilationConfig(
             resolutions=[(480, 832), (720, 1280)],
             num_frames=[33, 81],
         )
@@ -29,62 +29,62 @@ class TestWarmupConfig:
         assert cfg.num_frames == [33, 81]
 
     def test_empty_lists(self):
-        cfg = WarmupConfig(resolutions=[], num_frames=[])
+        cfg = CompilationConfig(resolutions=[], num_frames=[])
         assert cfg.resolutions == []
         assert cfg.num_frames == []
 
     def test_partial_resolutions_only(self):
-        cfg = WarmupConfig(resolutions=[(1920, 1080)])
+        cfg = CompilationConfig(resolutions=[(1920, 1080)])
         assert cfg.resolutions == [(1920, 1080)]
         assert cfg.num_frames is None
 
     def test_partial_num_frames_only(self):
-        cfg = WarmupConfig(num_frames=[81])
+        cfg = CompilationConfig(num_frames=[81])
         assert cfg.resolutions is None
         assert cfg.num_frames == [81]
 
     def test_unknown_field_rejected(self):
         with pytest.raises(ValidationError, match="Extra inputs are not permitted"):
-            WarmupConfig(resolutions=[(480, 832)], bad_field=True)
+            CompilationConfig(resolutions=[(480, 832)], bad_field=True)
 
 
 class TestVisualGenArgsWarmup:
-    """WarmupConfig integration with VisualGenArgs."""
+    """CompilationConfig integration with VisualGenArgs."""
 
     def test_default_warmup(self):
         args = VisualGenArgs(checkpoint_path="/tmp/model")
-        assert isinstance(args.warmup, WarmupConfig)
-        assert args.warmup.resolutions is None
-        assert args.warmup.num_frames is None
+        assert isinstance(args.compilation, CompilationConfig)
+        assert args.compilation.resolutions is None
+        assert args.compilation.num_frames is None
 
     def test_warmup_from_dict(self):
         args = VisualGenArgs(
             checkpoint_path="/tmp/model",
-            warmup={"resolutions": [(480, 832)], "num_frames": [33, 81]},
+            compilation={"resolutions": [(480, 832)], "num_frames": [33, 81]},
         )
-        assert args.warmup.resolutions == [(480, 832)]
-        assert args.warmup.num_frames == [33, 81]
+        assert args.compilation.resolutions == [(480, 832)]
+        assert args.compilation.num_frames == [33, 81]
 
     def test_warmup_from_yaml(self, tmp_path):
         yaml_path = tmp_path / "config.yml"
         yaml_path.write_text(
             "checkpoint_path: /tmp/model\n"
-            "warmup:\n"
+            "compilation:\n"
             "  resolutions:\n"
             "    - [480, 832]\n"
             "    - [720, 1280]\n"
             "  num_frames: [33, 81]\n"
         )
         args = VisualGenArgs.from_yaml(yaml_path)
-        assert len(args.warmup.resolutions) == 2
-        assert args.warmup.num_frames == [33, 81]
+        assert len(args.compilation.resolutions) == 2
+        assert args.compilation.num_frames == [33, 81]
 
     def test_warmup_pickle_roundtrip(self):
         import pickle
 
         args = VisualGenArgs(
             checkpoint_path="/tmp/model",
-            warmup=WarmupConfig(resolutions=[(480, 832)], num_frames=[33]),
+            compilation=CompilationConfig(resolutions=[(480, 832)], num_frames=[33]),
         )
         restored = pickle.loads(pickle.dumps(args))
         assert restored.warmup.resolutions == [(480, 832)]
@@ -103,7 +103,7 @@ class _BaseStubPipeline(BasePipeline):
     def __init__(self, warmup_cfg):
         self._warmed_up_shapes = set()
         self.model_config = MagicMock()
-        self.model_config.warmup = warmup_cfg or WarmupConfig()
+        self.model_config.compilation = warmup_cfg or CompilationConfig()
 
     def forward(self, *args, **kwargs):
         pass
@@ -174,7 +174,7 @@ class TestResolveWarmupPlan:
 
     def test_user_resolutions_only(self):
         """User specifies resolutions, num_frames from model default."""
-        cfg = WarmupConfig(resolutions=[(1920, 1088)])
+        cfg = CompilationConfig(resolutions=[(1920, 1088)])
         pipe = _make_stub_pipeline(cfg)
         shapes, _ = pipe.resolve_warmup_plan()
         assert len(shapes) == 2  # 1 resolution x 2 default frame counts
@@ -183,7 +183,7 @@ class TestResolveWarmupPlan:
 
     def test_user_num_frames_only(self):
         """User specifies num_frames, resolutions from model default."""
-        cfg = WarmupConfig(num_frames=[81])
+        cfg = CompilationConfig(num_frames=[81])
         pipe = _make_stub_pipeline(cfg)
         shapes, _ = pipe.resolve_warmup_plan()
         assert len(shapes) == 2  # 2 default resolutions x 1 frame count
@@ -192,7 +192,7 @@ class TestResolveWarmupPlan:
 
     def test_user_both(self):
         """User specifies both → user values Cartesian product."""
-        cfg = WarmupConfig(
+        cfg = CompilationConfig(
             resolutions=[(256, 256)],
             num_frames=[5],
         )
@@ -202,31 +202,32 @@ class TestResolveWarmupPlan:
 
     def test_empty_resolutions_skips_warmup(self):
         """Empty resolutions → no shapes → warmup skipped."""
-        cfg = WarmupConfig(resolutions=[], num_frames=[33])
+        cfg = CompilationConfig(resolutions=[], num_frames=[33])
         pipe = _make_stub_pipeline(cfg)
         shapes, _ = pipe.resolve_warmup_plan()
         assert shapes == []
 
     def test_empty_num_frames_skips_warmup(self):
         """Empty num_frames → no shapes → warmup skipped."""
-        cfg = WarmupConfig(resolutions=[(480, 832)], num_frames=[])
+        cfg = CompilationConfig(resolutions=[(480, 832)], num_frames=[])
         pipe = _make_stub_pipeline(cfg)
         shapes, _ = pipe.resolve_warmup_plan()
         assert shapes == []
 
-    def test_invalid_user_resolution_raises(self):
-        """User resolution not multiple of 16 → validate_shape raises."""
-        cfg = WarmupConfig(resolutions=[(481, 832)])
+    def test_invalid_user_resolution_skipped(self):
+        """User resolution not multiple of 16 → warning, shape skipped."""
+        cfg = CompilationConfig(resolutions=[(481, 832)])
         pipe = _make_stub_pipeline(cfg)
-        with pytest.raises(ValueError, match="must be multiples of"):
-            pipe.resolve_warmup_plan()
+        shapes, _ = pipe.resolve_warmup_plan()
+        assert (481, 832, 33) not in shapes
+        assert (481, 832, 81) not in shapes
 
-    def test_invalid_user_num_frames_raises(self):
-        """User num_frames not valid → validate_shape raises."""
-        cfg = WarmupConfig(num_frames=[30])  # (30-1)%4 != 0
+    def test_invalid_user_num_frames_skipped(self):
+        """User num_frames not valid → warning, shape skipped."""
+        cfg = CompilationConfig(num_frames=[30])  # (30-1)%4 != 0
         pipe = _make_stub_pipeline(cfg)
-        with pytest.raises(ValueError, match="Invalid num_frames"):
-            pipe.resolve_warmup_plan()
+        shapes, _ = pipe.resolve_warmup_plan()
+        assert len(shapes) == 0
 
     def test_flux_default(self):
         """Flux default: 1 resolution x 1 frame = 1 shape."""
@@ -235,12 +236,12 @@ class TestResolveWarmupPlan:
         assert shapes == [(1024, 1024, 1)]
         assert steps == 2
 
-    def test_flux_rejects_video_frames(self):
-        """Flux: num_frames != 1 → raises."""
-        cfg = WarmupConfig(num_frames=[81])
+    def test_flux_skips_video_frames(self):
+        """Flux: num_frames != 1 → warning, shape skipped."""
+        cfg = CompilationConfig(num_frames=[81])
         pipe = _make_flux_stub_pipeline(cfg)
-        with pytest.raises(ValueError, match="Invalid num_frames"):
-            pipe.resolve_warmup_plan()
+        shapes, _ = pipe.resolve_warmup_plan()
+        assert len(shapes) == 0
 
 
 class TestValidateShape:
@@ -293,13 +294,13 @@ class TestWarmupExecution:
         assert (720, 1280, 81) in pipe._warmed_up_shapes
 
     def test_warmup_empty_shapes_skips(self):
-        cfg = WarmupConfig(resolutions=[], num_frames=[])
+        cfg = CompilationConfig(resolutions=[], num_frames=[])
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
         assert pipe._warmed_up_shapes == set()
 
     def test_warmup_user_shapes_recorded(self):
-        cfg = WarmupConfig(resolutions=[(480, 832)], num_frames=[33])
+        cfg = CompilationConfig(resolutions=[(480, 832)], num_frames=[33])
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
         assert pipe._warmed_up_shapes == {(480, 832, 33)}
@@ -322,7 +323,7 @@ class TestRequestValidation:
 
     def test_valid_unwarmed_shape_warns(self):
         """Request with valid but un-warmed shape → pipeline accepts but would warn."""
-        cfg = WarmupConfig(resolutions=[(480, 832)], num_frames=[33])
+        cfg = CompilationConfig(resolutions=[(480, 832)], num_frames=[33])
         pipe = _make_stub_pipeline(cfg)
         pipe.warmup()
 
