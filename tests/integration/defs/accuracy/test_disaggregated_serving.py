@@ -534,7 +534,7 @@ def run_parallel_test(model_name: str,
         )
 
     kv_cache_config = {
-        "free_gpu_memory_fraction": 0.5,
+        "free_gpu_memory_fraction": 0.35,
         "enable_block_reuse": True
     }
     ctx_server_config = {
@@ -597,14 +597,16 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config = {
             "disable_overlap_scheduler": ctx_disable_overlap_scheduler,
             "kv_cache_config": {
-                "enable_block_reuse": ctx_enable_block_reuse
+                "enable_block_reuse": ctx_enable_block_reuse,
+                "free_gpu_memory_fraction": 0.6
             }
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
         gen_server_config = {
             "disable_overlap_scheduler": gen_disable_overlap_scheduler,
             "kv_cache_config": {
-                "enable_block_reuse": gen_enable_block_reuse
+                "enable_block_reuse": gen_enable_block_reuse,
+                "free_gpu_memory_fraction": 0.6
             }
         }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
@@ -634,7 +636,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "is_public_pool": True
         }
         kv_cache_config = {
-            "free_gpu_memory_fraction": 0.5,
+            "free_gpu_memory_fraction": 0.35,
             "enable_block_reuse": False
         }
         ctx_server_config = {
@@ -733,13 +735,19 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            }
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5
+            },
         }
         gen_server_config = {
             "guided_decoding_backend": backend,
             "cache_transceiver_config": {
                 "backend": "DEFAULT"
-            }
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.5
+            },
         }
         disaggregated_server_config = {
             "hostname": "localhost",
@@ -1428,6 +1436,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
         kv_cache_config = {
             "enable_block_reuse": True,
             "enable_partial_reuse": enable_partial_reuse,
+            "free_gpu_memory_fraction": 0.5,
         }
         ctx_server_config = {
             "disable_overlap_scheduler": True,
