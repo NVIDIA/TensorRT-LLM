@@ -11,6 +11,7 @@ from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
+from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
 from .modeling_starcoder2 import Starcoder2ForCausalLM
 
 __all__ = (
@@ -31,5 +32,6 @@ __all__ = (
     "Qwen3_5ForConditionalGeneration",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+    "SkyworkR1V2ForConditionalGeneration",
     "Starcoder2ForCausalLM",
 )
