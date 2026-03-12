@@ -84,11 +84,9 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
         try:
             # Extract tokenized input (required)
             if not request.HasField("tokenized"):
-                yield self._error_response(
-                    request_id,
+                await context.abort(
+                    grpc.StatusCode.INVALID_ARGUMENT,
                     "Missing tokenized input",
-                    "INVALID_REQUEST",
-                    400,
                 )
                 return
 
@@ -171,14 +169,18 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             logger.info(f"Request {request_id} cancelled")
             await self.request_manager.abort(request_id)
             raise
+        except grpc.aio.AbortError:
+            raise
+        except ValueError as e:
+            logger.warning(f"Invalid request in Generate for {request_id}: {e}")
+            if self.request_manager is not None:
+                await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(e))
         except Exception as e:
             logger.error(f"Error in Generate for {request_id}: {e}")
-            yield self._error_response(
-                request_id,
-                str(e),
-                "INTERNAL_ERROR",
-                500,
-            )
+            if self.request_manager is not None:
+                await self.request_manager.abort(request_id)
+            await context.abort(grpc.StatusCode.INTERNAL, str(e))
 
     async def Embed(
         self,
@@ -195,13 +197,7 @@ class TrtllmServiceServicer(trtllm_service_pb2_grpc.TrtllmServiceServicer):
             EmbedResponse protobuf
         """
         logger.warning("Embed RPC not yet implemented")
-        context.set_code(grpc.StatusCode.UNIMPLEMENTED)
-        context.set_details("Embed RPC not yet implemented")
-        return trtllm_service_pb2.EmbedResponse(
-            request_id=request.request_id,
-            embedding=[],
-            prompt_tokens=0,
-        )
+        await context.abort(grpc.StatusCode.UNIMPLEMENTED, "Embed RPC not yet implemented")
 
     async def HealthCheck(
         self,

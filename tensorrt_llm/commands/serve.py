@@ -372,6 +372,8 @@ def launch_grpc_server(host: str,
                 ("grpc.max_receive_message_length", -1),  # Unlimited
                 ("grpc.keepalive_time_ms", 30000),  # 30s keepalive
                 ("grpc.keepalive_timeout_ms", 10000),  # 10s timeout
+                ("grpc.keepalive_permit_without_calls", True),
+                ("grpc.http2.min_recv_ping_interval_without_data_ms", 10000),
             ], )
 
         # Add servicer to server
