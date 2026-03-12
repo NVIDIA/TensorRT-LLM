@@ -171,6 +171,8 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             dtype=config.torch_dtype,
             config=model_config,
             reduce_output=False,
+            layer_idx=layer_idx,
+            is_shared_expert=True,
         )
 
         self.shared_expert_gate = Linear(self.hidden_dim,
@@ -190,6 +192,7 @@ class Qwen3NextSparseMoeBlock(nn.Module):
         attn_metadata: AttentionMetadata,
         all_reduce_params: Optional[AllReduceParams] = None,
         do_finalize: Optional[bool] = True,
+        lora_params: Optional[dict] = None,
     ) -> torch.Tensor:
         assert hidden_states.shape[-1] == self.hidden_dim
         orig_shape = hidden_states.shape
@@ -221,7 +224,10 @@ class Qwen3NextSparseMoeBlock(nn.Module):
             return final_hidden_states
 
         def _compute_shared_output():
-            shared_expert_output = self.shared_expert(hidden_states)
+            shared_expert_output = self.shared_expert(
+                hidden_states,
+                lora_params=lora_params,
+            )
             shared_expert_output = F.sigmoid(
                 self.shared_expert_gate(hidden_states)) * shared_expert_output
             return shared_expert_output
@@ -902,6 +908,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if residual is None:
@@ -950,6 +957,7 @@ class Qwen3NextLinearDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
         if self.fusion_config.POST_MOE_FUSION:
             if do_finalize:
@@ -1061,6 +1069,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
 
@@ -1078,6 +1087,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
             attn_metadata=attn_metadata,
             all_reduce_params=AllReduceParams(
                 enable_allreduce=not self.disable_attn_allreduce),
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -1109,6 +1119,7 @@ class Qwen3NextFullAttentionDecoderLayer(DecoderLayer):
                 enable_allreduce=not (self.fusion_config.POST_MOE_FUSION
                                       or self.mapping.tp_size == 1)),
             do_finalize=do_finalize,
+            lora_params=lora_params,
         )
 
         if self.fusion_config.POST_MOE_FUSION:
@@ -1213,6 +1224,7 @@ class Qwen3NextModel(DecoderModel):
         position_ids: Optional[torch.IntTensor] = None,
         inputs_embeds: Optional[torch.FloatTensor] = None,
         spec_metadata: Optional[SpecMetadata] = None,
+        lora_params: Optional[dict] = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -1237,7 +1249,8 @@ class Qwen3NextModel(DecoderModel):
                 attn_metadata=attn_metadata,
                 residual=residual,
                 spec_metadata=spec_metadata,
-                mamba_metadata=mamba_metadata)
+                mamba_metadata=mamba_metadata,
+                lora_params=lora_params)
         return hidden_states
 
 

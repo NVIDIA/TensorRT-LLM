@@ -21,10 +21,13 @@ namespace tensorrt_llm::runtime
 
 std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> const& loraModuleNames,
     SizeType32 hiddenSize, SizeType32 mlpHiddenSize, SizeType32 numAttentionHeads, SizeType32 numKvAttentionHeads,
-    SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts)
+    SizeType32 attentionHeadSize, SizeType32 tpSize, SizeType32 numExperts, SizeType32 sharedExpertHiddenSize,
+    SizeType32 moeHiddenSize)
 {
     auto const hidden = hiddenSize * tpSize;
     auto const mlpHidden = mlpHiddenSize * tpSize;
+    auto const sharedExpertHidden = sharedExpertHiddenSize > 0 ? sharedExpertHiddenSize * tpSize : mlpHidden;
+    auto const moeHidden = moeHiddenSize > 0 ? moeHiddenSize * tpSize : mlpHidden;
     auto const numHeads = numAttentionHeads * tpSize;
     auto const numKvHeads = numKvAttentionHeads * tpSize;
     auto const attnHeadSize = attentionHeadSize;
@@ -54,13 +57,19 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMLP_H_TO_4H: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_GATE: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
         case ModuleType::kMLP_4H_TO_H: modules.emplace_back(t, mlpHidden, hidden, false, true, 1, -1); break;
-        // TODO(TRTLLM-379): Support MOE LoRA weights
+        case ModuleType::kSHARED_EXPERT_H_TO_4H:
+        case ModuleType::kSHARED_EXPERT_GATE:
+            modules.emplace_back(t, hidden, sharedExpertHidden, false, true, -1, 0);
+            break;
+        case ModuleType::kSHARED_EXPERT_4H_TO_H:
+            modules.emplace_back(t, sharedExpertHidden, hidden, false, true, 1, -1);
+            break;
         case ModuleType::kMOE_H_TO_4H:
         case ModuleType::kMOE_GATE:
-            modules.emplace_back(t, hidden * numExperts, mlpHidden * numExperts, false, true, -1, 0);
+            modules.emplace_back(t, hidden * numExperts, moeHidden * numExperts, false, true, -1, 0);
             break;
         case ModuleType::kMOE_4H_TO_H:
-            modules.emplace_back(t, mlpHidden * numExperts, hidden * numExperts, false, true, 1, -1);
+            modules.emplace_back(t, moeHidden * numExperts, hidden * numExperts, false, true, 1, -1);
             break;
         case ModuleType::kMOE_ROUTER: modules.emplace_back(t, hidden, numExperts, false, true, -1, -1); break;
         case ModuleType::kMLP_ROUTER: modules.emplace_back(t, hidden, 1, false, true, -1, -1); break;
