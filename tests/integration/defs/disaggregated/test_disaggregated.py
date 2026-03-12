@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
+import numpy as np
 import pytest
 import yaml
 from defs.common import get_free_port_in_ci as get_free_port
@@ -431,6 +432,7 @@ def fetch_prometheus_metrics(server_url: str):
     response = requests.get(f"{server_url}/prometheus/metrics", timeout=10)
     assert response.status_code == 200
     return response.text
+
 
 
 def setup_disagg_cluster(
@@ -2108,114 +2110,166 @@ def test_disaggregated_cancel_large_context_requests(disaggregated_test_root,
 
 
 @pytest.mark.skip_less_device(4)
-@pytest.mark.parametrize("streaming", [False, True],
-                         ids=["non_streaming", "streaming"])
 @pytest.mark.parametrize("llama_model_root", ['llama-3.1-8b-instruct'],
                          indirect=True)
-def test_disaggregated_logprobs(disaggregated_test_root,
-                                disaggregated_example_root, llm_venv,
-                                llama_model_root, streaming):
-    """Test that logprobs work correctly in disaggregated serving mode.
-
-    Uses Llama-3.1-8B-Instruct with TP2 (ctx) + TP2 (gen) on 4 GPUs to cover
-    the customer-reported bug where 'LogProbStorage' object has no attribute
-    'cum_log_probs' when logprobs are requested via the OpenAI API in
-    disaggregated serving mode with multi-GPU tensor parallelism.
-
-    Sends completion requests with logprobs enabled (both streaming and
-    non-streaming) and verifies that:
-    1. The request completes without server errors
-    2. The response contains logprobs for each token
+def test_disaggregated_logprobs_serving(disaggregated_test_root,
+                                        disaggregated_example_root, llm_venv,
+                                        llama_model_root):
+    """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
+    RCCA: https://nvbugspro.nvidia.com/bug/5926823
     """
+
+    async def iter_sse_chunks(resp):
+        """Yield parsed JSON chunks from an OpenAI SSE stream."""
+        async for line in resp.content:
+            decoded = line.decode("utf-8").strip()
+            if not decoded.startswith("data: "):
+                continue
+            data_str = decoded[len("data: "):]
+            if data_str == "[DONE]":
+                break
+            try:
+                yield json.loads(data_str)
+            except json.JSONDecodeError:
+                continue
+
+    async def collect_streaming_logprobs(resp, api_type):
+        """Parse SSE stream and return (tokens, logprobs) lists."""
+        tokens, logprobs = [], []
+        async for chunk in iter_sse_chunks(resp):
+            choices = chunk.get("choices", [])
+            if not choices:
+                continue
+            lp_data = choices[0].get("logprobs")
+            if not lp_data:
+                continue
+            if api_type == "completions":
+                tokens.extend(lp_data.get("tokens", []))
+                logprobs.extend(lp_data.get("token_logprobs", []))
+            else:
+                for item in lp_data.get("content", []):
+                    tokens.append(item.get("token"))
+                    logprobs.append(item.get("logprob"))
+        return tokens, logprobs
+
+    def extract_logprobs(result, api_type):
+        """Extract (tokens, logprobs) from non-streaming OpenAI response."""
+        choices = result.get("choices", [])
+        assert len(choices) > 0, "Response should have choices"
+        if api_type == "completions":
+            lp_data = choices[0].get("logprobs")
+            assert lp_data is not None, "Response should contain logprobs"
+            tokens = lp_data.get("tokens", [])
+            logprobs = lp_data.get("token_logprobs", [])
+            assert len(tokens) == len(logprobs), (
+                f"count mismatch: {len(logprobs)} logprobs "
+                f"for {len(tokens)} tokens")
+            return tokens, logprobs
+        lp_obj = choices[0].get("logprobs")
+        assert lp_obj is not None, "Response should contain logprobs"
+        content = lp_obj.get("content", [])
+        tokens = [item.get("token") for item in content]
+        logprobs = [item.get("logprob") for item in content]
+        return tokens, logprobs
+
+    def verify_logprobs_valid(logprobs_list, label=""):
+        """Assert logprobs are non-empty and non-positive."""
+        assert len(logprobs_list) > 0, f"{label}: should have logprobs"
+        assert any(lp is not None for lp in logprobs_list), \
+            f"{label}: at least one logprob must be non-None"
+        for lp in logprobs_list:
+            if lp is not None:
+                assert lp <= 0.0, f"{label}: logprob {lp} should be <= 0"
+
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
     config_file = get_test_config("llama31_8b_nixl",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
-    _, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
+    config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=llm_venv._new_env,
                              model_name=llama_model_root,
                              cwd=llm_venv.get_working_directory(),
                              server_start_timeout=600)
 
+    server_host = config.get("hostname", "localhost")
+    server_url = f"http://{server_host}:{server_port}"
+    model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
+    max_tokens = 20
+    timeout = aiohttp.ClientTimeout(total=120)
+    prompts = [
+        "What is the capital of France?",
+        "Explain quantum computing in simple terms.",
+        "Write a short poem about the ocean.",
+        "I love coding 🚀 and AI.",
+    ]
+
+    async def check_logprobs():
+        async with aiohttp.ClientSession() as session:
+            for api_type in ("completions", "chat"):
+                url = (f"{server_url}/v1/completions"
+                       if api_type == "completions" else
+                       f"{server_url}/v1/chat/completions")
+
+                def make_payload(prompt, stream):
+                    if api_type == "completions":
+                        return {"model": model_name, "prompt": prompt,
+                                "max_tokens": max_tokens, "logprobs": 1,
+                                "stream": stream}
+                    return {"model": model_name,
+                            "messages": [{"role": "user", "content": prompt}],
+                            "max_tokens": max_tokens, "logprobs": True,
+                            "stream": stream}
+
+                # 1) Streaming vs non-streaming consistency check
+                async with session.post(
+                        url, json=make_payload(prompts[0], False),
+                        timeout=timeout) as resp:
+                    assert resp.status == 200, \
+                        f"[{api_type}] non-streaming: {await resp.text()}"
+                    ns_tokens, ns_logprobs = extract_logprobs(
+                        await resp.json(), api_type)
+
+                async with session.post(
+                        url, json=make_payload(prompts[0], True),
+                        timeout=timeout) as resp:
+                    assert resp.status == 200, \
+                        f"[{api_type}] streaming: {await resp.text()}"
+                    st_tokens, st_logprobs = \
+                        await collect_streaming_logprobs(resp, api_type)
+
+                assert ns_tokens == st_tokens, (
+                    f"[{api_type}] streaming vs non-streaming tokens mismatch")
+                assert len(ns_logprobs) == len(st_logprobs), (
+                    f"[{api_type}] logprobs length: "
+                    f"{len(ns_logprobs)} vs {len(st_logprobs)}")
+                for i, (n, s) in enumerate(zip(ns_logprobs, st_logprobs)):
+                    if n is not None and s is not None:
+                        assert np.isclose(n, s, rtol=1e-4, atol=1e-5), \
+                            f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
+
+                # 2) Multi-prompt validation (streaming and non-streaming)
+                for streaming in (False, True):
+                    mode = "streaming" if streaming else "non_streaming"
+                    for prompt in prompts:
+                        async with session.post(
+                                url,
+                                json=make_payload(prompt, streaming),
+                                timeout=timeout) as resp:
+                            assert resp.status == 200, (
+                                f"[{api_type}/{mode}] {resp.status}: "
+                                f"{await resp.text()}")
+                            if streaming:
+                                _, lps = await collect_streaming_logprobs(
+                                    resp, api_type)
+                            else:
+                                _, lps = extract_logprobs(
+                                    await resp.json(), api_type)
+                            verify_logprobs_valid(
+                                lps, f"{api_type}/{mode}/{prompt[:30]}")
+
     try:
-        server_url = f"http://localhost:{server_port}"
-        max_tokens = 20
-        prompts = [
-            "What is the capital of France?",
-            "Explain quantum computing in simple terms.",
-            "Write a short poem about the ocean.",
-        ]
-
-        async def check_logprobs():
-            async with aiohttp.ClientSession() as session:
-                for prompt in prompts:
-                    payload = {
-                        "model": "llama-3.1-model/Llama-3.1-8B-Instruct",
-                        "prompt": prompt,
-                        "max_tokens": max_tokens,
-                        "logprobs": 1,
-                        "stream": streaming,
-                    }
-                    async with session.post(
-                            f"{server_url}/v1/completions",
-                            json=payload,
-                            timeout=aiohttp.ClientTimeout(
-                                total=120)) as resp:
-                        assert resp.status == 200, \
-                            f"Server returned {resp.status}: {await resp.text()}"
-
-                        if streaming:
-                            all_token_logprobs = []
-                            async for line in resp.content:
-                                decoded = line.decode("utf-8").strip()
-                                if not decoded.startswith("data: "):
-                                    continue
-                                data_str = decoded[len("data: "):]
-                                if data_str == "[DONE]":
-                                    break
-                                try:
-                                    chunk = json.loads(data_str)
-                                except json.JSONDecodeError as e:
-                                    raise AssertionError(
-                                        f"Invalid streaming chunk JSON: "
-                                        f"{data_str[:200]}") from e
-                                choices = chunk.get("choices", [])
-                                if choices:
-                                    lp_data = choices[0].get("logprobs")
-                                    if lp_data:
-                                        lps = lp_data.get(
-                                            "token_logprobs", [])
-                                        all_token_logprobs.extend(lps)
-                            assert len(all_token_logprobs) > 0, \
-                                "Streaming response should contain logprobs"
-                            for lp in all_token_logprobs:
-                                if lp is not None:
-                                    assert lp <= 0.0, \
-                                        f"Log probability {lp} should be <= 0"
-                        else:
-                            result = await resp.json()
-                            choices = result.get("choices", [])
-                            assert len(choices) > 0, \
-                                "Response should have choices"
-                            logprobs_data = choices[0].get("logprobs")
-                            assert logprobs_data is not None, \
-                                "Response should contain logprobs"
-                            token_logprobs = logprobs_data.get(
-                                "token_logprobs", [])
-                            tokens = logprobs_data.get("tokens", [])
-                            assert len(token_logprobs) == len(tokens), (
-                                f"logprobs count mismatch: "
-                                f"{len(token_logprobs)} logprobs for "
-                                f"{len(tokens)} tokens")
-                            assert len(token_logprobs) > 0, \
-                                "Response should have token logprobs"
-                            for lp in token_logprobs:
-                                if lp is not None:
-                                    assert lp <= 0.0, \
-                                        f"Log probability {lp} should be <= 0"
-
         asyncio.run(check_logprobs())
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
