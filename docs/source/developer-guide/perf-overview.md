@@ -308,7 +308,7 @@ cuda_graph_config:
 For MoE models:
 
 ```shell
-trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options
+trtllm-bench --tp $tp_size --pp $pp_size --ep $ep_size --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options --concurrency -1
 ```
 
 GPT-OSS:
