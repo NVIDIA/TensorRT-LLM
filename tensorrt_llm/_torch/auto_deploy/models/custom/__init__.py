@@ -15,13 +15,14 @@ from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextFor
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_olmo3 import Olmo3ForCausalLM
-from .modeling_qwen3 import Qwen3ForCausalLM
-from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from .modeling_phi4 import Phi4ForCausalLM
 from .modeling_phi4_visionr import Phi4VisionRForConditionalGeneration
 from .modeling_phi4flash import Phi4FlashForCausalLM
 from .modeling_phi4mm import Phi4MMForCausalLM
+from .modeling_qwen3 import Qwen3ForCausalLM
+from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
+from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
 from .modeling_smollm3 import SmolLM3ForCausalLM
 from .modeling_starcoder2 import Starcoder2ForCausalLM
@@ -53,10 +54,10 @@ __all__ = (
     "Phi4ForCausalLM",
     "Phi4MMForCausalLM",
     "Phi4FlashForCausalLM",
-    "Qwen3ForCausalLM",
     "Phi4VisionRForConditionalGeneration",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3MoeForCausalLM",
     "SkyworkR1V2ForConditionalGeneration",
     "SmolLM3ForCausalLM",
     "Starcoder2ForCausalLM",
