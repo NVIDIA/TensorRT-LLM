@@ -28,7 +28,7 @@ Step 2 - If the model code is not present locally, download the HF repo without 
 huggingface-cli download {org}/{model} --exclude "*.safetensors" "*.bin" "*.pt" "*.gguf"
 ```
 
-This pulls config, code, and tokenizer files into the HF cache while skipping large weights. After that, work from the cached snapshot directory reported by the command.
+This pulls config, code, and tokenizer files into the HF cache while skipping large weights. Files cached here are automatically found by `transformers.AutoConfig.from_pretrained` and similar APIs, so no extra path wiring is needed. After that, work from the cached snapshot directory reported by the command.
 
 ## Phase 1 - Survey Existing Coverage & Analyze HF Model
 
@@ -128,10 +128,10 @@ Plain PyTorch is acceptable ONLY for operations where no canonical op exists (e.
 
 The custom model forward signature must obey these rules:
 
-1. Always take `input_ids` at the top-level entry point.
-2. Always take `position_ids`. **Assert `position_ids is not None`** at the top of the forward method — it is a required input, never optional. Do not include fallback logic to generate position_ids from input_ids (HF models often do this; strip it). If the model uses a custom position scheme, derive it internally from the provided vanilla `position_ids`.
+1. Always take `input_ids` at the top-level entry point. A submodule graph may internally use `inputs_embeds`, but the exported entry point always starts from token ids.
+2. Always take `position_ids`. **Assert `position_ids is not None`** at the top of the forward method — it is a required input, never optional. Do not include fallback logic to generate position ids from `input_ids` (HF models often do this; strip it). If the model uses a custom position scheme or non-standard RoPE variant, derive it internally from the provided vanilla `position_ids`.
 3. For multimodal models, pass additional inputs during prefill alongside `input_ids`.
-4. Do not accept HF runtime arguments such as `attention_mask`, `past_key_values`, `use_cache`, or similar cache/runtime features.
+4. Do not accept HF runtime arguments such as `attention_mask`, `past_key_values`, `use_cache`, or similar cache/runtime features. AD manages masking and caching via its own transforms and runtime.
 
 ## Phase 6 - Add Hierarchical Tests
 
@@ -145,9 +145,9 @@ Rules:
 - Use `pytest.skip` if the HF reference class is unavailable
 
 HF reference strategy:
-- If HF modules exist in installed `transformers`, import them directly behind helper functions that return `None` on `ImportError`.
-- If they do not exist, copy the minimal reference module definitions from HF `modeling_*.py` into the test file so the test remains self-contained.
-- Add test-only weight conversion helpers where HF and custom layouts differ.
+- If HF modules exist in installed `transformers`, import them directly behind helper functions that return `None` on `ImportError`, and `pytest.skip` if the reference class is unavailable.
+- If they do not exist, copy the minimal reference module definitions from HF `modeling_*.py` into the test file so the test remains self-contained. Keep the copied reference strictly faithful to the HF implementation; do not tweak its behavior.
+- Add test-only weight conversion helpers where HF and custom layouts differ, such as RoPE de-interleaving, stacked-to-per-expert MoE weights, or gate-weight key remapping.
 - For full-model tests, prefer `load_state_dict` pre-hooks already registered on the custom model when possible.
 
 Numerical comparison:
@@ -156,19 +156,20 @@ Numerical comparison:
 from _model_test_utils import assert_rmse_close
 ```
 
-Use `assert_rmse_close` for custom-op-backed equivalence tests. Use `torch.testing.assert_close` only for blocks with identical math.
-Important: No smoke tests just check for inf or Nan
+Use `assert_rmse_close` for custom-op-backed equivalence tests. It measures `rmse(actual - expected) / rmse(expected)`, which is more robust than per-element checks when a few outliers exist. Use `torch.testing.assert_close` only for blocks with identical math.
+Important: No smoke tests that only check for inf or NaN.
 
 Recommended `rmse_ratio_tol` values for bfloat16:
+- Identical math blocks such as plain MLP or norm: prefer `torch.testing.assert_close` with tight tolerances (for example `rtol=1e-3`, `atol=1e-3`)
 - MoE block: `0.02`
 - Decoder layer, MoE layer, or full model: `0.05`
 - Attention: `0.10`
 
 Bottom-up levels, in order:
-1. Block equivalence
-2. Layer equivalence
-3. Full model equivalence
-4. Export test with `torch_export_to_gm`, `Dim.DYNAMIC` for batch and sequence, finite output checks, and a second shape
+1. Block equivalence. Test MLP, attention, MoE, and norm individually. If the model has heterogeneous block types, cover each type separately.
+2. Layer equivalence. Test the full decoder layer, or each distinct layer type if the architecture mixes dense and MoE or attention and SSM variants.
+3. Full model equivalence. Use a small config with fewer than 10 layers that still covers the essential architecture, ideally including at least one of each layer type.
+4. Export test with `torch_export_to_gm`, `Dim.DYNAMIC` for batch and sequence, finite output checks, and a second shape.
 
 ## Phase 7 - Run Independent Review
 
@@ -179,7 +180,7 @@ Pass only:
 - Path to the model file
 - Path to the test file
 
-Do not include your own assessment.
+Do not include your own assessment or summary of what you changed. Let the reviewer inspect the files independently.
 
 If the reviewer returns FAIL:
 1. Read each failed item and cited `file:line`
@@ -227,6 +228,7 @@ The model is run via:
 CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
 The `--use-registry` flag resolves the model's config from `models.yaml` automatically. The `ad_run_agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
+The `ad_run_agent` should also archive logs and use them to evaluate generation quality.
 
 If the run fails or generation quality is poor:
 1. Read the subagent's worklog and archived log
@@ -248,6 +250,19 @@ Print, do not write a file:
 7. End-to-end AD run result, run iteration count, and final generation quality
 8. Registry entry added/updated in `models.yaml` and any new config YAMLs created
 
+## Phase 11 - Prepare a Pull Request
+
+Before running any `gh` command, check whether a custom `GH_CONFIG_DIR` is already specified in the environment or local developer overrides. If none is specified, use the default `~/.config/gh`.
+
+Prepare a pull request against `origin` targeting branch `feat/paperclip_maximizer`.
+
+When creating the PR:
+- Include the results from running `build_and_run_ad.py` with the model registry configs.
+- Include a reproducible command such as `python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry`.
+- Include the detailed `pytest` command for the unit tests added for the onboarding.
+
+After posting the PR, ask the user to provide feedback once comments are available, then continue iterating based on that feedback.
+
 ## Key Gotchas
 
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
@@ -256,9 +271,9 @@ Print, do not write a file:
 - **Reuse config classes:** Import from `transformers` or load from checkpoint whenever possible. Only bundle a config class if it truly doesn't exist anywhere.
 - **Assert `position_ids`:** Always assert `position_ids is not None` — it is a required input, never optional.
 - Every custom model file must be self-contained.
-- RoPE buffers should use the `_ad_` prefix, return the full table, and be sliced downstream by `position_ids`.
-- MoE weights should use `nn.ModuleList` per-expert for checkpoint compatibility.
+- RoPE buffers should use the `_ad_` prefix. Slice by `position_ids` once in the rotary embedding path and return pre-sliced `(cos, sin)` to downstream layers instead of re-slicing in every attention block.
+- MoE weights should use `nn.ModuleList` per-expert for checkpoint compatibility. Write test-only state-dict converters when HF uses stacked expert weights.
 - `noaux_tc`-style routers should stay in plain PyTorch.
-- Vision towers are usually not exported unless explicitly requested.
+- Vision towers are usually not exported unless explicitly requested; keep vision logic in eager PyTorch and export only the text path unless the task explicitly requires more.
 - Model code and tests must run on CPU.
 - Use only `torch_*` prefixed reference ops in the modeling path — never `triton_*`, `flashinfer_*`, or `trtllm_*`.
