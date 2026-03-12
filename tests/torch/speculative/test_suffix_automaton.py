@@ -688,10 +688,14 @@ class TestExtendGlobal:
             max_ngram_size=-1,
         )
 
-        print(f"global no-match: match_len={match_len}")
+        print(f"global no-match: match_len={match_len}, draft_tokens={draft_tokens}")
 
         assert match_len[0].item() == 0, "Request 0 should have no match"
         assert match_len[1].item() == 0, "Request 1 should have no match"
+        draft_0 = draft_tokens[0, :max_draft_len].cpu().tolist()
+        assert draft_0 == [0] * max_draft_len, f"Expected zeroed draft for request 0, got {draft_0}"
+        draft_1 = draft_tokens[1, :max_draft_len].cpu().tolist()
+        assert draft_1 == [0] * max_draft_len, f"Expected zeroed draft for request 1, got {draft_1}"
 
         manager.shutdown()
 

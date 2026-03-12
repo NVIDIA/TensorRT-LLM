@@ -183,8 +183,8 @@ void invokeSuffixAutomatonExtendNgram(SuffixAutomatonExtendNgramParams const& pa
 
 // Kernel 1: Extend all SAs with accepted tokens.
 // Separate kernel ensures all mutations complete before cross-SA reads.
-__global__ void suffixAutomatonGlobalExtendKernel(int batchSize, int draftLength, size_t stateSize, void* slotsMemory,
-    int const* batchIndices, int const* acceptedTokensIn, int const* acceptedLensIn)
+__global__ void suffixAutomatonGlobalExtendKernel(int batchSize, int draftLength, int maxSlots, size_t stateSize,
+    void* slotsMemory, int const* batchIndices, int const* acceptedTokensIn, int const* acceptedLensIn)
 {
     int reqIdx = blockIdx.x;
     if (reqIdx >= batchSize)
@@ -193,6 +193,7 @@ __global__ void suffixAutomatonGlobalExtendKernel(int batchSize, int draftLength
     }
 
     int ownSlotIdx = batchIndices[reqIdx];
+    assert(ownSlotIdx >= 0 && ownSlotIdx < maxSlots);
     uint8_t* slotMemory = static_cast<uint8_t*>(slotsMemory) + static_cast<size_t>(ownSlotIdx) * stateSize;
     SuffixAutomaton* ownSlot = reinterpret_cast<SuffixAutomaton*>(slotMemory);
 
@@ -215,10 +216,8 @@ struct SlotMatch
     TextIndex pos;
 };
 
-// Max suffix tokens loaded into shared memory per block.
-// Caps the suffix length used for cross-SA matching to bound shared-memory usage.
-// With maxNgramSize == -1, longer sequences are silently truncated to this limit.
-static constexpr int kMaxGlobalSuffixLen = 64;
+// kMaxGlobalSuffixLen is defined in suffixAutomatonParams.h.
+// With maxNgramSize == -1, longer sequences are silently truncated to that limit.
 
 // Kernel 2: Search all active SAs in parallel, reduce to best match per request.
 // All SAs are read-only (const) — launched after the extend kernel on the same stream.
@@ -237,6 +236,7 @@ __global__ void suffixAutomatonGlobalSearchKernel(int batchSize, int draftLength
     }
 
     int ownSlotIdx = batchIndices[reqIdx];
+    assert(ownSlotIdx >= 0 && ownSlotIdx < maxSlots);
 
     // Step 1: Extract suffix from own SA into shared memory
     __shared__ Token sharedSuffix[kMaxGlobalSuffixLen];
@@ -370,7 +370,7 @@ void invokeSuffixAutomatonGlobalSearch(SuffixAutomatonGlobalSearchParams const& 
     size_t stateSize = getSuffixAutomatonStateSize(params.maxSeqLen);
 
     // Kernel 1: Extend all SAs (1 thread per block, 1 block per request)
-    suffixAutomatonGlobalExtendKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, stateSize,
+    suffixAutomatonGlobalExtendKernel<<<batchSize, 1, 0, stream>>>(batchSize, params.draftLength, maxSlots, stateSize,
         params.slots, params.batchIndices, params.acceptedTokensIn, params.acceptedLensIn);
 
     // Kernel 2: Global search + reduce (N threads per block, 1 block per request)

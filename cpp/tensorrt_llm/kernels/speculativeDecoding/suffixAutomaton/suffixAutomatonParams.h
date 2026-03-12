@@ -37,6 +37,10 @@ namespace kernels::speculative_decoding::suffix_automaton
 // Forward declaration — full definition lives in suffixAutomaton.h (CUDA-only).
 struct SuffixAutomaton;
 
+// Max suffix tokens loaded into shared memory per block in the global search kernel.
+// Caps the suffix length used for cross-SA matching to bound shared-memory usage.
+static constexpr int kMaxGlobalSuffixLen = 64;
+
 // =====================================================================
 // Param structs
 // =====================================================================
@@ -193,6 +197,8 @@ struct SuffixAutomatonGlobalSearchParams
         TLLM_CHECK(maxSlots > 0);
         TLLM_CHECK_WITH_INFO(
             maxSlots <= 1024, "Global search kernel supports at most 1024 slots (one CUDA thread per slot)");
+        TLLM_CHECK_WITH_INFO(maxNgramSize == -1 || (maxNgramSize >= 1 && maxNgramSize <= kMaxGlobalSuffixLen),
+            "maxNgramSize must be -1 (longest match) or in [1, %d], got %d", kMaxGlobalSuffixLen, maxNgramSize);
         TLLM_CHECK(maxSeqLen > 0);
         TLLM_CHECK(slots != nullptr);
         TLLM_CHECK(batchIndices != nullptr);
