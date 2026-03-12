@@ -69,6 +69,18 @@ class BaseReasoningParser(ABC):
     def parse_delta(self, delta_text: str) -> ReasoningParserResult:
         raise NotImplementedError
 
+    def finish(self) -> ReasoningParserResult:
+        """Called when the stream ends. Returns any remaining buffered content.
+        If reasoning was never completed (no closing tag found), accumulated
+        reasoning is returned as content instead."""
+        return ReasoningParserResult()
+
+    @property
+    def reasoning_completed(self) -> bool:
+        """Whether the reasoning section was properly closed with a closing
+        tag during streaming."""
+        return True
+
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
 @register_reasoning_parser("qwen3")
@@ -90,6 +102,8 @@ class DeepSeekR1Parser(BaseReasoningParser):
         self.reasoning_at_start = reasoning_at_start
         self.in_reasoning = self.reasoning_at_start
         self._buffer = ""
+        self._accumulated_reasoning = ""
+        self._found_closing_tag = False
 
     def _create_reasoning_end_result(self, content: str,
                                      reasoning_content: str):
@@ -113,6 +127,9 @@ class DeepSeekR1Parser(BaseReasoningParser):
             # text before reasoning start tag is dropped
             text = splits[2]
         splits = text.partition(self.reasoning_end)
+        if splits[1] == "":
+            # no reasoning end tag found - treat everything as content
+            return ReasoningParserResult(content=text)
         reasoning_content, content = splits[0], splits[2]
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)
@@ -149,16 +166,35 @@ class DeepSeekR1Parser(BaseReasoningParser):
                 else:
                     self._buffer = ""
                     reasoning_content = delta_text
+                self._accumulated_reasoning += reasoning_content
                 return ReasoningParserResult(
                     reasoning_content=reasoning_content)
             reasoning_content = delta_text[:end_idx]
             content = delta_text[end_idx + len(self.reasoning_end):]
             self.in_reasoning = False
+            self._found_closing_tag = True
+            self._accumulated_reasoning = ""
             self._buffer = ""
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning_content)
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
+
+    def finish(self) -> ReasoningParserResult:
+        remaining = self._buffer
+        self._buffer = ""
+        if self.in_reasoning and not self._found_closing_tag:
+            all_content = self._accumulated_reasoning + remaining
+            self._accumulated_reasoning = ""
+            self.in_reasoning = False
+            return ReasoningParserResult(content=all_content)
+        if remaining:
+            return ReasoningParserResult(content=remaining)
+        return ReasoningParserResult()
+
+    @property
+    def reasoning_completed(self) -> bool:
+        return self._found_closing_tag or not self.reasoning_at_start
 
 
 @register_reasoning_parser("nano-v3")
