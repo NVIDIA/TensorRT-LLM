@@ -34,6 +34,9 @@ from tensorrt_llm.bindings.internal.runtime import delay_kernel
 from tensorrt_llm.logger import logger
 from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 
+# MiniMax all-reduce only uses D (hidden_size) 128 and 1536 in practice.
+ALLOWED_HIDDEN_SIZES = (128, 1536)
+
 
 def profile_minimax_allreduce_rms(
     mapping: Mapping,
@@ -118,22 +121,21 @@ def minimax_allreduce_benchmark(
     shape_list = []
     if explore_2d:
         num_tokens_list = [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384]
-        hidden_size_list = [128, 256, 512, 1024, 2048, 4096, 8192]
+        hidden_size_list = list(ALLOWED_HIDDEN_SIZES)
         for num_tokens, hidden_size in product(num_tokens_list, hidden_size_list):
             shape_list.append((num_tokens, hidden_size))
     else:
         min_size, max_size, ratio = [int(i) for i in test_range.split(",")]
-        size = min_size
-        hidden_size = min_size
-        num_tokens = 1
-        while size < max_size:
-            size *= ratio
-            shape_list.append((num_tokens, hidden_size))
-            if hidden_size * ratio > 4096:
+        for hidden_size in ALLOWED_HIDDEN_SIZES:
+            n_min = max(1, (min_size + hidden_size - 1) // hidden_size)
+            n_max = max_size // hidden_size
+            num_tokens = n_min
+            while num_tokens <= n_max:
+                shape_list.append((num_tokens, hidden_size))
                 num_tokens *= ratio
-            else:
-                hidden_size *= ratio
-            assert size == num_tokens * hidden_size
+                num_tokens = max(num_tokens, 1)
+    # Only test D (hidden_size) = 128 and 1536 (no-op when explore_2d already uses them)
+    shape_list = [(n, d) for n, d in shape_list if d in ALLOWED_HIDDEN_SIZES]
 
     op = MiniMaxAllReduceRMS(mapping=mapping)
     max_workspace = CustomAllReduceHelper.max_workspace_size_auto(
