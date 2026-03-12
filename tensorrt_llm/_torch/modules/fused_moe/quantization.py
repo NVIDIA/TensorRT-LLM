@@ -1103,6 +1103,23 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
                      weights: List[Dict],
                      weight_loading_mode: MoEWeightLoadingMode,
                      allow_partial_loading: bool = False):
+        if is_sm_100f():
+            expert_ids = set(module.initial_local_expert_ids)
+            if self.need_load_shared_weights(module):
+                expert_ids.update(
+                    module.layer_load_balancer.get_load_expert_ids())
+            for name in list(weights.keys()):
+                if name.endswith("weight_scale_inv"):
+                    if int(name.split(".")[0]) not in expert_ids:
+                        continue
+                    weight_name = name.replace("weight_scale_inv", "weight")
+                    logger.debug(f"Resmoothing {weight_name}")
+                    weight = weights[weight_name][:]
+                    # Forcing the scale to float32 to avoid potential precision issues
+                    # For instance, Qwen3.5 FP8 MoE checkpoints use bf16 scales
+                    scale = weights[name][:].to(torch.float32)
+                    weights[weight_name], weights[name] = resmooth_to_fp8_e8m0(
+                        weight, scale)
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
