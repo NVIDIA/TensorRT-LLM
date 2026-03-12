@@ -27,7 +27,8 @@ import pytest
 import torch
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
-from transformers import AutoConfig, Qwen2Config, Qwen2ForCausalLM
+from transformers import Qwen2Config, Qwen2ForCausalLM
+from transformers.modeling_utils import PretrainedConfig
 from transformers.models.qwen2.modeling_qwen2 import (
     Qwen2Attention,
     Qwen2DecoderLayer,
@@ -47,22 +48,77 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_skywork_r1v2 import 
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
-# Load SkyworkChatConfig the same way AutoDeploy's factory does: via AutoConfig with
-# trust_remote_code.  Skip all tests if the checkpoint is not in the local HF cache.
-try:
-    SkyworkChatConfig = type(
-        AutoConfig.from_pretrained(
-            "Skywork/Skywork-R1V2-38B", trust_remote_code=True, local_files_only=True
-        )
-    )
-except Exception:
-    SkyworkChatConfig = None
+# ---------------------------------------------------------------------------
+# Minimal faithful copies of HF remote-code config classes
+# (SkyworkChatConfig / SkyworkVisionConfig use trust_remote_code and are not
+#  in transformers; these copies are for test-only use)
+# ---------------------------------------------------------------------------
 
-if SkyworkChatConfig is None:
-    pytest.skip(
-        "Skywork/Skywork-R1V2-38B not found in local HF cache; skipping tests.",
-        allow_module_level=True,
-    )
+
+class SkyworkVisionConfig(PretrainedConfig):
+    """Minimal faithful copy of SkyworkVisionConfig from HF checkpoint remote code."""
+
+    model_type = "skywork_vit"
+
+    def __init__(
+        self,
+        hidden_size=32,
+        image_size=32,
+        patch_size=16,
+        num_attention_heads=2,
+        intermediate_size=64,
+        hidden_act="gelu",
+        num_hidden_layers=1,
+        qkv_bias=True,
+        qk_normalization=False,
+        layer_norm_eps=1e-6,
+        norm_type="rms_norm",
+        initializer_factor=0.1,
+        **kwargs,
+    ):
+        super().__init__(**kwargs)
+        self.hidden_size = hidden_size
+        self.image_size = image_size
+        self.patch_size = patch_size
+        self.num_attention_heads = num_attention_heads
+        self.intermediate_size = intermediate_size
+        self.hidden_act = hidden_act
+        self.num_hidden_layers = num_hidden_layers
+        self.qkv_bias = qkv_bias
+        self.qk_normalization = qk_normalization
+        self.layer_norm_eps = layer_norm_eps
+        self.norm_type = norm_type
+        self.initializer_factor = initializer_factor
+
+
+class SkyworkChatConfig(PretrainedConfig):
+    """Minimal faithful copy of SkyworkChatConfig from HF checkpoint remote code."""
+
+    model_type = "skywork_chat"
+
+    def __init__(
+        self,
+        llm_config=None,
+        vision_config=None,
+        select_layer=-1,
+        downsample_ratio=0.5,
+        ps_version="v1",
+        tie_word_embeddings=False,
+        **kwargs,
+    ):
+        super().__init__(tie_word_embeddings=tie_word_embeddings, **kwargs)
+        if isinstance(llm_config, dict):
+            llm_config = Qwen2Config(**{k: v for k, v in llm_config.items() if k != "model_type"})
+        self.llm_config = llm_config
+        if isinstance(vision_config, dict):
+            vision_config = SkyworkVisionConfig(**vision_config)
+        elif vision_config is None:
+            vision_config = SkyworkVisionConfig()
+        self.vision_config = vision_config
+        self.select_layer = select_layer
+        self.downsample_ratio = downsample_ratio
+        self.ps_version = ps_version
+
 
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 
@@ -80,7 +136,7 @@ def set_seed():
 def _create_small_llm_config() -> Qwen2Config:
     """Create a small Qwen2 config for the LLM backbone (used by block/layer tests)."""
     return Qwen2Config(
-        architectures=["Qwen2ForCausalLM"],  # required by SkyworkChatConfig.__init__
+        architectures=["Qwen2ForCausalLM"],
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
@@ -101,9 +157,10 @@ def _create_small_chat_config() -> SkyworkChatConfig:
     """Create a small SkyworkChatConfig wrapping the Qwen2 LLM config.
 
     Mirrors how AutoDeploy's factory builds the model: AutoConfig returns a
-    SkyworkChatConfig, which is then passed to SkyworkR1V2ForConditionalGeneration._from_config.
-    tie_word_embeddings is forwarded explicitly to prevent PretrainedConfig from
-    defaulting to True and spuriously tying lm_head to embed_tokens.
+    SkyworkChatConfig, which is then passed to
+    SkyworkR1V2ForConditionalGeneration._from_config. tie_word_embeddings is
+    forwarded explicitly to prevent PretrainedConfig from defaulting to True
+    and spuriously tying lm_head to embed_tokens.
     """
     llm_dict = _create_small_llm_config().to_dict()
     return SkyworkChatConfig(
@@ -389,7 +446,7 @@ def test_skywork_r1v2_state_dict_keys():
     """Test that state_dict keys match expected checkpoint format.
 
     With a full SkyworkChatConfig (which includes vision_config), the model also
-    instantiates the vision tower and mlp1 projector.  Their keys follow the HF
+    instantiates the vision tower and mlp1 projector. Their keys follow the HF
     checkpoint layout: vision_model.* and mlp1.*.
     """
     model = SkyworkR1V2ForConditionalGeneration(_create_small_chat_config())
@@ -429,11 +486,11 @@ def test_skywork_r1v2_state_dict_keys():
         "vision_model.encoder.layers.0.norm2.weight",
         "vision_model.encoder.layers.0.ls1",
         "vision_model.encoder.layers.0.ls2",
-        "mlp1.0.weight",  # LayerNorm
+        "mlp1.0.weight",
         "mlp1.0.bias",
-        "mlp1.1.weight",  # Linear
+        "mlp1.1.weight",
         "mlp1.1.bias",
-        "mlp1.3.weight",  # Linear
+        "mlp1.3.weight",
         "mlp1.3.bias",
     ]
     for key in expected_vision_keys:
@@ -441,9 +498,8 @@ def test_skywork_r1v2_state_dict_keys():
             f"Expected vision key '{key}' in state_dict, got keys: {list(state_dict.keys())[:10]}..."
         )
 
-    # All keys must be under language_model.*, vision_model.*, or mlp1.*
     valid_prefixes = ("language_model.", "vision_model.", "mlp1.")
     for key in state_dict:
-        assert any(key.startswith(p) for p in valid_prefixes), (
+        assert any(key.startswith(prefix) for prefix in valid_prefixes), (
             f"Unexpected key '{key}' — expected prefix in {valid_prefixes}"
         )
