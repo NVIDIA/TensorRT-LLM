@@ -21,6 +21,8 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: google/gemma-3-1b-it
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'gemma3_1b.yaml']
+- name: meta-llama/Meta-Llama-3-8B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: meta-llama/Llama-3.1-8B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 - name: casperhansen/llama-3-8b-instruct-awq
@@ -123,6 +125,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: meta-llama/Llama-3.2-11B-Vision-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+- name: meta-llama/Meta-Llama-3-70B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
+- name: meta-llama/Llama-3.1-70B-Instruct
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml']
 - name: meta-llama/Llama-3.3-70B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'llama3_3_70b.yaml']
 - name: meta-llama/CodeLlama-34b-Instruct-hf
