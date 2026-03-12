@@ -64,8 +64,12 @@ def gen_fc2_alpha_fused(
         output.zero_()
         fc2_alpha = output
     else:
+        assert alpha is not None, (
+            "alpha must be provided when output buffer is not pre-allocated, "
+            "since expert_size cannot be inferred from token_final_scales alone"
+        )
         num_tokens = token_selected_experts.shape[0]
-        expert_size = alpha.shape[0] if alpha is not None else token_final_scales.shape[1]
+        expert_size = alpha.shape[0]
         fc2_alpha = torch.zeros(
             [num_tokens, expert_size],
             dtype=torch.float32,
@@ -156,10 +160,13 @@ class DenseGEMMFusedMoE(CutlassFusedMoE):
 
     def load_weights(self, weights: List[Dict]):
         super().load_weights(weights)
-        w2_weight = self.w2_weight.clone()
-        self.w2_weight.reshape([-1]).copy_(
-            w2_weight.transpose(0, 1).reshape([-1]), non_blocking=True
-        )
+        # Transpose w2_weight layout: (E, H, ...) -> (H, E, ...) for dense GEMM.
+        # Use contiguous() to materialize the transposed layout, then copy back
+        # into self.w2_weight in-place. This avoids clone() which would double
+        # peak memory for large expert counts.
+        w2_transposed = self.w2_weight.transpose(0, 1).contiguous()
+        self.w2_weight.reshape([-1]).copy_(w2_transposed.reshape([-1]), non_blocking=True)
+        del w2_transposed
         if self.has_any_quant:
             if self.has_nvfp4:
                 self._transform_w2_weight_scale_for_min_latency()

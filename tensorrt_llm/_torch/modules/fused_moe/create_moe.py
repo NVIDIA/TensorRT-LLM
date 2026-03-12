@@ -149,8 +149,8 @@ def create_moe_backend(
     if moe_load_balancer is not None:
         assert moe_cls in [
             WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
-            DeepGemmFusedMoE
-        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, and DeepGemmFusedMoE."
+            DeepGemmFusedMoE, DenseGEMMFusedMoE
+        ], "MoE Load Balance is only supported in WideEPMoE, CutlassFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE, DeepGemmFusedMoE, and DenseGEMMFusedMoE."
 
     if bias:
         assert moe_cls in [CutlassFusedMoE, TritonFusedMoE, TRTLLMGenFusedMoE
