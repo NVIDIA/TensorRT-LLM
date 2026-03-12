@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for HunYuan Dense V1 custom model implementation.
+"""Tests for HunYuan Dense custom model implementation.
 
 Hierarchical test levels:
 1. Block equivalence — MLP, RMSNorm, Attention individually
@@ -26,16 +26,16 @@ import pytest
 import torch
 from _model_test_utils import assert_rmse_close
 from torch.export import Dim
+from transformers import PretrainedConfig
 
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
-from tensorrt_llm._torch.auto_deploy.models.custom.modeling_hunyuan_dense_v1 import (
-    HunYuanDenseV1Attention,
-    HunYuanDenseV1Config,
-    HunYuanDenseV1DecoderLayer,
-    HunYuanDenseV1ForCausalLM,
-    HunYuanDenseV1MLP,
-    HunYuanDenseV1RMSNorm,
-    HunYuanDenseV1RotaryEmbedding,
+from tensorrt_llm._torch.auto_deploy.models.custom.modeling_hunyuan_dense import (
+    HunYuanDenseAttention,
+    HunYuanDenseDecoderLayer,
+    HunYuanDenseForCausalLM,
+    HunYuanDenseMLP,
+    HunYuanDenseRMSNorm,
+    HunYuanDenseRotaryEmbedding,
 )
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
 
@@ -151,9 +151,9 @@ def _create_small_hf_config():
     return cfg
 
 
-def _create_small_custom_config() -> HunYuanDenseV1Config:
+def _create_small_custom_config() -> PretrainedConfig:
     """Create a small custom config for testing."""
-    return HunYuanDenseV1Config(
+    return PretrainedConfig(
         vocab_size=1000,
         hidden_size=64,
         intermediate_size=128,
@@ -235,7 +235,7 @@ def test_mlp_equivalence(B, S, dtype):
     hf_mlp = HFMLPCls(hf_config).to(dtype=dtype)
     hf_mlp.eval()
 
-    custom_mlp = HunYuanDenseV1MLP(
+    custom_mlp = HunYuanDenseMLP(
         hidden_size=hf_config.hidden_size,
         intermediate_size=hf_config.intermediate_size,
         hidden_act=hf_config.hidden_act,
@@ -269,7 +269,7 @@ def test_rmsnorm_equivalence(B, S, dtype):
     hf_norm = HFRMSNorm(hidden_size, eps=eps).to(dtype=dtype)
     hf_norm.eval()
 
-    custom_norm = HunYuanDenseV1RMSNorm(hidden_size, eps=eps).to(dtype=dtype)
+    custom_norm = HunYuanDenseRMSNorm(hidden_size, eps=eps).to(dtype=dtype)
     custom_norm.eval()
     custom_norm.weight.data.copy_(hf_norm.weight.data)
 
@@ -297,7 +297,7 @@ def test_attention_equivalence(B, S, dtype):
     hf_attn.eval()
 
     # Custom attention
-    custom_attn = HunYuanDenseV1Attention(
+    custom_attn = HunYuanDenseAttention(
         hidden_size=hf_config.hidden_size,
         num_attention_heads=hf_config.num_attention_heads,
         num_key_value_heads=hf_config.num_key_value_heads,
@@ -328,7 +328,7 @@ def test_attention_equivalence(B, S, dtype):
     )
 
     # Custom
-    custom_rope = HunYuanDenseV1RotaryEmbedding(
+    custom_rope = HunYuanDenseRotaryEmbedding(
         dim=hf_config.head_dim,
         max_position_embeddings=hf_config.max_position_embeddings,
         base=hf_config.rope_theta,
@@ -361,7 +361,7 @@ def test_decoder_layer_equivalence(B, S, dtype):
     hf_layer = HFLayerCls(hf_config, layer_idx=0).to(dtype=dtype)
     hf_layer.eval()
 
-    custom_layer = HunYuanDenseV1DecoderLayer(custom_config, layer_idx=0).to(dtype=dtype)
+    custom_layer = HunYuanDenseDecoderLayer(custom_config, layer_idx=0).to(dtype=dtype)
     custom_layer.eval()
 
     _transfer_decoder_layer_weights(hf_layer, custom_layer)
@@ -388,7 +388,7 @@ def test_decoder_layer_equivalence(B, S, dtype):
         hf_out = hf_out[0]
 
     # Custom
-    custom_rope = HunYuanDenseV1RotaryEmbedding(
+    custom_rope = HunYuanDenseRotaryEmbedding(
         dim=custom_config.head_dim,
         max_position_embeddings=custom_config.max_position_embeddings,
         base=custom_config.rope_theta,
@@ -420,7 +420,7 @@ def test_full_model_equivalence(B, S, dtype):
     hf_model = HFModelCls(hf_config).to(dtype=dtype)
     hf_model.eval()
 
-    custom_model = HunYuanDenseV1ForCausalLM(custom_config).to(dtype=dtype)
+    custom_model = HunYuanDenseForCausalLM(custom_config).to(dtype=dtype)
     custom_model.eval()
 
     _transfer_full_model_weights(hf_model, custom_model)
@@ -452,7 +452,7 @@ def test_model_can_be_exported(device):
     dtype = torch.bfloat16
     custom_config = _create_small_custom_config()
 
-    model = HunYuanDenseV1ForCausalLM(custom_config)
+    model = HunYuanDenseForCausalLM(custom_config)
     model.to(device=device, dtype=dtype)
     model.eval()
 
@@ -511,10 +511,7 @@ def test_model_can_be_exported(device):
 
 
 def test_config_registration():
-    """Test that the config has correct model_type and is registered."""
-    config = _create_small_custom_config()
-    assert config.model_type == "hunyuan_v1_dense"
-
+    """Factory knows the model class under the real HF config name."""
     from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
 
     assert "HunYuanDenseV1Config" in AutoModelForCausalLMFactory._custom_model_mapping
@@ -523,7 +520,7 @@ def test_config_registration():
 def test_tied_weights():
     """Test that tie_word_embeddings works correctly."""
     config = _create_small_custom_config()
-    model = HunYuanDenseV1ForCausalLM(config)
+    model = HunYuanDenseForCausalLM(config)
 
     # With tied weights, lm_head.weight should be the same tensor as embed_tokens.weight
     assert model.lm_head.weight is model.model.embed_tokens.weight
@@ -532,20 +529,20 @@ def test_tied_weights():
 def test_qk_norm_structure():
     """Test that QK normalization layers exist in attention."""
     config = _create_small_custom_config()
-    model = HunYuanDenseV1ForCausalLM(config)
+    model = HunYuanDenseForCausalLM(config)
 
     for i, layer in enumerate(model.model.layers):
         attn = layer.self_attn
         assert hasattr(attn, "query_layernorm"), f"Layer {i} missing query_layernorm"
         assert hasattr(attn, "key_layernorm"), f"Layer {i} missing key_layernorm"
-        assert isinstance(attn.query_layernorm, HunYuanDenseV1RMSNorm)
-        assert isinstance(attn.key_layernorm, HunYuanDenseV1RMSNorm)
+        assert isinstance(attn.query_layernorm, HunYuanDenseRMSNorm)
+        assert isinstance(attn.key_layernorm, HunYuanDenseRMSNorm)
 
 
 def test_state_dict_keys_match_checkpoint():
     """Test that model state_dict keys match the expected checkpoint format."""
     config = _create_small_custom_config()
-    model = HunYuanDenseV1ForCausalLM(config)
+    model = HunYuanDenseForCausalLM(config)
     state_dict = model.state_dict()
 
     expected_keys = [
