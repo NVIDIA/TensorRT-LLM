@@ -486,18 +486,11 @@ class UnquantizedLinearMethod(LinearMethodBase):
 
     def apply_out(self, module: Linear, input: torch.Tensor,
                   bias: Optional[torch.Tensor], out: torch.Tensor):
-        if module.use_custom_cublas_mm:
-            output = torch.ops.trtllm.cublas_mm_out(input, module.weight.t(),
-                                                    bias, out)
-        else:
-            if input.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
-                # torch.matmul(out=) does not support float8; fall back to non-out path.
-                return self.apply(module, input, bias)
-            torch.matmul(input, module.weight.t(), out=out)
-            if bias is not None:
-                out += bias
-            output = out
-        return output
+        # Only called when use_custom_cublas_mm=True (see Linear.forward).
+        # torch.matmul(out=) is not used: it produces auto_functionalized(aten.mm.out)
+        # under torch.compile which breaks the piecewise CUDA-graph optimizer.
+        return torch.ops.trtllm.cublas_mm_out(input, module.weight.t(), bias,
+                                              out)
 
     def load_weights_vanilla(self,
                              module: Linear,
@@ -2739,93 +2732,6 @@ class Linear(nn.Module):
                 output = output + lora_result
         return output
 
-    def _should_use_nccl_window_output(
-            self,
-            input: torch.Tensor,
-            all_reduce_params: Optional[AllReduceParams],
-            lora_params: Optional[dict],
-            prefer_window_output: Optional[bool] = None) -> bool:
-        if mpi_disabled():
-            return False
-        if self.all_reduce is None:
-            return False
-        if not self.all_reduce.uses_nccl_window():
-            return False
-        if (all_reduce_params is not None
-                and not all_reduce_params.enable_allreduce
-                and not prefer_window_output):
-            return False
-        if self.lora is not None and bool(lora_params):
-            return False
-        if not isinstance(input, torch.Tensor) or input.numel() == 0:
-            return False
-        return True
-
-    def _maybe_create_nccl_window_output(
-        self,
-        input: torch.Tensor,
-        all_reduce_params: Optional[AllReduceParams],
-        lora_params: Optional[dict],
-        prefer_window_output: Optional[bool] = None,
-        output_dtype: Optional[torch.dtype] = None,
-    ) -> Optional[torch.Tensor]:
-        if not self._should_use_nccl_window_output(
-                input, all_reduce_params, lora_params, prefer_window_output):
-            if logger.level in ('verbose', 'debug', 'trace'):
-                mpi_off = mpi_disabled()
-                has_all_reduce = self.all_reduce is not None
-                strategy = None if self.all_reduce is None else self.all_reduce.strategy
-                enable_allreduce = None if all_reduce_params is None else all_reduce_params.enable_allreduce
-                has_lora = self.lora is not None and bool(lora_params)
-                valid_input = isinstance(input,
-                                         torch.Tensor) and input.numel() > 0
-                strategy_ok = strategy in (AllReduceStrategy.AUTO,
-                                           AllReduceStrategy.NCCL_SYMMETRIC)
-                reasons = []
-                if mpi_off:
-                    reasons.append("mpi_disabled")
-                if not has_all_reduce:
-                    reasons.append("no_all_reduce")
-                if has_all_reduce and not strategy_ok:
-                    reasons.append("strategy_not_auto_or_nccl_symmetric")
-                if enable_allreduce is False and not prefer_window_output:
-                    reasons.append("enable_allreduce_false")
-                if has_lora:
-                    reasons.append("lora_active")
-                if not valid_input:
-                    reasons.append("invalid_input")
-                logger.debug(
-                    "create_nccl_window_tensor skipped "
-                    f"(reasons={reasons}, "
-                    f"mpi_disabled={mpi_off}, has_all_reduce={has_all_reduce}, "
-                    f"strategy={strategy}, enable_allreduce={enable_allreduce}, "
-                    f"prefer_window_output={prefer_window_output}, "
-                    f"has_lora={has_lora}, valid_input={valid_input})")
-            return None
-        output_shape = list(input.shape)
-        if not output_shape:
-            return None
-        output_shape[-1] = self.out_features
-        output_dtype = output_dtype or input.dtype
-        like_tensor = input
-        if output_dtype != input.dtype:
-            like_tensor = torch.empty((),
-                                      device=input.device,
-                                      dtype=output_dtype)
-        window = self.all_reduce.get_nccl_window_for_shape(
-            tuple(output_shape),
-            all_reduce_params=all_reduce_params,
-            like_tensor=like_tensor,
-        )
-        if window is None:
-            logger.debug(
-                "create_nccl_window_tensor skipped (get_nccl_window_for_shape "
-                "returned None; shape=%s, group=%s)",
-                tuple(output_shape),
-                tuple(self.mapping.tp_group),
-            )
-        return window
-
     def apply_linear_allreduce(self,
                                input,
                                bias,
@@ -2874,52 +2780,43 @@ class Linear(nn.Module):
                     fuse_bias = self._maybe_fuse_bias_into_allreduce(
                         bias, all_reduce_params)
                     bias = None if fuse_bias else bias
-                    window_out = None
-                    window_attempted = False
-                    window_path = "none"
-                    if hasattr(self.quant_method, "apply_window_output"
-                               ) and self._should_use_nccl_window_output(
-                                   input, all_reduce_params, lora_params,
-                                   prefer_window_output):
-                        window_attempted = True
-                        window_path = "apply_window_output"
+                    # Try to write GEMM output directly into the NCCL window
+                    # buffer so the allreduce can read from it without a copy.
+                    # Activates for AUTO and NCCL_SYMMETRIC strategies.
+                    # A failed window allocation is graceful: fall back to a
+                    # fresh tensor and let the allreduce handle it normally.
+                    use_window = (
+                        self.all_reduce is not None
+                        and self.all_reduce.uses_nccl_window()
+                        and not (self.lora is not None and lora_params)
+                        and (all_reduce_params is None
+                             or all_reduce_params.enable_allreduce is not False
+                             or prefer_window_output))
+                    if use_window and hasattr(self.quant_method,
+                                              "apply_window_output"):
                         output = self.quant_method.apply_window_output(
                             self, input, bias)
-                        window_out = output
-                    elif hasattr(self.quant_method, "apply_out"):
-                        window_attempted = True
-                        window_path = "apply_out"
-                        window_out = self._maybe_create_nccl_window_output(
-                            input,
-                            all_reduce_params,
-                            lora_params,
-                            prefer_window_output,
-                            output_dtype=self.dtype or input.dtype)
-                        if window_out is not None:
-                            # Pre-check float8: torch.matmul(out=) is unsupported,
-                            # so apply_out would fall back. Avoids data_ptr()
-                            # comparison inside the dynamo-traced region.
-                            if (not self.use_custom_cublas_mm
-                                    and input.dtype in (torch.float8_e4m3fn,
-                                                        torch.float8_e5m2)):
-                                window_out = None
-                                output = self.apply_linear(
-                                    input, bias, lora_params, layer_idx)
-                            else:
-                                output = self.quant_method.apply_out(
-                                    self, input, bias, window_out)
-                        else:
-                            output = self.apply_linear(input, bias, lora_params,
-                                                       layer_idx)
+                    elif (use_window and hasattr(self.quant_method, "apply_out")
+                          and self.use_custom_cublas_mm):
+                        # Window output is only used when use_custom_cublas_mm=True
+                        # because the fallback path in apply_out uses
+                        # torch.matmul(out=), which introduces
+                        # auto_functionalized(aten.mm.out) into the AOT graph
+                        # and breaks the piecewise CUDA-graph optimizer.
+                        # cublas_mm_out is a functional custom op and is safe.
+                        output_shape = list(input.shape)
+                        output_shape[-1] = self.out_features
+                        window_out = self.all_reduce.get_nccl_window_for_shape(
+                            tuple(output_shape),
+                            all_reduce_params=all_reduce_params,
+                            like_tensor=input)
+                        output = (self.quant_method.apply_out(
+                            self, input, bias, window_out) if window_out
+                                  is not None else self.apply_linear(
+                                      input, bias, lora_params, layer_idx))
                     else:
                         output = self.apply_linear(input, bias, lora_params,
                                                    layer_idx)
-                    window_success = window_attempted and window_out is not None
-                    if logger.level in ('verbose', 'debug', 'trace'):
-                        logger.debug(
-                            "Linear GEMM NCCL window output buffer: %s (path=%s)",
-                            "success" if window_success else "failure",
-                            window_path)
                     output = self.all_reduce(
                         output, all_reduce_params=all_reduce_params)
             else:
