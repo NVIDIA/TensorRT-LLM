@@ -33,6 +33,7 @@ class GatedMLP(nn.Module):
         use_cute_dsl_blockscaling_mm: bool = False,
         disable_deep_gemm: bool = False,
         use_custom_cublas_mm: bool = False,
+        is_shared_expert: bool = False,
     ):
 
         super().__init__()
@@ -87,8 +88,16 @@ class GatedMLP(nn.Module):
             use_custom_cublas_mm=use_custom_cublas_mm,
         )
 
-        self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
-                                   [self.hidden_size])
+        if is_shared_expert:
+            down_type = LoraModuleType.SHARED_EXPERT_4H_TO_H
+            h_to_4h_type = LoraModuleType.SHARED_EXPERT_H_TO_4H
+            gate_type = LoraModuleType.SHARED_EXPERT_GATE
+        else:
+            down_type = LoraModuleType.MLP_4H_TO_H
+            h_to_4h_type = LoraModuleType.MLP_H_TO_4H
+            gate_type = LoraModuleType.MLP_GATE
+
+        self.down_lora = LoraLayer([down_type], [self.hidden_size])
 
         self.down_proj = Linear(
             self.intermediate_size,
@@ -111,11 +120,10 @@ class GatedMLP(nn.Module):
         # These two modules are mutually exclusive - either splitted_gate_up_lora or fused_gate_up_lora will be used,
         # but never both at the same time. splitted_gate_up_lora handles gate and up separately while fused_gate_up_lora
         # handles them as a single fused operation.
-        self.splitted_gate_up_lora = LoraLayer(
-            [LoraModuleType.MLP_H_TO_4H, LoraModuleType.MLP_GATE], [
-                self.intermediate_size // mapping.tp_size,
-                self.intermediate_size // mapping.tp_size
-            ])
+        self.splitted_gate_up_lora = LoraLayer([h_to_4h_type, gate_type], [
+            self.intermediate_size // mapping.tp_size,
+            self.intermediate_size // mapping.tp_size
+        ])
         self.fused_gate_up_lora = LoraLayer(
             [LoraModuleType.MLP_GATE_UP],
             [2 * self.intermediate_size // mapping.tp_size])
