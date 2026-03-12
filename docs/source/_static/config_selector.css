@@ -163,8 +163,11 @@
 }
 
 .trtllm-config-selector__optionHint {
-  font-size: 0.78rem;
+  font-size: 0.75rem;
   color: var(--pst-color-text-muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
 }
 
 .trtllm-config-selector__output {

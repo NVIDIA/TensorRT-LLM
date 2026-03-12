@@ -110,9 +110,11 @@
 
   function modelOption(model, modelsInfo) {
     const info = modelsInfo[model];
+    const displayName = info && info.display_name ? info.display_name : model;
     return {
       value: model,
-      label: info && info.display_name ? `${info.display_name} (${model})` : model,
+      label: displayName,
+      hint: displayName !== model ? model : "",
     };
   }
 
@@ -824,7 +826,9 @@
           "aria-disabled": isIncompatible ? "true" : "false",
           title: isIncompatible
             ? `${option.label} is unavailable for the current selection.`
-            : option.label,
+            : option.hint
+              ? `${option.label} (${option.hint})`
+              : option.label,
         });
         if (isIncompatible) button.disabled = true;
         button.appendChild(
@@ -833,6 +837,14 @@
             text: option.label,
           })
         );
+        if (option.hint) {
+          button.appendChild(
+            el("span", {
+              class: "trtllm-config-selector__optionHint",
+              text: option.hint,
+            })
+          );
+        }
         if (option.status === "active-incompatible") {
           button.appendChild(
             el("span", {

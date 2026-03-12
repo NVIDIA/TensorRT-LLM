@@ -201,3 +201,22 @@ test("selector auto-selects singleton concurrency without a separate profile bad
   assert.equal(view.selectedConcurrencyBadge, "");
   assert.equal(view.finalEntries.length, 1);
 });
+
+test("model buttons show friendly display name, with HF ID as hint", () => {
+  const { selector, payload, entries } = setupDeepSeekNvfp4();
+
+  const view = selector.createSelectorViewModel(entries, payload.models, {
+    model: "",
+    topology: "",
+    islOsl: "",
+    concurrency: "",
+  });
+
+  const option = findOption(view.groups.model, DEEPSEEK_NVFP4_MODEL);
+  assert.ok(option, "model option should exist");
+  assert.ok(
+    !option.label.includes(DEEPSEEK_NVFP4_MODEL),
+    "label should not contain raw HF ID"
+  );
+  assert.equal(option.hint, DEEPSEEK_NVFP4_MODEL);
+});
