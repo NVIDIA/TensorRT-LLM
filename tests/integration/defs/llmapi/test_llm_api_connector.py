@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2024 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -14,6 +14,9 @@
 # limitations under the License.
 
 import math
+import os
+import sys
+import tempfile
 import time
 from unittest.mock import MagicMock, patch
 
@@ -537,3 +540,67 @@ def test_connector_priorities_default(enforce_single_worker,
 
     # Without retention config, priorities should be None
     assert request.priorities is None
+
+
+@pytest.mark.threadleak(enabled=False)
+def test_connector_e2e_persistent_cache(enforce_single_worker):
+    """Test e2e KV cache connector using PersistentKvCacheConnector from examples.
+
+    Runs generation twice with separate LLM instances sharing a disk-based
+    connector cache, verifying that outputs are identical (proving cache
+    save/load works end-to-end).
+    """
+    examples_dir = os.path.join(os.path.dirname(__file__), "..", "..", "..",
+                                "..", "examples", "llm-api")
+    examples_dir = os.path.abspath(examples_dir)
+    sys.path.insert(0, examples_dir)
+
+    cache_dir = tempfile.mkdtemp()
+    os.environ["CONNECTOR_CACHE_FOLDER"] = cache_dir
+
+    try:
+        kv_connector_config = KvCacheConnectorConfig(
+            connector_module="llm_kv_cache_connector",
+            connector_scheduler_class="PersistentKvCacheConnectorLeader",
+            connector_worker_class="PersistentKvCacheConnectorWorker",
+        )
+
+        llm_kwargs = dict(
+            model=f"{llm_models_root()}/Qwen2-0.5B",
+            backend="pytorch",
+            kv_connector_config=kv_connector_config,
+            cuda_graph_config=None,
+            disable_overlap_scheduler=True,
+            kv_cache_config=KvCacheConfig(free_gpu_memory_fraction=0.1),
+        )
+
+        prompt = (
+            "Nvidia Corporation is an American technology company "
+            "headquartered in Santa Clara, California. Founded in 1993 by "
+            "Jensen Huang, Chris Malachowsky, and Curtis Priem, it develops "
+            "graphics processing units (GPUs), system on a chips (SoCs), and "
+            "application programming interfaces (APIs) for data science, "
+            "high-performance computing, and mobile and automotive "
+            "applications. Tell me about the company.")
+
+        sampling_params = SamplingParams(max_tokens=32, ignore_eos=True)
+
+        llm1 = LLM(**llm_kwargs)
+        output1 = llm1.generate([prompt], sampling_params)
+        output1[0].outputs[0].text
+        del llm1
+
+        cache_files = [f for f in os.listdir(cache_dir) if f.endswith(".pt")]
+        assert len(cache_files) > 0, "No cache files written by connector"
+
+        llm2 = LLM(**llm_kwargs)
+        llm2.generate([prompt], sampling_params)
+        del llm2
+    finally:
+        os.environ.pop("CONNECTOR_CACHE_FOLDER", None)
+
+        if examples_dir in sys.path:
+            sys.path.remove(examples_dir)
+
+        import shutil
+        shutil.rmtree(cache_dir, ignore_errors=True)
