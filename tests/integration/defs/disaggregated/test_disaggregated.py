@@ -2213,14 +2213,12 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                        f"{server_url}/v1/chat/completions")
 
                 def make_payload(prompt, stream):
+                    base = {"max_tokens": max_tokens, "logprobs": 1 if api_type == "completions" else True,
+                            "stream": stream, "temperature": 0}
                     if api_type == "completions":
-                        return {"model": model_name, "prompt": prompt,
-                                "max_tokens": max_tokens, "logprobs": 1,
-                                "stream": stream}
+                        return {"model": model_name, "prompt": prompt, **base}
                     return {"model": model_name,
-                            "messages": [{"role": "user", "content": prompt}],
-                            "max_tokens": max_tokens, "logprobs": True,
-                            "stream": stream}
+                            "messages": [{"role": "user", "content": prompt}], **base}
 
                 # 1) Streaming vs non-streaming consistency check
                 async with session.post(
