@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2022-2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -48,6 +48,7 @@ from .open_search_db_utils import (
 MODEL_PATH_DICT = {
     "deepseek_r1_fp8": "DeepSeek-R1/DeepSeek-R1",
     "deepseek_r1_nvfp4": "DeepSeek-R1/DeepSeek-R1-FP4",
+    "deepseek_r1_distill_qwen_32b": "DeepSeek-R1/DeepSeek-R1-Distill-Qwen-32B",
     "deepseek_r1_0528_fp8": "DeepSeek-R1/DeepSeek-R1-0528/",
     "deepseek_r1_0528_fp4": "DeepSeek-R1/DeepSeek-R1-0528-FP4/",
     "deepseek_r1_0528_fp4_v2": "DeepSeek-R1/DeepSeek-R1-0528-FP4-v2/",
@@ -142,6 +143,7 @@ class ServerConfig:
         self.model_path = ""
         self.env_vars = env_vars
         self.disagg_run_type = server_config_data.get("disagg_run_type", "aggr")
+        self.backend = server_config_data.get("backend", "pytorch")
 
         # Extract optional fields with defaults
         self.tp = server_config_data.get("tensor_parallel_size", 1)
@@ -241,6 +243,7 @@ class ServerConfig:
             "name",
             "model_name",
             "disagg_run_type",
+            "backend",
             "gpus",
             "gpus_per_node",
             "match_mode",
@@ -268,7 +271,7 @@ class ServerConfig:
             "trtllm-serve",
             self.model_path,
             "--backend",
-            "pytorch",
+            self.backend,
             "--config",
             config_path,
         ]

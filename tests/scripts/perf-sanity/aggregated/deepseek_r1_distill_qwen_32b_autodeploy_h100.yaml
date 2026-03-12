@@ -1,0 +1,27 @@
+# SPDX-FileCopyrightText: Copyright (c) 2022-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+metadata:
+  model_name: deepseek_r1_distill_qwen_32b
+  supported_gpus:
+  - H100
+hardware:
+  gpus_per_node: 1
+server_configs:
+  - name: "distill_qwen32b_autodeploy_1k1k"
+    model_name: "deepseek_r1_distill_qwen_32b"
+    backend: "_autodeploy"
+    max_batch_size: 512
+    max_num_tokens: 2048
+    max_seq_len: 2048
+    transforms:
+      compile_model:
+        backend: "torch-opt"
+    runtime: "trtllm"
+    skip_loading_weights: false
+    client_configs:
+      - name: "con64_iter8_1k1k"
+        concurrency: 64
+        iterations: 8
+        isl: 1024
+        osl: 1024
+        backend: "openai"

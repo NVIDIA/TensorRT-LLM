@@ -16,3 +16,4 @@ l0_perf_autodeploy:
         backend: autodeploy
     tests:
       - perf/test_perf.py::test_perf[deepseek_r1_distill_qwen_32b-bench-_autodeploy-float16-input_output_len:1024,1024-reqs:512]
+      - perf/test_perf_sanity.py::test_e2e[aggr_upload-deepseek_r1_distill_qwen_32b_autodeploy_h100-distill_qwen32b_autodeploy_1k1k]
