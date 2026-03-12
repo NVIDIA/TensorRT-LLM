@@ -77,6 +77,10 @@ class DeepEP(Communication):
         self.deep_ep_buffer = buffer_pool.get_buffer(mapping)
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
+        # Invalid token expert ID: TRTLLM-gen kernels only support -1 for invalid tokens.
+        # After dispatch, non-local expert slots are replaced with this value.
+        self.invalid_token_expert_id = -1
+
     def destroy(self):
         """Release the DeepEP buffer to prevent deadlock/hang.
 
@@ -232,6 +236,17 @@ class DeepEP(Communication):
                 "deep_ep_handle": deep_ep_handle,
                 "padded": padded,
             }
+
+        if kwargs.get("enable_sanitize_expert_ids", False) and token_selected_slots.numel() > 0:
+            slot_start = self.expert_size_per_partition * self.ep_rank
+            slot_end = slot_start + self.expert_size_per_partition
+            non_local_mask = (token_selected_slots < slot_start) | (
+                token_selected_slots >= slot_end
+            )
+            if non_local_mask.any():
+                token_selected_slots = token_selected_slots.masked_fill(
+                    non_local_mask, self.invalid_token_expert_id
+                )
 
         # Restore token_final_scales to original dtype for downstream consumers
         if (

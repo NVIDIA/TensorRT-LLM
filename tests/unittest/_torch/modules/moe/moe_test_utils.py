@@ -352,22 +352,6 @@ def should_skip_trtllm(
                 f"Single-GPU tests pass; issue is in the kernel runner under EP."
             )
 
-        # Issue: NVFP4 with large model configs crashes with CUDA illegal memory
-        # access in DeepEP mode (deep_ep.cpp:86).
-        # Verified: e60_k4_h2048_i1408 passes, e256_k8_h7168_i2048 crashes.
-        # The crash kills the entire pytest process, blocking all subsequent tests.
-        if (
-            quant_algo == QuantAlgo.NVFP4
-            and num_experts >= 256
-            and model_config.hidden_size >= 7168
-        ):
-            return (
-                f"[Potential Bug] TRTLLMGenFusedMoE NVFP4 with large model "
-                f"(num_experts={num_experts}, hidden_size={model_config.hidden_size}) "
-                f"crashes with CUDA illegal memory access in DeepEP mode "
-                f"(comm={comm_method}). Smaller configs pass."
-            )
-
     # TP per-shard alignment: when moe_tp_size > 1, intermediate_size is sharded.
     # MXFP4 variants (W4A16_MXFP4, W4A8_MXFP4_MXFP8) auto-pad to 128 alignment,
     # but other quants (FP8_BLOCK_SCALES, NVFP4, W4A8_NVFP4_FP8) crash:
