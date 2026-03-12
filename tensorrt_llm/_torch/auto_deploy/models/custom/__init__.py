@@ -1,3 +1,4 @@
+from .modeling_cohere import CohereForCausalLM
 from .modeling_decilm import DeciLMForCausalLM
 from .modeling_deepseek import DeepSeekV3ForCausalLM
 from .modeling_deepseek_v2 import DeepSeekV2ForCausalLM
@@ -14,6 +15,7 @@ from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
 from .modeling_starcoder2 import Starcoder2ForCausalLM
 
 __all__ = (
+    "CohereForCausalLM",
     "DeciLMForCausalLM",
     "DeepSeekV2ForCausalLM",
     "DeepSeekV3ForCausalLM",
