@@ -28,12 +28,15 @@ This implementation differs from the Hugging Face version in the following ways:
   exported text submodule.
 """
 
+from contextlib import nullcontext
 from dataclasses import dataclass
 from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import torch
 import torch.nn.functional as F
+from accelerate import init_empty_weights
 from torch import nn
+from torch._prims_common import DeviceLikeType
 from transformers import AutoConfig, Siglip2VisionConfig
 from transformers.activations import ACT2FN
 from transformers.configuration_utils import PretrainedConfig
@@ -43,10 +46,13 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.phi3.configuration_phi3 import Phi3Config
 from transformers.utils import ModelOutput
 
+from tensorrt_llm._torch.auto_deploy.models.factory import ModelFactoryRegistry
 from tensorrt_llm._torch.auto_deploy.models.hf import (
     AutoModelForCausalLMFactory,
     AutoModelForImageTextToTextFactory,
 )
+from tensorrt_llm._torch.auto_deploy.utils.logger import ad_logger
+from tensorrt_llm.tokenizer.tokenizer import TransformersTokenizer
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
@@ -958,6 +964,72 @@ class Phi4VisionRForConditionalGeneration(PreTrainedModel, GenerationMixin):
         )
         logits = self.lm_head(outputs.last_hidden_state).float()
         return Phi4VisionCausalLMOutput(logits=logits)
+
+
+class Phi4VisionRTokenizer(TransformersTokenizer):
+    """Tokenizer wrapper that applies the default chat template for raw text prompts."""
+
+    def encode(self, text: str, *args, **kwargs) -> List[int]:
+        if (
+            getattr(self.tokenizer, "chat_template", None) is not None
+            and "<|im_start|>" not in text
+        ):
+            text = self.tokenizer.apply_chat_template(
+                [{"role": "user", "content": text}],
+                add_generation_prompt=True,
+                tokenize=False,
+            )
+        return super().encode(text, *args, **kwargs)
+
+
+class Phi4VisionRProcessorWrapper:
+    """Processor wrapper that uses the tokenizer chat template for text-only messages."""
+
+    def __init__(self, processor):
+        self.processor = processor
+        self.tokenizer = Phi4VisionRTokenizer(processor.tokenizer)
+
+    def __call__(self, *args, **kwargs):
+        return self.processor(*args, **kwargs)
+
+    def apply_chat_template(self, conversation, *args, **kwargs):
+        return self.tokenizer.apply_chat_template(conversation, *args, **kwargs)
+
+
+@ModelFactoryRegistry.register("Phi4VisionRAutoModelForImageTextToText")
+class Phi4VisionRAutoModelForImageTextToTextFactory(AutoModelForImageTextToTextFactory):
+    """Model-specific ImageTextToText factory that keeps Phi-4 prompt templating out of llm.py."""
+
+    def _build_model(self, device: DeviceLikeType) -> nn.Module:
+        model_config, unused_kwargs = self._get_model_config()
+        with (init_empty_weights if device == "meta" else nullcontext)():
+            ad_logger.info(
+                f"Using custom model implementation {Phi4VisionRForConditionalGeneration}"
+            )
+            model = Phi4VisionRForConditionalGeneration._from_config(model_config, **unused_kwargs)
+
+        if device == "meta":
+            if hasattr(model, "post_init"):
+                model.post_init()
+        else:
+            model.to(device)
+
+        self._set_sharding_config(model.config)
+        self._checkpoint_conversion_mapping = getattr(model, "_checkpoint_conversion_mapping", None)
+        model.eval()
+        return model
+
+    def init_processor(self) -> Optional[Phi4VisionRProcessorWrapper]:
+        processor = super().init_processor()
+        if processor is None:
+            return None
+        return Phi4VisionRProcessorWrapper(processor)
+
+    def init_tokenizer(self) -> Optional[Phi4VisionRTokenizer]:
+        processor = self.init_processor()
+        if processor is None:
+            return None
+        return processor.tokenizer
 
 
 try:

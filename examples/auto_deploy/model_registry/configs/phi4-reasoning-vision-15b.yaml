@@ -12,6 +12,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+model_factory: Phi4VisionRAutoModelForImageTextToText
+
 model_kwargs:
   # The remote Phi-4 reasoning-vision wrapper defaults to FA2-backed attention construction,
   # but the AD text-only onboarding path keeps the VLM wrapper and exports only the text stack.
