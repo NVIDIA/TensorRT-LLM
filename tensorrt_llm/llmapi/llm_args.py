@@ -5,11 +5,13 @@ import math
 import os
 import types
 from abc import ABC, abstractmethod
+from collections import defaultdict
 from dataclasses import dataclass
 from enum import Enum, EnumMeta
 from pathlib import Path
-from typing import (Annotated, Any, Dict, List, Literal, Optional, Set, Tuple,
-                    Type, TypeAlias, TypeVar, Union, get_args, get_origin)
+from typing import (TYPE_CHECKING, Annotated, Any, ClassVar, Dict, List,
+                    Literal, Optional, Set, Tuple, Type, TypeAlias, TypeVar,
+                    Union, get_args, get_origin)
 
 import torch
 import yaml
@@ -28,7 +30,7 @@ except ImportError:
 from tensorrt_llm.lora_helper import (LoraConfig,
                                       get_default_trtllm_modules_to_hf_modules)
 
-from .._utils import _str_to_torch_dtype_dict, mpi_rank
+from .._utils import _str_to_torch_dtype_dict, mpi_rank, prefer_pinned
 
 # yapf: disable
 # isort: off
@@ -63,6 +65,12 @@ from .utils import (StrictBaseModel, generate_api_docs_as_docstring,
                     get_type_repr)
 
 TypeBaseModel = TypeVar("T", bound=BaseModel)
+
+if TYPE_CHECKING:
+    from tensorrt_llm._torch.virtual_memory import \
+        RestoreMode as _VirtualMemoryRestoreMode
+else:
+    _VirtualMemoryRestoreMode = Enum
 
 
 def Field(default: Any = ...,
@@ -1472,6 +1480,119 @@ class RayPlacementConfig(StrictBaseModel):
         return self
 
 
+class ExecutorMemoryType(StrEnum):
+    """Types of GPU memory used by executor.
+
+     These are used by the sleep/wakeup feature to target specific type of memory.
+     """
+    SAMPLER = "sampler"
+    DRAFTER = "drafter"
+    GUIDED_DECODER = "guided_decoder"
+    SPEC_RESOURCES = "spec_resource_manager"
+    INIT_KV_CACHE = "_no_capture_init_kv_cache"
+    INIT_EXTRA_RESOURCES = "_no_capture_init_extra_resources"
+    MODEL_EXTRA = "model_extra"
+    EXTRA_RESOURCES = "executor_extra"
+    KV_CACHE = "kv_cache"
+    MODEL_ENGINE_MAIN = "model"
+    MODEL_ENGINE_DRAFT = "draft_model"
+    MODEL_WEIGHTS_MAIN = "model_weights"
+    MODEL_WEIGHTS_DRAFT = "draft_model_weights"
+
+
+class SleepConfig(StrictBaseModel):
+    """Configuration for the LLM sleep/wakeup feature.
+    """
+
+    restore_modes: dict[
+        ExecutorMemoryType, Literal["NONE", "MEMSET", "CPU", "PINNED"]
+        | _VirtualMemoryRestoreMode] = Field(
+            default_factory=lambda: SleepConfig._make_defaulted_restore_modes(),
+            description="Per-component RestoreMode for the sleep feature. "
+            "Keys are ExecutorMemoryType values (e.g. 'model', 'kv_cache'), "
+            "values can be RestoreMode names (NONE, MEMSET, CPU, PINNED) or "
+            "RestoreMode enum values. "
+            "Unlisted entries default to the suitable mode selected between "
+            "PINNED and CPU.")
+
+    DEFAULT_RESTORE_MODES: ClassVar[dict[str, str]] = {
+        ExecutorMemoryType.KV_CACHE: "NONE",
+    }
+
+    @staticmethod
+    def _normalize_restore_mode(
+            value: str | _VirtualMemoryRestoreMode
+    ) -> _VirtualMemoryRestoreMode:
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        if isinstance(value, RestoreMode):
+            return value
+        if isinstance(value, str):
+            try:
+                return RestoreMode[value]
+            except KeyError as e:
+                valid = ", ".join(mode.name for mode in RestoreMode)
+                raise ValueError(
+                    f"invalid restore_mode: {value}. Expected one of: {valid}"
+                ) from e
+        raise ValueError(f"invalid restore_mode type: {type(value).__name__}")
+
+    @staticmethod
+    def _normalize_executor_memory_type(
+            key: ExecutorMemoryType | str) -> ExecutorMemoryType:
+        if isinstance(key, ExecutorMemoryType):
+            return key
+        if isinstance(key, str):
+            try:
+                return ExecutorMemoryType(key)
+            except ValueError as e:
+                valid = ", ".join(member.value for member in ExecutorMemoryType)
+                raise ValueError(
+                    f"invalid executor memory type: {key}. Expected one of: {valid}"
+                ) from e
+        raise ValueError(
+            f"executor memory type must be ExecutorMemoryType or str, got {type(key).__name__}"
+        )
+
+    @classmethod
+    def _make_defaulted_restore_modes(
+        cls,
+        cases: Optional[dict[ExecutorMemoryType,
+                             str | _VirtualMemoryRestoreMode]] = None,
+        *,
+        default_mode: Optional[_VirtualMemoryRestoreMode] = None
+    ) -> defaultdict[ExecutorMemoryType, _VirtualMemoryRestoreMode]:
+        from tensorrt_llm._torch.virtual_memory import RestoreMode
+        default_mode: _VirtualMemoryRestoreMode = default_mode or (
+            RestoreMode.PINNED if prefer_pinned() else RestoreMode.CPU)
+
+        if cases is None:
+            cases = cls.DEFAULT_RESTORE_MODES
+        normalized_cases = {
+            cls._normalize_executor_memory_type(key):
+            cls._normalize_restore_mode(value)
+            for key, value in cases.items()
+        }
+        return defaultdict(lambda: default_mode, normalized_cases)
+
+    @field_validator('restore_modes', mode='plain')
+    @classmethod
+    def _validate_restore_modes(cls, v):
+        if not isinstance(v, dict):
+            raise ValueError(
+                f"restore_modes must be dict, got {type(v).__name__}")
+
+        default_mode = None
+        if isinstance(v, defaultdict) and v.default_factory is not None:
+            try:
+                default_mode = cls._normalize_restore_mode(v.default_factory())
+            except Exception as e:
+                raise ValueError(
+                    "restore_modes defaultdict default_factory must return a valid RestoreMode"
+                ) from e
+
+        return cls._make_defaulted_restore_modes(v, default_mode=default_mode)
+
+
 class PybindMirror(ABC):
     ''' A class containing the utilities for mirroring Python classes to
     pybind classes.
@@ -1951,6 +2072,22 @@ class KvCacheConfig(StrictBaseModel, PybindMirror):
             description=
             "The data type to use for the Mamba SSM cache. If set to 'auto', the data type will be inferred from the model config."
         )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_stochastic_rounding: bool = Field(
+        default=False,
+        description=
+        "Enable stochastic rounding for Mamba SSM state updates. Only applicable with float16 cache dtype."
+    )
+
+    # This is a pure python field, not a pybind field. It is only for the Pytorch backend.
+    mamba_ssm_philox_rounds: int = Field(
+        default=10,
+        ge=1,
+        description=
+        "Number of Philox rounds for stochastic rounding PRNG. Higher values give better randomness "
+        "but increase compute cost. Only used when mamba_ssm_stochastic_rounding is enabled."
+    )
 
     tokens_per_block: int = Field(default=32,
                                   description="The number of tokens per block.")
@@ -3203,10 +3340,10 @@ class TorchLlmArgs(BaseLlmArgs):
         status="prototype",
     )
 
-    enable_sleep: bool = Field(
-        default=False,
-        description=
-        "Enable LLM sleep feature. Sleep feature requires extra setup that may slow down model loading. "
+    sleep_config: Optional[SleepConfig] = Field(
+        default=None,
+        description="Configuration for the LLM sleep feature. "
+        "Sleep feature requires extra setup that may slow down model loading. "
         "Only enable it if you intend to use this feature.",
         status="prototype")
 

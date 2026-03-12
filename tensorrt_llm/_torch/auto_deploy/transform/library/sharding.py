@@ -1015,8 +1015,10 @@ class Sharding(BaseTransform):
             config.max_num_tokens = 0
 
         # initialize the transform container
+        # Store container on gm, not shared_config, so multiple graph modules
+        # (target + draft) don't overwrite each other (#11928)
         transform_container = ShardingTransformContainer(config=config)
-        shared_config.sharding_transform_container = transform_container
+        gm._sharding_transform_container = transform_container
         ad_logger.info(
             f"Using allreduce strategy: {config.allreduce_strategy.name}, dist backend: {config.dist_backend}"
         )
@@ -1120,7 +1122,16 @@ class ShardingTransformExecutor(BaseTransform):
             return transform.check_and_apply(gm, node_dict[transform.target_node])
 
         num_matches = 0
-        transforms = shared_config.sharding_transform_container
+        transforms = gm._sharding_transform_container
+        _is_draft = getattr(gm, "is_draft", False)
+        _gm_name = getattr(gm, "_graph_module_name", type(gm).__name__)
+        ad_logger.info(
+            f"sharding_transform_executor: gm={_gm_name}, is_draft={_is_draft}, "
+            f"TP={len(transforms.weight_sharding_transforms)}, "
+            f"EP={len(transforms.ep_transforms)}, "
+            f"BMM={len(transforms.bmm_transforms)}, "
+            f"RMSNorm={len(transforms.rmsnorm_transforms)}"
+        )
         with WeightBiasInfoCache():
             for tp_transform in transforms.weight_sharding_transforms:
                 if check_and_apply(tp_transform):

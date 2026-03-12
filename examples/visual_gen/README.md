@@ -151,7 +151,7 @@ python visual_gen_wan_i2v.py \
 | `--seed` | ✓ | ✓ | 42 | Random seed |
 | `--enable_teacache` | ✓ | ✓ | False | Cache optimization |
 | `--teacache_thresh` | ✓ | ✓ | 0.2 | TeaCache similarity threshold |
-| `--attention_backend` | ✓ | ✓ | VANILLA | VANILLA or TRTLLM |
+| `--attention_backend` | ✓ | ✓ | VANILLA | `VANILLA`, `TRTLLM`, or `FA4` |
 | `--cfg_size` | — | ✓ | 1 | CFG parallelism |
 | `--ulysses_size` | ✓ | ✓ | 1 | Sequence parallelism |
 | `--linear_type` | ✓ | ✓ | default | Quantization type |

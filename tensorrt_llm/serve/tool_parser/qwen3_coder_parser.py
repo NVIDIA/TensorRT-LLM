@@ -106,7 +106,7 @@ class Qwen3CoderToolParser(BaseToolParser):
                     function_name = function_match.group(1).strip()
 
                     # Validate function name
-                    if function_name in self._tool_indices:
+                    if function_name:
                         self._current_function_name = function_name
                         self._function_name_sent = True
 
@@ -138,13 +138,6 @@ class Qwen3CoderToolParser(BaseToolParser):
                         # Remove the processed function declaration
                         self._buf = self._buf[function_match.end() :]
                         continue
-                    else:
-                        # Invalid function name, reset state
-                        logger.warning(f"Invalid function name: {function_name}")
-                        self._reset_streaming_state()
-                        normal += self._buf
-                        self._buf = ""
-                        break
                 else:
                     # Function name not complete yet, wait for more text
                     break
@@ -324,13 +317,13 @@ class Qwen3CoderToolParser(BaseToolParser):
                 # Convert parameter value to the correct type.
                 param_config = self._get_arguments_config(fname, tools)
                 params[pname] = self._convert_param_value(pval, pname, param_config, fname)
-            raw = {"name": fname, "arguments": params}
-            try:
-                # TODO: fix idx in function call, the index for a function
-                # call will always be -1 in parse_base_json
-                res.extend(self.parse_base_json(raw, tools))
-            except Exception:
-                logger.warning(f"invalid tool call for {fname} dropped")
+            res.append(
+                ToolCallItem(
+                    tool_index=-1,
+                    name=fname,
+                    parameters=json.dumps(params, ensure_ascii=False),
+                )
+            )
         return res
 
     def supports_structural_tag(self) -> bool:
