@@ -165,7 +165,8 @@ class GatedMLP(nn.Module):
     ) -> torch.Tensor:
         if bool(lora_params):
             return self.forward_lora(x, all_rank_num_tokens,
-                                     final_all_reduce_params, lora_params)
+                                     final_all_reduce_params,
+                                     prefer_window_output, lora_params)
 
         h1 = self.gate_up_proj(x)
         h2 = self._apply_activation(h1)
