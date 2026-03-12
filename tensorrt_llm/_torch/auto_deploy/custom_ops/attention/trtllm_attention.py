@@ -285,7 +285,9 @@ def prepare_trtllm_metadata_fake(
     cache_loc: torch.Tensor,
 ) -> List[torch.Tensor]:
     """Fake implementation for torch.compile tracing."""
-    _, max_blocks_per_seq, _, max_batch_size = max_seq_info_host.tolist()
+    del batch_info_host, max_seq_info_host
+    max_batch_size = cu_num_pages.shape[0] - 1
+    max_blocks_per_seq = torch.library.get_ctx().new_dynamic_size(min=1)
     return [
         torch.empty(
             1, max_batch_size, 2, max_blocks_per_seq, dtype=torch.int32, device=cache_loc.device
@@ -345,9 +347,14 @@ def trtllm_mha_with_cache(
     num_tokens = num_prefill_tokens + num_decode
     max_context_length = int(max_seq_info_host[0])
     max_num_requests = int(max_seq_info_host[3])
-    # Use sliding_window for attention_window_size if provided, else full context length
+    # TRTLLM's attention_window_size follows the kernel convention
+    # [max(0, query_idx - window), query_idx], while AutoDeploy torch_attention uses
+    # sliding_window as the total visible-token count. Normalize at the backend boundary,
+    # matching the existing FlashInfer precedent in tensorrt_llm/_torch/attention_backend/
+    # flashinfer.py:605, so cached TRTLLM attention preserves the same eager/export semantics
+    # without changing global KV capacity sizing.
     attention_window_size = (
-        sliding_window
+        max(sliding_window - 1, 0)
         if isinstance(sliding_window, int) and sliding_window > 0
         else max_context_length
     )

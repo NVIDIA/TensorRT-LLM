@@ -116,7 +116,7 @@ models:
 - name: nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
 - name: google/gemma-3-27b-it
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
 - name: deepseek-ai/DeepSeek-V2.5
   yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'deepseek_v2_ep.yaml']
 - name: ai21labs/AI21-Jamba-1.5-Mini
