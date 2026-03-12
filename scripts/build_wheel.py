@@ -49,7 +49,7 @@ def get_available_cpu_count() -> int:
     try:
         return len(os.sched_getaffinity(0))
     except AttributeError:
-        return cpu_count()
+        return cpu_count() or 1
 
 
 @contextmanager
