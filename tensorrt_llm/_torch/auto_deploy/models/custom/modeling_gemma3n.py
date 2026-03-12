@@ -253,6 +253,8 @@ class Gemma3nMultimodalEmbedder(nn.Module):
 class Gemma3nTextAttention(nn.Module):
     def __init__(self, config: Gemma3nTextConfig, layer_idx: int):
         super().__init__()
+        self.layer_idx = layer_idx
+        self.config = config
         self.head_dim = getattr(
             config, "head_dim", config.hidden_size // config.num_attention_heads
         )
@@ -260,6 +262,15 @@ class Gemma3nTextAttention(nn.Module):
         self.num_kv_heads = config.num_key_value_heads
         self.is_sliding = config.layer_types[layer_idx] == "sliding_attention"
         self.sliding_window = config.sliding_window if self.is_sliding else None
+        first_kv_shared_layer_idx = config.num_hidden_layers - config.num_kv_shared_layers
+        self.is_kv_shared_layer = layer_idx >= first_kv_shared_layer_idx > 0
+        prev_layers = config.layer_types[:first_kv_shared_layer_idx]
+        if self.is_kv_shared_layer:
+            self.kv_shared_layer_index = (
+                len(prev_layers) - 1 - prev_layers[::-1].index(config.layer_types[layer_idx])
+            )
+        else:
+            self.kv_shared_layer_index = None
 
         self.q_proj = nn.Linear(
             config.hidden_size, self.num_heads * self.head_dim, bias=config.attention_bias
@@ -305,19 +316,37 @@ class Gemma3nTextAttention(nn.Module):
             2,
         )
 
-        attn_output = torch.ops.auto_deploy.torch_attention(
-            query_states,
-            key_states,
-            value_states,
-            None,
-            0.0,
-            True,
-            1.0,
-            None,
-            self.sliding_window,
-            None,
-            "bsnd",
-        )
+        if self.is_kv_shared_layer:
+            attn_output = torch.ops.auto_deploy.torch_attention_shared_kv(
+                query_states,
+                key_states,
+                value_states,
+                None,
+                0.0,
+                True,
+                1.0,
+                None,
+                self.sliding_window,
+                None,
+                "bsnd",
+                self.layer_idx,
+                self.kv_shared_layer_index,
+            )
+        else:
+            attn_output = torch.ops.auto_deploy.torch_attention(
+                query_states,
+                key_states,
+                value_states,
+                None,
+                0.0,
+                True,
+                1.0,
+                None,
+                self.sliding_window,
+                None,
+                "bsnd",
+                self.layer_idx,
+            )
         attn_output = attn_output.reshape(batch_size, seq_len, -1)
         return self.o_proj(attn_output)
 
