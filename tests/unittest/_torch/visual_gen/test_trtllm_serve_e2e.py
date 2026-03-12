@@ -1,7 +1,8 @@
 """End-to-end tests for trtllm-serve visual_gen with real models.
 
-Tests text-to-video (t2v) and text+image-to-video (ti2v) generation through
-the full ``trtllm-serve`` stack backed by real VisualGen models.
+Tests text-to-video (t2v), text+image-to-video (ti2v), and text-to-image (t2i)
+generation through the full ``trtllm-serve`` stack backed by real VisualGen
+models.
 
 The server is launched as a subprocess (same pattern as
 ``tests/unittest/llmapi/apps/openai_server.py``), so each test class gets an
@@ -13,12 +14,19 @@ Usage::
     pytest tests/visual_gen/test_trtllm_serve_e2e.py -v
 
     # Run only t2v tests
-    pytest tests/visual_gen/test_trtllm_serve_e2e.py -v -k TestWanT2V
+    pytest tests/visual_gen/test_trtllm_serve_e2e.py -v -k TestWanTextToVideo
 
     # Run only ti2v tests
-    pytest tests/visual_gen/test_trtllm_serve_e2e.py -v -k TestWanI2V
+    pytest tests/visual_gen/test_trtllm_serve_e2e.py -v -k TestWanImageToVideo
+
+    # Run only FLUX.1 t2i tests
+    pytest tests/visual_gen/test_trtllm_serve_e2e.py -v -k TestFlux1TextToImage
+
+    # Run only FLUX.2 t2i tests
+    pytest tests/visual_gen/test_trtllm_serve_e2e.py -v -k TestFlux2TextToImage
 """
 
+import base64
 import os
 import shutil
 import subprocess
@@ -54,6 +62,12 @@ def _llm_models_root() -> str:
 
 _WAN_T2V_PATH = Path(_llm_models_root()) / "Wan2.1-T2V-1.3B-Diffusers"
 _WAN_I2V_PATH = Path(_llm_models_root()) / "Wan2.2-I2V-A14B-Diffusers"
+_FLUX1_PATH = Path(
+    os.environ.get("FLUX1_MODEL_PATH", os.path.join(_llm_models_root(), "FLUX.1-dev"))
+)
+_FLUX2_PATH = Path(
+    os.environ.get("FLUX2_MODEL_PATH", os.path.join(_llm_models_root(), "FLUX.2-dev"))
+)
 
 # Reference image used for image-to-video (ti2v) tests
 _PROJECT_ROOT = Path(__file__).resolve().parents[4]  # repo root
@@ -437,3 +451,139 @@ class TestWanImageToVideo:
         # 5. Confirm gone
         gone_resp = requests.get(f"{base}/{video_id}")
         assert gone_resp.status_code == 404
+
+
+# =========================================================================
+# FLUX.1 – Text-to-Image (t2i)
+# =========================================================================
+
+
+@pytest.mark.skipif(
+    not _model_available(_FLUX1_PATH), reason=f"FLUX.1 model not found at {_FLUX1_PATH}"
+)
+class TestFlux1TextToImage:
+    """Test FLUX.1-dev text-to-image generation via serve API."""
+
+    @pytest.fixture(scope="class")
+    def server(self):
+        with RemoteVisualGenServer(
+            model=str(_FLUX1_PATH),
+            extra_visual_gen_options=_make_visual_gen_options(),
+        ) as srv:
+            yield srv
+
+    # ------------------------------------------------------------------
+
+    def test_health(self, server):
+        resp = requests.get(server.url_for("health"))
+        assert resp.status_code == 200
+
+    def test_t2i_sync_b64(self, server):
+        """Synchronous text-to-image via POST /v1/images/generations (b64_json)."""
+        resp = requests.post(
+            server.url_for("v1", "images", "generations"),
+            json={
+                "prompt": "A cute cat sitting on a windowsill",
+                "response_format": "b64_json",
+                "size": "512x512",
+                "num_inference_steps": 4,
+                "seed": 42,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "data" in data
+        assert len(data["data"]) >= 1
+        img_obj = data["data"][0]
+        assert img_obj["b64_json"] is not None
+        # Verify it decodes to valid bytes
+        decoded = base64.b64decode(img_obj["b64_json"])
+        assert len(decoded) > 100, "Image data too small"
+
+    def test_t2i_sync_with_optional_params(self, server):
+        """Text-to-image with optional parameters (guidance_scale, negative_prompt)."""
+        resp = requests.post(
+            server.url_for("v1", "images", "generations"),
+            json={
+                "prompt": "A beautiful sunset over the ocean",
+                "response_format": "b64_json",
+                "size": "512x512",
+                "num_inference_steps": 4,
+                "guidance_scale": 3.5,
+                "seed": 123,
+                "negative_prompt": "blurry, low quality",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "data" in data
+        assert len(data["data"]) >= 1
+        assert data["data"][0]["b64_json"] is not None
+
+
+# =========================================================================
+# FLUX.2 – Text-to-Image (t2i)
+# =========================================================================
+
+
+@pytest.mark.skipif(
+    not _model_available(_FLUX2_PATH), reason=f"FLUX.2 model not found at {_FLUX2_PATH}"
+)
+class TestFlux2TextToImage:
+    """Test FLUX.2-dev text-to-image generation via serve API."""
+
+    @pytest.fixture(scope="class")
+    def server(self):
+        with RemoteVisualGenServer(
+            model=str(_FLUX2_PATH),
+            extra_visual_gen_options=_make_visual_gen_options(),
+        ) as srv:
+            yield srv
+
+    # ------------------------------------------------------------------
+
+    def test_health(self, server):
+        resp = requests.get(server.url_for("health"))
+        assert resp.status_code == 200
+
+    def test_t2i_sync_b64(self, server):
+        """Synchronous text-to-image via POST /v1/images/generations (b64_json)."""
+        resp = requests.post(
+            server.url_for("v1", "images", "generations"),
+            json={
+                "prompt": "A lovely cat lying on a sofa",
+                "response_format": "b64_json",
+                "size": "512x512",
+                "num_inference_steps": 4,
+                "seed": 42,
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "data" in data
+        assert len(data["data"]) >= 1
+        img_obj = data["data"][0]
+        assert img_obj["b64_json"] is not None
+        # Verify it decodes to valid bytes
+        decoded = base64.b64decode(img_obj["b64_json"])
+        assert len(decoded) > 100, "Image data too small"
+
+    def test_t2i_sync_with_optional_params(self, server):
+        """Text-to-image with optional parameters (guidance_scale, negative_prompt)."""
+        resp = requests.post(
+            server.url_for("v1", "images", "generations"),
+            json={
+                "prompt": "A rocket launching into a starry sky",
+                "response_format": "b64_json",
+                "size": "1024x1024",
+                "num_inference_steps": 4,
+                "guidance_scale": 4.0,
+                "seed": 123,
+                "negative_prompt": "blurry, low quality",
+            },
+        )
+        assert resp.status_code == 200, resp.text
+        data = resp.json()
+        assert "data" in data
+        assert len(data["data"]) >= 1
+        assert data["data"][0]["b64_json"] is not None
