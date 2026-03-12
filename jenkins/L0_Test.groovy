@@ -3062,6 +3062,8 @@ def runPackageSanityCheck(pipeline, wheel_path, reinstall_dependencies=false, cp
         sh "bash -c 'pip3 list --format=freeze | grep -Ev \"${pip_keep}\" | xargs -r pip3 uninstall -y'"
         sh "bash -c 'yum remove -y libcudnn* libnccl* libcublas* && ${remove_trt}'"
     }
+    //WAR: remove python3-pygments first since it is installed in NGC PyTorch image
+    trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get remove -y python3-pygments")
 
     // Test preview installation
     trtllm_utils.llmExecStepWithRetry(pipeline, script: "bash -c 'pip3 install pytest tensorrt_llm-*.whl'")
@@ -3622,6 +3624,8 @@ def launchTestJobs(pipeline, testFilter)
                         // Clean up the pip constraint file from the base NGC PyTorch image.
                         if (values[5] == DLFW_IMAGE) {
                             trtllm_utils.llmExecStepWithRetry(pipeline, script: "[ -f /etc/pip/constraint.txt ] && : > /etc/pip/constraint.txt || true")
+                            // Remove the python3-pygments pip package because the dlfw image already includes a Debian pygments package, which conflicts with the pip-installed version.
+                            trtllm_utils.llmExecStepWithRetry(pipeline, script: "pip3 uninstall -y pygments")
                         }
                         trtllm_utils.llmExecStepWithRetry(pipeline, script: "apt-get update && apt-get install -y python3-pip git rsync curl wget")
                         trtllm_utils.checkoutSource(LLM_REPO, env.gitlabCommit, LLM_ROOT, false, true)

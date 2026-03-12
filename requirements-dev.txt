@@ -45,3 +45,4 @@ nvidia-cuda-cupti>=13.0,<13.2
 cxxfilt
 hf-transfer==0.1.9
 line_profiler
+PyYAML

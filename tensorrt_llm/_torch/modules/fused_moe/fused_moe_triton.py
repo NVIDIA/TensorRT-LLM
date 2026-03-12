@@ -130,8 +130,8 @@ def _routing_shift_bitmatrix_range(Bitmatrix, stride_bm, stride_bn, Indices,
 # This kernel was removed from triton_kernels in 3.6.0, so we keep a local
 # copy here.
 @triton.jit
-def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn,
-                              cutoff, BLOCK_N: tl.constexpr):
+def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn, cutoff,
+                             BLOCK_N: tl.constexpr):
     pid_m = tl.program_id(0)
     cutoff_word = cutoff // 32
     cutoff_bit = cutoff % 32
@@ -142,7 +142,8 @@ def _routing_clear_bitmatrix(Bitmatrix, stride_bm, stride_bn, shape_bn,
                          mask=offs_n < shape_bn)
         values = tl.where(offs_n == cutoff_word, values & cutoff_mask, values)
         values = tl.where(offs_n > cutoff_word, 0, values)
-        tl.store(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn, values,
+        tl.store(Bitmatrix + pid_m * stride_bm + offs_n * stride_bn,
+                 values,
                  mask=offs_n < shape_bn)
 
 
@@ -400,9 +401,9 @@ class TritonUnquantizedFusedMoEMethod(FusedMoEMethodBase):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit"), reduction_n=2),
-                (alpha, module.swiglu_limit))
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -636,9 +637,9 @@ class TritonFP8QDQFusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         beta = module.swiglu_beta or 0.0
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit"), reduction_n=2),
-                (alpha, module.swiglu_limit))
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
                                  module.w3_w1_bias if module.bias else None,
@@ -1270,9 +1271,9 @@ class TritonMXFP4FusedMoEMethod(TritonUnquantizedFusedMoEMethod):
         hidden_states = _maybe_pad_activation(hidden_states)
         if beta == 1.0:
             act = FusedActivation(
-                FnSpecs("swiglu", triton_kernels.swiglu.swiglu_fn,
-                        ("alpha", "limit"), reduction_n=2),
-                (alpha, module.swiglu_limit))
+                FnSpecs("swiglu",
+                        triton_kernels.swiglu.swiglu_fn, ("alpha", "limit"),
+                        reduction_n=2), (alpha, module.swiglu_limit))
 
             act_out = matmul_ogs(hidden_states,
                                  gemm1_weights,
