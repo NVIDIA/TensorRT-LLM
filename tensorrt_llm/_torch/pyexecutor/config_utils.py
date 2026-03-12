@@ -22,6 +22,13 @@ def is_qwen3_next(config):
     ) and config.architectures is not None and config.architectures[
         0] == 'Qwen3NextForCausalLM'
 
+    
+def is_qwen3_5(config):
+    return hasattr(
+        config, 'architectures'
+    ) and config.architectures is not None and config.architectures[
+        0] in ['Qwen3_5ForCausalLM','Qwen3_5MoeForCausalLM']
+
 
 # TODO: remove this once the transformers can support all of those models in _CONFIG_REGISTRY
 class LazyConfigDict(dict):

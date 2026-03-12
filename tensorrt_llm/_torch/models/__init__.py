@@ -33,6 +33,8 @@ from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_qwen3vl import Qwen3VLModel
 from .modeling_qwen3vl_moe import Qwen3MoeVLModel
 from .modeling_qwen_moe import Qwen2MoeForCausalLM
+from .modeling_qwen3_5 import Qwen3_5Model
+# from .modeling_qwen3_5_moe import Qwen3_5MoeModel
 from .modeling_seedoss import SeedOssForCausalLM
 from .modeling_siglip import SiglipVisionModel
 from .modeling_starcoder2 import Starcoder2ForCausalLM
@@ -82,6 +84,8 @@ __all__ = [
     "Glm4MoeForCausalLM",
     "Qwen3VLModel",
     "MiniMaxM2ForCausalLM",
+    "Qwen3_5Model",
+    # "Qwen3_5MoeModel",
 ]
 
 if transformers.__version__ >= "4.45.1":
