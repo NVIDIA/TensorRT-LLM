@@ -324,7 +324,7 @@ models:
 - name: microsoft/Phi-4-multimodal-instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'phi4-multimodal-instruct.yaml']
 - name: microsoft/Phi-4-reasoning-vision-15B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml', 'phi4-reasoning-vision-15b.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml', 'phi4-reasoning-vision-15b.yaml']
 # --- MiniMax M2 (2025) ---
 - name: MiniMaxAI/MiniMax-M2
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']

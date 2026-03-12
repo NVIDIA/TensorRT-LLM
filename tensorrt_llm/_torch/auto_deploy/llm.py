@@ -26,6 +26,28 @@ class ADInputProcessor(DefaultInputProcessor):
         # NOTE: HF's tokenizer/processor that has the apply_chat_template method
         self.processor = processor or getattr(tokenizer, "tokenizer", None)
 
+    def _is_phi4_reasoning_vision_processor(self) -> bool:
+        return type(self.processor).__name__ == "Phi4VisionRProcessor"
+
+    def _get_chat_template_target(self) -> Any:
+        if self.processor is None:
+            return None
+
+        tokenizer = getattr(self.processor, "tokenizer", None)
+        if (
+            self._is_phi4_reasoning_vision_processor()
+            and getattr(tokenizer, "chat_template", None) is not None
+        ):
+            return tokenizer
+
+        if getattr(self.processor, "chat_template", None) is not None:
+            return self.processor
+
+        if getattr(tokenizer, "chat_template", None) is not None:
+            return tokenizer
+
+        return self.processor
+
     def __call__(
         self, inputs: Dict[str, Any], sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -41,22 +63,37 @@ class ADInputProcessor(DefaultInputProcessor):
                 "truncation": True,
                 "max_length": sampling_params.truncate_prompt_tokens,
             }
+
+        if (
+            self._is_phi4_reasoning_vision_processor()
+            and "messages" not in inputs
+            and "prompt" in inputs
+        ):
+            inputs = {
+                **inputs,
+                "messages": [{"role": "user", "content": inputs["prompt"]}],
+            }
+
         # check for messages field and if yes, use the apply_chat_template method
         if "messages" in inputs:
             # multi_modal_data should not be present in the messages field
             assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
+            messages = inputs["messages"]
+            chat_template_target = self._get_chat_template_target()
+            if chat_template_target is None:
+                raise ValueError("processor or tokenizer with apply_chat_template is required")
 
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
-            prompt = self.processor.apply_chat_template(
-                inputs["messages"],
+            prompt = chat_template_target.apply_chat_template(
+                messages,
                 add_generation_prompt=True,
                 tokenize=False,
             )
             inputs["prompt"] = prompt
 
-            all_args = self.processor.apply_chat_template(
-                inputs["messages"],
+            all_args = chat_template_target.apply_chat_template(
+                messages,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,

@@ -31,6 +31,7 @@ from transformers.models.siglip2.image_processing_siglip2 import Siglip2ImagePro
 
 import tensorrt_llm._torch.auto_deploy.custom_ops  # noqa: F401
 from tensorrt_llm._torch.auto_deploy.export import torch_export_to_gm
+from tensorrt_llm._torch.auto_deploy.llm import ADInputProcessor
 from tensorrt_llm._torch.auto_deploy.models.custom.modeling_phi4_visionr import (
     IMAGE_TOKEN_INDEX,
     Phi4VisionAttention,
@@ -41,7 +42,12 @@ from tensorrt_llm._torch.auto_deploy.models.custom.modeling_phi4_visionr import 
     Phi4VisionRotaryEmbedding,
     build_vision_projector,
 )
+from tensorrt_llm._torch.auto_deploy.models.hf import (
+    AutoModelForCausalLMFactory,
+    AutoModelForImageTextToTextFactory,
+)
 from tensorrt_llm._torch.auto_deploy.utils._graph import move_to_device
+from tensorrt_llm.sampling_params import SamplingParams
 
 _BATCH_AND_SEQUENCE_TEST_CASES = ((2, 6), (1, 8))
 _HF_MODEL_DIR = "models--microsoft--Phi-4-reasoning-vision-15B"
@@ -211,6 +217,80 @@ def test_phi4_visionr_accepts_flat_remote_like_config():
     assert model.model.config.model_type == "phi3"
     assert model.model.full_config.model_type == "phi4-siglip"
     assert model.model.full_config.text_config.hidden_size == 64
+
+
+def test_phi4_visionr_is_registered_for_both_hf_factories():
+    assert (
+        AutoModelForCausalLMFactory._custom_model_mapping["Phi4VisionR"]
+        is Phi4VisionRForConditionalGeneration
+    )
+    assert (
+        AutoModelForImageTextToTextFactory._custom_model_mapping["Phi4VisionR"]
+        is Phi4VisionRForConditionalGeneration
+    )
+
+
+def test_ad_input_processor_falls_back_to_tokenizer_chat_template():
+    class FakeTokenizer:
+        def __init__(self):
+            self.chat_template = "{{ messages }}"
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append(kwargs)
+            if kwargs["tokenize"]:
+                return {"input_ids": torch.tensor([[11, 12, 13]], dtype=torch.long)}
+            return "formatted prompt"
+
+    class FakeProcessor:
+        def __init__(self, tokenizer):
+            self.tokenizer = tokenizer
+
+    tokenizer = FakeTokenizer()
+    processor = FakeProcessor(tokenizer)
+    input_processor = ADInputProcessor(tokenizer=None, processor=processor)
+
+    prompt_token_ids, extra_processed_inputs = input_processor(
+        inputs={"messages": [{"role": "user", "content": "hello"}]},
+        sampling_params=SamplingParams(),
+    )
+
+    assert prompt_token_ids == [11, 12, 13]
+    assert extra_processed_inputs is None
+    assert len(tokenizer.calls) == 2
+
+
+def test_ad_input_processor_phi4_prompt_uses_default_chat_template():
+    class FakeTokenizer:
+        def __init__(self):
+            self.chat_template = "{{ messages }}"
+            self.calls = []
+
+        def apply_chat_template(self, messages, **kwargs):
+            self.calls.append((messages, kwargs))
+            if kwargs["tokenize"]:
+                return {"input_ids": torch.tensor([[21, 22]], dtype=torch.long)}
+            return "formatted phi4 prompt"
+
+    class Phi4VisionRProcessor:
+        def __init__(self):
+            self.tokenizer = FakeTokenizer()
+            self.calls = []
+
+    processor = Phi4VisionRProcessor()
+    input_processor = ADInputProcessor(tokenizer=None, processor=processor)
+
+    prompt_token_ids, extra_processed_inputs = input_processor(
+        inputs={"prompt": "Where is the capital of Iceland?"},
+        sampling_params=SamplingParams(),
+    )
+
+    assert prompt_token_ids == [21, 22]
+    assert extra_processed_inputs is None
+    assert processor.tokenizer.calls[0][0] == [
+        {"role": "user", "content": "Where is the capital of Iceland?"}
+    ]
+    assert not processor.calls
 
 
 def test_phi4_visionr_state_dict_hierarchy_matches_checkpoint_layout():
