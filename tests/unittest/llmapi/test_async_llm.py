@@ -8,8 +8,8 @@ from utils.util import get_current_process_gpu_memory
 
 from tensorrt_llm import AsyncLLM
 from tensorrt_llm._torch.utils import get_device_uuid
-from tensorrt_llm._torch.virtual_memory import ExecutorMemoryType
 from tensorrt_llm.llmapi import KvCacheConfig, SamplingParams
+from tensorrt_llm.llmapi.llm_args import ExecutorMemoryType, SleepConfig
 
 
 @pytest.mark.ray
@@ -23,7 +23,7 @@ async def test_async_llm_awaitable():
 
     llm = await AsyncLLM(
         model=llama_model_path,
-        enable_sleep=True,
+        sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
     )
@@ -49,7 +49,7 @@ async def test_async_llm_release_resume(process_gpu_memory_info_available, num_c
 
     async with AsyncLLM(
         model=llama_model_path,
-        enable_sleep=True,
+        sleep_config=SleepConfig(),
         cuda_graph_config=None,
         kv_cache_config=kv_cache_config,
         tensor_parallel_size=2,

@@ -429,8 +429,6 @@ class TestNemotronSuperV3(LlmapiAccuracyTestHarness):
     @pytest.mark.parametrize("model_id", ["bf16", "fp8", "nvfp4"])
     def test_accuracy(self, model_id, world_size, enable_attention_dp,
                       attn_backend):
-        if model_id == "nvfp4":
-            pytest.skip("NVFP4 not yet supported for Super V3")
         if get_device_count() < world_size:
             pytest.skip(f"Not enough devices for world_size={world_size}")
         # bf16 120B model requires at least 4 GPUs
@@ -590,8 +588,9 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
                     "num_moe_experts_for_export": 2,
                 },
                 "detect_sharding": {
+                    "sharding_dims": ['tp', 'ep', 'bmm'],
+                    # NOTE: sharding_source applies only to TP sharding
                     "sharding_source": ['factory', 'heuristic'],
-                    "sharding_dims": ['ep', 'bmm'],
                 },
             },
         }

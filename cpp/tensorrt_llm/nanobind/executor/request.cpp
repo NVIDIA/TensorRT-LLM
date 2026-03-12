@@ -415,7 +415,8 @@ void initRequestBindings(nb::module_& m)
         kvCacheRetentionConfig, "TokenRangeRetentionConfig")
         .def(nb::init<SizeType32, std::optional<SizeType32>, tle::RetentionPriority,
                  std::optional<std::chrono::milliseconds>>(),
-            nb::arg("token_start"), nb::arg("token_end"), nb::arg("priority"), nb::arg("duration_ms") = nb::none())
+            nb::arg("token_start"), nb::arg("token_end") = nb::none(), nb::arg("priority"),
+            nb::arg("duration_ms") = nb::none())
         .def_rw("token_start", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenStart)
         .def_rw("token_end", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::tokenEnd)
         .def_rw("priority", &tle::KvCacheRetentionConfig::TokenRangeRetentionConfig::priority)
@@ -433,7 +434,7 @@ void initRequestBindings(nb::module_& m)
             nb::arg("token_range_retention_configs"),
             nb::arg("decode_retention_priority") = tle::KvCacheRetentionConfig::kDefaultRetentionPriority,
             nb::arg("decode_duration_ms") = nb::none(), nb::arg("transfer_mode") = tle::KvCacheTransferMode::DRAM,
-            nb::arg("directory") = nb::none())
+            nb::arg("directory") = "")
         .def_prop_ro("token_range_retention_configs", &tle::KvCacheRetentionConfig::getTokenRangeRetentionConfigs)
         .def_prop_ro("decode_retention_priority", &tle::KvCacheRetentionConfig::getDecodeRetentionPriority)
         .def_prop_ro("decode_duration_ms", &tle::KvCacheRetentionConfig::getDecodeDurationMs)
