@@ -65,6 +65,12 @@ std::vector<LoraModule> LoraModule::createLoraModules(std::vector<std::string> c
         case ModuleType::kMOE_ROUTER: modules.emplace_back(t, hidden, numExperts, false, true, -1, -1); break;
         case ModuleType::kMLP_ROUTER: modules.emplace_back(t, hidden, 1, false, true, -1, -1); break;
         case ModuleType::kMLP_GATE_UP: modules.emplace_back(t, hidden, 2 * mlpHidden, false, true, -1, 0); break;
+        // Mamba modules: in_proj expands, out_proj contracts (similar to MLP pattern)
+        case ModuleType::kMAMBA_IN_PROJ: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
+        case ModuleType::kMAMBA_OUT_PROJ: modules.emplace_back(t, mlpHidden, hidden, false, true, 1, -1); break;
+        // MoE latent projections: up expands to moe_hidden, down contracts back
+        case ModuleType::kMOE_LATENT_UP: modules.emplace_back(t, hidden, mlpHidden, false, true, -1, 0); break;
+        case ModuleType::kMOE_LATENT_DOWN: modules.emplace_back(t, mlpHidden, hidden, false, true, 1, -1); break;
         case ModuleType::kINVALID: throw std::runtime_error("Invalid LoRA module " + moduleName);
         }
     }

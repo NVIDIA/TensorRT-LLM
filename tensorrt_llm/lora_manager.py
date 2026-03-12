@@ -658,6 +658,10 @@ class LoraManager(object):
         "moe_router": 16,
         "mlp_router": 17,
         "mlp_gate_up": 18,
+        "mamba_in_proj": 19,
+        "mamba_out_proj": 20,
+        "moe_latent_up": 21,
+        "moe_latent_down": 22,
     }
 
     def __init__(

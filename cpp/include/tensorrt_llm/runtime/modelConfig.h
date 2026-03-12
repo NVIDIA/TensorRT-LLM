@@ -228,6 +228,26 @@ public:
         return countLocalLayers(LayerType::kRECURRENT, pipelineParallelism, pipelineParallelismRank);
     }
 
+    // Get number of layers that can have LoRA applied.
+    // For hybrid models (e.g., Nemotron-H with Mamba + Attention), this may differ from num_attention_layers
+    // because LoRA can be applied to non-attention layers (e.g., Mamba in_proj/out_proj).
+    [[nodiscard]] SizeType32 getNbLoraLayers(
+        SizeType32 pipelineParallelism = 1, SizeType32 pipelineParallelismRank = 0) const
+    {
+        TLLM_CHECK_WITH_INFO(pipelineParallelism > 0, "Invalid pipelineParallelism: %d", pipelineParallelism);
+        // If mNbLoraLayers is set (non-zero), use it; otherwise fall back to num_attention_layers
+        if (mNbLoraLayers > 0)
+        {
+            return mNbLoraLayers / pipelineParallelism;
+        }
+        return getNbAttentionLayers(pipelineParallelism, pipelineParallelismRank);
+    }
+
+    void setNbLoraLayers(SizeType32 nbLoraLayers)
+    {
+        mNbLoraLayers = nbLoraLayers;
+    }
+
     [[nodiscard]] SizeType32 constexpr getNbHeads() const noexcept
     {
         return mNbHeads;
@@ -922,6 +942,8 @@ private:
     std::vector<LoraModule> mLoraModules;
     SizeType32 mMlpHiddenSize;
     SizeType32 mMaxLoraRank;
+    // Number of layers that can have LoRA applied (for hybrid models this may be > num_attention_layers)
+    SizeType32 mNbLoraLayers{0};
 
     std::optional<RnnConfig> mRnnConfig;
 

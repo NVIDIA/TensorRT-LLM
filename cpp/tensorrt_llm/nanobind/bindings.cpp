@@ -217,7 +217,11 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .value("MOE_GATE", tr::LoraModule::ModuleType::kMOE_GATE)
         .value("MOE_ROUTER", tr::LoraModule::ModuleType::kMOE_ROUTER)
         .value("MLP_ROUTER", tr::LoraModule::ModuleType::kMLP_ROUTER)
-        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP);
+        .value("MLP_GATE_UP", tr::LoraModule::ModuleType::kMLP_GATE_UP)
+        .value("MAMBA_IN_PROJ", tr::LoraModule::ModuleType::kMAMBA_IN_PROJ)
+        .value("MAMBA_OUT_PROJ", tr::LoraModule::ModuleType::kMAMBA_OUT_PROJ)
+        .value("MOE_LATENT_UP", tr::LoraModule::ModuleType::kMOE_LATENT_UP)
+        .value("MOE_LATENT_DOWN", tr::LoraModule::ModuleType::kMOE_LATENT_DOWN);
 
     nb::class_<tr::LoraModule>(m, "LoraModule")
         .def(nb::init<tr::LoraModule::ModuleType, SizeType32, SizeType32, bool, bool, SizeType32, SizeType32>(),
@@ -339,6 +343,9 @@ NB_MODULE(TRTLLM_NB_MODULE, m)
         .def_prop_rw("lora_modules", &tr::ModelConfig::getLoraModules, &tr::ModelConfig::setLoraModules)
         .def_prop_rw("max_lora_rank", &tr::ModelConfig::getMaxLoraRank, &tr::ModelConfig::setMaxLoraRank)
         .def_prop_rw("mlp_hidden_size", &tr::ModelConfig::getMlpHiddenSize, &tr::ModelConfig::setMlpHiddenSize)
+        .def("num_lora_layers", &tr::ModelConfig::getNbLoraLayers, nb::arg("pipeline_parallelism") = 1,
+            nb::arg("pipeline_parallelism_rank") = 0)
+        .def("set_num_lora_layers", &tr::ModelConfig::setNbLoraLayers, nb::arg("num_lora_layers"))
         .def_prop_rw("size_per_head", &tr::ModelConfig::getSizePerHead, &tr::ModelConfig::setSizePerHead);
 
     nb::class_<tr::WorldConfig>(m, "WorldConfig")

@@ -72,7 +72,7 @@ void LoraManager::fillInputTensors(TensorPtr weightsPtrs, TensorPtr adapterSizes
 
     auto const ppSize = worldConfig.getPipelineParallelism();
     auto const ppRank = worldConfig.getPipelineParallelRank();
-    auto const localNumLayers = modelConfig.getNbAttentionLayers(ppSize, ppRank);
+    auto const localNumLayers = modelConfig.getNbLoraLayers(ppSize, ppRank);
     auto const firstLayerId = ppRank * localNumLayers;
 
     auto weightsPointersPtr = bufferCast<int64_t>(*weightsPtrs);
@@ -124,7 +124,7 @@ void LoraManager::insertInputTensors(TensorMap& inputTensors, TensorPtr weightsP
 {
     TLLM_LOG_TRACE("%s start", __PRETTY_FUNCTION__);
     auto localNbLayers
-        = modelConfig.getNbAttentionLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
+        = modelConfig.getNbLoraLayers(worldConfig.getPipelineParallelism(), worldConfig.getPipelineParallelRank());
     auto firstLayerId = worldConfig.getPipelineParallelRank() * localNbLayers;
 
     for (auto const& [modId, mod] : mModuleIdToModule)

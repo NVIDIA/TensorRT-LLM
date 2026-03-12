@@ -852,8 +852,11 @@ class DeepseekV3Gate(nn.Module):
         fuse_routing_kernel: bool = True,
         apply_routing: bool = False,
         moe_backend: str = 'CUTLASS',
+        lora_config: Optional["LoraConfig"] = None,
     ):
         super().__init__()
+        self.hidden_size = hidden_size
+        self.num_experts = num_experts
         self.weight = nn.Parameter(torch.empty((num_experts, hidden_size),
                                                dtype=dtype),
                                    requires_grad=False)
@@ -877,11 +880,27 @@ class DeepseekV3Gate(nn.Module):
             routed_scaling_factor=routed_scaling_factor,
             is_fused=fuse_routing_kernel)
 
-    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        # LoRA for gate (router) - only create when LoRA is configured
+        from ..peft.lora.layer import LoraModuleType
+        self.gate_lora = (LoraLayer([LoraModuleType.MOE_ROUTER], [num_experts])
+                          if lora_config is not None else None)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        lora_params: Optional[dict] = None,
+        layer_idx: Optional[int] = None,
+    ) -> torch.Tensor:
         logits = torch.ops.trtllm.dsv3_router_gemm_op(hidden_states,
                                                       self.weight.t(),
                                                       bias=None,
                                                       out_dtype=torch.float32)
+        # Apply LoRA to gate (if LoRA is configured and weights are loaded)
+        if self.gate_lora is not None and bool(
+                lora_params) and layer_idx is not None:
+            lora_output = self.gate_lora(hidden_states, lora_params, layer_idx)
+            if lora_output is not None:
+                logits = logits + lora_output.to(logits.dtype)
         return logits
 
     def load_weights(self, weights: List[Dict]):

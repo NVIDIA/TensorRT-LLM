@@ -26,6 +26,8 @@ class MLP(nn.Module):
         layer_idx: Optional[int] = None,
         reduce_output: bool = True,
         overridden_tp_size: Optional[int] = None,
+        lora_up_module_type: LoraModuleType = LoraModuleType.MLP_H_TO_4H,
+        lora_down_module_type: LoraModuleType = LoraModuleType.MLP_4H_TO_H,
     ):
         super().__init__()
         self.layer_idx = layer_idx
@@ -51,7 +53,7 @@ class MLP(nn.Module):
             mapping = config.mapping
 
         self.up_lora = LoraLayer(
-            [LoraModuleType.MLP_H_TO_4H],
+            [lora_up_module_type],
             [self.intermediate_size // config.mapping.tp_size])
 
         self.up_proj = Linear(
@@ -69,8 +71,7 @@ class MLP(nn.Module):
             allreduce_strategy=config.allreduce_strategy,
             force_dynamic_quantization=config.force_dynamic_quantization)
 
-        self.down_lora = LoraLayer([LoraModuleType.MLP_4H_TO_H],
-                                   [self.hidden_size])
+        self.down_lora = LoraLayer([lora_down_module_type], [self.hidden_size])
         self.down_proj = Linear(
             self.intermediate_size,
             self.hidden_size,

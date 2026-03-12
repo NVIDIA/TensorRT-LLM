@@ -42,6 +42,7 @@ from ..modules.mamba.mamba2_mixer import Mamba2Mixer
 from ..modules.mlp import MLP
 from ..modules.multi_stream_utils import maybe_execute_in_parallel
 from ..modules.rms_norm import RMSNorm
+from ..peft.lora.layer import LoraLayer, LoraModuleType
 from ..speculative import SpecMetadata
 from ..utils import AuxStreamType, EventType, Fp4QuantizedTensor
 from .modeling_deepseekv3 import DeepseekV3MTPHead
@@ -83,9 +84,10 @@ class MLPLayer(MLP):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        return super().forward(hidden_states)
+        return super().forward(hidden_states, lora_params=lora_params)
 
 
 class TransformerLayer(Attention):
@@ -115,11 +117,13 @@ class TransformerLayer(Attention):
         self,
         hidden_states: torch.Tensor,
         attn_metadata: AttentionMetadata,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         return super().forward(position_ids=None,
                                hidden_states=hidden_states,
-                               attn_metadata=attn_metadata)
+                               attn_metadata=attn_metadata,
+                               lora_params=lora_params)
 
 
 # Ref code: https://huggingface.co/nvidia/Nemotron-Nano-3-30B-A3.5B-dev-1024/blob/main/modeling_nemotron_h.py#L818
@@ -182,6 +186,9 @@ class NemotronHMOE(nn.Module):
                 reduce_output=False,
                 overridden_tp_size=1
                 if model_config.mapping.enable_attention_dp else None,
+                # Use MoE LoRA types for shared experts
+                lora_up_module_type=LoraModuleType.MOE_H_TO_4H,
+                lora_down_module_type=LoraModuleType.MOE_4H_TO_H,
             )
         # Setup MoE gate.
         self.gate = DeepseekV3Gate(
@@ -195,6 +202,7 @@ class NemotronHMOE(nn.Module):
             fuse_routing_kernel=True,
             apply_routing=False,
             moe_backend=model_config.moe_backend,
+            lora_config=model_config.lora_config,
         )
 
         # For MIXED_PRECISION models, the global quant_config has quant_algo=MIXED_PRECISION
@@ -239,6 +247,10 @@ class NemotronHMOE(nn.Module):
         # These layers should NOT be TP-sharded to ensure MoE receives
         # full latent representation. They are replicated across all GPUs.
         if self.use_latent_moe:
+            # LoRA for fc1_latent_proj (only create when LoRA is configured)
+            self.fc1_latent_lora = (LoraLayer([LoraModuleType.MOE_LATENT_UP], [
+                self.moe_hidden_size
+            ]) if model_config.lora_config is not None else None)
             self.fc1_latent_proj = Linear(
                 in_features=self.hidden_size,
                 out_features=self.moe_hidden_size,
@@ -247,7 +259,12 @@ class NemotronHMOE(nn.Module):
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                lora=self.fc1_latent_lora,
             )
+            # LoRA for fc2_latent_proj (only create when LoRA is configured)
+            self.fc2_latent_lora = (
+                LoraLayer([LoraModuleType.MOE_LATENT_DOWN], [self.hidden_size])
+                if model_config.lora_config is not None else None)
             self.fc2_latent_proj = Linear(
                 in_features=self.moe_hidden_size,
                 out_features=self.hidden_size,
@@ -256,10 +273,13 @@ class NemotronHMOE(nn.Module):
                 quant_config=model_config.get_quant_config(),
                 skip_create_weights_in_init=model_config.
                 skip_create_weights_in_init,
+                lora=self.fc2_latent_lora,
             )
         else:
             self.fc1_latent_proj = None
             self.fc2_latent_proj = None
+            self.fc1_latent_lora = None
+            self.fc2_latent_lora = None
 
         self.aux_stream_shared = aux_stream_dict[AuxStreamType.MoeShared]
         self.event_dict = {
@@ -272,6 +292,7 @@ class NemotronHMOE(nn.Module):
         hidden_states: torch.Tensor
         | tuple[torch.Tensor | Fp4QuantizedTensor, torch.Tensor],
         attn_metadata: AttentionMetadata,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if isinstance(hidden_states, tuple):
@@ -289,17 +310,25 @@ class NemotronHMOE(nn.Module):
 
         def _compute_shared_output():
             if self.shared_experts is not None:
-                shared_expert_output = self.shared_experts(hidden_states_hp)
+                shared_expert_output = self.shared_experts(
+                    hidden_states_hp, lora_params=lora_params)
             else:
                 shared_expert_output = 0
             return shared_expert_output
 
         def _compute_routed_output():
             # Gate uses high precision input for accurate routing decisions.
-            router_logits = self.gate(hidden_states_hp_2d)
+            router_logits = self.gate(hidden_states_hp_2d,
+                                      lora_params=lora_params,
+                                      layer_idx=self.layer_idx)
 
-            routed_hidden_states = self.fc1_latent_proj(
-                hidden_states_hp) if self.use_latent_moe else hidden_states
+            if self.use_latent_moe:
+                routed_hidden_states = self.fc1_latent_proj(
+                    hidden_states_hp,
+                    lora_params=lora_params,
+                    layer_idx=self.layer_idx)
+            else:
+                routed_hidden_states = hidden_states
 
             final_hidden_states = self.experts(
                 routed_hidden_states,
@@ -309,7 +338,10 @@ class NemotronHMOE(nn.Module):
             )
 
             if self.use_latent_moe:
-                final_hidden_states = self.fc2_latent_proj(final_hidden_states)
+                final_hidden_states = self.fc2_latent_proj(
+                    final_hidden_states,
+                    lora_params=lora_params,
+                    layer_idx=self.layer_idx)
 
             return final_hidden_states
 
@@ -458,6 +490,7 @@ class NemotronHLayer(DecoderLayer):
         attn_metadata: AttentionMetadata,
         residual: torch.Tensor | None = None,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         if residual is None:
@@ -472,6 +505,7 @@ class NemotronHLayer(DecoderLayer):
         hidden_states = self.mixer(hidden_states,
                                    attn_metadata,
                                    spec_metadata=spec_metadata,
+                                   lora_params=lora_params,
                                    **kwargs)
 
         if spec_metadata is not None and spec_metadata.is_layer_capture(
@@ -544,6 +578,7 @@ class NemotronHModel(DecoderModel):
         position_ids: torch.IntTensor | None = None,
         inputs_embeds: torch.FloatTensor | None = None,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         if (input_ids is None) ^ (inputs_embeds is not None):
@@ -565,6 +600,7 @@ class NemotronHModel(DecoderModel):
                 residual=residual,
                 attn_metadata=attn_metadata,
                 spec_metadata=spec_metadata,
+                lora_params=lora_params,
                 mamba_metadata=mamba_metadata,
             )
         hidden_states, _ = self.norm_f(hidden_states, residual)
@@ -761,6 +797,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None = None,
         attn_metadata: AttentionMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         if self.has_start_projections:
@@ -790,6 +827,7 @@ class NemotronHMTPDecoderLayer(NemotronHLayer):
         hidden_states = self.mixer(
             hidden_states=hidden_states,
             attn_metadata=attn_metadata,
+            lora_params=lora_params,
             **kwargs,
         )
 
@@ -885,6 +923,7 @@ class NemotronHMTP(nn.Module):
         attn_metadata: AttentionMetadata,
         all_rank_num_tokens: list[int] | None = None,
         spec_metadata: SpecMetadata | None = None,
+        lora_params: dict | None = None,
         **kwargs,
     ) -> torch.Tensor:
         inputs_embeds = embed_tokens(input_ids)
@@ -898,6 +937,7 @@ class NemotronHMTP(nn.Module):
                 residual=residual,
                 attn_metadata=attn_metadata,
                 all_rank_num_tokens=all_rank_num_tokens,
+                lora_params=lora_params,
             )
         return hidden_states
 

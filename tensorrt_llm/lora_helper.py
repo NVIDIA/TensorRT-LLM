@@ -53,10 +53,14 @@ def get_default_trtllm_modules_to_hf_modules():
         "mlp_4h_to_h": "down_proj",
         "mlp_gate": "up_proj",
         "mlp_gate_up": "gate_up_proj",
-        "moe_h_to_4h": "w1",
-        "moe_4h_to_h": "w2",
+        "moe_h_to_4h": ["w1", "shared_experts.up_proj"],
+        "moe_4h_to_h": ["w2", "shared_experts.down_proj"],
         "moe_gate": "w3",
         "moe_router": "gate",
+        "mamba_in_proj": "in_proj",
+        "mamba_out_proj": "out_proj",
+        "moe_latent_up": "fc1_latent_proj",
+        "moe_latent_down": "fc2_latent_proj",
     }
 
 

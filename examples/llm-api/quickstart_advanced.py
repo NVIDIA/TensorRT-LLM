@@ -3,11 +3,13 @@ import json
 import time
 
 from tensorrt_llm import LLM, SamplingParams
+from tensorrt_llm.executor.request import LoRARequest
 from tensorrt_llm.llmapi import (AttentionDpConfig, AutoDecodingConfig,
                                  CudaGraphConfig, DraftTargetDecodingConfig,
                                  Eagle3DecodingConfig, KvCacheConfig, MoeConfig,
                                  MTPDecodingConfig, NGramDecodingConfig,
                                  TorchCompileConfig)
+from tensorrt_llm.lora_helper import LoraConfig
 
 example_prompts = [
     "Hello, my name is",
@@ -198,6 +200,12 @@ def add_llm_args(parser):
     parser.add_argument('--relaxed_topk', type=int, default=1)
     parser.add_argument('--relaxed_delta', type=float, default=0.)
 
+    # LoRA
+    parser.add_argument('--lora_dir',
+                        type=str,
+                        default=None,
+                        help='Path to LoRA adapter directory.')
+
     # HF
     parser.add_argument('--trust_remote_code',
                         default=False,
@@ -292,6 +300,18 @@ def setup_llm(args, **kwargs):
         batching_wait_iters=args.attention_dp_batching_wait_iters,
     )
 
+    lora_config = LoraConfig(
+        lora_dir=[args.lora_dir]) if args.lora_dir else None
+
+    # Create LoRARequest to use during generation
+    lora_request = None
+    if args.lora_dir:
+        lora_request = LoRARequest(
+            lora_name="lora_adapter",
+            lora_int_id=0,  # First adapter ID
+            lora_path=args.lora_dir,
+        )
+
     llm = LLM(
         model=args.model_dir,
         backend='pytorch',
@@ -327,6 +347,7 @@ def setup_llm(args, **kwargs):
         gather_generation_logits=args.return_generation_logits,
         max_beam_width=args.max_beam_width,
         orchestrator_type=args.orchestrator_type,
+        lora_config=lora_config,
         **kwargs)
 
     use_beam_search = args.max_beam_width > 1
@@ -352,14 +373,14 @@ def setup_llm(args, **kwargs):
         use_beam_search=use_beam_search,
         additional_model_outputs=args.additional_model_outputs,
     )
-    return llm, sampling_params
+    return llm, sampling_params, lora_request
 
 
 def main():
     args = parse_arguments()
     prompts = args.prompt if args.prompt else example_prompts
 
-    llm, sampling_params = setup_llm(args)
+    llm, sampling_params, lora_request = setup_llm(args)
     new_prompts = []
     if args.apply_chat_template:
         for prompt in prompts:
@@ -369,7 +390,7 @@ def main():
                                                   tokenize=False,
                                                   add_generation_prompt=True))
         prompts = new_prompts
-    outputs = llm.generate(prompts, sampling_params)
+    outputs = llm.generate(prompts, sampling_params, lora_request=lora_request)
 
     for i, output in enumerate(outputs):
         prompt = output.prompt
