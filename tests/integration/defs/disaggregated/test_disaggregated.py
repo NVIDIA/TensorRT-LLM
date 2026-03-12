@@ -53,6 +53,16 @@ class TestConfig:
         return self.test_desc
 
 
+def get_ucx_tls():
+    """Get UCX_TLS value based on GPU architecture.
+
+    Pre-Hopper GPUs need cuda_ipc excluded from UCX transports.
+    """
+    if get_sm_version() < 90:
+        return "^cuda_ipc,ib,gdr_copy"
+    return "^ib,gdr_copy"
+
+
 def cleanup_output_files():
     """Clean up output files from previous runs."""
     for file in ['output.json', 'output_streaming.json']:
@@ -782,9 +792,11 @@ def test_disaggregated_overlap_transceiver_runtime_python(
     setup_model_symlink(llm_venv, llama_model_root,
                         "TinyLlama/TinyLlama-1.1B-Chat-v1.0")
 
+    env = llm_venv._new_env.copy()
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "overlap_transceiver_runtime_python",
-                           env=llm_venv._new_env,
+                           env=env,
                            cwd=llm_venv.get_working_directory())
 
 
@@ -1110,7 +1122,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_ucx",
                            env=env,
@@ -1131,7 +1143,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_nixl(disaggregated_test_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_NIXL_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     env["UCX_MM_ERROR_HANDLING"] = "y"
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_nixl",
@@ -1150,7 +1162,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_transceiver_runtime_python(
     setup_model_symlink(llm_venv, deepseek_v3_model_root,
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_transceiver_runtime_python",
                            env=env,
@@ -1169,7 +1181,7 @@ def test_disaggregated_deepseek_v3_lite_fp8_ucx_tp1_single_gpu(
                         "DeepSeek-V3-Lite/fp8")
     env = llm_venv._new_env.copy()
     env["TRTLLM_USE_UCX_KVCACHE"] = "1"
-    env["UCX_TLS"] = "^ib,gdr_copy"
+    env["UCX_TLS"] = get_ucx_tls()
 
     run_disaggregated_test(disaggregated_example_root,
                            "deepseek_v3_lite_fp8_tp1",
@@ -1413,7 +1425,7 @@ def run_disaggregated_benchmark(example_dir,
                                 cwd=None):
     """Run disaggregated test with given configuration."""
     run_env = env.copy() if env else os.environ.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -1551,7 +1563,7 @@ def run_disaggregated_aiperf(config_file,
 
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
     run_env["UCX_MM_ERROR_HANDLING"] = "y"
 
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
@@ -2025,7 +2037,7 @@ def run_disaggregated_cancel_test(example_dir,
     """Run disaggregated test with request cancellation stress test."""
     cleanup_output_files()
     run_env = env.copy()
-    run_env["UCX_TLS"] = "^ib,gdr_copy"
+    run_env["UCX_TLS"] = get_ucx_tls()
 
     config_file = get_test_config(test_desc, example_dir,
                                   os.path.dirname(__file__))
