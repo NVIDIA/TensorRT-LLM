@@ -26,32 +26,6 @@ class ADInputProcessor(DefaultInputProcessor):
         # NOTE: HF's tokenizer/processor that has the apply_chat_template method
         self.processor = processor or getattr(tokenizer, "tokenizer", None)
 
-    def _get_chat_template_target(self) -> Any:
-        if self.processor is None:
-            return None
-
-        tokenizer = getattr(self.processor, "tokenizer", None)
-        if getattr(tokenizer, "chat_template", None) is not None:
-            return tokenizer
-
-        if getattr(self.processor, "chat_template", None) is not None:
-            return self.processor
-
-        if getattr(tokenizer, "chat_template", None) is not None:
-            return tokenizer
-
-        return self.processor
-
-    def _should_apply_chat_template_to_prompt(self, inputs: Dict[str, Any]) -> bool:
-        if "messages" in inputs or "prompt" not in inputs or "multi_modal_data" in inputs:
-            return False
-
-        # When a multimodal processor wraps a tokenizer with a chat template, route prompt-only
-        # requests through that template instead of falling back to raw tokenizer.encode().
-        return getattr(self.processor, "tokenizer", None) is not None and (
-            self._get_chat_template_target() is not None
-        )
-
     def __call__(
         self, inputs: Dict[str, Any], sampling_params: SamplingParams
     ) -> Tuple[List[int], Optional[ExtraProcessedInputs]]:
@@ -68,32 +42,22 @@ class ADInputProcessor(DefaultInputProcessor):
                 "max_length": sampling_params.truncate_prompt_tokens,
             }
 
-        if self._should_apply_chat_template_to_prompt(inputs):
-            inputs = {
-                **inputs,
-                "messages": [{"role": "user", "content": inputs["prompt"]}],
-            }
-
         # check for messages field and if yes, use the apply_chat_template method
         if "messages" in inputs:
             # multi_modal_data should not be present in the messages field
             assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
-            messages = inputs["messages"]
-            chat_template_target = self._get_chat_template_target()
-            if chat_template_target is None:
-                raise ValueError("processor or tokenizer with apply_chat_template is required")
 
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
-            prompt = chat_template_target.apply_chat_template(
-                messages,
+            prompt = self.processor.apply_chat_template(
+                inputs["messages"],
                 add_generation_prompt=True,
                 tokenize=False,
             )
             inputs["prompt"] = prompt
 
-            all_args = chat_template_target.apply_chat_template(
-                messages,
+            all_args = self.processor.apply_chat_template(
+                inputs["messages"],
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
