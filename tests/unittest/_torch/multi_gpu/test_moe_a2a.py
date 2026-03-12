@@ -668,7 +668,7 @@ class TestMoEAlltoAll:
         if use_fp8_combine:
             verify_combine(all_results, ep_size, rtol=0.13, atol=1.0)
         else:
-            verify_combine(all_results, ep_size)
+            verify_combine(all_results, ep_size, rtol=0.1, atol=0.5)
 
 
 def run_moe_a2a_dispatch_moe_combine_single_rank(
@@ -785,7 +785,7 @@ def run_moe_a2a_dispatch_moe_combine_single_rank(
         raise
 
 
-def verify_combine(all_results, ep_size, rtol=1e-1, atol=5e-1):
+def verify_combine(all_results, ep_size, rtol, atol):
     """Verify that combine correctly sums the dispatched tokens."""
 
     # Extract results
