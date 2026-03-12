@@ -1623,17 +1623,20 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         # - RestM: tile index in M dimension (cur_tile_coord[0])
                         # Each epilogue thread (epi_tidx) handles exactly ONE M coordinate
                         # Thread layout: 128 threads map to 128 M coordinates in the epilogue tile
-                        # Guard with M boundary check to prevent OOB global memory access
-                        # when M < epi_tile_m (e.g., M=64 with epi_tile_m=128).
-                        m_start = mma_tile_coord_mnl[0] * self.epi_tile[0]
-                        if epi_tidx < (m_total - m_start):
-                            current_alpha_scale_post = tTR_gAlphaPost[
-                                epi_tidx, cur_tile_coord[0], expert_idx, batch_idx
-                            ]
-                            for i in cutlass.range_constexpr(cute.size(tCompute)):
-                                tCompute[i] = tCompute[i] * cutlass.Float32(
-                                    current_alpha_scale_post
-                                )
+                        # Guard with M boundary check to prevent OOB global memory access.
+                        # Use cur_tile_coord[0] (not mma_tile_coord_mnl[0]) so that in 2CTA
+                        # mode each CTA correctly computes its own M offset within the cluster.
+                        # Nest the checks to avoid unsigned subtraction underflow.
+                        m_start = cur_tile_coord[0] * self.epi_tile[0]
+                        if m_start < m_total:
+                            if epi_tidx < (m_total - m_start):
+                                current_alpha_scale_post = tTR_gAlphaPost[
+                                    epi_tidx, cur_tile_coord[0], expert_idx, batch_idx
+                                ]
+                                for i in cutlass.range_constexpr(cute.size(tCompute)):
+                                    tCompute[i] = tCompute[i] * cutlass.Float32(
+                                        current_alpha_scale_post
+                                    )
 
                     if cutlass.const_expr(self.generate_sfc):
                         #
@@ -1643,6 +1646,11 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         # 3. Store SFC to global memory
                         # 4. Quantize output by scaling with reciprocal of SFC
                         #
+                        # Guard: skip SFC store for CTA tiles beyond the M boundary.
+                        # In 2CTA mode, CTA 1 may have cur_tile_coord[0] beyond
+                        # the actual M tile count; direct memory SFC store would
+                        # write OOB and corrupt adjacent GPU memory.
+                        m_tile_in_bounds = cur_tile_coord[0] * self.epi_tile[0] < m_total
                         # Assume subtile partitioned always happens on n dimension
                         sfc_subtile_idx_mn = (
                             cur_tile_coord[0] * self.epi_tile_cnt[0],
@@ -1709,9 +1717,10 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
                         tCrSFC.store(tCrSFC_pvscale.load().to(self.sf_dtype))
 
                         #
-                        # Store SFC to global memory
+                        # Store SFC to global memory (guarded for M boundary)
                         #
-                        cute.autovec_copy(tCrSFC, tCgSFC)
+                        if m_tile_in_bounds:
+                            cute.autovec_copy(tCrSFC, tCgSFC)
 
                         #
                         # Compute quantized output values and convert to C type
@@ -2474,9 +2483,14 @@ class Sm100BlockScaledPersistentDenseGemmKernel:
         if n != expert_count * weight_per_expert:
             can_implement = False
 
-        # weight_per_expert should divide cta_tile_shape_n
-        cta_tile_shape_n = 128
+        # weight_per_expert must be divisible by the CTA N tile size.
+        # CTA N tile = mma_tiler_mn[1] (e.g. 128 for (128,128), 256 for (256,256))
+        cta_tile_shape_n = mma_tiler_mn[1]
         if weight_per_expert % cta_tile_shape_n != 0:
+            can_implement = False
+
+        # cluster_m > 1 requires 2CTA mode (mma_m=256)
+        if cluster_shape_mn[0] > 1 and mma_tiler_mn[0] != 256:
             can_implement = False
 
         return can_implement
