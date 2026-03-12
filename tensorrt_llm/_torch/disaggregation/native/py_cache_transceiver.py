@@ -65,7 +65,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.context_info_endpoint = None
         self.dp_rank = self.mapping.tp_rank if self.mapping.enable_attention_dp else 0
         if self.dist.rank == 0:
-            self.context_info_endpoint = self.transfer_worker._rank_info_server.endpoint
+            self.context_info_endpoint = self.transfer_worker.rank_info_server_endpoint
             self.dist.broadcast(self.context_info_endpoint, 0)
         else:
             self.context_info_endpoint = self.dist.broadcast(self.context_info_endpoint, 0)
@@ -80,7 +80,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.gen_sync_allgather_fun = (
             self.dist.pp_allgather if mapping.enable_attention_dp else self.dist.allgather
         )
-        ctx_server_endpoint = self.transfer_worker._sender.endpoint
+        ctx_server_endpoint = self.transfer_worker.sender_endpoint
         layer_num = len(self.kv_cache_manager.pp_layers)
 
         ctx_server_endpoints = self.dist.allgather(ctx_server_endpoint)
@@ -98,7 +98,7 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         self.recv_task_ids = {}  # request_id to recv_task_id
         self.send_req_id_to_request = {}  # request_id to request (for send)
         self.recv_req_id_to_request = {}  # request_id to request (for recv)
-        self.page_table = self.transfer_worker._rank_info.page_table
+        self.page_table = self.transfer_worker.page_table
         # Check if using V2 manager (has kv_cache_map attribute)
         self.is_v2_manager = hasattr(self.kv_cache_manager, "kv_cache_map")
 
@@ -190,9 +190,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.send_sessions.items():
-            if session.state.status == SessionStatus.TRANSFERRED:
+            if session.status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED):
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == SessionStatus.ERROR:
+            elif session.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
         if self.ctx_need_tp_sync:
@@ -222,7 +222,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         timeout_request_ids = []
         failed_request_ids = []
         for request_id in to_complete_request_ids:
-            future = self.send_sessions[request_id]._kv_tasks[self.send_task_ids[request_id]].future
+            future = self.send_sessions[request_id].get_kv_task_future(
+                self.send_task_ids[request_id]
+            )
             try:
                 sync_status = future.result(timeout=self.sender_future_timeout_ms / 1000.0)
                 if sync_status == "SUCCESS":
@@ -260,9 +262,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_completed_request_ids = []
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
-            if session.state.status == SessionStatus.TRANSFERRED:
+            if session.status in (SessionStatus.KV_TRANSFERRED, SessionStatus.FULLY_TRANSFERRED):
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == SessionStatus.ERROR:
+            elif session.status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
         if self.gen_need_sync:
@@ -293,7 +295,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         completed_request_ids = []
         failed_request_ids = []
         for request_id in to_complete_request_ids:
-            future = self.recv_sessions[request_id]._kv_tasks[self.recv_task_ids[request_id]].future
+            future = self.recv_sessions[request_id].get_kv_task_future(
+                self.recv_task_ids[request_id]
+            )
             try:
                 sync_status = future.result()
                 if sync_status == "SUCCESS":
@@ -303,7 +307,6 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
             except Exception:
                 failed_request_ids.append(request_id)
         for request_id in completed_request_ids + failed_request_ids:
-            future = self.recv_sessions[request_id]._kv_tasks[self.recv_task_ids[request_id]].future
             if request_id in completed_request_ids:
                 self.recv_req_id_to_request[
                     request_id

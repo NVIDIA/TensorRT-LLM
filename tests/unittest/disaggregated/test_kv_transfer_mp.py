@@ -336,7 +336,7 @@ def worker_fn(
 
             # Wait for send to complete
             send_slice_task.future.result()
-            assert sender_session.state.status == SessionStatus.TRANSFERRED
+            assert sender_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]
@@ -375,7 +375,7 @@ def worker_fn(
 
             # Wait for receive to complete
             recv_slice_task.future.result()
-            assert receiver_session.state.status == SessionStatus.TRANSFERRED
+            assert receiver_session.status == SessionStatus.KV_TRANSFERRED
 
             # Get block data for verification
             block_data = kv_cache_manager.get_unique_primary_pool()[block_ids]

@@ -631,7 +631,7 @@ def add_and_verify_request(
         ]
 
         for sender_session in sender_sessions:
-            assert sender_session.state.status == SessionStatus.INIT
+            assert sender_session.status == SessionStatus.INIT
 
         receiver_sessions = [
             gen_transfer_worker.create_rx_session(gen_request)
@@ -670,7 +670,7 @@ def add_and_verify_request(
         time.sleep(0.1)
 
         for sender_session in sender_sessions:
-            assert sender_session.state.status != SessionStatus.INIT
+            assert sender_session.status != SessionStatus.INIT
 
         send_kv_slices = [
             KVSlice(is_last_slice=True, block_ids_per_layer_groups=ctx_block_ids_per_group)
@@ -693,14 +693,16 @@ def add_and_verify_request(
         for send_aux_task in send_aux_tasks:
             send_aux_task.future.result()
 
-    sync_session_status = SessionStatus.TRANSFERRED if send_first else SessionStatus.AUX_TRANSFERRED
+    sync_session_status = (
+        SessionStatus.KV_TRANSFERRED if send_first else SessionStatus.FULLY_TRANSFERRED
+    )
     for sender_session in sender_sessions:
-        assert sender_session.state.status == sync_session_status
+        assert sender_session.status == sync_session_status
     if not send_first:
         time.sleep(0.1)
     for receiver_session in receiver_sessions:
-        assert receiver_session.state.status == sync_session_status, (
-            f"receiver_session.state.status={receiver_session.state.status}, "
+        assert receiver_session.status == sync_session_status, (
+            f"receiver_session.status={receiver_session.status}, "
             f"sync_session_status={sync_session_status} send_first={send_first}"
         )
 

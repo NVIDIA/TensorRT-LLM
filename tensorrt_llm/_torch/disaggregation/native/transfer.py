@@ -29,7 +29,6 @@ from tensorrt_llm._torch.disaggregation.base.transfer import (
     KVSlice,
     RxSessionBase,
     SessionArgsBase,
-    SessionState,
     SessionStatus,
     TaskIdType,
     TxSessionBase,
@@ -83,28 +82,28 @@ class RecvReqInfo:
 class ReadMeta:
     unique_rid: int
     slice_id: int
-    target_ranks: List[int] = None
+    target_ranks: Optional[List[int]] = None
 
 
 @dataclass
 class WriteMeta:
     future_for_task: concurrent.futures.Future
-
     expected_transfers: int
     peer_name: str
     peer_rank: int
-    src_kv_ptrs: List[int] = None
-    dst_kv_ptrs: List[int] = None
-    kv_sizes: List[int] = None
-    dst_device_id: int = None
-    src_aux_ptrs: List[int] = None
-    dst_aux_ptrs: List[int] = None
-    aux_sizes: List[int] = None
-    peer_endpoint: Optional[str] = None  # used for send state
-    unique_rid: Optional[int] = None
+    peer_endpoint: str
+    unique_rid: int
+    src_ptrs: List[int]
+    dst_ptrs: List[int]
+    sizes: List[int]
+    dst_device_id: Optional[int] = None
     slice_id: Optional[int] = None
-    is_last_slice: Optional[bool] = False
-    is_only_aux: Optional[bool] = False
+    is_last_slice: bool = False
+
+    @property
+    def is_aux(self) -> bool:
+        """True for aux (token) transfers, False for KV (cache) transfers."""
+        return self.slice_id is None
 
 
 class MessageType:
@@ -121,18 +120,19 @@ class TaskStatus(Enum):
     INIT = "INIT"
     TRANSFERRING = "TRANSFERRING"
     TRANSFERRED = "TRANSFERRED"
-    AUX_TRANSFERRED = "AUX_TRANSFERRED"
-    COMPLETED = "COMPLETED"
-    CANCELED = "CANCELED"
     ERROR = "ERROR"
 
 
+class SyncStatus(Enum):
+    SUCCESS = "SUCCESS"
+    FAILED = "FAILED"
+
+
 class AuxSendTask:
-    def __init__(self, params: DisaggregatedParams, slot: int, peer_registrar: PeerRegistrar):
+    def __init__(self, params: DisaggregatedParams, slot: int):
         self._params = params
         self._unique_rid = params.disagg_request_id
         self._slot = slot
-        self._registrar = peer_registrar
         self._status = TaskStatus.INIT
         self._future = concurrent.futures.Future()
         self._transferred_count = 0
@@ -150,114 +150,13 @@ class AuxSendTask:
     def future(self) -> concurrent.futures.Future:
         return self._future
 
-    def _create_write_meta(self, req_info: RecvReqInfo) -> WriteMeta:
-        peer_rank_info = self._registrar.get_peer_rank_info(
-            req_info.instance_name, req_info.instance_rank
-        )
-        if self._perf_timer is not None:
-            self._perf_timer.record_prepare_args_start(peer_rank_info.instance_rank)
-        expected_transfers = len(
-            self._registrar.get_peer_overlap(peer_rank_info, peer_rank_info.dp_rank).ranks
-        )
-        if not self._should_write(peer_rank_info):
-            if self._perf_timer is not None:
-                self._perf_timer.record_prepare_args_end(peer_rank_info.instance_rank)
-                self._perf_timer.record_transfer_sizes(
-                    req_info.instance_name + str(req_info.instance_rank), 0, 0
-                )
-            return WriteMeta(
-                future_for_task=self._future,
-                src_aux_ptrs=[],
-                dst_aux_ptrs=[],
-                aux_sizes=[],
-                expected_transfers=expected_transfers,
-                is_only_aux=True,
-                peer_name=req_info.instance_name + str(req_info.instance_rank),
-                peer_rank=req_info.instance_rank,
-                peer_endpoint=self._registrar.get_peer_rank_info(
-                    req_info.instance_name, req_info.instance_rank
-                ).self_endpoint,
-                unique_rid=self._unique_rid,
-            )
-        peer_aux_meta = self._registrar.get_peer_rank_info(
-            req_info.instance_name, req_info.instance_rank
-        ).aux_meta
-
-        peer_slot = req_info.aux_slot
-
-        src_aux_meta = self._registrar.self_rank_info.aux_meta
-
-        src_ptrs = [
-            ptr + item_size * self._slot
-            for ptr, item_size in zip(src_aux_meta.ptrs, src_aux_meta.item_sizes)
-        ]
-        dst_ptrs = [
-            ptr + item_size * peer_slot
-            for ptr, item_size in zip(peer_aux_meta.ptrs, peer_aux_meta.item_sizes)
-        ]
-        size = [item_size for item_size in src_aux_meta.item_sizes]
-
-        if self._perf_timer is not None:
-            self._perf_timer.record_prepare_args_end(peer_rank_info.instance_rank)
-            self._perf_timer.record_transfer_sizes(req_info.instance_rank, sum(size), len(src_ptrs))
-        return WriteMeta(
-            future_for_task=self._future,
-            src_aux_ptrs=src_ptrs,
-            dst_aux_ptrs=dst_ptrs,
-            aux_sizes=size,
-            expected_transfers=expected_transfers,
-            is_only_aux=True,
-            peer_name=req_info.instance_name + str(req_info.instance_rank),
-            peer_rank=req_info.instance_rank,
-            peer_endpoint=self._registrar.get_peer_rank_info(
-                req_info.instance_name, req_info.instance_rank
-            ).self_endpoint,
-            unique_rid=self._unique_rid,
-        )
-
-    def _should_write(self, peer_rank_info: RankInfo) -> bool:
-        # to ensure the transfer aux is not duplicated
-        self_ri = self._registrar.self_rank_info
-        self_tp_rank_in_dp_group = self_ri.tp_rank % self_ri.tp_size_per_dp_group
-
-        should_send_in_tp = False
-        if self_ri.tp_size_per_dp_group <= peer_rank_info.tp_size_per_dp_group:
-            should_send_in_tp = True
-
-        else:
-            ratio = self_ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group
-            should_send_in_tp = self_tp_rank_in_dp_group % ratio == 0
-
-        # Compute peer pp_rank's global layer range from layer_num_per_pp
-        self_layer_num_per_pp = self_ri.layer_num_per_pp
-        peer_layer_num_per_pp = peer_rank_info.layer_num_per_pp
-        peer_start_layer = sum(peer_layer_num_per_pp[: peer_rank_info.pp_rank])
-        peer_end_layer = peer_start_layer + peer_layer_num_per_pp[peer_rank_info.pp_rank]
-
-        # Find the first self pp_rank whose global layers overlap with peer's pp_rank.
-        # All tp/pp ranks have the same aux data, so we only select one self pp_rank
-        # to send to the peer; pick the first overlapping one to avoid duplication.
-        first_matching_self_pp_rank = None
-        self_layer_offset = 0
-        for p in range(self_ri.pp_size):
-            self_start = self_layer_offset
-            self_end = self_start + self_layer_num_per_pp[p]
-            if self_start < peer_end_layer and self_end > peer_start_layer:
-                first_matching_self_pp_rank = p
-                break
-            self_layer_offset += self_layer_num_per_pp[p]
-
-        should_send_in_pp = first_matching_self_pp_rank == self_ri.pp_rank
-        return should_send_in_tp and should_send_in_pp
-
-    def print_perf_info(self, peer_rank: int):
-        ri = self._registrar.self_rank_info
+    def print_perf_info(self, peer_rank: int, instance_name: str, instance_rank: int):
         perf_log_manager.log_task_perf(
             "AuxSendTask",
             self._unique_rid,
             peer_rank,
-            ri.instance_name,
-            ri.instance_rank,
+            instance_name,
+            instance_rank,
             self._perf_timer,
         )
 
@@ -268,12 +167,8 @@ class KVSendTask:
         kv_slice: KVSlice,
         params: DisaggregatedParams,
         slice_id: int,
-        peer_registrar: PeerRegistrar,
     ):
-        self._registrar = peer_registrar
         self._future = concurrent.futures.Future()
-        self._first_transfer = False
-        self._extraction_count = 0
         self._expected_transfers = 0
         self._slice = kv_slice
         self._params = params
@@ -307,129 +202,13 @@ class KVSendTask:
     def transferred_count(self, v: int):
         self._transferred_count = v
 
-    @nvtx_range("_create_write_meta")
-    def _create_write_meta(self, req_info: RecvReqInfo) -> WriteMeta:
-        assert self.is_active(), "KVSendTask is not active"
-        peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
-        if self._perf_timer is not None:
-            self._perf_timer.record_prepare_args_start(peer_ri.instance_rank)
-        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
-        expected_transfers = len(targets.ranks)
-        if not self._first_transfer:
-            self._first_transfer = True
-            self._expected_transfers = expected_transfers
-        self._extraction_count = self._extraction_count + 1
-        if not self._should_write(targets, peer_ri):
-            if self._perf_timer is not None:
-                self._perf_timer.record_prepare_args_end(peer_ri.instance_rank)
-                self._perf_timer.record_transfer_sizes(peer_ri.instance_rank, 0, 0)
-            return WriteMeta(
-                future_for_task=self._future,
-                src_kv_ptrs=[],
-                dst_kv_ptrs=[],
-                kv_sizes=[],
-                expected_transfers=expected_transfers,
-                peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
-                peer_rank=peer_ri.instance_rank,
-                peer_endpoint=peer_ri.self_endpoint,
-                unique_rid=self._unique_rid,
-                slice_id=self._slice_id,
-                is_last_slice=self._slice.is_last_slice,
-            )
-
-        dst_device_id = peer_ri.device_id
-        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
-        src_block_ids_per_groups = self._slice.block_ids_per_layer_groups
-
-        extractor = self._registrar.self_extractor
-        peer_extractor = self._registrar.peer_extractor(
-            peer_ri.instance_name, peer_ri.instance_rank
-        )
-
-        # Get pool mapping: (self_lg, self_pi) -> (peer_lg, peer_pi)
-        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
-
-        # Aggregate fragments from all matching pools
-        src_frags: List[int] = []
-        dst_frags: List[int] = []
-        kv_sizes: List[int] = []
-
-        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
-            src_block_ids = src_block_ids_per_groups[self_lg]
-            dst_block_ids = dst_block_ids_per_groups[peer_lg]
-
-            if len(src_block_ids) + 1 == len(dst_block_ids):
-                # FIXME: this is a temporary solution, need to be fixed for the draft tokens
-                logger.warning(
-                    "src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
-                    " remove the last block from dst_block_ids "
-                )
-                dst_block_ids = dst_block_ids[:-1]
-            src_block_ids, dst_block_ids = self._filter_kv_blocks(src_block_ids, dst_block_ids)
-
-            src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
-            dst_region = peer_extractor.extract(
-                dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
-            )
-            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
-            region_pair = mapper.map(src_region, dst_region)
-            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
-            for rp in region_pairs:
-                src_frags.extend(rp.src.memory.ptrs)
-                dst_frags.extend(rp.dst.memory.ptrs)
-                frag_size = rp.src.memory.bytes_per_region
-                kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
-
-        if self._perf_timer is not None:
-            transfer_total_size = sum(kv_sizes)
-            self._perf_timer.record_prepare_args_end(peer_ri.instance_rank)
-            self._perf_timer.record_transfer_sizes(
-                peer_ri.instance_rank, transfer_total_size, len(dst_frags)
-            )
-
-        return WriteMeta(
-            future_for_task=self._future,
-            src_kv_ptrs=src_frags,
-            dst_kv_ptrs=dst_frags,
-            kv_sizes=kv_sizes,
-            dst_device_id=dst_device_id,
-            expected_transfers=expected_transfers,
-            peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
-            peer_rank=peer_ri.instance_rank,
-            peer_endpoint=peer_ri.self_endpoint,
-            unique_rid=self._unique_rid,
-            slice_id=self._slice_id,
-            is_last_slice=self._slice.is_last_slice,
-        )
-
-    def is_active(self) -> bool:
-        if self._first_transfer:
-            return self._extraction_count < self._expected_transfers
-        else:
-            return True
-
-    def _should_write(self, peer_overlap: PeerOverlap, peer_rank_info: RankInfo) -> bool:
-        dup_head_factor = peer_overlap.duplicate_head_factor
-        if dup_head_factor <= 1:
-            return True
-        peer_ri = peer_rank_info
-        peer_dp_rank = peer_ri.dp_rank
-        self_ri = self._registrar.self_rank_info
-        self_tp_rank_in_dp_group = self_ri.tp_rank % self_ri.tp_size_per_dp_group
-        return (peer_dp_rank % dup_head_factor) == (self_tp_rank_in_dp_group % dup_head_factor)
-
-    def _filter_kv_blocks(self, src_block_ids, dst_block_ids) -> tuple[list[int], list[int]]:
-        # TODO: filter the kv block_ids according to the peer_overlap
-        return src_block_ids, dst_block_ids
-
-    def print_perf_info(self, peer_rank: int):
-        ri = self._registrar.self_rank_info
+    def print_perf_info(self, peer_rank: int, instance_name: str, instance_rank: int):
         perf_log_manager.log_task_perf(
             "KVSendTask",
             self._unique_rid,
             peer_rank,
-            ri.instance_name,
-            ri.instance_rank,
+            instance_name,
+            instance_rank,
             self._perf_timer,
         )
 
@@ -481,19 +260,13 @@ class Sender:
         self._device_id = device_id
         self._agent = agent
         self._peer_reqs = ReqInfoManager()
-
         self._messenger = ZMQMessenger(mode="ROUTER")
-        self._start_listener()
-
         self._dealers = {}
         self._tx_sessions = {}  # unique_rid -> TxSession
         self._sessions_lock = threading.Lock()  # Protects _tx_sessions access
-        logger.info(f" Sender init end with endpoint: {self._messenger.endpoint}")
         self._closed = False
         self._instance_rank = self._registrar.self_rank_info.instance_rank
         self._loaded_remote_agents: set[str] = set()
-
-        # Multi-threaded task queue support
         self._num_threads = KV_TRANSFER_NUM_THREADS
         self._send_task_queues: List[queue.Queue] = [
             queue.Queue() for _ in range(self._num_threads)
@@ -502,16 +275,21 @@ class Sender:
             threading.Thread(target=self._process_task_queue, args=(i,), daemon=True)
             for i in range(self._num_threads)
         ]
+
+        self._start_listener()
         for t in self._worker_threads:
             t.start()
-        logger.info(f"Sender started with {self._num_threads} worker thread(s)")
+        logger.info(
+            f"Sender init end with endpoint: {self._messenger.endpoint},"
+            f" {self._num_threads} worker thread(s)"
+        )
 
     @property
     def endpoint(self):
         return self._messenger.endpoint
 
     def setup_session(self, tx_session: TxSessionBase):
-        unique_rid = tx_session._base_args.params.disagg_request_id
+        unique_rid = tx_session.disagg_request_id
         with self._sessions_lock:
             self._tx_sessions[unique_rid] = weakref.ref(tx_session)
 
@@ -523,10 +301,10 @@ class Sender:
             )
             expected_count = len(self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank).ranks)
             if self._peer_reqs.is_ready(unique_rid, expected_count):
-                tx_session.state.status = SessionStatus.READY
+                tx_session.set_peer_ready()
         return
 
-    def _get_tx_session(self, unique_rid: int) -> TxSessionBase:
+    def _get_tx_session(self, unique_rid: int) -> "TxSession":
         session_ref = self._tx_sessions.get(unique_rid)
         if session_ref is None:
             return None
@@ -536,11 +314,11 @@ class Sender:
             return None
         return session
 
-    def submit_task(self, agent_args: WriteMeta):
+    def submit_task(self, write_meta: WriteMeta):
         # Distribute tasks to threads by unique_rid to ensure same session's tasks
         # are processed by the same thread in order
-        thread_idx = agent_args.unique_rid % self._num_threads
-        self._send_task_queues[thread_idx].put(agent_args)
+        thread_idx = write_meta.unique_rid % self._num_threads
+        self._send_task_queues[thread_idx].put(write_meta)
 
     def _process_task_queue(self, thread_idx: int):
         """Process tasks from the queue assigned to this thread.
@@ -554,46 +332,42 @@ class Sender:
 
         task_queue = self._send_task_queues[thread_idx]
         while True:
-            agent_args = task_queue.get()
-            if agent_args is None:
+            write_meta = task_queue.get()
+            if write_meta is None:
                 break
-            if agent_args.is_only_aux:
+            if write_meta.is_aux:
                 logger.debug(
-                    f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {agent_args}"
+                    f"_process_task_queue[{thread_idx}]: delivering aux task to agent: {write_meta}"
                 )
-                self._deliver_aux_to_agent(agent_args)
+                self._deliver_aux_to_agent(write_meta)
             else:
-                self._deliver_kv_to_agent(agent_args)
+                self._deliver_kv_to_agent(write_meta)
 
     @staticmethod
     @nvtx_range("_make_agent_request")
-    def _make_agent_request(agent_args: WriteMeta, is_aux: bool, device_id: int):
-        if is_aux:
-            assert agent_args.src_aux_ptrs is not None and agent_args.dst_aux_ptrs is not None
+    def _make_agent_request(write_meta: WriteMeta, device_id: int):
+        if write_meta.is_aux:
             src_list = [
-                (src_ptr, size, 0)
-                for src_ptr, size in zip(agent_args.src_aux_ptrs, agent_args.aux_sizes)
+                (src_ptr, size, 0) for src_ptr, size in zip(write_meta.src_ptrs, write_meta.sizes)
             ]
             dst_list = [
-                (dst_ptr, size, 0)
-                for dst_ptr, size in zip(agent_args.dst_aux_ptrs, agent_args.aux_sizes)
+                (dst_ptr, size, 0) for dst_ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes)
             ]
             src_mem_type = MemoryType.DRAM
             dst_mem_type = MemoryType.DRAM
-            peer_name = agent_args.peer_name
         else:
-            assert agent_args.src_kv_ptrs is not None and agent_args.dst_kv_ptrs is not None
+            assert write_meta.dst_device_id is not None
             src_list = [
                 (src_ptr, size, device_id)
-                for src_ptr, size in zip(agent_args.src_kv_ptrs, agent_args.kv_sizes)
+                for src_ptr, size in zip(write_meta.src_ptrs, write_meta.sizes)
             ]
             dst_list = [
-                (dst_ptr, size, agent_args.dst_device_id)
-                for dst_ptr, size in zip(agent_args.dst_kv_ptrs, agent_args.kv_sizes)
+                (dst_ptr, size, write_meta.dst_device_id)
+                for dst_ptr, size in zip(write_meta.dst_ptrs, write_meta.sizes)
             ]
             src_mem_type = MemoryType.VRAM
             dst_mem_type = MemoryType.VRAM
-            peer_name = agent_args.peer_name
+        peer_name = write_meta.peer_name
 
         # Use C++ MemoryDescs directly with batch constructor (list of tuples)
         src_memory_descs = MemoryDescs(src_mem_type, src_list)
@@ -604,137 +378,324 @@ class Sender:
         return request, src_list, dst_list
 
     @nvtx_range("_deliver_kv_to_agent")
-    def _deliver_kv_to_agent(self, agent_args: WriteMeta):
-        assert len(agent_args.src_kv_ptrs) == len(agent_args.dst_kv_ptrs)
-        assert len(agent_args.kv_sizes) == len(agent_args.src_kv_ptrs)
-        assert agent_args.is_only_aux is False, "agent_args.is_only_aux should be False"
-
-        unique_rid = agent_args.unique_rid
-        slice_id = agent_args.slice_id
-        peer_endpoint = agent_args.peer_endpoint
-        session = self._get_tx_session(unique_rid)
-        assert session is not None
-        task = session._kv_tasks[slice_id]
-        if task._perf_timer is not None:
-            task._perf_timer.record_push_end(agent_args.peer_rank)
-        assert session.state.status != SessionStatus.ERROR
-        session.state.status = SessionStatus.TRANSFERRING
-        task.status = TaskStatus.TRANSFERRING
-        request, src_kv_list, _ = Sender._make_agent_request(
-            agent_args, is_aux=False, device_id=self._device_id
+    def _deliver_kv_to_agent(self, write_meta: WriteMeta):
+        assert (
+            write_meta.src_ptrs is not None
+            and write_meta.dst_ptrs is not None
+            and write_meta.sizes is not None
         )
+        assert len(write_meta.src_ptrs) == len(write_meta.dst_ptrs)
+        assert len(write_meta.sizes) == len(write_meta.src_ptrs)
 
-        skip_send = len(src_kv_list) == 0
-        logger.debug(f"Submitting transfer request to transfer agent: {request}")
-        agent_handler = None
-        if task._perf_timer is not None:
-            task._perf_timer.record_transfer_start(agent_args.peer_rank)
+        session = self._get_tx_session(write_meta.unique_rid)
+        assert session is not None
+        task = session.kv_tasks[write_meta.slice_id]
+        timer = task._perf_timer
+        if timer:
+            timer.record_push_end(write_meta.peer_rank)
+        assert session.status != SessionStatus.ERROR
+        task.status = TaskStatus.TRANSFERRING
+
+        skip_send = len(write_meta.src_ptrs) == 0
+        logger.debug(f"Submitting transfer request to transfer agent, skip_send={skip_send}")
+        sync_status = SyncStatus.SUCCESS
+        if timer:
+            timer.record_transfer_start(write_meta.peer_rank)
         if not skip_send:
-            agent_handler = self._agent.submit_transfer_requests(request)
-
-        sync_status = "SUCCESS"
-        if not skip_send and not agent_handler.wait():
-            sync_status = "FAILED"
-            agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
-            task.status = TaskStatus.ERROR
-            session.state.status = SessionStatus.ERROR
-        if task._perf_timer is not None:
-            task._perf_timer.record_transfer_end(agent_args.peer_rank)
-
-        messenger = self._get_or_connect_dealer(peer_endpoint)
+            request, _, _ = Sender._make_agent_request(write_meta, device_id=self._device_id)
+            if not self._agent.submit_transfer_requests(request).wait():
+                sync_status = SyncStatus.FAILED
+                write_meta.future_for_task.set_exception(RuntimeError("Transfer failed"))
+                task.status = TaskStatus.ERROR
+        if timer:
+            timer.record_transfer_end(write_meta.peer_rank)
 
         ## TODO: just last slice need to send task state?
-        messenger.send(
+        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.TASK_STATUS,
                 str(self._instance_rank).encode("ascii"),
-                str(unique_rid).encode("ascii"),
-                str(slice_id).encode("ascii"),
-                str(agent_args.is_last_slice).encode("ascii"),
-                sync_status.encode("ascii"),
+                str(write_meta.unique_rid).encode("ascii"),
+                str(write_meta.slice_id).encode("ascii"),
+                str(write_meta.is_last_slice).encode("ascii"),
+                sync_status.value.encode("ascii"),
             ]
         )
 
-        curr = task.transferred_count
-        task.transferred_count = curr + 1
-        if task._perf_timer is not None:
-            task._perf_timer.record_task_end(agent_args.peer_rank)
-        task.print_perf_info(agent_args.peer_rank)
-        if task.transferred_count > agent_args.expected_transfers:
-            agent_args.future_for_task.set_exception(
+        task.transferred_count += 1
+        if timer:
+            timer.record_task_end(write_meta.peer_rank)
+        ri = self._registrar.self_rank_info
+        task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+        if task.transferred_count > write_meta.expected_transfers:
+            write_meta.future_for_task.set_exception(
                 RuntimeError(
-                    f"Session {unique_rid} has more than {agent_args.expected_transfers} transfers"
+                    f"Session {write_meta.unique_rid} has more than {write_meta.expected_transfers} transfers"
                 )
             )
             # TODO: set exception for the session ?
-            session.state.status = SessionStatus.ERROR
-        elif task.transferred_count == agent_args.expected_transfers:
+            session.mark_error()
+        elif task.transferred_count == write_meta.expected_transfers:
             # TODO avoid set_result if tranfser failed since it has been set exception
-            agent_args.future_for_task.set_result(sync_status)
+            write_meta.future_for_task.set_result(sync_status)
             task.status = TaskStatus.TRANSFERRED
-            session.state.finished_tasks.append(slice_id)
-            if agent_args.is_last_slice:
-                session.state.status = SessionStatus.TRANSFERRED
 
         logger.debug(
-            f"deliver_kv_to_agent completed: unique_rid={agent_args.unique_rid}, "
-            f"slice_id={slice_id}, sync_status={sync_status}"
+            f"deliver_kv_to_agent completed: unique_rid={write_meta.unique_rid}, "
+            f"slice_id={write_meta.slice_id}, sync_status={sync_status}"
         )
 
-    @nvtx_range("submit_send_aux_to_agent")
-    def _deliver_aux_to_agent(self, agent_args: WriteMeta):
-        # TODO: submit the aux data task to the transfer agent
-        assert agent_args.is_only_aux is True
-        # assert agent_args.src_aux_ptrs is not None
-
-        session = self._get_tx_session(agent_args.unique_rid)
+    @nvtx_range("_deliver_aux_to_agent")
+    def _deliver_aux_to_agent(self, write_meta: WriteMeta):
+        assert write_meta.src_ptrs is not None
+        session = self._get_tx_session(write_meta.unique_rid)
         assert session is not None
-        if session._aux_task._perf_timer is not None:
-            session._aux_task._perf_timer.record_push_end(agent_args.peer_rank)
-        skip_send = len(agent_args.src_aux_ptrs) == 0
-        sync_status = "SUCCESS"
-        agent_handler = None
+        assert isinstance(session, TxSession)
+        aux_task = session.aux_task
+        timer = aux_task._perf_timer
+        if timer:
+            timer.record_push_end(write_meta.peer_rank)
+
+        skip_send = len(write_meta.src_ptrs) == 0
+        sync_status = SyncStatus.SUCCESS
         if not skip_send:
-            request, _, _ = Sender._make_agent_request(
-                agent_args, is_aux=True, device_id=self._device_id
-            )
-            agent_handler = self._agent.submit_transfer_requests(request)
+            request, _, _ = Sender._make_agent_request(write_meta, device_id=self._device_id)
+            if timer:
+                timer.record_transfer_start(write_meta.peer_rank)
+            if not self._agent.submit_transfer_requests(request).wait():
+                sync_status = SyncStatus.FAILED
+                write_meta.future_for_task.set_exception(RuntimeError("Transfer failed"))
+                session.mark_error()
+            if timer:
+                timer.record_transfer_end(write_meta.peer_rank)
 
-            if session._aux_task._perf_timer is not None:
-                session._aux_task._perf_timer.record_transfer_start(agent_args.peer_rank)
-            if not agent_handler.wait():
-                sync_status = "FAILED"
-                agent_args.future_for_task.set_exception(RuntimeError("Transfer failed"))
-                session.state.status = SessionStatus.ERROR
-
-            if session._aux_task._perf_timer is not None:
-                session._aux_task._perf_timer.record_transfer_end(agent_args.peer_rank)
-        messenger = self._get_or_connect_dealer(agent_args.peer_endpoint)
-        messenger.send(
+        self._get_or_connect_dealer(write_meta.peer_endpoint).send(
             [
                 MessageType.AUX_SEND_STATUS,
                 str(self._instance_rank).encode("ascii"),
-                str(agent_args.unique_rid).encode("ascii"),
-                sync_status.encode("ascii"),
+                str(write_meta.unique_rid).encode("ascii"),
+                sync_status.value.encode("ascii"),
             ]
         )
 
-        aux_task = session._aux_task
         aux_task._transferred_count += 1
-        if aux_task._perf_timer is not None:
-            aux_task._perf_timer.record_task_end(agent_args.peer_rank)
-        aux_task.print_perf_info(agent_args.peer_rank)
-        if aux_task._transferred_count == agent_args.expected_transfers:
+        if timer:
+            timer.record_task_end(write_meta.peer_rank)
+        ri = self._registrar.self_rank_info
+        aux_task.print_perf_info(write_meta.peer_rank, ri.instance_name, ri.instance_rank)
+        if aux_task._transferred_count == write_meta.expected_transfers:
             aux_task.future.set_result(sync_status)
-            aux_task.status = TaskStatus.AUX_TRANSFERRED
-            session.state.status = SessionStatus.AUX_TRANSFERRED
-        elif aux_task._transferred_count > agent_args.expected_transfers:
+            aux_task.status = TaskStatus.TRANSFERRED
+        elif aux_task._transferred_count > write_meta.expected_transfers:
             aux_task.future.set_exception(
                 RuntimeError(
-                    f"Session {agent_args.unique_rid} has more than {agent_args.expected_transfers} transfers"
+                    f"Session {write_meta.unique_rid} has more than {write_meta.expected_transfers} transfers"
                 )
             )
-            session.state.status = SessionStatus.ERROR
+            session.mark_error()
+
+    def _should_send_kv(self, peer_overlap: PeerOverlap, peer_rank_info: RankInfo) -> bool:
+        dup_head_factor = peer_overlap.duplicate_head_factor
+        if dup_head_factor <= 1:
+            return True
+        self_ri = self._registrar.self_rank_info
+        self_tp_rank_in_dp_group = self_ri.tp_rank % self_ri.tp_size_per_dp_group
+        return (peer_rank_info.dp_rank % dup_head_factor) == (
+            self_tp_rank_in_dp_group % dup_head_factor
+        )
+
+    def _should_send_aux(self, peer_rank_info: RankInfo) -> bool:
+        # to ensure the transfer aux is not duplicated
+        self_ri = self._registrar.self_rank_info
+        self_tp_rank_in_dp_group = self_ri.tp_rank % self_ri.tp_size_per_dp_group
+
+        should_send_in_tp = False
+        if self_ri.tp_size_per_dp_group <= peer_rank_info.tp_size_per_dp_group:
+            should_send_in_tp = True
+        else:
+            ratio = self_ri.tp_size_per_dp_group // peer_rank_info.tp_size_per_dp_group
+            should_send_in_tp = self_tp_rank_in_dp_group % ratio == 0
+
+        # Compute peer pp_rank's global layer range from layer_num_per_pp
+        self_layer_num_per_pp = self_ri.layer_num_per_pp
+        peer_layer_num_per_pp = peer_rank_info.layer_num_per_pp
+        peer_start_layer = sum(peer_layer_num_per_pp[: peer_rank_info.pp_rank])
+        peer_end_layer = peer_start_layer + peer_layer_num_per_pp[peer_rank_info.pp_rank]
+
+        # Find the first self pp_rank whose global layers overlap with peer's pp_rank.
+        # All tp/pp ranks have the same aux data, so we only select one self pp_rank
+        # to send to the peer; pick the first overlapping one to avoid duplication.
+        first_matching_self_pp_rank = None
+        self_layer_offset = 0
+        for p in range(self_ri.pp_size):
+            self_start = self_layer_offset
+            self_end = self_start + self_layer_num_per_pp[p]
+            if self_start < peer_end_layer and self_end > peer_start_layer:
+                first_matching_self_pp_rank = p
+                break
+            self_layer_offset += self_layer_num_per_pp[p]
+
+        should_send_in_pp = first_matching_self_pp_rank == self_ri.pp_rank
+        return should_send_in_tp and should_send_in_pp
+
+    @staticmethod
+    def _filter_kv_blocks(src_block_ids, dst_block_ids) -> tuple[list[int], list[int]]:
+        # TODO: filter the kv block_ids according to the peer_overlap
+        return src_block_ids, dst_block_ids
+
+    @nvtx_range("_build_kv_write_meta")
+    def _build_kv_write_meta(self, task: KVSendTask, req_info: RecvReqInfo) -> WriteMeta:
+        peer_ri = self._registrar.get_peer_rank_info(req_info.instance_name, req_info.instance_rank)
+        if task._perf_timer is not None:
+            task._perf_timer.record_prepare_args_start(peer_ri.instance_rank)
+        targets = self._registrar.get_peer_overlap(peer_ri, peer_ri.dp_rank)
+        expected_transfers = len(targets.ranks)
+        if task._expected_transfers == 0:
+            task._expected_transfers = expected_transfers
+        if not self._should_send_kv(targets, peer_ri):
+            if task._perf_timer is not None:
+                task._perf_timer.record_prepare_args_end(peer_ri.instance_rank)
+                task._perf_timer.record_transfer_sizes(peer_ri.instance_rank, 0, 0)
+            return WriteMeta(
+                future_for_task=task._future,
+                src_ptrs=[],
+                dst_ptrs=[],
+                sizes=[],
+                expected_transfers=expected_transfers,
+                peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
+                peer_rank=peer_ri.instance_rank,
+                peer_endpoint=peer_ri.self_endpoint,
+                unique_rid=task._unique_rid,
+                slice_id=task._slice_id,
+                is_last_slice=task._slice.is_last_slice,
+            )
+
+        dst_device_id = peer_ri.device_id
+        dst_block_ids_per_groups = req_info.block_ids_per_layer_groups
+        src_block_ids_per_groups = task._slice.block_ids_per_layer_groups
+
+        extractor = self._registrar.self_extractor
+        peer_extractor = self._registrar.peer_extractor(
+            peer_ri.instance_name, peer_ri.instance_rank
+        )
+
+        # Get pool mapping: (self_lg, self_pi) -> (peer_lg, peer_pi)
+        pool_mapping = self._registrar.get_pool_mapping(peer_ri)
+
+        # Aggregate fragments from all matching pools
+        src_frags: List[int] = []
+        dst_frags: List[int] = []
+        kv_sizes: List[int] = []
+
+        for (self_lg, self_pi), (peer_lg, peer_pi) in pool_mapping.items():
+            src_block_ids = src_block_ids_per_groups[self_lg]
+            dst_block_ids = dst_block_ids_per_groups[peer_lg]
+
+            if len(src_block_ids) + 1 == len(dst_block_ids):
+                # FIXME: this is a temporary solution, need to be fixed for the draft tokens
+                logger.warning(
+                    "src_block_num is one less than dst_block_num, maybe it is due to draft tokens,"
+                    " remove the last block from dst_block_ids "
+                )
+                dst_block_ids = dst_block_ids[:-1]
+            src_block_ids, dst_block_ids = Sender._filter_kv_blocks(src_block_ids, dst_block_ids)
+
+            src_region = extractor.extract(src_block_ids, layer_group_id=self_lg, pool_idx=self_pi)
+            dst_region = peer_extractor.extract(
+                dst_block_ids, layer_group_id=peer_lg, pool_idx=peer_pi
+            )
+            mapper = self._registrar.get_kv_map(peer_ri, (self_lg, self_pi), (peer_lg, peer_pi))
+            region_pair = mapper.map(src_region, dst_region)
+            region_pairs = region_pair if isinstance(region_pair, list) else [region_pair]
+            for rp in region_pairs:
+                src_frags.extend(rp.src.memory.ptrs)
+                dst_frags.extend(rp.dst.memory.ptrs)
+                frag_size = rp.src.memory.bytes_per_region
+                kv_sizes.extend([frag_size] * len(rp.src.memory.ptrs))
+
+        if task._perf_timer is not None:
+            transfer_total_size = sum(kv_sizes)
+            task._perf_timer.record_prepare_args_end(peer_ri.instance_rank)
+            task._perf_timer.record_transfer_sizes(
+                peer_ri.instance_rank, transfer_total_size, len(dst_frags)
+            )
+
+        return WriteMeta(
+            future_for_task=task._future,
+            src_ptrs=src_frags,
+            dst_ptrs=dst_frags,
+            sizes=kv_sizes,
+            dst_device_id=dst_device_id,
+            expected_transfers=expected_transfers,
+            peer_name=peer_ri.instance_name + str(peer_ri.instance_rank),
+            peer_rank=peer_ri.instance_rank,
+            peer_endpoint=peer_ri.self_endpoint,
+            unique_rid=task._unique_rid,
+            slice_id=task._slice_id,
+            is_last_slice=task._slice.is_last_slice,
+        )
+
+    def _build_aux_write_meta(self, task: AuxSendTask, req_info: RecvReqInfo) -> WriteMeta:
+        peer_rank_info = self._registrar.get_peer_rank_info(
+            req_info.instance_name, req_info.instance_rank
+        )
+        if task._perf_timer is not None:
+            task._perf_timer.record_prepare_args_start(peer_rank_info.instance_rank)
+        expected_transfers = len(
+            self._registrar.get_peer_overlap(peer_rank_info, peer_rank_info.dp_rank).ranks
+        )
+        if not self._should_send_aux(peer_rank_info):
+            if task._perf_timer is not None:
+                task._perf_timer.record_prepare_args_end(peer_rank_info.instance_rank)
+                task._perf_timer.record_transfer_sizes(
+                    req_info.instance_name + str(req_info.instance_rank), 0, 0
+                )
+            return WriteMeta(
+                future_for_task=task._future,
+                src_ptrs=[],
+                dst_ptrs=[],
+                sizes=[],
+                expected_transfers=expected_transfers,
+                peer_name=req_info.instance_name + str(req_info.instance_rank),
+                peer_rank=req_info.instance_rank,
+                peer_endpoint=self._registrar.get_peer_rank_info(
+                    req_info.instance_name, req_info.instance_rank
+                ).self_endpoint,
+                unique_rid=task._unique_rid,
+            )
+        peer_aux_meta = self._registrar.get_peer_rank_info(
+            req_info.instance_name, req_info.instance_rank
+        ).aux_meta
+
+        peer_slot = req_info.aux_slot
+        src_aux_meta = self._registrar.self_rank_info.aux_meta
+
+        src_ptrs = [
+            ptr + item_size * task._slot
+            for ptr, item_size in zip(src_aux_meta.ptrs, src_aux_meta.item_sizes)
+        ]
+        dst_ptrs = [
+            ptr + item_size * peer_slot
+            for ptr, item_size in zip(peer_aux_meta.ptrs, peer_aux_meta.item_sizes)
+        ]
+        size = [item_size for item_size in src_aux_meta.item_sizes]
+
+        if task._perf_timer is not None:
+            task._perf_timer.record_prepare_args_end(peer_rank_info.instance_rank)
+            task._perf_timer.record_transfer_sizes(req_info.instance_rank, sum(size), len(src_ptrs))
+        return WriteMeta(
+            future_for_task=task._future,
+            src_ptrs=src_ptrs,
+            dst_ptrs=dst_ptrs,
+            sizes=size,
+            expected_transfers=expected_transfers,
+            peer_name=req_info.instance_name + str(req_info.instance_rank),
+            peer_rank=req_info.instance_rank,
+            peer_endpoint=self._registrar.get_peer_rank_info(
+                req_info.instance_name, req_info.instance_rank
+            ).self_endpoint,
+            unique_rid=task._unique_rid,
+        )
 
     def dispatch_task(self, task: KVSendTask | AuxSendTask):
         req_info_dict = self._peer_reqs.get_req_info(task._unique_rid)
@@ -743,7 +704,10 @@ class Sender:
             for info in req_info_dict.values():
                 if task._perf_timer is not None:
                     task._perf_timer.record_task_start(info.instance_rank)
-                trans_meta = task._create_write_meta(info)
+                if isinstance(task, KVSendTask):
+                    trans_meta = self._build_kv_write_meta(task, info)
+                else:
+                    trans_meta = self._build_aux_write_meta(task, info)
                 if task._perf_timer is not None:
                     task._perf_timer.record_push_start(trans_meta.peer_rank)
                 self.submit_task(trans_meta)
@@ -798,15 +762,15 @@ class Sender:
             if session is None:
                 self._save_peer_req_info(info)
                 return
-        with session._lock:
+        with session.lock:
             self._save_peer_req_info(info)
 
-            tasks = session._kv_tasks
+            tasks = session.kv_tasks
             if tasks:
                 for task in tasks:
                     if task._perf_timer is not None:
                         task._perf_timer.record_task_start(info.instance_rank)
-                    trans_meta = task._create_write_meta(info)
+                    trans_meta = self._build_kv_write_meta(task, info)
                     if task._perf_timer is not None:
                         task._perf_timer.record_push_start(trans_meta.peer_rank)
                     self.submit_task(trans_meta)
@@ -826,8 +790,8 @@ class Sender:
         if self._peer_reqs.is_ready(req_info.unique_rid, expected_transfers):
             if req_info.unique_rid in self._tx_sessions:
                 session = self._get_tx_session(req_info.unique_rid)
-                if session.state.status == SessionStatus.INIT:
-                    session.state.status = SessionStatus.READY
+                if not session.peer_ready:
+                    session.set_peer_ready()
 
     def clear_session(self, unique_rid: int):
         """Clear session-related resources from Sender.
@@ -882,7 +846,8 @@ class TxSession(TxSessionBase):
         super().__init__(sender, SessionArgsBase(params))
         self.request_id = request_id
         self.aux_slot = aux_slot
-        self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
+        self._peer_ready: bool = False
+        self._has_error = False
         self._exception = None
         self._closed = False
         self._kv_tasks = []
@@ -896,18 +861,29 @@ class TxSession(TxSessionBase):
         self._sender.setup_session(self)
 
     @property
-    def state(self) -> SessionState:
-        return self._state
+    def peer_ready(self) -> bool:
+        return self._peer_ready
 
-    @state.setter
-    def state(self, s: SessionState):
-        self._state = s
+    @property
+    def status(self) -> SessionStatus:
+        if self._has_error or any(t.status == TaskStatus.ERROR for t in self._kv_tasks):
+            return SessionStatus.ERROR
+        kv_all_transferred = bool(self._kv_tasks) and all(
+            t.status == TaskStatus.TRANSFERRED for t in self._kv_tasks
+        )
+        if kv_all_transferred:
+            if self._aux_task is not None and self._aux_task.status == TaskStatus.TRANSFERRED:
+                return SessionStatus.FULLY_TRANSFERRED
+            return SessionStatus.KV_TRANSFERRED
+        if self._kv_tasks and any(t.status == TaskStatus.TRANSFERRING for t in self._kv_tasks):
+            return SessionStatus.TRANSFERRING
+        return SessionStatus.READY if self._peer_ready else SessionStatus.INIT
 
     def send(self, slice: KVSlice) -> TaskIdType:
         with self._lock:
             params = self._base_args.params
             slice_id = len(self._kv_tasks)
-            task = KVSendTask(slice, params, slice_id, self._sender._registrar)
+            task = KVSendTask(slice, params, slice_id)
             self._kv_tasks.append(task)
             self._sender.dispatch_task(task)
             return task.slice_id
@@ -915,15 +891,36 @@ class TxSession(TxSessionBase):
     def send_aux(self) -> AuxSendTask:
         with self._lock:
             params = self._base_args.params
-            slot = self.aux_slot
-            task = AuxSendTask(params, slot, self._sender._registrar)
-
+            task = AuxSendTask(params, self.aux_slot)
             self._aux_task = task
             self._sender.dispatch_task(task)
             return task
 
+    @property
+    def lock(self) -> threading.Lock:
+        return self._lock
+
+    @property
+    def kv_tasks(self) -> list:
+        return self._kv_tasks
+
+    @property
+    def aux_task(self) -> Optional["AuxSendTask"]:
+        return self._aux_task
+
+    def get_kv_task_future(self, task_id: TaskIdType) -> concurrent.futures.Future:
+        return self._kv_tasks[task_id].future
+
+    def set_peer_ready(self):
+        self._peer_ready = True
+
+    def mark_error(self):
+        self._has_error = True
+
     def poll_task(self, id: TaskIdType) -> SessionStatus:
-        return self._kv_tasks[id].state
+        if self._kv_tasks[id].status == TaskStatus.ERROR:
+            return SessionStatus.ERROR
+        return self.status
 
     @property
     def exception(self) -> Optional[Exception]:
@@ -939,8 +936,7 @@ class TxSession(TxSessionBase):
         # and need access to these fields to finish in-flight transfers.
         # Resources are freed when the session object is garbage collected.
         if self._sender is not None:
-            unique_rid = self._base_args.params.disagg_request_id
-            self._sender.clear_session(unique_rid)
+            self._sender.clear_session(self.disagg_request_id)
 
     def __enter__(self):
         return self
@@ -962,18 +958,15 @@ class KVRecvTask:
         kv_slice: KVSlice,
         slice_id: int,
         params: DisaggregatedParams,
-        peer_registrar: PeerRegistrar,
         aux_slot: int,
     ):
         self._unique_rid = unique_rid
         self._kv_slice = kv_slice
         self._slice_id = slice_id
         self._params = params
-        self._registrar = peer_registrar
         self._status = TaskStatus.INIT
         self._exception = None
         self._future = concurrent.futures.Future()
-        self._first_transfer = False
         self._expected_transfers = 0
         self._aux_slot = aux_slot
         self._perf_timer = PerfTimer() if perf_log_manager.enabled else None
@@ -1002,34 +995,12 @@ class KVRecvTask:
     def expected_transfers(self, v: int):
         self._expected_transfers = v
 
-    def _create_req_info(self) -> RecvReqInfo:
-        return RecvReqInfo(
-            sender_req_id=self._params.ctx_request_id,
-            instance_name=self._registrar.self_rank_info.instance_name,
-            instance_rank=self._registrar.self_rank_info.instance_rank,
-            block_ids_per_layer_groups=self._kv_slice.block_ids_per_layer_groups,
-            unique_rid=self._unique_rid,
-            aux_slot=self._aux_slot,
-        )
-
-    def _make_read_meta(self, peer_ii, peer_dp_rank) -> ReadMeta:
-        peer_overlap = self._registrar.get_peer_overlap(peer_ii, peer_dp_rank)
-        if not self._first_transfer:
-            self._first_transfer = True
-            self._expected_transfers = len(peer_overlap.ranks)
-        return ReadMeta(
-            slice_id=self._slice_id,
-            unique_rid=self._unique_rid,
-            target_ranks=peer_overlap.ranks,
-        )
-
-    def print_perf_info(self, peer_rank: int):
-        ri = self._registrar.self_rank_info
+    def print_perf_info(self, peer_rank: int, instance_name: str, instance_rank: int):
         perf_log_manager.log_recv_task_perf(
             self._unique_rid,
             peer_rank,
-            ri.instance_name,
-            ri.instance_rank,
+            instance_name,
+            instance_rank,
             self._perf_timer,
         )
 
@@ -1073,7 +1044,7 @@ class Receiver:
         self._rx_sessions.pop(unique_rid, None)
 
     def setup_session(self, rx_session: RxSessionBase):
-        self._rx_sessions[rx_session._base_args.params.disagg_request_id] = weakref.ref(rx_session)
+        self._rx_sessions[rx_session.disagg_request_id] = weakref.ref(rx_session)
 
     def _get_rx_session(self, unique_rid: int) -> RxSessionBase:
         session_ref = self._rx_sessions.get(unique_rid)
@@ -1085,18 +1056,30 @@ class Receiver:
             return None
         return session
 
+    def _build_recv_req_info(self, task: KVRecvTask) -> RecvReqInfo:
+        self_ri = self._registrar.self_rank_info
+        return RecvReqInfo(
+            sender_req_id=task._params.ctx_request_id,
+            instance_name=self_ri.instance_name,
+            instance_rank=self_ri.instance_rank,
+            block_ids_per_layer_groups=task._kv_slice.block_ids_per_layer_groups,
+            unique_rid=task._unique_rid,
+            aux_slot=task._aux_slot,
+        )
+
     def dispatch_task(self, task: KVRecvTask):
         params = task._params
         logger.debug(f"Preparing async data transfer request for disagg_params={params}")
-        receiver_req = task._create_req_info()
+        receiver_req = self._build_recv_req_info(task)
         sender_dp_rank = params.ctx_dp_rank
         if sender_dp_rank is None:
             raise ValueError("sender_dp_rank is None")
         peer_infos: RankInfo = self._get_sender_info(params)
-        agent_args = task._make_read_meta(peer_infos, sender_dp_rank)
-        session = self._get_rx_session(agent_args.unique_rid)
-        session._kv_tasks[agent_args.slice_id].status = TaskStatus.TRANSFERRING
-        for rank in agent_args.target_ranks:
+        peer_overlap = self._registrar.get_peer_overlap(peer_infos, sender_dp_rank)
+        task._expected_transfers = len(peer_overlap.ranks)
+        session = self._get_rx_session(task._unique_rid)
+        session._kv_tasks[task._slice_id].status = TaskStatus.TRANSFERRING
+        for rank in peer_overlap.ranks:
             if task._perf_timer is not None:
                 task._perf_timer.record_task_start(rank)
             self._request_sender_data(peer_infos.sender_endpoints[rank], receiver_req)
@@ -1156,14 +1139,14 @@ class Receiver:
         unique_rid = int(unique_rid)
         assert msg_type.encode("ascii") == MessageType.TASK_STATUS
         session = self._get_rx_session(unique_rid)
-        session.process_kv_task_status(peer_rank, is_last_slice_str == "True", status)
+        session.process_kv_task_status(peer_rank, is_last_slice_str == "True", SyncStatus(status))
 
     def _process_aux_state(self, send_id: bytes, message: list[bytes]):
         msg_type, peer_rank, unique_rid, status = decode_message(message)
         peer_rank = int(peer_rank)
         unique_rid = int(unique_rid)
         session = self._get_rx_session(unique_rid)
-        session.process_aux_state(peer_rank, status)
+        session.process_aux_state(peer_rank, SyncStatus(status))
 
     def _request_sender_data(self, endpoint: str, receiver_info: RecvReqInfo):
         logger.debug(
@@ -1196,23 +1179,31 @@ class RxSession(RxSessionBase):
         super().__init__(receiver, SessionArgsBase(params))
         self.request_id = request_id
         self.aux_slot = aux_slot
-        self._state = SessionState(status=SessionStatus.INIT, finished_tasks=[])
+        self._has_error = False
         self._exception = None
         self._closed = False
         self._kv_tasks = []
         self._last_slice_counts = 0
         self._aux_counts = 0
+        self._aux_done = False
         self._receiver.setup_session(self)
 
     @property
-    def state(self) -> SessionState:
-        return self._state
-
-    @state.setter
-    def state(self, s: SessionState):
-        self._state = s
+    def status(self) -> SessionStatus:
+        if self._has_error or (self._kv_tasks and self._kv_tasks[0].status == TaskStatus.ERROR):
+            return SessionStatus.ERROR
+        if self._kv_tasks:
+            task_status = self._kv_tasks[0].status
+            if task_status == TaskStatus.TRANSFERRED and self._aux_done:
+                return SessionStatus.FULLY_TRANSFERRED
+            if task_status == TaskStatus.TRANSFERRED:
+                return SessionStatus.KV_TRANSFERRED
+            if task_status == TaskStatus.TRANSFERRING:
+                return SessionStatus.TRANSFERRING
+        return SessionStatus.INIT
 
     def receive(self, slice: KVSlice) -> TaskIdType:
+        assert len(self._kv_tasks) == 0, "RxSession only supports a single KV slice"
         params = self._base_args.params
         slice_id = len(self._kv_tasks)
         task = KVRecvTask(
@@ -1220,57 +1211,58 @@ class RxSession(RxSessionBase):
             slice,
             slice_id,
             params,
-            self._receiver._registrar,
             aux_slot=self.aux_slot,
         )
         self._kv_tasks.append(task)
         self._receiver.dispatch_task(task)
         return task.slice_id
 
-    def process_kv_task_status(self, peer_rank: int, is_last_slice: bool, status: str):
+    def process_kv_task_status(self, peer_rank: int, is_last_slice: bool, status: SyncStatus):
         task = self._kv_tasks[0]  # receive task slice only support slice 0
-        if status == "SUCCESS":
+        if status == SyncStatus.SUCCESS:
             if is_last_slice:
                 self._last_slice_counts += 1
                 if self._last_slice_counts == task.expected_transfers:
-                    task.future.set_result("SUCCESS")
+                    task.future.set_result(SyncStatus.SUCCESS)
                     task.status = TaskStatus.TRANSFERRED
-                    self.state.status = SessionStatus.TRANSFERRED
-                    self.state.finished_tasks.append(0)
 
                     logger.debug("Task state handled successfully")
                     if task._perf_timer is not None:
                         task._perf_timer.record_task_end(peer_rank)
-                    task.print_perf_info(peer_rank)
-        elif status == "FAILED":
-            task.future.set_exception(RuntimeError(f"Task state: {status}"))
+                    ri = self._receiver._registrar.self_rank_info
+                    task.print_perf_info(peer_rank, ri.instance_name, ri.instance_rank)
+        elif status == SyncStatus.FAILED:
+            task.future.set_exception(RuntimeError(f"Task state: {status.value}"))
             task.status = TaskStatus.ERROR
-            self.state.status = SessionStatus.ERROR
         else:
             raise ValueError(f"Session received unknown task status: {status}")
 
-    def process_aux_state(self, peer_rank: int, status: str):
+    def process_aux_state(self, peer_rank: int, status: SyncStatus):
         task = self._kv_tasks[0]  # receive task slice only support slice 0
-        if status == "SUCCESS":
+        if status == SyncStatus.SUCCESS:
             self._aux_counts += 1
 
             if self._aux_counts == task.expected_transfers:
-                task.status = TaskStatus.AUX_TRANSFERRED
-                self.state.status = SessionStatus.AUX_TRANSFERRED
+                self._aux_done = True
             elif self._aux_counts > task.expected_transfers:
                 logger.error(
                     f"Session {self.request_id} has more than {task.expected_transfers} transfers"
                 )
-                self.state.status = SessionStatus.ERROR
-        elif status == "FAILED":
-            self.state.status = SessionStatus.ERROR
+                self._has_error = True
+        elif status == SyncStatus.FAILED:
+            self._has_error = True
         else:
             raise ValueError(
                 f"Session {self.request_id} received unknown aux send status: {status}"
             )
 
+    def get_kv_task_future(self, task_id: TaskIdType) -> concurrent.futures.Future:
+        return self._kv_tasks[task_id].future
+
     def poll_task(self, id: TaskIdType) -> SessionStatus:
-        return self._kv_tasks[id].state
+        if self._kv_tasks[id].status == TaskStatus.ERROR:
+            return SessionStatus.ERROR
+        return self.status
 
     @property
     def exception(self) -> Optional[Exception]:
@@ -1286,8 +1278,7 @@ class RxSession(RxSessionBase):
         # and need access to these fields to finish processing in-flight status messages.
         # Resources are freed when the session object is garbage collected.
         if self._receiver is not None:
-            unique_rid = self._base_args.params.disagg_request_id
-            self._receiver.clear_session(unique_rid)
+            self._receiver.clear_session(self.disagg_request_id)
 
     def __enter__(self):
         return self
@@ -1469,58 +1460,38 @@ class TransferWorker:
             self._aux_buffer.free_slot(aux_slot)
 
     def init_rank_info(self, instance_name):
-        rank = self._mapping.rank
-
-        tp_size = self._mapping.tp_size
-        pp_size = self._mapping.pp_size
-        dp_size = self._mapping.dp_size
-        cp_size = self._mapping.cp_size
-        tp_rank = self._mapping.tp_rank
-        pp_rank = self._mapping.pp_rank
-        enable_attention_dp = self._mapping.enable_attention_dp
-        dp_rank = 0
-        if enable_attention_dp:
-            dp_size = self._mapping.tp_size
-            dp_rank = tp_rank
-        cp_rank = self._mapping.cp_rank
-        is_mla = self._kv_cache_manager.kv_factor == 1
-        self._kv_cache_manager.kv_factor
-        heads_num_per_rank = self._kv_cache_manager.num_kv_heads_per_layer[0]
-        tokens_per_block = self._kv_cache_manager.tokens_per_block
-        dims_per_head = self._kv_cache_manager.head_dim
-        element_bytes = get_size_in_bytes(1, self._kv_cache_manager.dtype)
-        layer_num_per_pp = [len(self._kv_cache_manager.pp_layers)]
-        sender_endpoints = []
-        # Build page table from manager (supports V1 and V2)
-        page_table = build_page_table_from_manager(self._kv_cache_manager)
+        m = self._mapping
+        kvm = self._kv_cache_manager
+        enable_attention_dp = m.enable_attention_dp
 
         self._rank_info = RankInfo(
             instance_name=instance_name,
-            instance_rank=rank,
-            tp_size=tp_size,
-            tp_rank=tp_rank,
-            pp_size=pp_size,
-            pp_rank=pp_rank,
-            dp_size=dp_size,
-            dp_rank=dp_rank,
-            cp_size=cp_size,
-            cp_rank=cp_rank,
+            instance_rank=m.rank,
+            tp_size=m.tp_size,
+            tp_rank=m.tp_rank,
+            pp_size=m.pp_size,
+            pp_rank=m.pp_rank,
+            dp_size=m.tp_size if enable_attention_dp else m.dp_size,
+            dp_rank=m.tp_rank if enable_attention_dp else 0,
+            cp_size=m.cp_size,
+            cp_rank=m.cp_rank,
             device_id=self._device_id,
-            layer_num_per_pp=layer_num_per_pp,
-            sender_endpoints=sender_endpoints,
+            layer_num_per_pp=[len(kvm.pp_layers)],
+            sender_endpoints=[],
             server_endpoint="",
             self_endpoint="",
             transfer_engine_info=bytes(),
             attention=AttentionInfo(
-                kv_heads_per_rank=heads_num_per_rank,
-                tokens_per_block=tokens_per_block,
-                dims_per_head=dims_per_head,
-                element_bytes=element_bytes,
+                kv_heads_per_rank=kvm.num_kv_heads_per_layer[0],
+                tokens_per_block=kvm.tokens_per_block,
+                dims_per_head=kvm.head_dim,
+                element_bytes=get_size_in_bytes(1, kvm.dtype),
                 enable_attention_dp=enable_attention_dp,
-                is_mla=is_mla,
+                is_mla=kvm.kv_factor == 1,
             ),
             aux_meta=self._aux_buffer.meta if self._aux_buffer is not None else None,
-            page_table=page_table,
+            # Build page table from manager (supports V1 and V2)
+            page_table=build_page_table_from_manager(kvm),
         )
 
     def _register_kv_cache(self):
@@ -1565,6 +1536,18 @@ class TransferWorker:
         self._agent.register_memory(reg_memory_desc)
         logger.debug(f"Registered auxiliary buffer memory with transfer agent: {reg_memory_desc}")
         self._registered_mem.append(reg_memory_desc)
+
+    @property
+    def rank_info_server_endpoint(self) -> Optional[str]:
+        return self._rank_info_server.endpoint if self._rank_info_server is not None else None
+
+    @property
+    def sender_endpoint(self) -> str:
+        return self._sender.endpoint
+
+    @property
+    def page_table(self):
+        return self._rank_info.page_table
 
     # pack the aux data to the meta buffer
 

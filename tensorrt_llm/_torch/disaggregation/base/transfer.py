@@ -53,37 +53,25 @@ class KVSlice:
 class SessionStatus(Enum):
     """Status of a transfer session.
 
-    Represents the various stages/statuses that a file transfer session can go through:
+    Represents the lifecycle stages of a KV cache transfer session:
 
-    - INIT: The session has been initialized but not yet ready.
-    - READY: The session is ready to start transferring.
-    - TRANSFERRING: The session is in progress, currently transferring data.
-    - TRANSFERRED: The primary transfer has completed successfully.
-    - AUX_TRANSFERRED: The auxiliary part (such as tokens) of the transfer has completed successfully.
-    - COMPLETED: The entire session process, including all transfers, has been successfully completed.
-    - CANCELED: The session has been canceled by the user or system.
-    - ERROR: An error occurred during the session. The session could not complete successfully.
+    - INIT: Session initialized; waiting for the remote peer to become ready.
+    - READY: Peer is ready; transfer can begin.
+    - TRANSFERRING: KV cache transfer is in progress.
+    - KV_TRANSFERRED: KV cache transfer completed; auxiliary data transfer may still be pending.
+    - FULLY_TRANSFERRED: Both KV cache and auxiliary data (e.g. tokens) transferred successfully.
+    - ERROR: A transfer error occurred; the session cannot complete.
     """
 
     INIT = "INIT"
     READY = "READY"
     TRANSFERRING = "TRANSFERRING"
-    TRANSFERRED = "TRANSFERRED"
-    AUX_TRANSFERRED = "AUX_TRANSFERRED"
-    COMPLETED = "COMPLETED"
-    CANCELED = "CANCELED"
+    KV_TRANSFERRED = "KV_TRANSFERRED"
+    FULLY_TRANSFERRED = "FULLY_TRANSFERRED"
     ERROR = "ERROR"
 
 
 TaskIdType = int
-
-
-@dataclass
-class SessionState:
-    """State of a transfer session."""
-
-    status: SessionStatus
-    finished_tasks: List[TaskIdType]
 
 
 @dataclass
@@ -116,12 +104,8 @@ class TxSessionBase(ABC):
         self._base_args = args
 
     @property
-    @abstractmethod
-    def state(self) -> SessionState:
-        """
-        Returns the current state of the session.
-        """
-        ...
+    def disagg_request_id(self) -> int:
+        return self._base_args.params.disagg_request_id
 
     @abstractmethod
     def poll_task(self, id: TaskIdType) -> SessionStatus:
@@ -165,12 +149,8 @@ class RxSessionBase(ABC):
         self._base_args = args
 
     @property
-    @abstractmethod
-    def state(self) -> SessionState:
-        """
-        Returns the current state of the session.
-        """
-        ...
+    def disagg_request_id(self) -> int:
+        return self._base_args.params.disagg_request_id
 
     @abstractmethod
     def poll_task(self, task_id: TaskIdType) -> SessionStatus:
