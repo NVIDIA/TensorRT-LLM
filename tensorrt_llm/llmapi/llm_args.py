@@ -2370,7 +2370,7 @@ class BaseLlmArgs(StrictBaseModel):
     moe_cluster_parallel_size: Optional[int] = Field(
         default=None,
         description="The cluster parallel size for MoE model's expert weights.",
-        status="beta")
+        status="deprecated")
 
     moe_tensor_parallel_size: Optional[int] = Field(
         default=None,
@@ -2762,10 +2762,10 @@ class TrtLlmArgs(BaseLlmArgs):
                                      description="The workspace for the model.")
 
     fail_fast_on_attention_window_too_large: bool = Field(
-        default=False,
+        default=True,
         description=
         "Fail fast when attention window is too large to fit even a single sequence in the KV cache.",
-        status="prototype")
+        status="deprecated")
 
     # Once set, the model will reuse the build_cache
     enable_build_cache: Union[BuildCacheConfig,

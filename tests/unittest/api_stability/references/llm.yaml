@@ -9,7 +9,7 @@ methods:
       moe_cluster_parallel_size:
         annotation: Optional[int]
         default: null
-        status: beta
+        status: deprecated
       enable_attention_dp:
         annotation: bool
         default: False
