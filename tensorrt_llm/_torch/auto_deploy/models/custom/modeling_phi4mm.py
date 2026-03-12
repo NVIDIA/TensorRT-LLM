@@ -19,16 +19,15 @@ import importlib.util
 import math
 import pathlib
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple, Union
+from typing import Dict, Optional, Tuple
 
 import torch
 from huggingface_hub import snapshot_download
 from torch import nn
-from transformers import AutoConfig
 from transformers.activations import ACT2FN
-from transformers.configuration_utils import PretrainedConfig
 from transformers.generation import GenerationMixin
 from transformers.modeling_utils import PreTrainedModel
+from transformers.models.phi4_multimodal.configuration_phi4_multimodal import Phi4MultimodalConfig
 from transformers.utils import ModelOutput
 
 from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
@@ -44,6 +43,9 @@ class InputMode(enum.IntEnum):
     VISION_SPEECH = 3
 
 
+Phi4MMConfig = Phi4MultimodalConfig
+
+
 def _load_hf_aux_module(model_name_or_path: str, filename: str, module_name: str):
     root = pathlib.Path(model_name_or_path)
     module_path = root / filename
@@ -56,101 +58,6 @@ def _load_hf_aux_module(model_name_or_path: str, filename: str, module_name: str
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
-
-
-class Phi4MMConfig(PretrainedConfig):
-    model_type = "phi4mm"
-
-    def __init__(
-        self,
-        vocab_size: int = 200064,
-        hidden_size: int = 3072,
-        intermediate_size: int = 8192,
-        num_hidden_layers: int = 32,
-        num_attention_heads: int = 32,
-        num_key_value_heads: Optional[int] = None,
-        resid_pdrop: float = 0.0,
-        embd_pdrop: float = 0.0,
-        attention_dropout: float = 0.0,
-        hidden_act: str = "silu",
-        max_position_embeddings: int = 4096,
-        original_max_position_embeddings: int = 4096,
-        initializer_range: float = 0.02,
-        rms_norm_eps: float = 1e-5,
-        tie_word_embeddings: bool = True,
-        rope_theta: float = 10000.0,
-        rope_scaling=None,
-        partial_rotary_factor: float = 1.0,
-        bos_token_id: int = 199999,
-        eos_token_id: Union[int, list[int]] = 199999,
-        pad_token_id: int = 199999,
-        sliding_window=None,
-        embd_layer=None,
-        img_processor=None,
-        audio_processor=None,
-        vision_lora=None,
-        speech_lora=None,
-        **kwargs,
-    ):
-        self.embd_layer = embd_layer
-        self.img_processor = img_processor
-        self.audio_processor = audio_processor
-        self.vision_lora = vision_lora
-        self.speech_lora = speech_lora
-        self.vocab_size = vocab_size
-        self.hidden_size = hidden_size
-        self.intermediate_size = intermediate_size
-        self.num_hidden_layers = num_hidden_layers
-        self.num_attention_heads = num_attention_heads
-        self.num_key_value_heads = (
-            num_attention_heads if num_key_value_heads is None else num_key_value_heads
-        )
-        self.resid_pdrop = resid_pdrop
-        self.embd_pdrop = embd_pdrop
-        self.attention_dropout = attention_dropout
-        self.hidden_act = hidden_act
-        self.max_position_embeddings = max_position_embeddings
-        self.original_max_position_embeddings = original_max_position_embeddings
-        self.initializer_range = initializer_range
-        self.rms_norm_eps = rms_norm_eps
-        self.rope_theta = rope_theta
-        self.rope_scaling = rope_scaling
-        self.partial_rotary_factor = partial_rotary_factor
-        self.sliding_window = sliding_window
-        self._rope_scaling_adjustment()
-        self._rope_scaling_validation()
-        super().__init__(
-            bos_token_id=bos_token_id,
-            eos_token_id=eos_token_id,
-            pad_token_id=pad_token_id,
-            tie_word_embeddings=tie_word_embeddings,
-            **kwargs,
-        )
-
-    def _rope_scaling_adjustment(self):
-        if self.rope_scaling is None:
-            return
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        if rope_scaling_type in ["su", "yarn"]:
-            self.rope_scaling["type"] = "longrope"
-
-    def _rope_scaling_validation(self):
-        if self.rope_scaling is None:
-            return
-        if not isinstance(self.rope_scaling, dict) or len(self.rope_scaling) != 3:
-            raise ValueError(
-                "`rope_scaling` must be a dictionary with fields `type`, `short_factor`, and `long_factor`."
-            )
-        rope_scaling_type = self.rope_scaling.get("type", None)
-        if rope_scaling_type != "longrope":
-            raise ValueError(f"`rope_scaling.type` must be `longrope`, got {rope_scaling_type}")
-        rotary_ndims = int(
-            self.hidden_size // self.num_attention_heads * self.partial_rotary_factor
-        )
-        for key in ["short_factor", "long_factor"]:
-            factors = self.rope_scaling.get(key, None)
-            if not isinstance(factors, list) or len(factors) != rotary_ndims // 2:
-                raise ValueError(f"`rope_scaling.{key}` must have length {rotary_ndims // 2}")
 
 
 class Phi4MMLoRALinear(nn.Module):
@@ -283,15 +190,15 @@ class Phi4MMMLP(nn.Module):
         self.gate_up_proj = Phi4MMLoRALinear(
             config.hidden_size,
             2 * config.intermediate_size,
-            vision_lora=config.vision_lora,
-            speech_lora=config.speech_lora,
+            vision_lora=getattr(config, "vision_lora", None),
+            speech_lora=getattr(config, "speech_lora", None),
             bias=False,
         )
         self.down_proj = Phi4MMLoRALinear(
             config.intermediate_size,
             config.hidden_size,
-            vision_lora=config.vision_lora,
-            speech_lora=config.speech_lora,
+            vision_lora=getattr(config, "vision_lora", None),
+            speech_lora=getattr(config, "speech_lora", None),
             bias=False,
         )
         self.activation_fn = ACT2FN[config.hidden_act]
@@ -325,15 +232,15 @@ class Phi4MMAttention(nn.Module):
         self.qkv_proj = Phi4MMLoRALinear(
             config.hidden_size,
             op_size,
-            vision_lora=config.vision_lora,
-            speech_lora=config.speech_lora,
+            vision_lora=getattr(config, "vision_lora", None),
+            speech_lora=getattr(config, "speech_lora", None),
             bias=False,
         )
         self.o_proj = Phi4MMLoRALinear(
             self.num_heads * self.head_dim,
             config.hidden_size,
-            vision_lora=config.vision_lora,
-            speech_lora=config.speech_lora,
+            vision_lora=getattr(config, "vision_lora", None),
+            speech_lora=getattr(config, "speech_lora", None),
             bias=False,
         )
         self.rotary_emb = Phi4MMRotaryEmbedding(self.rotary_ndims, config)
@@ -609,7 +516,7 @@ class Phi4MMAudioEmbedding(nn.Module):
         aux = _load_hf_aux_module(
             config._name_or_path, "speech_conformer_encoder.py", "phi4mm_audio_aux"
         )
-        encoder_config = config.audio_processor["config"]
+        encoder_config = getattr(config, "audio_processor", None)["config"]
         self.encoder = aux.ConformerEncoder(**encoder_config)
         hidden_size = config.hidden_size
         downsample_rate = kwargs.get("downsample_rate", 1)
@@ -757,8 +664,9 @@ class Phi4MMModel(Phi4MMPreTrainedModel):
         self.padding_idx = config.pad_token_id
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size, self.padding_idx)
         self.embed_tokens_extend = None
-        if isinstance(config.embd_layer, dict):
-            self.embed_tokens_extend = Phi4MMImageAudioEmbedding(config, **config.embd_layer)
+        embd_layer = getattr(config, "embd_layer", None)
+        if isinstance(embd_layer, dict):
+            self.embed_tokens_extend = Phi4MMImageAudioEmbedding(config, **embd_layer)
         self.layers = nn.ModuleList(
             [Phi4MMDecoderLayer(config, layer_idx) for layer_idx in range(config.num_hidden_layers)]
         )
@@ -908,12 +816,4 @@ class Phi4MMForCausalLM(Phi4MMPreTrainedModel, GenerationMixin):
         return Phi4MMCausalLMOutput(logits=logits)
 
 
-try:
-    AutoConfig.register("phi4mm", Phi4MMConfig, exist_ok=True)
-except TypeError:
-    try:
-        AutoConfig.register("phi4mm", Phi4MMConfig)
-    except ValueError:
-        pass
-
-AutoModelForCausalLMFactory.register_custom_model_cls("Phi4MMConfig", Phi4MMForCausalLM)
+AutoModelForCausalLMFactory.register_custom_model_cls("Phi4MultimodalConfig", Phi4MMForCausalLM)
