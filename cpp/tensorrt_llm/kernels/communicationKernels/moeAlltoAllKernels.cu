@@ -980,11 +980,55 @@ __device__ void vectorized_combine(T* dst_typed_base, int size_per_token, int st
     }
 }
 
-// Vectorized per-element type-conversion helpers (must precede the kernel that calls them).
-// SrcT → DstT, using vec_t for wide loads and stores.
+// ---- vec_convert: per-vector type conversion, specialized by PTX where available ----
+// Generic: SrcT → float → DstT (all architectures, all type combinations).
+template <size_t VEC_SIZE, typename SrcT, typename DstT>
+__device__ __forceinline__ void vec_convert(
+    flashinfer::vec_t<DstT, VEC_SIZE>& out, flashinfer::vec_t<SrcT, VEC_SIZE> const& in)
+{
+#pragma unroll
+    for (int j = 0; j < VEC_SIZE; ++j)
+        out[j] = DstT(static_cast<float>(in[j]));
+}
+
+// BF16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.bf16x2 (SM100+, Blackwell).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
+__device__ __forceinline__ void vec_convert(
+    flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out, flashinfer::vec_t<__nv_bfloat16, VEC_SIZE> const& in)
+{
+    uint32_t const* src_u32 = reinterpret_cast<uint32_t const*>(&in);
+    uint16_t* dst_u16 = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+    for (int p = 0; p < VEC_SIZE / 2; ++p)
+    {
+        uint16_t d;
+        asm volatile("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
+        dst_u16[p] = d;
+    }
+}
+#endif
+
+// FP16 → FP8 e4m3: paired PTX cvt.rn.satfinite.e4m3x2.f16x2 (SM89+, Hopper).
+#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 890)
+template <size_t VEC_SIZE, std::enable_if_t<(VEC_SIZE % 2 == 0), int> = 0>
+__device__ __forceinline__ void vec_convert(
+    flashinfer::vec_t<__nv_fp8_e4m3, VEC_SIZE>& out, flashinfer::vec_t<half, VEC_SIZE> const& in)
+{
+    uint32_t const* src_u32 = reinterpret_cast<uint32_t const*>(&in);
+    uint16_t* dst_u16 = reinterpret_cast<uint16_t*>(&out);
+#pragma unroll
+    for (int p = 0; p < VEC_SIZE / 2; ++p)
+    {
+        uint16_t d;
+        asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
+        dst_u16[p] = d;
+    }
+}
+#endif
+
+// ---- vectorized_quant_impl: load → sync → convert → store ----
 // VEC_SIZE is in elements (not bytes), so both SrcT and DstT vectors hold VEC_SIZE values.
-// On SM89+, bf16/fp16 → fp8_e4m3 uses paired PTX cvt instructions (2 elements per instruction),
-// bypassing the float intermediate.  All other type combinations go through float.
 template <int VEC_SIZE, typename ThreadingPolicy, typename SrcT, typename DstT>
 __device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elements)
 {
@@ -994,7 +1038,6 @@ __device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elemen
 
     for (int e = ThreadingPolicy::offset() * VEC_SIZE; e < num_elements; e += stride)
     {
-        // Vectorized load of VEC_SIZE SrcT elements.
         vec_t<SrcT, VEC_SIZE> in_vec;
         in_vec.load(src + e);
 
@@ -1005,45 +1048,8 @@ __device__ void vectorized_quant_impl(DstT* dst, SrcT const* src, int num_elemen
         // updated data.
         ThreadingPolicy::sync();
 
-        // Convert SrcT → DstT.
         vec_t<DstT, VEC_SIZE> out_vec;
-
-#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
-        // SM89+: for bf16/fp16 → fp8_e4m3 with even VEC_SIZE, use paired PTX conversion.
-        // cvt.rn.satfinite.e4m3x2.{bf16x2|f16x2} converts 2 values in one instruction:
-        //   src u32: bf16/fp16[0] in bits 0:15, bf16/fp16[1] in bits 16:31
-        //   dst u32: fp8_e4m3[0] in bits 0:7,  fp8_e4m3[1]  in bits 8:15
-        // in_vec storage is reinterpreted as uint32_t pairs (2×16-bit → 1×32-bit),
-        // out_vec storage as uint16_t pairs (2×fp8 → 1×uint16, low 16 bits of dst u32).
-        if constexpr ((std::is_same_v<SrcT, __nv_bfloat16>
-                          || std::is_same_v<SrcT, half>) &&std::is_same_v<DstT, __nv_fp8_e4m3>
-            && VEC_SIZE % 2 == 0)
-        {
-            uint32_t const* src_u32 = reinterpret_cast<uint32_t const*>(&in_vec);
-            uint16_t* dst_u16 = reinterpret_cast<uint16_t*>(&out_vec);
-#pragma unroll
-            for (int p = 0; p < VEC_SIZE / 2; ++p)
-            {
-                // Output is .b16 (2×fp8_e4m3 packed): use "=h" (16-bit register constraint).
-                // Input  is .b32 (2×bf16/fp16 packed): use  "r" (32-bit register constraint).
-                uint16_t d;
-                if constexpr (std::is_same_v<SrcT, __nv_bfloat16>)
-                    asm volatile("cvt.rn.satfinite.e4m3x2.bf16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
-                else
-                    asm volatile("cvt.rn.satfinite.e4m3x2.f16x2 %0, %1;" : "=h"(d) : "r"(src_u32[p]));
-                dst_u16[p] = d;
-            }
-        }
-        else
-#endif
-        {
-            // Generic path: SrcT → float → DstT.
-#pragma unroll
-            for (int j = 0; j < VEC_SIZE; ++j)
-                out_vec[j] = DstT(static_cast<float>(in_vec[j]));
-        }
-
-        // Vectorized store of VEC_SIZE DstT elements.
+        vec_convert(out_vec, in_vec);
         out_vec.store(dst + e);
     }
 }
