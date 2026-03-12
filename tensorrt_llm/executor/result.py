@@ -177,6 +177,7 @@ class GenerationResultBase:
         # None indicates not yet available (e.g., before first step/stream).
         self.avg_decoded_tokens_per_iter: Optional[float] = None
         self._done = False
+        self._aborted = False
         self.metrics_dict = {}
         self.trace_headers: Optional[dict[str, str]] = None
         # torch backend will use trtllm sampler in beam search mode, but it does not support return logprobs incrementally
@@ -211,6 +212,22 @@ class GenerationResultBase:
         # request. SamplingParams is necessary for creating dummy
         # GenerationResultBase instances on postprocess worker processes.
         self._params_transmitted = False
+
+    def abort(self) -> None:
+        """Abort the generation request.
+
+        Base implementation sets the aborted flag. Subclasses with executor
+        access (e.g. GenerationResult) override to also cancel on the executor.
+        """
+        self._aborted = True
+
+    def aborted(self) -> bool:
+        """Return whether the generation request is aborted.
+
+        Returns:
+            bool: whether the generation request is aborted.
+        """
+        return self._aborted
 
     @property
     def outputs(self) -> List[CompletionOutput]:
@@ -417,6 +434,9 @@ class GenerationResultBase:
 
             if response.metrics:
                 self.metrics_dict.update(response.metrics)
+
+            if response.should_abort and not self._aborted:
+                self.abort()
 
             if response.error:
                 if self._background_error_handler is not None and (
@@ -764,7 +784,6 @@ class GenerationResult(GenerationResultBase):
         # for aborting the request
         self._executor: Optional[weakref.ReferenceType[
             "GenerationExecutor"]] = weakref.ref(executor) if executor else None
-        self._aborted = False
 
         # Pipelined multimodal hashes from request to result
         mm_hashes = getattr(
@@ -785,15 +804,7 @@ class GenerationResult(GenerationResultBase):
         """
         assert self._executor is not None, "The executor is not set for this result."
         self._executor().abort_request(self.request_id)
-        self._aborted = True
-
-    def aborted(self) -> bool:
-        """Return whether the generation request is aborted.
-
-        Returns:
-            bool: whether the generation request is aborted.
-        """
-        return self._aborted
+        super().abort()
 
     @property
     def finished(self) -> bool:
