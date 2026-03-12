@@ -1,0 +1,153 @@
+.trtllm-config-selector {
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  border-radius: 10px;
+  padding: 16px;
+  margin: 16px 0;
+}
+
+.trtllm-config-selector__header {
+  margin-bottom: 12px;
+}
+
+.trtllm-config-selector__subtitle {
+  font-size: 0.95rem;
+  opacity: 0.8;
+  margin-top: 4px;
+}
+
+.trtllm-config-selector__form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 12px;
+  margin-top: 12px;
+}
+
+.trtllm-config-selector__label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.85rem;
+  margin-bottom: 6px;
+  opacity: 0.9;
+}
+
+.trtllm-config-selector__step {
+  flex: 0 0 auto;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 999px;
+  font-size: 0.68rem;
+  font-weight: 600;
+  letter-spacing: 0.01em;
+  border: 1px solid rgba(127, 127, 127, 0.18);
+  background: rgba(127, 127, 127, 0.06);
+  color: inherit;
+  opacity: 0.65;
+}
+
+.trtllm-config-selector__labelText {
+  line-height: 1.2;
+}
+
+.trtllm-config-selector__select {
+  width: 100%;
+  padding: 8px 10px;
+  border-radius: 8px;
+  border: 1px solid rgba(0, 0, 0, 0.18);
+  background: transparent;
+}
+
+.trtllm-config-selector__output {
+  margin-top: 14px;
+}
+
+.trtllm-config-selector__cmd {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  overflow-x: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  position: relative;
+  padding-right: 54px; /* room for inline copy button */
+}
+
+.trtllm-config-selector__meta {
+  margin-top: 8px;
+  font-size: 0.9rem;
+  opacity: 0.85;
+}
+
+.trtllm-config-selector__yamlDetails {
+  margin-top: 12px;
+}
+
+.trtllm-config-selector__yamlSummary {
+  cursor: pointer;
+  font-weight: 600;
+}
+
+.trtllm-config-selector__yamlBox {
+  margin-top: 10px;
+}
+
+.trtllm-config-selector__yamlPre {
+  margin: 0;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  overflow-x: auto;
+  max-height: 520px;
+  position: relative;
+  padding-right: 54px; /* room for inline copy button */
+}
+
+.trtllm-config-selector__copyInline {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  font-size: 0.85rem;
+  padding: 6px 10px;
+  border-radius: 10px;
+  border: 1px solid rgba(0, 0, 0, 0.12);
+  background: rgba(255, 255, 255, 0.9);
+  cursor: pointer;
+}
+
+.trtllm-config-selector__copyInline:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.trtllm-config-selector__copyInline:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 1);
+}
+
+.trtllm-config-selector__configLink {
+  text-decoration: underline;
+}
+
+.yaml-key {
+  font-weight: 600;
+}
+
+.yaml-comment {
+  opacity: 0.7;
+}
+
+.yaml-punct,
+.yaml-bool,
+.yaml-num,
+.yaml-str {
+  opacity: 0.9;
+}
+
+.trtllm-config-selector__error {
+  margin-top: 10px;
+  font-size: 0.9rem;
+  opacity: 0.85;
+}
