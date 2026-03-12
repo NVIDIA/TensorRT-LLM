@@ -261,7 +261,7 @@ class MnnvlMemory:
                             )
                     try:
                         _check_cu_result(cuda.cuMemRelease(allocated_mem_handle))
-                    except Exception as e:
+                    except RuntimeError as e:
                         logger.warning(
                             "cuMemRelease failed during error cleanup (original error will be raised): %s",
                             e,
