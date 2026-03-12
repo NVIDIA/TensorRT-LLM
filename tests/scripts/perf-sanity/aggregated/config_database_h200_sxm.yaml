@@ -10,7 +10,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -43,7 +43,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -114,7 +114,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -147,7 +147,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -217,7 +217,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -250,7 +250,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -283,7 +283,7 @@ server_configs:
   print_iter_log: true
   kv_cache_config:
     dtype: fp8
-    free_gpu_memory_fraction: 0.8
+    free_gpu_memory_fraction: 0.6
     enable_block_reuse: false
   stream_interval: 10
   moe_config:
@@ -315,7 +315,7 @@ server_configs:
     enable_padding: true
     max_batch_size: 4
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   moe_config:
     backend: TRITON
@@ -346,7 +346,7 @@ server_configs:
     enable_padding: true
     max_batch_size: 64
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   moe_config:
     backend: TRITON
@@ -380,7 +380,7 @@ server_configs:
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -413,7 +413,7 @@ server_configs:
     enable_padding: true
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -445,7 +445,7 @@ server_configs:
     max_batch_size: 384
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -477,7 +477,7 @@ server_configs:
     max_batch_size: 1024
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -509,7 +509,7 @@ server_configs:
     max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -541,7 +541,7 @@ server_configs:
     max_batch_size: 64
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -573,7 +573,7 @@ server_configs:
     max_batch_size: 1280
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -605,7 +605,7 @@ server_configs:
     max_batch_size: 512
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -637,7 +637,7 @@ server_configs:
     max_batch_size: 1
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -669,7 +669,7 @@ server_configs:
     max_batch_size: 64
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -701,7 +701,7 @@ server_configs:
     max_batch_size: 1536
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -733,7 +733,7 @@ server_configs:
     max_batch_size: 2
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -765,7 +765,7 @@ server_configs:
     max_batch_size: 4
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -797,7 +797,7 @@ server_configs:
     max_batch_size: 768
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -830,7 +830,7 @@ server_configs:
   enable_attention_dp: true
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -862,7 +862,7 @@ server_configs:
     max_batch_size: 256
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:
@@ -894,7 +894,7 @@ server_configs:
     max_batch_size: 384
   print_iter_log: true
   kv_cache_config:
-    free_gpu_memory_fraction: 0.85
+    free_gpu_memory_fraction: 0.65
     enable_block_reuse: false
   stream_interval: 20
   moe_config:

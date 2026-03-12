@@ -23,7 +23,7 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.6
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -53,7 +53,7 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.6
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:
@@ -83,7 +83,7 @@ server_configs:
     kv_cache_config:
       dtype: 'fp8'
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.85
+      free_gpu_memory_fraction: 0.6
     num_postprocess_workers: 4
     stream_interval: 20
     client_configs:

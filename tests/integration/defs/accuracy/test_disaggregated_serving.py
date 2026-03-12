@@ -598,7 +598,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": ctx_disable_overlap_scheduler,
             "kv_cache_config": {
                 "enable_block_reuse": ctx_enable_block_reuse,
-                "free_gpu_memory_fraction": 0.6
+                "free_gpu_memory_fraction": 0.4
             }
         }
         ctx_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
@@ -606,7 +606,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": gen_disable_overlap_scheduler,
             "kv_cache_config": {
                 "enable_block_reuse": gen_enable_block_reuse,
-                "free_gpu_memory_fraction": 0.6
+                "free_gpu_memory_fraction": 0.3
             }
         }
         gen_server_config["cache_transceiver_config"] = {"backend": "DEFAULT"}
@@ -1514,6 +1514,7 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
                 "backend": "UCX"
             },
             "max_batch_size": max_batch_size,
+            "kv_cache_config": kv_cache_config,
         }
         disaggregated_server_config = {
             "hostname": "localhost",
