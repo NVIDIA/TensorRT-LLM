@@ -217,7 +217,7 @@ command for the unit tests you added so they can be run by the reviewer as well.
 - **Reuse config classes:** Import from `transformers` or load from checkpoint whenever possible. Only bundle a config class if it truly doesn't exist anywhere.
 - **Assert `position_ids`:** Always assert `position_ids is not None` — it is a required input, never optional.
 - **Self-contained files only**: Never import from other AD custom models. Each `modeling_{name}.py` is a standalone translation from HF source.
-- RoPE buffers: `_ad_` prefix, return full table (not sliced), slice by `position_ids` downstream.
+- RoPE buffers: `_ad_` prefix. The `RotaryEmbedding.forward(x, position_ids)` should slice by `position_ids` once and return pre-sliced `(cos, sin)` to all layers. Do NOT pass `position_ids` through to every attention forward — that is wasteful redundant slicing.
 - MoE weights: use `nn.ModuleList` per-expert for checkpoint compatibility. Write test-only state_dict converters for HF stacked format.
 - `noaux_tc` routers (DeepSeek-V3 style): use vanilla PyTorch (sigmoid + bias + group topk + normalize + scale). AD transforms can replace with fused `trtllm` kernels at deployment time.
 - Vision towers are typically **not** exported. Keep vision logic in eager PyTorch and export only the text path unless explicitly requested otherwise.
