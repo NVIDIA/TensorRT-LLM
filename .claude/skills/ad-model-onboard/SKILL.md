@@ -10,6 +10,14 @@ description: Translates a HuggingFace model into a prefill-only AutoDeploy custo
 ## Phase 0 — Gather All Resources Upfront
 Web/GitHub fetches require user approval and the user may leave. Do ALL network access now and save locally before proceeding.
 
+### Step 0 — GPU memory sanity check
+
+Before anything else, check whether the model can fit on the current system.
+
+1. Run `nvidia-smi --query-gpu=memory.total --format=csv,noheader,nounits` to get the total VRAM (in MiB) across all GPUs on the system.
+2. Estimate the model's memory footprint from the HuggingFace model card or config (number of parameters × bytes per parameter, e.g. 7B params × 2 bytes = ~14 GB for bfloat16).
+3. If the estimated size exceeds total system VRAM, **stop and report this to the user** — do not proceed with onboarding until the user acknowledges and decides how to proceed. Example message: "This model requires ~Xgb but the system only has Ygb across N GPUs. Onboarding is likely to fail at the e2e run stage."
+
 **Step 1 — Check local transformers install first:**
 ```bash
 python -c "import transformers; print(transformers.__file__)"
@@ -85,8 +93,8 @@ Available canonical ops (see `tensorrt_llm/_torch/auto_deploy/custom_ops/README.
 ## Phase 4 — Register
 1. Bottom of model file: `AutoModelForCausalLMFactory.register_custom_model_cls("ConfigClassName", ForCausalLM)`.
 2. Add import + `__all__` entry in `models/custom/__init__.py`.
-3. **Prefer reusing the existing config class** — if the config can be loaded via `AutoConfig.from_pretrained(model_id)` (either from the installed `transformers` or from files in the HF cache downloaded in Phase 0), import it from `transformers` and use it directly. Do NOT recreate or copy the config class into the modeling file when it is already available.
-4. Only if the config is truly not available (not in `transformers` and not bundled with the checkpoint), define a minimal config class in the modeling file and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`.
+3. **Prefer reusing the existing config class** — if the config can be loaded via `AutoConfig.from_pretrained(model_id)` (either from the installed `transformers` or from files in the HF cache downloaded in Phase 0), import it from `transformers` and use it directly. Do NOT recreate or copy the config class into the modeling file when it is already available. Note: AD's factory already calls `AutoConfig.from_pretrained(model_id, trust_remote_code=True)` and passes the result to your model, so you rarely need to import the config at all — if you find yourself doing so, sanity-check that it's genuinely needed.
+4. Only if the config is truly not available (not in `transformers` and not bundled with the checkpoint), define a minimal config class in the modeling file and `AutoConfig.register(model_type, ConfigCls, exist_ok=True)`. A good sanity check: if the E2E test passes without a custom config class, you don't need one — `AutoConfig.from_pretrained` already picked up the right class.
 
 ## Phase 5 — Model Input Contract
 The custom model's forward signature must follow these rules:
@@ -99,9 +107,9 @@ The custom model's forward signature must follow these rules:
 ## Phase 6 — Hierarchical Tests
 Create `tests/unittest/_torch/auto_deploy/unit/singlegpu/models/test_{name}_modeling.py`. Use `test_glm4_moe_lite_modeling.py` as template. **No smoke tests.** Small config (hidden=64, layers=2-3, vocab=1000). Use `pytest.skip` if HF class unavailable.
 
-**HF Reference Strategy:** Equivalence tests compare our custom implementation against the HF reference with identical weights and inputs.
+**HF Reference Strategy:** Equivalence tests compare our custom implementation against the HF reference with identical weights and inputs. **Use actual HF classes if they exist — prefer importing directly over standalone HF-like implementations for unit tests.** Standalone "reference" implementations are effectively alternative AD IR models and defeat the purpose of the reference test; they also tend to silently agree with whatever bugs exist in the custom model.
 - **If HF modules exist in the installed `transformers`**: import them directly (e.g., `from transformers.models.deepseek_v3.modeling_deepseek_v3 import DeepseekV3ForCausalLM`). Wrap imports in `_get_hf_*_class()` try/except helpers that return `None` on `ImportError`, and use `pytest.skip` when `None`.
-- **If HF modules are NOT in the installed `transformers`**: copy the minimal module definitions from the HF `modeling_*.py` source into the test file as standalone reference classes. This keeps tests self-contained without requiring a specific `transformers` version. **Important**: make sure the copy is minimal and strictly faithful to the HF implementation only. Do NOT tweak the functionality of the reference.
+- **If HF modules are NOT in the installed `transformers`**: copy the minimal module definitions from the HF `modeling_*.py` source into the test file as standalone reference classes. This keeps tests self-contained without requiring a specific `transformers` version or HF cache at test time. **Important**: make sure the copy is minimal and strictly faithful to the HF implementation only. Do NOT tweak the functionality of the reference. The same applies to **config classes** that use `trust_remote_code` (i.e., not available in `transformers`): copy a minimal faithful version into the test file. The modeling file should NOT import the config class — AD loads it at runtime via `AutoConfig.from_pretrained(..., trust_remote_code=True)`. The test-only config copy lets you verify config-wrapping behavior (e.g., structure of state_dict).
 - **Weight conversion helpers**: Write test-only helpers for any weight format differences between HF and custom (e.g., RoPE de-interleaving, stacked-to-per-expert MoE weights, gate weight key remapping). For full-model tests, prefer using `load_state_dict` pre-hooks already registered on the custom model.
 
 **Numerical comparison:** For equivalence tests comparing custom ops against HF reference, use the shared `assert_rmse_close` utility from `_model_test_utils`:
@@ -190,6 +198,10 @@ Run with full num layers. The generation should be coherent in step 2.
   - "changed attention backend to torch_mha"
   - "fixed weight loading hooks"
 
+The model is run via:
+```bash
+CUDA_VISIBLE_DEVICES=<SELECTED_GPUS> python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
+```
 The `ad-run-agent` will determine the required `world_size` from the registry, check GPU availability via `nvidia-smi`, select free GPUs, and wait if not enough are available.
 
 The ad-run-agent will build+run the model, check generation quality, archive logs, and update its worklog.
@@ -233,7 +245,7 @@ When you post a PR, you **MUST** include:
 ```
 python examples/auto_deploy/build_and_run_ad.py --model <MODEL-ID> --use-registry
 ```
-3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well.
+3. A detailed pytest command for the unit tests you added so they can be run by the reviewer as well. Make sure you have run this pytest command on the latest commit that you are pushing, and include these results in the PR.
 
 ## Key Gotchas
 - **Canonical ops first:** Always use `torch.ops.auto_deploy.torch_*` canonical ops whenever one exists for the operation. This is how AD knows what to optimize. Writing manual attention, MoE, RoPE, or normalization in plain PyTorch instead of using the canonical op will prevent AD transforms from working.
