@@ -16,6 +16,7 @@ from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreT
 from .modeling_nemotron_h import NemotronHForCausalLM
 from .modeling_olmo3 import Olmo3ForCausalLM
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
+from .modeling_qwen3_moe import Qwen3MoeForCausalLM
 from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
 from .modeling_smollm3 import SmolLM3ForCausalLM
 from .modeling_starcoder2 import Starcoder2ForCausalLM
@@ -44,6 +45,7 @@ __all__ = (
     "Qwen3ForCausalLM",
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
+    "Qwen3MoeForCausalLM",
     "SkyworkR1V2ForConditionalGeneration",
     "SmolLM3ForCausalLM",
     "Starcoder2ForCausalLM",
