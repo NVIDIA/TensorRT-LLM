@@ -13,6 +13,7 @@ from .modeling_llama3 import Llama3ForCausalLM
 from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
+from .modeling_olmo3 import Olmo3ForCausalLM
 from .modeling_qwen3 import Qwen3ForCausalLM
 from .modeling_qwen3_5 import Qwen3_5ForCausalLM, Qwen3_5ForConditionalGeneration
 from .modeling_phi4 import Phi4ForCausalLM
@@ -42,6 +43,7 @@ __all__ = (
     "NemotronFlashForCausalLM",
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",
+    "Olmo3ForCausalLM",
     "Qwen3ForCausalLM",
     "Qwen3_5ForCausalLM",
     "Qwen3_5ForConditionalGeneration",
