@@ -639,13 +639,7 @@ class TrtllmAttention(AttentionDescriptor):
         from tensor shapes or SequenceInfo metadata at runtime.
         """
         # Sanity check: layout == "bsnd"
-        layout = source_attn_node.kwargs.get("layout", None)
-        if (
-            layout is None
-            and len(source_attn_node.args) > 0
-            and isinstance(source_attn_node.args[-1], str)
-        ):
-            layout = source_attn_node.args[-1]
+        layout = extract_op_args(source_attn_node, "layout")[0]
         if layout != "bsnd":
             raise RuntimeError(
                 f"Expected torch_attention layout='bsnd' but got {layout!r} "
