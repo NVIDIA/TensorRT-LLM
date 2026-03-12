@@ -66,7 +66,7 @@ tkc::CutlassGemmConfig getDefaultGemmConfig(int64_t m, int64_t n, int64_t k, FP4
             // SM120 (B200) has ~228 KiB, but SM121 (GB10/DGX Spark) only has ~99 KiB
             // (101376 bytes). The 128x128x256B tile requires >99 KiB and overflows on GB10.
             // Use 105 KiB as a conservative threshold with safety margin.
-            static int const maxSmem = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
+            int const maxSmem = tensorrt_llm::common::getMaxSharedMemoryPerBlockOptin();
             constexpr int kMinSmemForLargeTile = 105 * 1024;
             auto tileConfig = maxSmem > kMinSmemForLargeTile ? tkc::CutlassTileConfigSM120::CtaShape128x128x256B
                                                              : tkc::CutlassTileConfigSM120::CtaShape128x128x128B;
