@@ -1174,3 +1174,20 @@ class MiniMaxAllReduceRMS(nn.Module):
                                                       self.mapping.tp_rank,
                                                       self.mapping.tp_size, eps,
                                                       False)
+
+    def forward_qk(self, q: torch.Tensor, k: torch.Tensor,
+                   rms_weights_q: torch.Tensor, rms_weights_k: torch.Tensor,
+                   eps: float):
+        """Fused Q+K RMS norm with allreduce. Returns (q_out, k_out)."""
+        out_list = torch.ops.trtllm.minimax_allreduce_rms_qk(
+            q,
+            k,
+            rms_weights_q,
+            rms_weights_k,
+            self.workspace,
+            self.mapping.tp_rank,
+            self.mapping.tp_size,
+            eps,
+            False,
+        )
+        return (out_list[0], out_list[1])

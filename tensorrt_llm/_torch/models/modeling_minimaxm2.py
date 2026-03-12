@@ -217,26 +217,13 @@ class MiniMaxM2Attention(Attention):
             )
 
     def apply_qk_norm(self, q, k):
-        q = self.q_norm(q)
-        k = self.k_norm(k)
-        # if self.qkv_proj.mapping.tp_size > 1:
-        #     # collect q and k from all gpus
-        #     from ..distributed import allgather
-
-        #     temp_q = allgather(q, self.qkv_proj.mapping)
-        #     temp_k = allgather(k, self.qkv_proj.mapping)
-        #     temp_q = self.q_norm(temp_q)
-        #     temp_k = self.k_norm(temp_k)
-        #     q = temp_q.reshape(-1, self.tp_size, self.q_size)[:, self.tp_rank, :].reshape(
-        #         -1, self.q_size
-        #     )
-        #     k = temp_k.reshape(-1, self.tp_size, self.kv_size)[:, self.tp_rank, :].reshape(
-        #         -1, self.kv_size
-        #     )
-        # else:
-        #     q = self.q_norm(q)
-        #     k = self.k_norm(k)
-
+        if self.qkv_proj.mapping.tp_size > 1:
+            q, k = self.q_norm.minimax_all_reduce_rms.forward_qk(
+                q, k, self.q_norm.weight, self.k_norm.weight, self.q_norm.eps
+            )
+        else:
+            q = self.q_norm(q)
+            k = self.k_norm(k)
         return q, k
 
     def apply_rope(

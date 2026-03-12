@@ -45,12 +45,17 @@ struct MiniMaxReduceRMSParams
     int nranks{};
     int rank{};
     nvinfer1::DataType dtype;
-    int size{};
-    int hidden_dim{};
+    int size_q{};           // numel of Q (num_token * head_dim_q)
+    int hidden_dim{};       // head_dim_q
+    int size_k{};           // numel of K (num_token * head_dim_k)
+    int hidden_dim_k{};     // head_dim_k; must have head_dim_q >= head_dim_k
     void** workspace{};
-    void* allreduce_in{};
-    void* rms_norm_out{};
-    void* rms_gamma{};
+    void* allreduce_in{};   // Q input
+    void* rms_norm_out{};   // Q output
+    void* rms_gamma{};      // Q norm weight
+    void* allreduce_in_k{}; // K input (nullptr for single-matrix path)
+    void* rms_norm_out_k{}; // K output
+    void* rms_gamma_k{};    // K norm weight
     float rms_eps{};
     cudaStream_t stream{};
     bool trigger_completion_at_end = true;

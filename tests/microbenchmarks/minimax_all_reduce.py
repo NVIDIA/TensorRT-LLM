@@ -37,6 +37,10 @@ from tensorrt_llm.plugin.plugin import CustomAllReduceHelper
 # MiniMax all-reduce only uses D (hidden_size) 128 and 1536 in practice.
 ALLOWED_HIDDEN_SIZES = (128, 1536)
 
+# Q+K fused API benchmark dimensions
+QK_Q_DIM = 1536
+QK_K_DIM = 128
+
 
 def profile_minimax_allreduce_rms(
     mapping: Mapping,
@@ -62,6 +66,64 @@ def profile_minimax_allreduce_rms(
     with (
         torch.cuda.stream(stream),
         nvtx_range(f"minimax_allreduce_rms: shape={input_tensor.size(0)}x{input_tensor.size(1)}"),
+    ):
+        func(loop_num=1)
+
+        if enable_cudagraph:
+            for i in range(2):
+                func(loop_num=1)
+            with torch.cuda.graph(graph, stream=stream):
+                _ = func()
+
+        delay_kernel(20000, stream)
+
+        torch.cuda.synchronize()
+        torch.cuda.profiler.start()
+
+        for i in range(outer_loop):
+            start[i].record(stream)
+            if enable_cudagraph:
+                graph.replay()
+            else:
+                _ = func()
+            stop[i].record(stream)
+
+    torch.cuda.synchronize()
+    torch.cuda.profiler.stop()
+    runtimes = [start[i].elapsed_time(stop[i]) for i in range(outer_loop)]
+    median_ms = sorted(runtimes)[len(runtimes) // 2] / inner_loop
+    return median_ms
+
+
+def profile_minimax_allreduce_rms_qk(
+    mapping: Mapping,
+    op: MiniMaxAllReduceRMS,
+    enable_cudagraph: bool = False,
+    inner_loop: int = 200,
+    outer_loop: int = 10,
+    q_tensor=None,
+    k_tensor=None,
+    norm_weight_q=None,
+    norm_weight_k=None,
+    eps: float = 1e-5,
+):
+    """Profile the fused Q+K minimax allreduce RMS API (forward_qk)."""
+
+    def func(loop_num=inner_loop):
+        out_q, out_k = None, None
+        for _ in range(loop_num):
+            out_q, out_k = op.forward_qk(q_tensor, k_tensor, norm_weight_q, norm_weight_k, eps)
+        return (out_q, out_k)
+
+    start = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
+    stop = [torch.cuda.Event(enable_timing=True) for _ in range(outer_loop)]
+    graph = torch.cuda.CUDAGraph()
+
+    stream = torch.cuda.Stream()
+    n_tok, q_d, k_d = q_tensor.size(0), q_tensor.size(1), k_tensor.size(1)
+    with (
+        torch.cuda.stream(stream),
+        nvtx_range(f"minimax_allreduce_rms_qk: shape={n_tok}x{q_d}+{n_tok}x{k_d}"),
     ):
         func(loop_num=1)
 
@@ -170,9 +232,12 @@ def minimax_allreduce_benchmark(
                         {
                             "world_size": [mapping.world_size],
                             "dtype": [dtype],
+                            "api": ["single"],
                             "message_size_bytes": [message_size_bytes],
                             "num_tokens": [num_tokens],
                             "hidden_size": [hidden_size],
+                            "q_dim": [pd.NA],
+                            "k_dim": [pd.NA],
                             "time (us)": [median_ms * 1000],
                         }
                     ),
@@ -181,6 +246,56 @@ def minimax_allreduce_benchmark(
             print(
                 f"num_tokens: {num_tokens}, hidden_size: {hidden_size}, "
                 f"time (us): {median_ms * 1000}"
+            )
+
+    # Q+K fused API benchmark: q_dim=1536, k_dim=128
+    num_tokens_qk = sorted({n for n, _ in shape_list})
+    for num_tokens in num_tokens_qk:
+        q_tensor = torch.ones((num_tokens, QK_Q_DIM), dtype=torch_dtype, device="cuda")
+        k_tensor = torch.ones((num_tokens, QK_K_DIM), dtype=torch_dtype, device="cuda")
+        norm_weight_q = torch.randn((QK_Q_DIM,), dtype=torch_dtype, device="cuda")
+        norm_weight_k = torch.randn((QK_K_DIM,), dtype=torch_dtype, device="cuda")
+        message_size_bytes_qk = (
+            num_tokens * (QK_Q_DIM + QK_K_DIM) * torch.finfo(torch_dtype).bits // 8
+        )
+        if message_size_bytes_qk > max_workspace:
+            continue
+
+        median_ms_qk = profile_minimax_allreduce_rms_qk(
+            mapping=mapping,
+            op=op,
+            enable_cudagraph=enable_cudagraph,
+            inner_loop=inner_loop,
+            outer_loop=outer_loop,
+            q_tensor=q_tensor,
+            k_tensor=k_tensor,
+            norm_weight_q=norm_weight_q,
+            norm_weight_k=norm_weight_k,
+            eps=eps,
+        )
+
+        if mapping.rank == 0:
+            df = pd.concat(
+                [
+                    df,
+                    pd.DataFrame(
+                        {
+                            "world_size": [mapping.world_size],
+                            "dtype": [dtype],
+                            "api": ["qk"],
+                            "message_size_bytes": [message_size_bytes_qk],
+                            "num_tokens": [num_tokens],
+                            "hidden_size": [pd.NA],
+                            "q_dim": [QK_Q_DIM],
+                            "k_dim": [QK_K_DIM],
+                            "time (us)": [median_ms_qk * 1000],
+                        }
+                    ),
+                ]
+            )
+            print(
+                f"qk: num_tokens: {num_tokens}, q_dim: {QK_Q_DIM}, k_dim: {QK_K_DIM}, "
+                f"time (us): {median_ms_qk * 1000}"
             )
 
     if mapping.rank == 0:

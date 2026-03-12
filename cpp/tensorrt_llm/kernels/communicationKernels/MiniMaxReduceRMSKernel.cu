@@ -116,7 +116,7 @@ public:
 #endif
         access_id = token_id * params.hidden_dim / kElemsPerAccess<DType> + access_id_in_token;
         access_stride = token_stride * params.hidden_dim / kElemsPerAccess<DType>;
-        tot_access = params.size / kElemsPerAccess<DType>;
+        tot_access = params.size_q / kElemsPerAccess<DType>;
     }
 
     int token_id;
@@ -147,7 +147,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
     int access_id = index_helper.access_id;
     int access_stride = index_helper.access_stride;
     int tot_access = index_helper.tot_access;
-    int tot_tokens = params.size / params.hidden_dim;
+    int tot_tokens = params.size_q / params.hidden_dim;
     float4 clear_vec = get_neg_zero();
     // FusedOp<Pattern, DType> fused_op(params, access_id, access_id_in_token);
 
@@ -236,7 +236,7 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
         // Clear comm buffer that previous kernel used
         reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     }
-    comm.update(params.size * NRanks);
+    comm.update(params.size_q * NRanks);
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (TriggerCompletionAtEnd)
     {
@@ -249,13 +249,15 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport(MiniMa
  * Float4 variant: process 4 rows at once, allreduce variance sums as float4 for better memory coalescing.
  * sum_variance is always float; applies to all DTypes (half, bf16, float).
  * When tot_tokens % 4 != 0, the last group pads rows with zeros; padded rows are not written to rms_norm_out.
+ * IsQK: when true, process Q+K in one loop with doubled comm buffer; when false, single-matrix (Q only).
  */
-template <typename DType, int NRanks, bool TriggerCompletionAtEnd = true>
+template <typename DType, int NRanks, bool IsQK, bool TriggerCompletionAtEnd = true>
 __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4(MiniMaxReduceRMSParams params)
 {
-    int tot_tokens = params.size / params.hidden_dim;
+    int tot_tokens = params.size_q / params.hidden_dim;
     int tot_groups = (tot_tokens + 3) / 4; // ceiling: last group may have 1-3 valid rows
-    int access_per_row = params.hidden_dim / kElemsPerAccess<DType>;
+    int access_per_row_q = params.hidden_dim / kElemsPerAccess<DType>;
+    int access_per_row_k = IsQK ? (params.hidden_dim_k / kElemsPerAccess<DType>) : 0;
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     namespace cg = cooperative_groups;
     cg::cluster_group cluster = cg::this_cluster();
@@ -283,15 +285,16 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
     {
         alignas(16) DType vals[4][kElemsPerAccess<DType>];
         float sum_variance[4] = {0.F, 0.F, 0.F, 0.F};
+        float sum_variance_k[4] = {0.F, 0.F, 0.F, 0.F};
 
-        // Load 4 rows and compute partial sum of squares per row (sum_variance always float)
+        // Load 4 rows of Q and compute partial sum of squares per row
 #pragma unroll
         for (int r = 0; r < 4; ++r)
         {
             int token_r = g * 4 + r;
             if (token_r < tot_tokens)
             {
-                int idx_r = token_r * access_per_row + access_id_in_token;
+                int idx_r = token_r * access_per_row_q + access_id_in_token;
                 *reinterpret_cast<float4*>(&vals[r][0]) = reinterpret_cast<float4 const*>(params.allreduce_in)[idx_r];
 #pragma unroll
                 for (int i = 0; i < kElemsPerAccess<DType>; ++i)
@@ -306,7 +309,32 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
             }
         }
 
+        // Load 4 rows of K only when this thread is in K column range (access_id_in_token < access_per_row_k)
+        if constexpr (IsQK)
+        {
+#pragma unroll
+            for (int r = 0; r < 4; ++r)
+            {
+                int token_r = g * 4 + r;
+                if (token_r < tot_tokens && access_id_in_token < access_per_row_k)
+                {
+                    int idx_r = token_r * access_per_row_k + access_id_in_token;
+                    alignas(16) DType vals_k[kElemsPerAccess<DType>];
+                    *reinterpret_cast<float4*>(vals_k) = reinterpret_cast<float4 const*>(params.allreduce_in_k)[idx_r];
+#pragma unroll
+                    for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+                    {
+                        sum_variance_k[r] += static_cast<float>(vals_k[i]) * static_cast<float>(vals_k[i]);
+                    }
+                }
+            }
+        }
+
         tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_variance);
+        if constexpr (IsQK)
+        {
+            tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_variance_k);
+        }
 #pragma unroll
         for (int r = 0; r < 4; ++r)
         {
@@ -314,9 +342,16 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
             {
                 sum_variance[r] = 0.F;
             }
+            if constexpr (IsQK)
+            {
+                if (is_neg_zero(sum_variance_k[r]))
+                {
+                    sum_variance_k[r] = 0.F;
+                }
+            }
         }
 
-        // Allreduce: write float4, volatile read float4 from each rank, component-wise sum
+        // Allreduce: write float4(s) to comm
         if (threadIdx.x == 0)
         {
             float4 sum4;
@@ -326,10 +361,29 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
             sum4.w = sum_variance[3];
             for (int r = 0; r < NRanks; ++r)
             {
-                reinterpret_cast<float4*>(comm.data_bufs[r])[(params.rank * tot_groups) + g] = sum4;
+                if constexpr (IsQK)
+                {
+                    reinterpret_cast<float4*>(comm.data_bufs[r])[(params.rank * 2 * tot_groups) + 2 * g] = sum4;
+                }
+                else
+                {
+                    reinterpret_cast<float4*>(comm.data_bufs[r])[(params.rank * tot_groups) + g] = sum4;
+                }
+            }
+            if constexpr (IsQK)
+            {
+                sum4.x = sum_variance_k[0];
+                sum4.y = sum_variance_k[1];
+                sum4.z = sum_variance_k[2];
+                sum4.w = sum_variance_k[3];
+                for (int r = 0; r < NRanks; ++r)
+                {
+                    reinterpret_cast<float4*>(comm.data_bufs[r])[(params.rank * 2 * tot_groups) + 2 * g + 1] = sum4;
+                }
             }
         }
 
+        // Read Q from buffer first, sum, then RMS and store Q; then read K, sum, RMS and store K
         bool done = false;
         float4 vars_all_ranks[NRanks];
         while (!done)
@@ -338,12 +392,19 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
 #pragma unroll
             for (int r = 0; r < NRanks; ++r)
             {
-                vars_all_ranks[r]
-                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[(r * tot_groups) + g]);
+                if constexpr (IsQK)
+                {
+                    vars_all_ranks[r] = ld_global_volatile(
+                        &reinterpret_cast<float4*>(comm.data_bufs[params.rank])[(r * 2 * tot_groups) + 2 * g]);
+                }
+                else
+                {
+                    vars_all_ranks[r] = ld_global_volatile(
+                        &reinterpret_cast<float4*>(comm.data_bufs[params.rank])[(r * tot_groups) + g]);
+                }
                 done &= !is_neg_zero(vars_all_ranks[r]);
             }
         }
-
         sum_variance[0] = 0.F;
         sum_variance[1] = 0.F;
         sum_variance[2] = 0.F;
@@ -357,13 +418,13 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
             sum_variance[3] += vars_all_ranks[r].w;
         }
 
-        // Load norm weight (same column for all 4 rows)
+        // Load norm weight for Q (same column for all 4 rows)
         __nv_bfloat16 norm_weight[kElemsPerAccess<DType>];
         *reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type*>(norm_weight)
             = reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type const*>(
                 params.rms_gamma)[access_id_in_token];
 
-        // RMS norm and store 4 rows (skip write for padded rows)
+        // RMS norm and store 4 rows of Q (skip write for padded rows)
         for (int r = 0; r < 4; ++r)
         {
             int token_r = g * 4 + r;
@@ -378,235 +439,64 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
                 vals[r][i]
                     = static_cast<DType>(static_cast<float>(vals[r][i]) * scale * static_cast<float>(norm_weight[i]));
             }
-            int idx_out = token_r * access_per_row + access_id_in_token;
+            int idx_out = token_r * access_per_row_q + access_id_in_token;
             reinterpret_cast<float4*>(params.rms_norm_out)[idx_out] = *reinterpret_cast<float4*>(&vals[r][0]);
         }
-    }
 
-    // Clear comm buffer: clear full size set by previous kernel (same as non-float4 kernel).
-    int clear_access = static_cast<int>(comm.clear_size / kElemsPerAccess<DType>);
-    int clear_stride = group_stride * access_per_row;
-    for (int idx = group_id * access_per_row + threadIdx.x; idx < clear_access; idx += clear_stride)
-    {
-        reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
-    }
-    comm.update(
-        tot_groups * 8 * NRanks); // this size is bf16 elem size, for each token, we use fp32 to store variance sum
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    if constexpr (TriggerCompletionAtEnd)
-    {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-}
-
-/**
- * Pipelined float4 variant: pre-compute first group's local sum, then in loop process
- * "previous" group (allreduce + RMS) while computing "current" group; use fixed
- * sum_prev/sum_curr and vals_prev/vals_curr with explicit copy (no iter%2) to avoid
- * non-constant indexing and register spill.
- */
-template <typename DType, int NRanks, bool TriggerCompletionAtEnd = true>
-__global__ void __launch_bounds__(1024)
-    minimax_reduce_rms_kernel_lamport_float4_pipelined(MiniMaxReduceRMSParams params)
-{
-    int tot_tokens = params.size / params.hidden_dim;
-    int tot_groups = (tot_tokens + 3) / 4;
-    int access_per_row = params.hidden_dim / kElemsPerAccess<DType>;
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    namespace cg = cooperative_groups;
-    cg::cluster_group cluster = cg::this_cluster();
-    cg::grid_group grid = cg::this_grid();
-    int group_id = grid.cluster_rank();
-    int access_id_in_token = cluster.thread_rank();
-    int group_stride = grid.num_clusters();
-#else
-    int group_id = blockIdx.x;
-    int access_id_in_token = threadIdx.x;
-    int group_stride = gridDim.x;
-#endif
-    float4 clear_vec = get_neg_zero();
-
-#if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
-    cudaGridDependencySynchronize();
-    if constexpr (!TriggerCompletionAtEnd)
-    {
-        cudaTriggerProgrammaticLaunchCompletion();
-    }
-#endif
-    LamportComm<NRanks> comm(params.workspace, params.rank);
-
-    __shared__ float sum_global[4];
-
-    int g_first = group_id;
-    if (g_first >= tot_groups)
-    {
-        return;
-    }
-
-    // Fixed double-buffer variables (constant indexing, no spill)
-    alignas(16) DType vals_prev[4][kElemsPerAccess<DType>];
-    alignas(16) DType vals_curr[4][kElemsPerAccess<DType>];
-    float sum_prev[4] = {0.F, 0.F, 0.F, 0.F};
-    float sum_curr[4] = {0.F, 0.F, 0.F, 0.F};
-
-    // Pre phase: compute first group into sum_prev, vals_prev
-    {
-        int g = g_first;
-#pragma unroll
-        for (int r = 0; r < 4; ++r)
+        // Then read K from buffer, sum, RMS and store K (only when IsQK and access_id_in_token < access_per_row_k)
+        if constexpr (IsQK)
         {
-            int token_r = g * 4 + r;
-            if (token_r < tot_tokens)
+            float4 vars_k_all_ranks[NRanks];
+            done = false;
+            while (!done)
             {
-                int idx_r = token_r * access_per_row + access_id_in_token;
-                *reinterpret_cast<float4*>(&vals_prev[r][0])
-                    = reinterpret_cast<float4 const*>(params.allreduce_in)[idx_r];
+                done = true;
 #pragma unroll
-                for (int i = 0; i < kElemsPerAccess<DType>; ++i)
+                for (int r = 0; r < NRanks; ++r)
                 {
-                    sum_prev[r] += static_cast<float>(vals_prev[r][i]) * static_cast<float>(vals_prev[r][i]);
+                    vars_k_all_ranks[r] = ld_global_volatile(
+                        &reinterpret_cast<float4*>(comm.data_bufs[params.rank])[(r * 2 * tot_groups) + 2 * g + 1]);
+                    done &= !is_neg_zero(vars_k_all_ranks[r]);
                 }
             }
-            else
-            {
-                *reinterpret_cast<float4*>(&vals_prev[r][0]) = make_float4(0.F, 0.F, 0.F, 0.F);
-                sum_prev[r] = 0.F;
-            }
-        }
-        tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_prev);
-#pragma unroll
-        for (int r = 0; r < 4; ++r)
-        {
-            if (is_neg_zero(sum_prev[r]))
-            {
-                sum_prev[r] = 0.F;
-            }
-        }
-    }
-
-    for (int g = g_first; g < tot_groups; g += group_stride)
-    {
-        // 1. Process group g: allreduce sum_prev, broadcast, RMS vals_prev and store
-        if (threadIdx.x == 0)
-        {
-            float4 sum4;
-            sum4.x = sum_prev[0];
-            sum4.y = sum_prev[1];
-            sum4.z = sum_prev[2];
-            sum4.w = sum_prev[3];
-            for (int r = 0; r < NRanks; ++r)
-            {
-                reinterpret_cast<float4*>(comm.data_bufs[r])[(params.rank * tot_groups) + g] = sum4;
-            }
-        }
-
-        bool done = false;
-        float4 vars_all_ranks[NRanks];
-        while (!done)
-        {
-            done = true;
+            sum_variance_k[0] = 0.F;
+            sum_variance_k[1] = 0.F;
+            sum_variance_k[2] = 0.F;
+            sum_variance_k[3] = 0.F;
 #pragma unroll
             for (int r = 0; r < NRanks; ++r)
             {
-                vars_all_ranks[r]
-                    = ld_global_volatile(&reinterpret_cast<float4*>(comm.data_bufs[params.rank])[(r * tot_groups) + g]);
-                done &= !is_neg_zero(vars_all_ranks[r]);
+                sum_variance_k[0] += vars_k_all_ranks[r].x;
+                sum_variance_k[1] += vars_k_all_ranks[r].y;
+                sum_variance_k[2] += vars_k_all_ranks[r].z;
+                sum_variance_k[3] += vars_k_all_ranks[r].w;
             }
-        }
 
-        if (threadIdx.x == 0)
-        {
-            sum_global[0] = 0.F;
-            sum_global[1] = 0.F;
-            sum_global[2] = 0.F;
-            sum_global[3] = 0.F;
-#pragma unroll
-            for (int r = 0; r < NRanks; ++r)
+            if (access_id_in_token < access_per_row_k)
             {
-                sum_global[0] += vars_all_ranks[r].x;
-                sum_global[1] += vars_all_ranks[r].y;
-                sum_global[2] += vars_all_ranks[r].z;
-                sum_global[3] += vars_all_ranks[r].w;
-            }
-        }
-        __syncthreads();
-
-        __nv_bfloat16 norm_weight[kElemsPerAccess<DType>];
-        *reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type*>(norm_weight)
-            = reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type const*>(
-                params.rms_gamma)[access_id_in_token];
-
-#pragma unroll
-        for (int r = 0; r < 4; ++r)
-        {
-            int token_r = g * 4 + r;
-            if (token_r >= tot_tokens)
-            {
-                continue;
-            }
-            float scale = rsqrtf((sum_global[r] / static_cast<float>(params.hidden_dim) / NRanks) + params.rms_eps);
-#pragma unroll
-            for (int i = 0; i < kElemsPerAccess<DType>; ++i)
-            {
-                vals_prev[r][i] = static_cast<DType>(
-                    static_cast<float>(vals_prev[r][i]) * scale * static_cast<float>(norm_weight[i]));
-            }
-            int idx_out = token_r * access_per_row + access_id_in_token;
-            reinterpret_cast<float4*>(params.rms_norm_out)[idx_out] = *reinterpret_cast<float4*>(&vals_prev[r][0]);
-        }
-
-        // 2. If there is a next group: compute into sum_curr, vals_curr then copy curr -> prev
-        int g_next = g + group_stride;
-        if (g_next < tot_groups)
-        {
-            sum_curr[0] = 0.F;
-            sum_curr[1] = 0.F;
-            sum_curr[2] = 0.F;
-            sum_curr[3] = 0.F;
-#pragma unroll
-            for (int r = 0; r < 4; ++r)
-            {
-                int token_r = g_next * 4 + r;
-                if (token_r < tot_tokens)
+                __nv_bfloat16 norm_weight_k[kElemsPerAccess<DType>];
+                *reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type*>(norm_weight_k)
+                    = reinterpret_cast<typename ElemsPerAccess<DType>::norm_weight_type const*>(
+                        params.rms_gamma_k)[access_id_in_token];
+                for (int r = 0; r < 4; ++r)
                 {
-                    int idx_r = token_r * access_per_row + access_id_in_token;
-                    *reinterpret_cast<float4*>(&vals_curr[r][0])
-                        = reinterpret_cast<float4 const*>(params.allreduce_in)[idx_r];
+                    int token_r = g * 4 + r;
+                    if (token_r >= tot_tokens)
+                    {
+                        continue;
+                    }
+                    alignas(16) DType vals_k[kElemsPerAccess<DType>];
+                    int idx_r = token_r * access_per_row_k + access_id_in_token;
+                    *reinterpret_cast<float4*>(vals_k) = reinterpret_cast<float4 const*>(params.allreduce_in_k)[idx_r];
+                    float scale_k = rsqrtf(
+                        (sum_variance_k[r] / static_cast<float>(params.hidden_dim_k) / NRanks) + params.rms_eps);
 #pragma unroll
                     for (int i = 0; i < kElemsPerAccess<DType>; ++i)
                     {
-                        sum_curr[r] += static_cast<float>(vals_curr[r][i]) * static_cast<float>(vals_curr[r][i]);
+                        vals_k[i] = static_cast<DType>(
+                            static_cast<float>(vals_k[i]) * scale_k * static_cast<float>(norm_weight_k[i]));
                     }
-                }
-                else
-                {
-                    *reinterpret_cast<float4*>(&vals_curr[r][0]) = make_float4(0.F, 0.F, 0.F, 0.F);
-                    sum_curr[r] = 0.F;
-                }
-            }
-            tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_curr);
-#pragma unroll
-            for (int r = 0; r < 4; ++r)
-            {
-                if (is_neg_zero(sum_curr[r]))
-                {
-                    sum_curr[r] = 0.F;
-                }
-            }
-
-            // Explicit copy curr -> prev (constant indexing)
-            sum_prev[0] = sum_curr[0];
-            sum_prev[1] = sum_curr[1];
-            sum_prev[2] = sum_curr[2];
-            sum_prev[3] = sum_curr[3];
-#pragma unroll
-            for (int r = 0; r < 4; ++r)
-            {
-#pragma unroll
-                for (int i = 0; i < kElemsPerAccess<DType>; ++i)
-                {
-                    vals_prev[r][i] = vals_curr[r][i];
+                    reinterpret_cast<float4*>(params.rms_norm_out_k)[idx_r] = *reinterpret_cast<float4*>(vals_k);
                 }
             }
         }
@@ -614,12 +504,12 @@ __global__ void __launch_bounds__(1024)
 
     // Clear comm buffer: clear full size set by previous kernel (same as non-float4 kernel).
     int clear_access = static_cast<int>(comm.clear_size / kElemsPerAccess<DType>);
-    int clear_stride = group_stride * access_per_row;
-    for (int idx = group_id * access_per_row + threadIdx.x; idx < clear_access; idx += clear_stride)
+    int clear_stride = group_stride * access_per_row_q;
+    for (int idx = group_id * access_per_row_q + threadIdx.x; idx < clear_access; idx += clear_stride)
     {
         reinterpret_cast<float4*>(comm.clear_buf)[idx] = clear_vec;
     }
-    comm.update(tot_groups * 8 * NRanks);
+    comm.update(IsQK ? (2 * tot_groups * 8 * NRanks) : (tot_groups * 8 * NRanks));
 #if (defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 900))
     if constexpr (TriggerCompletionAtEnd)
     {
@@ -645,10 +535,10 @@ int get_sm_count()
 template <typename DType, int NRanks>
 void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params)
 {
-    TLLM_CHECK(params.size % params.hidden_dim == 0);
+    TLLM_CHECK(params.size_q % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
     static int SM = tensorrt_llm::common::getSMVersion();
-    int token_num = params.size / params.hidden_dim;
+    int token_num = params.size_q / params.hidden_dim;
     // for current problem size, we only need one cluster
     int sm_count = get_sm_count();
     int cluster_size = 1;
@@ -687,9 +577,16 @@ void minimax_reduce_rms_kernel_launcher(MiniMaxReduceRMSParams const& params)
 template <typename DType, int NRanks>
 void minimax_reduce_rms_kernel_launcher_float4(MiniMaxReduceRMSParams const& params)
 {
-    TLLM_CHECK(params.size % params.hidden_dim == 0);
+    TLLM_CHECK(params.size_q % params.hidden_dim == 0);
     TLLM_CHECK(params.hidden_dim % kElemsPerAccess<DType> == 0);
-    int token_num = params.size / params.hidden_dim;
+    if (params.allreduce_in_k != nullptr)
+    {
+        TLLM_CHECK(params.hidden_dim >= params.hidden_dim_k);
+        TLLM_CHECK(params.size_k % params.hidden_dim_k == 0);
+        TLLM_CHECK(params.hidden_dim_k % kElemsPerAccess<DType> == 0);
+        TLLM_CHECK(params.size_q / params.hidden_dim == params.size_k / params.hidden_dim_k);
+    }
+    int token_num = params.size_q / params.hidden_dim;
     int tot_groups = (token_num + 3) / 4; // ceiling
     if (tot_groups == 0)
     {
@@ -720,22 +617,39 @@ void minimax_reduce_rms_kernel_launcher_float4(MiniMaxReduceRMSParams const& par
     cfg.numAttrs = SM >= 90 ? 2 : 0;
 
     bool trigger_completion_at_end = params.trigger_completion_at_end;
+    bool is_qk = (params.allreduce_in_k != nullptr);
     if (trigger_completion_at_end)
     {
-        TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, true>, params));
+        if (is_qk)
+        {
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, true, true>, params));
+        }
+        else
+        {
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, false, true>, params));
+        }
     }
     else
     {
-        TLLM_CUDA_CHECK(
-            cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, false>, params));
+        if (is_qk)
+        {
+            TLLM_CUDA_CHECK(
+                cudaLaunchKernelEx(&cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, true, false>, params));
+        }
+        else
+        {
+            TLLM_CUDA_CHECK(cudaLaunchKernelEx(
+                &cfg, minimax_reduce_rms_kernel_lamport_float4<DType, NRanks, false, false>, params));
+        }
     }
 }
 
 template <int NRanks>
 void dispatch_dtype(MiniMaxReduceRMSParams const& params)
 {
-    int token_num = params.size / params.hidden_dim;
+    int token_num = params.size_q / params.hidden_dim;
     constexpr int kFloat4MinTokens = 32;
     bool use_float4 = (token_num >= kFloat4MinTokens);
 
