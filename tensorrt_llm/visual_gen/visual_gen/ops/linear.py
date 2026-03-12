@@ -537,12 +537,17 @@ class TrtllmNVFP4Linear(BaseLinear):
                     out_dtype=origin_dtype,
                 )
         else:
+            input_shape = input.shape
+            if input.dim() > 2:
+                input = input.view(-1, input_shape[-1])
             act_fp4, act_sf = torch.ops.trtllm.fp4_quantize(
                 input, input_scale_2, scaling_vector_size, False
             )
             output = torch.ops.trtllm.nvfp4_gemm(
                 act_fp4, weight, act_sf, weight_scale, alpha, output_dtype=origin_dtype
             )
+            if len(input_shape) > 2:
+                output = output.view(*input_shape[:-1], output.shape[-1])
 
         if bias is not None:
             if bias.dtype != output.dtype:
