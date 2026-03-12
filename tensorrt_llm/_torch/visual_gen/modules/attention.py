@@ -70,8 +70,9 @@ class Attention(nn.Module):
         ulysses_size = config.parallel.dit_ulysses_size
         base_backend = config.attention.backend
 
-        if self.qkv_mode == QKVMode.SEPARATE_QKV:
-            backend_name = "VANILLA"  # Cross-attention requires VANILLA
+        # TRTLLM doesn't support cross-attention (different Q/KV seq lengths); fall back to VANILLA
+        if self.qkv_mode == QKVMode.SEPARATE_QKV and base_backend == "TRTLLM":
+            backend_name = "VANILLA"
         else:
             backend_name = base_backend
         self.attn_backend = backend_name

@@ -1,7 +1,7 @@
 import json
 import os
 import time
-from typing import Optional, Tuple, Type, Union
+from typing import Optional, Tuple, Union
 
 import diffusers
 import PIL.Image
@@ -18,8 +18,6 @@ from tensorrt_llm._torch.visual_gen.pipeline_registry import register_pipeline
 from tensorrt_llm._torch.visual_gen.teacache import ExtractorConfig, register_extractor_from_config
 from tensorrt_llm._torch.visual_gen.utils import postprocess_video_tensor
 from tensorrt_llm.logger import logger
-
-from .parallel_vae import WanParallelVAEAdapter
 
 # Supported Wan I2V 14B models:
 # - Wan2.1-I2V-14B-480P: Single-stage image-to-video
@@ -149,10 +147,6 @@ class WanImageToVideoPipeline(BasePipeline):
     def common_warmup_shapes(self) -> list:
         """Return list of common warmup shapes for the pipeline."""
         return [(480, 832, 33), (480, 832, 81), (720, 1280, 81)]
-
-    @property
-    def vae_adapter_class(self) -> Type[WanParallelVAEAdapter]:
-        return WanParallelVAEAdapter
 
     def _init_transformer(self) -> None:
         logger.info("Creating WAN I2V transformer with quantization support...")
