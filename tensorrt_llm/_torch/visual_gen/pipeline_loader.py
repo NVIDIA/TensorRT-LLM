@@ -205,7 +205,7 @@ class PipelineLoader:
         # These are NOT quantized - loaded as-is from checkpoint
         # =====================================================================
         pipeline.load_standard_components(checkpoint_dir, self.device, skip_components)
-        logger.info("Model loaded successfully in {time.time() - load_start:.2f}s")
+        logger.info(f"Model loaded successfully in {time.time() - load_start:.2f}s")
 
         # =====================================================================
         # STEP 5: Post-load Hooks (TeaCache setup, etc.)
