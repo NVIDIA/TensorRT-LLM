@@ -330,9 +330,9 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_maverick_lite.yaml']
 # --- Phi-4 variants (2025) ---
 - name: microsoft/Phi-4-multimodal-instruct
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml', 'phi4-multimodal-instruct.yaml']
 - name: microsoft/Phi-4-reasoning-vision-15B
-  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'multimodal.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'multimodal.yaml', 'phi4-reasoning-vision-15b.yaml']
 # --- MiniMax M2 (2025) ---
 - name: MiniMaxAI/MiniMax-M2
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
@@ -464,7 +464,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
 # --- Phi-4-mini flash reasoning (2025) ---
 - name: microsoft/Phi-4-mini-flash-reasoning
-  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml', 'phi4-mini-flash-reasoning.yaml']
 # --- Qwen2.5-VL (2025) - top VLM family ---
 - name: Qwen/Qwen2.5-VL-7B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml', 'multimodal.yaml']

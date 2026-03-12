@@ -100,7 +100,9 @@ The table below lists the operators grouped by category.
 | Operator Name | Description |
 |--------------|-------------|
 | `torch.ops.auto_deploy.torch_ssm` | State Space Model (SSM) computation (PyTorch backend) |
+| `torch.ops.auto_deploy.torch_ysamba_ssm` | ySamba/Phi-4-Flash-style SSM with per-state decay matrix (PyTorch backend) |
 | `torch.ops.auto_deploy.torch_cached_ssm` | Cached SSM with state management (PyTorch backend) |
+| `torch.ops.auto_deploy.torch_cached_ysamba_ssm` | Cached ySamba/Phi-4-Flash-style SSM with state management (PyTorch backend) |
 | `torch.ops.auto_deploy.triton_cached_ssm` | Cached SSM with state management (Triton backend) |
 | `torch.ops.auto_deploy.flashinfer_cached_ssm` | Cached SSM with state management (FlashInfer backend) |
 | `torch.ops.auto_deploy.mamba_ssm_prepare_metadata` | Mamba SSM metadata preparation (chunk indices, offsets, seq_idx) |
