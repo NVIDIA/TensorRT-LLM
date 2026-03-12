@@ -304,15 +304,6 @@ public:
 
     size_t getHash() const;
 
-    //! \brief Mark/unmark this block as having been evicted and repurposed for a different
-    //! sequence, without being stored back into the reuse trie.  Used by storeBlocks to
-    //! detect the case where an OOW block was stolen, used, and freed by another sequence
-    //! that never stored it — leaving hasRefs()==false and isInLookupTree()==false but with
-    //! stale KV content that must not be reinserted under the original sequence's prefix.
-    void setRepurposed(bool repurposed);
-
-    [[nodiscard]] bool isRepurposed() const;
-
     std::vector<MmKey> getExtraKeys() const;
 
 private:
@@ -363,11 +354,6 @@ private:
     std::optional<std::chrono::steady_clock::time_point::duration> mExpirationTime;
     // Hash for the event manager
     size_t mHash;
-
-    // True when this block was evicted (via getFreeBlock) for a different sequence and has
-    // not yet been stored back in the reuse trie under the new owner's token prefix.
-    // Cleared when addNextBlock successfully inserts the block into the trie.
-    bool mRepurposed;
 };
 
 class GenerationRequest
@@ -867,19 +853,21 @@ public:
 
     [[nodiscard]] static bool blockInRadixTree(BlockPtr const& block);
 
-    //! \brief Store blocks in cached blocks.
+    //! \brief Store context blocks in the reuse trie for this window.
+    //! \details Called after context phase for both SWA and non-SWA windows.
+    //!          Must be called before any detachFrontBlock call so that OOW blocks
+    //!          are already in the trie when they are replaced with placeholders.
+    void storeContextBlocks(GenerationRequest& sequence, LlmRequest const& llmRequest);
+
+    //! \brief Store blocks in the reuse trie.
     //! \param blockKeys Key of each block.
-    //! \param blockIds Id of each block.
-    //! \param pinBlocks If true, increment ref count for blocks while storing (pin on store).
-    //! \param numOowBlocks Number of out-of-window blocks at the front of blockIds whose ref count
-    //!        has already been decremented by detachFrontBlock. For these blocks only, a non-zero
-    //!        ref count means the block was stolen by another sequence and must not be stored.
-    //!        In-window blocks always have ref=1 (their own sequence's ref) at storeBlocks call
-    //!        time, so the stolen check must be skipped for them.
+    //! \param blocks Block pointers (beam 0 only). OOW slots contain placeholder blocks
+    //!        (isPlaceholder()==true); storeBlocks advances the search root past them via
+    //!        a trie lookup rather than re-inserting, and stops if the OOW block was evicted.
+    //! \param pinBlocks If true, increment ref count for blocks while storing.
     //! \return Pair of (num blocks stored for reuse, vector of pinned block IDs).
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        bool pinBlocks = false, SizeType32 numOowBlocks = 0);
+        std::vector<BlockKey> const& blockKeys, std::vector<BlockPtr> const& blocks, bool pinBlocks = false);
 
     [[nodiscard]] bool verifyQueueIntegrity() const;
 
@@ -919,7 +907,7 @@ public:
 
     void resetReuseState()
     {
-        std::lock_guard<std::recursive_mutex> lock(mCachedBlocksRootMutex);
+        std::lock_guard<std::mutex> lock(mLookupTree->getMutex());
         // The shared lookup tree is reset once by BlockManager::resetReuseState() before
         // this method is called.  Here we only need to re-create the per-window root block
         // and wire it into the (already fresh) shared tree.
@@ -1033,9 +1021,6 @@ private:
     bool mCopyOnPartialReuse;
     // The kv cache connector manager
     std::shared_ptr<kv_connector::KvCacheConnectorManager> mKvCacheConnectorManager;
-
-    // Mutex for the cached blocks root
-    mutable std::recursive_mutex mCachedBlocksRootMutex;
 
     // Whether to enable indexer K cache
     bool mEnableIndexerKCache;
@@ -1154,10 +1139,10 @@ public:
         executor::KvCacheTransferMode mode = executor::KvCacheTransferMode::DRAM, std::string const& directory = "");
 
     [[nodiscard]] std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> storeBlocks(
-        std::vector<BlockKey> const& blockKeys, std::vector<KVCacheBlock::IdType> const& blockIds,
-        SizeType32 windowSize, bool pinBlocks = false, SizeType32 numOowBlocks = 0)
+        std::vector<BlockKey> const& blockKeys, std::vector<BlockPtr> const& blocks, SizeType32 windowSize,
+        bool pinBlocks = false)
     {
-        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blockIds, pinBlocks, numOowBlocks);
+        return mWindowBlockManagers.at(windowSize).storeBlocks(blockKeys, blocks, pinBlocks);
     }
 
     [[nodiscard]] bool verifyQueueIntegrity(SizeType32 windowSize) const;
