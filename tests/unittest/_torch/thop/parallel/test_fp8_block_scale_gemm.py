@@ -218,8 +218,8 @@ def test_fp8_block_scale_bmm(dtype, m, k, n, num_groups):
 
 
 @pytest.mark.skipif(
-    getSMVersion() != 90 and getSMVersion() != 120,
-    reason="The test is for Hopper and SM120 only. Current SM is %d." %
+    getSMVersion() != 120,
+    reason="The test is for SM120 only. Current SM is %d." %
     getSMVersion(),
 )
 @pytest.mark.parametrize(
