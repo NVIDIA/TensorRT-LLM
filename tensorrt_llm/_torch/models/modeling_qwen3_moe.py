@@ -25,7 +25,8 @@ from ..speculative import SpecMetadata
 from ..utils import AuxStreamType
 from .modeling_qwen3 import Qwen3Attention
 from .modeling_speculative import SpecDecOneEngineForCausalLM
-from .modeling_utils import DecoderModel, EagerFusionConfig, register_auto_model
+from .modeling_utils import (DecoderModel, EagerFusionConfig,
+                             maybe_alias_or_copy_tensor, register_auto_model)
 
 
 class Qwen3Gate(nn.Module):
@@ -66,7 +67,7 @@ class Qwen3Gate(nn.Module):
         if not allow_partial_loading:
             assert w is not None, "Qwen3Gate expects weight when partial loading is disabled"
         if w is not None:
-            self.weight.copy_(w[:])
+            maybe_alias_or_copy_tensor(self.weight, w[:])
 
     @property
     def routing_method(self) -> BaseMoeRoutingMethod:

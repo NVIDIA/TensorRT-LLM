@@ -43,6 +43,7 @@ from .modeling_utils import (
     EagerFusionConfig,
     duplicate_kv_weight,
     filter_weights,
+    maybe_alias_or_copy_tensor,
     register_auto_model,
 )
 
@@ -186,7 +187,7 @@ class Glm4WeightLoader:
                             if not allow_partial_loading:
                                 assert n in module_weights
                             if n in module_weights:
-                                p.data.copy_(module_weights[n][:])
+                                maybe_alias_or_copy_tensor(p, module_weights[n][:])
                     # Mark consumed weights
                     if can_mark_consumed:
                         weights.mark_consumed(name)

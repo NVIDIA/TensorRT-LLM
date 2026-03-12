@@ -496,7 +496,8 @@ void initConfigBindings(nb::module_& m)
             c.getExtendedRuntimePerfKnobConfig(), c.getDebugConfig(), c.getRecvPollPeriodMs(),
             c.getMaxSeqIdleMicroseconds(), c.getSpecDecConfig(), c.getGuidedDecodingConfig(),
             c.getAdditionalModelOutputs(), c.getCacheTransceiverConfig(), c.getGatherGenerationLogits(),
-            c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge());
+            c.getPromptTableOffloading(), c.getEnableTrtOverlap(), c.getFailFastOnAttentionWindowTooLarge(),
+            c.getAliasManagedWeightsFromGpu());
         auto pickle_tuple = nb::make_tuple(cpp_states, nb::getattr(self, "__dict__"));
         return pickle_tuple;
     };
@@ -509,7 +510,8 @@ void initConfigBindings(nb::module_& m)
         }
 
         auto cpp_states = nb::cast<nb::tuple>(state[0]);
-        if (cpp_states.size() != 29)
+        auto const numStates = cpp_states.size();
+        if (numStates != 29 && numStates != 30)
         {
             throw std::runtime_error("Invalid cpp_states!");
         }
@@ -545,7 +547,8 @@ void initConfigBindings(nb::module_& m)
             nb::cast<bool>(cpp_states[25]),                                                   // GatherGenerationLogits
             nb::cast<bool>(cpp_states[26]),                                                   // PromptTableOffloading
             nb::cast<bool>(cpp_states[27]),                                                   // EnableTrtOverlap
-            nb::cast<bool>(cpp_states[28]) // FailFastOnAttentionWindowTooLarge
+            nb::cast<bool>(cpp_states[28]),                                                   // FailFastOnAttentionWindowTooLarge
+            numStates > 29 ? nb::cast<bool>(cpp_states[29]) : false // AliasManagedWeightsFromGpu
         );
 
         // Restore Python data
@@ -585,7 +588,8 @@ void initConfigBindings(nb::module_& m)
                  bool,                                                   // GatherGenerationLogits
                  bool,                                                   // PromptTableOffloading
                  bool,                                                   // EnableTrtOverlap
-                 bool                                                    // FailFastOnAttentionWindowTooLarge
+                 bool,                                                   // FailFastOnAttentionWindowTooLarge
+                 bool                                                    // AliasManagedWeightsFromGpu
                  >(),
             nb::arg("max_beam_width") = 1, nb::arg("scheduler_config") = tle::SchedulerConfig(),
             nb::arg("kv_cache_config") = tle::KvCacheConfig(), nb::arg("enable_chunked_context") = false,
@@ -603,7 +607,8 @@ void initConfigBindings(nb::module_& m)
             nb::arg("spec_dec_config") = nb::none(), nb::arg("guided_decoding_config") = nb::none(),
             nb::arg("additional_model_outputs") = nb::none(), nb::arg("cache_transceiver_config") = nb::none(),
             nb::arg("gather_generation_logits") = false, nb::arg("mm_embedding_offloading") = false,
-            nb::arg("enable_trt_overlap") = false, nb::arg("fail_fast_on_attention_window_too_large") = false)
+            nb::arg("enable_trt_overlap") = false, nb::arg("fail_fast_on_attention_window_too_large") = false,
+            nb::arg("alias_managed_weights_from_gpu") = false)
         .def_prop_rw("max_beam_width", &tle::ExecutorConfig::getMaxBeamWidth, &tle::ExecutorConfig::setMaxBeamWidth)
         .def_prop_rw("max_batch_size", &tle::ExecutorConfig::getMaxBatchSize, &tle::ExecutorConfig::setMaxBatchSize)
         .def_prop_rw("max_num_tokens", &tle::ExecutorConfig::getMaxNumTokens, &tle::ExecutorConfig::setMaxNumTokens)
@@ -632,6 +637,8 @@ void initConfigBindings(nb::module_& m)
             &tle::ExecutorConfig::setUseGpuDirectStorage)
         .def_prop_rw("gpu_weights_percent", &tle::ExecutorConfig::getGpuWeightsPercent,
             &tle::ExecutorConfig::setGpuWeightsPercent)
+        .def_prop_rw("alias_managed_weights_from_gpu", &tle::ExecutorConfig::getAliasManagedWeightsFromGpu,
+            &tle::ExecutorConfig::setAliasManagedWeightsFromGpu)
         .def_prop_rw("max_queue_size", &tle::ExecutorConfig::getMaxQueueSize, &tle::ExecutorConfig::setMaxQueueSize)
         .def_prop_rw("extended_runtime_perf_knob_config", &tle::ExecutorConfig::getExtendedRuntimePerfKnobConfig,
             &tle::ExecutorConfig::setExtendedRuntimePerfKnobConfig)

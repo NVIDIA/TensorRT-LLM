@@ -1551,7 +1551,7 @@ public:
         std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs = std::nullopt,
         std::optional<CacheTransceiverConfig> cacheTransceiverConfig = std::nullopt,
         bool gatherGenerationLogits = false, bool promptTableOffloading = false, bool enableTrtOverlap = false,
-        bool failFastOnAttentionWindowTooLarge = false);
+        bool failFastOnAttentionWindowTooLarge = false, bool aliasManagedWeightsFromGpu = false);
 
     [[nodiscard]] SizeType32 getMaxBeamWidth() const;
     [[nodiscard]] SchedulerConfig getSchedulerConfig() const;
@@ -1574,6 +1574,7 @@ public:
     [[nodiscard]] std::optional<DecodingConfig> getDecodingConfig() const;
     [[nodiscard]] bool getUseGpuDirectStorage() const;
     [[nodiscard]] float getGpuWeightsPercent() const;
+    [[nodiscard]] bool getAliasManagedWeightsFromGpu() const;
     [[nodiscard]] std::optional<SizeType32> getMaxQueueSize() const;
     [[nodiscard]] ExtendedRuntimePerfKnobConfig getExtendedRuntimePerfKnobConfig() const;
     [[nodiscard]] std::optional<DebugConfig> getDebugConfig() const;
@@ -1604,6 +1605,7 @@ public:
     void setDecodingConfig(DecodingConfig const& decodingConfig);
     void setUseGpuDirectStorage(bool const& useGpuDirectStorage);
     void setGpuWeightsPercent(float const& gpuWeightsPercent);
+    void setAliasManagedWeightsFromGpu(bool const& aliasManagedWeightsFromGpu);
     void setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize);
     void setExtendedRuntimePerfKnobConfig(ExtendedRuntimePerfKnobConfig const& extendedRuntimePerfKnobConfig);
     void setDebugConfig(DebugConfig const& debugConfig);
@@ -1707,6 +1709,9 @@ private:
     /// @brief Controls whether to fail fast when attention window is too large to fit even a single sequence in the KV
     /// cache.
     bool mFailFastOnAttentionWindowTooLarge{false};
+
+    /// @brief Alias managed GPU weights directly when loading from engine buffer instead of making a device copy.
+    bool mAliasManagedWeightsFromGpu{false};
 };
 
 struct KVCacheCreatedData

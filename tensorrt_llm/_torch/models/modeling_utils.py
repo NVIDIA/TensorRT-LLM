@@ -38,6 +38,27 @@ def timing(message: str):
     print(f"{message} -- {(end-start):.2f}s")
 
 
+def maybe_alias_or_copy_tensor(dest: Union[torch.Tensor, nn.Parameter],
+                               src: torch.Tensor) -> bool:
+    """Alias ``src`` into ``dest`` when device, shape, dtype, and contiguity all match.
+
+    Returns ``True`` when ``dest.data`` is rebound to ``src`` storage, and ``False``
+    when the helper falls back to ``copy_()``. The alias path only triggers when the
+    caller already provides a tensor on the destination device, so the default
+    HuggingFace checkpoint loader still behaves like ``copy_()`` and custom
+    GPU-preloaded checkpoint loaders opt into the zero-copy path.
+    """
+    dest_tensor = dest.data
+    if (src.device == dest_tensor.device and src.shape == dest_tensor.shape
+            and src.dtype == dest_tensor.dtype and src.is_contiguous()):
+        dest.data = src
+        return True
+
+    with torch.no_grad():
+        dest_tensor.copy_(src)
+    return False
+
+
 @dataclass
 class EagerFusionConfig:
     PRE_MOE_FUSION: bool = False
@@ -398,6 +419,8 @@ class DecoderModelForCausalLM(nn.Module,
                             config.mapping.tp_rank,
                             dim=0)  # split by vocabulary dimension
                     x = weight.to(self.lm_head.dtype).cuda()
+                    # Keep custom lm_head storage distinct; aliasing here would
+                    # implicitly tie weights rather than loading checkpoint data.
                     self.lm_head.weight.data.copy_(x)
 
         # use embedding weights in lm_head if tie word embedding is enabled
@@ -968,7 +991,8 @@ def _load_weights_impl(model: Union[nn.Module, DecoderModelForCausalLM],
                             if not allow_partial_loading:
                                 assert n in module_weights
                             if n in module_weights:
-                                p.data.copy_(module_weights[n][:])
+                                maybe_alias_or_copy_tensor(
+                                    p, module_weights[n][:])
 
                     # Mark consumed weights
                     if hasattr(weights, 'mark_consumed'):

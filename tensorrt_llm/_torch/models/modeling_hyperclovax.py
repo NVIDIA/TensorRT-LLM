@@ -28,7 +28,7 @@ from .modeling_auto import AutoModelForCausalLM
 from .modeling_multimodal_utils import (find_input_mm_embeds, fuse_input_embeds,
                                         get_multimodal_embeddings)
 from .modeling_siglip import SiglipVisionModel
-from .modeling_utils import register_auto_model
+from .modeling_utils import maybe_alias_or_copy_tensor, register_auto_model
 
 DISAGG = os.getenv('TLLM_MULTIMODAL_DISAGGREGATED', '0') == '1'
 
@@ -859,7 +859,7 @@ class HCXVisionModel(nn.Module):
         mm_projector_weights = _filter_weights(weights, "mm_projector.")
         self.mm_projector.load_state_dict(mm_projector_weights, strict=True)
 
-        self.image_newline.data.copy_(weights["image_newline"])
+        maybe_alias_or_copy_tensor(self.image_newline, weights["image_newline"])
 
     def _parse_and_batch_multimodal_data(
         self, multimodal_params: List[MultimodalParams]

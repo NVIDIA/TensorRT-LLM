@@ -14,7 +14,7 @@ from ..modules.attention import Attention
 from ..modules.decoder_layer import DecoderLayer
 from ..modules.embedding import Embedding
 from ..modules.linear import Linear
-from .modeling_utils import register_auto_model
+from .modeling_utils import maybe_alias_or_copy_tensor, register_auto_model
 
 
 class MLP(nn.Module):
@@ -320,7 +320,7 @@ class BertForSequenceClassification(nn.Module):
                         for n, p in module._parameters.items():
                             if p is not None:
                                 weight = module_weights[n][:]
-                                p.data.copy_(weight)
+                                maybe_alias_or_copy_tensor(p, weight)
 
                 except Exception as e:
                     raise e

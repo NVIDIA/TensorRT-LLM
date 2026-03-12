@@ -34,7 +34,8 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     std::optional<SpeculativeDecodingConfig> specDecConfig, std::optional<GuidedDecodingConfig> guidedDecodingConfig,
     std::optional<std::vector<AdditionalModelOutput>> additionalModelOutputs,
     std::optional<CacheTransceiverConfig> cacheTransceiverConfig, bool gatherGenerationLogits,
-    bool promptTableOffloading, bool enableTrtOverlap, bool failFastOnAttentionWindowTooLarge)
+    bool promptTableOffloading, bool enableTrtOverlap, bool failFastOnAttentionWindowTooLarge,
+    bool aliasManagedWeightsFromGpu)
     : mMaxBeamWidth(maxBeamWidth)
     , mSchedulerConfig(std::move(schedulerConfig))
     , mKvCacheConfig(std::move(kvCacheConfig))
@@ -64,6 +65,7 @@ ExecutorConfig::ExecutorConfig(SizeType32 maxBeamWidth, SchedulerConfig schedule
     , mPromptTableOffloading(promptTableOffloading)
     , mEnableTrtOverlap(enableTrtOverlap)
     , mFailFastOnAttentionWindowTooLarge(failFastOnAttentionWindowTooLarge)
+    , mAliasManagedWeightsFromGpu(aliasManagedWeightsFromGpu)
 {
     TLLM_CHECK(iterStatsMaxIterations >= 0);
     TLLM_CHECK(requestStatsMaxIterations >= 0);
@@ -161,6 +163,11 @@ bool ExecutorConfig::getUseGpuDirectStorage() const
 float ExecutorConfig::getGpuWeightsPercent() const
 {
     return mGpuWeightsPercent;
+}
+
+bool ExecutorConfig::getAliasManagedWeightsFromGpu() const
+{
+    return mAliasManagedWeightsFromGpu;
 }
 
 std::optional<SizeType32> ExecutorConfig::getMaxQueueSize() const
@@ -313,6 +320,11 @@ void ExecutorConfig::setUseGpuDirectStorage(bool const& useGpuDirectStorage)
 void ExecutorConfig::setGpuWeightsPercent(float const& gpuWeightsPercent)
 {
     mGpuWeightsPercent = gpuWeightsPercent;
+}
+
+void ExecutorConfig::setAliasManagedWeightsFromGpu(bool const& aliasManagedWeightsFromGpu)
+{
+    mAliasManagedWeightsFromGpu = aliasManagedWeightsFromGpu;
 }
 
 void ExecutorConfig::setMaxQueueSize(std::optional<SizeType32> const& maxQueueSize)

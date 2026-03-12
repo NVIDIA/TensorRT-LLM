@@ -35,7 +35,7 @@ from ..modules.logits_processor import LogitsProcessor
 from ..modules.rms_norm import RMSNorm
 from .modeling_llama import LlamaAttention
 from .modeling_utils import (duplicate_kv_weight, filter_weights,
-                             register_auto_model)
+                             maybe_alias_or_copy_tensor, register_auto_model)
 
 
 class MllamaDecoderLayer(DecoderLayer):
@@ -384,4 +384,4 @@ class MllamaForConditionalGeneration(nn.Module):
                         for n, p in module._parameters.items():
                             if p is not None:
                                 weight = module_weights[n][:]
-                                p.data.copy_(weight)
+                                maybe_alias_or_copy_tensor(p, weight)

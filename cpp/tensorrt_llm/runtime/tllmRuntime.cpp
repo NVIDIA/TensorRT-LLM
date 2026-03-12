@@ -16,6 +16,7 @@
 #include "tllmRuntime.h"
 #include "common.h"
 #include "tensorrt_llm/common/assert.h"
+#include "tensorrt_llm/common/cudaUtils.h"
 #include "tensorrt_llm/common/logger.h"
 #include "tensorrt_llm/common/nvtxUtils.h"
 #include "tensorrt_llm/common/safetensors.h"
@@ -186,11 +187,12 @@ void assessLikelihoodOfRuntimeAllocation(
 } // namespace
 
 TllmRuntime::TllmRuntime(RawEngine const& rawEngine, nvinfer1::ILogger* logger, bool useGpuDirectStorage,
-    float gpuWeightsPercent, bool useShapeInference)
+    float gpuWeightsPercent, bool useShapeInference, bool aliasManagedWeightsFromGpu)
     : mStream(std::make_shared<CudaStream>())
     , mBufferManager{mStream, true} // Ensure to trim the memory pool on destruction.
     , mRuntime{nvinfer1::createInferRuntime(static_cast<bool>(logger) ? *logger : defaultLogger)}
     , mUseShapeInference{useShapeInference}
+    , mAliasManagedWeightsFromGpu{aliasManagedWeightsFromGpu}
     , mUserBufferEnabled{false}
 {
     auto const startTime = std::chrono::high_resolution_clock::now();
@@ -803,7 +805,29 @@ void TllmRuntime::loadManagedWeights(RawEngine const& rawEngine, int localRank)
         {
             TLLM_LOG_DEBUG("Loading managed weight: %s", name.c_str());
             auto iTensor = tensorrt_llm::executor::detail::toITensor(weight);
-            auto weightsDevice = std::shared_ptr<ITensor>{manager.copyFrom(*iTensor, MemoryType::kGPU)};
+            std::shared_ptr<ITensor> weightsDevice;
+            if (mAliasManagedWeightsFromGpu && iTensor->getMemoryType() == MemoryType::kGPU)
+            {
+                // Verify that the GPU tensor resides on the same device as the runtime.
+                cudaPointerAttributes attrs{};
+                TLLM_CUDA_CHECK(cudaPointerGetAttributes(&attrs, iTensor->data()));
+                auto const runtimeDevice = mStream->getDevice();
+                if (attrs.device == runtimeDevice)
+                {
+                    weightsDevice = iTensor;
+                }
+                else
+                {
+                    TLLM_LOG_WARNING(
+                        "Managed weight '%s' is on device %d but runtime uses device %d; copying instead of aliasing.",
+                        name.c_str(), attrs.device, runtimeDevice);
+                    weightsDevice = std::shared_ptr<ITensor>{manager.copyFrom(*iTensor, MemoryType::kGPU)};
+                }
+            }
+            else
+            {
+                weightsDevice = std::shared_ptr<ITensor>{manager.copyFrom(*iTensor, MemoryType::kGPU)};
+            }
             mManagedWeightsMap.insert(std::make_pair(name, weightsDevice));
         }
     }

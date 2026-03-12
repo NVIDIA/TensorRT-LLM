@@ -4,7 +4,8 @@ from typing import Callable, List, Union
 from torch import nn
 
 from tensorrt_llm._torch.model_config import ModelConfig
-from tensorrt_llm._torch.models.modeling_utils import DecoderModelForCausalLM
+from tensorrt_llm._torch.models.modeling_utils import (
+    DecoderModelForCausalLM, maybe_alias_or_copy_tensor)
 
 
 class BaseWeightMapper(ABC):
@@ -126,10 +127,24 @@ class BaseWeightMapper(ABC):
                            n: str,
                            p: nn.Parameter,
                            allow_partial_loading: bool = False) -> None:
+        """Copy or alias a single weight tensor into a module parameter.
+
+        When the source tensor matches the destination in device, shape, dtype,
+        and contiguity, ``p.data`` is rebound to share storage with the source
+        (zero-copy aliasing). Otherwise, the data is copied via
+        ``Tensor.copy_()``.
+
+        Args:
+            module_name: Dot-separated module name (used only for diagnostics).
+            module_weights: Dict mapping parameter names to source tensors.
+            n: Name of the parameter inside ``module_weights``.
+            p: Destination ``nn.Parameter`` to populate.
+            allow_partial_loading: When ``True``, silently skip missing keys.
+        """
         if not allow_partial_loading:
             assert n in module_weights
         if n in module_weights:
-            p.data.copy_(module_weights[n][:])
+            maybe_alias_or_copy_tensor(p, module_weights[n][:])
 
     def does_require_special_handling(self, module_name: str) -> bool:
         return module_name in self.mapping

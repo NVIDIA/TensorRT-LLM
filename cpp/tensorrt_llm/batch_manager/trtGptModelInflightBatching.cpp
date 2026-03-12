@@ -183,8 +183,11 @@ TrtGptModelInflightBatching::TrtGptModelInflightBatching(std::shared_ptr<nvinfer
     , mAdditionalModelOutputs{worldConfig.isLastPipelineParallelRank() ? executorConfig.getAdditionalModelOutputs()
                                                                        : std::nullopt}
     , mLogger{logger ? std::move(logger) : std::make_shared<TllmLogger>()}
-    , mRuntime{std::make_unique<TllmRuntime>(rawEngine, mLogger.get(), executorConfig.getUseGpuDirectStorage(),
-          executorConfig.getGpuWeightsPercent(), modelConfig.useShapeInference())}
+    , mRuntime{std::make_unique<TllmRuntime>(rawEngine, mLogger.get(),
+          /* useGpuDirectStorage = */ executorConfig.getUseGpuDirectStorage(),
+          /* gpuWeightsPercent = */ executorConfig.getGpuWeightsPercent(),
+          /* useShapeInference = */ modelConfig.useShapeInference(),
+          /* aliasManagedWeightsFromGpu = */ executorConfig.getAliasManagedWeightsFromGpu())}
     , mCopyBufferManager{std::make_shared<CudaStream>()}
     , mCtxGenFusion(ctxGenFusion)
     , mOperatingBeamWidth{getMaxBeamWidth()}

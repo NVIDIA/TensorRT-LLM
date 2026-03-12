@@ -22,3 +22,12 @@ if IS_FLASHINFER_AVAILABLE:
         "FlashInferAttention", "FlashInferAttentionMetadata", "StarAttention",
         "StarAttentionMetadata"
     ]
+else:
+    # Provide fallback names so that model files (e.g. Gemma3, Cohere2)
+    # can be imported even when FlashInfer is not installed.  These names
+    # are intentionally *not* added to __all__ because they are not real
+    # implementations and should not be relied upon at runtime.
+    FlashInferAttention = TrtllmAttention
+    FlashInferAttentionMetadata = TrtllmAttentionMetadata
+    StarAttention = TrtllmAttention
+    StarAttentionMetadata = TrtllmAttentionMetadata
