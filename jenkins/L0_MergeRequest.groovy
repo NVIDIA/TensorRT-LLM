@@ -384,7 +384,7 @@ def mergeWaiveList(pipeline, globalVars)
 
 def preparation(pipeline, testFilter, globalVars)
 {
-    image = "urm.nvidia.com/docker/buildpack-deps:bookworm-scm"
+    image = "urm.nvidia.com/docker/buildpack-deps:trixie-scm"
     setupPipelineSpec = createKubernetesPodConfig(image, "package")
     trtllm_utils.launchKubernetesPod(pipeline, setupPipelineSpec, "trt-llm", {
         stage("Setup Environment") {
