@@ -260,7 +260,7 @@ def test_ad_input_processor_falls_back_to_tokenizer_chat_template():
     assert len(tokenizer.calls) == 2
 
 
-def test_ad_input_processor_phi4_prompt_uses_default_chat_template():
+def test_ad_input_processor_prompt_uses_wrapped_tokenizer_chat_template():
     class FakeTokenizer:
         def __init__(self):
             self.chat_template = "{{ messages }}"
@@ -272,12 +272,12 @@ def test_ad_input_processor_phi4_prompt_uses_default_chat_template():
                 return {"input_ids": torch.tensor([[21, 22]], dtype=torch.long)}
             return "formatted phi4 prompt"
 
-    class Phi4VisionRProcessor:
+    class FakeProcessor:
         def __init__(self):
             self.tokenizer = FakeTokenizer()
             self.calls = []
 
-    processor = Phi4VisionRProcessor()
+    processor = FakeProcessor()
     input_processor = ADInputProcessor(tokenizer=None, processor=processor)
 
     prompt_token_ids, extra_processed_inputs = input_processor(

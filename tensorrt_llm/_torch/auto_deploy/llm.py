@@ -26,18 +26,12 @@ class ADInputProcessor(DefaultInputProcessor):
         # NOTE: HF's tokenizer/processor that has the apply_chat_template method
         self.processor = processor or getattr(tokenizer, "tokenizer", None)
 
-    def _is_phi4_reasoning_vision_processor(self) -> bool:
-        return type(self.processor).__name__ == "Phi4VisionRProcessor"
-
     def _get_chat_template_target(self) -> Any:
         if self.processor is None:
             return None
 
         tokenizer = getattr(self.processor, "tokenizer", None)
-        if (
-            self._is_phi4_reasoning_vision_processor()
-            and getattr(tokenizer, "chat_template", None) is not None
-        ):
+        if getattr(tokenizer, "chat_template", None) is not None:
             return tokenizer
 
         if getattr(self.processor, "chat_template", None) is not None:
@@ -47,6 +41,16 @@ class ADInputProcessor(DefaultInputProcessor):
             return tokenizer
 
         return self.processor
+
+    def _should_apply_chat_template_to_prompt(self, inputs: Dict[str, Any]) -> bool:
+        if "messages" in inputs or "prompt" not in inputs or "multi_modal_data" in inputs:
+            return False
+
+        # When a multimodal processor wraps a tokenizer with a chat template, route prompt-only
+        # requests through that template instead of falling back to raw tokenizer.encode().
+        return getattr(self.processor, "tokenizer", None) is not None and (
+            self._get_chat_template_target() is not None
+        )
 
     def __call__(
         self, inputs: Dict[str, Any], sampling_params: SamplingParams
@@ -64,11 +68,7 @@ class ADInputProcessor(DefaultInputProcessor):
                 "max_length": sampling_params.truncate_prompt_tokens,
             }
 
-        if (
-            self._is_phi4_reasoning_vision_processor()
-            and "messages" not in inputs
-            and "prompt" in inputs
-        ):
+        if self._should_apply_chat_template_to_prompt(inputs):
             inputs = {
                 **inputs,
                 "messages": [{"role": "user", "content": inputs["prompt"]}],
