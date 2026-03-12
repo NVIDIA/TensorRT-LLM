@@ -2393,14 +2393,6 @@ def _stack_nvfp4_trtllm_gen_moe_weights(
 
     matched_nodes = [node for node in graph.nodes if is_op(node, replaced_op)]
     for node in matched_nodes:
-        mapping_config = node.kwargs.get("mapping_config", "") if node.kwargs else ""
-        if mapping_config:
-            ad_logger.debug_once(
-                "Skip TRTLLM-Gen NVFP4 fusion: mapping_config is not supported.",
-                key="trtllm_gen_nvfp4_skip_mapping_config",
-            )
-            continue
-
         (
             hidden_states,
             selected_experts,
