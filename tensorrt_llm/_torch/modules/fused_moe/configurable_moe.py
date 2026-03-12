@@ -53,6 +53,7 @@ from .communication import (
 from .fused_moe_cute_dsl import CuteDslFusedMoE
 from .fused_moe_cutlass import CutlassFusedMoE
 from .fused_moe_deepgemm import DeepGemmFusedMoE
+from .fused_moe_densegemm import DenseGEMMFusedMoE
 from .fused_moe_trtllm_gen import TRTLLMGenFusedMoE
 
 
@@ -1117,7 +1118,12 @@ class ConfigurableMoE(MoE):
         kwargs = {}
 
         # Common parameters for Cutlass and DeepGemm
-        if self.backend.__class__ in (CutlassFusedMoE, DeepGemmFusedMoE, CuteDslFusedMoE):
+        if self.backend.__class__ in (
+            CutlassFusedMoE,
+            DeepGemmFusedMoE,
+            CuteDslFusedMoE,
+            DenseGEMMFusedMoE,
+        ):
             pass
 
         # Cutlass-specific parameters
