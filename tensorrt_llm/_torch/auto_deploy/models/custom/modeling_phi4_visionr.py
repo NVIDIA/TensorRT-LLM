@@ -43,7 +43,10 @@ from transformers.modeling_utils import PreTrainedModel
 from transformers.models.phi3.configuration_phi3 import Phi3Config
 from transformers.utils import ModelOutput
 
-from tensorrt_llm._torch.auto_deploy.models.hf import AutoModelForCausalLMFactory
+from tensorrt_llm._torch.auto_deploy.models.hf import (
+    AutoModelForCausalLMFactory,
+    AutoModelForImageTextToTextFactory,
+)
 
 IGNORE_INDEX = -100
 IMAGE_TOKEN_INDEX = -200
@@ -969,5 +972,11 @@ AutoModelForCausalLMFactory.register_custom_model_cls(
     "Phi4VisionRConfig", Phi4VisionRForConditionalGeneration
 )
 AutoModelForCausalLMFactory.register_custom_model_cls(
+    "Phi4VisionR", Phi4VisionRForConditionalGeneration
+)
+AutoModelForImageTextToTextFactory.register_custom_model_cls(
+    "Phi4VisionRConfig", Phi4VisionRForConditionalGeneration
+)
+AutoModelForImageTextToTextFactory.register_custom_model_cls(
     "Phi4VisionR", Phi4VisionRForConditionalGeneration
 )
