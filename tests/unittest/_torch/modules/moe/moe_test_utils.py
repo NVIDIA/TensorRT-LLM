@@ -45,6 +45,7 @@ from tensorrt_llm._torch.modules.fused_moe import (
     TRTLLMGenFusedMoE,
 )
 from tensorrt_llm._torch.modules.fused_moe.fused_moe_deepgemm import DeepGemmFusedMoE
+from tensorrt_llm._torch.modules.fused_moe.fused_moe_densegemm import DenseGEMMFusedMoE
 from tensorrt_llm._torch.modules.fused_moe.interface import MoE
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation
 from tensorrt_llm.models.modeling_utils import QuantAlgo
@@ -62,6 +63,7 @@ class MoeBackendType(str, Enum):
     TRTLLM = "TRTLLM"
     CUTEDSL = "CUTEDSL"
     DEEPGEMM = "DEEPGEMM"
+    DENSEGEMM = "DENSEGEMM"
 
 
 def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
@@ -71,6 +73,7 @@ def get_backend_class(backend_type: MoeBackendType) -> Type[MoE]:
         MoeBackendType.TRTLLM: TRTLLMGenFusedMoE,
         MoeBackendType.CUTEDSL: CuteDslFusedMoE,
         MoeBackendType.DEEPGEMM: DeepGemmFusedMoE,
+        MoeBackendType.DENSEGEMM: DenseGEMMFusedMoE,
     }
     return backend_class_map[backend_type]
 
@@ -533,6 +536,68 @@ def should_skip_deepgemm(
     return None
 
 
+def should_skip_densegemm(
+    backend_type: MoeBackendType,
+    quant_algo: Optional[QuantAlgo] = None,
+    model_config: "MoeModelConfig" = None,
+) -> Optional[str]:
+    """
+    Check DenseGEMM backend specific constraints.
+
+    DenseGEMM reshapes all expert weights into a single dense matrix and performs
+    a single large GEMM. It only supports NVFP4 quantization on Blackwell (SM 100/103).
+
+    Constraints:
+    - Only NVFP4 quantization
+    - hidden_size and intermediate_size must be 128-aligned (NVFP4 requirement)
+    - top_k must be >= 2 (fc2_alpha scatter requires multiple expert selections)
+    - num_experts must be > top_k
+
+    Returns:
+        Skip reason string if test should be skipped, None otherwise
+    """
+    if backend_type != MoeBackendType.DENSEGEMM:
+        return None
+
+    # DenseGEMM only supports NVFP4
+    if quant_algo != QuantAlgo.NVFP4:
+        return f"DenseGEMMFusedMoE only supports NVFP4 quantization (got quant_algo={quant_algo})"
+
+    if model_config is not None:
+        hidden_size = model_config.hidden_size
+        intermediate_size = model_config.intermediate_size
+
+        # 128-alignment required for NVFP4 dense GEMM kernels
+        if hidden_size % 128 != 0 or intermediate_size % 128 != 0:
+            return (
+                f"DenseGEMMFusedMoE NVFP4 requires 128-aligned sizes "
+                f"(got h={hidden_size}, i={intermediate_size})"
+            )
+
+        # FC2 DenseGEMM kernel tiles K with MMA tile size 256.
+        # intermediate_size (= weight_per_expert for FC2) must be 256-aligned
+        # so expert boundaries align with MMA tile boundaries.
+        _MMA_TILE_K = 256
+        if intermediate_size % _MMA_TILE_K != 0:
+            return (
+                f"DenseGEMMFusedMoE requires intermediate_size to be a multiple "
+                f"of {_MMA_TILE_K} (got intermediate_size={intermediate_size}). "
+                f"FC2 kernel cannot split alpha_scale at non-aligned expert boundaries."
+            )
+
+        # DenseGEMM with very large intermediate_size has accuracy issues vs
+        # per-expert reference due to FP4 error accumulation in the large
+        # FC2 reduction dimension (expert_count * intermediate_size).
+        if intermediate_size >= 14336:
+            return (
+                f"[Design Limitation] DenseGEMMFusedMoE NVFP4 with large "
+                f"intermediate_size={intermediate_size} has accuracy issues "
+                f"vs per-expert reference due to FP4 error accumulation."
+            )
+
+    return None
+
+
 def should_skip_multi_gpu(
     parallel_mode: str,
     model_config: "MoeModelConfig",
@@ -703,15 +768,21 @@ def get_quick_skip_reason(
             lambda: should_skip_deepgemm(
                 backend_type, quant_algo=quant_algo, model_config=model_config
             ),
+            lambda: should_skip_densegemm(
+                backend_type, quant_algo=quant_algo, model_config=model_config
+            ),
         ]
         for check in skip_checks:
             skip_reason = check()
             if skip_reason:
                 return skip_reason
 
-        # DEEPGEMM: float16 reference module constraint
-        if backend_type == MoeBackendType.DEEPGEMM and dtype == torch.float16:
-            return "DeepGemmFusedMoE reference module requires bfloat16 input"
+        # DEEPGEMM/DENSEGEMM: float16 reference module constraint
+        if (
+            backend_type in (MoeBackendType.DEEPGEMM, MoeBackendType.DENSEGEMM)
+            and dtype == torch.float16
+        ):
+            return f"{backend_type.value} reference module requires bfloat16 input"
 
         # 128-alignment requirement for quantization
         if quant_algo is not None:

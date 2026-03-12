@@ -740,6 +740,7 @@ BACKEND_TYPES = [
     MoeBackendType.TRTLLM,
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
+    MoeBackendType.DENSEGEMM,
 ]
 
 # Data types to test
@@ -1098,6 +1099,10 @@ def test_configurable_moe_single_gpu(
     3. Autotune captures and replays all tactics properly
     4. swiglu_gptoss_style (SwiGLU with custom parameters) works correctly
     """
+    # DENSEGEMM: disable fused fc2_alpha path for testing against per-expert reference.
+    if moe_backend == MoeBackendType.DENSEGEMM.value:
+        os.environ["TRTLLM_MOE_FUSED_FC2_ALPHA"] = "0"
+
     swiglu_gptoss_style = swiglu_alpha != 1 or swiglu_beta != 0 or swiglu_limit != float("inf")
     ci_skip = should_skip_to_accelerate_ci(
         backend_type=MoeBackendType(moe_backend),

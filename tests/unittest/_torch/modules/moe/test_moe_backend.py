@@ -28,6 +28,7 @@ Design Goals:
 
 import itertools
 import logging
+import os
 from typing import List, Optional
 
 import pytest
@@ -220,6 +221,7 @@ BACKEND_TYPES_TO_TEST = [
     MoeBackendType.TRTLLM,
     MoeBackendType.CUTEDSL,
     MoeBackendType.DEEPGEMM,
+    MoeBackendType.DENSEGEMM,
 ]
 
 # Data types to test
@@ -466,6 +468,10 @@ def test_moe_backend(
     3. Different sequence lengths use appropriate tactics
     4. swiglu_gptoss_style (SwiGlu with custom parameters) works correctly
     """
+    # DENSEGEMM: disable fused fc2_alpha path for backend-level testing.
+    if backend_type == MoeBackendType.DENSEGEMM:
+        os.environ["TRTLLM_MOE_FUSED_FC2_ALPHA"] = "0"
+
     is_gated = is_gated_activation(activation_type)
     swiglu_gptoss_style = False
     if is_gated:
