@@ -28,9 +28,12 @@
 import copy
 import math
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
 import triton
 import triton.language as tl
 from torch import nn

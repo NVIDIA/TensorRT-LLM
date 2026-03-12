@@ -4,9 +4,14 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Dict, Generic, List, Optional, Tuple, Type, TypeVar, Union
+from typing import (TYPE_CHECKING, Dict, Generic, List, Optional, Tuple, Type,
+                    TypeVar, Union)
 
 import torch
+
+if TYPE_CHECKING:
+    from tensorrt_llm.llmapi.llm_args import TorchLlmArgs
+
 from torch import nn
 from torch.utils._python_dispatch import TorchDispatchMode
 from torch.utils._pytree import tree_any_only
