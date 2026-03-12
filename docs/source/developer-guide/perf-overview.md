@@ -76,15 +76,15 @@ All performance values are measured in **output tokens per second per GPU**.
 ## Table of Contents
 
 - [Deepseek R1 0528](#deepseek-r1-0528)
-  - [Deepseek R1 0528 - RTX Configurations](#deepseek-r1-0528-rtx-configurations)
+  - [Deepseek R1 0528 - RTX 6000 Pro Blackwell Server Edition](#deepseek-r1-0528-rtx-configurations)
 - [GPT-OSS 120B](#gpt-oss-120b)
 - [GPT-OSS 20B](#gpt-oss-20b)
 - [LLaMA v3.3 70B](#llama-v33-70b)
-  - [LLaMA v3.3 70B - RTX Configurations](#llama-v33-70b-rtx-configurations)
+  - [LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition](#llama-v33-70b-rtx-configurations)
 - [Qwen3 235B A22B](#qwen3-235b-a22b)
-  - [Qwen3 235B A22B - RTX Configurations](#qwen3-235b-a22b-rtx-configurations)
+  - [Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition](#qwen3-235b-a22b-rtx-configurations)
 - [Qwen3 30B A3B](#qwen3-30b-a3b)
-  - [Qwen3 30B A3B - RTX Configurations](#qwen3-30b-a3b-rtx-configurations)
+  - [Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition](#qwen3-30b-a3b-rtx-configurations)
 
 ---
 
@@ -105,7 +105,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 <a id="deepseek-r1-0528-rtx-configurations"></a>
 
-# Deepseek R1 0528 - RTX Configurations (TP/PP)
+# Deepseek R1 0528 - RTX 6000 Pro Blackwell Server Edition (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
@@ -165,7 +165,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 <a id="llama-v33-70b-rtx-configurations"></a>
 
-# LLaMA v3.3 70B - RTX Configurations (TP/PP)
+# LLaMA v3.3 70B - RTX 6000 Pro Blackwell Server Edition (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
@@ -197,7 +197,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 <a id="qwen3-235b-a22b-rtx-configurations"></a>
 
-# Qwen3 235B A22B - RTX Configurations (TP/PP)
+# Qwen3 235B A22B - RTX 6000 Pro Blackwell Server Edition (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
@@ -229,7 +229,7 @@ All performance values are measured in **output tokens per second per GPU**.
 
 <a id="qwen3-30b-a3b-rtx-configurations"></a>
 
-# Qwen3 30B A3B - RTX Configurations (TP/PP)
+# Qwen3 30B A3B - RTX 6000 Pro Blackwell Server Edition (TP/PP)
 
 *Shows Tensor Parallel (TP) and Pipeline Parallel (PP) configurations*
 
@@ -313,7 +313,7 @@ a model name (HuggingFace reference or path to a local model), a [generated data
 
 For dense / non-MoE models:
 ```shell
-trtllm-bench --tp $tp_size --pp $pp_size --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options
+trtllm-bench --tp $tp_size --pp $pp_size --model $model_name throughput --dataset $dataset_file --backend pytorch --config $llm_options  --concurrency -1
 ```
 Llama 3.3
 
@@ -342,7 +342,7 @@ kv_cache_config:
   dtype: fp8
   # Hopper: use auto
 moe_config:
-  backend: CUTLASS
+  backend: TRTLLM
   # Hopper: use TRITON
 ```
 
@@ -362,6 +362,20 @@ moe_config:
   backend: CUTLASS
 kv_cache_config:
   dtype: fp8
+```
+
+Kimi K2:
+
+`llm_options.yml`
+```yaml
+enable_attention_dp: true
+cuda_graph_config:
+  enable_padding: true
+  batch_sizes: [1, 2, 4, 8, 16, 32, 64, 128, 256, 384]
+moe_config:
+  backend: CUTLASS
+kv_cache_config:
+  dtype: auto
 ```
 
 Qwen3 MoE, Llama4 Maverick:
