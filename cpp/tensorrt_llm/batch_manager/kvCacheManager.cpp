@@ -38,6 +38,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <unordered_set>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -1856,9 +1857,17 @@ void WindowBlockManager::pinBlocks(GenerationRequest& sequence)
 {
     auto const requestId = sequence.getRequestId();
     auto& allocatedBlocks = mAllocatedBlocksPerSeq.at(requestId);
+    // Shared context blocks appear beamWidth times in the flat vector (once per beam),
+    // but must be pinned exactly once: unpinBlocksById decrements once per unique block ID.
+    // Without deduplication, a shared block with beamWidth=B gets pinned B times but
+    // unpinned once, leaking the block permanently.
+    std::unordered_set<KVCacheBlock::IdType> seen;
     for (auto& block : allocatedBlocks)
     {
-        block->incRefCount();
+        if (seen.insert(block->getBlockId()).second)
+        {
+            block->incRefCount();
+        }
     }
 }
 
