@@ -97,6 +97,15 @@ class DeepEPLowLatency(Communication):
         self.deep_ep_buffer = buffer_pool.get_low_latency_buffer(mapping)
         self.deep_ep_buffer.reserve(self.deep_ep_max_num_tokens, hidden_size, num_slots)
 
+    def destroy(self):
+        """Release the DeepEP low-latency buffer to prevent deadlock/hang.
+
+        Buffer.__del__ calls intranode::barrier (collective op). Without
+        explicit release, non-deterministic GC timing across ranks causes
+        some ranks to block in the barrier indefinitely.
+        """
+        self.deep_ep_buffer = None
+
     @staticmethod
     def is_platform_supported() -> bool:
         """
