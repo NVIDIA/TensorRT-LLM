@@ -918,8 +918,14 @@ class Deepseekv3MoE(nn.Module):
                              moe_backend=model_config.moe_backend)
         # For MIXED_PRECISION, resolve the per-expert quant config (e.g. W4A8_AWQ)
         # instead of using the ambiguous global MIXED_PRECISION config.
-        expert_quant_config = self._get_experts_quant_config(
-            model_config, layer_idx)
+        # For other cases (e.g. nvfp4, unquantized MTP layers), use
+        # override_quant_config as-is — it already encodes exclusions like MTP.
+        if (override_quant_config is not None and
+                override_quant_config.quant_algo == QuantAlgo.MIXED_PRECISION):
+            expert_quant_config = self._get_experts_quant_config(
+                model_config, layer_idx)
+        else:
+            expert_quant_config = override_quant_config
         self.experts = create_moe(
             num_experts=num_experts,
             routing_method=self.gate.routing_method,
