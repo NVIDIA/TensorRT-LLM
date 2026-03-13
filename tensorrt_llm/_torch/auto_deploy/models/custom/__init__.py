@@ -12,6 +12,7 @@ from .modeling_hunyuan_dense import HunYuanDenseForCausalLM
 from .modeling_hunyuan_moe import HunYuanMoEForCausalLM
 from .modeling_kimi_k2 import KimiK2ForCausalLM, KimiK25ForConditionalGeneration
 from .modeling_llama3 import Llama3ForCausalLM
+from .modeling_mistral import MistralForCausalLM
 from .modeling_mistral3 import Mistral3ForConditionalGeneration, Mistral3TextForCausalLM
 from .modeling_nemotron_flash import NemotronFlashForCausalLM, NemotronFlashPreTrainedTokenizerFast
 from .modeling_nemotron_h import NemotronHForCausalLM
@@ -47,6 +48,7 @@ __all__ = (
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
     "Llama3ForCausalLM",
+    "MistralForCausalLM",
     "Mistral3ForConditionalGeneration",
     "Mistral3TextForCausalLM",
     "NemotronFlashForCausalLM",
