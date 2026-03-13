@@ -10,7 +10,6 @@
 # limitations under the License.
 
 import copy
-import os
 import types
 from collections import abc, defaultdict
 from dataclasses import dataclass
