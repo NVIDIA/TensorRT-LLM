@@ -2846,6 +2846,12 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = DenseGemmSwigluKernel
         kernel_cache = dict()
         tuning_config_cache = dict()
+        _CUTLASS_DTYPE_MAP = {
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float16: cutlass.Float16,
+            torch.float32: cutlass.Float32,
+            torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
+        }
 
         def __init__(
             self,
@@ -2901,12 +2907,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4), (2, 1)]
 
             # Map torch dtype to cutlass dtype
-            c_cutlass_dtype = {
-                torch.bfloat16: cutlass.BFloat16,
-                torch.float16: cutlass.Float16,
-                torch.float32: cutlass.Float32,
-                torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
-            }.get(self.output_dtype, cutlass.BFloat16)
+            if self.output_dtype not in self._CUTLASS_DTYPE_MAP:
+                raise ValueError(
+                    f"Unsupported output_dtype {self.output_dtype} for FC1 DenseGEMM runner"
+                )
+            c_cutlass_dtype = self._CUTLASS_DTYPE_MAP[self.output_dtype]
 
             tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -2998,12 +3003,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             # Map torch dtype to cutlass dtype
-            c_cutlass_dtype = {
-                torch.bfloat16: cutlass.BFloat16,
-                torch.float16: cutlass.Float16,
-                torch.float32: cutlass.Float32,
-                torch.float4_e2m1fn_x2: cutlass.Float4E2M1FN,
-            }.get(c_dtype, cutlass.BFloat16)
+            if c_dtype not in self._CUTLASS_DTYPE_MAP:
+                raise ValueError(
+                    f"Unsupported output_dtype {c_dtype} for FC1 DenseGEMM runner"
+                )
+            c_cutlass_dtype = self._CUTLASS_DTYPE_MAP[c_dtype]
 
             # Create pointers for kernel
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
@@ -3229,6 +3233,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
         kernel_class = DenseGemmFC2Kernel
         kernel_cache = dict()
         tuning_config_cache = dict()
+        _CUTLASS_DTYPE_MAP = {
+            torch.bfloat16: cutlass.BFloat16,
+            torch.float16: cutlass.Float16,
+            torch.float32: cutlass.Float32,
+        }
 
         def __init__(
             self,
@@ -3284,11 +3293,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             cluster_shape_mn_candidates = [(1, 1), (1, 2), (1, 4)]
 
             # Map torch dtype to cutlass dtype
-            c_cutlass_dtype = {
-                torch.bfloat16: cutlass.BFloat16,
-                torch.float16: cutlass.Float16,
-                torch.float32: cutlass.Float32,
-            }.get(self.output_dtype, cutlass.BFloat16)
+            if self.output_dtype not in self._CUTLASS_DTYPE_MAP:
+                raise ValueError(
+                    f"Unsupported output_dtype {self.output_dtype} for FC2 DenseGEMM runner"
+                )
+            c_cutlass_dtype = self._CUTLASS_DTYPE_MAP[self.output_dtype]
 
             tactics = []
             for mma_tiler_mn, cluster_shape_mn in itertools.product(
@@ -3370,11 +3379,11 @@ if IS_CUTLASS_DSL_AVAILABLE:
             stream = cuda.CUstream(torch_stream.cuda_stream)
 
             # Map torch dtype to cutlass dtype
-            c_cutlass_dtype = {
-                torch.bfloat16: cutlass.BFloat16,
-                torch.float16: cutlass.Float16,
-                torch.float32: cutlass.Float32,
-            }.get(c_dtype, cutlass.BFloat16)
+            if c_dtype not in self._CUTLASS_DTYPE_MAP:
+                raise ValueError(
+                    f"Unsupported output_dtype {c_dtype} for FC2 DenseGEMM runner"
+                )
+            c_cutlass_dtype = self._CUTLASS_DTYPE_MAP[c_dtype]
 
             # Create pointers for kernel
             a_ptr = make_ptr(cutlass.Float4E2M1FN,
