@@ -913,6 +913,7 @@ class TestPEFT:
         """determine_num_pages returns different values per req."""
         mgr = make_kv_cache_manager()
         peft = make_peft_cache_manager(max_device_pages=5, pages_per_task=1)
+
         def determine_pages(req):
             return 3  # 3+3=6 > 5
 
