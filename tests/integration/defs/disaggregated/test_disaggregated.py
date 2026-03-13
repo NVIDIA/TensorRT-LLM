@@ -2116,7 +2116,11 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                                         disaggregated_example_root, llm_venv,
                                         llama_model_root):
     """Test logprobs via OpenAI API in disaggregated serving with multi-GPU TP.
-    RCCA: https://nvbugspro.nvidia.com/bug/5926823
+
+    Covers the RCCA scenario (NVBug 5926823): disaggregated + streaming + logprobs,
+    where the context worker returns prefill result (request_type=generation_only)
+    to the generation worker. Ensures LogProbStorage flows correctly across the
+    context/gen boundary without AttributeError on cum_log_probs.
     """
 
     async def iter_sse_chunks(resp):
