@@ -4,10 +4,10 @@ from .controller import (BestOfNController, ChatWithMCPController, Controller,
                          MajorityVoteController, NativeChatController,
                          NativeGenerationController, NativeRewardController,
                          ParallelProcess, PRMController)
-from .execution_trace import ExecutionTrace, TaskRecord, TraceEvent
+from .execution_trace import ExecutionTrace, TraceEvent
 from .math_utils import (extract_answer_from_boxed, extract_answer_with_regex,
                          get_digit_majority_vote_result)
-from .replay import (ReplayDriver, ReplayMCPWorker, TraceReplayDriver,
+from .replay import (ReplayMismatchError, TraceReplayEngine,
                      create_replay_scaffolding_llm)
 from .scaffolding_llm import ScaffoldingLlm
 from .task import (AssistantMessage, ChatTask, DropKVCacheTask, GenerationTask,
@@ -62,7 +62,6 @@ __all__ = [
     "TaskTimer",
     "QueryCollector",
     "TaskMetricsCollector",
-    "DetailedTaskProfiler",
     "sub_request_node",
     "async_scaffolding_benchmark",
     "ScaffoldingBenchRequest",
@@ -70,11 +69,9 @@ __all__ = [
     "drop_kv_cache_scope",
     "ExecutionTrace",
     "TraceEvent",
-    "TaskRecord",
     "ExecutionTracer",
     "with_execution_tracing",
-    "ReplayDriver",
-    "TraceReplayDriver",
-    "ReplayMCPWorker",
+    "TraceReplayEngine",
+    "ReplayMismatchError",
     "create_replay_scaffolding_llm",
 ]

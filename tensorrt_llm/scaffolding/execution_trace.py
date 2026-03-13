@@ -1,47 +1,67 @@
 import json
 import time
 import uuid
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from typing import Any, Dict, List, Optional, Tuple
 
 
-@dataclass
-class TaskRecord:
-    """Captures a single task's input/output at a yield point."""
+def _strip_none(obj):
+    """Recursively remove keys with None values from dicts."""
+    if isinstance(obj, dict):
+        return {k: _strip_none(v) for k, v in obj.items() if v is not None}
+    if isinstance(obj, list):
+        return [_strip_none(item) for item in obj]
+    return obj
 
-    task_type: str = ""
+
+@dataclass
+class TraceEvent:
+    """A single event in the execution trace.
+
+    event_type semantics:
+      - "message": a single message in a conversation.  ``conversation_id``
+        groups messages belonging to the same ChatTask or GenerationTask.
+        ``role`` is "system", "user", "assistant", or "tool".
+        Assistant messages carry generation metadata (token counts,
+        tool_calls, finish_reason, duration_ms).  Non-assistant messages
+        are informational context recorded between yields.
+      - "tool_call": a single MCP tool invocation (MCPCallTask).
+      - "parallel_start": a parallel branching point.  Two sub-cases:
+          * ParallelProcess — ``children`` is ``None``; child events
+            are recorded as separate top-level events on sub-branch paths.
+          * Multi-task yield (pseudo-fork) — ``children`` contains one
+            child TraceEvent per concurrently-dispatched task.
+      - "drop_kv_cache": a KV-cache eviction marker (DropKVCacheTask).
+    """
+
+    event_type: str = ""
+    branch_path: List[int] = field(default_factory=list)
+    timestamp: float = 0.0
+    duration_ms: float = 0.0
     worker_tag: str = ""
 
-    # ChatTask fields
-    input_messages: Optional[List[Dict[str, Any]]] = None
-    output_messages: Optional[List[Dict[str, Any]]] = None
+    # -- message fields (event_type == "message") --
+    conversation_id: Optional[int] = None
+    role: Optional[str] = None
+    content: Optional[str] = None
+    tool_calls: Optional[List[Dict[str, Any]]] = None
     prompt_tokens: Optional[int] = None
     completion_tokens: Optional[int] = None
     reasoning_tokens: Optional[int] = None
     finish_reason: Optional[str] = None
     tools: Optional[List[Dict[str, Any]]] = None
+    output_token_count: Optional[int] = None
+    input_tokens: Optional[int] = None
 
-    # MCPCallTask fields
+    # -- tool_call fields (event_type == "tool_call") --
     tool_call_id: Optional[str] = None
     tool_name: Optional[str] = None
     tool_args: Optional[Any] = None
     result_str: Optional[str] = None
 
-    # GenerationTask fields
-    input_str: Optional[str] = None
-    output_str: Optional[str] = None
-    output_token_count: Optional[int] = None
-
-
-@dataclass
-class TraceEvent:
-    """A single event in the execution trace."""
-
-    event_type: str = ""
-    timestamp: float = 0.0
-    duration_ms: float = 0.0
-    tasks: Optional[List[TaskRecord]] = None
+    # -- parallel_start fields (event_type == "parallel_start") --
     num_branches: Optional[int] = None
+    children: Optional[List["TraceEvent"]] = None
 
 
 @dataclass
@@ -55,8 +75,12 @@ class ExecutionTrace:
     metadata: Dict[str, Any] = field(default_factory=dict)
 
     def save(self, path: str):
-        """Serialize and write the trace to a JSON file."""
-        data = asdict(self)
+        """Serialize and write the trace to a JSON file.
+
+        None-valued fields are stripped to keep the JSON compact — each
+        event only contains the keys relevant to its ``event_type``.
+        """
+        data = _strip_none(asdict(self))
         with open(path, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2, ensure_ascii=False, default=str)
 
@@ -66,20 +90,7 @@ class ExecutionTrace:
         with open(path, "r", encoding="utf-8") as f:
             data = json.load(f)
 
-        events = []
-        for ev_data in data.get("events", []):
-            task_records = None
-            if ev_data.get("tasks") is not None:
-                task_records = [TaskRecord(**tr) for tr in ev_data["tasks"]]
-            events.append(
-                TraceEvent(
-                    event_type=ev_data.get("event_type", ""),
-                    timestamp=ev_data.get("timestamp", 0.0),
-                    duration_ms=ev_data.get("duration_ms", 0.0),
-                    tasks=task_records,
-                    num_branches=ev_data.get("num_branches"),
-                )
-            )
+        events = [_parse_event(ev) for ev in data.get("events", [])]
 
         return cls(
             trace_id=data.get("trace_id", str(uuid.uuid4())),
@@ -89,20 +100,60 @@ class ExecutionTrace:
             metadata=data.get("metadata", {}),
         )
 
+    def annotate_input_tokens(self, tokenizer) -> None:
+        """Add ``input_tokens`` to system/user/tool message events.
+
+        Uses the provided tokenizer to compute the token count for each
+        non-assistant message's content.  This makes per-message token
+        lengths available in the saved JSON, so that tools like the replay
+        engine can determine e.g. the system-prompt length without
+        re-tokenizing.
+        """
+        self._annotate_events(self.events, tokenizer)
+
+    @staticmethod
+    def _annotate_events(events: List[TraceEvent], tokenizer) -> None:
+        for event in events:
+            if event.event_type == "message" and event.role in ("system", "user", "tool"):
+                content = event.content or ""
+                event.input_tokens = len(tokenizer.encode(content, add_special_tokens=False))
+            if event.children:
+                ExecutionTrace._annotate_events(event.children, tokenizer)
+
     def get_mcp_responses(self) -> List[Tuple[str, Any, str, float]]:
-        """Extract (tool_name, tool_args, result_str, duration_ms) from all MCPCallTask records."""
-        results = []
+        """Extract (tool_name, tool_args, result_str, duration_ms) tuples."""
+        results: List[Tuple[str, Any, str, float]] = []
         for event in self.events:
-            if event.event_type != "task_yield" or event.tasks is None:
-                continue
-            for task_record in event.tasks:
-                if task_record.task_type == "MCPCallTask":
-                    results.append(
-                        (
-                            task_record.tool_name,
-                            task_record.tool_args,
-                            task_record.result_str,
-                            event.duration_ms,
-                        )
+            if event.event_type == "tool_call":
+                results.append(
+                    (
+                        event.tool_name,
+                        event.tool_args,
+                        event.result_str,
+                        event.duration_ms,
                     )
+                )
+            elif event.event_type == "parallel_start" and event.children:
+                for child in event.children:
+                    if child.event_type == "tool_call":
+                        results.append(
+                            (
+                                child.tool_name,
+                                child.tool_args,
+                                child.result_str,
+                                child.duration_ms,
+                            )
+                        )
         return results
+
+
+_TRACE_EVENT_FIELDS = {f.name for f in fields(TraceEvent)}
+
+
+def _parse_event(ev_data: dict) -> TraceEvent:
+    """Deserialize a single TraceEvent from a JSON dict."""
+    d = dict(ev_data)
+    if d.get("children") is not None:
+        d["children"] = [_parse_event(c) for c in d["children"]]
+    d = {k: v for k, v in d.items() if k in _TRACE_EVENT_FIELDS}
+    return TraceEvent(**d)

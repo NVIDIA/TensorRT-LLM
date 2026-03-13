@@ -69,6 +69,15 @@ async def main():
         QueryCollector.get_global_info()
         print("Query info dumped to query_result.json!")
 
+    if result.task_collections:
+        tracer = result.task_collections.get("execution_tracer")
+        if tracer:
+            trace = tracer.export_trace(prompt)
+            # tokenizer = AutoTokenizer.from_pretrained(args.model)
+            # trace.annotate_input_tokens(tokenizer)
+            trace.save("execution_trace.json")
+            print("Execution trace saved to execution_trace.json")
+
     llm.shutdown()
     generation_worker.shutdown()
     mcp_worker.shutdown()

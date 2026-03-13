@@ -248,7 +248,7 @@ class ChatWithMCPController(Controller):
             assert isinstance(
                 response_message, AssistantMessage
             ), f"response is not AssistantMessage, {type(response_message)=}"
-            if response_message.tool_calls is not None:
+            if response_message.tool_calls:
                 tool_calls = response_message.tool_calls
                 mcp_tasks = [
                     MCPCallTask.create_mcptask(tool_call.id,

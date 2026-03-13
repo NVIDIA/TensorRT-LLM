@@ -1,3 +1,17 @@
+# Copyright (c) 2026, NVIDIA CORPORATION. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 import copy
 import json
 from dataclasses import dataclass, field
@@ -186,6 +200,7 @@ class Supervisor(Controller):
         final_report = final_report_generation_task.messages[-1].content
 
         tasks[0].output_str = final_report
+        tasks[0].output_tokens = tasks[0].output_tokens or []
         return
 
 
@@ -216,15 +231,13 @@ class FinalReportController(NativeGenerationController):
         return
 
 
-def create_open_deep_research_scaffolding_llm(
-    generation_worker: Worker,
-    mcp_worker: Worker,
+def create_open_deep_research_controller(
     max_tokens: int = 16384,
-    max_parallel_requests: int = 1024,
     enable_statistics: bool = False,
     enable_query_collector: bool = False,
     enable_tracing: bool = False,
-) -> ScaffoldingLlm:
+) -> Controller:
+    """Create the prototype controller for open deep research scaffolding."""
     sampling_params = {
         "temperature": 0.9,
         "max_tokens": max_tokens,
@@ -290,8 +303,25 @@ def create_open_deep_research_scaffolding_llm(
     research_planning_controller = research_planning_type(sampling_params=sampling_params)
     final_report_controller = final_report_type(sampling_params=sampling_params)
 
-    supervisor_controller = supervisor_type(
+    return supervisor_type(
         brief_controller, research_planning_controller, research_controller, final_report_controller
+    )
+
+
+def create_open_deep_research_scaffolding_llm(
+    generation_worker: Worker,
+    mcp_worker: Worker,
+    max_tokens: int = 16384,
+    max_parallel_requests: int = 1024,
+    enable_statistics: bool = False,
+    enable_query_collector: bool = False,
+    enable_tracing: bool = False,
+) -> ScaffoldingLlm:
+    supervisor_controller = create_open_deep_research_controller(
+        max_tokens=max_tokens,
+        enable_statistics=enable_statistics,
+        enable_query_collector=enable_query_collector,
+        enable_tracing=enable_tracing,
     )
 
     scaffolding_llm = ScaffoldingLlm(

@@ -1,12 +1,22 @@
+import contextvars
 import json
 import os
 import time
 from enum import Enum
-from typing import Any, Dict, List, Tuple, Type
+from typing import Any, Dict, List, Optional, Tuple, Type
 
-from .controller import ParallelProcess, Controller
-from .execution_trace import ExecutionTrace, TaskRecord, TraceEvent
+from .controller import Controller, ParallelProcess
+from .execution_trace import ExecutionTrace, TraceEvent
 from .task import ChatTask, DropKVCacheTask, GenerationTask, MCPCallTask, Task
+
+# Tracks the current parallel-branch nesting path.  Defaults to [] (root /
+# main trunk).  Elements are zero-based branch indices appended at each
+# parallel fork.  E.g. [1, 0] means "branch 0 inside branch 1 of the
+# first parallel section off the trunk".
+# Set automatically by TaskCollectionWrapper when iterating sub-generators
+# of a ParallelProcess; read by ExecutionTracer and TraceReplayEngine.
+current_branch_path: contextvars.ContextVar[List[int]] = contextvars.ContextVar(
+    'current_branch_path', default=[])
 
 
 class TaskCollection:
@@ -49,20 +59,31 @@ def with_task_collection(name: str, task_collection_cls: Type[TaskCollection],
 
             class TaskCollectionWrapper:
 
-                def __init__(self, task_collection, gen):
+                def __init__(self, task_collection, gen, branch_idx=None):
                     self.task_collection = task_collection
                     self.gen = gen
+                    self.branch_idx = branch_idx
 
                 def __call__(self):
+                    if self.branch_idx is not None:
+                        parent_path = current_branch_path.get()
+                        current_branch_path.set(parent_path + [self.branch_idx])
+
                     for obj in self.gen:
                         if isinstance(obj, ParallelProcess):
                             num_branches = len(obj.sub_gens)
                             new_sub_gens = []
-                            for sub_gen in obj.sub_gens:
+                            already_branched = getattr(obj, '_branch_path_set',
+                                                       False)
+                            for idx, sub_gen in enumerate(obj.sub_gens):
                                 new_sub_gen = TaskCollectionWrapper(
-                                    self.task_collection, sub_gen)
+                                    self.task_collection,
+                                    sub_gen,
+                                    branch_idx=None
+                                    if already_branched else idx)
                                 new_sub_gens.append(new_sub_gen)
                             obj.sub_gens = new_sub_gens
+                            obj._branch_path_set = True
                             self.task_collection.on_parallel_start(num_branches)
                             yield obj
                             self.task_collection.on_parallel_end(num_branches)
@@ -520,12 +541,25 @@ class TaskMetricsCollector(TaskCollection):
 
 
 class ExecutionTracer(TaskCollection):
-    """Captures the full execution flow of a controller as a serializable trace.
+    """Captures the full execution flow of a controller as a chat transcript.
 
-    Records task yields (with input/output data, token counts, timing) and
-    parallel process events. Attach via ``with_execution_tracing`` decorator
-    or ``with_task_collection("execution_tracer", ExecutionTracer, ...)``.
+    Every message in a ChatTask conversation becomes its own ``message``
+    event with a ``conversation_id``.  Non-assistant messages (system, user,
+    tool) are emitted in ``before_yield`` as context; assistant messages are
+    emitted in ``after_yield`` with generation metadata (token counts,
+    tool_calls, duration).
 
+    GenerationTask yields produce two ``message`` events: a ``user`` event
+    for the input and an ``assistant`` event for the output.
+
+    MCPCallTask and DropKVCacheTask are recorded as ``tool_call`` and
+    ``drop_kv_cache`` events respectively (unchanged).
+
+    Multi-task yields become ``fork`` events whose ``children`` are the
+    assistant-level events.  ParallelProcess forks are structural ``fork``
+    events without ``children``.
+
+    Attach via ``@with_execution_tracing`` decorator.
     After execution, call ``export_trace(prompt)`` to obtain an
     ``ExecutionTrace`` that can be saved to JSON and later replayed.
     """
@@ -536,6 +570,16 @@ class ExecutionTracer(TaskCollection):
         self.events: List[TraceEvent] = []
         self._start_times: Dict[int, float] = {}
         self._pre_message_counts: Dict[int, int] = {}
+        self._conversation_ids: Dict[int, int] = {}
+        self._last_recorded_counts: Dict[int, int] = {}
+        self._conv_counter = 0
+
+    def _get_conversation_id(self, task_id: int) -> int:
+        """Return a stable conversation_id for a task, assigning one on first encounter."""
+        if task_id not in self._conversation_ids:
+            self._conversation_ids[task_id] = self._conv_counter
+            self._conv_counter += 1
+        return self._conversation_ids[task_id]
 
     def _is_task_already_traced(self, task: Task) -> bool:
         return getattr(task, '_tracing_in_progress', False)
@@ -556,34 +600,51 @@ class ExecutionTracer(TaskCollection):
 
             if isinstance(task, ChatTask):
                 task.enable_token_counting = True
-                self._pre_message_counts[task_id] = len(task.messages)
+                pre_count = len(task.messages)
+                self._pre_message_counts[task_id] = pre_count
+
+                conv_id = self._get_conversation_id(task_id)
+                last_recorded = self._last_recorded_counts.get(task_id, 0)
+                branch_path = current_branch_path.get()
+                now = time.time()
+                for msg in task.messages[last_recorded:pre_count]:
+                    self.events.append(
+                        self._message_event_from_role_message(
+                            msg, conv_id, branch_path, now))
+                self._last_recorded_counts[task_id] = pre_count
 
     def after_yield(self, tasks: List[Task]):
-        task_records: List[TaskRecord] = []
+        assistant_events: List[TraceEvent] = []
         max_duration_ms = 0.0
-        event_timestamp = time.time()
+        now = time.time()
 
         for task in tasks:
             task_id = id(task)
             if task_id not in self._start_times:
                 continue
 
-            end_time = time.time()
-            duration_ms = (end_time - self._start_times[task_id]) * 1000
+            duration_ms = (now - self._start_times[task_id]) * 1000
             max_duration_ms = max(max_duration_ms, duration_ms)
             del self._start_times[task_id]
             self._mark_task_tracing_end(task)
 
-            record = self._build_task_record(task, task_id)
-            task_records.append(record)
+            event = self._build_yield_event(task, task_id, duration_ms, now)
+            assistant_events.append(event)
 
-        if task_records:
+        if not assistant_events:
+            return
+
+        if len(assistant_events) == 1:
+            self.events.append(assistant_events[0])
+        else:
             self.events.append(
                 TraceEvent(
-                    event_type="task_yield",
-                    timestamp=event_timestamp,
+                    event_type="parallel_start",
+                    branch_path=current_branch_path.get(),
+                    timestamp=now,
                     duration_ms=max_duration_ms,
-                    tasks=task_records,
+                    num_branches=len(assistant_events),
+                    children=assistant_events,
                 ))
 
     def on_parallel_start(self, num_branches: int):
@@ -592,91 +653,147 @@ class ExecutionTracer(TaskCollection):
                 event_type="parallel_start",
                 timestamp=time.time(),
                 num_branches=num_branches,
+                branch_path=current_branch_path.get(),
             ))
 
-    def on_parallel_end(self, num_branches: int):
-        self.events.append(
-            TraceEvent(
-                event_type="parallel_end",
-                timestamp=time.time(),
-                num_branches=num_branches,
-            ))
-
-    def _build_task_record(self, task: Task, task_id: int) -> TaskRecord:
+    def _build_yield_event(self, task: Task, task_id: int, duration_ms: float,
+                           timestamp: float) -> TraceEvent:
+        """Build the consumable event emitted at a yield point."""
         worker_tag = str(task.worker_tag.value if hasattr(
             task.worker_tag, 'value') else task.worker_tag)
-
-        record = TaskRecord(
-            task_type=type(task).__name__,
-            worker_tag=worker_tag,
-        )
+        branch_path = current_branch_path.get()
 
         if isinstance(task, ChatTask):
             pre_count = self._pre_message_counts.pop(task_id, 0)
-            record.input_messages = [
-                self._serialize_message(msg)
-                for msg in task.messages[:pre_count]
-            ]
-            record.output_messages = [
-                self._serialize_message(msg)
-                for msg in task.messages[pre_count:]
-            ]
-            record.prompt_tokens = getattr(task, 'prompt_tokens_num', 0)
-            record.completion_tokens = getattr(task, 'completion_tokens_num', 0)
-            record.reasoning_tokens = getattr(task, 'reasoning_tokens_num', 0)
-            record.finish_reason = getattr(task, 'finish_reason', None)
+            conv_id = self._get_conversation_id(task_id)
+            new_messages = task.messages[pre_count:]
+            self._last_recorded_counts[task_id] = len(task.messages)
+
+            tools = None
             if task.tools is not None:
                 try:
-                    record.tools = [
+                    tools = [
                         t.to_dict() if hasattr(t, 'to_dict') else t
                         for t in task.tools
                     ]
                 except (TypeError, AttributeError):
-                    record.tools = None
+                    pass
+
+            assistant_msg = new_messages[0] if new_messages else None
+            content = getattr(assistant_msg, "content",
+                              None) if assistant_msg else None
+
+            return TraceEvent(
+                event_type="message",
+                branch_path=branch_path,
+                timestamp=timestamp,
+                duration_ms=duration_ms,
+                worker_tag=worker_tag,
+                conversation_id=conv_id,
+                role="assistant",
+                content=content,
+                tool_calls=self._extract_tool_calls(new_messages),
+                prompt_tokens=getattr(task, 'prompt_tokens_num', 0),
+                completion_tokens=getattr(task, 'completion_tokens_num', 0),
+                reasoning_tokens=getattr(task, 'reasoning_tokens_num', 0),
+                finish_reason=getattr(task, 'finish_reason', None),
+                tools=tools,
+            )
         elif isinstance(task, MCPCallTask):
-            record.tool_call_id = task.tool_call_id
-            record.tool_name = task.tool_name
+            tool_args = task.args
             if isinstance(task.args, str):
                 try:
-                    record.tool_args = json.loads(task.args)
+                    tool_args = json.loads(task.args)
                 except (json.JSONDecodeError, TypeError):
-                    record.tool_args = task.args
-            else:
-                record.tool_args = task.args
-            record.result_str = task.result_str
+                    pass
+            return TraceEvent(
+                event_type="tool_call",
+                branch_path=branch_path,
+                timestamp=timestamp,
+                duration_ms=duration_ms,
+                worker_tag=worker_tag,
+                tool_call_id=task.tool_call_id,
+                tool_name=task.tool_name,
+                tool_args=tool_args,
+                result_str=task.result_str,
+            )
         elif isinstance(task, GenerationTask):
-            record.input_str = task.input_str
-            record.output_str = task.output_str
-            record.output_token_count = (len(task.output_tokens)
-                                         if task.output_tokens else 0)
+            conv_id = self._conv_counter
+            self._conv_counter += 1
 
-        return record
+            self.events.append(
+                TraceEvent(
+                    event_type="message",
+                    branch_path=branch_path,
+                    timestamp=timestamp,
+                    conversation_id=conv_id,
+                    role="user",
+                    content=task.input_str,
+                ))
+
+            return TraceEvent(
+                event_type="message",
+                branch_path=branch_path,
+                timestamp=timestamp,
+                duration_ms=duration_ms,
+                worker_tag=worker_tag,
+                conversation_id=conv_id,
+                role="assistant",
+                content=task.output_str,
+                output_token_count=(len(task.output_tokens)
+                                    if task.output_tokens else 0),
+            )
+        elif isinstance(task, DropKVCacheTask):
+            return TraceEvent(
+                event_type="drop_kv_cache",
+                branch_path=branch_path,
+                timestamp=timestamp,
+                duration_ms=duration_ms,
+                worker_tag=worker_tag,
+            )
+        else:
+            return TraceEvent(
+                event_type="message",
+                branch_path=branch_path,
+                timestamp=timestamp,
+                duration_ms=duration_ms,
+                worker_tag=worker_tag,
+                role="assistant",
+            )
+
+    def _message_event_from_role_message(self, message, conversation_id: int,
+                                         branch_path: List[int],
+                                         timestamp: float) -> TraceEvent:
+        """Convert a RoleMessage into a non-assistant message event."""
+        role = getattr(message, "role", None)
+        content = getattr(message, "content", None)
+        return TraceEvent(
+            event_type="message",
+            branch_path=branch_path,
+            timestamp=timestamp,
+            conversation_id=conversation_id,
+            role=role,
+            content=content,
+        )
 
     @staticmethod
-    def _serialize_message(message) -> Dict[str, Any]:
-        """Serialize a RoleMessage to a dictionary."""
-        result: Dict[str, Any] = {
-            "role": getattr(message, "role", None),
-            "content": getattr(message, "content", None),
-        }
-        if hasattr(message, "reasoning") and message.reasoning is not None:
-            result["reasoning"] = message.reasoning
-        if hasattr(
-                message,
-                "reasoning_content") and message.reasoning_content is not None:
-            result["reasoning_content"] = message.reasoning_content
-        if hasattr(message, "tool_calls") and message.tool_calls is not None:
-            result["tool_calls"] = [{
+    def _extract_tool_calls(output_messages) -> Optional[List[Dict[str, Any]]]:
+        """Extract tool_calls from the first assistant message, or None."""
+        for msg in output_messages:
+            if getattr(msg, "role", None) != "assistant":
+                continue
+            tc_list = getattr(msg, "tool_calls", None)
+            if not tc_list:
+                return None
+            return [{
                 "id": tc.id,
                 "type": "function",
                 "function": {
                     "name": tc.function.name,
                     "arguments": tc.function.arguments,
                 },
-            } for tc in message.tool_calls]
-        if hasattr(message, "tool_call_id"):
-            result["tool_call_id"] = message.tool_call_id
-        return result
+            } for tc in tc_list]
+        return None
 
     def export_trace(self,
                      prompt: str,
