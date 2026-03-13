@@ -1838,11 +1838,20 @@ class Qwen3_5ModelBase(PreTrainedModel):
         else:
             raise ValueError(f"Unsupported architecture: {self.original_arch}")
         # Qwen3_5ForCausalLM.
+        # NOTE: correcting module names for quantization exclude modules, 
+        # otherwise the weights will not be loaded correctly with expected dtype
+        if llm_model_config.quant_config.exclude_modules:
+            exclude_modules = [name.replace("model.language_model.", "model.").replace("model.visual.", "") \
+                for name in llm_model_config.quant_config.exclude_modules]
+            llm_model_config.quant_config.exclude_modules = exclude_modules
         self.llm = AutoModelForCausalLM.from_config(llm_model_config)
 
+        # NOTE: need to use deepcopy to avoid modifying the original model_config, 
+        # e.g. we reset self.model_config.quant_config in Qwen3_5VisionModelBase __init__
+        vison_model_config = copy.deepcopy(model_config)
         if not _is_disagg():
             self.mm_encoder = Qwen3_5VisionModelBase(
-                model_config, kwargs.get("vision_model_class", None)
+                vison_model_config, kwargs.get("vision_model_class", None)
             ).eval()
 
         self.use_deepstack = hasattr(config.vision_config, "deepstack_visual_indexes")

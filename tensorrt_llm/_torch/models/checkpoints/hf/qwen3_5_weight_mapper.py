@@ -147,8 +147,17 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
                 if "conv1d.weight" in key:
                     w = w.squeeze(1)
 
+                split_dims = [linear_key_dim, linear_key_dim, linear_value_dim]
+                # NOTE: When using FP8 block quantization for in_proj_qkv,
+                # we need also to reorder the corresponding conv1d weight_scale_inv
+                # The split dims should be divided by 128, which is the dim 0 of weight block size (128, 128)
+                if "in_proj_qkv.weight_scale_inv" in key:
+                    if self.config.quant_config.quant_mode.has_fp8_block_scales():
+                        split_dims = [linear_key_dim // 128, linear_key_dim // 128, linear_value_dim // 128]
+                    else:
+                        raise ValueError(f"Unexpected quantization {self.config.quant_config.quant_algo} for in_proj_qkv, currently only support FP8 block quantization for in_proj_qkv")
                 q, k, v = torch.split(
-                    w, [linear_key_dim, linear_key_dim, linear_value_dim],
+                    w, split_dims,
                     dim=0)
 
                 w = []
