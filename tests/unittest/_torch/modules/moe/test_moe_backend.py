@@ -619,8 +619,11 @@ def test_moe_backend(
         with torch.inference_mode(), autotune(cache_path="/tmp/moe_autotuner_cache.json"):
             _ = run_moe()
 
+        # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
+        use_flashinfer = getattr(backend, "use_flashinfer", False)
+
         # Check if this backend+quant_algo combination supports autotuner capture/replay
-        if supports_autotuner_capture(backend_type, quant_algo):
+        if supports_autotuner_capture(backend_type, quant_algo, use_flashinfer):
             # Capture phase: record which tactics are used (requires actual execution)
             with AutoTuner.get().capture() as all_tactics, torch.inference_mode():
                 _ = run_moe()
