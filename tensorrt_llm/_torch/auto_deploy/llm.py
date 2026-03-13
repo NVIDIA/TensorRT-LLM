@@ -46,17 +46,25 @@ class ADInputProcessor(DefaultInputProcessor):
             # multi_modal_data should not be present in the messages field
             assert "multi_modal_data" not in inputs, f"unexpected multi_modal_data key in {inputs=}"
 
+            # Normalize message content to list-of-dicts format for multimodal
+            # processors (e.g., Llama4) that expect {"type": "text", "text": "..."}
+            # instead of plain strings when tokenize=True.
+            messages = inputs["messages"]
+            for msg in messages:
+                if isinstance(msg.get("content"), str):
+                    msg["content"] = [{"type": "text", "text": msg["content"]}]
+
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.
             prompt = self.processor.apply_chat_template(
-                inputs["messages"],
+                messages,
                 add_generation_prompt=True,
                 tokenize=False,
             )
             inputs["prompt"] = prompt
 
             all_args = self.processor.apply_chat_template(
-                inputs["messages"],
+                messages,
                 add_generation_prompt=True,
                 tokenize=True,
                 return_dict=True,
