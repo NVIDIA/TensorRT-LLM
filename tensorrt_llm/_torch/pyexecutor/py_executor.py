@@ -1972,6 +1972,33 @@ class PyExecutor:
             self.control_action_done.set()
             self.control_request_barrier.clear()
 
+    def _check_benchmark_stall(self, gen_count, prev_gen_count, stall_count,
+                               max_stall_iterations, log_info):
+        """Check if benchmark gen count has stalled due to KV cache saturation.
+
+        Returns (new_prev_gen_count, new_stall_count, should_proceed) where
+        should_proceed=True means can_forward should be set and the loop should
+        continue to the forward pass, False means keep waiting.
+        """
+        if gen_count > 0 and gen_count == prev_gen_count:
+            stall_count += 1
+        else:
+            stall_count = 0
+        prev_gen_count = gen_count
+
+        if stall_count >= max_stall_iterations and gen_count > 0:
+            if self.dist.rank == 0:
+                logger.warning(
+                    f"KV cache saturated: only {gen_count} gen requests "
+                    f"scheduled out of {self.benchmark_req_queues_size} target. "
+                    f"Lowering benchmark_req_queues_size to {gen_count}.")
+            self.benchmark_req_queues_size = gen_count
+            return prev_gen_count, stall_count, True
+
+        if self.dist.rank == 0:
+            logger.info(f"sleep 10 seconds, {log_info}")
+        return prev_gen_count, stall_count, False
+
     def _executor_loop_overlap(self):
         torch.cuda.set_device(self.device_id)
         # ensure the context is created, otherwise, some MPI calls will fail.
@@ -2016,58 +2043,31 @@ class PyExecutor:
                             can_forward = True
                             time.sleep(10)
                         else:
-                            # Detect KV cache saturation: if the scheduled gen
-                            # count stops growing, lower the target to the
-                            # actual capacity so we don't hang forever.
-                            if total_gen_count > 0 and total_gen_count == prev_gen_count:
-                                stall_count += 1
-                            else:
-                                stall_count = 0
-                            prev_gen_count = total_gen_count
-                            if stall_count >= max_stall_iterations and total_gen_count > 0:
-                                if self.dist.rank == 0:
-                                    logger.warning(
-                                        f"KV cache saturated: only {total_gen_count} gen requests "
-                                        f"scheduled out of {self.benchmark_req_queues_size} target. "
-                                        f"Lowering benchmark_req_queues_size to {total_gen_count}."
-                                    )
-                                self.benchmark_req_queues_size = total_gen_count
+                            log_info = (
+                                f"num_fetched_requests: {self.num_fetch_requests}, "
+                                f"total_gen_count: {total_gen_count}, "
+                                f"scheduled_gen_batch: {local_gen_count}")
+                            prev_gen_count, stall_count, should_proceed = \
+                                self._check_benchmark_stall(
+                                    total_gen_count, prev_gen_count,
+                                    stall_count, max_stall_iterations, log_info)
+                            if should_proceed:
                                 can_forward = True
                                 time.sleep(10)
                             else:
-                                if self.dist.rank == 0:
-                                    logger.info(
-                                        f"sleep 10 seconds, num_fetched_requests: {self.num_fetch_requests}, "
-                                        f"total_gen_count: {total_gen_count}, "
-                                        f"scheduled_gen_batch: {local_gen_count}"
-                                    )
                                 time.sleep(10)
                                 continue
                     else:
                         if scheduled_batch.num_generation_requests < self.benchmark_req_queues_size:
                             cur_gen_count = scheduled_batch.num_generation_requests
-                            # Detect KV cache saturation: if the scheduled gen
-                            # count stops growing, lower the target to the
-                            # actual capacity so we don't hang forever.
-                            if cur_gen_count > 0 and cur_gen_count == prev_gen_count:
-                                stall_count += 1
-                            else:
-                                stall_count = 0
-                            prev_gen_count = cur_gen_count
-                            if stall_count >= max_stall_iterations and cur_gen_count > 0:
-                                if self.dist.rank == 0:
-                                    logger.warning(
-                                        f"KV cache saturated: only {cur_gen_count} gen requests "
-                                        f"scheduled out of {self.benchmark_req_queues_size} target. "
-                                        f"Lowering benchmark_req_queues_size to {cur_gen_count}."
-                                    )
-                                self.benchmark_req_queues_size = cur_gen_count
+                            log_info = f"scheduled_gen_batch: {cur_gen_count}"
+                            prev_gen_count, stall_count, should_proceed = \
+                                self._check_benchmark_stall(
+                                    cur_gen_count, prev_gen_count,
+                                    stall_count, max_stall_iterations, log_info)
+                            if should_proceed:
                                 can_forward = True
                             else:
-                                if self.dist.rank == 0:
-                                    logger.info(
-                                        f"sleep 10 seconds, scheduled_gen_batch: {cur_gen_count}"
-                                    )
                                 time.sleep(10)
                                 continue
                         else:
