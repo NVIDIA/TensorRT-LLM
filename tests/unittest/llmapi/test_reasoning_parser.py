@@ -6,7 +6,7 @@ R1_START, R1_END = "<think>", "</think>"
 
 
 @pytest.mark.parametrize(("text", "content", "reasoning_context"), [
-    ("a b", "a b", ""),
+    ("a b", "", "a b"),
     (f"{R1_END} a b", " a b", ""),
     (f"a {R1_END} b", " b", "a "),
     (f"a b {R1_END}", "", "a b "),
@@ -40,33 +40,10 @@ def test_deepseek_r1_reasoning_parser_stream(delta_texts: list, content: list,
         assert result.reasoning_content == reasoning_context[i]
 
 
-@pytest.mark.parametrize(("delta_texts", "finish_content", "finish_reasoning",
-                          "reasoning_completed"), [
-                              (["a", "b"], "ab", "", False),
-                              (["hello ", "world"], "hello world", "", False),
-                              ([R1_END, "a", "b"], "", "", True),
-                              (["a", R1_END, "b"], "", "", True),
-                              (["a", "b", R1_END], "", "", True),
-                              (["a", f"l{R1_END}r", "b"], "", "", True),
-                          ])
-def test_deepseek_r1_reasoning_parser_finish(delta_texts: list,
-                                             finish_content: str,
-                                             finish_reasoning: str,
-                                             reasoning_completed: bool):
-    reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
-        "deepseek-r1")
-    for delta_text in delta_texts:
-        reasoning_parser.parse_delta(delta_text)
-    result = reasoning_parser.finish()
-    assert result.content == finish_content
-    assert result.reasoning_content == finish_reasoning
-    assert reasoning_parser.reasoning_completed == reasoning_completed
-
-
 @pytest.mark.parametrize(("text", "content", "reasoning_context"), [
     ("a<think>b</think>c", "c", "b"),
     ("<think>a</think>b", "b", "a"),
-    ("<think>a", "a", ""),
+    ("<think>a", "", "a"),
     ("a", "a", ""),
     ("<think>", "", ""),
 ])
@@ -97,29 +74,9 @@ def test_qwen3_reasoning_parser_stream(delta_texts: list, content: list,
 
 
 @pytest.mark.parametrize(
-    ("delta_texts", "finish_content", "finish_reasoning",
-     "reasoning_completed"), [
-         (["<think>a", "b"], "ab", "", False),
-         (["<think>hello ", "world"], "hello world", "", False),
-         (["<think>a", "l</think>r", "b"], "", "", True),
-         (["<think>a</think>", "b"], "", "", True),
-     ])
-def test_qwen3_reasoning_parser_finish(delta_texts: list, finish_content: str,
-                                       finish_reasoning: str,
-                                       reasoning_completed: bool):
-    reasoning_parser = ReasoningParserFactory.create_reasoning_parser("qwen3")
-    for delta_text in delta_texts:
-        reasoning_parser.parse_delta(delta_text)
-    result = reasoning_parser.finish()
-    assert result.content == finish_content
-    assert result.reasoning_content == finish_reasoning
-    assert reasoning_parser.reasoning_completed == reasoning_completed
-
-
-@pytest.mark.parametrize(
     ("text", "content", "reasoning_context", "chat_template_kwargs"),
     [
-        ("a b", "a b", "", None),
+        ("a b", "", "a b", None),
         (f"{R1_END} a b", " a b", "", None),
         (f"a {R1_END} b", " b", "a ", None),
         (f"a b {R1_END}", "", "a b ", None),
@@ -206,26 +163,28 @@ def test_nano_v3_reasoning_parser_stream(delta_texts: list, content: list,
 
 
 @pytest.mark.parametrize(("delta_texts", "finish_content", "finish_reasoning",
-                          "reasoning_completed", "chat_template_kwargs"), [
-                              (["a", "b"], "", "", False, None),
-                              ([R1_END, "a", "b"], "", "", True, None),
-                              (["a", R1_END, "b"], "", "", True, None),
-                              (["a", "b"], "", "", True, {
+                          "chat_template_kwargs"), [
+                              (["a", "b"], "", "", None),
+                              ([R1_END, "a", "b"], "", "", None),
+                              (["a", R1_END, "b"], "", "", None),
+                              (["a", "b"], "", "", {
                                   "enable_thinking": False
                               }),
-                              (["a", "b"], "", "", False, {
+                              ([f"{R1_START}a", "b"], "", "", {
+                                  "enable_thinking": False
+                              }),
+                              (["a", "b"], "", "", {
                                   "force_nonempty_content": False
                               }),
-                              (["a", "b"], "ab", "", False, {
+                              (["a", "b"], "ab", "", {
                                   "force_nonempty_content": True
                               }),
-                              ([R1_END, "a", "b"], "", "", True, {
+                              ([R1_END, "a", "b"], "", "", {
                                   "force_nonempty_content": True
                               }),
                           ])
 def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
                                          finish_reasoning: str,
-                                         reasoning_completed: bool,
                                          chat_template_kwargs: dict):
     reasoning_parser = ReasoningParserFactory.create_reasoning_parser(
         "nano-v3", chat_template_kwargs)
@@ -234,4 +193,3 @@ def test_nano_v3_reasoning_parser_finish(delta_texts: list, finish_content: str,
     result = reasoning_parser.finish()
     assert result.content == finish_content
     assert result.reasoning_content == finish_reasoning
-    assert reasoning_parser.reasoning_completed == reasoning_completed

@@ -70,16 +70,10 @@ class BaseReasoningParser(ABC):
         raise NotImplementedError
 
     def finish(self) -> ReasoningParserResult:
-        """Called when the stream ends. Returns any remaining buffered content.
-        If reasoning was never completed (no closing tag found), accumulated
-        reasoning is returned as content instead."""
+        """Called when the stream ends. Subclasses may override to flush
+        buffered state or reclassify accumulated content. The default
+        implementation returns an empty result."""
         return ReasoningParserResult()
-
-    @property
-    def reasoning_completed(self) -> bool:
-        """Whether the reasoning section was properly closed with a closing
-        tag during streaming."""
-        return True
 
 
 @register_reasoning_parser("deepseek-r1", reasoning_at_start=True)
@@ -102,8 +96,6 @@ class DeepSeekR1Parser(BaseReasoningParser):
         self.reasoning_at_start = reasoning_at_start
         self.in_reasoning = self.reasoning_at_start
         self._buffer = ""
-        self._accumulated_reasoning = ""
-        self._found_closing_tag = False
 
     def _create_reasoning_end_result(self, content: str,
                                      reasoning_content: str):
@@ -127,9 +119,6 @@ class DeepSeekR1Parser(BaseReasoningParser):
             # text before reasoning start tag is dropped
             text = splits[2]
         splits = text.partition(self.reasoning_end)
-        if splits[1] == "":
-            # no reasoning end tag found - treat everything as content
-            return ReasoningParserResult(content=text)
         reasoning_content, content = splits[0], splits[2]
         return ReasoningParserResult(content=content,
                                      reasoning_content=reasoning_content)
@@ -166,35 +155,16 @@ class DeepSeekR1Parser(BaseReasoningParser):
                 else:
                     self._buffer = ""
                     reasoning_content = delta_text
-                self._accumulated_reasoning += reasoning_content
                 return ReasoningParserResult(
                     reasoning_content=reasoning_content)
             reasoning_content = delta_text[:end_idx]
             content = delta_text[end_idx + len(self.reasoning_end):]
             self.in_reasoning = False
-            self._found_closing_tag = True
-            self._accumulated_reasoning = ""
             self._buffer = ""
             return ReasoningParserResult(content=content,
                                          reasoning_content=reasoning_content)
         raise RuntimeError(
             "Unreachable code reached in `DeepSeekR1Parser.parse_delta`")
-
-    def finish(self) -> ReasoningParserResult:
-        remaining = self._buffer
-        self._buffer = ""
-        if self.in_reasoning and not self._found_closing_tag:
-            all_content = self._accumulated_reasoning + remaining
-            self._accumulated_reasoning = ""
-            self.in_reasoning = False
-            return ReasoningParserResult(content=all_content)
-        if remaining:
-            return ReasoningParserResult(content=remaining)
-        return ReasoningParserResult()
-
-    @property
-    def reasoning_completed(self) -> bool:
-        return self._found_closing_tag or not self.reasoning_at_start
 
 
 @register_reasoning_parser("nano-v3")
@@ -221,6 +191,8 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                 "force_nonempty_content", False) is True
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
+        self._accumulated_reasoning = ""
+        self._found_closing_tag = False
 
     def _maybe_swap_content(
             self, result: ReasoningParserResult) -> ReasoningParserResult:
@@ -231,17 +203,49 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                                          reasoning_content="")
         return result
 
+    def parse_delta(self, delta_text: str) -> ReasoningParserResult:
+        """Wraps the parent parse_delta to track accumulated reasoning and
+        detect the closing tag. When the closing tag is found (in_reasoning
+        transitions from True to False), the accumulation is cleared to
+        free memory."""
+        was_in_reasoning = self.in_reasoning
+        result = super().parse_delta(delta_text)
+        if result.reasoning_content:
+            self._accumulated_reasoning += result.reasoning_content
+        if was_in_reasoning and not self.in_reasoning:
+            self._found_closing_tag = True
+            self._accumulated_reasoning = ""
+        return result
+
     def finish(self) -> ReasoningParserResult:
-        if (not self._force_nonempty_content and self.in_reasoning
-                and not self._found_closing_tag):
+        """Called when the stream ends.
+
+        If no closing think tag was found and force_nonempty_content is
+        set, returns the full accumulated reasoning as content so the
+        response is never empty. If no closing tag was found and
+        force_nonempty_content is not set, returns any remaining buffer
+        as reasoning_content since we are still in reasoning mode.
+
+        If the closing tag was already found (or reasoning was never
+        entered), flushes any remaining buffer as content."""
+        if self.in_reasoning and not self._found_closing_tag:
             remaining = self._buffer
             self._buffer = ""
+            if self._force_nonempty_content:
+                all_content = self._accumulated_reasoning + remaining
+                self._accumulated_reasoning = ""
+                self.in_reasoning = False
+                return ReasoningParserResult(content=all_content)
             self._accumulated_reasoning = ""
             self.in_reasoning = False
             if remaining:
                 return ReasoningParserResult(reasoning_content=remaining)
             return ReasoningParserResult()
-        return self._maybe_swap_content(super().finish())
+        remaining = self._buffer
+        self._buffer = ""
+        if remaining:
+            return ReasoningParserResult(content=remaining)
+        return ReasoningParserResult()
 
     def parse(self, text: str) -> ReasoningParserResult:
         return self._maybe_swap_content(super().parse(text))
