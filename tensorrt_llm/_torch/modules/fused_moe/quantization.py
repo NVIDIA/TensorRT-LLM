@@ -1102,8 +1102,11 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         super().load_weights(module, weights, weight_loading_mode,
                              allow_partial_loading)
 
+    def _needs_e8m0_resmooth(self):
+        return is_sm_100f() or get_sm_version() == 120
+
     def post_load_weights(self, module: torch.nn.Module):
-        if is_sm_100f():
+        if is_sm_100f() or get_sm_version() == 120:
             # Resmooth shared experts before registering shared weights
             if self.need_load_shared_weights(module):
                 local_shared_load_expert_ids = module.layer_load_balancer.get_load_expert_ids(
@@ -1142,7 +1145,7 @@ class DeepSeekFP8BlockScalesFusedMoEMethodDeepGemm(
         # Call super() after resmooth shared experts (local_shared tensors will be deleted in super().post_load_weights())
         super().post_load_weights(module)
 
-        if is_sm_100f():
+        if self._needs_e8m0_resmooth():
             logger.debug("Resmoothing FP8 weights in post_load_weights")
             resmoothed_w3_w1_weight, transformed_w3_w1_scale = resmooth_and_transform_fp8_scale(
                 module.w3_w1_weight, module.w3_w1_weight_scaling_factor)

@@ -33,6 +33,7 @@ from tensorrt_llm._torch.modules.fused_moe.interface import MoEWeightLoadingMode
 from tensorrt_llm._torch.modules.gated_mlp import GatedMLP
 from tensorrt_llm._torch.modules.mlp import MLP
 from tensorrt_llm._torch.utils import ActivationType, is_gated_activation, relu2
+from tensorrt_llm._utils import get_sm_version
 from tensorrt_llm.models.modeling_utils import QuantAlgo, QuantConfig
 
 
@@ -134,6 +135,9 @@ def get_test_quant_params(quant_algo, x, backend_type=None):
         if backend_name is not None:
             if backend_name == "DEEPGEMM":
                 # Use DEEPGEMM-specific util with E8M0 scales and manual grouped_gemm reference
+                quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
+            elif backend_name == "CUTLASS" and get_sm_version() == 120:
+                # SM120 CUTLASS uses E8M0 scale format (same as DEEPGEMM)
                 quantize_util_cls = DeepGemmFP8BlockScalesQuantizeUtil
             elif backend_name == "TRTLLM":
                 # Use FP8BlockScalesQuantizeUtil with TRTLLMGenFP8BlockScalesRefModule as ref
