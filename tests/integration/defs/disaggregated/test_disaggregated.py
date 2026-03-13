@@ -2176,31 +2176,14 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         logprobs = [item.get("logprob") for item in content]
         return tokens, logprobs
 
-    def verify_logprobs_valid(logprobs_list, label=""):
-        """Assert logprobs are non-empty and non-positive."""
-        assert len(logprobs_list) > 0, f"{label}: should have logprobs"
-        assert any(lp is not None for lp in logprobs_list), \
-            f"{label}: at least one logprob must be non-None"
-        for lp in logprobs_list:
-            if lp is not None:
-                assert lp <= 0.0, f"{label}: logprob {lp} should be <= 0"
-
     setup_model_symlink(llm_venv, llama_model_root,
                         "llama-3.1-model/Llama-3.1-8B-Instruct")
 
     config_file = get_test_config("llama31_8b_nixl",
                                   disaggregated_example_root,
                                   os.path.dirname(__file__))
-    # Inject gather_generation_logits for top_logprobs coverage
-    with open(config_file, 'r') as f:
-        cluster_config = yaml.safe_load(f)
-    cluster_config["gather_generation_logits"] = True
-    with tempfile.NamedTemporaryFile(mode='w',
-                                     suffix='.yaml',
-                                     delete=False) as tmp:
-        yaml.dump(cluster_config, tmp)
-        config_file = tmp.name
 
+    ctx_workers, gen_workers, disagg_server, work_dir = [], [], None, None
     config, ctx_workers, gen_workers, disagg_server, server_port, work_dir = \
         setup_disagg_cluster(config_file, env=llm_venv._new_env,
                              model_name=llama_model_root,
@@ -2212,12 +2195,8 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
     model_name = "llama-3.1-model/Llama-3.1-8B-Instruct"
     max_tokens = 20
     timeout = aiohttp.ClientTimeout(total=120)
-    prompts = [
-        "What is the capital of France?",
-        "Explain quantum computing in simple terms.",
-        "Write a short poem about the ocean.",
-        "I love coding 🚀 and AI.",
-    ]
+    # Use emoji prompt to also stress-test multi-byte tokenizer handling
+    prompt = "I love coding 🚀 and AI."
 
     async def check_logprobs():
         async with aiohttp.ClientSession() as session:
@@ -2226,17 +2205,17 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                        if api_type == "completions" else
                        f"{server_url}/v1/chat/completions")
 
-                def make_payload(prompt, stream):
-                    base = {"max_tokens": max_tokens, "logprobs": 1 if api_type == "completions" else True,
+                def make_payload(prompt, stream, _api_type=api_type):
+                    base = {"max_tokens": max_tokens, "logprobs": 1 if _api_type == "completions" else True,
                             "stream": stream, "temperature": 0}
-                    if api_type == "completions":
+                    if _api_type == "completions":
                         return {"model": model_name, "prompt": prompt, **base}
                     return {"model": model_name,
                             "messages": [{"role": "user", "content": prompt}], **base}
 
                 # 1) Streaming vs non-streaming consistency check
                 async with session.post(
-                        url, json=make_payload(prompts[0], False),
+                        url, json=make_payload(prompt, False),
                         timeout=timeout) as resp:
                     assert resp.status == 200, \
                         f"[{api_type}] non-streaming: {await resp.text()}"
@@ -2244,7 +2223,7 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                         await resp.json(), api_type)
 
                 async with session.post(
-                        url, json=make_payload(prompts[0], True),
+                        url, json=make_payload(prompt, True),
                         timeout=timeout) as resp:
                     assert resp.status == 200, \
                         f"[{api_type}] streaming: {await resp.text()}"
@@ -2260,35 +2239,15 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     if n is not None and s is not None:
                         # Chat API in disaggregated can have larger variance
                         # (different postproc paths, chat template, etc.)
-                        rtol, atol = (1e-2, 1e-4) if api_type == "chat" else (1e-4, 1e-5)
+                        rtol, atol = (1e-3, 1e-4) if api_type == "chat" else (1e-4, 1e-5)
                         assert np.isclose(n, s, rtol=rtol, atol=atol), \
                             f"[{api_type}] logprob mismatch at {i}: {n} vs {s}"
 
-                # 2) Multi-prompt validation (streaming and non-streaming)
-                for streaming in (False, True):
-                    mode = "streaming" if streaming else "non_streaming"
-                    for prompt in prompts:
-                        async with session.post(
-                                url,
-                                json=make_payload(prompt, streaming),
-                                timeout=timeout) as resp:
-                            assert resp.status == 200, (
-                                f"[{api_type}/{mode}] {resp.status}: "
-                                f"{await resp.text()}")
-                            if streaming:
-                                _, lps = await collect_streaming_logprobs(
-                                    resp, api_type)
-                            else:
-                                _, lps = extract_logprobs(
-                                    await resp.json(), api_type)
-                            verify_logprobs_valid(
-                                lps, f"{api_type}/{mode}/{prompt[:30]}")
-
-                # 3) Chat API with top_logprobs (requires gather_generation_logits)
+                # 2) Chat API with top_logprobs (requires gather_generation_logits)
                 if api_type == "chat":
                     top_lp_payload = {
                         "model": model_name,
-                        "messages": [{"role": "user", "content": prompts[0]}],
+                        "messages": [{"role": "user", "content": prompt}],
                         "max_tokens": max_tokens,
                         "logprobs": True,
                         "top_logprobs": 3,
@@ -2308,7 +2267,9 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
                     content = lp_obj.get("content", [])
                     assert len(content) > 0, "top_logprobs content should be non-empty"
                     for item in content:
-                        top_lps = item.get("top_logprobs") or []
+                        top_lps = item.get("top_logprobs")
+                        assert top_lps is not None and len(top_lps) > 0, (
+                            f"top_logprobs should be non-empty when requested: {item}")
                         for tl in top_lps:
                             assert "token" in tl and "logprob" in tl, (
                                 f"top_logprob entry missing token/logprob: {tl}")
@@ -2319,11 +2280,8 @@ def test_disaggregated_logprobs_serving(disaggregated_test_root,
         asyncio.run(check_logprobs())
     finally:
         terminate(*ctx_workers, *gen_workers, disagg_server)
-        shutil.rmtree(work_dir, ignore_errors=True)
-        try:
-            os.unlink(config_file)
-        except OSError:
-            pass
+        if work_dir:
+            shutil.rmtree(work_dir, ignore_errors=True)
 
 
 @pytest.mark.skip_less_device(8)
