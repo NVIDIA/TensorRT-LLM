@@ -4,4 +4,3 @@
 # Gemma 3n uses shared-KV decode semantics in the tail layers. FlashInfer now
 # supports the read-only shared-KV cache path and alternating sliding windows.
 attn_backend: flashinfer
-compile_backend: torch-simple
