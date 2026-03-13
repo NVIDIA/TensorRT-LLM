@@ -130,7 +130,8 @@ def torch_attention(
 
     Returns a tensor in the SAME layout as inputs specified by `layout`.
     """
-    del layer_idx
+    # `layer_idx` is graph metadata used by the KV-cache transform; the eager attention kernel
+    # itself does not need it.
     if layout not in ("bnsd", "bsnd"):
         raise ValueError(f"layout must be 'bnsd' or 'bsnd', got {layout!r}")
 
@@ -243,7 +244,6 @@ def torch_attention_fake(
     layout: str = "bnsd",
     layer_idx: Optional[int] = None,
 ):
-    del layer_idx
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()
 
 
@@ -264,7 +264,6 @@ def torch_attention_shared_kv(
     shared_kv_source_layer_idx: Optional[int] = None,
 ) -> torch.Tensor:
     """Source attention op variant that marks a layer as reusing another layer's KV cache."""
-    del layer_idx, shared_kv_source_layer_idx
     return torch_attention(
         query,
         key,
@@ -296,5 +295,4 @@ def torch_attention_shared_kv_fake(
     layer_idx: Optional[int] = None,
     shared_kv_source_layer_idx: Optional[int] = None,
 ):
-    del layer_idx, shared_kv_source_layer_idx
     return query.new_empty(*query.shape[:-1], value.shape[-1]).contiguous()

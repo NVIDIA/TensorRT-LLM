@@ -3266,10 +3266,6 @@ class PyExecutor:
             self.active_requests.remove(request)
 
         for request in scheduled_requests.context_requests:
-            old_state = request.state
-            old_ctx_pos = request.context_current_position
-            old_remaining = request.context_remaining_length
-            old_ctx_chunk = request.context_chunk_size
             if request.state != LlmRequestState.GENERATION_COMPLETE:  # skip failed requests
                 request.py_last_context_chunk = (
                     request.context_current_position,
@@ -3283,20 +3279,6 @@ class PyExecutor:
                     request.state = LlmRequestState.GENERATION_TO_COMPLETE
                 else:
                     request.state = LlmRequestState.GENERATION_IN_PROGRESS
-            if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
-                logger.info(
-                    "[GEMMA3N_STATE_DEBUG] request_id=%s old_state=%s new_state=%s "
-                    "old_ctx_pos=%s new_ctx_pos=%s old_remaining=%s new_remaining=%s "
-                    "ctx_chunk=%s",
-                    request.py_request_id,
-                    old_state,
-                    request.state,
-                    old_ctx_pos,
-                    request.context_current_position,
-                    old_remaining,
-                    request.context_remaining_length,
-                    old_ctx_chunk,
-                )
 
     def _update_request_states_star_attention(
             self, scheduled_requests: ScheduledRequests):

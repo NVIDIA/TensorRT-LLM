@@ -873,39 +873,6 @@ class ADEngine(ModelEngine):
                 ordered_requests, self.cache_seq_interface
             )
 
-        if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
-            debug_iter = getattr(self, "_ad_debug_gemma3n_iter", 0)
-            self._ad_debug_gemma3n_iter = debug_iter + 1
-            debug_requests = []
-            for i, request in enumerate(ordered_requests[:8]):
-                seq_len_i = cu_seqlen[i + 1] - cu_seqlen[i]
-                debug_requests.append(
-                    {
-                        "request_id": request.py_request_id,
-                        "slot": request.seq_slot,
-                        "is_dummy": request.is_dummy,
-                        "is_context": i < len(context_requests),
-                        "draft_len": get_draft_token_length(request),
-                        "input_pos": input_pos[i],
-                        "seq_len": seq_len_i,
-                        "end_pos": input_pos[i] + seq_len_i,
-                    }
-                )
-            ad_logger.info(
-                "[GEMMA3N_DEBUG] iter=%s num_prefill=%s num_prefill_tokens=%s "
-                "num_gen=%s batch_info=%s cu_seqlen=%s input_pos=%s "
-                "token_gather_indices=%s requests=%s",
-                debug_iter,
-                num_prefill,
-                num_prefill_tokens,
-                len(gen_requests),
-                batch_info,
-                cu_seqlen[:16],
-                input_pos[:16],
-                None if token_gather_indices is None else token_gather_indices[:32],
-                debug_requests,
-            )
-
         self.iter_states["num_ctx_requests"] = num_prefill
         self.iter_states["num_ctx_tokens"] = num_prefill_tokens
         # TODO: handle extend requests and draft requests for specdec

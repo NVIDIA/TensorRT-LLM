@@ -1861,8 +1861,12 @@ class AttentionDescriptor(ABC):
 
     @classmethod
     def get_cached_attention_op_for_source_node(cls, source_attn_node: Node) -> MHACallable:
-        """Get the cached attention op for a specific source node."""
-        del source_attn_node
+        """Get the cached attention op for a specific source node.
+
+        Backends that distinguish between multiple source attention variants can override this to
+        select a different cached op based on the source node metadata. The default behavior is to
+        use the backend's single cached attention op for all source nodes.
+        """
         return cls.get_cached_attention_op()
 
     @classmethod
@@ -1935,13 +1939,11 @@ class AttentionDescriptor(ABC):
     @classmethod
     def get_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
         """Return the logical layer index associated with a source attention node, if any."""
-        del source_attn_node
         return None
 
     @classmethod
     def get_shared_kv_source_layer_idx(cls, source_attn_node: Node) -> Optional[int]:
         """Return the KV source layer for a shared-KV attention node, if any."""
-        del source_attn_node
         return None
 
     @staticmethod
