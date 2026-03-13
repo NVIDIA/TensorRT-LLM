@@ -1442,7 +1442,7 @@ repos:
         additional_dependencies:
         - tomli
         # add ignore words list
-        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*"]
+        args: ["-L", "Mor,ans,thirdparty,subtiles,PARD,pard,therefrom", "--skip", "ATTRIBUTIONS-*.md,*.svg", "--skip", "security_scanning/*", "--skip", "tensorrt_llm/_torch/visual_gen/jit_kernels/*"]
         exclude: 'scripts/attribution/data/cas/.*$'
 -   repo: https://github.com/astral-sh/ruff-pre-commit
     rev: v0.9.4
@@ -1459,6 +1459,14 @@ repos:
         files: ".*/auto_deploy/.*"
 -   repo: local
     hooks:
+    -   id: model-registry-check
+        name: Validate AutoDeploy model registry
+        entry: python scripts/check_model_registry.py
+        language: python
+        additional_dependencies:
+        - PyYAML
+        files: ^examples/auto_deploy/model_registry/models\.yaml$
+        pass_filenames: false
     -   id: test lists format
         name: Check for tabs and multiple spaces in test_lists txt files
         entry: ./scripts/format_test_list.py

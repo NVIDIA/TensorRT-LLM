@@ -70,6 +70,7 @@ enum class SfLayout
     // I.e., the SF buffer is a tensor [⌈m/128⌉, ⌈n/b/4⌉, 32, 4, 4]
     // The SF for the element (i, j) is stored at (i/128, j/b/4, i%32, (i%128)/32, (j/b)%4).
     R128c4,
+
 };
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////
@@ -84,6 +85,13 @@ inline std::string sfLayoutToString(SfLayout layout)
     case SfLayout::R128c4: return "128x4";
     default: assert(false); return "Unsupported layout";
     }
+}
+
+////////////////////////////////////////////////////////////////////////////////////////////////////
+
+inline bool sfLayoutCanUseUtccp(SfLayout layout)
+{
+    return (layout == SfLayout::R128c4);
 }
 
 ////////////////////////////////////////////////////////////////////////////////////////////////////

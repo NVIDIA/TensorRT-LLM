@@ -232,6 +232,28 @@ def _register_fake():
         return (input.new_empty(output_shape, dtype=torch.uint8),
                 global_scale.new_empty(scale_shape, dtype=torch.uint8))
 
+    @torch.library.register_fake("trtllm::fp4_quantize_with_reorder_residual")
+    def _(
+        X: torch.Tensor,
+        input_scale: torch.Tensor,
+        reorder_index: torch.Tensor,
+        KE: int,
+        is_act: bool,
+    ):
+        M = X.size(0)
+        KQ = X.size(1)
+        K = KQ + KE
+
+        # QX shape: [M, K/2]
+        QX = X.new_empty((M, K // 2), dtype=torch.uint8)
+
+        # SFX shape: swizzled layout size for scale factors
+        # isSfSwizzledLayout = True, sf_vec_size = 16
+        SFSize = fp4_utils.pad_up(M, 128) * fp4_utils.pad_up(K // 16, 4)
+        SFX = X.new_empty((SFSize, ), dtype=torch.uint8)
+
+        return QX, SFX
+
     @torch.library.register_fake("trtllm::mxfp8_quantize")
     def _(
         input: torch.Tensor,
@@ -543,6 +565,16 @@ def _register_fake():
         return torch.empty_like(input,
                                 dtype=torch.float8_e4m3fn), input.new_empty(
                                     sz, dtype=torch.float)
+
+    @torch.library.register_fake("trtllm::fused_cat_fp8")
+    def _(pe: torch.Tensor, nope: torch.Tensor, use_ue8m0: bool = False):
+        pe_dim = pe.shape[-1]
+        nope_dim = nope.shape[-1]
+        head_dim = pe_dim + nope_dim
+        M = pe.numel() // pe_dim
+        fp8_out = pe.new_empty((M, head_dim), dtype=torch.float8_e4m3fn)
+        scale_out = pe.new_empty((M, 1), dtype=torch.float32)
+        return fp8_out, scale_out
 
     @torch.library.register_fake("trtllm::causal_conv1d_fwd")
     def _(
