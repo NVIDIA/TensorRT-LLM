@@ -31,12 +31,33 @@ from .accuracy_core import GSM8K, MMLU, CnnDailymail, LlmapiAccuracyTestHarness
 
 _AD_CONFIGS_DIR = (Path(get_llm_root()) / 'examples' / 'auto_deploy' /
                    'model_registry' / 'configs')
+_AD_MODEL_REGISTRY_DIR = Path(
+    get_llm_root()) / 'examples' / 'auto_deploy' / 'model_registry'
 
 
 def _load_ad_config(config_name):
     """Load a YAML config from the AutoDeploy model registry configs directory."""
     with open(_AD_CONFIGS_DIR / config_name) as f:
         return yaml.safe_load(f)
+
+
+def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
+    """Return (yaml_extra paths, world_size) from the AutoDeploy model registry."""
+    with open(_AD_MODEL_REGISTRY_DIR / "models.yaml") as f:
+        registry = yaml.safe_load(f)
+    for entry in registry["models"]:
+        if entry["name"] != model_name:
+            continue
+        config_dir = _AD_MODEL_REGISTRY_DIR / "configs"
+        paths = [str(config_dir / cfg) for cfg in entry["yaml_extra"]]
+        world_size = 1
+        for cfg in entry["yaml_extra"]:
+            cfg_name = str(cfg)
+            if "world_size_" in cfg_name and cfg_name.endswith(".yaml"):
+                world_size = int(
+                    cfg_name.replace("world_size_", "").replace(".yaml", ""))
+        return paths, world_size
+    raise ValueError(f"Model '{model_name}' not found in model registry")
 
 
 def _set_quant_config(llm, model_id: str) -> None:
@@ -703,7 +724,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
             task.evaluate(llm)
 
 
-class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
+class TestQwen3_5_397B_MoE(LlmapiAccuracyTestHarness):
     """Accuracy regression tests for Qwen3.5-397B-A17B via AutoDeploy.
 
     Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
@@ -715,15 +736,11 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
                       GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
 
-    def _load_config(self):
-        """Load config from qwen3.5_moe_400b.yaml with test-specific overrides."""
-        config = _load_ad_config('qwen3.5_moe_400b.yaml')
-        config.pop('world_size', None)
-        config['max_seq_len'] = self.MAX_SEQ_LEN
-        config['max_num_tokens'] = self.MAX_SEQ_LEN
-        config.setdefault('skip_tokenizer_init', False)
-        config.setdefault('trust_remote_code', True)
-        return config
+    def get_default_kwargs(self):
+        return {
+            "skip_tokenizer_init": False,
+            "trust_remote_code": True,
+        }
 
     def get_default_sampling_params(self):
         eos_id = -1
@@ -738,12 +755,17 @@ class TestQwen3_5_MoE(LlmapiAccuracyTestHarness):
     def test_bf16(self, world_size):
         if get_device_count() < world_size:
             pytest.skip("Not enough devices for world size, skipping test")
-        kwargs = self._load_config()
+        kwargs = self.get_default_kwargs()
         sampling_params = self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        assert registry_world_size == world_size
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            dtype="bfloat16",
                            world_size=world_size,
+                           yaml_extra=yaml_paths,
                            **kwargs) as llm:
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm, sampling_params=sampling_params)
@@ -913,27 +935,6 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
         ),
     ]
 
-    @staticmethod
-    def _get_registry_yaml_extra(model_name: str) -> tuple[list[str], int]:
-        """Return (yaml_extra paths, world_size) from model registry."""
-        registry_path = (Path(__file__).resolve().parents[4] /
-                         "examples/auto_deploy/model_registry")
-        with open(registry_path / "models.yaml") as f:
-            registry = yaml.safe_load(f)
-        for entry in registry["models"]:
-            if entry["name"] == model_name:
-                config_dir = registry_path / "configs"
-                paths = [str(config_dir / f) for f in entry["yaml_extra"]]
-                # world_size from world_size_N.yaml (last match wins)
-                world_size = 1
-                for f in entry["yaml_extra"]:
-                    s = str(f)
-                    if "world_size_" in s and s.endswith(".yaml"):
-                        world_size = int(
-                            s.replace("world_size_", "").replace(".yaml", ""))
-                return paths, world_size
-        raise ValueError(f"Model '{model_name}' not found in model registry")
-
     def get_default_sampling_params(self):
         # Use end_id=None so _setup runs and tokenizes stop sequences (e.g. GSM8K).
         return SamplingParams(end_id=None,
@@ -948,8 +949,7 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
     def test_autodeploy_from_registry(self, model_name, config_overrides, tasks,
                                       accuracy_check):
         model_path = hf_id_to_local_model_dir(model_name)
-        yaml_paths, registry_world_size = self._get_registry_yaml_extra(
-            model_name)
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(model_name)
         effective_world_size = config_overrides.get("world_size",
                                                     registry_world_size)
         if get_device_count() < effective_world_size:
@@ -969,44 +969,20 @@ class TestModelRegistryAccuracy(LlmapiAccuracyTestHarness):
                         raise type(e)(f"[{task_cls.__name__}] {e}") from None
 
 
-class TestKimiK2_5(LlmapiAccuracyTestHarness):
-    """Accuracy regression tests for Kimi-K2.5 via AutoDeploy.
+class TestQwen3_5_35B_MoE(LlmapiAccuracyTestHarness):
+    """Accuracy regression tests for Qwen3.5-35B-A3B via AutoDeploy.
 
-    Runs the model via AutoDeploy and verifies benchmark performance on MMLU and GSM8K.
-    Configuration derived from examples/auto_deploy/model_registry/configs/kimi_k2.yaml.
+    Runs the model via AutoDeploy and verifies MMMU performance.
+    Configuration derived from the AutoDeploy model registry entry for Qwen3.5 35B.
     """
 
-    MODEL_NAME = "nvidia/Kimi-K2.5-NVFP4"
-    MAX_SEQ_LEN = max(MMLU.MAX_INPUT_LEN + MMLU.MAX_OUTPUT_LEN,
-                      GSM8K.MAX_INPUT_LEN + GSM8K.MAX_OUTPUT_LEN)
+    MODEL_NAME = "Qwen/Qwen3.5-35B-A3B"
+    MAX_SEQ_LEN = max(MMMU.MAX_INPUT_LEN + MMMU.MAX_OUTPUT_LEN, 4096)
 
     def get_default_kwargs(self):
         return {
             "skip_tokenizer_init": False,
             "trust_remote_code": True,
-            "enable_chunked_prefill": True,
-            "compile_backend": "torch-cudagraph",
-            "max_batch_size": 64,
-            "max_seq_len": self.MAX_SEQ_LEN,
-            "max_num_tokens": self.MAX_SEQ_LEN,
-            "cuda_graph_batch_sizes": [1, 2, 4, 8, 16, 32, 64],
-            "kv_cache_config": {
-                "dtype": "bfloat16",
-                "enable_block_reuse": False,
-                "free_gpu_memory_fraction": 0.7,
-                "tokens_per_block": 64,
-            },
-            "model_kwargs": {
-                "torch_dtype": "bfloat16",
-            },
-            "transforms": {
-                "export_to_gm": {
-                    "num_moe_experts_for_export": 2,
-                },
-                "fuse_nvfp4_moe": {
-                    "allow_different_input_scales": True,
-                },
-            },
         }
 
     def get_default_sampling_params(self):
@@ -1024,15 +1000,16 @@ class TestKimiK2_5(LlmapiAccuracyTestHarness):
             pytest.skip("Not enough devices for world size, skipping test")
         kwargs = self.get_default_kwargs()
         self.get_default_sampling_params()
-        with AutoDeployLLM(model=self.MODEL_NAME,
-                           tokenizer=self.MODEL_NAME,
+        model_path = hf_id_to_local_model_dir(self.MODEL_NAME)
+        yaml_paths, registry_world_size = _get_registry_yaml_extra(
+            self.MODEL_NAME)
+        assert registry_world_size == world_size
+        with AutoDeployLLM(model=model_path,
+                           tokenizer=model_path,
                            dtype="bfloat16",
                            world_size=world_size,
+                           yaml_extra=yaml_paths,
                            **kwargs) as llm:
-            # task = MMLU(self.MODEL_NAME)
-            # task.evaluate(llm, sampling_params=sampling_params)
-            # task = GSM8K(self.MODEL_NAME)
-            # task.evaluate(llm)
             task = MMMU(self.MODEL_NAME)
             task.EVALUATE_KWARGS = {
                 "model_type": "qwen3_vl",

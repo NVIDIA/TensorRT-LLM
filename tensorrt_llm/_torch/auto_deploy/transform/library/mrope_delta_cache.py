@@ -17,15 +17,11 @@
 
 Multimodal models using mRoPE (multi-dimensional rotary position embeddings)
 compute a position delta during prefill that must be remembered for subsequent
-decode steps.  This transform allocates a tiny ``(max_slots, 1)`` int32 buffer
+decode steps. This transform allocates a tiny ``(max_slots, 1)`` int32 buffer
 and registers it as a state resource so that the runtime can write during prefill
 and read during decode.
-
-Detection: scans the model source for usage of the
-``auto_deploy::mrope_delta_with_cache`` custom op via ``torch.ops``.
 """
 
-import inspect
 from typing import Tuple, Type
 
 import torch
@@ -42,27 +38,14 @@ from ..interface import (
     TransformRegistry,
 )
 
-_MROPE_DELTA_CACHE_OP = "mrope_delta_with_cache"
-
-
-def _model_uses_mrope_delta_cache(mod: nn.Module) -> bool:
-    """Return True if any submodule's forward references the mrope_delta_with_cache op."""
-    for m in mod.modules():
-        try:
-            src = inspect.getsource(type(m).forward)
-        except (TypeError, OSError):
-            continue
-        if _MROPE_DELTA_CACHE_OP in src:
-            return True
-    return False
-
 
 @TransformRegistry.register("initialize_qwen_mrope_delta_cache")
 class InitializeMropeDeltaCache(BaseTransform):
     """Allocate a per-slot mrope_delta_cache for multimodal mRoPE models.
 
-    Skipped when no submodule forward method references the
-    ``qwen3_mrope_delta_with_cache`` custom op.
+    This transform is intentionally enabled per-model via config rather than
+    auto-detected. TODO: if we want to make this generic-by-default, add a
+    proper capability signal or reliable heuristic instead of source inspection.
     """
 
     @classmethod
@@ -76,11 +59,6 @@ class InitializeMropeDeltaCache(BaseTransform):
         factory: ModelFactory,
         shared_config: SharedConfig,
     ) -> Tuple[nn.Module, TransformInfo]:
-        if not _model_uses_mrope_delta_cache(mod):
-            return mod, TransformInfo(
-                skipped=True, num_matches=0, is_clean=True, has_valid_shapes=True
-            )
-
         cm.add_resource("mrope_delta_cache", StateResourceHandler(1, dtype=torch.int32))
 
         return mod, TransformInfo(

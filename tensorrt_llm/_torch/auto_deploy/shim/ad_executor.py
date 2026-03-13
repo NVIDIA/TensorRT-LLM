@@ -566,7 +566,12 @@ class ADEngine(ModelEngine):
         num_prefill_seqs: int,
         extra_args: Dict[str, List[torch.Tensor]],
     ) -> None:
-        """Stage per-request multimodal layout metadata needed by the VLM wrapper."""
+        """Stage per-request multimodal layout metadata needed by the VLM wrapper.
+
+        The standard attention metadata captures request geometry (batch_info, cu_seqlen,
+        seq_len_with_cache, input_pos), but not the original per-request multimodal span layout
+        or multimodal special-token offsets needed to rebuild chunk-aware mRoPE positions.
+        """
         if num_prefill_seqs == 0:
             return
 
