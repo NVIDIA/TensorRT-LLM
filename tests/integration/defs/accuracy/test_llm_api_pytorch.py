@@ -6040,10 +6040,10 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
 
         kv_cache_config = KvCacheConfig(enable_block_reuse=False,
                                         mamba_ssm_cache_dtype="float32")
-        pytorch_config = dict(disable_overlap_scheduler=not overlap_scheduler,
-                              cuda_graph_config=CudaGraphConfig(
-                                  max_batch_size=512, enable_padding=True)
-                              if cuda_graph else None)
+        pytorch_config = dict(
+            disable_overlap_scheduler=not overlap_scheduler,
+            cuda_graph_config=CudaGraphConfig(
+                max_batch_size=32, enable_padding=True) if cuda_graph else None)
 
         with LLM(
                 f"{llm_models_root()}/Nemotron-Super-3-120B-A12B-dev",
@@ -6101,7 +6101,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                 tensor_parallel_size=4,
                 moe_expert_parallel_size=4,
                 enable_attention_dp=attention_dp,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=512,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="CUTLASS"),
@@ -6177,12 +6177,12 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.8,
                 ),
-                max_batch_size=512,
+                max_batch_size=32,
                 tensor_parallel_size=tp_size,
                 moe_expert_parallel_size=ep_size,
                 pipeline_parallel_size=pp_size,
                 enable_attention_dp=attention_dp,
-                cuda_graph_config=CudaGraphConfig(max_batch_size=512,
+                cuda_graph_config=CudaGraphConfig(max_batch_size=32,
                                                   enable_padding=True),
                 disable_overlap_scheduler=False,
                 moe_config=MoeConfig(backend="TRTLLM"),
@@ -6190,11 +6190,9 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             task = MMLU(self.MODEL_NAME)
             task.evaluate(llm,
                           extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
-            # TODO: GSM8K will be failed due to mamba cache issue for pp_size > 1.
-            if pp_size == 1:
-                task = GSM8K(self.MODEL_NAME)
-                task.evaluate(
-                    llm, extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
+            task = GSM8K(self.MODEL_NAME)
+            task.evaluate(llm,
+                          extra_evaluator_kwargs=self.EXTRA_EVALUATOR_KWARGS)
 
     @skip_pre_blackwell
     @pytest.mark.skip_less_mpi_world_size(8)
@@ -6213,7 +6211,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
                     mamba_ssm_cache_dtype="float16",
                     free_gpu_memory_fraction=0.5,
                 ),
-                max_batch_size=128,
+                max_batch_size=32,
                 tensor_parallel_size=8,
                 moe_expert_parallel_size=8,
                 pipeline_parallel_size=1,
@@ -6253,7 +6251,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             ),
             max_batch_size=4,
             enable_attention_dp=True,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
                                               enable_padding=True),
             disable_overlap_scheduler=False,
             moe_config=MoeConfig(backend="CUTLASS"),
@@ -6317,7 +6315,7 @@ class TestNemotronV3Super(LlmapiAccuracyTestHarness):
             ),
             max_batch_size=4,
             enable_attention_dp=True,
-            cuda_graph_config=CudaGraphConfig(max_batch_size=32,
+            cuda_graph_config=CudaGraphConfig(max_batch_size=4,
                                               enable_padding=True),
             disable_overlap_scheduler=False,
             moe_config=MoeConfig(backend="CUTLASS"),
