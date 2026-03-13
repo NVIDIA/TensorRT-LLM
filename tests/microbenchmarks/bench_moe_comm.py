@@ -471,7 +471,6 @@ def _demangle_names(names: List[str]) -> Dict[str, str]:
 def _build_cuda_graph_kernel_stats_cupti(
     cupti_kernels: List[Tuple[str, int, int]],  # (name, start_ns, end_ns)
     cupti_events: List[int],  # device_timestamps of EXTERNAL events, sorted
-    warmup: int,
     iters: int,
 ) -> Optional[Dict[str, Any]]:
     """Categorize GPU kernels from a CUDA graph replay into dispatch/combine/other.
@@ -487,6 +486,12 @@ def _build_cuda_graph_kernel_stats_cupti(
     dispatch or combine window; everything else (including warmup kernels) is other.
 
     Returns None if CUPTI events are missing.
+
+    The returned dict includes:
+      dispatch_times_us / combine_times_us: per-iter kernel-span times (ns → µs),
+        computed as (last_kernel_end − first_kernel_start) within each window.
+        None for iterations where no kernels were attributed (caller should fall back
+        to CUDA-event elapsed_time for those iterations).
     """
     expected_events = 4 * iters
     if len(cupti_events) != expected_events:
@@ -511,27 +516,38 @@ def _build_cuda_graph_kernel_stats_cupti(
     combine_kernel_times: Dict[str, List[float]] = {}
     other_kernel_times: Dict[str, List[float]] = {}
 
+    # Per-iteration [first_start_ns, last_end_ns] for kernel-span timing.
+    dispatch_iter_span: List[List[Optional[int]]] = [[None, None] for _ in range(iters)]
+    combine_iter_span: List[List[Optional[int]]] = [[None, None] for _ in range(iters)]
+
     for name, k_start, k_end in cupti_kernels:
         demangled = dm.get(name, name)
         device_time_us = (k_end - k_start) / 1e3  # ns → µs
 
         category = "other"
+        iter_idx = -1
         for i in range(iters):
             if k_start >= d_starts_abs[i] and k_end <= d_ends_abs[i]:
                 category = "dispatch"
+                iter_idx = i
                 break
             if k_start >= c_starts_abs[i] and k_end <= c_ends_abs[i]:
                 category = "combine"
+                iter_idx = i
                 break
 
-        target = (
-            dispatch_kernel_times
-            if category == "dispatch"
-            else combine_kernel_times
-            if category == "combine"
-            else other_kernel_times
-        )
-        target.setdefault(demangled, []).append(device_time_us)
+        if category == "dispatch":
+            span = dispatch_iter_span[iter_idx]
+            span[0] = k_start if span[0] is None else min(span[0], k_start)
+            span[1] = k_end if span[1] is None else max(span[1], k_end)
+            dispatch_kernel_times.setdefault(demangled, []).append(device_time_us)
+        elif category == "combine":
+            span = combine_iter_span[iter_idx]
+            span[0] = k_start if span[0] is None else min(span[0], k_start)
+            span[1] = k_end if span[1] is None else max(span[1], k_end)
+            combine_kernel_times.setdefault(demangled, []).append(device_time_us)
+        else:
+            other_kernel_times.setdefault(demangled, []).append(device_time_us)
 
     def _build(ktimes: Dict[str, List[float]]) -> List[Dict[str, Any]]:
         result = [{"name": n, "count": len(t), "_times": t} for n, t in ktimes.items()]
@@ -540,10 +556,19 @@ def _build_cuda_graph_kernel_stats_cupti(
         )
         return result
 
+    dispatch_times_us = [
+        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in dispatch_iter_span
+    ]
+    combine_times_us = [
+        (span[1] - span[0]) / 1e3 if span[0] is not None else None for span in combine_iter_span
+    ]
+
     return {
         "dispatch_kernels": _build(dispatch_kernel_times),
         "combine_kernels": _build(combine_kernel_times),
         "other_kernels": _build(other_kernel_times),
+        "dispatch_times_us": dispatch_times_us,
+        "combine_times_us": combine_times_us,
     }
 
 
@@ -750,10 +775,19 @@ def _time_dispatch_and_combine_cuda_graph(
         _cupti_kernels.sort(key=lambda k: k[1])
         _cupti_events.sort()  # sort by device_timestamp; CUPTI may deliver out of order
 
-        detailed_stats = _build_cuda_graph_kernel_stats_cupti(
-            _cupti_kernels, _cupti_events, warmup, iters
-        )
-        if detailed_stats is None:
+        detailed_stats = _build_cuda_graph_kernel_stats_cupti(_cupti_kernels, _cupti_events, iters)
+        if detailed_stats is not None:
+            # Replace event-based times with tighter kernel-span times.
+            # Fall back per-iter to event timing if no kernels were attributed.
+            cupti_dispatch = detailed_stats.pop("dispatch_times_us")
+            cupti_combine = detailed_stats.pop("combine_times_us")
+            dispatch_times_us = [
+                ct if ct is not None else et for ct, et in zip(cupti_dispatch, dispatch_times_us)
+            ]
+            combine_times_us = [
+                ct if ct is not None else et for ct, et in zip(cupti_combine, combine_times_us)
+            ]
+        else:
             detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
     else:
         detailed_stats = {"dispatch_kernels": [], "combine_kernels": [], "other_kernels": []}
@@ -990,7 +1024,7 @@ def _run_benchmark_worker_under_current_mpi(
     # but silently drops CUDA_EVENT records.  _set_device_from_local_rank() (below) is
     # the first call that creates the CUDA context, so we init CUPTI here.
     _early_cupti_ctx: Optional[Any] = None
-    if not args.no_cuda_graph and args.kernel_breakdown:
+    if not args.no_cuda_graph:
         _cupti_module, _cupti_kernels_list, _cupti_events_list, _cupti_ok = _try_init_cupti()
         if _cupti_ok:
             _early_cupti_ctx = (_cupti_module, _cupti_kernels_list, _cupti_events_list, True)
@@ -1067,9 +1101,9 @@ def _run_benchmark_worker_under_current_mpi(
     # CUPTI was initialized before the CUDA context at the top of this function.
     # Reuse that early context; do not re-initialize here (too late for CUDA_EVENT delivery).
     _cupti_ctx: Optional[Any] = _early_cupti_ctx
-    if not args.no_cuda_graph and args.kernel_breakdown and _cupti_ctx is None:
+    if not args.no_cuda_graph and _cupti_ctx is None:
         _maybe_warn_rank0(
-            "[bench] CUPTI unavailable, kernel breakdown disabled for cuda_graph mode."
+            "[bench] CUPTI unavailable; dispatch_us/combine_us will use CUDA event elapsed_time."
         )
 
     for backend_name in backends:
