@@ -80,7 +80,8 @@ union FP8x4
 template <bool UseUe8m0>
 __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(__nv_fp8_e4m3* __restrict__ fp8_out,
     float* __restrict__ scale_out, __nv_bfloat16 const* __restrict__ pe, __nv_bfloat16 const* __restrict__ nope,
-    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride, int32_t nope_row_stride)
+    int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride, int32_t nope_row_stride,
+    float output_scale_factor)
 {
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane = threadIdx.x % WARP_SIZE;
@@ -169,7 +170,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(_
 
     if (lane == 0)
     {
-        scale_out[row] = scale;
+        scale_out[row] = scale * output_scale_factor;
     }
 }
 
@@ -177,7 +178,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8Kernel(_
 
 void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 const* pe, __nv_bfloat16 const* nope,
     int32_t M, int32_t pe_dim, int32_t nope_dim, int32_t head_dim, int32_t pe_row_stride, int32_t nope_row_stride,
-    bool use_ue8m0, cudaStream_t stream)
+    bool use_ue8m0, float output_scale_factor, cudaStream_t stream)
 {
     if (M == 0)
     {
@@ -208,12 +209,12 @@ void invokeFusedCatFp8(__nv_fp8_e4m3* fp8_out, float* scale_out, __nv_bfloat16 c
     if (use_ue8m0)
     {
         fusedCatFp8Kernel<true><<<grid, block, 0, stream>>>(
-            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride);
+            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, output_scale_factor);
     }
     else
     {
         fusedCatFp8Kernel<false><<<grid, block, 0, stream>>>(
-            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride);
+            fp8_out, scale_out, pe, nope, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, output_scale_factor);
     }
 
     TLLM_CUDA_CHECK(cudaGetLastError());
