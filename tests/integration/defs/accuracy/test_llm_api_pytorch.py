@@ -1502,8 +1502,7 @@ class TestDeepSeekV3Lite(LlmapiAccuracyTestHarness):
                            (False, True, True), (True, True, True)])
     # Only Hopper and Blackwell MLA kernel supports MTP
     @parametrize_with_ids("mtp_nextn", [0, 2])
-    @parametrize_with_ids("v2_kv_cache", [True, False],
-                          ids=["v2_kv_cache", "v1_kv_cache"])
+    @parametrize_with_ids("v2_kv_cache", [True, False])
     def test_bfloat16(self, mtp_nextn, attention_dp, cuda_graph,
                       overlap_scheduler, torch_compile, enable_chunked_prefill,
                       v2_kv_cache):
