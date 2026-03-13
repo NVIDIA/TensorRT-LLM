@@ -200,6 +200,7 @@ def _create_model_config(
     enable_eplb=False,
     num_slots=-1,
     layer_updates_per_iter=-1,
+    max_num_tokens=None,
 ):
     """Create PretrainedConfig and ModelConfig for MoE testing."""
     pretrained_config = PretrainedConfig()
@@ -217,7 +218,7 @@ def _create_model_config(
         else None
     )
 
-    return ModelConfig(
+    kwargs = dict(
         pretrained_config=pretrained_config,
         mapping=mapping,
         quant_config=quant_config,
@@ -225,6 +226,10 @@ def _create_model_config(
         moe_disable_finalize_fusion=False,
         moe_load_balancer=moe_load_balancer_config,
     )
+    if max_num_tokens is not None:
+        kwargs["max_num_tokens"] = max_num_tokens
+
+    return ModelConfig(**kwargs)
 
 
 def _run_autotune_test(
@@ -506,6 +511,13 @@ def _test_moe_worker_impl(
                     weights[key] = weights[key].to("cpu")
         ref_weights = copy.deepcopy(weights) if enable_eplb else weights
 
+        # Use a small max_num_tokens for unit tests to avoid NVSHMEM buffer
+        # allocation failures.  DeepEP low-latency buffers are sized by
+        # max_num_tokens * hidden_size * num_experts, and the default 8192
+        # causes cuMemMap failures for large configs (e.g. e384 * h7168).
+        # Unit tests only send seq_len tokens, so 256 is more than enough.
+        test_max_num_tokens = max(256, seq_len)
+
         # Create configs
         model_cfg = _create_model_config(
             num_experts=num_experts,
@@ -518,6 +530,7 @@ def _test_moe_worker_impl(
             enable_eplb=enable_eplb,
             num_slots=num_slots,
             layer_updates_per_iter=layer_updates_per_iter,
+            max_num_tokens=test_max_num_tokens,
         )
 
         # Create MoE load balancer
@@ -532,9 +545,9 @@ def _test_moe_worker_impl(
             quantize_util, "weight_loading_mode", MoEWeightLoadingMode.VANILLA
         )
 
-        with moe_load_balancer:
-            # Create and setup fused MoE module
-            fused_moe = create_moe(
+        with (
+            moe_load_balancer,
+            create_moe(
                 routing_method=routing_method,
                 reduce_results=True,
                 model_config=model_cfg,
@@ -543,7 +556,8 @@ def _test_moe_worker_impl(
                 swiglu_beta=swiglu_tensors["swiglu_beta"] if swiglu_tensors else None,
                 swiglu_limit=swiglu_tensors["swiglu_limit"] if swiglu_tensors else None,
                 weight_loading_mode=weight_loading_mode,
-            )
+            ) as fused_moe,
+        ):
             fused_moe.load_weights([weights])
             fused_moe.post_load_weights()
             fused_moe.cuda(f"cuda:{mapping.rank}")
@@ -816,27 +830,36 @@ def _get_comm_method_skip_reason(
 
     Returns a skip reason string if incompatible, None otherwise.
     """
-    # NVLink-based methods require MNNVL support (all NVLink links active).
-    # See: _mnnvl_utils.py:supports_mnnvl() -> support_nvlink(need_all_up=True)
-    # Without MNNVL, Communication.__init__() raises RuntimeError (base.py:53-58).
-    if comm_method in ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED"):
+    # NVLink-based methods require all NVLink links active.
+    # NVLINK_ONE_SIDED/TWO_SIDED: base.py:53-58 raises RuntimeError without MNNVL.
+    # DEEPEP: upstream DeepEP check_nvlink_connections() asserts NVLink P2P
+    #   between all GPU pairs; NUM_MAX_NVL_PEERS=8 hardcoded in configs.cuh.
+    # DeepEPLowLatency does NOT require NVLink (RDMA only, num_nvl_bytes=0).
+    if comm_method in ("NVLINK_ONE_SIDED", "NVLINK_TWO_SIDED", "DEEPEP"):
         if not _is_mnnvl_supported():
             return (
-                f"{comm_method} requires MNNVL support (all NVLink links active). "
+                f"{comm_method} requires NVLink support (all links active). "
                 f"Not supported on this platform."
             )
 
-    # DeepEP normal mode: is_workload_feasible (deep_ep.py:127) rejects
-    # non-bfloat16, causing a runtime fallback to AllGather. The fallback
-    # replaces self.comm, and when the old DeepEP object is GC'd its
-    # Buffer destructor calls intranode::barrier (deep_ep.cpp:90) which
-    # requires all ranks simultaneously -- non-deterministic GC timing
-    # across MPI ranks causes the barrier to timeout and crash.
-    if comm_method == "DEEPEP" and dtype is not None and dtype != torch.bfloat16:
+    # DeepEP/DeepEPLowLatency only support bfloat16 at runtime:
+    # is_workload_feasible (deep_ep.py:136, deep_ep_low_latency.py:164)
+    # rejects non-bfloat16.  The auto-selection path already guards this
+    # (communication_factory.py:157: act_dtype == torch.bfloat16), but
+    # the forced-method path used by tests creates the NVSHMEM buffer
+    # unconditionally.  Buffer creation is a collective NVSHMEM operation
+    # that can hang when followed by immediate destruction on fallback.
+    # Skip here to avoid creating buffers that will never be used.
+    if (
+        comm_method in ("DEEPEP", "DEEPEPLOWLATENCY")
+        and dtype is not None
+        and dtype != torch.bfloat16
+    ):
         return (
-            f"DeepEP is_workload_feasible rejects dtype={dtype} "
-            f"(requires bfloat16), and the runtime fallback triggers an "
-            f"unsafe Buffer destruction that crashes all ranks."
+            f"{comm_method} only supports bfloat16 (dtype={dtype}). "
+            f"Auto-selection already skips DeepEP for non-bfloat16 "
+            f"(communication_factory.py:157); forced-method buffer "
+            f"creation hangs on collective NVSHMEM init."
         )
 
     if comm_method == "DEEPEPLOWLATENCY":

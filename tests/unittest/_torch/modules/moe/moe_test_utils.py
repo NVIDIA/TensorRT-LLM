@@ -611,15 +611,6 @@ def should_skip_multi_gpu(
     Returns:
         Skip reason string if test should be skipped, None otherwise
     """
-    # DEEPEPLOWLATENCY hangs on H100 (SM90) in CI multi-GPU tests.
-    if comm_method == "DEEPEPLOWLATENCY":
-        capability = torch.cuda.get_device_capability(0)
-        if capability == (9, 0):
-            return (
-                "[CI Hang] DEEPEPLOWLATENCY hangs on H100 (SM90) in "
-                "multi-GPU tests. Skipping until the issue is resolved."
-            )
-
     # Only EP modes have ep_size = world_size; TP modes have ep_size = 1
     if parallel_mode not in ("DEP", "TEP"):
         return None
@@ -632,6 +623,22 @@ def should_skip_multi_gpu(
             f"in {parallel_mode} mode. Requires EPLB to handle non-uniform "
             f"expert partitioning (tested separately in test_configurable_moe_multi_gpu_eplb)."
         )
+
+    # DeepEP Low Latency requires NVSHMEM IBGDA transport, which needs
+    # GPU-side MMIO mapping of InfiniBand UAR (User Access Region).
+    # On Hopper (SM90) nodes the cudaHostRegister(IoMemory) call fails
+    # (cudaErrorNotSupported), causing IBGDA init to fail.  NVSHMEM v3.2.5
+    # has a double-free bug in the IBGDA cleanup path that crashes MPI
+    # workers with SIGABRT, leaving the parent process hung forever.
+    # Skip on Hopper until NVSHMEM ships a fix or IBRC fallback is enabled.
+    if comm_method == "DEEPEPLOWLATENCY":
+        if torch.cuda.get_device_capability(0) == (9, 0):
+            return (
+                "DEEPEPLOWLATENCY requires NVSHMEM IBGDA transport. "
+                "Hopper (SM90) nodes lack GPU-side UAR mapping support "
+                "(cudaHostRegister IoMemory returns cudaErrorNotSupported), "
+                "and NVSHMEM v3.2.5 crashes on IBGDA init failure cleanup."
+            )
 
     return None
 

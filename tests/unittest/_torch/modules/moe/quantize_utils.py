@@ -1994,8 +1994,12 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
             act = act * pre_quant_scale
 
         # Step 2: Quantize activation to FP8 and dequantize back (Q/DQ simulation)
-        # This introduces quantization noise that is part of the W4A8_AWQ computation
-        act = torch.clamp((act / input_scale), -448.0, 448.0).to(torch.float8_e4m3fn).to(self.dtype)
+        # The kernel applies the reciprocal scale in fp16 precision (expandInputRowsKernel
+        # PRE_QUANT_AWQ path: frag_elems[e] * prequant_scales[...] where both are fp16),
+        # then converts to fp8 via arrayConvert. Match this by computing the reciprocal
+        # in fp16 and multiplying instead of dividing in fp32.
+        inv_scale = (1.0 / input_scale).to(self.dtype)
+        act = torch.clamp((act * inv_scale), -448.0, 448.0).to(torch.float8_e4m3fn).to(self.dtype)
 
         # Step 3: Dequantize weight
         weight = (
@@ -2104,8 +2108,10 @@ class W4A8AWQRefGatedMLPFusedMoE(nn.Module):
                 weight_scale_2=q3_q1,
             )
             # SwiGLU activation: first half is up (w3), second half is gate (w1)
+            # The kernel computes SwiGLU in float32 (doActivationKernel uses
+            # ComputeElem = Array<float, N>), so match that precision here.
             fc1, gate = fc1.chunk(2, dim=-1)
-            fc1 = fc1 * F.silu(gate)
+            fc1 = (fc1.float() * F.silu(gate.float())).to(fc1.dtype)
 
             # Forward pass: down_proj (fc2)
             fc2 = self._process_layer(
