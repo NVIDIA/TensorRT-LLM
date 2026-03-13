@@ -772,6 +772,7 @@ class AllReduce(nn.Module):
         Returns:
             A tensor lists with different tensor outptus according to the fusion_op.
             NONE: [hidden_states]
+            RMS_NORM: [hidden_states]
             RESIDUAL_RMS_NORM: [hidden_states, residual]
             RESIDUAL_RMS_NORM_QUANT_FP8: [norm_quant, residual]
             RESIDUAL_RMS_NORM_OUT_QUANT_FP8: [norm, norm_quant, residual]
@@ -943,9 +944,6 @@ class MoEAllReduce(nn.Module):
                 eps=all_reduce_params.eps,
             )
         else:
-            assert all_reduce_params.residual.shape[
-                0] <= self.max_token, "Num tokens must be less than or equal to max_token"
-
             return torch.ops.trtllm.moe_finalize_allreduce(
                 input=input,
                 residual=all_reduce_params.residual,
