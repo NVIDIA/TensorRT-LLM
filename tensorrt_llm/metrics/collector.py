@@ -33,15 +33,41 @@ class MetricsCollector:
         {"model_name": "nemotron-nano-3", "engine_type": "trtllm"}
 
     Created Prometheus metrics:
-        trtllm_request_success_total
-        trtllm_e2e_request_latency_seconds
-        trtllm_time_to_first_token_seconds
-        trtllm_time_per_output_token_seconds
-        trtllm_request_queue_time_seconds
-        trtllm_kv_cache_hit_rate
-        trtllm_kv_cache_reused_blocks_total
-        trtllm_kv_cache_missed_blocks_total
-        trtllm_kv_cache_utilization
+        Per-request metrics:
+            trtllm_request_success_total
+            trtllm_e2e_request_latency_seconds
+            trtllm_time_to_first_token_seconds
+            trtllm_time_per_output_token_seconds
+            trtllm_request_queue_time_seconds
+
+        Iteration-level metrics:
+            trtllm_kv_cache_hit_rate
+            trtllm_kv_cache_utilization
+            trtllm_num_requests_running
+            trtllm_num_requests_waiting
+            trtllm_num_requests_completed_total
+            trtllm_max_num_active_requests
+            trtllm_iteration_latency_seconds
+            trtllm_gpu_memory_usage_bytes
+            trtllm_cpu_memory_usage_bytes
+            trtllm_pinned_memory_usage_bytes
+            trtllm_max_batch_size_static
+            trtllm_max_batch_size_runtime
+            trtllm_max_num_tokens_runtime
+            trtllm_kv_cache_max_blocks
+            trtllm_kv_cache_free_blocks
+            trtllm_kv_cache_used_blocks
+            trtllm_kv_cache_tokens_per_block
+            trtllm_num_context_requests
+            trtllm_num_generation_requests
+            trtllm_num_paused_requests
+            trtllm_num_scheduled_requests
+            trtllm_total_context_tokens
+            trtllm_avg_decoded_tokens_per_iter
+            trtllm_spec_decode_num_draft_tokens
+            trtllm_spec_decode_num_accepted_tokens
+            trtllm_spec_decode_acceptance_length
+            trtllm_spec_decode_draft_overhead
     """
     labelname_finish_reason = "finished_reason"
 
@@ -123,6 +149,124 @@ class MetricsCollector:
         self._prev_reused_blocks = 0
         self._prev_missed_blocks = 0
 
+        # Queue & load metrics
+        self.num_requests_running = Gauge(
+            name=self.metric_prefix + "num_requests_running",
+            documentation="Number of active requests",
+            labelnames=self.labels.keys())
+        self.num_requests_waiting = Gauge(
+            name=self.metric_prefix + "num_requests_waiting",
+            documentation="Number of queued requests",
+            labelnames=self.labels.keys())
+        self.counter_num_requests_completed = Counter(
+            name=self.metric_prefix + "num_requests_completed_total",
+            documentation=
+            "Total number of completed requests across iterations",
+            labelnames=self.labels.keys())
+        self.max_num_active_requests = Gauge(
+            name=self.metric_prefix + "max_num_active_requests",
+            documentation="Maximum number of active requests",
+            labelnames=self.labels.keys())
+
+        # Iteration latency
+        self.iteration_latency_seconds = Gauge(
+            name=self.metric_prefix + "iteration_latency_seconds",
+            documentation="Iteration latency in seconds",
+            labelnames=self.labels.keys())
+
+        # Memory usage
+        self.gpu_memory_usage_bytes = Gauge(
+            name=self.metric_prefix + "gpu_memory_usage_bytes",
+            documentation="GPU memory usage in bytes",
+            labelnames=self.labels.keys())
+        self.cpu_memory_usage_bytes = Gauge(
+            name=self.metric_prefix + "cpu_memory_usage_bytes",
+            documentation="CPU memory usage in bytes",
+            labelnames=self.labels.keys())
+        self.pinned_memory_usage_bytes = Gauge(
+            name=self.metric_prefix + "pinned_memory_usage_bytes",
+            documentation="Pinned memory usage in bytes",
+            labelnames=self.labels.keys())
+
+        # Batch size
+        self.max_batch_size_static = Gauge(
+            name=self.metric_prefix + "max_batch_size_static",
+            documentation="Static maximum batch size",
+            labelnames=self.labels.keys())
+        self.max_batch_size_runtime = Gauge(
+            name=self.metric_prefix + "max_batch_size_runtime",
+            documentation="Runtime maximum batch size",
+            labelnames=self.labels.keys())
+        self.max_num_tokens_runtime = Gauge(
+            name=self.metric_prefix + "max_num_tokens_runtime",
+            documentation="Runtime maximum number of tokens",
+            labelnames=self.labels.keys())
+
+        # KV cache block metrics
+        self.kv_cache_max_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_max_blocks",
+            documentation="Maximum number of KV cache blocks",
+            labelnames=self.labels.keys())
+        self.kv_cache_free_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_free_blocks",
+            documentation="Number of free KV cache blocks",
+            labelnames=self.labels.keys())
+        self.kv_cache_used_blocks = Gauge(
+            name=self.metric_prefix + "kv_cache_used_blocks",
+            documentation="Number of used KV cache blocks",
+            labelnames=self.labels.keys())
+        self.kv_cache_tokens_per_block = Gauge(
+            name=self.metric_prefix + "kv_cache_tokens_per_block",
+            documentation="Number of tokens per KV cache block",
+            labelnames=self.labels.keys())
+
+        # Inflight batching metrics
+        self.num_context_requests = Gauge(
+            name=self.metric_prefix + "num_context_requests",
+            documentation="Number of context (prefill) requests",
+            labelnames=self.labels.keys())
+        self.num_generation_requests = Gauge(
+            name=self.metric_prefix + "num_generation_requests",
+            documentation="Number of generation (decode) requests",
+            labelnames=self.labels.keys())
+        self.num_paused_requests = Gauge(
+            name=self.metric_prefix + "num_paused_requests",
+            documentation="Number of paused requests",
+            labelnames=self.labels.keys())
+        self.num_scheduled_requests = Gauge(
+            name=self.metric_prefix + "num_scheduled_requests",
+            documentation="Number of scheduled requests",
+            labelnames=self.labels.keys())
+        self.total_context_tokens = Gauge(
+            name=self.metric_prefix + "total_context_tokens",
+            documentation="Total number of context tokens",
+            labelnames=self.labels.keys())
+        self.avg_decoded_tokens_per_iter = Gauge(
+            name=self.metric_prefix + "avg_decoded_tokens_per_iter",
+            documentation=
+            "Average number of decoded tokens per iteration",
+            labelnames=self.labels.keys())
+
+        # Speculative decoding metrics
+        self.spec_decode_num_draft_tokens = Gauge(
+            name=self.metric_prefix + "spec_decode_num_draft_tokens",
+            documentation="Number of draft tokens in speculative decoding",
+            labelnames=self.labels.keys())
+        self.spec_decode_num_accepted_tokens = Gauge(
+            name=self.metric_prefix + "spec_decode_num_accepted_tokens",
+            documentation=
+            "Number of accepted tokens in speculative decoding",
+            labelnames=self.labels.keys())
+        self.spec_decode_acceptance_length = Gauge(
+            name=self.metric_prefix + "spec_decode_acceptance_length",
+            documentation=
+            "Acceptance length in speculative decoding",
+            labelnames=self.labels.keys())
+        self.spec_decode_draft_overhead = Gauge(
+            name=self.metric_prefix + "spec_decode_draft_overhead",
+            documentation="Draft overhead in speculative decoding",
+            labelnames=self.labels.keys())
+
     def _label_merge(self, labels: Dict[str, str]) -> Dict[str, str]:
         if labels is None or len(labels) == 0:
             return self.labels
@@ -193,32 +337,64 @@ class MetricsCollector:
         """
         Log iteration-level statistics from TRTLLM engine.
 
-        This method updates Prometheus metrics including:
-        - kv_cache_hit_rate
-        - kv_cache_reused_blocks
-        - kv_cache_missed_blocks
-        - kv_cache_utilization
+        Updates Prometheus gauges/counters for queue load, memory usage, batch sizes,
+        KV cache blocks, inflight batching, and speculative decoding stats.
 
         Args:
-            iteration_stats: A JSON dict returned from `BaseLLM.get_stats()` containing iteration-level statistics
-                with the following expected structure:
-                - "kvCacheStats" (dict): KV cache statistics containing:
-                    - "cacheHitRate" (float): Cache hit rate (0.0 to 1.0). If present (including zero),
-                      the kv_cache_hit_rate gauge is updated.
-                    - "reusedBlocks" (int): Number of KV cache blocks reused (cache hits).
-                    - "missedBlocks" (int): Number of KV cache blocks missed (cache misses).
-                    - "usedNumBlocks" (int): Number of KV cache blocks currently in use.
-                    - "maxNumBlocks" (int): Maximum number of KV cache blocks available. Should always be
-                      non-zero.
-
-        Returns:
-            None: Metrics are logged to Prometheus; nothing is returned.
+            iteration_stats: A JSON dict returned from `BaseLLM.get_stats()` containing iteration-level statistics.
+                Top-level fields: numActiveRequests, numQueuedRequests, numCompletedRequests,
+                maxNumActiveRequests, iterLatencyMS, gpuMemUsage, cpuMemUsage, pinnedMemUsage,
+                maxBatchSizeStatic, maxBatchSizeRuntime, maxNumTokensRuntime.
+                Nested dicts: kvCacheStats, inflightBatchingStats, specDecodingStats.
 
         Note:
-            - Needs to include `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
-            - KV cache utilization is only calculated and logged when both "usedNumBlocks" and
-              "maxNumBlocks" are present in kvCacheStats and "maxNumBlocks" is non-zero.
+            - Needs `enable_iter_perf_stats: true` in LLM args to collect iteration-level stats.
+            - inflightBatchingStats and specDecodingStats are only present when applicable.
         """
+        # Top-level queue & load metrics
+        if "numActiveRequests" in iteration_stats:
+            self._log_gauge(self.num_requests_running,
+                            iteration_stats["numActiveRequests"])
+        if "numQueuedRequests" in iteration_stats:
+            self._log_gauge(self.num_requests_waiting,
+                            iteration_stats["numQueuedRequests"])
+        if "numCompletedRequests" in iteration_stats:
+            completed = iteration_stats["numCompletedRequests"]
+            if completed > 0:
+                self._log_counter(self.counter_num_requests_completed, {},
+                                  completed)
+        if "maxNumActiveRequests" in iteration_stats:
+            self._log_gauge(self.max_num_active_requests,
+                            iteration_stats["maxNumActiveRequests"])
+
+        # Iteration latency (convert ms to seconds)
+        if "iterLatencyMS" in iteration_stats:
+            self._log_gauge(self.iteration_latency_seconds,
+                            iteration_stats["iterLatencyMS"] / 1000.0)
+
+        # Memory usage
+        if "gpuMemUsage" in iteration_stats:
+            self._log_gauge(self.gpu_memory_usage_bytes,
+                            iteration_stats["gpuMemUsage"])
+        if "cpuMemUsage" in iteration_stats:
+            self._log_gauge(self.cpu_memory_usage_bytes,
+                            iteration_stats["cpuMemUsage"])
+        if "pinnedMemUsage" in iteration_stats:
+            self._log_gauge(self.pinned_memory_usage_bytes,
+                            iteration_stats["pinnedMemUsage"])
+
+        # Batch size
+        if "maxBatchSizeStatic" in iteration_stats:
+            self._log_gauge(self.max_batch_size_static,
+                            iteration_stats["maxBatchSizeStatic"])
+        if "maxBatchSizeRuntime" in iteration_stats:
+            self._log_gauge(self.max_batch_size_runtime,
+                            iteration_stats["maxBatchSizeRuntime"])
+        if "maxNumTokensRuntime" in iteration_stats:
+            self._log_gauge(self.max_num_tokens_runtime,
+                            iteration_stats["maxNumTokensRuntime"])
+
+        # KV cache stats
         if kv_stats := iteration_stats.get("kvCacheStats"):
             cache_hit_rate = kv_stats.get("cacheHitRate")
             if cache_hit_rate is not None:
@@ -240,3 +416,51 @@ class MetricsCollector:
                 if max_num_blocks:
                     utilization = kv_stats["usedNumBlocks"] / max_num_blocks
                     self._log_gauge(self.kv_cache_utilization, utilization)
+            if "maxNumBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_max_blocks,
+                                kv_stats["maxNumBlocks"])
+            if "freeNumBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_free_blocks,
+                                kv_stats["freeNumBlocks"])
+            if "usedNumBlocks" in kv_stats:
+                self._log_gauge(self.kv_cache_used_blocks,
+                                kv_stats["usedNumBlocks"])
+            if "tokensPerBlock" in kv_stats:
+                self._log_gauge(self.kv_cache_tokens_per_block,
+                                kv_stats["tokensPerBlock"])
+
+        # Inflight batching stats
+        if ifb_stats := iteration_stats.get("inflightBatchingStats"):
+            if "numContextRequests" in ifb_stats:
+                self._log_gauge(self.num_context_requests,
+                                ifb_stats["numContextRequests"])
+            if "numGenRequests" in ifb_stats:
+                self._log_gauge(self.num_generation_requests,
+                                ifb_stats["numGenRequests"])
+            if "numPausedRequests" in ifb_stats:
+                self._log_gauge(self.num_paused_requests,
+                                ifb_stats["numPausedRequests"])
+            if "numScheduledRequests" in ifb_stats:
+                self._log_gauge(self.num_scheduled_requests,
+                                ifb_stats["numScheduledRequests"])
+            if "numCtxTokens" in ifb_stats:
+                self._log_gauge(self.total_context_tokens,
+                                ifb_stats["numCtxTokens"])
+            if "avgNumDecodedTokensPerIter" in ifb_stats:
+                self._log_gauge(self.avg_decoded_tokens_per_iter,
+                                ifb_stats["avgNumDecodedTokensPerIter"])
+
+        # Speculative decoding stats
+        if spec_stats := iteration_stats.get("specDecodingStats"):
+            if "numDraftTokens" in spec_stats:
+                self._log_gauge(self.spec_decode_num_draft_tokens,
+                                spec_stats["numDraftTokens"])
+            if "numAcceptedTokens" in spec_stats:
+                self._log_gauge(self.spec_decode_num_accepted_tokens,
+                                spec_stats["numAcceptedTokens"])
+            if "acceptanceLength" in spec_stats:
+                self._log_gauge(self.spec_decode_acceptance_length,
+                                spec_stats["acceptanceLength"])
+            if "draftOverhead" in spec_stats:
+                self._log_gauge(self.spec_decode_draft_overhead,
+                                spec_stats["draftOverhead"])
