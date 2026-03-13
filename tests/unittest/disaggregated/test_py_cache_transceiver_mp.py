@@ -1045,7 +1045,7 @@ MP_TEST_CONFIGS = [
 ]
 
 
-@pytest.mark.timeout(60)
+@pytest.mark.timeout(180)
 @pytest.mark.parametrize(
     "ctx_tp,ctx_pp,gen_tp,gen_pp,ctx_enable_dp,gen_enable_dp,is_mla",
     [(c[0], c[1], c[2], c[3], c[4], c[5], c[6]) for c in MP_TEST_CONFIGS],

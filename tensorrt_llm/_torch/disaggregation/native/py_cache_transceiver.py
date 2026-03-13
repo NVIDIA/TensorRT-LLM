@@ -1,3 +1,4 @@
+import concurrent
 import uuid
 from collections import defaultdict
 from itertools import chain
@@ -73,7 +74,8 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         # Aux payload carries first-gen and draft tokens in generation-first flow.
         self.aux_buffer = AuxBuffer(
-            max_slot_num=max(1, int(self.kv_cache_manager.max_batch_size)),
+            # * 2 to allow back-to-back batches, one in transferring, one in preparing next batch
+            max_slot_num=max(1, int(self.kv_cache_manager.max_batch_size)) * 2,
             beam_width=max(1, int(getattr(self.kv_cache_manager, "max_beam_width", 1))),
             max_draft_len=max(0, int(getattr(self.kv_cache_manager, "max_draft_len", 0))),
             device="cpu",
@@ -226,37 +228,27 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
 
         local_completed_request_ids = []
         local_failed_request_ids = []
-        local_ready_request_ids = []
         for request_id, session in self.send_sessions.items():
-            if session.state.status == SessionStatus.TRANSFERRED:
+            req = self.send_req_id_to_request[request_id]
+            need_aux = self._need_aux_transfer(req)
+            session_status = session.state.status
+            if need_aux:
+                if session_status == SessionStatus.AUX_TRANSFERRED:
+                    local_completed_request_ids.append(request_id)
+                elif session_status == SessionStatus.ERROR:
+                    local_failed_request_ids.append(request_id)
+            elif session_status == SessionStatus.TRANSFERRED:
                 local_completed_request_ids.append(request_id)
-            elif session.state.status == SessionStatus.ERROR:
+            elif session_status == SessionStatus.ERROR:
                 local_failed_request_ids.append(request_id)
-        for request_id in self.wait_req_id_to_request.keys():
-            # For generation-first mode, if all peer request infos are ready,
-            # mark the request as ready to be scheduled and sync with other tp ranks
-            if self.transfer_worker.has_all_peer_req_infos_for_send(request_id):
-                local_ready_request_ids.append(request_id)
         local_sync_request_ids = local_completed_request_ids + local_failed_request_ids
 
         if self.ctx_need_tp_sync:
-            combined_request_ids_all_ranks = self.dist.tp_allgather(
-                (local_sync_request_ids, local_ready_request_ids)
-            )
-            sync_request_ids_all_ranks = [entry[0] for entry in combined_request_ids_all_ranks]
-            ready_request_ids_all_ranks = [entry[1] for entry in combined_request_ids_all_ranks]
-
+            sync_request_ids_all_ranks = self.dist.tp_allgather(local_sync_request_ids)
         else:
             sync_request_ids_all_ranks = [local_sync_request_ids]
-            ready_request_ids_all_ranks = [local_ready_request_ids]
 
         sync_size = self.dist.tp_size if self.ctx_need_tp_sync else 1
-
-        ready_request_ids = _find_consensus_request_ids(ready_request_ids_all_ranks, sync_size)
-        # set the gen-first ctx requests state to CONTEXT_INIT to allow being scheduled
-        for request_id in ready_request_ids:
-            self.wait_req_id_to_request[request_id].state = LlmRequestState.CONTEXT_INIT
-            del self.wait_req_id_to_request[request_id]
 
         to_complete_request_ids = _find_consensus_request_ids(sync_request_ids_all_ranks, sync_size)
         for request_id in self.send_req_id_to_request.keys():
@@ -271,18 +263,19 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         failed_request_ids = []
         for request_id in to_complete_request_ids:
             session = self.send_sessions[request_id]
-            if session.wait_complete(
-                self.send_task_ids[request_id],
-                wait_aux=True,
-                timeout_ms=self.sender_future_timeout_ms,
-            ):
-                completed_request_ids.append(request_id)
-            else:
+            try:
+                if session.wait_complete(
+                    self.send_task_ids[request_id],
+                    wait_aux=True,
+                    timeout_ms=self.sender_future_timeout_ms,
+                ):
+                    completed_request_ids.append(request_id)
+            except concurrent.futures.TimeoutError:
+                logger.warning(f"TxSession {session.unique_rid} timed out waiting for completion")
                 timeout_request_ids.append(request_id)
-                logger.warning(
-                    f"Request {request_id} timed out waiting for context KV cache transfer after",
-                    f"{self.sender_future_timeout_ms} milliseconds.",
-                )
+            except Exception:
+                logger.warning(f"TxSession {session.unique_rid} failed to complete")
+                failed_request_ids.append(request_id)
 
         for request_id in completed_request_ids + failed_request_ids:
             if request_id in completed_request_ids:
@@ -308,9 +301,9 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         local_failed_request_ids = []
         for request_id, session in self.recv_sessions.items():
             req = self.recv_req_id_to_request[request_id]
-            need_aux_transfer = self._need_aux_transfer(req)
+            need_aux = self._need_aux_transfer(req)
             session_status = session.state.status
-            if need_aux_transfer:
+            if need_aux:
                 if session_status == SessionStatus.AUX_TRANSFERRED:
                     local_completed_request_ids.append(request_id)
                 elif session_status == SessionStatus.ERROR:
@@ -387,18 +380,36 @@ class PyNativeCacheTransceiver(KvCacheTransceiver):
         }
 
     def prepare_context_requests(self, requests: List[LlmRequest]):
-        # Create session for new generation-first requests
-        # Context request may arrive before or after the kvcache request.
-        # If peer request data is available, the context request should be set to CONTEXT_INIT.
-        # Otherwise, the context request should be set to DISAGG_CONTEXT_TRANS_IN_PROGRESS.
+        # Place new generation-first context requests into wait state, then
+        # use tp_allgather consensus to promote ready requests to CONTEXT_INIT.
         for req in requests:
             unique_rid = get_unique_rid(req)
             if unique_rid not in self.send_sessions:
-                if self.transfer_worker.has_all_peer_req_infos_for_send(unique_rid):
-                    req.state = LlmRequestState.CONTEXT_INIT
-                else:
-                    self.wait_req_id_to_request[unique_rid] = req
-                    req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+                self.wait_req_id_to_request[unique_rid] = req
+                req.state = LlmRequestState.DISAGG_CONTEXT_WAIT_SCHEDULER
+
+        # Check which waiting requests have peer info locally, then use
+        # tp_allgather consensus so all TP ranks agree before promoting.
+        # Without consensus, background peer info arriving at different
+        # times on different ranks causes scheduling mismatches → hang.
+        # Place tp sync here because this function runs in every iteration
+        # but check_context_transfer_status runs when can_queue is True
+        local_ready_request_ids = []
+        for request_id in self.wait_req_id_to_request.keys():
+            if self.transfer_worker.has_all_peer_req_infos_for_send(request_id):
+                local_ready_request_ids.append(request_id)
+
+        if self.ctx_need_tp_sync:
+            ready_request_ids_all_ranks = self.dist.tp_allgather(local_ready_request_ids)
+        else:
+            ready_request_ids_all_ranks = [local_ready_request_ids]
+
+        sync_size = self.dist.tp_size if self.ctx_need_tp_sync else 1
+        ready_request_ids = _find_consensus_request_ids(ready_request_ids_all_ranks, sync_size)
+
+        for request_id in ready_request_ids:
+            self.wait_req_id_to_request[request_id].state = LlmRequestState.CONTEXT_INIT
+            del self.wait_req_id_to_request[request_id]
 
     def _check_compatible(self):
         if self.mapping.cp_size != 1:

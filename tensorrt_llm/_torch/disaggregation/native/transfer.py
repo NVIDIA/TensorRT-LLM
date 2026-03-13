@@ -728,7 +728,6 @@ class Sender:
                 sync_status.encode("ascii"),
             ]
         )
-
         aux_task = session._aux_task
         aux_task._transferred_count += 1
         if aux_task._perf_timer is not None:
@@ -950,22 +949,13 @@ class TxSession(TxSessionBase):
     def wait_complete(
         self, task_id: TaskIdType, wait_aux: bool = True, timeout_ms: int = -1
     ) -> bool:
-        try:
-            timeout_s = timeout_ms / 1000.0 if timeout_ms > 0 else None
-            kv_result = self._kv_tasks[task_id].future.result(timeout=timeout_s) == "SUCCESS"
-            if wait_aux and self._aux_task:
-                aux_result = self._aux_task.future.result(timeout=timeout_s) == "SUCCESS"
-                return kv_result and aux_result
-            else:
-                return kv_result
-        except concurrent.futures.TimeoutError:
-            logger.warning(
-                f"TxSession {self.unique_rid} timed out waiting for completion after {timeout_ms} milliseconds."
-            )
-            return False
-        except Exception as e:
-            logger.error(f"Exception in TxSession.wait_complete: {e}")
-            return False
+        timeout_s = timeout_ms / 1000.0 if timeout_ms > 0 else None
+        kv_result = self._kv_tasks[task_id].future.result(timeout=timeout_s) == "SUCCESS"
+        if wait_aux and self._aux_task:
+            aux_result = self._aux_task.future.result(timeout=timeout_s) == "SUCCESS"
+            return kv_result and aux_result
+        else:
+            return kv_result
 
     def close(self):
         if getattr(self, "_closed", False):
@@ -1194,6 +1184,8 @@ class Receiver:
         session = self._get_rx_session(unique_rid)
         if session is not None:
             session.process_kv_task_status(peer_rank, is_last_slice_str == "True", status)
+        else:
+            logger.warning(f"RxSession {unique_rid} not found when processing kv task status")
 
     def _process_aux_state(self, send_id: bytes, message: list[bytes]):
         msg_type, peer_rank, unique_rid, status = decode_message(message)
@@ -1202,6 +1194,8 @@ class Receiver:
         session = self._get_rx_session(unique_rid)
         if session is not None:
             session.process_aux_state(peer_rank, status)
+        else:
+            logger.warning(f"RxSession {unique_rid} not found when processing aux state")
 
     def _request_sender_data(self, endpoint: str, receiver_info: RecvReqInfo):
         messenger = self._get_or_connect_dealer(endpoint)
@@ -1267,11 +1261,10 @@ class RxSession(RxSessionBase):
                     self.state.status = SessionStatus.TRANSFERRED
                     self.state.finished_tasks.append(0)
 
-                    logger.debug("Task state handled successfully")
                     if task._perf_timer is not None:
                         task._perf_timer.record_task_end(peer_rank)
                     task.print_perf_info(peer_rank)
-                if self._last_slice_counts > task.expected_transfers:
+                elif self._last_slice_counts > task.expected_transfers:
                     logger.error(
                         f"Session {self.unique_rid} has more than {task.expected_transfers} transfers"
                     )
