@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -243,10 +243,9 @@ class DeepEP(Communication):
             non_local_mask = (token_selected_slots < slot_start) | (
                 token_selected_slots >= slot_end
             )
-            if non_local_mask.any():
-                token_selected_slots = token_selected_slots.masked_fill(
-                    non_local_mask, self.invalid_token_expert_id
-                )
+            token_selected_slots = token_selected_slots.masked_fill(
+                non_local_mask, self.invalid_token_expert_id
+            )
 
         # Restore token_final_scales to original dtype for downstream consumers
         if (
