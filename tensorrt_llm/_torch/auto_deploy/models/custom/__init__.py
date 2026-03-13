@@ -2,6 +2,7 @@ from .modeling_cohere import CohereForCausalLM
 from .modeling_decilm import DeciLMForCausalLM
 from .modeling_deepseek import DeepSeekV3ForCausalLM
 from .modeling_deepseek_v2 import DeepSeekV2ForCausalLM
+from .modeling_exaone import ExaoneForCausalLM
 from .modeling_gemma import GemmaADForCausalLM
 from .modeling_gemma2 import Gemma2ForCausalLM
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
@@ -30,12 +31,13 @@ __all__ = (
     "DeciLMForCausalLM",
     "DeepSeekV2ForCausalLM",
     "DeepSeekV3ForCausalLM",
+    "ExaoneForCausalLM",
     "GemmaADForCausalLM",
     "Gemma2ForCausalLM",
     "Glm4MoeLiteForCausalLM",
     "GraniteForCausalLM",
-    "HunYuanDenseForCausalLM",
     "GraniteMoeHybridForCausalLM",
+    "HunYuanDenseForCausalLM",
     "HunYuanMoEForCausalLM",
     "KimiK2ForCausalLM",
     "KimiK25ForConditionalGeneration",
@@ -47,6 +49,10 @@ __all__ = (
     "NemotronFlashPreTrainedTokenizerFast",
     "NemotronHForCausalLM",
     "Olmo3ForCausalLM",
+    "Phi4ForCausalLM",
+    "Phi4FlashForCausalLM",
+    "Phi4MMForCausalLM",
+    "Phi4VisionRForConditionalGeneration",
     "Qwen2ForCausalLM",
     "Qwen3ForCausalLM",
     "Qwen3_5MoeForCausalLM",
