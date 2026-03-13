@@ -233,7 +233,13 @@ def _create_model_config(
 
 
 def _run_autotune_test(
-    run_forward_fn, ref_fused_moe, ref_output, backend_type, quant_algo, run_all_tactics=False
+    run_forward_fn,
+    ref_fused_moe,
+    ref_output,
+    backend_type,
+    quant_algo,
+    run_all_tactics=False,
+    use_flashinfer=False,
 ):
     """Run autotune phase and tactic replay test.
 
@@ -251,7 +257,9 @@ def _run_autotune_test(
         _ = run_forward_fn()
 
     # Check if we should run full tactic replay
-    if not run_all_tactics or not supports_autotuner_capture(backend_type, quant_algo):
+    if not run_all_tactics or not supports_autotuner_capture(
+        backend_type, quant_algo, use_flashinfer
+    ):
         # Simple accuracy check for unsupported backends or when run_all_tactics is False
         with torch.inference_mode():
             output = run_forward_fn()
@@ -599,10 +607,20 @@ def _test_moe_worker_impl(
             with torch.inference_mode():
                 ref_output = ref_fused_moe.forward(x, router_logits)
 
+            # flashinfer has no capture and replay mechanisms, so we skip test_all_kernels
+            use_flashinfer = getattr(fused_moe, "use_flashinfer", False)
+
             # Run tests
             if enable_autotune:
                 _setup_autotuner_for_test(mapping)
-                _run_autotune_test(run_forward, ref_fused_moe, ref_output, backend_type, quant_algo)
+                _run_autotune_test(
+                    run_forward,
+                    ref_fused_moe,
+                    ref_output,
+                    backend_type,
+                    quant_algo,
+                    use_flashinfer=use_flashinfer,
+                )
             else:
                 output = run_forward()
                 ref_fused_moe.check_accuracy(output, ref_output)
