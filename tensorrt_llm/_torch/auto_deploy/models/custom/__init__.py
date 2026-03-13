@@ -19,6 +19,7 @@ from .modeling_olmo3 import Olmo3ForCausalLM
 from .modeling_qwen2 import Qwen2ForCausalLM
 from .modeling_qwen3_5_moe import Qwen3_5MoeForCausalLM, Qwen3_5MoeForConditionalGeneration
 from .modeling_qwen3_moe import Qwen3MoeForCausalLM
+from .modeling_qwen3_next import Qwen3NextForCausalLM
 from .modeling_seed_oss import SeedOssForCausalLM
 from .modeling_skywork_r1v2 import SkyworkR1V2ForConditionalGeneration
 from .modeling_smollm3 import SmolLM3ForCausalLM
@@ -51,6 +52,7 @@ __all__ = (
     "Qwen3_5MoeForCausalLM",
     "Qwen3_5MoeForConditionalGeneration",
     "Qwen3MoeForCausalLM",
+    "Qwen3NextForCausalLM",
     "SeedOssForCausalLM",
     "SkyworkR1V2ForConditionalGeneration",
     "SmolLM3ForCausalLM",

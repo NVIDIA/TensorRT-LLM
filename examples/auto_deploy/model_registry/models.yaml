@@ -253,7 +253,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # --- Qwen3-Next (Sep 2025) ---
 - name: Qwen/Qwen3-Next-80B-A3B-Instruct
-  yaml_extra: ['qwen3Next.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_4.yaml', 'qwen3Next.yaml']
 # --- OLMo 3 (Nov 2025) ---
 - name: allenai/Olmo-3-7B-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_1.yaml']
