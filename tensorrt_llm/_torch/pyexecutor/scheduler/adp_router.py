@@ -8,6 +8,11 @@ Protocol:
     1. Each rank builds its local RankState
     2. All ranks exchange RankState via allgather
     3. ADPRouter.route_requests() distributes new requests
+
+Includes:
+    - DefaultADPRouter: load-balanced min-heap routing
+    - KVCacheAwareADPRouter: cache-aware routing that factors in
+      prefix match length from the KV cache radix tree
 """
 
 from __future__ import annotations
@@ -272,3 +277,168 @@ class DefaultADPRouter(ADPRouter):
             all_ranks_new_requests[rank].extend(reqs)
 
         return all_ranks_new_requests
+
+
+class KVCacheAwareADPRouter(ADPRouter):
+    """KV cache-aware request router for attention data parallelism.
+
+    Routes requests considering both load balance and KV cache prefix match
+    length on each rank. When a request's prefix is already cached on a rank,
+    that rank is preferred to avoid redundant prefill computation.
+
+    Scoring: score(rank, request) = effective_tokens + β * rank_active_tokens
+    where effective_tokens = input_tokens - prefix_match_length.
+    Lower score = better rank.
+
+    Requires a KV cache manager with enable_block_reuse=True and
+    probe_prefix_match_length() support (both v1 and v2 managers).
+    Falls back to load-based routing when no cache hits exist.
+    """
+
+    def __init__(self, dist: "Distributed", kv_cache_manager,
+                 load_balance_weight: float = 1.0):
+        super().__init__(dist)
+        self.kv_cache_manager = kv_cache_manager
+        self.load_balance_weight = load_balance_weight
+        self._all_ranks_prefix_matches: List[Dict[int, int]] = []
+
+    def create_rank_state(
+        self,
+        active_requests: list[LlmRequest],
+        new_requests: list[RequestQueueItem],
+    ) -> RankState:
+        if self.dist.has_cp_helix:
+            num_active_tokens = sum(req.total_input_len_cp for req in active_requests)
+        else:
+            num_active_tokens = sum(req.py_orig_prompt_len for req in active_requests)
+        return RankState(
+            rank=self.dist.tp_rank,
+            num_active_requests=len(active_requests),
+            num_active_tokens=num_active_tokens,
+        )
+
+    def gather_prefix_matches(
+        self,
+        new_requests: list[RequestQueueItem],
+    ) -> None:
+        """Probe local radix tree for each new request, allgather across ranks.
+
+        Populates self._all_ranks_prefix_matches for use by route_requests.
+        Must be called after new_requests are available and before route_requests.
+        """
+        local_matches: list[int] = []
+        for req_item in new_requests:
+            req = req_item.request
+            if req is None:
+                local_matches.extend([req_item.id, 0])
+                continue
+            input_tokens = getattr(req, 'input_token_ids', None) or []
+            probe_tokens = input_tokens[:-1] if len(input_tokens) > 1 else []
+            lora_config = getattr(req, 'lora_config', None)
+            lora_task_id = lora_config.task_id if lora_config is not None else None
+            match_len = self.kv_cache_manager.probe_prefix_match_length(
+                probe_tokens, lora_task_id
+            )
+            local_matches.extend([req_item.id, match_len])
+
+        all_data = self.dist.tp_allgather(local_matches)
+
+        self._all_ranks_prefix_matches = []
+        for rank_data in all_data:
+            matches: Dict[int, int] = {}
+            for i in range(0, len(rank_data), 2):
+                req_id = rank_data[i]
+                matches[req_id] = rank_data[i + 1]
+            self._all_ranks_prefix_matches.append(matches)
+
+    def route_requests(
+        self,
+        all_rank_states: list[RankState],
+        new_requests: list[RequestQueueItem],
+        max_num_active_requests: int,
+    ) -> Tuple[Dict[int, List[RequestQueueItem]], int]:
+        tp_size = len(all_rank_states)
+        all_ranks_new_requests: Dict[int, List[RequestQueueItem]] = {
+            s.rank: [] for s in all_rank_states
+        }
+        all_ranks_num_active_requests = [s.num_active_requests for s in all_rank_states]
+        all_ranks_num_active_tokens = [float(s.num_active_tokens) for s in all_rank_states]
+
+        def get_relax_value(req_item):
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is None:
+                return True
+            return scheduling_params.attention_dp_relax
+
+        sorted_requests = sorted(new_requests, key=get_relax_value)
+
+        remaining_unscheduled = []
+        for req_item in sorted_requests:
+            scheduled = False
+            scheduling_params = getattr(req_item.request, "py_scheduling_params", None)
+            if scheduling_params is not None:
+                target_dp_rank = scheduling_params.attention_dp_rank
+                if (
+                    target_dp_rank is not None
+                    and all_ranks_num_active_requests[target_dp_rank] < max_num_active_requests
+                ):
+                    all_ranks_num_active_requests[target_dp_rank] += 1
+                    scheduled = True
+                    all_ranks_new_requests[target_dp_rank].append(req_item)
+
+            if not scheduled:
+                remaining_unscheduled.append(req_item)
+
+        num_new_requests_all_ranks = len(remaining_unscheduled)
+        total_num_active_requests = sum(all_ranks_num_active_requests)
+        expected_num_active_requests = max(
+            (total_num_active_requests + num_new_requests_all_ranks + tp_size - 1) // tp_size,
+            max(all_ranks_num_active_requests),
+        )
+
+        remaining_unscheduled = sorted(
+            remaining_unscheduled,
+            key=lambda x: len(getattr(x.request, "input_token_ids", [])) if x.request else 0,
+            reverse=True,
+        )
+
+        eligible_ranks = [
+            rank for rank in range(tp_size)
+            if all_ranks_num_active_requests[rank] < expected_num_active_requests
+        ]
+
+        beta = self.load_balance_weight
+        prefix_matches = self._all_ranks_prefix_matches
+
+        for req_item in remaining_unscheduled:
+            if not eligible_ranks:
+                break
+
+            req_tokens = (
+                len(getattr(req_item.request, "input_token_ids", []))
+                if req_item.request else 0
+            )
+            req_id = req_item.id
+
+            best_rank = eligible_ranks[0]
+            best_score = float('inf')
+            for rank in eligible_ranks:
+                match_len = (prefix_matches[rank].get(req_id, 0)
+                             if rank < len(prefix_matches) else 0)
+                effective = req_tokens - match_len
+                score = effective + beta * all_ranks_num_active_tokens[rank]
+                if score < best_score:
+                    best_score = score
+                    best_rank = rank
+
+            all_ranks_new_requests[best_rank].append(req_item)
+            all_ranks_num_active_requests[best_rank] += 1
+
+            match_len = (prefix_matches[best_rank].get(req_id, 0)
+                         if best_rank < len(prefix_matches) else 0)
+            all_ranks_num_active_tokens[best_rank] += req_tokens - match_len
+
+            if all_ranks_num_active_requests[best_rank] >= expected_num_active_requests:
+                eligible_ranks.remove(best_rank)
+
+        return all_ranks_new_requests, expected_num_active_requests
