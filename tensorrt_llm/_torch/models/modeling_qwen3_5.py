@@ -601,8 +601,7 @@ class Qwen3_5LinearDecoderLayer(DecoderLayer):
                 hidden_states,
                 attn_metadata,
                 all_reduce_params=AllReduceParams(
-                    enable_allreduce=not (self.fusion_config.PRE_MOE_FUSION
-                                          or self.mapping.tp_size == 1)),
+                    enable_allreduce=not self.disable_attn_allreduce),
                 **kwargs)
         if self.fusion_config.PRE_MOE_FUSION:
             hidden_states, residual = self.allreduce(

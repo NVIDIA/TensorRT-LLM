@@ -81,9 +81,23 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
                                                  DecoderModelForCausalLM],
                               config: ModelConfig):
         super().init_model_and_config(model, config)
-        self._num_kv_heads = model.config.num_key_value_heads if hasattr(
-            model.config, 'num_key_value_heads'
-        ) and model.config.num_key_value_heads is not None else model.config.num_attention_heads
+        
+    @property
+    def _num_kv_heads(self) -> int:
+        config = self._model.config
+        if isinstance(config, Qwen3_5TextConfig):
+            num_kv_heads = getattr(config, "num_key_value_heads", None)
+            if num_kv_heads is None:
+                num_kv_heads = config.num_attention_heads
+        elif isinstance(config, Qwen3_5VisionConfig):
+            num_kv_heads = config.num_heads
+        else:
+            raise TypeError(
+                "Expected `Qwen3_5TextConfig` or `Qwen3_5VisionConfig`, "
+                f"got {type(config).__name__}"
+            )
+
+        return num_kv_heads
 
     def should_skip_module(self, module_name: str) -> bool:
         if module_name.startswith("draft_model"):
@@ -117,6 +131,12 @@ class Qwen3_5HfWeightMapper(HfWeightMapper):
 
     def preprocess_weights(self, weights: dict) -> dict:
         # To process the language_model part of qwen3_5
+        
+        # NOTE: A_log, dt_bias, conv1d, in_proj_qkv processed blow are all linear attention weights,
+        # for attention dp, we do not need to reorder these weights
+        if self.config.mapping.enable_attention_dp:
+            return weights
+            
         config = self.config.pretrained_config
         tp_size = self.config.mapping.tp_size
         tp_rank = self.config.mapping.tp_rank

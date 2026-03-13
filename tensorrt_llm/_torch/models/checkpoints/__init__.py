@@ -13,7 +13,7 @@ from .hf.qwen3_next_weight_mapper import Qwen3NextHfWeightMapper
 from .hf.qwen3vl_weight_mapper import Qwen3VLHfWeightMapper
 from .hf.qwen3vl_moe_weight_mapper import Qwen3VLMoeHfWeightMapper
 from .hf.qwen3_5_weight_mapper import Qwen3_5HfWeightMapper
-# from .hf.qwen3_5_moe_weight_mapper import Qwen3_5MoeHfWeightMapper
+from .hf.qwen3_5_moe_weight_mapper import Qwen3_5MoeHfWeightMapper
 from .hf.weight_loader import HfWeightLoader
 from .hf.weight_mapper import HfWeightMapper
 from .mistral.checkpoint_loader import (MistralCheckpointLoader,
@@ -31,5 +31,5 @@ __all__ = [
     "Qwen3NextHfWeightMapper", "LlavaNextHfWeightMapper",
     "MistralLarge3CheckpointLoader", "MistralLarge3WeightMapper",
     "Qwen3VLHfWeightMapper", "Qwen3VLMoeHfWeightMapper",
-    "Qwen3_5HfWeightMapper", # "Qwen3_5MoeHfWeightMapper",
+    "Qwen3_5HfWeightMapper", "Qwen3_5MoeHfWeightMapper",
 ]
