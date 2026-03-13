@@ -44,7 +44,6 @@ from ..interface import (
     TransformRegistry,
 )
 
-
 class InsertCachedAttentionConfig(TransformConfig):
     """Configuration for the insert cached attention transform."""
 
