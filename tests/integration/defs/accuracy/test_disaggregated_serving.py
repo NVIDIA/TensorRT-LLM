@@ -686,7 +686,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             True,  # BS=1 does not need overlap scheduling
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
+                "free_gpu_memory_fraction": 0.4,
                 "enable_block_reuse": True  # reuse on context requests
             },
             "max_num_tokens": 13393 * 2,
@@ -700,7 +700,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": not overlap_scheduler,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.5,
+                "free_gpu_memory_fraction": 0.4,
                 "enable_block_reuse": False
             },
             "max_num_tokens": 13393 * 2,
@@ -737,7 +737,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "backend": "DEFAULT"
             },
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4
+                "free_gpu_memory_fraction": 0.3
             },
         }
         gen_server_config = {
@@ -746,7 +746,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
                 "backend": "DEFAULT"
             },
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4
+                "free_gpu_memory_fraction": 0.3
             },
         }
         disaggregated_server_config = {
@@ -880,8 +880,12 @@ class TestLlama4ScoutInstruct(LlmapiAccuracyTestHarness):
         ctx_server_config["max_seq_len"] = 8192
         gen_server_config["max_seq_len"] = 8192
 
-        ctx_server_config["kv_cache_config"] = 0.6
-        gen_server_config["kv_cache_config"] = 0.6
+        ctx_server_config["kv_cache_config"] = {
+            "free_gpu_memory_fraction": 0.6,
+        }
+        gen_server_config["kv_cache_config"] = {
+            "free_gpu_memory_fraction": 0.6,
+        }
 
         disaggregated_server_config = {
             "hostname": "localhost",
