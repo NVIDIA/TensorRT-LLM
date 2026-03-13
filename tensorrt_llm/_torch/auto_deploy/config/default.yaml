@@ -55,6 +55,8 @@ transforms:
     run_shape_prop: true
   match_l2norm_pattern:
     stage: pattern_matcher
+  match_moe_routing_pattern:
+    stage: pattern_matcher
   ############################################################################################
   # RUN TRANSFORMATIONS ON STANDARDIZED GRAPH REPRESENTATION
   ############################################################################################
@@ -89,15 +91,20 @@ transforms:
   # proceeds normally.
   match_swiglu_pattern:
     stage: pattern_matcher
-    enabled: false
+    enabled: true
   match_nvfp4_swiglu_pattern:
     stage: pattern_matcher
     requires_shape_prop: true
-    enabled: false
+    enabled: true
+  match_finegrained_fp8_swiglu_pattern:
+    stage: pattern_matcher
+    requires_shape_prop: true
+    enabled: true
   quantize_fp8_moe:
     stage: pattern_matcher
   quantize_nvfp4_moe:
     stage: pattern_matcher
+    run_shape_prop: true
   quantize_mxfp4_moe:
     stage: pattern_matcher
   detect_hidden_states_for_capture:
@@ -156,6 +163,8 @@ transforms:
     enabled: true
   fuse_nvfp4_swiglu:
     stage: post_load_fusion
+  fuse_finegrained_fp8_swiglu:
+    stage: post_load_fusion
   fuse_finegrained_fp8_linear:
     stage: post_load_fusion
     backend: trtllm
@@ -185,6 +194,8 @@ transforms:
     rmsnorm_backend: flashinfer
     gated_rmsnorm_backend: triton
     requires_shape_prop: true
+  fuse_gdn_gating:
+    stage: post_load_fusion
   fuse_l2norm:
     stage: post_load_fusion
     backend: fla
@@ -247,6 +258,9 @@ transforms:
     stage: compile
     enabled: false
   multi_stream_mla_attn:
+    stage: compile
+    enabled: false
+  multi_stream_gemm:
     stage: compile
     enabled: false
   compile_model:

@@ -284,7 +284,7 @@ class Qwen3_5MoeTextRotaryEmbedding(nn.Module):
 # =============================================================================
 # Adapted from the Qwen3Next GDN patch:
 #   tensorrt_llm/_torch/auto_deploy/models/patches/qwen3_next.py
-# Uses autodeploy custom ops: torch_causal_conv1d, torch_l2norm, torch_gated_delta_rule
+# Uses autodeploy custom ops: torch_causal_conv1d, torch_gated_delta_rule
 
 
 class Qwen3_5MoeGatedDeltaNet(nn.Module):
@@ -333,11 +333,9 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
 
     def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
         batch_size, seq_len, _ = hidden_states.shape
-
         # 1. Projections (separate, unlike Qwen3Next which uses combined in_proj_qkvz)
         mixed_qkv = self.in_proj_qkv(hidden_states)  # [B, S, conv_dim]
         z = self.in_proj_z(hidden_states)  # [B, S, value_dim]
-        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]
         b = self.in_proj_b(hidden_states)  # [B, S, num_v_heads]
         a = self.in_proj_a(hidden_states)  # [B, S, num_v_heads]
 
@@ -367,33 +365,18 @@ class Qwen3_5MoeGatedDeltaNet(nn.Module):
         key = key.reshape(batch_size, seq_len, -1, self.head_k_dim)
         value = value.reshape(batch_size, seq_len, -1, self.head_v_dim)
 
-        # 3. L2 normalize Q and K via autodeploy op
-        query = torch.ops.auto_deploy.torch_l2norm(query)
-        key = torch.ops.auto_deploy.torch_l2norm(key)
+        # 3. Gated Delta Rule via autodeploy custom op
+        # L2 norm, GQA repeat-interleave, and g/beta computation are handled inside the op.
+        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(
+            query, key, value, a, b, self.A_log, self.dt_bias
+        )
 
-        # 4. Compute beta and gating
-        beta = b.sigmoid()  # [B, S, num_v_heads]
-        # If the model is loaded in fp16, without the .float() here, A might be -inf
-        g = -self.A_log.float().exp() * F.softplus(a.float() + self.dt_bias)  # [B, S, num_v_heads]
-
-        # Repeat-interleave Q, K if num_v_heads > num_k_heads (GQA for linear attention)
-        if self.num_v_heads // self.num_k_heads > 1:
-            query = query.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-            key = key.repeat_interleave(self.num_v_heads // self.num_k_heads, dim=2)
-
-        # 5. Gated Delta Rule via autodeploy custom op
-        # Op expects [B, S, H, D] layout (bsnd convention)
-        core_attn_out = torch.ops.auto_deploy.torch_gated_delta_rule(query, key, value, g, beta)
-
-        # 6. Gated RMSNorm
-        z_shape_og = z.shape
-        core_attn_out = core_attn_out.reshape(-1, core_attn_out.shape[-1])
-        z = z.reshape(-1, z.shape[-1])
+        # 5. Gated RMSNorm + merge heads
+        z = z.reshape(batch_size, seq_len, -1, self.head_v_dim)  # [B, S, num_v_heads, head_v_dim]
         core_attn_out = self.norm(core_attn_out, z)
-        core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.reshape(batch_size, seq_len, -1)
 
-        # 7. Output projection
+        # 6. Output projection
         output = self.out_proj(core_attn_out)
         return output
 
@@ -619,6 +602,12 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
         w2_weights = [self.experts[i].down_proj.weight for i in range(len(self.experts))]
         w3_weights = [self.experts[i].up_proj.weight for i in range(len(self.experts))]
 
+        # Shared expert with sigmoid gating
+        shared_expert_output = self.shared_expert(hidden_states_flat)
+        shared_expert_output = (
+            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
+        )
+
         expert_output = torch.ops.auto_deploy.torch_moe(
             hidden_states_flat,
             selected_experts,
@@ -629,11 +618,6 @@ class Qwen3_5MoeSparseMoeBlock(nn.Module):
             is_gated_mlp=True,
         )
 
-        # Shared expert with sigmoid gating
-        shared_expert_output = self.shared_expert(hidden_states_flat)
-        shared_expert_output = (
-            F.sigmoid(self.shared_expert_gate(hidden_states_flat)) * shared_expert_output
-        )
         expert_output = expert_output + shared_expert_output
 
         expert_output = expert_output.reshape(batch_size, sequence_length, hidden_dim)
@@ -1515,7 +1499,7 @@ class Qwen3_5MoeModel(nn.Module):
         Steps:
             1. Embed input_ids -> inputs_embeds
             2. Run vision tower on pixel_values -> masked_scatter into embeds
-            3. Compute mRoPE position_ids via get_rope_index
+            3. Compute mRoPE position_ids via get_rope_index (or use external ones)
             4. Compute (cos, sin) from rotary_emb
             5. Call language_model (TextModel) with (inputs_embeds, position_embeddings)
         """

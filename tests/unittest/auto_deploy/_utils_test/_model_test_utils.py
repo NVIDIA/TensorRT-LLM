@@ -465,8 +465,8 @@ _SMALL_MODEL_CONFIGS = {
         "model_kwargs": {
             "first_k_dense_replace": 1,
             "num_hidden_layers": 2,
-            "hidden_size": 32,
-            "intermediate_size": 64,
+            "hidden_size": 128,
+            "intermediate_size": 128,
             "kv_lora_rank": 512,  # NOTE: must be 512 (default) for flashinfer_mla to work
             "qk_rope_head_dim": 64,  # NOTE: must be 64 (default) for flashinfer_mla to work
             "moe_intermediate_size": 128,

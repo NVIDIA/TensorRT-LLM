@@ -56,6 +56,7 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
     seq_len = torch.ones(batch, device=device, dtype=torch.int32)
     cu_seqlen = torch.zeros(batch + 1, device=device, dtype=torch.int32)
     use_initial_states = torch.zeros(batch, device=device, dtype=torch.bool)
+    any_prefill_use_initial_states_host = torch.tensor([False], device=device, dtype=torch.bool)
 
     # Torch reference
     y_torch = torch.ops.auto_deploy.torch_cached_ssm(
@@ -93,6 +94,7 @@ def test_triton_generate_only_with_slot_mapping(mamba_env):
         cu_seqlen,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         # EXTRA METADATA
         None,  # chunk indices
         None,  # chunk offsets
@@ -141,6 +143,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
     seq_len = torch.tensor(lens, device=device, dtype=torch.int32)
     cu_seqlen = torch.tensor([0, lens[0]], device=device, dtype=torch.int32)
     use_initial_states = torch.tensor([0] * batch, device=device).to(torch.bool)
+    any_prefill_use_initial_states_host = torch.tensor([False], device=device, dtype=torch.bool)
     cu_seqlens = torch.cat(
         [
             torch.zeros(1, dtype=torch.int32, device=device),
@@ -190,6 +193,7 @@ def test_triton_context_flattened_and_state_writeback(mamba_env):
         cu_seqlens,
         slot_idx,
         use_initial_states,
+        any_prefill_use_initial_states_host,
         # EXTRA METADATA
         None,  # chunk indices
         None,  # chunk offsets

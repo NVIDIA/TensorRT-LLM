@@ -53,6 +53,7 @@ def fla_cached_delta_rule(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     #
     # CACHES
@@ -82,7 +83,8 @@ def fla_cached_delta_rule(
 
     if num_prefill > 0:
         initial_states = None
-        if torch.any(use_initial_states[:num_prefill]):
+        # Use precomputed host flag to avoid GPU->CPU sync from torch.any()
+        if any_prefill_use_initial_states_host.item():
             initial_states = torch.where(
                 use_initial_states[:num_prefill, None, None, None],
                 delta_cache[slot_idx[:num_prefill]],
@@ -138,6 +140,7 @@ def fla_cached_delta_rule_fake(
     cu_seqlen: torch.Tensor,
     slot_idx: torch.Tensor,
     use_initial_states: torch.Tensor,
+    any_prefill_use_initial_states_host: torch.Tensor,
     # EXTRA METADATA
     #
     # CACHES
@@ -169,7 +172,13 @@ class FlaDeltaBackend(AttentionDescriptor):
 
     @classmethod
     def get_standard_metadata_args(cls) -> List[str]:
-        return ["batch_info_host", "cu_seqlen", "slot_idx", "use_initial_states"]
+        return [
+            "batch_info_host",
+            "cu_seqlen",
+            "slot_idx",
+            "use_initial_states",
+            "any_prefill_use_initial_states_host",
+        ]
 
     @classmethod
     def get_cache_initializers(

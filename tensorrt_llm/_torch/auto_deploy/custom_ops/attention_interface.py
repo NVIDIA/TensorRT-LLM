@@ -431,6 +431,9 @@ class SequenceInfo:
       Total sequence length including cached tokens for each sequence (input_pos + seq_len).
     - use_initial_states: [bool_0, bool_1, ..., bool_{b-1}]
       Per-sequence boolean indicating whether initial states should be used (True if input_pos > 0).
+    - any_prefill_use_initial_states: [bool]
+      Scalar boolean indicating whether any prefill sequence needs initial states. Precomputed on
+      the host to avoid GPU->CPU sync from torch.any() on the device tensor per layer.
 
     ### OTHER ARGUMENTS USED BY THE RUNTIME ########################################################
     - extra_page_per_seq: [ep_0, ep_1, ..., ep_{b-1}]
@@ -527,6 +530,7 @@ class SequenceInfo:
             ("last_page_len", self.max_batch_size, torch.int),
             ("slot_idx", self.max_batch_size, torch.long),
             ### INFO OBJECTS THAT ARE AVAILABLE TO DESCRIBE THE INPUTS IN A MORE COMPACT WAY #######
+            ("any_prefill_use_initial_states", 1, torch.bool),
             ("batch_info", 3, torch.int),
             ("max_seq_info", 4, torch.int),
             ### ADDITIONAL ARGUMENTS AVAILABLE THAT ARE DERIVED FROM THE BASIC ARGUMENTS ###########
@@ -1036,6 +1040,17 @@ class SequenceInfo:
         if self._is_required("use_initial_states"):
             use_initial_states = ip_host > 0
             self._stage_arg("use_initial_states", use_initial_states)
+
+        # precompute any(use_initial_states[:num_prefill]) on the host to avoid
+        # per-layer GPU->CPU sync from torch.any() inside cached ops
+        if self._is_required("any_prefill_use_initial_states"):
+            bi_host = self.get_arg("batch_info_host")
+            num_prefill = bi_host[0].item()
+            uis = self.get_arg("use_initial_states_host", truncate=True)
+            self._stage_arg(
+                "any_prefill_use_initial_states",
+                [bool(uis[:num_prefill].any())],
+            )
 
         ### UPDATE LOGITS GATHERING METADATA using heuristic if not provided #######################
         # default is to gather all logits

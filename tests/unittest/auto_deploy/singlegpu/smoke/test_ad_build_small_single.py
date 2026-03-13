@@ -7,6 +7,9 @@ from build_and_run_ad import ExperimentConfig, main
 from tensorrt_llm._torch.auto_deploy.llm_args import LlmArgs, _ParallelConfig
 from tensorrt_llm._torch.auto_deploy.shim.ad_executor import ADEngine
 
+# When a run uses FP8 block scaling GEMM on a GPU that doesn't support it, skip only that run.
+_FP8_BLOCK_SCALING_GEMM_ERR = "Unsupported SM version for FP8 block scaling GEMM"
+
 
 def _check_ad_config(experiment_config: ExperimentConfig, llm_args: LlmArgs):
     # Verify that llm_args was captured
@@ -219,7 +222,15 @@ def test_build_ad(model_hub_id: str, llm_extra_args: dict):
     ADEngine.build_from_config = check_and_original_build
 
     try:
-        main(experiment_config)
+        try:
+            main(experiment_config)
+        except RuntimeError as e:
+            if _FP8_BLOCK_SCALING_GEMM_ERR in str(e):
+                pytest.skip(
+                    "This run uses FP8 block scaling GEMM, which requires SM 89 (Ada), "
+                    "90 (Hopper), 100/103 (Blackwell), or 120 (RTX 6000)"
+                )
+            raise
     finally:
         # Restore original build_from_config
         ADEngine.build_from_config = original_build_from_config

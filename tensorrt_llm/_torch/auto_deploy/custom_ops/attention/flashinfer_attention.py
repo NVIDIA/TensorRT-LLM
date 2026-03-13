@@ -119,7 +119,7 @@ class _FlashInferPlanner:
 
         # NOTE (lucaslie): avoid OOM for many cudagraphs,
         # see https://github.com/NVIDIA/TensorRT-LLM/pull/3686
-        self.workspace_buffer = torch.empty(320 * 1024 * 1024, device=device, dtype=torch.uint8)
+        self.workspace_buffer = torch.empty(1024 * 1024 * 1024, device=device, dtype=torch.uint8)
 
         # NOTE (lucaslie): flashinfer fa3 backend has accuracy issue + illegal memory access issues
         # on H100 PCIe, see https://github.com/NVIDIA/TensorRT-LLM/issues/4504

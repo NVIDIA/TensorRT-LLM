@@ -291,7 +291,7 @@ def ref_gdn_forward(module, hidden_states):
 
     Uses module.conv1d directly (nn.Conv1d forward) instead of torch_causal_conv1d,
     and ref_chunk_gated_delta_rule (with internal l2norm) instead of
-    torch_l2norm + torch_gated_delta_rule.
+    torch_gated_delta_rule (which handles l2norm, GQA expand, and gating internally).
     """
     batch_size, seq_len, _ = hidden_states.shape
 
