@@ -139,6 +139,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         self,
         request: LlmRequest,
         next_draft_tokens: list[list[int]],
+        runtime_draft_len: Optional[int],
     ) -> None:
         """Common handling for both context and generation requests."""
         assert not request.py_return_context_logits, (
@@ -150,7 +151,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         assert not request.py_return_log_probs, (
             "return_log_probs not implemented for speculative sampler"
         )
-        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot]
+        request.py_draft_tokens = next_draft_tokens[request.py_seq_slot][:runtime_draft_len]
         request.py_decoding_iter += 1
 
     def update_requests(
@@ -173,7 +174,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         new_tokens_lens_list = state.host.new_tokens_lens.tolist()
         next_draft_tokens_list = state.host.next_draft_tokens.tolist()
         beam_idx = DEFAULT_BEAM_IDX
-
+        runtime_draft_len = getattr(state, "runtime_draft_len", self.draft_len)
         # Handle context requests (prefill phase)
         for req in state.scheduled_requests.context_requests:
             if (
@@ -185,7 +186,7 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             TorchSampler._handle_stop_criteria(
                 req, new_token, max_seq_len=self.max_seq_len, beam_idx=beam_idx
             )
-            self._request_common_handling(req, next_draft_tokens_list)
+            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
         # Handle generation requests (decode phase)
         for req in state.scheduled_requests.generation_requests:
@@ -199,8 +200,8 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
                 ):
                     break
             req.py_num_accepted_draft_tokens = num_new_tokens - 1
-            req.py_rewind_len = self.draft_len - req.py_num_accepted_draft_tokens
-            self._request_common_handling(req, next_draft_tokens_list)
+            req.py_rewind_len = runtime_draft_len - req.py_num_accepted_draft_tokens
+            self._request_common_handling(req, next_draft_tokens_list, runtime_draft_len)
 
     def sample_async(
         self,
@@ -232,6 +233,21 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
         o_new_tokens_lens = outputs["new_tokens_lens"][: len(requests)]
         o_next_draft_tokens = outputs["next_draft_tokens"][: len(requests)]
         o_next_new_tokens = outputs["next_new_tokens"][: len(requests)]
+        runtime_draft_len = o_next_draft_tokens.shape[1]
+
+        # Pad to match fixed-size store buffers for index_copy_.
+        if o_new_tokens.shape[1] < (self.draft_len + 1):
+            o_new_tokens = torch.nn.functional.pad(
+                o_new_tokens, (0, (self.draft_len + 1) - o_new_tokens.shape[1])
+            )
+        if o_next_draft_tokens.shape[1] < self.draft_len:
+            o_next_draft_tokens = torch.nn.functional.pad(
+                o_next_draft_tokens, (0, self.draft_len - o_next_draft_tokens.shape[1])
+            )
+        if o_next_new_tokens.shape[1] < (self.draft_len + 1):
+            o_next_new_tokens = torch.nn.functional.pad(
+                o_next_new_tokens, (0, (self.draft_len + 1) - o_next_new_tokens.shape[1])
+            )
 
         # Use index_copy_ for efficient copying (slots are unique)
         self.store.new_tokens.squeeze(-1).T.index_copy_(0, slots, o_new_tokens)
@@ -263,4 +279,5 @@ class SpecSamplerBase(Sampler[SampleStateSpec], AsyncWorkerMixin):
             device=device_tensors,
             host=host_tensors,
             sampler_event=sampler_event,
+            runtime_draft_len=runtime_draft_len,
         )
