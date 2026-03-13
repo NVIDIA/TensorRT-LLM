@@ -49,10 +49,14 @@ class ADInputProcessor(DefaultInputProcessor):
             # Normalize message content to list-of-dicts format for multimodal
             # processors (e.g., Llama4) that expect {"type": "text", "text": "..."}
             # instead of plain strings when tokenize=True.
+            # Only apply for multimodal processors that need it; text-only models
+            # (e.g., GPT-OSS) have chat templates that expect plain string content.
             messages = inputs["messages"]
-            for msg in messages:
-                if isinstance(msg.get("content"), str):
-                    msg["content"] = [{"type": "text", "text": msg["content"]}]
+            is_multimodal = hasattr(self.processor, "image_processor")
+            if is_multimodal:
+                for msg in messages:
+                    if isinstance(msg.get("content"), str):
+                        msg["content"] = [{"type": "text", "text": msg["content"]}]
 
             # TODO: we don't really need this but it makes for a good sanity check. Consider
             # removing this in the future if we need to speed things up.

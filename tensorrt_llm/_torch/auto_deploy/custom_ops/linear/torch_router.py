@@ -59,5 +59,5 @@ def _torch_moe_router_fake(
     else:  # dim = 2
         T, H = hidden_states.shape
     E = weight.shape[0]
-    scores = torch.empty((T, E), device="meta", dtype=hidden_states.dtype)
+    scores = torch.empty((T, E), device=hidden_states.device, dtype=hidden_states.dtype)
     return scores

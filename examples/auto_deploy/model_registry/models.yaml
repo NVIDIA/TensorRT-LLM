@@ -103,8 +103,6 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: nvidia/Mistral-NeMo-Minitron-8B-Base
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
-- name: openai/gpt-oss-20b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: ibm-granite/granite-3.0-8b-instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_2.yaml']
 - name: mistralai/Ministral-8B-Instruct-2410
@@ -197,8 +195,10 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 - name: meta-llama/Llama-3.2-90B-Vision-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml']
+- name: openai/gpt-oss-20b
+  yaml_extra: ['gpt_oss.yaml', 'world_size_4.yaml']
 - name: openai/gpt-oss-120b
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
+  yaml_extra: ['gpt_oss.yaml', 'world_size_8.yaml', 'num_hidden_layers_5.yaml']
 - name: meta-llama/Llama-4-Scout-17B-16E-Instruct
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'multimodal.yaml', 'llama4_scout.yaml']
 - name: meta-llama/Llama-4-Maverick-17B-128E-Instruct

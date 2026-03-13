@@ -1,0 +1,17 @@
+# Configuration for GPT-OSS models
+# Uses torch attention backend because attention sinks are only supported
+# by torch_attention, not flashinfer or trtllm backends.
+# Uses torch-simple compile backend because torch_backend_attention uses
+# .item() calls that are incompatible with CUDA graph capture.
+attn_backend: torch
+compile_backend: torch-simple
+# Simple shard + BMM sharding: simple_shard handles attention weights
+# (including sinks parameter), BMM sharding handles the vectorized expert
+# computation by slicing along the expert/batch dimension with all_gather.
+# TODO: Not optimal performance-wise (all_gather), but provides functional
+# multi-GPU support. Consider adding proper EP support when torch_moe
+# supports the custom activation and biases used by GPT-OSS.
+transforms:
+  detect_sharding:
+    simple_shard_only: true
+    sharding_dims: ['bmm']
