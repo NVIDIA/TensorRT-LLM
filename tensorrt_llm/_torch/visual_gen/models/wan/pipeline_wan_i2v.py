@@ -359,7 +359,7 @@ class WanImageToVideoPipeline(BasePipeline):
                 num_frames=num_frames,
                 num_inference_steps=steps,
                 guidance_scale=5.0,
-                seed=0,
+                seed=42,
                 max_sequence_length=512,
             )
 

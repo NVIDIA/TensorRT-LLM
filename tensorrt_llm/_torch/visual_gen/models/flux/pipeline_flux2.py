@@ -187,7 +187,7 @@ class Flux2Pipeline(BasePipeline):
                 width=width,
                 num_inference_steps=steps,
                 guidance_scale=3.5,
-                seed=0,
+                seed=42,
                 max_sequence_length=512,
             )
 
