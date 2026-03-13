@@ -869,7 +869,7 @@ def collectTestResults(pipeline, testFilter)
                 }
             }
 
-            junit(testResults: '**/results*.xml', allowEmptyResults : true)
+            junit(testResults: '**/results*.xml', allowEmptyResults: true, stdioRetention: 'NONE')
         } // Collect test result stage
         stage("Collect Perf Sanity Test Result") {
             def yamlFiles = sh(
