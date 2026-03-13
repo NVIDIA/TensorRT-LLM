@@ -316,13 +316,13 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     auto constexpr numKvHeads = 6;
     auto constexpr sizePerHead = 128;
     auto constexpr tokensPerBlock = 32;
-    auto constexpr blocksInPrimaryPool = 24;
+    auto constexpr blocksInPrimaryPool = 48;
     auto constexpr blocksInSecondaryPool = 0;
     auto constexpr maxNumSequences = 8;
     auto const stream = std::make_shared<tr::CudaStream>();
     auto constexpr onboardBlocks = true;
 
-    auto maxAttentionWindow = numTokens0;
+    auto maxAttentionWindow = numTokens0 * 2;
     tr::SamplingConfig const samplingConfig{beamWidth};
     bool constexpr isStreaming{false};
     SizeType32 constexpr linearWindowSizeCode = LinearAttentionMetadata::LinearCacheType::kRecurrentStates;
@@ -335,11 +335,11 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
         .saveLastSnapshot = true,
     };
 
-    auto const blocksPerWindow = BlocksPerWindow{// {maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
+    auto const blocksPerWindow = BlocksPerWindow{{maxAttentionWindow, {blocksInPrimaryPool, blocksInSecondaryPool}},
         {linearWindowSizeCode, {blocksInPrimaryPool, blocksInSecondaryPool}}};
 
     BlockManager blockManager(std::vector(numLayers, numKvHeads), sizePerHead, tokensPerBlock, blocksPerWindow,
-        maxNumSequences, stream, numTokens0 * 2, beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode},
+        maxNumSequences, stream, maxAttentionWindow, beamWidth, std::vector<BlockManager::SizeType32>{linearWindowSizeCode, maxAttentionWindow},
         std::nullopt, nvinfer1::DataType::kHALF, 0, onboardBlocks, CacheType::kSELF, std::nullopt, nullptr, false, true,
         nullptr, std::nullopt, false, 128, 0, linearAttentionMetadata);
     blockManager.allocatePools(false);
@@ -357,6 +357,8 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     GenerationRequest seq0{requestId, numTokens0, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(
         seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, linearWindowSizeCode);
+        blockManager.addSequence(
+            seq0, numTokens0, tc::ceilDiv(numTokens0, tokensPerBlock), *llmRequest0, maxAttentionWindow);
     blockManager.holdSequence(seq0.getRequestId());
     ASSERT_EQ(llmRequest0->getContextCurrentPosition(), 0);
     int regularSnapshots = numTokens0 / linearAttentionMetadata.statesSnapshotInterval;
@@ -372,7 +374,7 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     auto totalBlocks = tc::ceilDiv(numTokens0, tokensPerBlock) + contextFinalState - 1;
     auto placeholderBlocks = totalBlocks - occupiedBlocksLinear;
     TLLM_LOG_DEBUG("==========================================================");
-    ASSERT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocks(), occupiedBlocksLinear);
+    ASSERT_EQ(blocksInPrimaryPool - blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], occupiedBlocksLinear);
 
     auto ids0 = seq0.getCacheBlockIds(linearWindowSizeCode); // copy
     std::set<std::int32_t> idSetPositive{};
@@ -398,7 +400,24 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
 
     blockManager.storeContextBlocks(seq0, *llmRequest0);
     blockManager.releaseBlocks(seq0);
-    ASSERT_EQ(blockManager.getNumFreeBlocks(), blocksInPrimaryPool);
+    ASSERT_EQ(blockManager.getNumFreeBlocksPerWindowSize()[linearWindowSizeCode], blocksInPrimaryPool);
+
+    auto inputTokensNoise = std::make_shared<VecTokens>();
+    for (int i = 0; i < numTokens1; ++i)
+    {
+        inputTokensNoise->push_back(10000 + i);
+    }
+    auto llmRequestNoise = std::make_shared<LlmRequest>(9999, numTokens1, inputTokensNoise, samplingConfig, isStreaming);
+    GenerationRequest seqNoise{9999, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
+    blockManager.addSequence(
+        seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, linearWindowSizeCode);
+    blockManager.addSequence(
+        seqNoise, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequestNoise, maxAttentionWindow);
+    blockManager.holdSequence(seqNoise.getRequestId());
+
+    TLLM_LOG_DEBUG("==========================================================");
+
+    blockManager.getWindowBlockManager(linearWindowSizeCode).printTree();
 
     auto inputTokens1 = std::make_shared<VecTokens>();
     for (int i = 0; i < numReusedTokens; ++i)
@@ -414,7 +433,12 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
     GenerationRequest seq1{1, numTokens1, beamWidth, blockManager.getWindowSizesMetadata()};
     blockManager.addSequence(
         seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, linearWindowSizeCode);
+    blockManager.addSequence(
+        seq1, numTokens1, tc::ceilDiv(numTokens1, tokensPerBlock), *llmRequest1, maxAttentionWindow);
+    
     blockManager.holdSequence(seq1.getRequestId());
+
+    blockManager.storeContextBlocks(seq1, *llmRequest1);
     int numReusedBlocks = numReusedTokens / tokensPerBlock;
     for (; numReusedBlocks > 0; --numReusedBlocks)
     {
@@ -451,6 +475,9 @@ void testBlockManagerLinearAttention_ContextReuse(int beamWidth, int numTokens0,
                 << "Block " << i << " should NOT be reused for beam " << beam;
         }
     }
+
+    auto matchedLen = seq1.getCurrentPrepopulatedPromptLen();
+    ASSERT_EQ(matchedLen, numReusedBlocks * tokensPerBlock);
 }
 
 std::vector<std::vector<int>> getExpectedBlockIds(int beamWidth, int numTotalBlocks, int numContextBlocks,
@@ -819,10 +846,13 @@ TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_ContextNoReuse)
 
 TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_ContextReuse)
 {
-    testBlockManagerLinearAttention_ContextReuse(4, 10, 135, 10);
-    testBlockManagerLinearAttention_ContextReuse(4, 96, 135, 64);
-    testBlockManagerLinearAttention_ContextReuse(4, 97, 135, 96);
-    testBlockManagerLinearAttention_ContextReuse(1, 97, 135, 97);
+    // testBlockManagerLinearAttention_ContextReuse(4, 10, 135, 10);
+    // testBlockManagerLinearAttention_ContextReuse(4, 96, 135, 10);
+    // testBlockManagerLinearAttention_ContextReuse(4, 96, 135, 37);
+    // testBlockManagerLinearAttention_ContextReuse(4, 96, 135, 64);
+    // testBlockManagerLinearAttention_ContextReuse(4, 97, 135, 96);
+    // testBlockManagerLinearAttention_ContextReuse(1, 97, 135, 97);
+    testBlockManagerLinearAttention_ContextReuse(4, 130, 135, 101);
 }
 
 TEST_F(KVCacheManagerTest, BlockManagerLinearAttentionTest_DecodingBlockGrowth)

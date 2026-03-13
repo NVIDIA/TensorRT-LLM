@@ -345,9 +345,10 @@ def create_moe(
         dtype = pretrained_config.torch_dtype
 
     moe_cls = get_moe_cls(model_config, override_quant_config)
+    print(f"moe_cls: {moe_cls}")
 
     enable_configurable_moe = os.environ.get("ENABLE_CONFIGURABLE_MOE",
-                                             "1") == "1"
+                                             "0") == "1"
     if enable_configurable_moe or moe_cls == CuteDslFusedMoE:
         if moe_cls in (DeepGemmFusedMoE, TRTLLMGenFusedMoE, CuteDslFusedMoE,
                        CutlassFusedMoE):

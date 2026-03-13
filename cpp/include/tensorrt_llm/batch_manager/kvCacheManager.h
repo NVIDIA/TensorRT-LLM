@@ -40,8 +40,11 @@
 #include <limits>
 #include <list>
 #include <memory>
+#include <mutex>
 #include <optional>
+#include <ostream>
 #include <set>
+#include <string>
 #include <unordered_map>
 #include <utility>
 #include <vector>
@@ -400,6 +403,10 @@ public:
     static BlockPtr createPlaceholder(IdType blockId, SizeType32 windowSize);
 
     void detachDescendantsFromLookupTree();
+    //! \brief Detach all placeholder blocks in the previous-block chain from the lookup tree.
+    //! \details Walks upward via getPrevBlock() and calls detachFromLookupNode() on each
+    //! block that is a placeholder. Stops at the root (kCachedBlocksRootId).
+    void detachPreviousPlaceholdersFromLookupTree() const;
     void freeBlockAndAllDescendants();
 
     //! \brief Find block matching blockKey. If allowPartial is true, the returned block may match only a prefix of
@@ -488,6 +495,20 @@ private:
     // Hash for the event manager
     size_t mHash;
 };
+
+//! \brief Stream block id for trie printTree (e.g. Node prints mValue as block ids).
+inline std::ostream& operator<<(std::ostream& out, BlockPtr const& block)
+{
+    if (block)
+    {
+        out << block->getBlockId();
+    }
+    else
+    {
+        out << "null";
+    }
+    return out;
+}
 
 class KVCacheBlockSet
 {
@@ -1085,6 +1106,12 @@ public:
         mCachedBlocksRoot->setAsRoot(mLookupTree->getRoot(), mWindowSize);
     }
 
+    void printTree() const
+    {
+        std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
+        mLookupTree->printTree();
+    }
+
 private:
     bool tryAllocatePlaceholderForLinearAttention(GenerationRequest& sequence, bool shareAmongBeams);
 
@@ -1126,6 +1153,7 @@ private:
         return mLinearAttentionMetadata.has_value()
             && LinearAttentionMetadata::hasRecurrentStatesCache(mLinearAttentionMetadata->cacheType);
     }
+
 
 private:
     nvinfer1::DataType mDataType;
@@ -1553,6 +1581,11 @@ public:
     //! \brief Perform per-request bookkeeping
     void refreshBlocks();
 
+    [[nodiscard]] WindowBlockManager& getWindowBlockManager(SizeType32 windowSize)
+    {
+        return mWindowBlockManagers.at(windowSize);
+    }
+
     [[nodiscard]] runtime::BufferManager const& getBufferManager(SizeType32 windowSize) const
     {
         return mWindowBlockManagers.at(windowSize).getBufferManager();
@@ -1863,7 +1896,14 @@ public:
         bool isCrossAttention, SizeType32 kvFactor)
     {
         auto const nkvh = modelConfig.getNumKvHeadsForGivenLayers(windowSizeLayers, isCrossAttention);
+        std::stringstream ss;
+        for (auto const& n : nkvh)
+        {
+            ss << n << " ";
+        }
+        TLLM_LOG_DEBUG("[calculateCacheSizePerTokenForSingleWindowSize] nkvh: %s", ss.str().c_str());
         auto const sumLocalHeads = std::reduce(nkvh.cbegin(), nkvh.cend());
+        TLLM_LOG_DEBUG("[calculateCacheSizePerTokenForSingleWindowSize] sumLocalHeads: %d, kvFactor: %d, sizePerHead: %d", sumLocalHeads, kvFactor, modelConfig.getSizePerHead());
         // NOTE: We expect the initialization of modelConfig to have already taken the tp size into account and do not
         // address it here
         // consider only local layers for the calculation

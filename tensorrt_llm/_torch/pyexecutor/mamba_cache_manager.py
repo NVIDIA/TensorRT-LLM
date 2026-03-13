@@ -729,6 +729,18 @@ class MambaHybridCacheManagerV1(KVCacheManager, MambaCacheManager):
                                               num_accepted_tokens)
 
 
+def calc_context_stop_positions(prompt_len: int, tokens_per_block: int, mamba_prefix_cache_step: int, save_last_snapshot: bool = False) -> list[int]:
+    stop_positions = range(0, prompt_len, mamba_prefix_cache_step)
+    stop_positions = list(stop_positions)
+    last_ckpt = prompt_len // tokens_per_block * tokens_per_block
+    if save_last_snapshot and (last_ckpt not in stop_positions):
+        stop_positions.append(last_ckpt)
+    if prompt_len not in stop_positions:
+        stop_positions.append(prompt_len)
+    return stop_positions
+
+
+
 class LinearHybridCacheManager(KVCacheManager):
 
     def __init__(
@@ -767,7 +779,6 @@ class LinearHybridCacheManager(KVCacheManager):
         indexer_k_cache_quant_block_size: int = 128,
         indexer_k_cache_index_head_dim: int = 0,
         is_estimating_kv_cache: bool = False,
-        snapshot_interval: int = 128,
         **kwargs,
     ) -> None:
         # Derive ssm_state_shape and conv_state_shape from mamba params (same as MambaCacheManager)
@@ -787,13 +798,18 @@ class LinearHybridCacheManager(KVCacheManager):
         self.conv_count = reduce(lambda x, y: x * y, self.conv_state_shape)
         self.ssm_bytes = self.ssm_count * self.ssm_state_dtype.itemsize
         self.conv_bytes = self.conv_count * self.conv_state_dtype.itemsize
+
+        self.use_fake_pool = os.getenv("USE_FAKE_POOL", "0") == "1"
+
+        print(f"conv_state_shape: {self.conv_state_shape}, ssm_state_shape: {self.ssm_state_shape}, conv_bytes: {self.conv_bytes}, ssm_bytes: {self.ssm_bytes}")
         self.linear_attention_metadata = LinearAttentionMetadata()
-        # TODO(xiweny): is this needed?
+        # TODO(xiweny): confirm if this is needed
         # self.linear_attention_metadata.linear_layer_indices = [0, 1]
         self.linear_attention_metadata.cache_type = LinearCacheType.RECURRENT_STATES.value
-        self.linear_attention_metadata.all_recurrent_states_bytes = self.ssm_bytes + self.conv_bytes
+        self.linear_attention_metadata.all_recurrent_states_bytes = 1 if self.use_fake_pool else (self.ssm_bytes + self.conv_bytes)
         self.linear_attention_metadata.input_features_bytes_per_token = 0
-        self.linear_attention_metadata.states_snapshot_interval = snapshot_interval
+        self.linear_attention_metadata.states_snapshot_interval = kv_cache_config.mamba_prefix_cache_step
+        # self.linear_attention_metadata.save_last_snapshot = True
 
         if kv_cache_config.enable_partial_reuse:
             logger.warning(
@@ -855,6 +871,15 @@ class LinearHybridCacheManager(KVCacheManager):
         self._cuda_state_indices = torch.zeros([self.max_batch_size],
                                                dtype=torch.int32,
                                                device="cuda")
+        self.kv_cache_config = kv_cache_config
+        if self.use_fake_pool:
+            self.fake_state_indices = torch.arange(self.max_batch_size, dtype=torch.int32, device="cuda")
+            block_num = 128
+            self.fake_ssm_states = torch.empty([self.num_linear_layers, block_num, *self.ssm_state_shape], dtype=self.ssm_state_dtype, device="cuda")
+            self.fake_conv_states = torch.empty([self.num_linear_layers, block_num, *self.conv_state_shape], dtype=self.conv_state_dtype, device="cuda")
+
+        pool = self.impl.get_recurrent_states_pool()
+        print(f"address range of linear pool: {hex(pool.data_ptr())} to {hex(pool.data_ptr() + pool.numel() * pool.itemsize)}")
 
     def add_dummy_requests(
         self,
@@ -886,6 +911,10 @@ class LinearHybridCacheManager(KVCacheManager):
                                               num_extra_decoding_steps,
                                               draft_kv_cache_manager)
         self.requests.extend(requests)
+        if self.use_fake_pool:
+            self._setup_fake_states()
+        else:
+            self._setup_state_indices()
         return requests
 
     def prepare_resources(self, scheduled_batch: ScheduledRequests):
@@ -894,7 +923,18 @@ class LinearHybridCacheManager(KVCacheManager):
         self.requests = scheduled_batch.context_requests + \
             scheduled_batch.generation_requests
         super().prepare_resources(scheduled_batch)
-        self._setup_state_indices()
+        if self.kv_cache_config.enable_block_reuse:
+            for req in scheduled_batch.context_requests:
+                req.context_chunk_size = self.calc_next_context_chunk_size(req)
+                # print(f"context_chunk_size for request {req.py_request_id}: {req.context_chunk_size}")
+        for req in self.requests:
+            self.impl.copy_linear_attention_block(req)
+        self.impl.refresh_blocks()
+        
+        if self.use_fake_pool:
+            self._setup_fake_states()
+        else:
+            self._setup_state_indices()
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
         # print(f"free_resources for request {request.py_request_id}")
@@ -907,13 +947,18 @@ class LinearHybridCacheManager(KVCacheManager):
         # return torch.tensor([req.py_request_id for req in self.requests], dtype=torch.int32, device="cuda")
         block_indices = []
         for req in self.requests:
-            next_step = req.get_num_tokens(0) if req.is_context_finished else (
-                req.context_current_position - 1 + req.context_chunk_size)
+            if req.is_context_finished:
+                next_step = req.get_num_tokens(0) - 1 # already called add_token so get_num_tokens = 1 + tokens we have.
+            elif self.kv_cache_config.enable_block_reuse:
+                next_step = (req.context_current_position - 1 + req.context_chunk_size)
+            else:
+                next_step = req.prompt_len - 1
             # print(f"next_step for request {req.py_request_id}: {next_step}")
             block_indices.append(next_step // self.tokens_per_block)
-            block_ids = self.get_cache_indices(
-                req, LinearCacheType.RECURRENT_STATES.value)
+            # block_ids = self.get_cache_indices(
+            #     req, LinearCacheType.RECURRENT_STATES.value)
             # print(f"block_ids for request {req.py_request_id}: {block_ids}")
+            # print(f"request {req.py_request_id}, next_step={next_step}, block_index={next_step // self.tokens_per_block} block_ids: {block_ids}")
         self.impl.copy_batch_block_offsets(
             self.host_block_offsets,
             [req.py_request_id for req in self.requests], 1, 0)
@@ -927,19 +972,87 @@ class LinearHybridCacheManager(KVCacheManager):
                 f"value: {value} at index {i}is not in the range of [0, {self.blocks_per_window[LinearCacheType.RECURRENT_STATES.value][0] * self.num_linear_layers}).\nself.host_linear_block_offsets[self.recurrent_states_pool_index, :, 0, 0]: {self.host_block_offsets[self.recurrent_states_pool_index, :, 0, 0]}"
             host_linear_block_offsets[i] = value // self.num_linear_layers
         # print(f"block_indices: {block_indices}")
-        # print(f"self.host_linear_block_offsets: {self.host_linear_block_offsets[0, :len(block_indices), 0, :12]}")
+        # print(f"self.host_block_offsets: {self.host_block_offsets[self.recurrent_states_pool_index, :len(block_indices), 0, :20]}")
         # print(f"host_linear_block_offsets: {host_linear_block_offsets}")
+
+        # torch.fill_(self._cuda_state_indices, 0)
         self._cuda_state_indices[:len(self.requests
                                       )] = host_linear_block_offsets.cuda()
+        self._host_state_indices = host_linear_block_offsets.clone()
+
+
+    def _setup_fake_states(self):
+        block_indices = []
+        self.next_block_id = []
+        for req in self.requests:
+            if req.is_context_finished:
+                next_step = req.get_num_tokens(0) - 1 # already called add_token so get_num_tokens = 1 + tokens we have.
+                current_step = next_step - 1
+            elif self.kv_cache_config.enable_block_reuse:
+                next_step = (req.context_current_position - 1 + req.context_chunk_size)
+                current_step = req.context_current_position - 1
+            else:
+                next_step = req.prompt_len - 1
+                current_step = req.context_current_position - 1
+            block_ids = self.get_cache_indices(req, LinearCacheType.RECURRENT_STATES.value)
+            current_block_id = block_ids[current_step // self.tokens_per_block]
+            next_block_id = block_ids[next_step // self.tokens_per_block]
+            self.next_block_id.append(next_block_id)
+            print(f"current_block_id: {current_block_id}, next_block_id: {next_block_id}")
+            if current_block_id != next_block_id and not req.is_context_finished:
+                print(f"fake copy states: {current_block_id} to {next_block_id}")
+                ssm_states, conv_states = self._get_fake_states(current_block_id)
+                next_ssm_states, next_conv_states = self._get_fake_states(next_block_id)
+                next_ssm_states.copy_(ssm_states)
+                next_conv_states.copy_(conv_states)
+
+        self.fake_state_indices[:len(self.requests)] = torch.tensor(self.next_block_id, dtype=torch.int32, device="cuda")
+
+    def _get_fake_states(self, block_id: int) -> tuple[torch.Tensor, torch.Tensor]:
+        return self.fake_ssm_states[:, block_id], self.fake_conv_states[:, block_id]
+
+
 
     def get_state_indices(self) -> torch.Tensor:
+        if self.use_fake_pool:
+            return self.fake_state_indices
         return self._cuda_state_indices
+
+    def calc_next_context_chunk_size(self, request: LlmRequest) -> int:
+        """Compute the next prefill chunk size for a context request when block reuse is enabled.
+
+        When kv_cache_config.enable_block_reuse is True, context prefill must stop exactly at
+        the positions returned by calc_context_stop_positions (mamba_prefix_cache_step boundaries
+        and block boundaries). This returns the chunk_size to use for the next prefill step so
+        that the next stop position is not exceeded.
+
+        Args:
+            request: Context request with prompt_len and context_current_position set.
+
+        Returns:
+            Number of tokens to prefill in the next step (0 if context is already complete).
+        """
+        prompt_len = request.prompt_len
+        current = request.context_current_position
+        if current >= prompt_len:
+            return 0
+        step = self.linear_attention_metadata.states_snapshot_interval
+        stop_positions = calc_context_stop_positions(
+            prompt_len, self.tokens_per_block, step
+        )
+        stop_positions = sorted(set(stop_positions))
+        for pos in stop_positions:
+            if pos > current:
+                return pos - current
+        return prompt_len - current
 
     # [total_block_num, *ssm_state_shape] (one block for one layer)
     def get_ssm_states(self, layer_idx: int) -> torch.Tensor:
+        if self.use_fake_pool:
+            return self.fake_ssm_states[self.linear_layer_offsets[layer_idx]]
         # return self.temp_ssm_states[layer_idx]
         # [total_block_num, 1, ssm_bytes + conv_bytes]
-        pool = self.impl.get_recurrent_states_pool().view(
+        pool = self.impl.get_recurrent_states_pool().view(torch.uint8).view(
             [-1, self.ssm_bytes + self.conv_bytes])
         # print(f"layer_idx: {layer_idx}, pool: {hex(pool.data_ptr())}, shape: {pool.shape}, dtype: {pool.dtype}")
         layer_idx = self.linear_layer_offsets[layer_idx]
@@ -969,10 +1082,12 @@ class LinearHybridCacheManager(KVCacheManager):
         return my_ssm_states
 
     def get_conv_states(self, layer_idx: int) -> torch.Tensor:
+        if self.use_fake_pool:
+            return self.fake_conv_states[self.linear_layer_offsets[layer_idx]]
         # return self.temp_conv_states[layer_idx]
 
         # [total_block_num, num_linear_layers, ssm_bytes + conv_bytes] -> [total_block_num * num_linear_layers, ssm_bytes + conv_bytes]
-        pool = self.impl.get_recurrent_states_pool().view(
+        pool = self.impl.get_recurrent_states_pool().view(torch.uint8).view(
             [-1, self.ssm_bytes + self.conv_bytes])
         # print(f"layer_idx: {layer_idx}, pool: {hex(pool.data_ptr())}, shape: {pool.shape}, dtype: {pool.dtype}")
         layer_idx = self.linear_layer_offsets[layer_idx]

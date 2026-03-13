@@ -20,8 +20,10 @@
 #include "tensorrt_llm/common/assert.h"
 #include <algorithm>
 #include <cstddef>
+#include <iostream>
 #include <memory>
 #include <optional>
+#include <string>
 
 //
 // This file implements a templated trie.
@@ -161,6 +163,53 @@ public:
         : mKey{key}
         , mPrevNode{prevNode}
     {
+    }
+
+    //! \brief Print subtree in Unix `tree` style (├──, └──, │). NodeKey must support operator<<(std::ostream&, NodeKey).
+    void printTree(int depth = 0, std::string const& prefix = "",
+        std::optional<bool> isLast = std::nullopt) const
+    {
+        (void) depth;
+        bool const isRoot = mPrevNode.expired();
+        if (isRoot)
+        {
+            std::cout << ".\n";
+            int idx = 0;
+            int const numChildren = static_cast<int>(mNextNodes.size());
+            for (auto const& [key, node] : mNextNodes)
+            {
+                node->printTree(0, "", idx == numChildren - 1);
+                ++idx;
+            }
+        }
+        else
+        {
+            std::cout << prefix << (isLast.value() ? "└── " : "├── ") << mKey;
+            if (!mValue.empty())
+            {
+                std::cout << " [";
+                bool first = true;
+                for (auto const& [vkey, val] : mValue)
+                {
+                    if (!first)
+                    {
+                        std::cout << ", ";
+                    }
+                    std::cout << vkey << ":" << val;
+                    first = false;
+                }
+                std::cout << "]";
+            }
+            std::cout << "\n";
+            int idx = 0;
+            int const numChildren = static_cast<int>(mNextNodes.size());
+            for (auto const& [key, node] : mNextNodes)
+            {
+                std::string newPrefix = prefix + (isLast.value() ? "    " : "│   ");
+                node->printTree(0, newPrefix, idx == numChildren - 1);
+                ++idx;
+            }
+        }
     }
 
     //! \brief Update the back-pointer to this node's parent.
@@ -601,6 +650,11 @@ public:
     {
         auto nodeMatches = lookupNodes(pkey, allowPartialMatch);
         return lookupValues(nodeMatches, vkey);
+    }
+
+    void printTree() const
+    {
+        mRoot->printTree();
     }
 
 private:

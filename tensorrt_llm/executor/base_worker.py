@@ -14,7 +14,7 @@ import torch
 from tensorrt_llm.logger import logger
 
 from .._torch.pyexecutor.llm_request import LlmResponse
-from .._utils import (global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
+from .._utils import (dump, global_mpi_rank, global_mpi_size, mpi_comm, mpi_rank,
                       nvtx_range_debug)
 from ..bindings import executor as tllm
 from ..builder import ConfigEncoder, Engine, EngineConfig
@@ -258,6 +258,7 @@ class BaseWorker(GenerationExecutor):
         ) if self.llm_args is not None else _create_engine(
             self._executor_config)
 
+        # dump.enable()
         self._lora_manager: Optional[LoraManager] = None
         self._prompt_adapter_manager: Optional[PromptAdapterManager] = None
         self._runtime_model_config: Optional[ModelConfig] = None

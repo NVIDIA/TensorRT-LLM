@@ -21,6 +21,8 @@
 #include "tensorrt_llm/executor/executor.h"
 #include "tensorrt_llm/runtime/common.h"
 
+#include <ostream>
+
 namespace tensorrt_llm::batch_manager::kv_cache_manager
 {
 using SizeType32 = tensorrt_llm::runtime::SizeType32;
@@ -140,4 +142,24 @@ struct BlockKeyHasher
         return hash(blockKey, parentHash);
     }
 };
+
+inline std::ostream& operator<<(std::ostream& out, BlockKey const& key)
+{
+    out << "BlockKey(n=" << key.uniqueTokens.size();
+    if (!key.uniqueTokens.empty())
+    {
+        out << ",tokens=[";
+        for (size_t i = 0; i < key.uniqueTokens.size(); ++i)
+        {
+            if (i > 0)
+            {
+                out << ",";
+            }
+            out << key.uniqueTokens[i].tokenId;
+        }
+        out << "]";
+    }
+    out << ")";
+    return out;
+}
 } // namespace tensorrt_llm::batch_manager::kv_cache_manager

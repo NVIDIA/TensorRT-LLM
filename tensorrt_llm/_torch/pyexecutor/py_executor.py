@@ -428,7 +428,7 @@ class PyExecutor:
 
         self.execution_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self.execution_stream):
-            self.model_engine.warmup(self.resource_manager)
+            # self.model_engine.warmup(self.resource_manager)
             if self.draft_model_engine is not None:
                 self.draft_model_engine.warmup(self.resource_manager)
 

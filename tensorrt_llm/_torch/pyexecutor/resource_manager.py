@@ -17,7 +17,7 @@ from tensorrt_llm._utils import (TensorWrapper, convert_to_torch_tensor,
                                  get_size_in_bytes, mpi_comm, mpi_disabled,
                                  prefer_pinned, torch_comm)
 from tensorrt_llm.bindings.internal.batch_manager import (
-    KvCacheStats, LinearAttentionMetadata)
+    KvCacheStats, LinearAttentionMetadata, LinearCacheType)
 from tensorrt_llm.bindings.internal.batch_manager.kv_cache_manager_v2_utils import (
     IndexMapper, copy_batch_block_offsets_to_device)
 from tensorrt_llm.bindings.internal.runtime import TaskLayerModuleConfig
@@ -407,12 +407,9 @@ class KVCacheManager(BaseResourceManager):
                 for window_size in set(self.max_attention_window_vec)
             }
             if self.is_linear_attention:
-                max_tokens = min(
-                    model_config.max_input_len * self.max_batch_size,
-                    kv_cache_config.max_tokens)
-                max_snapshots = max_tokens // linear_attention_metadata.states_snapshot_interval + self.max_batch_size
+                max_snapshots = max(max_num_tokens // linear_attention_metadata.states_snapshot_interval, self.max_batch_size)
                 blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (
-                    max_snapshots, max_snapshots)
+                    int(max_snapshots), 0)
             logger.info(
                 f"[kv cache manager] Primary/secondary blocks for window sizes set to {blocks_per_window} for estimation dry run"
             )
@@ -487,6 +484,9 @@ class KVCacheManager(BaseResourceManager):
             max_seq_len=self.max_seq_len,
             max_beam_width=max_beam_width,
         )
+
+        if os.environ.get("USE_FAKE_POOL", "0") == "1":
+            blocks_per_window[LinearCacheType.RECURRENT_STATES.value] = (128, 0)
 
         if kv_cache_type != CacheTypeCpp.SELF:
             assert len(

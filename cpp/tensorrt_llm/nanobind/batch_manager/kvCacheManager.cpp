@@ -316,7 +316,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
         .def_rw("cache_type", &tbk::LinearAttentionMetadata::cacheType)
         .def_rw("all_recurrent_states_bytes", &tbk::LinearAttentionMetadata::allRecurrentStatesBytes)
         .def_rw("input_features_bytes_per_token", &tbk::LinearAttentionMetadata::inputFeaturesBytesPerToken)
-        .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval);
+        .def_rw("states_snapshot_interval", &tbk::LinearAttentionMetadata::statesSnapshotInterval)
+        .def_rw("save_last_snapshot", &tbk::LinearAttentionMetadata::saveLastSnapshot);
 
     nb::enum_<tbk::LinearAttentionMetadata::LinearCacheType>(m, "LinearCacheType")
         .value("RECURRENT_STATES", tbk::LinearAttentionMetadata::LinearCacheType::kRecurrentStates)
@@ -570,7 +571,8 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             nb::arg("event_manager") = nullptr, nb::arg("enable_partial_reuse") = true,
             nb::arg("copy_on_partial_reuse") = true, nb::arg("kv_connector_manager") = nullptr,
             nb::arg("enable_indexer_k_cache") = false, nb::arg("indexer_k_cache_quant_block_size") = 128,
-            nb::arg("indexer_k_cache_index_head_dim") = 0, nb::arg("linear_attention_metadata").none(),
+            nb::arg("indexer_k_cache_index_head_dim") = 0,
+            nb::arg("linear_attention_metadata").none() = std::nullopt,
             nb::call_guard<nb::gil_scoped_release>())
         .def(
             "scheduling_has_free_blocks",
@@ -578,7 +580,9 @@ void tb::kv_cache_manager::KVCacheManagerBindings::initBindings(nb::module_& m)
             { return self.getBlockManager().schedulingHasFreeBlocks(numRequired, windowSize); },
             nb::arg("num_required"), nb::arg("window_size"), nb::call_guard<nb::gil_scoped_release>())
         .def_prop_ro(
-            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); });
+            "is_variable_window", [](tbk::KVCacheManager& self) { return self.getBlockManager().isVariableWindow(); })
+        .def("copy_linear_attention_block", &tbk::KVCacheManager::copyLinearAttentionBlock, nb::arg("llm_request"),
+            nb::call_guard<nb::gil_scoped_release>());
 }
 
 void tb::BasePeftCacheManagerBindings::initBindings(nb::module_& m)

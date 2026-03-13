@@ -139,7 +139,11 @@ class LmEvalWrapper(TemplateLM):
             output = self.llm.generate_async(prompt,
                                              sampling_params=sampling_params,
                                              streaming=self.streaming)
-            results.append(output)
+            output2 = self.llm.generate_async(prompt,
+                                             sampling_params=sampling_params,
+                                             streaming=self.streaming)
+            # results.append(output)
+            results.append(output2)
 
         outputs = []
         for output in tqdm(results,

@@ -38,6 +38,7 @@
 #include <limits>
 #include <map>
 #include <optional>
+#include <sstream>
 #include <utility>
 
 namespace tc = tensorrt_llm::common;
@@ -365,6 +366,23 @@ std::tuple<bool, SizeType32, BlockPtr> KVCacheBlock::findMatchingBlock(
 
     // Exact match
     auto exactMatch = mLookupNode->findMatchingNode(blockKey);
+    std::stringstream ss;
+    ss << "findMatchingBlock for blockKey: " << blockKey;
+    ss << " - exactMatch: " << (exactMatch.has_value() ? "true" : "false");
+    if (exactMatch.has_value())
+    {
+        auto block = exactMatch->node->getValue(mWindowSize);
+        if (block.has_value() && *block)
+        {
+            ss << " - matched block: " << (*block)->getBlockId();
+            ss << " - block is full: " << (*block)->isFull();
+        }
+        else
+        {
+            ss << " - matched block: null";
+        }
+    }
+    TLLM_LOG_DEBUG("%s", ss.str().c_str());
     if (exactMatch.has_value())
     {
         auto optBlock = exactMatch->node->getValue(mWindowSize);
@@ -466,9 +484,32 @@ void KVCacheBlock::detachDescendantsFromLookupTree()
     }
 }
 
+void KVCacheBlock::detachPreviousPlaceholdersFromLookupTree() const
+{
+    BlockPtr current = getPrevBlock();
+    while (current != nullptr && current->getBlockId() != KVCacheBlock::kCachedBlocksRootId)
+    {
+        if (!current->isPlaceholder())
+        {
+            return;
+        }
+        auto slibings = current->getNextBlocks();
+        for (auto const& [key, block] : slibings)
+        {
+            if (!block->isPlaceholder() && block.get() != this){
+                return;
+            }
+        }
+        BlockPtr prev = current->getPrevBlock();
+        current->detachFromLookupNode();
+        current = prev;
+    }
+}
+
 void KVCacheBlock::freeBlockAndAllDescendants()
 {
     detachDescendantsFromLookupTree();
+    detachPreviousPlaceholdersFromLookupTree();
     detachFromLookupNode();
 }
 
@@ -842,8 +883,9 @@ void BlockManager::storeContextBlocks(GenerationRequest& sequence, LlmRequest co
         auto cacheBlockIds = sequence.getCacheBlockIds(windowSize);
         auto const& uniqueTokens = llmRequest.getUniqueTokens(beamIdx);
 
+        size_t const completedTokens = llmRequest.getContextCurrentPosition();
         auto blockedUniqueTokens
-            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, uniqueTokens.size() - 1, getTokensPerBlock(), false);
+            = chopVectorIntoBlocks<UniqueToken>(uniqueTokens, std::min(completedTokens, uniqueTokens.size() - 1), getTokensPerBlock(), false);
         auto blockKeys = buildBlockKeys(blockedUniqueTokens, llmRequest);
         (void) mWindowBlockManagers.at(windowSize).storeBlocks(std::move(blockKeys), cacheBlockIds[beamIdx]);
     }
@@ -1320,6 +1362,7 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
 {
     std::lock_guard<std::mutex> lock(mCachedBlocksRootMutex);
     SizeType32 numMatchedTokens{0};
+    SizeType32 latestMatchingNonPlaceholderBlockIdx{-1};
     auto searchRoot = mCachedBlocksRoot;
     std::set<KVCacheBlock::IdType> reusedBlockIds;
 
@@ -1343,6 +1386,10 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             KVCacheBlock::IdType matchingBlockId = matchingBlock->getBlockId();
 
             numMatchedTokens += numMatched > 0 ? numMatched : blockItr->uniqueTokens.size();
+            if (!matchingBlock->isPlaceholder())
+            {
+                latestMatchingNonPlaceholderBlockIdx = bi;
+            }
             if (perBlockRetentions[bi].retentionPriority.has_value()
                 && matchingBlock->getPriority() != perBlockRetentions[bi].retentionPriority && mEventManager)
             {
@@ -1383,11 +1430,24 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
             }
             else
             {
-                // Recover block and reuse
-                mEvictionPolicy->claimBlock(
-                    matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
-                TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
                 searchRoot = matchingBlock;
+                if (matchingBlock->isPlaceholder())
+                {
+                    auto newBlock = mEvictionPolicy->getPlaceholderBlock(mWindowSize);
+                    matchingBlock = newBlock;
+                    TLLM_LOG_DEBUG(
+                        "%s::loadOrAllocateBlocks - Matched placeholder block %d, allocated new placeholder block %d "
+                        "(don't bother with reusing placeholders)",
+                        mLogPrefix.c_str(), matchingBlockId, newBlock->getBlockId());
+                }
+                else
+                {
+                    // Recover block and reuse
+                    mEvictionPolicy->claimBlock(
+                        matchingBlock, perBlockRetentions[bi].retentionPriority, perBlockRetentions[bi].durationMs);
+                    TLLM_LOG_DEBUG(
+                        "%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
+                }
             }
             onboardBlock(sequence, matchingBlock, mode, directory);
             addBlockToAllBeams(matchingBlock, sequence);
@@ -1469,6 +1529,10 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
         }
     }
 
+    if (isRecurrentState())
+    {
+        numMatchedTokens = (latestMatchingNonPlaceholderBlockIdx + 1) * mTokensPerBlock;
+    }
     sequence.setCurrentPrepopulatedPromptLen(numMatchedTokens);
     return numMatchedTokens;
 }
@@ -1752,9 +1816,10 @@ bool WindowBlockManager::tryAllocatePlaceholderForLinearAttention(GenerationRequ
 
     for (auto beamIdx = 0; beamIdx < beamWidth; ++beamIdx)
     {
-        auto block = (beamWidthChanged && beamIdx > 0) ? getFreeBlock(sequence, sequence.getDecodeRetentionPriority(),
-                         sequence.getDecodeDurationMs(), sequence.getTransferMode(), sequence.getDirectory())
-                                                       : getBlockById(lastBlockIds[beamIdx]);
+        auto block = (beamWidthChanged && beamIdx > 0)
+            ? getFreeBlock(sequence, sequence.getDecodeRetentionPriority(), sequence.getDecodeDurationMs(),
+                  sequence.getTransferMode(), sequence.getDirectory())
+            : getBlockById(lastBlockIds[beamIdx]);
         addBlockToBeam(block, sequence, beamIdx);
     }
     return true;
@@ -1954,7 +2019,6 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                     mLogPrefix.c_str(), block->getBlockId());
                 TLLM_CHECK_WITH_INFO(block->getBlockId() == bid,
                     "Block id mismatch " + std::to_string(block->getBlockId()) + " != " + std::to_string(bid));
-                needMatch = false; // no matching needed for following blocks
 
                 if (block->getPrevBlock() != nullptr)
                 {
@@ -1965,7 +2029,51 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 searchRoot->addNextBlock(blockKey, block);
 
                 // Sanity check. The list of stored blocks should be connected.
-                TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
+                if (!(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back()))
+                {
+                    // TODO: remove me
+                    std::stringstream dbgStream;
+                    dbgStream << mLogPrefix << "::storeBlocks sanity check failed: stored blocks list not connected.\n";
+                    dbgStream << "parameters: blockKeys.size()=" << blockKeys.size()
+                              << " blockIds.size()=" << blockIds.size() << " pinBlocks=" << pinBlocks
+                              << " numBlocks=" << numBlocks << " blockCnt=" << blockCnt << "\n";
+                    dbgStream << "blockIds:";
+                    for (std::size_t i = 0; i < blockIds.size(); ++i)
+                    {
+                        dbgStream << " [" << i << "]=" << blockIds.at(i);
+                    }
+                    dbgStream << "\nstoredBlocks: size=" << storedBlocks.size();
+                    for (std::size_t i = 0; i < storedBlocks.size(); ++i)
+                    {
+                        dbgStream << " [" << i << "]=" << (storedBlocks[i] ? storedBlocks[i]->getBlockId() : -1);
+                    }
+                    dbgStream << "\nblock: bid=" << bid << " blockId=" << (block ? block->getBlockId() : -1)
+                              << " prevBlockId="
+                              << ((block && block->getPrevBlock()) ? block->getPrevBlock()->getBlockId() : -1);
+                    if (!storedBlocks.empty() && storedBlocks.back())
+                    {
+                        dbgStream << " storedBlocks.back()=" << storedBlocks.back()->getBlockId();
+                    }
+                    auto searchRootNext = searchRoot->getNextBlocks().find(blockKey);
+                    if (searchRootNext != searchRoot->getNextBlocks().end())
+                    {
+                        dbgStream << " searchRootNext=" << searchRootNext->second->getBlockId();
+                        if (searchRootNext->second->getBlockKey() == blockKey)
+                        {
+                            dbgStream << " (same block key)";
+                        }
+                        else
+                        {
+                            dbgStream << " (different block key)";
+                        }
+                    }
+                    else
+                    {
+                        dbgStream << " searchRootNext=nil";
+                    }
+                    dbgStream << "\nneedMatch: " << needMatch;
+                    TLLM_LOG_ERROR("%s", dbgStream.str().c_str());
+                }
 
                 storedBlocks.push_back(block);
                 TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
@@ -1979,6 +2087,7 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
                 }
                 searchRoot = block;
                 numBlocksStoredForReuse++;
+                needMatch = false; // no matching needed for following blocks
             }
             if (pinBlocks)
             {

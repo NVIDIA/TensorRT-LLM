@@ -125,20 +125,28 @@ std::tuple<BlockPtr, bool> LRUEvictionPolicy::getFreeBlock(SizeType32 cacheLevel
 
 BlockPtr LRUEvictionPolicy::getPlaceholderBlock(WindowSizeType windowSize)
 {
-    if (mPlaceholderBlockPool.empty())
+    BlockPtr candidate = nullptr;
+    // TODO: this may be slow
+    for (auto const& block : mPlaceholderBlockPool)
     {
-        TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::getPlaceholderBlock :: Creating new placeholder block with id=%d",
-            __FILE__, __LINE__, mNextPlaceholderBlockId);
-        auto block = KVCacheBlock::createPlaceholder(mNextPlaceholderBlockId--, windowSize);
-        mAllPlaceholders[block->getBlockId()] = block;
-        return block;
+        if (block->getLookupNode() == nullptr)
+        {
+            candidate = block;
+            break;
+        }
     }
-    else
+    if (candidate != nullptr)
     {
-        auto block = *mPlaceholderBlockPool.begin();
-        mPlaceholderBlockPool.erase(block);
-        return block;
+        mPlaceholderBlockPool.erase(candidate);
+        return candidate;
     }
+
+    TLLM_LOG_DEBUG("%s;%d - LRUEvictionPolicy::getPlaceholderBlock :: Creating new placeholder block with id=%d",
+        __FILE__, __LINE__, mNextPlaceholderBlockId);
+    auto block = KVCacheBlock::createPlaceholder(mNextPlaceholderBlockId--, windowSize);
+    mAllPlaceholders[block->getBlockId()] = block;
+    TLLM_CHECK(block->getLookupNode() == nullptr);
+    return block;
 }
 
 BlockPtr LRUEvictionPolicy::findPlaceholderBlockById(KVCacheBlock::IdType blockId)

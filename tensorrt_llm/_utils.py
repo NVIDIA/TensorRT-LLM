@@ -55,6 +55,78 @@ np_bfloat16 = np.dtype('V2', metadata={"dtype": "bfloat16"})
 np_float8 = np.dtype('V1', metadata={"dtype": "float8"})
 
 
+class TensorDumpState:
+    """Holds dump-related state (prefix, enabled, iteration) and provides dump()."""
+
+    def __init__(self):
+        prefix = os.environ.get("DUMP_PREFIX", "")
+        if prefix != "":
+            prefix += "_"
+        self.prefix = prefix
+        self.enabled = os.environ.get("ENABLE_DUMP", "0") == "1"
+        self.iter_count = 0
+        self.layer_range = []
+        self.last_iter_layer = None
+        self.index = 0
+        try:
+            from tensorrt_llm.logger import logger
+            self.log = logger.info
+        except ImportError:
+            self.log = print
+
+    def dump(self, tensor, layer, name):
+        if not self.enabled:
+            return
+        if layer is not None and layer not in self.layer_range:
+            return
+        if self.iter_range is not None and self.iter_count not in self.iter_range:
+            return
+        if self.last_iter_layer == (self.prefix, self.iter_count, layer):
+            self.index += 1
+        else:
+            self.index = 0
+        self.last_iter_layer = (self.prefix, self.iter_count, layer)
+        directory = os.path.join(f"{self.prefix}it{self.iter_count}")
+        os.makedirs(directory, exist_ok=True)
+        rank = mpi_rank()
+        self.log(
+            f"Dumping tensor to {os.path.join(directory, f'rank{rank}_layer{layer}_{self.index:02d}_{name}.pt')}"
+        )
+        torch.save(
+            tensor.clone(),
+            os.path.join(directory, f"rank{rank}_layer{layer}_{self.index:02d}_{name}.pt"),
+        )
+    
+    def set_prefix(self, prefix):
+        self.prefix = prefix
+        if prefix != "":
+            self.prefix += "_"
+
+    def set_enable_layer(self, layer_range):
+        self.layer_range = layer_range
+
+    def set_enable_iter(self, iter_range):
+        self.iter_range = iter_range
+
+    def enable(self):
+        # self.log(f"Enabling tensor dump")
+        self.enabled = True
+    def disable(self):
+        # self.log(f"Disabling tensor dump")
+        self.enabled = False
+    def reset_iter(self, iter_count=0):
+        # self.log(f"Resetting tensor dump iter to {iter_count}")
+        self.iter_count = iter_count
+    def inc_iter(self):
+        # self.log(f"Incrementing tensor dump iter to {self.iter_count + 1}")
+        self.iter_count += 1
+
+    def __call__(self, tensor, layer, name):
+        self.dump(tensor, layer, name)
+
+dump = TensorDumpState()
+
+
 def torch_to_numpy(x: torch.Tensor):
     assert isinstance(x, torch.Tensor), \
         f'x must be a torch.Tensor object, but got {type(x)}.'

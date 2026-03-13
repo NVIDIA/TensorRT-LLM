@@ -672,15 +672,18 @@ class ModelConfig(Generic[TConfig]):
 
         num_key_value_heads = getattr(self.pretrained_config,
                                       "num_key_value_heads", num_heads)
+        def ceil_div(a, b):
+            return (a + b - 1) // b
+
         if isinstance(num_key_value_heads, (list, tuple)):
             # Per-layer KV heads (e.g., Nemotron-NAS, variable GQA models)
             num_kv_heads_per_layer = [
-                kv_heads // (attn_tp_size * attn_cp_size)
+                ceil_div(kv_heads, attn_tp_size * attn_cp_size)
                 for kv_heads in num_key_value_heads
             ]
             model_config_cpp.num_kv_heads_per_layer = num_kv_heads_per_layer
         else:
-            num_kv_heads = num_key_value_heads // (attn_tp_size * attn_cp_size)
+            num_kv_heads = ceil_div(num_key_value_heads, attn_tp_size * attn_cp_size)
             model_config_cpp.set_num_kv_heads(num_kv_heads)
 
         mlp_hidden_size = None
