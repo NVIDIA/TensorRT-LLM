@@ -99,29 +99,29 @@ class FluxPipeline(BasePipeline):
         return torch.device("cuda:0")
 
     @property
-    def common_warmup_shapes(self) -> list:
-        """Return list of common warmup shapes (height, width, num_frames)."""
-        return [(1024, 1024, 1)]
+    def default_warmup_resolutions(self):
+        return [(1024, 1024)]
+
+    @property
+    def default_warmup_num_frames(self):
+        return [1]
 
     def _init_transformer(self) -> None:
         """Initialize FLUX transformer with quantization support."""
         logger.info("Creating FLUX transformer with quantization support...")
         self.transformer = FluxTransformer2DModel(model_config=self.model_config)
 
-    def _run_warmup(self, warmup_steps: int) -> None:
-        """Run warmup inference to trigger torch.compile and CUDA init."""
-        for height, width, _ in self.common_warmup_shapes:
-            logger.info(f"Warmup: FLUX.1 {height}x{width}, {warmup_steps} steps")
-            with torch.no_grad():
-                self.forward(
-                    prompt="warmup",
-                    height=height,
-                    width=width,
-                    num_inference_steps=warmup_steps,
-                    guidance_scale=3.5,
-                    seed=0,
-                    max_sequence_length=512,
-                )
+    def _run_warmup(self, height: int, width: int, num_frames: int, steps: int) -> None:
+        with torch.no_grad():
+            self.forward(
+                prompt="warmup",
+                height=height,
+                width=width,
+                num_inference_steps=steps,
+                guidance_scale=3.5,
+                seed=42,
+                max_sequence_length=512,
+            )
 
     def load_standard_components(
         self,

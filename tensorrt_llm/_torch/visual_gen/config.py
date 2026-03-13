@@ -205,7 +205,11 @@ class TeaCacheConfig(StrictBaseModel):
 
 
 class TorchCompileConfig(StrictBaseModel):
-    """Configuration for torch.compile and autotuning."""
+    """Configuration for torch.compile and autotuning.
+
+    Warmup shapes for torch.compile specialization are configured via
+    CompilationConfig (resolutions + num_frames), not here.
+    """
 
     enable_torch_compile: bool = True
     enable_fullgraph: bool = False
@@ -213,9 +217,43 @@ class TorchCompileConfig(StrictBaseModel):
 
 
 class CudaGraphConfig(StrictBaseModel):
-    """Configuration for CUDA graph capture/replay."""
+    """Configuration for CUDA graph capture/replay.
+
+    Warmup shapes for CUDA graph pre-capture are configured via
+    CompilationConfig (resolutions + num_frames), not here.
+    """
 
     enable_cuda_graph: bool = False
+
+
+class CompilationConfig(StrictBaseModel):
+    """Configuration for torch.compile / CUDA graph warmup shapes.
+
+    Warmup shapes are the Cartesian product of ``resolutions`` and ``num_frames``.
+    For example, 2 resolutions x 2 frame counts = 4 warmup shapes.
+
+    More warmup shapes = slower startup, but lower risk of torch.compile
+    recompilation delays on first requests. Fewer shapes = faster startup,
+    but first request with an un-warmed shape triggers recompilation.
+    """
+
+    resolutions: Optional[List[Tuple[int, int]]] = PydanticField(
+        default=None,
+        description=(
+            "List of (height, width) resolutions to warmup at startup. "
+            "Combined with num_frames via Cartesian product. "
+            "If None, uses model-specific defaults."
+        ),
+    )
+    num_frames: Optional[List[int]] = PydanticField(
+        default=None,
+        description=(
+            "List of frame counts to warmup at startup. "
+            "Combined with resolutions via Cartesian product. "
+            "If None, uses model-specific defaults. "
+            "For image models, use [1]."
+        ),
+    )
 
 
 class PipelineConfig(StrictBaseModel):
@@ -298,6 +336,7 @@ class VisualGenArgs(StrictBaseModel):
 
     # Sub-configs (dict input for quant_config is coerced to QuantConfig in model_validator)
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
+    compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
@@ -432,6 +471,7 @@ class DiffusionModelConfig(BaseModel):
     quant_config: QuantConfig = PydanticField(default_factory=QuantConfig)
     # Per-layer quant (from load_diffusion_quant_config layer_quant_config; None until mixed-precision parsing exists)
     quant_config_dict: Optional[Dict[str, QuantConfig]] = None
+    compilation: CompilationConfig = PydanticField(default_factory=CompilationConfig)
     torch_compile: TorchCompileConfig = PydanticField(default_factory=TorchCompileConfig)
     cuda_graph: CudaGraphConfig = PydanticField(default_factory=CudaGraphConfig)
     pipeline: PipelineConfig = PydanticField(default_factory=PipelineConfig)
@@ -659,12 +699,13 @@ class DiffusionModelConfig(BaseModel):
         Args:
             checkpoint_dir: Path to checkpoint
             args: VisualGenArgs containing user config
-                - (torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
+                - (compilation, torch_compile, cuda_graph, pipeline, attention, parallel, teacache)
             **kwargs: Additional config options (e.g., mapping)
         """
         kwargs.pop("trust_remote_code", None)
 
         # Extract sub-configs from args or use defaults
+        compilation_cfg = args.compilation if args else CompilationConfig()
         torch_compile_cfg = args.torch_compile if args else TorchCompileConfig()
         cuda_graph_cfg = args.cuda_graph if args else CudaGraphConfig()
         pipeline_cfg = args.pipeline if args else PipelineConfig()
@@ -772,6 +813,7 @@ class DiffusionModelConfig(BaseModel):
             dynamic_weight_quant=dynamic_weight_quant,
             force_dynamic_quantization=dynamic_activation_quant,
             # Sub-configs from VisualGenArgs
+            compilation=compilation_cfg,
             torch_compile=torch_compile_cfg,
             cuda_graph=cuda_graph_cfg,
             pipeline=pipeline_cfg,
