@@ -41,8 +41,19 @@ class DiffusionRequest:
     guidance_rescale: float = 0.0
     output_type: str = "pt"
 
-    # Wan-specific parameters
+    # LTX-2 multi-modal guidance (STG / modality guidance)
+    stg_scale: float = 0.0
+    stg_blocks: Optional[List[int]] = None
+    modality_scale: float = 1.0
+    rescale_scale: float = 0.0
+    guidance_skip_step: int = 0
+    enhance_prompt: bool = False
+
+    # Image-to-video parameters
     image: Optional[Union[str, List[str]]] = None
+    image_cond_strength: float = 1.0
+
+    # Wan-specific parameters
     guidance_scale_2: Optional[float] = None
     boundary_ratio: Optional[float] = None
     last_image: Optional[Union[str, List[str]]] = None
@@ -174,14 +185,15 @@ class DiffusionExecutor:
     def process_request(self, req: DiffusionRequest):
         """Process a single request."""
         if (
-            self.pipeline.common_warmup_shapes
-            and (req.height, req.width, req.num_frames) not in self.pipeline.common_warmup_shapes
+            self.pipeline._warmed_up_shapes
+            and (req.height, req.width, req.num_frames) not in self.pipeline._warmed_up_shapes
         ):
             logger.warning(
-                f"Requested shape (height={req.height}, width={req.width}, num_frames={req.num_frames}) "
+                f"Requested shape (height={req.height}, width={req.width}, "
+                f"num_frames={req.num_frames}) "
                 f"was not warmed up. First request with this shape will be slower due to "
-                "torch.compile recompilation or CUDA graph capture."
-                f"Warmed-up shapes: {self.pipeline.common_warmup_shapes}"
+                f"torch.compile recompilation or CUDA graph capture."
+                f"Warmed-up shapes: {self.pipeline._warmed_up_shapes}"
             )
         try:
             output = self.pipeline.infer(req)

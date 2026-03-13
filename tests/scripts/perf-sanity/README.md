@@ -233,3 +233,123 @@ When working with perf sanity tests, use these paths:
 | Local submit (all) | `jenkins/scripts/perf/local/submit.py` |
 | Jenkins pipeline | `jenkins/L0_Test.groovy` |
 | Test database | `tests/integration/test_lists/test-db/` |
+| Test waives | `tests/integration/test_lists/waives.txt` |
+
+## Step-by-Step: Adding or Re-enabling Disaggregated Perf Sanity Tests
+
+When adding a new disaggregated perf sanity test (or uncommenting an existing one), you must update **two files**: the test-db YAML and `jenkins/L0_Test.groovy`. This section describes how to locate and edit each one.
+
+### Step 1: Identify the Disaggregated Config YAML
+
+Config files live in `tests/scripts/perf-sanity/disaggregated/`. The filename encodes the GPU type and test parameters:
+
+```
+{gpu_type}_{model}-{precision}_{ISL}k{OSL}k_con{concurrency}_ctx{ctx_count}_tp{ctx_tp}_gen{gen_count}_{gen_parallelism}_eplb{N}_mtp{N}_ccb-{transport}.yaml
+```
+
+Example: `gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+
+The **base name** (filename without `.yaml`) is used as the test case ID in the test-db.
+
+### Step 2: Calculate Resource Requirements from Config YAML
+
+Read the config YAML and extract these fields:
+
+```yaml
+hardware:
+  gpus_per_node: 4          # GPUs per physical node
+  num_ctx_servers: 1         # Number of context workers
+  num_gen_servers: 1         # Number of generation workers
+worker_config:
+  ctx:
+    tensor_parallel_size: 1  # GPUs per ctx worker
+  gen:
+    tensor_parallel_size: 8  # GPUs per gen worker
+```
+
+Calculate:
+
+| Value | Formula | Example (ctx_tp=1, gen_tp=8, gpus_per_node=4) |
+|-------|---------|-----------------------------------------------|
+| Nodes per ctx worker | `ceil(ctx_tp / gpus_per_node)` | `ceil(1/4) = 1` |
+| Nodes per gen worker | `ceil(gen_tp / gpus_per_node)` | `ceil(8/4) = 2` |
+| Total nodes | `(nodes_per_ctx * num_ctx) + (nodes_per_gen * num_gen)` | `1*1 + 2*1 = 3` |
+| Total GPUs | `total_nodes * gpus_per_node` | `3 * 4 = 12` |
+
+### Step 3: Find the Test-db YAML File
+
+The test-db file name follows this pattern (all in `tests/integration/test_lists/test-db/`):
+
+```
+l0_{gpu_type}_multi_nodes_perf_sanity_ctx{num_ctx}_node{nodes_per_ctx}_gpu{ctx_tp}_gen{num_gen}_node{nodes_per_gen}_gpu{gen_tp}.yml
+```
+
+Example: for ctx_tp=1, gen_tp=8, 1 ctx worker, 1 gen worker on GB200:
+```
+l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node2_gpu8.yml
+```
+
+The `system_gpu_count` in the test-db condition section equals the total GPUs calculated above.
+
+### Step 4: Add or Uncomment the Test in the Test-db File
+
+Each disagg test line in the test-db file follows one of these formats:
+
+```yaml
+# gen_only test:
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-{config_base_name}] TIMEOUT (120)
+
+# e2e test:
+- perf/test_perf_sanity.py::test_e2e[disagg_upload-e2e-{config_base_name}] TIMEOUT (120)
+
+# ctx_only test (placed in aggregated test-db files, not disagg ones):
+- perf/test_perf_sanity.py::test_e2e[aggr_upload-ctx_only-{config_base_name}] TIMEOUT (120)
+```
+
+- If the test line already exists but is **commented out** (prefixed with `# `), remove the `# ` prefix.
+- If the test line does not exist, add it to the `tests` list.
+- Count the total number of **active (uncommented) tests** in the file — you will need this count for Step 5.
+
+### Step 5: Update `jenkins/L0_Test.groovy`
+
+Open `jenkins/L0_Test.groovy` and search for the `multiNodesSBSAConfigs` section inside `launchTestJobs()`. Disaggregated perf sanity stages are added via `buildStageConfigs()`:
+
+```groovy
+def buildStageConfigs(stageName, platform, testlist, testCount, gpuCount, nodeCount, runWithSbatch=false)
+```
+
+| Parameter | Description |
+|-----------|-------------|
+| `stageName` | CI stage name prefix (see naming convention below) |
+| `platform` | Hardware platform, e.g., `"auto:gb200-flex"` |
+| `testlist` | Test-db filename **without** `.yml`, e.g., `"l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4"` |
+| `testCount` | Number of **active (uncommented)** tests in the test-db file. Each disagg test gets its own stage, so `testCount` must equal the number of active tests. |
+| `gpuCount` | Total GPUs from Step 2 (= `total_nodes * gpus_per_node`) |
+| `nodeCount` | Total nodes from Step 2 |
+
+**Stage naming convention:**
+
+```
+GB200-{gpuCount}_GPUs-{nodeCount}_Nodes-PyTorch-Disagg-PerfSanity-CTX{num_ctx}-NODE{nodes_per_ctx}-GPU{ctx_tp}-GEN{num_gen}-NODE{nodes_per_gen}-GPU{gen_tp}-Post-Merge
+```
+
+**If a `buildStageConfigs` entry already exists** for the test-db file: update `testCount` to match the new total number of active tests.
+
+**If no entry exists** for the test-db file: add a new `buildStageConfigs` block. Insert it in the correct section sorted by node count (2 Nodes, 3 Nodes, 4 Nodes, etc.).
+
+### Step 6: Check Waives
+
+Search `tests/integration/test_lists/waives.txt` for the exact test case string. If the test is listed there with a `SKIP` directive, remove that line (otherwise the test will be skipped even if present in the test-db).
+
+### Worked Example
+
+Adding back `qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX` as a gen_only test:
+
+1. Config file: `tests/scripts/perf-sanity/disaggregated/gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX.yaml`
+2. From config: `gpus_per_node=4`, `ctx_tp=1`, `gen_tp=4`, `num_ctx=1`, `num_gen=1`
+3. Nodes per ctx = `ceil(1/4)=1`, nodes per gen = `ceil(4/4)=1`, total nodes = 2, total GPUs = 8
+4. Test-db file: `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4.yml`
+5. Uncomment the line: `- perf/test_perf_sanity.py::test_e2e[disagg_upload-gen_only-gb200_qwen3-235b-fp4_8k1k_con64_ctx1_tp1_gen1_tep4_eplb0_mtp0_ccb-UCX] TIMEOUT (120)`
+6. Count active tests in that file (now 4)
+7. In `L0_Test.groovy`, find the existing `buildStageConfigs` for `l0_gb200_multi_nodes_perf_sanity_ctx1_node1_gpu1_gen1_node1_gpu4`, update `testCount` from 3 to 4
+8. Check `waives.txt` — no matching entry, done

@@ -1,4 +1,4 @@
-# SPDX-FileCopyrightText: Copyright (c) 2025 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 # SPDX-License-Identifier: Apache-2.0
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
@@ -269,6 +269,110 @@ def _run_moe_with_alltoall(
     # so the combined result has more rows than the original input.
     # Slice back to local_num_tokens (captured before padding) before returning.
     moe_out = moe_out.view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
+    combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
+    return combined[:local_num_tokens]
+
+
+def _run_trtllm_gen_nvfp4_moe_with_alltoall(
+    x: torch.Tensor,
+    selected_experts: torch.Tensor,
+    routing_weights: torch.Tensor,
+    fc1_expert_weights_fp4: torch.Tensor,
+    fc2_expert_weights_fp4: torch.Tensor,
+    fc1_weight_blockscale_fp8: torch.Tensor,
+    fc2_weight_blockscale_fp8: torch.Tensor,
+    fc1_act_global_scale: torch.Tensor,
+    fc1_scale_c: torch.Tensor,
+    fc1_alpha: torch.Tensor,
+    fc2_alpha: torch.Tensor,
+    mapping: Mapping,
+    max_num_tokens: int,
+    act_type: int,
+) -> torch.Tensor:
+    """Run TRTLLM-Gen NVFP4 MoE through the all-to-all dispatch/combine path."""
+
+    top_k = selected_experts.shape[1]
+    hidden_size = x.shape[-1]
+    local_num_experts = int(fc1_expert_weights_fp4.shape[0])
+    global_num_experts = local_num_experts * mapping.moe_ep_size
+    workspace_size = MoeAlltoAll.calculate_required_workspace_size(
+        mapping.moe_ep_size, top_k, max_num_tokens, hidden_size, x.dtype
+    )
+    runtime_max_tokens_per_rank = max_num_tokens
+
+    moe_a2a = MoeAlltoAll(
+        mapping=mapping,
+        max_num_tokens=max_num_tokens,
+        top_k=top_k,
+        num_slots=global_num_experts,
+        workspace_size_per_rank=workspace_size,
+        num_experts=None,
+    )
+
+    invalid_expert_id = global_num_experts
+    local_num_tokens = x.shape[0]
+    pad_expert_id = mapping.moe_ep_rank * local_num_experts
+    pad_size = runtime_max_tokens_per_rank - local_num_tokens
+    if pad_size > 0:
+        x = torch.nn.functional.pad(x, (0, 0, 0, pad_size))
+        selected_experts = torch.nn.functional.pad(
+            selected_experts, (0, 0, 0, pad_size), value=pad_expert_id
+        )
+        routing_weights = torch.nn.functional.pad(routing_weights, (0, 0, 0, pad_size))
+
+    recv_results = moe_a2a.dispatch(
+        selected_experts,
+        [x.contiguous(), selected_experts.contiguous(), routing_weights.contiguous()],
+        runtime_max_tokens_per_rank,
+        invalid_token_expert_id=invalid_expert_id,
+        expert_id_payload_index=1,
+    )
+
+    dispatched_x = recv_results[0].reshape(-1, hidden_size)
+    dispatched_selected = recv_results[1].reshape(-1, top_k).to(torch.int32).contiguous()
+    dispatched_weights = recv_results[2].reshape(-1, top_k).to(torch.bfloat16).contiguous()
+
+    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+        dispatched_x, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
+    )
+    factor = 1 if act_type == 1 else 2
+    intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
+    local_expert_offset = mapping.moe_ep_rank * local_num_experts
+    routing_method_type = int(RoutingMethodType.DeepSeekV3)
+
+    outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
+        None,
+        None,
+        x_q_fp4,
+        x_sf.view(torch.float8_e4m3fn),
+        fc1_expert_weights_fp4,
+        fc1_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        None,
+        None,
+        None,
+        fc2_expert_weights_fp4,
+        fc2_weight_blockscale_fp8.view(torch.float8_e4m3fn),
+        None,
+        fc1_scale_c,
+        fc1_alpha,
+        fc2_alpha,
+        global_num_experts,
+        top_k,
+        1,
+        1,
+        intermediate_size,
+        local_expert_offset,
+        local_num_experts,
+        1.0,
+        routing_method_type,
+        do_finalize=True,
+        act_type=act_type,
+        topk_weights=dispatched_weights,
+        topk_ids=dispatched_selected,
+    )
+
+    moe_out = outputs[0].view(mapping.moe_ep_size, runtime_max_tokens_per_rank, hidden_size)
     combined = moe_a2a.combine(moe_out, runtime_max_tokens_per_rank)
     return combined[:local_num_tokens]
 
@@ -825,7 +929,7 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     fc2_alpha: torch.Tensor,
     is_gated_mlp: bool = True,
     act_fn: int = int(ActivationType.Silu),
-    mapping_config: str = "",  # https://github.com/NVIDIA/TensorRT-LLM/issues/12008 Add mapping config support
+    mapping_config: str = "",
     max_num_tokens: int = 0,
     apply_routing_on_input: bool = False,
 ) -> torch.Tensor:
@@ -839,9 +943,6 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     pad_size = expected_hidden - int(x2d.shape[-1])
     if pad_size > 0:
         x2d = torch.nn.functional.pad(x2d, (0, pad_size))
-    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
-        x2d, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
-    )
 
     if act_fn in (ActivationType.Silu, ActivationType.Swiglu):
         act_type = 0
@@ -855,6 +956,32 @@ def trtllm_nvfp4_trtllm_gen_moe_fused(
     factor = 1 if act_type == 1 else 2
     intermediate_size = int(fc1_expert_weights_fp4.shape[1] // factor)
     routing_method_type = int(RoutingMethodType.DeepSeekV3)
+    mapping, enable_alltoall = _check_moe_alltoall(mapping_config, max_num_tokens)
+
+    if enable_alltoall:
+        final_hidden_states = _run_trtllm_gen_nvfp4_moe_with_alltoall(
+            x=x2d,
+            selected_experts=selected_experts.to(torch.int32),
+            routing_weights=routing_weights.to(torch.float32),
+            fc1_expert_weights_fp4=fc1_expert_weights_fp4,
+            fc2_expert_weights_fp4=fc2_expert_weights_fp4,
+            fc1_weight_blockscale_fp8=fc1_weight_blockscale_fp8,
+            fc2_weight_blockscale_fp8=fc2_weight_blockscale_fp8,
+            fc1_act_global_scale=fc1_act_global_scale,
+            fc1_scale_c=fc1_scale_c,
+            fc1_alpha=fc1_alpha,
+            fc2_alpha=fc2_alpha,
+            mapping=mapping,
+            max_num_tokens=max_num_tokens,
+            act_type=act_type,
+        )
+        if final_hidden_states.shape[1] > x_shape[-1]:
+            final_hidden_states = final_hidden_states[:, : x_shape[-1]].contiguous()
+        return final_hidden_states.view(x_shape)
+
+    x_q_fp4, x_sf = torch.ops.trtllm.fp4_quantize(
+        x2d, fc1_act_global_scale, TRTLLM_NVFP4_SCALING_VECTOR_SIZE, False, False
+    )
 
     outputs = torch.ops.trtllm.fp4_block_scale_moe_runner(
         None,
