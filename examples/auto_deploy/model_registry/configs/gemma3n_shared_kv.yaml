@@ -1,0 +1,7 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+# Gemma 3n uses shared-KV decode semantics in the tail layers. Use the torch
+# attention backend so AutoDeploy inserts the shared-KV cached attention path.
+attn_backend: torch
+compile_backend: torch-simple
