@@ -781,17 +781,6 @@ class KVCacheManager(BaseResourceManager):
 
         # For context requests, we store the blocks for reuse.
         for request in scheduled_batch.context_requests:
-            if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
-                logger.info(
-                    "[GEMMA3N_RM_DEBUG] store_context request_id=%s state=%s "
-                    "ctx_pos=%s ctx_chunk=%s ctx_remaining=%s in_kv_map=%s",
-                    request.py_request_id,
-                    request.state,
-                    request.context_current_position,
-                    request.context_chunk_size,
-                    request.context_remaining_length,
-                    request.py_request_id in self.kv_cache_map,
-                )
             self.impl.store_context_blocks(request)
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
@@ -2141,17 +2130,6 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
-            logger.info(
-                "[GEMMA3N_RM_DEBUG] free_resources request_id=%s state=%s "
-                "ctx_pos=%s prompt_len=%s in_kv_map=%s pin_on_release=%s",
-                request.py_request_id,
-                request.state,
-                request.context_current_position,
-                request.prompt_len,
-                request.py_request_id in self.kv_cache_map,
-                pin_on_release,
-            )
         if request.py_request_id not in self.kv_cache_map:
             return
         kv_cache = self.kv_cache_map.pop(request.py_request_id)
