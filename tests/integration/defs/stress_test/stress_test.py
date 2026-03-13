@@ -91,7 +91,7 @@ class ServerConfig:
     max_batch_size: Optional[int] = 1024  # 2048 is default value in BuildConfig
     max_num_tokens: Optional[int] = 8192  # 8192 is default value in BuildConfig
     kv_cache_free_gpu_memory_fraction: Optional[
-        float] = 0.8  # 0.9 is default value in BuildConfig
+        float] = 0.6
     capacity_scheduler_policy: str = "GUARANTEED_NO_EVICT"
     wait_interval: int = 10  # seconds
     max_wait_seconds: int = 600  # 10 mins <- Larger model need longer model loading time

@@ -437,6 +437,9 @@ def disagg_server_config(disagg_cluster_config, router, disagg_port):
         "disagg_cluster": disagg_cluster_config,
         "context_servers": {"router": {"type": router}},
         "generation_servers": {"router": {"type": router}},
+        "kv_cache_config": {
+            "free_gpu_memory_fraction": 0.4
+        },
     }
 
 
