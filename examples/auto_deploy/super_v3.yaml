@@ -51,4 +51,4 @@ transforms:
   insert_cached_ssm_attention:
     backend: flashinfer_ssm
   fuse_nvfp4_moe:
-    backend: trtllm_gen
+    backend: trtllm
