@@ -44,7 +44,14 @@ def main():
         "--output_dir",
         type=str,
         default=None,
-        help="The directory to save the exported ONNX model.",
+        help="The directory to save the exported ONNX model (language / text model).",
+    )
+    parser.add_argument(
+        "--visual_output_dir",
+        type=str,
+        default=None,
+        help="Optional. For VLM, the directory to save the exported vision ONNX (vision_model.onnx). "
+        "When set, the pipeline may write visual subgraph to this dir if supported.",
     )
     args = parser.parse_args()
 
@@ -71,6 +78,14 @@ def main():
     if args.output_dir is not None:
         ad_config.transforms["export_to_onnx"]["output_dir"] = args.output_dir
         ad_config.transforms["rewrite_embedding_to_inputs_embeds"]["output_dir"] = args.output_dir
+    if args.visual_output_dir is not None:
+        # Pass through for pipeline transforms that export vision ONNX.
+        ad_config.transforms["export_to_onnx"]["visual_output_dir"] = args.visual_output_dir
+        # When export_vision_to_onnx exists, it can read from here.
+        if "export_vision_to_onnx" in ad_config.transforms:
+            ad_config.transforms["export_vision_to_onnx"]["visual_output_dir"] = (
+                args.visual_output_dir
+            )
 
     # Use direct InferenceOptimizer instead of LLM to avoid executor initialization
     export_onnx(ad_config)
