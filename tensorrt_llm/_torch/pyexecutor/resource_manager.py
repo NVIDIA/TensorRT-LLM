@@ -2341,17 +2341,6 @@ class KVCacheManagerV2(BaseResourceManager):
         return requests
 
     def free_resources(self, request: LlmRequest, pin_on_release: bool = False):
-        if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
-            logger.info(
-                "[GEMMA3N_RM_DEBUG] free_resources request_id=%s state=%s "
-                "ctx_pos=%s prompt_len=%s in_kv_map=%s pin_on_release=%s",
-                request.py_request_id,
-                request.state,
-                request.context_current_position,
-                request.prompt_len,
-                request.py_request_id in self.kv_cache_map,
-                pin_on_release,
-            )
         kv_cache = self.kv_cache_map.pop(request.py_request_id, None)
         if kv_cache is None:
             return

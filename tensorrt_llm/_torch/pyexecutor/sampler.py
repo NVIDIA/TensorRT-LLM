@@ -4745,23 +4745,6 @@ class TRTLLMSampler(Sampler[SampleStateTRTLLM], AsyncWorkerMixin):
         new_tokens = state.host.new_tokens[0, seq_slots, 0].tolist()
         add_new_tokens_to_requests(reqs_with_new_tokens, new_tokens, 0)
 
-        if os.environ.get("AD_DEBUG_GEMMA3N") == "1":
-            token_by_slot = dict(zip(seq_slots, new_tokens))
-            debug_rows = []
-            for request in reqs:
-                assert request.py_seq_slot is not None
-                debug_rows.append(
-                    {
-                        "request_id": request.py_request_id,
-                        "slot": request.py_seq_slot,
-                        "new_token": token_by_slot.get(request.py_seq_slot),
-                        "seq_len_host": sequence_lengths_host_data[request.py_seq_slot],
-                        "num_tokens": request.get_num_tokens(0),
-                        "finish_reason": finish_reasons[request.py_seq_slot],
-                    }
-                )
-            logger.info("[GEMMA3N_SAMPLE_DEBUG] %s", debug_rows)
-
         # Log probs
         assert state.host is not None
         if state.host.log_probs is not None:
