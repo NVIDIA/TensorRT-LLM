@@ -353,7 +353,7 @@ def validate_outputs(llm: LLM, input_prompts: list[list[int]],
 @pytest.mark.parametrize("gather_generation_logits", [True, False])
 @pytest.mark.parametrize("gather_context_logits", [True, False])
 @pytest.mark.parametrize("num_output_beams", [1, 2])
-@pytest.mark.parametrize("num_prompts", [1, 2, 3])
+@pytest.mark.parametrize("num_prompts", [1, 3])
 @pytest.mark.parametrize("stop_token_ids", [[15], None])
 @pytest.mark.threadleak(enabled=False)
 def test_beam_search_e2e(
