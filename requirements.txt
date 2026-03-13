@@ -7,7 +7,7 @@ cuda-python>=13
 diffusers>=0.27.0
 lark
 mpi4py
-numpy<2
+numpy>=2.0.0,<2.4 # numba 0.63.1 requires numpy<2.4
 onnx>=1.18.0,<1.20.0
 onnx_graphsurgeon>=0.5.2
 openai
@@ -70,7 +70,7 @@ blobfile
 openai-harmony==0.0.4
 nvidia-cutlass-dsl==4.3.4; python_version >= "3.10"
 plotly
-numexpr<2.14.0 # WAR for attempted use of nonexistent numpy.typing
+numexpr
 partial_json_parser
 apache-tvm-ffi==0.1.6 # used for reduce nvidia-cutlass-dsl host overhead
 torch-c-dlpack-ext==0.1.3 # used for reduce nvidia-cutlass-dsl host overhead, optional package for improved torch tensor calling perf
