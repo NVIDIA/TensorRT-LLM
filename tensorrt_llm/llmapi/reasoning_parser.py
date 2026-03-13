@@ -191,6 +191,10 @@ class NemotronV3ReasoningParser(DeepSeekR1Parser):
                 "force_nonempty_content", False) is True
         super().__init__(reasoning_at_start=reasoning_at_start,
                          chat_template_kwargs=chat_template_kwargs)
+        # Workaround: the model sometimes does not send closing think tags
+        # which affects downstream applications. This is addressed by
+        # optionally accumulating reasoning tokens and returning them as
+        # content at the end of streaming.
         self._accumulated_reasoning = ""
         self._found_closing_tag = False
 
