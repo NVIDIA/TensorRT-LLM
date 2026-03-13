@@ -1738,6 +1738,13 @@ class Indexer(nn.Module):
 
         Returns a contiguous [num_generations, index_topk] int32 tensor,
         or None if any generation request lacks valid previous indices.
+
+        Adds +1 offset to all indices: the saved TopK came from a query at
+        position P (last MTP pos of previous step), while the current step's
+        first query is at position P+1. Shifting by +1 preserves relative
+        distances under RoPE, giving the heuristic kernel a more accurate
+        initial threshold. The kernel validates idx < N, so any overshoot
+        is safely ignored.
         """
         if self._prev_decode_topk is None:
             return None
@@ -1752,7 +1759,9 @@ class Indexer(nn.Module):
         slot_tensor = torch.tensor(slots,
                                    device=self._prev_decode_topk.device,
                                    dtype=torch.long)
-        return self._prev_decode_topk[slot_tensor].contiguous()
+        pre_idx = self._prev_decode_topk[slot_tensor].contiguous()
+        pre_idx = pre_idx + 1
+        return pre_idx
 
     def _save_decode_topk(
         self,
