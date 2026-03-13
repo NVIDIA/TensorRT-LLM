@@ -575,6 +575,13 @@ class ADEngine(ModelEngine):
         The standard attention metadata captures request geometry (batch_info, cu_seqlen,
         seq_len_with_cache, input_pos), but not the original per-request multimodal span layout
         or multimodal special-token offsets needed to rebuild chunk-aware mRoPE positions.
+
+        This tensorization happens in the executor because it still has the scheduled request
+        list, per-request chunk boundaries, input_pos, cu_seqlen, and access to the raw
+        request-side multimodal fields (multimodal_positions, multimodal_lengths, and
+        py_multimodal_data["layout_metadata"]). By the time control reaches the exported
+        wrapper/modeling path, Python request objects are gone and the model call can only
+        consume concrete tensor kwargs.
         """
         if num_prefill_seqs == 0:
             return
