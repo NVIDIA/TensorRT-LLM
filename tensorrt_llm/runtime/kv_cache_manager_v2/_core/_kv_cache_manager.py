@@ -18,7 +18,7 @@ from collections import defaultdict
 from collections.abc import Callable, Sequence
 from copy import deepcopy
 from dataclasses import dataclass
-from typing import Any, Iterable, Iterator, cast
+from typing import Iterable, Iterator, cast
 
 from .. import rawref
 from .._block_radix_tree import BlockRadixTree
@@ -50,7 +50,6 @@ from .._utils import (
     init_cuda_once,
     make_typed,
     typed_enumerate,
-    typed_map,
     typed_range,
     unwrap_rawref,
 )
@@ -164,7 +163,7 @@ class KVCacheManager:
         self._life_cycles = LifeCycleRegistry(config)
         self._radix_tree = BlockRadixTree(self._life_cycles, config.tokens_per_block)
         storage_config = create_storage_config(config)
-        self._storage = StorageManager(self._life_cycles, storage_config)
+        self._storage = StorageManager(self._life_cycles, storage_config, config.tokens_per_block)
         self._living_kv_caches = set[rawref.ref[_KVCache]]()
         decay = 0.9999
         self._avg_reused_length = MovingAverage(decay)
@@ -255,8 +254,8 @@ class KVCacheManager:
         self,
         lora_task_id: int | None = None,
         input_tokens: Sequence[TokenIdExt] | None = None,
-        id: Any = None,
-        custom_priority_callback: Callable[[BlockOrdinal, "LifeCycle"], Priority] = lambda _,
+        id: int | None = None,
+        custom_priority_callback: Callable[[BlockOrdinal, LifeCycle], Priority] = lambda _,
         __: PRIORITY_DEFAULT,
     ) -> _KVCache:
         """
@@ -499,27 +498,13 @@ class KVCacheManager:
         if self._num_closed_kv_caches - self._last_update_num_closed_requests < 100:
             return
         self._last_update_num_closed_requests = self._num_closed_kv_caches
-        tokens_per_blocks = self.tokens_per_block
-        life_cycles = self._life_cycles.get()
-        num_pool_groups = self._storage.num_pool_groups
+        tokens_per_block = self.tokens_per_block
         storage = self._storage
-        lc2pg = storage._life_cycle_grouping
 
         def ratio_from_length(
             history_length: int, capacity: int
         ) -> TypedIndexList[PoolGroupIndex, float]:
-            num_blocks = div_up(capacity, tokens_per_blocks)
-            num_bytes = filled_list(0.0, num_pool_groups)
-            for lc_idx, lc in typed_enumerate(life_cycles):
-                stale_beg, stale_end = _KVCache._get_stale_range(
-                    tokens_per_blocks, history_length, lc
-                )
-                pg_idx = lc2pg[lc_idx]
-                slot_size = storage.slot_size(pg_idx)
-                num_bytes[pg_idx] += (num_blocks - (stale_end - stale_beg)) * sum(slot_size)
-            total = sum(num_bytes)
-            assert total > 0
-            return typed_map(num_bytes, lambda x: x / total)
+            return storage.ratio_from_length(tokens_per_block, history_length, capacity)
 
         avg_reused_length: int = round(self._avg_reused_length.value)
         avg_capacity: int = round(self._avg_sqr_capacity.value**0.5)
