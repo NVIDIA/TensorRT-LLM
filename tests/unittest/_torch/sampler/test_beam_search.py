@@ -207,30 +207,33 @@ def check_cache_indirection(beam: CompletionOutput,
     ), f"expected {reference_cache_indirection[beam_idx, :num_valid_cache_indirection].tolist()} cache indirection, but got {valid_cache_indirection.tolist()}"
 
 
-def validate_output_beam(beam: CompletionOutput,
+def validate_output_beam(beam_output: CompletionOutput,
                          expected_outputs: BeamSearchTestOutput,
                          sampling_params: SamplingParams, prompt_length: int,
                          beam_idx: int) -> None:
     """Perform several checks on the output of a single beam"""
 
     valid_tokens = None
-    if sampling_params.stop_token_ids is not None:
-        if sampling_params.stop_token_ids[0] in expected_outputs.outputs[
-                beam_idx].tolist():
-            valid_tokens = expected_outputs.outputs[beam_idx].tolist().index(
-                sampling_params.stop_token_ids[0]) + 1
+    if sampling_params.stop_token_ids is not None and sampling_params.stop_token_ids[
+            0] in (expected_output_token_ids :=
+                   expected_outputs.outputs[beam_idx].tolist()):
+        assert beam_output.finish_reason == "stop"
+        valid_tokens = expected_output_token_ids.index(
+            sampling_params.stop_token_ids[0]) + 1
+    else:
+        assert beam_output.finish_reason == "length"
 
-    check_generation_logits(beam, sampling_params, valid_tokens)
-    check_logprobs(beam, sampling_params, valid_tokens)
-    check_cache_indirection(beam, sampling_params,
+    check_generation_logits(beam_output, sampling_params, valid_tokens)
+    check_logprobs(beam_output, sampling_params, valid_tokens)
+    check_cache_indirection(beam_output, sampling_params,
                             expected_outputs.cache_indirection, prompt_length,
                             beam_idx, valid_tokens)
     # Check output similarity
 
     assert valid_tokens is None or valid_tokens > 0
-    assert beam.token_ids == expected_outputs.outputs[
-        beam_idx, :valid_tokens].tolist(
-        ), f"expected {expected_outputs.outputs[beam_idx, :valid_tokens].tolist()} token ids, but got {beam.token_ids}"
+    expected_valid_token_ids = expected_outputs.outputs[
+        beam_idx, :valid_tokens].tolist()
+    assert beam_output.token_ids == expected_valid_token_ids, f"expected {expected_valid_token_ids} token ids, but got {beam_output.token_ids}"
 
 
 def check_context_logits(output: GenerationResult,
@@ -262,8 +265,9 @@ def validate_output(output: GenerationResult, input_prompt: list[int],
     # check each beam
     expected_outputs = get_expected_outputs(
         input_prompt[-1], num_iterations=sampling_params.max_tokens)
-    for beam_idx, beam in enumerate(output.outputs):
-        validate_output_beam(beam, expected_outputs, sampling_params,
+
+    for beam_idx, beam_output in enumerate(output.outputs):
+        validate_output_beam(beam_output, expected_outputs, sampling_params,
                              len(input_prompt), beam_idx)
 
 
