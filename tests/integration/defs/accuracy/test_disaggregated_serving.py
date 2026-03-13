@@ -686,7 +686,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             True,  # BS=1 does not need overlap scheduling
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4,
+                "free_gpu_memory_fraction": 0.3,
                 "enable_block_reuse": True  # reuse on context requests
             },
             "max_num_tokens": 13393 * 2,
@@ -700,7 +700,7 @@ class TestLlama3_1_8BInstruct(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": not overlap_scheduler,
             "speculative_config": speculative_decoding_config,
             "kv_cache_config": {
-                "free_gpu_memory_fraction": 0.4,
+                "free_gpu_memory_fraction": 0.3,
                 "enable_block_reuse": False
             },
             "max_num_tokens": 13393 * 2,
@@ -1427,12 +1427,18 @@ class TestQwen3_8B(LlmapiAccuracyTestHarness):
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL"
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.4
             }
         }
         gen_server_config = {
             "disable_overlap_scheduler": True,
             "cache_transceiver_config": {
                 "backend": "NIXL"
+            },
+            "kv_cache_config": {
+                "free_gpu_memory_fraction": 0.4
             }
         }
         disaggregated_server_config = {

@@ -3708,7 +3708,7 @@ class TestKimiK25(LlmapiAccuracyTestHarness):
     def test_nvfp4(self, ep_size, attention_dp):
         model_name = "moonshotai/Kimi-K2.5"
         model_path = f"{llm_models_root()}/Kimi-K2.5-NVFP4"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.8)
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5)
 
         with LLM(model_path,
                  tensor_parallel_size=8,
@@ -5594,7 +5594,7 @@ class TestQwen3NextInstruct(LlmapiAccuracyTestHarness):
     def test_bf16_4gpu(self, tp_size, pp_size, ep_size, cuda_graph,
                        overlap_scheduler, mocker):
         model_path = f"{self.MODEL_PATH}/Qwen3-Next-80B-A3B-Instruct"
-        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.6,
+        kv_cache_config = KvCacheConfig(free_gpu_memory_fraction=0.5,
                                         enable_block_reuse=False)
         pytorch_config = dict(
             disable_overlap_scheduler=not overlap_scheduler,

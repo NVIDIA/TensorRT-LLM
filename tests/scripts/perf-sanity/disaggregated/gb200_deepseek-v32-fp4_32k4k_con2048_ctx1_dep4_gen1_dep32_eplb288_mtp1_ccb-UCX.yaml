@@ -60,7 +60,7 @@ worker_config:
       max_batch_size: 64
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.4
+      free_gpu_memory_fraction: 0.25
       dtype: fp8
       tokens_per_block: 64
     moe_config:
@@ -96,7 +96,7 @@ worker_config:
     cuda_graph_config: null
     kv_cache_config:
       enable_block_reuse: false
-      free_gpu_memory_fraction: 0.3
+      free_gpu_memory_fraction: 0.25
       dtype: fp8
       tokens_per_block: 64
     moe_config:
