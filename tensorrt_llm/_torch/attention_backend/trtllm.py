@@ -29,9 +29,8 @@ from .interface import (AttentionBackend, AttentionInputType, AttentionMask,
 from .trtllm_gen import trtllm_gen_attention
 
 # Enable TRTLLM-Gen attention backend via environment variable.
-# _TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
-#     "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
-_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = True
+_TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION = os.environ.get(
+    "TRTLLM_ENABLE_TRTLLM_GEN_ATTENTION", "0") == "1"
 
 
 @dataclass(kw_only=True, init=False)
@@ -276,7 +275,7 @@ class TrtllmAttentionWrapper:
             out_scale_sf (torch.Tensor): The tensor to store the global scale for NVFP4 scaling factors, with shape (1) on GPU.
             kv_scales_sf (torch.Tensor): The tensor to store the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
             kv_scales_sf_inv (torch.Tensor): The tensor to store the inverse of the global scale for KV NVFP4 scaling factors, with shape (2) on GPU.
-            use_paged_context_fmha (bool): Sets the paged_context_fmha attribute in the op runner.
+            use_paged_context_fmha (bool): Sets the mPagedContextFMHA attribute in the op runner.
             mrope_config (dict): The dictionary containing the mRope configuration.
             softmax_stats_tensor (torch.Tensor): The tensor to store the softmax statistics (max/sum)
             attention_sinks (torch.Tensor): The attention sinks (additional value in the denominator of the softmax) with shape of (num_heads_q) on GPU.
