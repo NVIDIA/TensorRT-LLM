@@ -231,7 +231,7 @@ models:
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
 # --- MiniMax-M2.5 (Feb 2026) ---
 - name: MiniMaxAI/MiniMax-M2.5
-  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
+  yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml', 'minimax_m2.yaml']
 # --- MiMo-V2-Flash (Feb 2026) ---
 - name: XiaomiMiMo/MiMo-V2-Flash
   yaml_extra: ['dashboard_default.yaml', 'world_size_8.yaml']
