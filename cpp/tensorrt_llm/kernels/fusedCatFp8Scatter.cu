@@ -34,13 +34,14 @@ namespace kernels
 namespace
 {
 
-// Constants (same as fusedCatFp8)
 constexpr int HEAD_DIM = 128;
 constexpr int WARP_SIZE = 32;
 constexpr int ELEMS_PER_THREAD = 4; // 128 / 32
 constexpr int ROWS_PER_BLOCK = 8;
 constexpr float INV_FP8_E4M3_MAX = 1.0f / 448.0f;
 constexpr float MIN_AMAX = 1.0e-12f;
+constexpr int32_t SCALE_SIZE = 4;
+constexpr int32_t PER_TOKEN_SIZE = HEAD_DIM + SCALE_SIZE; // 132
 
 /// Warp-wide max reduction
 __device__ __forceinline__ float warpReduceMax(float val)
@@ -67,24 +68,22 @@ union FP8x4
 };
 
 /**
- * Given a flat element index and tensor shape [d0, d1, d2, d3] with strides [s0, s1, s2, s3],
- * find the actual memory offset.
+ * Unravel a flat element index into a byte offset for the indexer K cache.
+ * Specialized for the DeepSeek-V3.2 layout: d2=1, d3=132 (compile-time constants).
+ * This enables the compiler to use multiplication-based integer division (4 cycles)
+ * instead of general-purpose int64 division (20+ cycles) for the d3 unravel.
  */
 __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
-    int64_t flat_idx, int32_t d0, int32_t d1, int32_t d2, int32_t d3, int64_t s0, int64_t s1, int64_t s2, int64_t s3)
+    int64_t flat_idx, int32_t d1_mask, int32_t d1_shift, int64_t s0, int64_t s1, int64_t s3)
 {
-    int32_t i3 = flat_idx % d3;
-    flat_idx /= d3;
-
-    int32_t i2 = flat_idx % d2;
-    flat_idx /= d2;
-
-    int32_t i1 = flat_idx % d1;
-    flat_idx /= d1;
-
-    int32_t i0 = flat_idx;
-
-    return i0 * s0 + i1 * s1 + i2 * s2 + i3 * s3;
+    // d3 = PER_TOKEN_SIZE = 132 (compile-time constant → fast multiply-based reduction)
+    int32_t i3 = flat_idx % PER_TOKEN_SIZE;
+    flat_idx /= PER_TOKEN_SIZE;
+    // d2 = 1: skip (always 0)
+    // d1 is power of 2 → bitwise AND/shift instead of integer division
+    int32_t i1 = static_cast<int32_t>(flat_idx) & d1_mask;
+    int32_t i0 = static_cast<int32_t>(flat_idx) >> d1_shift;
+    return i0 * s0 + i1 * s1 + i3 * s3;
 }
 
 /// Fused kernel: cat + FP8 quantization + scatter to paged K cache.
@@ -93,17 +92,21 @@ __device__ __forceinline__ int64_t flatIndexToMemoryOffset(
 /// Block: (WARP_SIZE * ROWS_PER_BLOCK,)   i.e., (256,)
 ///
 /// Each warp handles one row:
-///   - Loads from pe/nope, quantizes to FP8 (same as fusedCatFp8Kernel)
+///   - Loads from pe/nope, quantizes to FP8
 ///   - Writes FP8 data to contiguous output AND to paged K cache
 ///   - Lane 0 writes scale to contiguous output AND to paged K cache
+///
+/// Optimizations:
+///   1. Compile-time d3=132, d2=1: fast integer division via multiplication reduction.
+///   2. __ldg for read-only inputs (pe, nope, slot_mappings).
+///   3. All threads compute own cache offset in SIMT lockstep (no shuffle overhead).
 template <bool UseUe8m0>
 __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8ScatterKernel(
     __nv_fp8_e4m3* __restrict__ fp8_out, float* __restrict__ scale_out, uint8_t* __restrict__ k_cache,
     __nv_bfloat16 const* __restrict__ pe, __nv_bfloat16 const* __restrict__ nope,
     int64_t const* __restrict__ slot_mapping_fp8, int64_t const* __restrict__ slot_mapping_scale, int32_t M,
     int32_t pe_dim, int32_t nope_dim, int32_t pe_row_stride, int32_t nope_row_stride, int64_t cache_stride_0,
-    int64_t cache_stride_1, int64_t cache_stride_2, int64_t cache_stride_3, int32_t cache_dim_0, int32_t cache_dim_1,
-    int32_t cache_dim_2, int32_t cache_dim_3)
+    int64_t cache_stride_1, int64_t cache_stride_3, int32_t d1_mask, int32_t d1_shift)
 {
     int warp_in_block = threadIdx.x / WARP_SIZE;
     int lane = threadIdx.x % WARP_SIZE;
@@ -126,7 +129,7 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8ScatterK
         int col = from_pe ? base : (base - pe_dim);
 
         BF16x4 loaded;
-        loaded.vec = *reinterpret_cast<int2 const*>(src + col);
+        loaded.vec = __ldg(reinterpret_cast<int2 const*>(src + col));
 
         float2 f0 = __bfloat1622float2(loaded.bf16x2[0]);
         float2 f1 = __bfloat1622float2(loaded.bf16x2[1]);
@@ -184,22 +187,24 @@ __global__ __launch_bounds__(WARP_SIZE* ROWS_PER_BLOCK) void fusedCatFp8ScatterK
     }
 
     // ---- Stage 4: Scatter to paged K cache ----
-    int64_t flat_idx_fp8_base = slot_mapping_fp8[row];
+    // All threads compute their own offset in SIMT lockstep (no shuffle overhead).
+    // Uses compile-time d3=132 and bitwise d1 for fast integer operations.
+    int64_t flat_idx_fp8_base = __ldg(&slot_mapping_fp8[row]);
     if (flat_idx_fp8_base >= 0)
     {
         int32_t head_dim_idx = lane * ELEMS_PER_THREAD;
         int64_t flat_idx = flat_idx_fp8_base + head_dim_idx;
 
-        int64_t dst_offset = flatIndexToMemoryOffset(flat_idx, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3,
-            cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
+        int64_t dst_offset
+            = flatIndexToMemoryOffset(flat_idx, d1_mask, d1_shift, cache_stride_0, cache_stride_1, cache_stride_3);
 
         *reinterpret_cast<uint32_t*>(&k_cache[dst_offset]) = packed.u32;
 
         if (lane == 0)
         {
-            int64_t flat_idx_scale_base = slot_mapping_scale[row];
-            int64_t dst_offset_scale = flatIndexToMemoryOffset(flat_idx_scale_base, cache_dim_0, cache_dim_1,
-                cache_dim_2, cache_dim_3, cache_stride_0, cache_stride_1, cache_stride_2, cache_stride_3);
+            int64_t flat_idx_scale_base = __ldg(&slot_mapping_scale[row]);
+            int64_t dst_offset_scale = flatIndexToMemoryOffset(
+                flat_idx_scale_base, d1_mask, d1_shift, cache_stride_0, cache_stride_1, cache_stride_3);
 
             *reinterpret_cast<float*>(&k_cache[dst_offset_scale]) = scale;
         }
@@ -233,6 +238,15 @@ void invokeFusedCatFp8Scatter(__nv_fp8_e4m3* fp8_out, float* scale_out, uint8_t*
         "fusedCatFp8Scatter: pe_row_stride (%d) must be a multiple of %d", pe_row_stride, ELEMS_PER_THREAD);
     TLLM_CHECK_WITH_INFO(nope_row_stride % ELEMS_PER_THREAD == 0,
         "fusedCatFp8Scatter: nope_row_stride (%d) must be a multiple of %d", nope_row_stride, ELEMS_PER_THREAD);
+    TLLM_CHECK_WITH_INFO(cache_dim_2 == 1, "fusedCatFp8Scatter: cache_dim_2 must be 1 (got %d)", cache_dim_2);
+    TLLM_CHECK_WITH_INFO(cache_dim_3 == PER_TOKEN_SIZE,
+        "fusedCatFp8Scatter: cache_dim_3 must be %d (head_dim + scale_size, got %d)", PER_TOKEN_SIZE, cache_dim_3);
+    TLLM_CHECK_WITH_INFO((cache_dim_1 & (cache_dim_1 - 1)) == 0,
+        "fusedCatFp8Scatter: cache_dim_1 (block_size=%d) must be a power of 2", cache_dim_1);
+
+    // Pre-compute mask and shift for power-of-2 block_size division
+    int32_t d1_mask = cache_dim_1 - 1;
+    int32_t d1_shift = __builtin_ctz(cache_dim_1);
 
     int num_blocks = (M + ROWS_PER_BLOCK - 1) / ROWS_PER_BLOCK;
     dim3 grid(num_blocks);
@@ -242,13 +256,13 @@ void invokeFusedCatFp8Scatter(__nv_fp8_e4m3* fp8_out, float* scale_out, uint8_t*
     {
         fusedCatFp8ScatterKernel<true><<<grid, block, 0, stream>>>(fp8_out, scale_out, k_cache, pe, nope,
             slot_mapping_fp8, slot_mapping_scale, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, cache_stride_0,
-            cache_stride_1, cache_stride_2, cache_stride_3, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3);
+            cache_stride_1, cache_stride_3, d1_mask, d1_shift);
     }
     else
     {
         fusedCatFp8ScatterKernel<false><<<grid, block, 0, stream>>>(fp8_out, scale_out, k_cache, pe, nope,
             slot_mapping_fp8, slot_mapping_scale, M, pe_dim, nope_dim, pe_row_stride, nope_row_stride, cache_stride_0,
-            cache_stride_1, cache_stride_2, cache_stride_3, cache_dim_0, cache_dim_1, cache_dim_2, cache_dim_3);
+            cache_stride_1, cache_stride_3, d1_mask, d1_shift);
     }
 
     TLLM_CUDA_CHECK(cudaGetLastError());
