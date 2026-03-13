@@ -1332,6 +1332,9 @@ def main() -> None:
     if ep_size <= 0:
         raise ValueError("--ep_size must be > 0")
 
+    _worker_env = dict(_WORKER_ENV)
+    _worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
+
     world_size = mpi_world_size()
     if world_size > 1:
         if args.ep_size is not None and ep_size != world_size:
@@ -1339,6 +1342,9 @@ def main() -> None:
                 f"--ep_size ({ep_size}) must match external MPI world size ({world_size}) "
                 "when running under mpirun."
             )
+        # In external MPI mode, workers are already launched, so MPIPoolExecutor(env=...)
+        # is not used. Apply worker env directly for parity with spawn mode.
+        os.environ.update(_worker_env)
         # Reuse externally launched MPI processes (supports multi-node SPMD).
         _run_benchmark_worker_under_current_mpi(args, launcher="external_mpi")
         return
@@ -1358,11 +1364,8 @@ def main() -> None:
             flush=True,
         )
 
-    worker_env = dict(_WORKER_ENV)
-    worker_env["TRTLLM_ENABLE_PDL"] = "1" if args.pdl else "0"
-
     args_blob = cloudpickle.dumps(args)
-    executor = MPIPoolExecutor(max_workers=ep_size, env=worker_env)
+    executor = MPIPoolExecutor(max_workers=ep_size, env=_worker_env)
     try:
         # Map the same args to all workers; each worker uses its own mpi_rank() and participates
         # in collectives within its spawned MPI world.
