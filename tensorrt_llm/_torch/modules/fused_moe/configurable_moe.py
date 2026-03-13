@@ -367,7 +367,6 @@ class ConfigurableMoE(MoE):
         feasible_workload = self.comm.is_workload_feasible(all_rank_num_tokens, num_chunks)
 
         if not feasible_workload:
-            # Current comm cannot be used, fallback to AllGather
             all_rank_max_num_tokens = max(all_rank_num_tokens)
             logger.info(
                 f"Communication strategy {self.comm.__class__.__name__} "
@@ -375,8 +374,29 @@ class ConfigurableMoE(MoE):
                 f"Falling back to AllGatherReduceScatter."
             )
 
-            # Switch to AllGather (always works)
+            self.comm.destroy()
             self.comm = AllGatherReduceScatter(mapping=self.mapping)
+
+    def destroy(self):
+        """Release communication resources.
+
+        Must be called on ALL ranks before the module is discarded.
+        DeepEP Buffer.__del__ calls intranode::barrier (a collective op);
+        without an explicit, synchronous release, non-deterministic GC
+        timing across ranks causes some to enter the barrier while others
+        proceed, resulting in an indefinite hang.
+
+        Prefer using ConfigurableMoE as a context manager (``with``) so
+        that destroy() is called automatically on scope exit.
+        """
+        if self.comm is not None:
+            self.comm.destroy()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc_info):
+        self.destroy()
 
     def _create_comm_strategy_auto(self) -> Communication:
         """
