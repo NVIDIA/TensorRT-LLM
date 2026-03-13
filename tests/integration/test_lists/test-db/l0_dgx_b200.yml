@@ -275,6 +275,8 @@ l0_dgx_b200:
   - examples/test_visual_gen.py::test_vbench_dimension_score_wan22_a14b_nvfp4
   - visual_gen/test_visual_gen_benchmark.py::test_offline_benchmark
   - visual_gen/test_visual_gen_benchmark.py::test_online_benchmark[openai-videos]
+  - examples/test_visual_gen.py::test_vbench_dimension_score_ltx2_bf16
+  - examples/test_visual_gen.py::test_vbench_dimension_score_ltx2_fp8
 # ------------- AutoDeploy Backend Stages ---------------
 - condition:
     ranges:
