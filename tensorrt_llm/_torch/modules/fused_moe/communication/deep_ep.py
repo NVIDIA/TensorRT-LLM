@@ -78,7 +78,6 @@ class DeepEP(Communication):
         self.deep_ep_buffer.reserve(hidden_size, weight_dtype)
 
         # Invalid token expert ID: TRTLLM-gen kernels only support -1 for invalid tokens.
-        # After dispatch, non-local expert slots are replaced with this value.
         self.invalid_token_expert_id = -1
 
     def destroy(self):
@@ -238,6 +237,9 @@ class DeepEP(Communication):
             }
 
         if kwargs.get("enable_sanitize_expert_ids", False) and token_selected_slots.numel() > 0:
+            # After dispatch, non-local expert slots are replaced with invalid_token_expert_id.
+            # Some renormalize kernel but not all yet might do this sanitization,
+            # but we want to make sure it is always done for non-local tokens to avoid potential issues.
             slot_start = self.expert_size_per_partition * self.ep_rank
             slot_end = slot_start + self.expert_size_per_partition
             non_local_mask = (token_selected_slots < slot_start) | (
