@@ -75,7 +75,9 @@ def model_kwargs(fixed_params, sampling_information) -> dict[str, Any]:
     )
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[False, True],
+                ids=["no_cuda_graph_and_overlap", "cuda_graph_and_overlap"])
 def with_cuda_graph_and_overlap(request):
     return request.param
 
@@ -247,7 +249,9 @@ def check_context_logits(output: GenerationResult,
         assert output.context_logits is None, "context logits should be None"
 
 
-@pytest.fixture(scope="module", params=[False, True])
+@pytest.fixture(scope="module",
+                params=[False, True],
+                ids=["multi_process", "single_process"])
 def single_process(request) -> bool:
     return cast(bool, request.param)
 
