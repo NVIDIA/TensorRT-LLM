@@ -727,7 +727,7 @@ class TestFluxE2E:
             guidance_scale=3.5,
             seed=42,
         )
-        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+        native_image = result.image[0].cpu().numpy()  # (H, W, 3) uint8
 
         # 4. Compute PSNR
         mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
@@ -780,7 +780,7 @@ class TestFluxE2E:
             guidance_scale=3.5,
             seed=42,
         )
-        native_image = result.image.cpu().numpy()  # (H, W, 3) uint8
+        native_image = result.image[0].cpu().numpy()  # (H, W, 3) uint8
 
         # 4. Compute PSNR
         mse = ((hf_image.astype(float) - native_image.astype(float)) ** 2).mean()
@@ -858,7 +858,8 @@ class TestFluxBatchGeneration:
             num_inference_steps=4,
             seed=42,
         )
-        assert single.image.dim() == 3, f"Expected 3D, got {single.image.shape}"
+        assert single.image.dim() == 4, f"Expected 4D, got {single.image.shape}"
+        assert single.image.shape[0] == 1
 
         # Batch prompts → (B, H, W, C)
         batch = flux1_pipeline.forward(

@@ -260,16 +260,14 @@ class FluxPipeline(BasePipeline):
             max_sequence_length: Maximum text sequence length
 
         Returns:
-            MediaOutput with image tensor (H, W, C) for single prompt,
-            or (B, H, W, C) for multiple prompts.
+            MediaOutput with image tensor (B, H, W, C).
         """
         pipeline_start = time.time()
 
         # Determine batch size
         if isinstance(prompt, str):
-            batch_size = 1
-        else:
-            batch_size = len(prompt)
+            prompt = [prompt]
+        batch_size = len(prompt)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -347,20 +345,19 @@ class FluxPipeline(BasePipeline):
 
     def _encode_prompt(
         self,
-        prompt: Union[str, List[str]],
+        prompt: List[str],
         max_sequence_length: int,
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Encode prompt(s) using CLIP and T5.
 
         Args:
-            prompt: Single prompt string or list of prompts.
+            prompt: List of prompts.
             max_sequence_length: Maximum T5 sequence length.
 
         Returns:
             Tuple of (T5 embeddings [B, seq, dim], CLIP pooled [B, dim],
             text position IDs [seq, 3])
         """
-        prompt = [prompt] if isinstance(prompt, str) else prompt
 
         # CLIP encoding (pooled embeddings)
         clip_inputs = self.tokenizer(
@@ -556,6 +553,4 @@ class FluxPipeline(BasePipeline):
         image = image.permute(0, 2, 3, 1)  # (B, C, H, W) -> (B, H, W, C)
         image = (image * 255).round().to(torch.uint8)
 
-        if batch_size == 1:
-            return image[0]  # (H, W, C) — backward compatible
         return image  # (B, H, W, C)

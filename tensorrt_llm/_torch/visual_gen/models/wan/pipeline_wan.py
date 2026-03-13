@@ -330,9 +330,8 @@ class WanPipeline(BasePipeline):
 
         # Determine batch size
         if isinstance(prompt, str):
-            batch_size = 1
-        else:
-            batch_size = len(prompt)
+            prompt = [prompt]
+        batch_size = len(prompt)
 
         generator = torch.Generator(device=self.device).manual_seed(seed)
 
@@ -495,12 +494,10 @@ class WanPipeline(BasePipeline):
     @nvtx_range("_encode_prompt", color="blue")
     def _encode_prompt(
         self,
-        prompt: Union[str, List[str]],
+        prompt: List[str],
         negative_prompt: Optional[str],
         max_sequence_length: int,
     ):
-        prompt = [prompt] if isinstance(prompt, str) else prompt
-
         def get_embeds(texts):
             text_inputs = self.tokenizer(
                 texts,
@@ -594,8 +591,7 @@ class WanPipeline(BasePipeline):
         # VAE decode: returns (B, C, T, H, W)
         video = self.vae.decode(latents, return_dict=False)[0]
 
-        # Post-process video tensor
-        # (B, C, T, H, W) -> (T, H, W, C) for batch=1, (B, T, H, W, C) for batch>1
-        video = postprocess_video_tensor(video, remove_batch_dim=(batch_size == 1))
+        # Post-process video tensor: (B, C, T, H, W) -> (B, T, H, W, C)
+        video = postprocess_video_tensor(video)
 
         return video

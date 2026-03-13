@@ -3482,9 +3482,9 @@ class TestWanBatchGeneration:
             guidance_scale=5.0,
             seed=42,
         )
-        assert result.video.dim() == 4, f"Expected 4D (T,H,W,C), got {result.video.dim()}D"
-        _T, H, W, C = result.video.shape
-        assert H == 480 and W == 832 and C == 3
+        assert result.video.dim() == 5, f"Expected 5D (B,T,H,W,C), got {result.video.dim()}D"
+        B, _T, H, W, C = result.video.shape
+        assert B == 1 and H == 480 and W == 832 and C == 3
 
     @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA not available")
     def test_batch_prompt_shape(self, wan21_full_pipeline):
