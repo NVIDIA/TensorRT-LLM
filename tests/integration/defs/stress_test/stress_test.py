@@ -900,10 +900,14 @@ def create_aiperf_command(model_name,
                           input_len_std=PerformanceParams.input_len_std,
                           output_len_mean=PerformanceParams.output_len_mean,
                           output_len_std=PerformanceParams.output_len_std,
-                          warmup_request_count=10,
-                          request_timeout_seconds=120.0):
+                          warmup_request_count=2):
     """
     Create a command list for aiperf with standardized parameters.
+
+    The server should already be inference-warmed via warmup_inference()
+    before this command is run.  We keep a small warmup_request_count
+    (default 2) at concurrency 1 so aiperf can verify connectivity
+    without hitting its internal startup timeout.
 
     Args:
         model_name: Name of the model
@@ -915,8 +919,7 @@ def create_aiperf_command(model_name,
         input_len_std: Standard deviation of input length
         output_len_mean: Mean output length
         output_len_std: Standard deviation of output length
-        warmup_request_count: Number of warmup requests
-        request_timeout_seconds: Per-request timeout in seconds for aiperf
+        warmup_request_count: Number of warmup requests for aiperf
 
     Returns:
         List of command-line arguments for aiperf
@@ -948,8 +951,8 @@ def create_aiperf_command(model_name,
         str(concurrency),
         "--warmup-request-count",
         str(warmup_request_count),
-        "--request-timeout-seconds",
-        str(request_timeout_seconds),
+        "--warmup-concurrency",
+        "1",
         # "--verbose",
     ]
 
@@ -1122,8 +1125,7 @@ def measure_capacity_stage(model_name,
             input_len_mean=performance_params.input_len_mean,
             input_len_std=performance_params.input_len_std,
             output_len_mean=performance_params.output_len_mean,
-            output_len_std=performance_params.output_len_std,
-            warmup_request_count=10)
+            output_len_std=performance_params.output_len_std)
 
         # Run aiperf process
         process_completed = run_aiperf_process(cmd, test_start_time,
@@ -1230,8 +1232,7 @@ def stress_stage(model_name,
         input_len_mean=PerformanceParams.input_len_mean,
         input_len_std=PerformanceParams.input_len_std,
         output_len_mean=PerformanceParams.output_len_mean,
-        output_len_std=PerformanceParams.output_len_std,
-        warmup_request_count=10)
+        output_len_std=PerformanceParams.output_len_std)
 
     # Start aiperf process
     process_completed = run_aiperf_process(cmd, test_start_time, test_timeout,
