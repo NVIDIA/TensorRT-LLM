@@ -98,6 +98,70 @@ __device__ __forceinline__ float ld_global_volatile(float* addr)
     return val;
 }
 
+template <typename T, int NUM>
+__device__ __forceinline__ void blockReduceSumRange(T* val, int rangeStart, int rangeEnd)
+{
+    constexpr int kWarpSize = 32;
+    constexpr unsigned kFullMask = 0xffffffffu;
+    static __shared__ T shared[NUM][33];
+
+    int const activeThreadCount = max(rangeEnd - rangeStart, 0);
+    bool const isActive = threadIdx.x >= rangeStart && threadIdx.x < rangeEnd;
+    int const lane = threadIdx.x & (kWarpSize - 1);
+    unsigned const activeMask = __ballot_sync(kFullMask, isActive);
+
+    if (isActive)
+    {
+#pragma unroll
+        for (int i = 0; i < NUM; ++i)
+        {
+            T sum = val[i];
+#pragma unroll
+            for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
+            {
+                sum += __shfl_down_sync(activeMask, sum, offset, kWarpSize);
+            }
+            val[i] = sum;
+        }
+    }
+
+    if (isActive && lane == 0)
+    {
+        int const localWarpId = (threadIdx.x - rangeStart) >> 5;
+#pragma unroll
+        for (int i = 0; i < NUM; ++i)
+        {
+            shared[i][localWarpId] = val[i];
+        }
+    }
+
+    __syncthreads();
+
+    int const shiftedTid = threadIdx.x - rangeStart;
+    int const warpCount = (activeThreadCount + kWarpSize - 1) / kWarpSize;
+    bool const inLeaderWarp = shiftedTid >= 0 && shiftedTid < kWarpSize;
+    bool const leaderLaneIsValid = inLeaderWarp && shiftedTid < warpCount;
+    unsigned const leaderMask = __ballot_sync(kFullMask, leaderLaneIsValid);
+
+    if (inLeaderWarp)
+    {
+#pragma unroll
+        for (int i = 0; i < NUM; ++i)
+        {
+            T sum = leaderLaneIsValid ? shared[i][shiftedTid] : static_cast<T>(0);
+#pragma unroll
+            for (int offset = kWarpSize / 2; offset > 0; offset >>= 1)
+            {
+                sum += __shfl_down_sync(leaderMask, sum, offset, kWarpSize);
+            }
+            if (threadIdx.x == rangeStart)
+            {
+                val[i] = sum;
+            }
+        }
+    }
+}
+
 template <typename DType>
 class IndexHelper
 {
@@ -344,8 +408,11 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
         tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_variance);
         if constexpr (IsQK)
         {
-            tensorrt_llm::common::blockReduceSumV2<float, 4>(sum_variance_k);
+            int const kStartThread = q_warps * MINIMAX_REDUCE_RMS_WARP_SIZE;
+            int const kEndThread = (q_warps + k_warps) * MINIMAX_REDUCE_RMS_WARP_SIZE;
+            blockReduceSumRange<float, 4>(sum_variance_k, kStartThread, kEndThread);
         }
+
 #pragma unroll
         for (int r = 0; r < 4; ++r)
         {
@@ -501,8 +568,8 @@ __global__ void __launch_bounds__(1024) minimax_reduce_rms_kernel_lamport_float4
                     {
                         continue;
                     }
-                    float scale_k = rsqrtf(
-                        (sum_variance_k[r] / static_cast<float>(params.hidden_dim_k) / NRanks) + params.rms_eps);
+                    float scale_k
+                        = rsqrtf((sum_variance[r] / static_cast<float>(params.hidden_dim_k) / NRanks) + params.rms_eps);
 #pragma unroll
                     for (int i = 0; i < kElemsPerAccess<DType>; ++i)
                     {
