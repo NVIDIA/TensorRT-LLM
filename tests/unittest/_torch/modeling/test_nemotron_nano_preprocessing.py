@@ -311,7 +311,7 @@ def vision_encoder():
     """Create a mock NanoV2VLVisionEncoder with required attributes."""
     encoder = mock.MagicMock(spec=NanoV2VLVisionEncoder)
     encoder.llm_hidden_size = 512
-    encoder.video_pruning_ratio = 0.0
+    encoder.video_pruning_rate = 0.0
     return encoder
 
 
