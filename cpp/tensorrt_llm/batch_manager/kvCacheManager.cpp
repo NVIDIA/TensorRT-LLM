@@ -1317,7 +1317,11 @@ SizeType32 WindowBlockManager::loadOrAllocateBlocks(std::vector<BlockKey> const&
                 TLLM_LOG_DEBUG("%s::loadOrAllocateBlocks - Matched full block %d", mLogPrefix.c_str(), matchingBlockId);
                 searchRoot = matchingBlock;
             }
+            // Release lock before onboardBlock — if the matched block is in secondary,
+            // onboardBlock calls getFreeBlock which acquires the same tree mutex.
+            lock.unlock();
             onboardBlock(sequence, matchingBlock, mode, directory);
+            lock.lock();
             addBlockToAllBeams(matchingBlock, sequence);
             // TODO: only add once for reused blocks
             ++mReusedBlocks;
@@ -1614,105 +1618,96 @@ std::pair<SizeType32, std::vector<KVCacheBlock::IdType>> WindowBlockManager::sto
 {
     SizeType32 numBlocksStoredForReuse = 0;
     std::lock_guard<std::mutex> lock(mLookupTree->getMutex());
-    TLLM_LOG_DEBUG("%s::storeBlocks - %zu blockKeys, %zu blocks", mLogPrefix.c_str(), blockKeys.size(), blocks.size());
 
-    auto searchRoot = mCachedBlocksRoot;
-    bool needMatch = true;
-
-    // Only iterate as long as we have a valid blockKey and block pointer.
+    // Trim to the shorter of the two inputs so the zip below is always in-bounds.
     auto const numBlocks = std::min(blockKeys.size(), blocks.size());
+    blockKeys.resize(numBlocks);
+
+    TLLM_LOG_DEBUG("%s::storeBlocks - %zu blockKeys, %zu blocks", mLogPrefix.c_str(), numBlocks, blocks.size());
+
+    if (numBlocks == 0)
+    {
+        return {0, {}};
+    }
+
+    // Insert (or look up) trie nodes for the entire prefix chain in one pass.
+    // This separates structural trie insertion from block-value assignment and
+    // allows us to skip occupied slots and continue storing later blocks
+    // (rather than stopping on the first collision).
+    auto nodeMatches = mLookupTree->insertNodes(blockKeys);
+
     std::vector<BlockPtr> storedBlocks;
     std::vector<KVCacheBlock::IdType> pinnedBlockIds;
-    for (std::size_t blockCnt = 0; blockCnt < numBlocks; ++blockCnt)
+    // prevBlock tracks the trie-level parent used for hash chaining and setPrevBlockInSeq.
+    BlockPtr prevBlock = mCachedBlocksRoot;
+
+    for (std::size_t i = 0; i < nodeMatches.exactMatches.size(); ++i)
     {
-        try
+        auto const& node = nodeMatches.exactMatches[i].node;
+        auto const& block = blocks[i];
+        auto const& blockKey = blockKeys[i];
+
+        if (block->isPlaceholder())
         {
-            auto const& block = blocks.at(blockCnt);
-            auto const& blockKey = blockKeys.at(blockCnt);
-
-            // Placeholder blocks occupy OOW slots in mAllocatedBlocksPerSeq after
-            // detachFrontBlock replaced the real block.  The real block was stored in the
-            // trie by storeContextBlocks / storeNewBlock before going OOW.  Attempt to
-            // advance searchRoot to its cached trie position.  If the real block was
-            // evicted (no trie entry), the chain is broken — stop.
-            if (block->isPlaceholder())
+            // OOW slot: the real block was stored before going OOW (invariant enforced by
+            // storeContextBlocks / storeNewBlock).  Advance prevBlock via the existing trie
+            // value.  If the OOW block was evicted (no value at this node), the chain is
+            // broken — stop storing subsequent blocks.
+            auto const existing = node->getValue(mWindowSize);
+            if (existing.has_value() && *existing)
             {
-                auto const matchedOow = std::get<2>(searchRoot->findMatchingBlock(blockKey, false, false));
-                if (matchedOow != nullptr)
-                {
-                    TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, found anchor block %d in trie",
-                        mLogPrefix.c_str(), blockCnt, matchedOow->getBlockId());
-                    searchRoot = matchedOow;
-                    continue;
-                }
-                TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, anchor block evicted — stopping chain store",
-                    mLogPrefix.c_str(), blockCnt);
-                break;
+                TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, found anchor block %d in trie",
+                    mLogPrefix.c_str(), i, (*existing)->getBlockId());
+                prevBlock = *existing;
+                continue;
             }
-
-            auto const bid = block->getBlockId();
-            TLLM_LOG_DEBUG("%s::storeBlocks - Searching match for block %d", mLogPrefix.c_str(), bid);
-
-            auto [partialMatch, numMatched, matchedBlock] = needMatch
-                ? searchRoot->findMatchingBlock(blockKey, false, false)
-                : std::make_tuple(false, 0, nullptr);
-            if (matchedBlock != nullptr)
-            {
-                // Found match
-                TLLM_LOG_DEBUG("%s::storeBlocks - Found matching block %d, traverse", mLogPrefix.c_str(),
-                    matchedBlock->getBlockId());
-                searchRoot = matchedBlock;
-                // TODO possible optimization: if bid != matchedBlock->getBlockId(),
-                // block can be freed and inserted at mFreePrimaryBlocks.begin()
-            }
-            else
-            {
-                // No match — insert block into the trie.
-                TLLM_LOG_DEBUG(
-                    "%s::storeBlocks - No match, inserting block %d into search structure", mLogPrefix.c_str(), bid);
-                needMatch = false; // no matching needed for following blocks
-
-                block->detachFromLookupNode();
-                block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
-                block->setPrevBlockInSeq(searchRoot);
-                searchRoot->addNextBlock(blockKey, block);
-
-                // If addNextBlock could not attach (trie slot already occupied by another block),
-                // stop — remaining blocks in this sequence cannot be stored for reuse.
-                if (block->getPrevBlock() == nullptr)
-                {
-                    break;
-                }
-
-                // Sanity check. The list of stored blocks should be connected.
-                TLLM_CHECK(storedBlocks.empty() || block->getPrevBlock() == storedBlocks.back());
-
-                storedBlocks.push_back(block);
-                TLLM_CHECK(block->getPrevBlockInSeq() == nullptr
-                    || block->getPrevBlockInSeq()->getHash() == searchRoot->getHash());
-                auto oldHash = block->getHash();
-                auto newHash = BlockKeyHasher()(blockKey, searchRoot->getHash());
-                if (oldHash != newHash)
-                {
-                    TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", block->getBlockId(), oldHash, newHash);
-                    block->setHash(newHash);
-                }
-                searchRoot = block;
-                numBlocksStoredForReuse++;
-            }
-            if (pinBlocks)
-            {
-                searchRoot->incRefCount();
-                pinnedBlockIds.push_back(searchRoot->getBlockId());
-            }
-        }
-        catch (std::out_of_range const& ex)
-        {
-            TLLM_LOG_WARNING("Out of range access, terminating storeBlocks early.");
-            // Prevent blocks following an invalid block from being reused.
+            TLLM_LOG_DEBUG("%s::storeBlocks - OOW placeholder at %zu, anchor block evicted — stopping chain store",
+                mLogPrefix.c_str(), i);
             break;
         }
+
+        auto const bid = block->getBlockId();
+        auto const existing = node->getValue(mWindowSize);
+
+        if (existing.has_value())
+        {
+            // Trie slot already occupied (block previously stored by this or another sequence).
+            // Advance prevBlock and continue. Subsequent blocks may still need
+            // storing as children of this node.
+            TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: slot occupied by %d, skipping", mLogPrefix.c_str(), bid,
+                (*existing)->getBlockId());
+            prevBlock = *existing;
+        }
+        else
+        {
+            // Empty trie slot — store this block.
+            TLLM_LOG_DEBUG("%s::storeBlocks - Block %d: no existing entry, inserting into search structure",
+                mLogPrefix.c_str(), bid);
+
+            block->detachFromLookupNode();
+            block->setBlockKey(blockKey, static_cast<SizeType32>(blockKey.uniqueTokens.size()) == mTokensPerBlock);
+            block->setPrevBlockInSeq(prevBlock);
+            block->attachToLookupNode(node, mWindowSize);
+
+            auto const newHash = BlockKeyHasher()(blockKey, prevBlock->getHash());
+            if (block->getHash() != newHash)
+            {
+                TLLM_LOG_DEBUG("#%d block hash %zx -> %zx", bid, block->getHash(), newHash);
+                block->setHash(newHash);
+            }
+
+            storedBlocks.push_back(block);
+            prevBlock = block;
+            numBlocksStoredForReuse++;
+        }
+
+        if (pinBlocks)
+        {
+            prevBlock->incRefCount();
+            pinnedBlockIds.push_back(prevBlock->getBlockId());
+        }
     }
+
     if (mEventManager)
     {
         mEventManager->enqueueStoredEvent(storedBlocks, mWindowSize);
