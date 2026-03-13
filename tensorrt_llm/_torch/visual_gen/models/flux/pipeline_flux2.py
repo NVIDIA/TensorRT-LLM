@@ -424,9 +424,7 @@ class Flux2Pipeline(BasePipeline):
         # Decode
         logger.info("Decoding image...")
         decode_start = time.time()
-        image = self.decode_latents(
-            latents, lambda lat: self._decode_latents(lat, latent_ids, batch_size)
-        )
+        image = self.decode_latents(latents, lambda lat: self._decode_latents(lat, latent_ids))
 
         if self.rank == 0:
             logger.info(f"Image decoded in {time.time() - decode_start:.2f}s")
@@ -659,17 +657,15 @@ class Flux2Pipeline(BasePipeline):
         self,
         latents: torch.Tensor,
         latent_ids: torch.Tensor,
-        batch_size: int = 1,
     ) -> torch.Tensor:
         """Decode latents to image tensor.
 
         Args:
             latents: Packed latents [B, seq, C].
             latent_ids: Position IDs [seq, 4].
-            batch_size: Number of images in batch.
 
         Returns:
-            Image tensor (H, W, C) for single image, (B, H, W, C) for batch.
+            Image tensor (B, H, W, C).
         """
         # Unpack latents using position IDs
         latents = self._unpack_latents_with_ids(latents, latent_ids)

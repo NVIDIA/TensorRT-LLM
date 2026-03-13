@@ -647,7 +647,7 @@ class WanImageToVideoPipeline(BasePipeline):
         # Decode
         logger.info("Decoding video...")
         decode_start = time.time()
-        video = self.decode_latents(latents, lambda lat: self._decode_latents(lat, batch_size))
+        video = self.decode_latents(latents, self._decode_latents)
 
         if self.rank == 0:
             logger.info(f"Video decoded in {time.time() - decode_start:.2f}s")
@@ -828,7 +828,7 @@ class WanImageToVideoPipeline(BasePipeline):
 
         return latents, condition
 
-    def _decode_latents(self, latents, batch_size=1):
+    def _decode_latents(self, latents):
         """Decode latents to video."""
         latents = latents.to(self.vae.dtype)
 
