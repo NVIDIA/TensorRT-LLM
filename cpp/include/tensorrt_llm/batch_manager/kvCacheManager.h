@@ -1646,7 +1646,8 @@ public:
         = 0;
 
     //! \brief Get the block ids of a request [per beam] **for a given window size block manager**
-    [[nodiscard]] virtual std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+    // Returns by value: KVCacheManager cannot return a reference after releasing mSequencesMtx.
+    [[nodiscard]] virtual std::vector<std::vector<SizeType32>> getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const
         = 0;
 
@@ -1986,8 +1987,56 @@ public:
     void removeToken(LlmRequest::RequestIdType requestId);
     void rewindKVCache(LlmRequest::RequestIdType requestId, SizeType32 rewindLengths) override;
 
-    [[nodiscard]] GenerationRequest const& getSequence(LlmRequest::RequestIdType requestId) const override;
-    [[nodiscard]] GenerationRequest& getSequence(LlmRequest::RequestIdType requestId) override;
+    // -------------------------------------------------------------------------
+    // Sequence access — safe API (replaces getSequence())
+    //
+    // Executes fn(sequence) while holding mSequencesMtx.  The reference passed
+    // to fn is valid for exactly the lifetime of fn; it must not be stored.
+    //
+    // Precondition: fn must not call any KVCacheManager method that also
+    //   acquires mSequencesMtx — use the private *Unlocked helpers instead.
+    //   Violation will deadlock (std::mutex is non-recursive by design).
+    // -------------------------------------------------------------------------
+
+    /// @brief Invoke fn with the GenerationRequest for requestId, under lock.
+    ///        Throws std::out_of_range if requestId is not present.
+    template <typename Fn>
+    auto withSequence(LlmRequest::RequestIdType requestId, Fn&& fn)
+        -> decltype(fn(std::declval<GenerationRequest&>()))
+    {
+        std::scoped_lock lck(mSequencesMtx);
+        return std::forward<Fn>(fn)(mSequences.at(requestId));
+    }
+
+    template <typename Fn>
+    auto withSequence(LlmRequest::RequestIdType requestId, Fn&& fn) const
+        -> decltype(fn(std::declval<GenerationRequest const&>()))
+    {
+        std::scoped_lock lck(mSequencesMtx);
+        return std::forward<Fn>(fn)(mSequences.at(requestId));
+    }
+
+    /// @brief Invoke fn with the GenerationRequest for requestId, under lock.
+    ///        Does nothing and returns false if requestId is not present.
+    template <typename Fn>
+    bool withSequenceIfExists(LlmRequest::RequestIdType requestId, Fn&& fn)
+    {
+        std::scoped_lock lck(mSequencesMtx);
+        auto it = mSequences.find(requestId);
+        if (it == mSequences.end()) return false;
+        std::forward<Fn>(fn)(it->second);
+        return true;
+    }
+
+    template <typename Fn>
+    bool withSequenceIfExists(LlmRequest::RequestIdType requestId, Fn&& fn) const
+    {
+        std::scoped_lock lck(mSequencesMtx);
+        auto it = mSequences.find(requestId);
+        if (it == mSequences.end()) return false;
+        std::forward<Fn>(fn)(it->second);
+        return true;
+    }
 
     [[nodiscard]] bool isCrossKv() const override
     {
@@ -2053,7 +2102,9 @@ public:
     [[nodiscard]] static SizeType32 calculateMaxBlockRequirementsPerBeam(
         SizeType32 sequenceLength, SizeType32 sinkTokenLength, SizeType32 windowSize, SizeType32 tokensPerBlock);
 
-    std::vector<std::vector<SizeType32>> const& getCacheBlockIds(
+    // Returns by value: cannot return a reference to map-internal data after
+    // mSequencesMtx is released.
+    [[nodiscard]] std::vector<std::vector<SizeType32>> getCacheBlockIds(
         LlmRequest::RequestIdType requestId, SizeType32 windowSize) const override;
 
     std::vector<std::vector<std::vector<SizeType32>>> getBatchCacheBlockIds(
@@ -2108,6 +2159,38 @@ public:
         SizeType32 sinkTokenLength, SizeType32 blockCapacity, SizeType32 beamWidth, SizeType32 tokensPerBlock);
 
 private:
+    // -------------------------------------------------------------------------
+    // Unlocked sequence helpers
+    //
+    // PRECONDITION: mSequencesMtx must already be held by the calling thread.
+    //
+    // These exist so that code already running inside a withSequence callback
+    // can look up additional sequences by ID without re-acquiring the mutex
+    // (which would deadlock since std::mutex is non-recursive).
+    // -------------------------------------------------------------------------
+
+    [[nodiscard]] GenerationRequest& getSequenceUnlocked(LlmRequest::RequestIdType requestId)
+    {
+        return mSequences.at(requestId); // no lock — caller must hold mSequencesMtx
+    }
+
+    [[nodiscard]] GenerationRequest const& getSequenceUnlocked(
+        LlmRequest::RequestIdType requestId) const
+    {
+        return mSequences.at(requestId);
+    }
+
+    // -------------------------------------------------------------------------
+    // Token removal implementation
+    //
+    // PRECONDITION: mSequencesMtx must already be held by the calling thread.
+    //
+    // Factored out of removeToken() so that rewindKVCache() can call it
+    // inside a single withSequenceIfExists callback, making the entire rewind
+    // atomic with respect to concurrent removeSequence() calls.
+    // -------------------------------------------------------------------------
+    void removeTokenImpl(GenerationRequest& sequence);
+
     // Maximum number of sequences
     SizeType32 mMaxNumSequences;
     // Maximum beam width
