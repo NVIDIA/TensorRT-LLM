@@ -7,6 +7,7 @@ from .modeling_gemma import GemmaADForCausalLM
 from .modeling_gemma2 import Gemma2ForCausalLM
 from .modeling_glm4_moe import Glm4MoeForCausalLM
 from .modeling_glm4_moe_lite import Glm4MoeLiteForCausalLM
+from .modeling_glm_moe_dsa import GlmMoeDsaForCausalLM
 from .modeling_granite import GraniteForCausalLM
 from .modeling_granite_moe_hybrid import GraniteMoeHybridForCausalLM
 from .modeling_hunyuan_dense import HunYuanDenseForCausalLM
@@ -39,6 +40,7 @@ __all__ = (
     "Gemma2ForCausalLM",
     "Glm4MoeForCausalLM",
     "Glm4MoeLiteForCausalLM",
+    "GlmMoeDsaForCausalLM",
     "GraniteForCausalLM",
     "GraniteMoeHybridForCausalLM",
     "HunYuanDenseForCausalLM",
