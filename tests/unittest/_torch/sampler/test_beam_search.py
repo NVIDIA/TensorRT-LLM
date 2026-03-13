@@ -365,9 +365,6 @@ def test_beam_search_e2e(
     check_no_sync = single_process  # single_process only used for sync check
     if check_no_sync and llm_args.sampler_type != "TorchSampler":
         pytest.skip("Sync check only supported for TorchSampler")
-    if check_no_sync and llm_args.sampler_type == "TorchSampler" and stop_token_ids is not None:
-        # FIXME: Fix TorchSampler._are_stop_words
-        pytest.skip("Stop word handling in TorchSampler syncs")
 
     if return_log_probs and num_prompts > 1 and llm_args.sampler_type == "TRTLLMSampler":
         pytest.skip(
